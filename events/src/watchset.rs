@@ -112,13 +112,126 @@ pub(crate) fn parse_prefix(
     Some(((bits, key), prefix_units(bits, k_max)))
 }
 
+/// The node-registry operations [`WatchSet::replace`] drives to reconcile the
+/// matcher's per-subscriber index with a new watch-set. Registry membership is a
+/// per-subscriber set (idempotent re-add, floor-updated in place), so re-adding
+/// a kept item is a no-op and only genuinely departed items are removed —
+/// keeping the trait thin and letting `replace` stay decoupled from
+/// `node::events::WatchHandle` (and mockable in tests).
+pub(crate) trait WatchRegistry {
+    fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]);
+    fn remove_scripthashes(&self, scripthashes: &[Scripthash]);
+    fn add_outpoints(&self, outpoints: &[OutPoint]);
+    fn remove_outpoints(&self, outpoints: &[OutPoint]);
+    fn add_txids(&self, txids: &[Txid], auto_close_depth: u32);
+    fn remove_txids(&self, txids: &[Txid]);
+    fn add_tx_depths(&self, items: &[(Txid, u32)]);
+    fn remove_tx_depths(&self, items: &[(Txid, u32)]);
+    fn add_prefixes(&self, prefixes: &[PrefixKey]);
+    fn remove_prefixes(&self, prefixes: &[PrefixKey]);
+}
+
+impl WatchRegistry for node::events::WatchHandle {
+    fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]) {
+        node::events::WatchHandle::add_scripthashes_with_floors(self, items);
+    }
+    fn remove_scripthashes(&self, scripthashes: &[Scripthash]) {
+        node::events::WatchHandle::remove_scripthashes(self, scripthashes);
+    }
+    fn add_outpoints(&self, outpoints: &[OutPoint]) {
+        node::events::WatchHandle::add_outpoints(self, outpoints);
+    }
+    fn remove_outpoints(&self, outpoints: &[OutPoint]) {
+        node::events::WatchHandle::remove_outpoints(self, outpoints);
+    }
+    fn add_txids(&self, txids: &[Txid], auto_close_depth: u32) {
+        node::events::WatchHandle::add_txids(self, txids, auto_close_depth);
+    }
+    fn remove_txids(&self, txids: &[Txid]) {
+        node::events::WatchHandle::remove_txids(self, txids);
+    }
+    fn add_tx_depths(&self, items: &[(Txid, u32)]) {
+        node::events::WatchHandle::add_tx_depths(self, items);
+    }
+    fn remove_tx_depths(&self, items: &[(Txid, u32)]) {
+        node::events::WatchHandle::remove_tx_depths(self, items);
+    }
+    fn add_prefixes(&self, prefixes: &[PrefixKey]) {
+        node::events::WatchHandle::add_prefixes(self, prefixes);
+    }
+    fn remove_prefixes(&self, prefixes: &[PrefixKey]) {
+        node::events::WatchHandle::remove_prefixes(self, prefixes);
+    }
+}
+
+/// A complete desired watch-set for [`WatchSet::replace`]. Each field is the FULL
+/// membership of its kind, not a delta. Descriptors arrive pre-expanded by the
+/// carrier (`descriptor string → derived scripthashes`), so `replace` reconciles
+/// by effective scripthash coverage without re-deriving.
+pub(crate) struct DesiredWatchSet {
+    /// Directly-watched scripthashes, each with its `min_value` floor (0 = none).
+    pub scripts: Vec<(Scripthash, u64)>,
+    /// Descriptor string → the scripthashes its window expands to (deduped by the
+    /// carrier). A scripthash may also appear in `scripts` or another descriptor;
+    /// it is charged once and owned by each source.
+    pub descriptors: Vec<(String, Vec<Scripthash>)>,
+    pub outpoints: Vec<OutPoint>,
+    /// Lifecycle watches: `(txid, auto_close_depth)` (0 = persist until removed).
+    pub lifecycles: Vec<(Txid, u32)>,
+    /// Single-shot depth alarms: `(txid, depth)`.
+    pub depth_alarms: Vec<(Txid, u32)>,
+    /// Prefix buckets with their (coarseness-priced) unit cost.
+    pub prefixes: Vec<(PrefixKey, u64)>,
+}
+
+/// Outcome of an atomic [`WatchSet::replace`].
+#[derive(Debug)]
+pub(crate) enum ReplaceOutcome {
+    /// The replace applied; counts are by effective coverage.
+    Accepted { added: u32, removed: u32, unchanged: u32 },
+    /// The target's total unit cost exceeds the principal's quota; the watch-set
+    /// is left unchanged.
+    Rejected { required: u64, quota: u64 },
+    /// The target's watch-set **entry** count exceeds the per-connection cap
+    /// (`max_items`, e.g. WS `streamwsmaxsubscriptions`); the watch-set is left
+    /// unchanged. Distinct from [`Rejected`](Self::Rejected): a loopback/no-auth
+    /// connection has no quota but is still entry-capped, and this bound is by
+    /// item count (a prefix is one entry regardless of its unit cost).
+    CapExceeded { limit: u64, requested: u64 },
+    /// The target snapshot contained an element the carrier could not parse or
+    /// expand. A full replace is all-or-nothing, so the snapshot is refused whole
+    /// and the live watch-set is left unchanged — never silently shrunk by the
+    /// dropped item. Constructed by the carrier before [`replace`](WatchSet::replace)
+    /// is ever called.
+    Malformed,
+}
+
 /// A subscription's live watch-set: the outpoints and scripts it watches, each
 /// paired with the [`WatchLease`](satd_auth::WatchLease) backing its quota unit
 /// (`None` when auth is disabled — loopback trust, unlimited).
 #[derive(Default)]
 pub(crate) struct WatchSet {
     outpoints: HashMap<OutPoint, Option<satd_auth::WatchLease>>,
+    /// Effectively-watched scripthashes, each holding its quota lease. A
+    /// scripthash is present here iff it has at least one owner (see
+    /// `script_owners`): a direct `add_scripts` and/or one or more descriptors.
+    /// The lease — and the script's registry watch — is released only when its
+    /// **last** owner goes, so a script shared by a direct add and a descriptor
+    /// (or by two descriptors) is not dropped while any source still wants it.
     scripts: HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    /// Per-scripthash owner count = (1 if directly added) + (number of
+    /// descriptors whose window currently contains it). Maintained in lockstep
+    /// with `scripts`: a script is in `scripts` iff its count here is `> 0`.
+    script_owners: HashMap<Scripthash, u32>,
+    /// Scripthashes a direct `add_scripts` owns. Makes the direct add/remove
+    /// path idempotent (a repeated direct add is one owner; one direct remove
+    /// drops it) and distinct from descriptor ownership.
+    script_direct: HashSet<Scripthash>,
+    /// Descriptor string → the scripthashes its current `[start, start+gap)`
+    /// window expands to. Retained so a `RemoveDescriptor` (or a re-asserted,
+    /// slid window) can release exactly the scripts that descriptor contributed,
+    /// decrementing `script_owners` rather than blindly dropping shared scripts.
+    descriptors: HashMap<String, Vec<Scripthash>>,
     /// Lifecycle watches (one quota unit per txid). An `auto_close_depth` rides
     /// on the lifecycle watch server-side and is NOT a separate charged item.
     txids: HashMap<Txid, Option<satd_auth::WatchLease>>,
@@ -143,11 +256,17 @@ impl WatchSet {
         add_items(&mut self.outpoints, principal, incoming, "outpoints", register, |_| {});
     }
 
-    /// Add scripthashes (direct or descriptor-derived). `kind` only labels the
-    /// rejection log line. `register` receives the net-new scripthashes (those
-    /// charged against the quota); `reassert` receives scripthashes already
-    /// watched, so the caller can refresh their per-item metadata (the
-    /// `min_value` floor) without re-charging quota.
+    /// Add **directly-watched** scripthashes (an `AddScripts` control message).
+    /// `kind` only labels the rejection log line. `register` receives the net-new
+    /// scripthashes (those charged against the quota); `reassert` receives
+    /// scripthashes already watched, so the caller can refresh their per-item
+    /// metadata (the `min_value` floor) without re-charging quota.
+    ///
+    /// Idempotent in direct ownership: re-adding a script already held directly
+    /// only refreshes its floor. A script that a descriptor already watches is
+    /// not re-charged (it is in `scripts`), but it gains a *second* owner here,
+    /// so a later `remove_scripts` drops only the direct ownership and the
+    /// descriptor keeps it alive.
     pub(crate) fn add_scripts(
         &mut self,
         principal: Option<&satd_auth::Principal>,
@@ -156,7 +275,386 @@ impl WatchSet {
         register: impl FnOnce(&[Scripthash]),
         reassert: impl FnOnce(&[Scripthash]),
     ) {
-        add_items(&mut self.scripts, principal, incoming, kind, register, reassert);
+        let items: Vec<Scripthash> = incoming.into_iter().collect();
+        // The registry/lease/floor handling is unchanged: `add_items` charges
+        // net-new (scripts not already in `scripts`) and refreshes re-asserts.
+        add_items(&mut self.scripts, principal, items.iter().copied(), kind, register, reassert);
+        // Reconcile direct ownership for whatever is now watched: every script
+        // that ended up in `scripts` (net-new committed, or already held) and is
+        // not yet a direct owner becomes one. A net-new that failed the quota is
+        // absent, so it is correctly skipped.
+        for s in &items {
+            if self.scripts.contains_key(s) && self.script_direct.insert(*s) {
+                *self.script_owners.entry(*s).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Remove **direct** ownership of scripthashes (a `RemoveScripts` control
+    /// message). A script's lease is released — and `unregister` called for it —
+    /// only when this drops its **last** owner; a script a descriptor still
+    /// watches stays. Removing a script held *only* by a descriptor is a no-op
+    /// (slide or `RemoveDescriptor` the descriptor instead).
+    pub(crate) fn remove_scripts(
+        &mut self,
+        incoming: impl IntoIterator<Item = Scripthash>,
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        let mut to_release = Vec::new();
+        for s in incoming {
+            if self.script_direct.remove(&s) {
+                self.release_owner(s, &mut to_release);
+            }
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+    }
+
+    /// Register a descriptor's expanded window. `derived` is the full set of
+    /// scripthashes the descriptor's current `[start, start+gap)` window expands
+    /// to (the carrier expands it). Re-asserting the same descriptor with a
+    /// **slid** window reconciles: scripts that left the window lose this
+    /// descriptor's ownership (released if it was their last owner), scripts that
+    /// entered are added. `register` / `reassert` / `unregister` mirror the
+    /// other paths. All-or-nothing on quota: if the net-new scripts do not fit,
+    /// the whole (re)assert is rejected and the descriptor's membership is left
+    /// unchanged.
+    pub(crate) fn add_descriptor(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        descriptor: String,
+        derived: impl IntoIterator<Item = Scripthash>,
+        register: impl FnOnce(&[Scripthash]),
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        // Dedup the new membership, preserving first-seen order.
+        let mut new: Vec<Scripthash> = Vec::new();
+        let mut new_set = HashSet::new();
+        for s in derived {
+            if new_set.insert(s) {
+                new.push(s);
+            }
+        }
+        let old: Vec<Scripthash> = self.descriptors.get(&descriptor).cloned().unwrap_or_default();
+        let old_set: HashSet<Scripthash> = old.iter().copied().collect();
+
+        // Scripts entering this descriptor's window (gain it as an owner).
+        let to_add: Vec<Scripthash> = new.iter().copied().filter(|s| !old_set.contains(s)).collect();
+        // Among those, the ones not currently watched at all are net-new to the
+        // registry and must fit the quota atomically.
+        let net_new: Vec<Scripthash> =
+            to_add.iter().copied().filter(|s| !self.scripts.contains_key(s)).collect();
+
+        if !net_new.is_empty()
+            && !reserve_scripts(&mut self.scripts, principal, &net_new, "descriptor", register)
+        {
+            // Quota/rate rejected the net-new batch: change nothing (membership,
+            // ownership, and the prior window all stay as they were).
+            return;
+        }
+        // Commit ownership for every script that gained this descriptor.
+        for s in &to_add {
+            *self.script_owners.entry(*s).or_insert(0) += 1;
+        }
+
+        // Scripts leaving the window lose this descriptor's ownership.
+        let mut to_release = Vec::new();
+        for s in &old {
+            if !new_set.contains(s) {
+                self.release_owner(*s, &mut to_release);
+            }
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+
+        self.descriptors.insert(descriptor, new);
+    }
+
+    /// Remove a descriptor entirely (a `RemoveDescriptor` control message),
+    /// releasing each of its scripts whose last owner this drops. Scripts the
+    /// descriptor shares with a direct add or another descriptor stay. Removing
+    /// an unknown descriptor is a no-op.
+    pub(crate) fn remove_descriptor(
+        &mut self,
+        descriptor: &str,
+        unregister: impl FnOnce(&[Scripthash]),
+    ) {
+        let Some(members) = self.descriptors.remove(descriptor) else {
+            return;
+        };
+        let mut to_release = Vec::new();
+        for s in members {
+            self.release_owner(s, &mut to_release);
+        }
+        remove_items(&mut self.scripts, to_release, unregister);
+    }
+
+    /// Atomically replace the entire watch-set with `desired` (a `SetWatchSet`).
+    /// Reconciles by **effective scripthash coverage** — descriptors arrive
+    /// pre-expanded, so a scripthash covered by both the old and new set (even if
+    /// its *mechanism* changed: direct ↔ descriptor) is KEPT: its registry entry
+    /// and quota unit are never dropped, so the matcher sees no unwatch/rewatch
+    /// gap. Quota is all-or-nothing on the whole target: if the target's total
+    /// unit cost exceeds the principal's ceiling the watch-set is left UNCHANGED
+    /// and [`ReplaceOutcome::Rejected`] is returned. Runs under the per-connection
+    /// watch-set lock the carrier already holds — the reconcile is not observable
+    /// mid-flight.
+    /// `max_items` is the per-connection watch-set **entry** cap (0 = unlimited):
+    /// a target whose effective entry count exceeds it is rejected whole
+    /// ([`ReplaceOutcome::CapExceeded`]), leaving the set unchanged. This mirrors
+    /// the incremental `Add*` shed on the same carrier — WS passes
+    /// `streamwsmaxsubscriptions`; gRPC, which entry-caps neither its incremental
+    /// adds nor a replace (quota is its bound), passes 0.
+    ///
+    /// Note `replace` deliberately does NOT charge the per-add rate limiter that
+    /// the incremental `Add*` paths do. `replace` is the watch-set
+    /// re-establishment primitive (reconnect / `ResilientWatch::reload`); rate-
+    /// limiting it would let a reconnect storm block clients from restoring their
+    /// watch-set exactly when they must. The per-add limiter bounds incremental
+    /// churn cadence; steady-state size is still bounded here by quota and
+    /// `max_items`.
+    pub(crate) fn replace(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        desired: DesiredWatchSet,
+        max_items: usize,
+        reg: &impl WatchRegistry,
+    ) -> ReplaceOutcome {
+        // ---- Build the target effective sets -----------------------------
+        // Direct scripts (floor kept; direct floor wins over a descriptor's 0).
+        let mut target_floors: HashMap<Scripthash, u64> = HashMap::new();
+        let mut target_owners: HashMap<Scripthash, u32> = HashMap::new();
+        let mut target_direct: HashSet<Scripthash> = HashSet::new();
+        for (sh, floor) in &desired.scripts {
+            if target_direct.insert(*sh) {
+                *target_owners.entry(*sh).or_insert(0) += 1;
+            }
+            target_floors.insert(*sh, *floor);
+        }
+        // Descriptors: dedup each window, add an owner per membership. A descriptor
+        // *string* identifies one watch (the `descriptors` map is keyed by it), so
+        // a duplicate entry in the snapshot is the same descriptor and is counted
+        // ONCE — first occurrence wins. Processing it twice would `+1` each script's
+        // owner count per occurrence while only one membership vec survives the map
+        // insert, inflating `script_owners` above the memberships a later
+        // `RemoveDescriptor` can decrement and stranding live scripthash watches.
+        let mut target_descriptors: HashMap<String, Vec<Scripthash>> = HashMap::new();
+        for (desc, shs) in &desired.descriptors {
+            if target_descriptors.contains_key(desc) {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut members = Vec::new();
+            for sh in shs {
+                if seen.insert(*sh) {
+                    members.push(*sh);
+                    *target_owners.entry(*sh).or_insert(0) += 1;
+                    target_floors.entry(*sh).or_insert(0);
+                }
+            }
+            target_descriptors.insert(desc.clone(), members);
+        }
+        let target_scripts: HashSet<Scripthash> = target_owners.keys().copied().collect();
+        let target_outpoints: HashSet<OutPoint> = desired.outpoints.iter().copied().collect();
+        let target_txids: HashMap<Txid, u32> = desired.lifecycles.iter().copied().collect();
+        let target_depths: HashSet<(Txid, u32)> = desired.depth_alarms.iter().copied().collect();
+        let target_prefixes: HashMap<PrefixKey, u64> = desired.prefixes.iter().copied().collect();
+
+        // Per-connection entry cap: bound the target the same way the incremental
+        // adds are bounded on this carrier. Count effective ENTRIES (a prefix is
+        // one entry regardless of its unit cost) — this matches `len()`. Checked
+        // BEFORE the quota swap and any mutation, so a rejection leaves the live
+        // set (and its leases) untouched. `max_items == 0` ⇒ unlimited.
+        let target_len =
+            target_scripts.len() + target_outpoints.len() + target_txids.len() + target_depths.len()
+                + target_prefixes.len();
+        if max_items != 0 && target_len > max_items {
+            return ReplaceOutcome::CapExceeded {
+                limit: max_items as u64,
+                requested: target_len as u64,
+            };
+        }
+
+        let target_units: u64 = target_scripts.len() as u64
+            + target_outpoints.len() as u64
+            + target_txids.len() as u64
+            + target_depths.len() as u64
+            + target_prefixes.values().sum::<u64>();
+
+        // ---- Diff vs the current set (registry lists + counts) -----------
+        // For scripts and lifecycles the full target is re-registered so a kept
+        // item's metadata (floor / auto-close) is refreshed in place; membership
+        // is idempotent so this never double-registers. Only genuinely departed
+        // items are removed. Metadata-less kinds register net-new only.
+        let departed_scripts: Vec<Scripthash> =
+            self.scripts.keys().filter(|k| !target_scripts.contains(*k)).copied().collect();
+        let all_target_scripts: Vec<(Scripthash, u64)> =
+            target_scripts.iter().map(|sh| (*sh, target_floors.get(sh).copied().unwrap_or(0))).collect();
+        let departed_outpoints: Vec<OutPoint> =
+            self.outpoints.keys().filter(|k| !target_outpoints.contains(*k)).copied().collect();
+        let new_outpoints: Vec<OutPoint> =
+            target_outpoints.iter().filter(|k| !self.outpoints.contains_key(*k)).copied().collect();
+        let departed_txids: Vec<Txid> =
+            self.txids.keys().filter(|k| !target_txids.contains_key(*k)).copied().collect();
+        let departed_depths: Vec<(Txid, u32)> =
+            self.tx_depths.keys().filter(|k| !target_depths.contains(*k)).copied().collect();
+        let new_depths: Vec<(Txid, u32)> =
+            target_depths.iter().filter(|k| !self.tx_depths.contains_key(*k)).copied().collect();
+        let departed_prefixes: Vec<PrefixKey> =
+            self.prefixes.keys().filter(|k| !target_prefixes.contains_key(*k)).copied().collect();
+        let new_prefixes: Vec<PrefixKey> =
+            target_prefixes.keys().filter(|k| !self.prefixes.contains_key(*k)).copied().collect();
+
+        // Counts by effective coverage (kept = in both, added = net-new).
+        let kept_scripts = self.scripts.len() - departed_scripts.len();
+        let kept_outpoints = self.outpoints.len() - departed_outpoints.len();
+        let kept_txids = self.txids.len() - departed_txids.len();
+        let kept_depths = self.tx_depths.len() - departed_depths.len();
+        let kept_prefixes = self.prefixes.len() - departed_prefixes.len();
+        let unchanged = (kept_scripts + kept_outpoints + kept_txids + kept_depths + kept_prefixes) as u32;
+        let removed = (departed_scripts.len()
+            + departed_outpoints.len()
+            + departed_txids.len()
+            + departed_depths.len()
+            + departed_prefixes.len()) as u32;
+        let added = ((target_scripts.len() - kept_scripts)
+            + (target_outpoints.len() - kept_outpoints)
+            + (target_txids.len() - kept_txids)
+            + (target_depths.len() - kept_depths)
+            + (target_prefixes.len() - kept_prefixes)) as u32;
+
+        // ---- Quota: atomically swap the reservation current → target -------
+        // One locked read-modify-write in the store (`replace_watch`): no window
+        // where the old units are freed but the target's are not yet held. So a
+        // same-size swap fits at exactly the quota ceiling (no transient
+        // over-count), and a REJECT leaves the reservation — and every existing
+        // lease — exactly as it was (no rollback, no race where a concurrent
+        // stream for this principal steals momentarily-freed units). On accept the
+        // swap already handed off the old units, so defuse the old lease objects
+        // before rebuilding lest their `Drop` release the same units twice.
+        // `batch` is one lease, so per-item leases split cleanly (incl. prefixes).
+        let batch: Option<satd_auth::WatchLease> = if let Some(p) = principal {
+            let current_units = self.scripts.len() as u64
+                + self.outpoints.len() as u64
+                + self.txids.len() as u64
+                + self.tx_depths.len() as u64
+                + self
+                    .prefixes
+                    .values()
+                    .filter_map(|l| l.as_ref().map(satd_auth::WatchLease::units))
+                    .sum::<u64>();
+            match p.replace_watch(current_units, target_units) {
+                Ok(b) => {
+                    self.defuse_leases();
+                    Some(b)
+                }
+                Err(satd_auth::WatchReject::QuotaExceeded(q)) => {
+                    return ReplaceOutcome::Rejected { required: target_units, quota: q.max };
+                }
+                Err(_) => {
+                    // Lacks `stream:watch`: no headroom, set left unchanged.
+                    return ReplaceOutcome::Rejected { required: target_units, quota: 0 };
+                }
+            }
+        } else {
+            None
+        };
+
+        // ---- Commit: rebuild membership, splitting per-item leases --------
+        let mut b = batch;
+        let mut take = |units: u64| b.as_mut().and_then(|l| l.split_off(units));
+        self.scripts = target_scripts.iter().map(|sh| (*sh, take(1))).collect();
+        self.outpoints = target_outpoints.iter().map(|op| (*op, take(1))).collect();
+        self.txids = target_txids.keys().map(|t| (*t, take(1))).collect();
+        self.tx_depths = target_depths.iter().map(|k| (*k, take(1))).collect();
+        self.prefixes = target_prefixes.iter().map(|(k, units)| (*k, take(*units))).collect();
+        self.script_owners = target_owners;
+        self.script_direct = target_direct;
+        self.descriptors = target_descriptors;
+
+        // ---- Registry reconcile (kept items untouched → no gap) ----------
+        if !all_target_scripts.is_empty() {
+            reg.add_scripthashes_with_floors(&all_target_scripts);
+        }
+        if !departed_scripts.is_empty() {
+            reg.remove_scripthashes(&departed_scripts);
+        }
+        if !new_outpoints.is_empty() {
+            reg.add_outpoints(&new_outpoints);
+        }
+        if !departed_outpoints.is_empty() {
+            reg.remove_outpoints(&departed_outpoints);
+        }
+        // Lifecycle re-adds refresh auto-close on kept txids; grouped by depth.
+        let mut by_auto_close: HashMap<u32, Vec<Txid>> = HashMap::new();
+        for (t, ac) in &target_txids {
+            by_auto_close.entry(*ac).or_default().push(*t);
+        }
+        for (ac, txids) in by_auto_close {
+            reg.add_txids(&txids, ac);
+        }
+        if !departed_txids.is_empty() {
+            reg.remove_txids(&departed_txids);
+        }
+        if !new_depths.is_empty() {
+            reg.add_tx_depths(&new_depths);
+        }
+        if !departed_depths.is_empty() {
+            reg.remove_tx_depths(&departed_depths);
+        }
+        if !new_prefixes.is_empty() {
+            reg.add_prefixes(&new_prefixes);
+        }
+        if !departed_prefixes.is_empty() {
+            reg.remove_prefixes(&departed_prefixes);
+        }
+
+        ReplaceOutcome::Accepted { added, removed, unchanged }
+    }
+
+    /// Defuse (drop **without** releasing) every current per-item lease. Used by
+    /// [`replace`](Self::replace) after an atomic quota swap
+    /// ([`Principal::replace_watch`](satd_auth::Principal::replace_watch)) has
+    /// already handed off the old units — their `Drop` must not release them a
+    /// second time. The maps are rebuilt wholesale immediately after.
+    fn defuse_leases(&mut self) {
+        for v in self.outpoints.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+        for v in self.scripts.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+        for v in self.txids.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+        for v in self.tx_depths.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+        for v in self.prefixes.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+    }
+
+    /// Drop one owner from a scripthash. If that was its last owner, queue it in
+    /// `to_release` (the caller then `remove_items` it, dropping the lease and
+    /// unregistering). Clears the `script_owners` entry on reaching zero so the
+    /// map stays in lockstep with `scripts`.
+    fn release_owner(&mut self, s: Scripthash, to_release: &mut Vec<Scripthash>) {
+        if let Some(c) = self.script_owners.get_mut(&s) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.script_owners.remove(&s);
+                to_release.push(s);
+            }
+        }
     }
 
     /// Remove outpoints, releasing each removed item's quota unit (lease drop)
@@ -167,15 +665,6 @@ impl WatchSet {
         unregister: impl FnOnce(&[OutPoint]),
     ) {
         remove_items(&mut self.outpoints, incoming, unregister);
-    }
-
-    /// Remove scripthashes, releasing each removed item's quota unit.
-    pub(crate) fn remove_scripts(
-        &mut self,
-        incoming: impl IntoIterator<Item = Scripthash>,
-        unregister: impl FnOnce(&[Scripthash]),
-    ) {
-        remove_items(&mut self.scripts, incoming, unregister);
     }
 
     /// Add txids, charging the quota only for items not already watched.
@@ -379,6 +868,70 @@ fn add_items_priced<T: Eq + Hash + Copy>(
             for it in net_new {
                 held.insert(it, None);
             }
+        }
+    }
+}
+
+/// Reserve quota for a batch of net-new scripthashes (one unit each), all-or-
+/// nothing, inserting each with its split lease and calling `register` on
+/// success. Returns whether the batch was committed (always `true` when auth is
+/// disabled or the batch is empty). Mirrors the net-new arm of
+/// [`add_items_priced`], but *reports* success so a descriptor (re)assert can
+/// stay atomic — rejecting the whole window rather than partially registering.
+fn reserve_scripts(
+    held: &mut HashMap<Scripthash, Option<satd_auth::WatchLease>>,
+    principal: Option<&satd_auth::Principal>,
+    net_new: &[Scripthash],
+    kind: &'static str,
+    register: impl FnOnce(&[Scripthash]),
+) -> bool {
+    if net_new.is_empty() {
+        return true;
+    }
+    // Per-add rate limit (C4): one effective add = one token, checked after the
+    // empty short-circuit so a no-op cannot burn the bucket.
+    if let Some(p) = principal
+        && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
+    {
+        warn!(
+            target: "events::watchset",
+            kind,
+            retry_after_secs,
+            "watch add rate-limited; skipping",
+        );
+        return false;
+    }
+    match principal {
+        Some(p) => match p.acquire_watch(net_new.len() as u64) {
+            Ok(mut batch) => {
+                register(net_new);
+                for s in net_new {
+                    let lease = batch.split_off(1);
+                    debug_assert!(
+                        lease.is_some(),
+                        "split_off drained before all scripts got a lease",
+                    );
+                    held.insert(*s, lease);
+                }
+                true
+            }
+            Err(reject) => {
+                warn!(
+                    target: "events::watchset",
+                    kind,
+                    reject = ?reject,
+                    "watch add rejected (capability or quota)",
+                );
+                false
+            }
+        },
+        // Auth disabled (loopback trust): unlimited, no lease.
+        None => {
+            register(net_new);
+            for s in net_new {
+                held.insert(*s, None);
+            }
+            true
         }
     }
 }
@@ -789,5 +1342,403 @@ mod tests {
 
         assert_eq!(reg3, 1, "a no-op duplicate must not have spent the rate budget");
         assert_eq!(ws.len(), 2, "both distinct watches registered");
+    }
+
+    // --- descriptor membership + ownership (RemoveDescriptor) ------------------
+
+    #[test]
+    fn descriptor_add_then_remove_releases_its_scripts() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut registered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |s| registered = s.to_vec(),
+            |_| {},
+        );
+        assert_eq!(registered, vec![sh(1), sh(2), sh(3)], "every derived script registers");
+        assert_eq!(q.current("tenant"), 3, "one unit per derived script");
+        assert_eq!(ws.len(), 3);
+
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered.len(), 3, "removing the descriptor releases all its scripts");
+        assert_eq!(q.current("tenant"), 0, "all units returned");
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn script_shared_by_direct_add_and_descriptor_held_until_last_owner() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        // Directly watch sh(2), then a descriptor whose window also contains it.
+        ws.add_scripts(Some(&p), [sh(2)], "scripts", |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 1);
+        let mut registered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |s| registered = s.to_vec(),
+            |_| {},
+        );
+        // sh(2) was already watched → only sh(1), sh(3) are net-new.
+        assert_eq!(registered, vec![sh(1), sh(3)], "the shared script is not re-charged");
+        assert_eq!(q.current("tenant"), 3, "sh1 + sh2(direct) + sh3");
+
+        // Removing the descriptor drops sh(1)/sh(3) but NOT sh(2) — the direct
+        // add still owns it.
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered.len(), 2, "only the descriptor-only scripts release");
+        assert!(!unregistered.contains(&sh(2)), "the shared, still-direct script stays");
+        assert_eq!(q.current("tenant"), 1, "sh(2) lease held by its direct owner");
+        assert_eq!(ws.len(), 1);
+
+        // Now the direct remove drops the last owner.
+        ws.remove_scripts([sh(2)], |_| {});
+        assert_eq!(q.current("tenant"), 0);
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn two_overlapping_descriptors_each_hold_the_shared_script() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D1".into(), [sh(1), sh(2)], |_| {}, |_| {});
+        ws.add_descriptor(Some(&p), "D2".into(), [sh(2), sh(3)], |_| {}, |_| {});
+        // sh(2) shared → charged once; total sh1 + sh2 + sh3.
+        assert_eq!(q.current("tenant"), 3);
+        assert_eq!(ws.len(), 3);
+
+        // Drop D1: sh(1) releases, sh(2) stays (still owned by D2).
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("D1", |s| unregistered = s.to_vec());
+        assert_eq!(unregistered, vec![sh(1)], "only D1's exclusive script releases");
+        assert_eq!(q.current("tenant"), 2);
+
+        // Drop D2: sh(2) and sh(3) release.
+        ws.remove_descriptor("D2", |_| {});
+        assert_eq!(q.current("tenant"), 0);
+        assert_eq!(ws.len(), 0);
+    }
+
+    #[test]
+    fn re_asserting_a_descriptor_with_a_slid_window_reconciles() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2), sh(3)], |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 3);
+
+        // Slide the window forward: {1,2,3} → {3,4,5}. 1,2 leave; 4,5 enter; 3 stays.
+        let mut registered = Vec::new();
+        let mut unregistered = Vec::new();
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(3), sh(4), sh(5)],
+            |s| registered = s.to_vec(),
+            |s| unregistered = s.to_vec(),
+        );
+        assert_eq!(registered, vec![sh(4), sh(5)], "scripts entering the window register");
+        let mut u = unregistered.clone();
+        u.sort();
+        assert_eq!(u, vec![sh(1), sh(2)], "scripts leaving the window release");
+        assert_eq!(q.current("tenant"), 3, "net quota unchanged: -2 +2");
+        assert_eq!(ws.len(), 3);
+    }
+
+    #[test]
+    fn remove_scripts_on_a_descriptor_only_script_is_a_noop() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1)], |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 1);
+
+        // A direct RemoveScripts does not touch descriptor ownership.
+        let mut unregistered = 0;
+        ws.remove_scripts([sh(1)], |s| unregistered = s.len());
+        assert_eq!(unregistered, 0, "no direct owner to drop");
+        assert_eq!(q.current("tenant"), 1, "the descriptor still holds it");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_add_is_all_or_nothing_on_quota() {
+        let (p, acct) = tenant(2); // room for 2 units only
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        // A 3-script descriptor does not fit → the whole add is rejected.
+        let mut registered = false;
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2), sh(3)],
+            |_| registered = true,
+            |_| {},
+        );
+        assert!(!registered, "an over-quota descriptor registers nothing");
+        assert_eq!(q.current("tenant"), 0, "no units charged");
+        assert_eq!(ws.len(), 0);
+        // And its membership was not recorded, so a later remove is a clean no-op.
+        ws.remove_descriptor("D", |_| panic!("nothing should release"));
+    }
+
+    #[test]
+    fn re_adding_an_identical_descriptor_window_is_idempotent() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        ws.add_descriptor(Some(&p), "D".into(), [sh(1), sh(2)], |_| {}, |_| {});
+        // Same descriptor, same window: nothing net-new, nothing released.
+        let mut registered = false;
+        let mut unregistered = false;
+        ws.add_descriptor(
+            Some(&p),
+            "D".into(),
+            [sh(1), sh(2)],
+            |_| registered = true,
+            |_| unregistered = true,
+        );
+        assert!(!registered && !unregistered, "a no-op re-assert touches nothing");
+        assert_eq!(q.current("tenant"), 2, "no double-charge");
+
+        // One removal clears it (ownership was counted once, not twice).
+        ws.remove_descriptor("D", |_| {});
+        assert_eq!(q.current("tenant"), 0);
+    }
+
+    #[test]
+    fn remove_unknown_descriptor_is_a_noop() {
+        let mut ws = WatchSet::default();
+        ws.remove_descriptor("never-added", |_| panic!("must not unregister anything"));
+        assert_eq!(ws.len(), 0);
+    }
+
+    // Records the registry reconcile calls so a test can assert which items were
+    // (de)registered — in particular that a KEPT scripthash is never removed.
+    #[derive(Default)]
+    struct MockReg {
+        added_scripts: std::cell::RefCell<Vec<Scripthash>>,
+        removed_scripts: std::cell::RefCell<Vec<Scripthash>>,
+    }
+    impl WatchRegistry for MockReg {
+        fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]) {
+            self.added_scripts.borrow_mut().extend(items.iter().map(|(s, _)| *s));
+        }
+        fn remove_scripthashes(&self, s: &[Scripthash]) {
+            self.removed_scripts.borrow_mut().extend_from_slice(s);
+        }
+        fn add_outpoints(&self, _: &[OutPoint]) {}
+        fn remove_outpoints(&self, _: &[OutPoint]) {}
+        fn add_txids(&self, _: &[Txid], _: u32) {}
+        fn remove_txids(&self, _: &[Txid]) {}
+        fn add_tx_depths(&self, _: &[(Txid, u32)]) {}
+        fn remove_tx_depths(&self, _: &[(Txid, u32)]) {}
+        fn add_prefixes(&self, _: &[PrefixKey]) {}
+        fn remove_prefixes(&self, _: &[PrefixKey]) {}
+    }
+
+    fn desired_scripts(scripts: &[Scripthash]) -> DesiredWatchSet {
+        DesiredWatchSet {
+            scripts: scripts.iter().map(|s| (*s, 0)).collect(),
+            descriptors: Vec::new(),
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replace_at_quota_disjoint_swap_fits() {
+        let (p, acct) = tenant(3); // room for exactly 3 units
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2), sh(3)]), 0, &MockReg::default());
+        assert_eq!(q.current("tenant"), 3);
+
+        // Swap all three for three DISJOINT scripts. At quota this only fits
+        // because the replace releases the old units before acquiring the new
+        // (no transient doubling — the tenant can never hold 6).
+        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(4), sh(5), sh(6)]), 0, &MockReg::default());
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 3, removed: 3, unchanged: 0 }),
+            "disjoint same-size swap must fit at quota, got {outcome:?}",
+        );
+        assert_eq!(q.current("tenant"), 3, "still exactly 3 units held");
+        assert!(ws.scripts.contains_key(&sh(4)) && !ws.scripts.contains_key(&sh(1)));
+    }
+
+    #[test]
+    fn replace_keeps_a_cross_mechanism_script_without_a_gap() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        // sh1 watched as a DIRECT script.
+        ws.add_scripts(Some(&p), [sh(1)], "s", |_| {}, |_| {});
+        assert_eq!(q.current("tenant"), 1);
+
+        // Reload covers the same scripthash via a DESCRIPTOR instead — the exact
+        // cross-mechanism transition the client-side diff could not see. The
+        // server diffs by effective coverage, so sh1 is `unchanged`.
+        let desired = DesiredWatchSet {
+            scripts: Vec::new(),
+            descriptors: vec![("d".to_string(), vec![sh(1)])],
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        let reg = MockReg::default();
+        let outcome = ws.replace(Some(&p), desired, 0, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 0, unchanged: 1 }),
+            "same effective scripthash → unchanged, got {outcome:?}",
+        );
+        // The kept scripthash was NEVER unregistered → no matcher gap.
+        assert!(reg.removed_scripts.borrow().is_empty(), "a kept script must not be unregistered");
+        assert_eq!(q.current("tenant"), 1, "no re-charge for the kept script");
+        assert!(ws.descriptors.contains_key("d") && !ws.script_direct.contains(&sh(1)));
+        assert!(ws.scripts.contains_key(&sh(1)), "still effectively watched");
+    }
+
+    #[test]
+    fn replace_dedups_a_duplicate_descriptor_so_removedescriptor_fully_clears() {
+        // A snapshot listing the same descriptor string twice is the same watch:
+        // it must be counted once. Otherwise `script_owners` is inflated (+1 per
+        // occurrence) while only one membership vec survives, and a later
+        // RemoveDescriptor decrements ownership once — leaving the scripthash
+        // stranded as a live watch that can't be cleared.
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        let desired = DesiredWatchSet {
+            scripts: Vec::new(),
+            descriptors: vec![
+                ("d".to_string(), vec![sh(1), sh(2)]),
+                ("d".to_string(), vec![sh(1), sh(2)]),
+            ],
+            outpoints: Vec::new(),
+            lifecycles: Vec::new(),
+            depth_alarms: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        let outcome = ws.replace(Some(&p), desired, 0, &MockReg::default());
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
+            "duplicate descriptor counts its scripts once, got {outcome:?}",
+        );
+        assert_eq!(q.current("tenant"), 2, "two scripthashes, two units — not four");
+        assert_eq!(ws.script_owners.get(&sh(1)), Some(&1), "one owner, not two");
+        assert_eq!(ws.script_owners.get(&sh(2)), Some(&1));
+
+        // The single RemoveDescriptor now fully clears both scripthashes.
+        let mut unregistered = Vec::new();
+        ws.remove_descriptor("d", |s| unregistered.extend_from_slice(s));
+        assert!(ws.scripts.is_empty(), "RemoveDescriptor clears the whole descriptor's coverage");
+        assert!(ws.script_owners.is_empty(), "no stranded owners");
+        assert_eq!(unregistered.len(), 2, "both scripthashes unregistered from the matcher");
+        assert_eq!(q.current("tenant"), 0, "all units released");
+    }
+
+    #[test]
+    fn replace_over_quota_leaves_the_set_unchanged() {
+        let (p, acct) = tenant(2);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        assert_eq!(q.current("tenant"), 2);
+
+        // Target needs 3 units > quota 2 → rejected whole; the old set stays.
+        let reg = MockReg::default();
+        let outcome = ws.replace(Some(&p), desired_scripts(&[sh(3), sh(4), sh(5)]), 0, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::Rejected { required: 3, quota: 2 }),
+            "over-quota target must be rejected, got {outcome:?}",
+        );
+        assert!(ws.scripts.contains_key(&sh(1)) && ws.scripts.contains_key(&sh(2)));
+        assert_eq!(ws.scripts.len(), 2, "old set intact");
+        assert_eq!(q.current("tenant"), 2, "still exactly the old 2 units");
+        assert!(
+            reg.added_scripts.borrow().is_empty() && reg.removed_scripts.borrow().is_empty(),
+            "a rejected replace touches nothing in the registry",
+        );
+    }
+
+    #[test]
+    fn replace_over_entry_cap_is_rejected_and_leaves_the_set_unchanged() {
+        // The per-connection entry cap bounds a replace the same way it bounds
+        // incremental adds — and it applies even with NO principal (loopback/
+        // no-auth), where there is no quota to fall back on. That is exactly the
+        // case the cap exists to protect: a single SetWatchSet cannot install more
+        // than `max_items` entries.
+        let mut ws = WatchSet::default();
+        // Seed a 2-entry set within a cap of 2 (no auth → no quota bound).
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 2, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
+        assert_eq!(ws.len(), 2);
+
+        // A target of 3 entries exceeds the cap of 2 → rejected whole, old set kept.
+        let reg = MockReg::default();
+        let outcome = ws.replace(None, desired_scripts(&[sh(3), sh(4), sh(5)]), 2, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::CapExceeded { limit: 2, requested: 3 }),
+            "over-cap target must be rejected, got {outcome:?}",
+        );
+        assert_eq!(ws.len(), 2, "old set intact");
+        assert!(ws.scripts.contains_key(&sh(1)) && ws.scripts.contains_key(&sh(2)));
+        assert!(
+            reg.added_scripts.borrow().is_empty() && reg.removed_scripts.borrow().is_empty(),
+            "a cap-rejected replace touches nothing in the registry",
+        );
+
+        // A target of exactly the cap (2) is allowed — and may swap membership.
+        let outcome = ws.replace(None, desired_scripts(&[sh(6), sh(7)]), 2, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "at-cap target fits");
+        assert_eq!(ws.len(), 2);
+        // max_items = 0 disables the cap entirely.
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2), sh(3), sh(4)]), 0, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { .. }), "cap 0 ⇒ unlimited");
+        assert_eq!(ws.len(), 4);
+    }
+
+    #[test]
+    fn replace_empty_target_clears_everything() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.replace(Some(&p), desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        let reg = MockReg::default();
+        let outcome = ws.replace(Some(&p), desired_scripts(&[]), 0, &reg);
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 0, removed: 2, unchanged: 0 }));
+        assert_eq!(ws.scripts.len(), 0);
+        assert_eq!(q.current("tenant"), 0, "all units released");
+        let mut rmd = reg.removed_scripts.borrow().clone();
+        rmd.sort();
+        assert_eq!(rmd, vec![sh(1), sh(2)]);
+    }
+
+    #[test]
+    fn replace_without_auth_holds_no_leases() {
+        let mut ws = WatchSet::default();
+        let outcome = ws.replace(None, desired_scripts(&[sh(1), sh(2)]), 0, &MockReg::default());
+        assert!(matches!(outcome, ReplaceOutcome::Accepted { added: 2, .. }));
+        assert_eq!(ws.scripts.len(), 2);
+        assert!(ws.scripts.values().all(Option::is_none), "auth disabled → no leases");
     }
 }

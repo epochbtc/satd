@@ -255,7 +255,10 @@ loop {
 It is single-task, like `ResilientSubscription`: interleave watch-set edits with
 `next()` calls from one task (react to a match, then adjust the watch-set). A
 descriptor replays from its latest `(gap_limit, start)`, so advance `start` to
-slide the window across reconnects.
+slide the window across reconnects (the server reconciles the slid window), or
+`remove_descriptor(descriptor)` to drop it — which releases every scripthash its
+window contributed whose last owner that drops (a script shared with a direct add
+or another descriptor stays).
 
 ### Watch-set loader — when truth lives outside the wrapper
 
@@ -314,6 +317,49 @@ Semantics:
 `WatchSetBuilder` exposes the declarative `add_*` / `set_categories` surface (no
 `remove_*` — you are building a complete set into an empty mirror). Omit the
 loader and behavior is exactly the mirror-replay described above.
+
+#### Pushing a truth change mid-stream — `reload()`
+
+The loader fires on every *reconnect*. When the durable truth changes **while the
+stream is up** — a bulk import that wrote rows outside your hot-add path, an admin
+rotation, an operator "make the wire match truth now" reconciliation — `reload()`
+re-runs the loader and pushes the freshly-loaded set as a **single atomic
+`SetWatchSet`**:
+
+```rust,ignore
+let summary = watch.reload().await?;   // ReloadSummary { added, removed, unchanged, applied }
+tracing::info!(?summary, "watch-set realigned with truth");
+```
+
+- **One atomic replace, server-reconciled** — `reload()` sends the *whole* desired
+  set in one `SetWatchSet` message; the server reconciles it under its watch-set
+  lock, by **effective scripthash coverage** (descriptors expanded). It never
+  sends a client-computed `Add*`/`Remove*` delta, so there is no message ordering
+  that can strand coverage or over-charge at quota. An item watched in both the
+  old and new set — even if its *mechanism* changes (a direct script becoming
+  descriptor-covered, or vice versa) — is kept without a re-registration, so the
+  matcher sees no gap. Quota is all-or-nothing on the whole target.
+- **Deterministic result** — the outcome arrives in-band on `next()` as
+  `Event::WatchSetReplaced { added, removed, unchanged }` (the server's
+  authoritative counts) or `Event::WatchSetRejected { reason, required, quota }`.
+  `reason` is `QuotaExceeded` (the target does not fit quota — shed and retry),
+  `CapExceeded` (more entries than the per-connection cap, which applies even with
+  no quota — shed and retry), or `Malformed` (the server could not parse an element
+  of the snapshot — a client bug; retrying the same set will not help). In every
+  case the live set is left unchanged. The `ReloadSummary` returned by `reload()`
+  carries advisory client-side counts; the `Event` is the source of truth.
+- **Atomic w.r.t. your task** — `&mut self` serializes `reload()` against your
+  `add_*` / `next()` on the single task.
+- **Disconnected defers, never errors** — with the stream down there's nothing to
+  apply now; the mirror is still updated and the next reconnect's loader
+  re-registers it. `ReloadSummary::applied` tells you which happened.
+- Returns `ReloadError::NoLoader` if no loader is configured, or
+  `ReloadError::Loader` if the loader itself fails (surfaced, not retried — you
+  decide whether to call again).
+
+This reuses the backoff / cursor re-anchor / loader plumbing — the reason to use
+`ResilientWatch` at all — instead of dropping and rebuilding the wrapper to force
+a full re-push.
 
 ## Prefix watches (privacy-preserving)
 

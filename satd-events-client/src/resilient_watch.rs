@@ -140,6 +140,10 @@ impl WatchSetMirror {
         self.descriptors.insert(descriptor, (gap_limit, start));
     }
 
+    fn remove_descriptor(&mut self, descriptor: &str) {
+        self.descriptors.remove(descriptor);
+    }
+
     fn add_prefixes(&mut self, items: &[pb::ScriptPrefix]) {
         for sp in items {
             self.prefixes.insert((sp.bits, sp.prefix.clone()));
@@ -246,6 +250,289 @@ impl WatchSetMirror {
 
         out
     }
+
+    /// Render the whole net watch-set as a single `SetWatchSet` snapshot — the
+    /// atomic-replace payload [`reload`](ResilientWatch::reload) sends. Unlike
+    /// [`control_messages`](Self::control_messages) (a fresh-stream replay) or a
+    /// `reconcile_to` delta, this is the COMPLETE desired membership in one
+    /// message: the server reconciles it under its lock by effective coverage, so
+    /// there is no client-computed Add*/Remove* ordering to strand coverage or
+    /// over-charge at quota.
+    fn to_set_watch_set(&self) -> pb::SetWatchSet {
+        let scripthashes: Vec<Vec<u8>> = self.scripts.keys().map(|h| h.to_vec()).collect();
+        let min_values = if self.scripts.values().any(Option::is_some) {
+            self.scripts.values().map(|f| f.unwrap_or(0)).collect()
+        } else {
+            Vec::new()
+        };
+        pb::SetWatchSet {
+            categories: self.categories.unwrap_or(0),
+            scripthashes,
+            min_values,
+            outpoints: self
+                .outpoints
+                .iter()
+                .map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v })
+                .collect(),
+            descriptors: self
+                .descriptors
+                .iter()
+                .map(|(d, (gap_limit, start))| pb::AddDescriptor {
+                    descriptor: d.clone(),
+                    gap_limit: *gap_limit,
+                    start: *start,
+                })
+                .collect(),
+            prefixes: self
+                .prefixes
+                .iter()
+                .map(|(bits, prefix)| pb::ScriptPrefix { prefix: prefix.clone(), bits: *bits })
+                .collect(),
+            lifecycles: self
+                .tx_lifecycles
+                .iter()
+                .map(|(t, ac)| pb::WatchLifecycle {
+                    txid: t.to_vec(),
+                    auto_close_depth: match ac {
+                        AutoClose::Never => 0,
+                        AutoClose::AtDepth(d) => *d,
+                    },
+                })
+                .collect(),
+            depth_alarms: self
+                .depth_alarms
+                .iter()
+                .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
+                .collect(),
+        }
+    }
+
+    /// Compute the minimal control messages that transform `self` (the current
+    /// net watch-set) into `target`, plus item counts — the delta a
+    /// [`reload`](ResilientWatch::reload) applies on the live wire. Only the
+    /// differences are emitted: items present-and-equal in both are left alone,
+    /// so the stream is never cleared and rebuilt. `Remove*`/`RemoveDescriptor`
+    /// lead (after any category change) so a removal frees its quota unit before
+    /// the replacement `Add*` claims it — a swap at quota would otherwise have its
+    /// net-new adds silently rejected while the removes still applied. See the
+    /// ordering note at the tail of this function for the full rationale. A
+    /// descriptor whose window changed is one `AddDescriptor` (the server
+    /// reconciles the slid window); a descriptor that disappeared is a
+    /// `RemoveDescriptor`.
+    fn reconcile_to(&self, target: &WatchSetMirror) -> (Vec<Msg>, ReloadCounts) {
+        let mut lead = Vec::new();
+        let mut adds = Vec::new();
+        let mut removes = Vec::new();
+        let mut c = ReloadCounts::default();
+
+        // Category filter (not a watch *item*, so it does not move the counts).
+        // `None` and `Some(0)` both mean "all categories" — the wire spells "all"
+        // as `SetCategories { categories: 0 }` (both carriers map 0 → u32::MAX).
+        // Compare the *effective* masks, not the raw `Option`: a reload that
+        // relaxes the filter (`Some(n)` → truth has no filter) must emit an
+        // explicit `SetCategories { 0 }` reset, or the mirror would adopt "no
+        // filter" while the live server stayed filtered until the next reconnect,
+        // silently dropping the now-in-scope events. A no-op `None` ↔ `Some(0)`
+        // change emits nothing.
+        let target_mask = target.categories.unwrap_or(0);
+        let live_mask = self.categories.unwrap_or(0);
+        if target_mask != live_mask {
+            lead.push(Msg::SetCategories(pb::SetCategories { categories: target_mask }));
+        }
+
+        // Scripts: new or changed-floor → AddScripts; vanished → RemoveScripts.
+        {
+            let mut changed: Vec<(Scripthash, Option<u64>)> = Vec::new();
+            for (h, floor) in &target.scripts {
+                match self.scripts.get(h) {
+                    Some(f) if f == floor => c.unchanged += 1,
+                    _ => changed.push((*h, *floor)),
+                }
+            }
+            let gone: Vec<Scripthash> =
+                self.scripts.keys().filter(|h| !target.scripts.contains_key(*h)).copied().collect();
+            if !changed.is_empty() {
+                c.added += changed.len();
+                let scripthashes = changed.iter().map(|(h, _)| h.to_vec()).collect();
+                let min_values = if changed.iter().any(|(_, f)| f.is_some()) {
+                    changed.iter().map(|(_, f)| f.unwrap_or(0)).collect()
+                } else {
+                    Vec::new()
+                };
+                adds.push(Msg::AddScripts(pb::AddScripts { scripthashes, min_values }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveScripts(pb::RemoveScripts {
+                    scripthashes: gone.iter().map(|h| h.to_vec()).collect(),
+                }));
+            }
+        }
+
+        // Outpoints.
+        {
+            let add: Vec<_> = target.outpoints.difference(&self.outpoints).copied().collect();
+            let gone: Vec<_> = self.outpoints.difference(&target.outpoints).copied().collect();
+            c.unchanged += target.outpoints.intersection(&self.outpoints).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                adds.push(Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: add.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveOutpoints(pb::RemoveOutpoints {
+                    outpoints: gone.iter().map(|(t, v)| pb::Outpoint { txid: t.to_vec(), vout: *v }).collect(),
+                }));
+            }
+        }
+
+        // Tx lifecycles: new or changed auto-close → AddTransactions (grouped by
+        // depth, empty min_depths); vanished → RemoveTransactions (lifecycle).
+        {
+            let mut by_depth: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
+            for (txid, ac) in &target.tx_lifecycles {
+                match self.tx_lifecycles.get(txid) {
+                    Some(old) if old == ac => c.unchanged += 1,
+                    _ => {
+                        let depth = match ac {
+                            AutoClose::Never => 0,
+                            AutoClose::AtDepth(d) => *d,
+                        };
+                        by_depth.entry(depth).or_default().push(txid.to_vec());
+                        c.added += 1;
+                    }
+                }
+            }
+            for (auto_close_depth, txids) in by_depth {
+                adds.push(Msg::AddTransactions(pb::AddTransactions {
+                    txids,
+                    min_depths: Vec::new(),
+                    auto_close_depth,
+                }));
+            }
+            let gone: Vec<Vec<u8>> = self
+                .tx_lifecycles
+                .keys()
+                .filter(|t| !target.tx_lifecycles.contains_key(*t))
+                .map(|t| t.to_vec())
+                .collect();
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveTransactions(pb::RemoveTransactions {
+                    txids: gone,
+                    min_depths: Vec::new(),
+                }));
+            }
+        }
+
+        // Depth alarms, grouped per txid (non-empty min_depths marks the kind).
+        {
+            let add: Vec<_> = target.depth_alarms.difference(&self.depth_alarms).copied().collect();
+            let gone: Vec<_> = self.depth_alarms.difference(&target.depth_alarms).copied().collect();
+            c.unchanged += target.depth_alarms.intersection(&self.depth_alarms).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                let mut by_txid: BTreeMap<Txid, Vec<u32>> = BTreeMap::new();
+                for (t, d) in add {
+                    by_txid.entry(t).or_default().push(d);
+                }
+                for (txid, min_depths) in by_txid {
+                    adds.push(Msg::AddTransactions(pb::AddTransactions {
+                        txids: vec![txid.to_vec()],
+                        min_depths,
+                        auto_close_depth: 0,
+                    }));
+                }
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                let mut by_txid: BTreeMap<Txid, Vec<u32>> = BTreeMap::new();
+                for (t, d) in gone {
+                    by_txid.entry(t).or_default().push(d);
+                }
+                for (txid, min_depths) in by_txid {
+                    removes.push(Msg::RemoveTransactions(pb::RemoveTransactions {
+                        txids: vec![txid.to_vec()],
+                        min_depths,
+                    }));
+                }
+            }
+        }
+
+        // Descriptors: new or changed window → AddDescriptor (server reconciles);
+        // vanished → RemoveDescriptor.
+        {
+            for (d, win) in &target.descriptors {
+                match self.descriptors.get(d) {
+                    Some(old) if old == win => c.unchanged += 1,
+                    _ => {
+                        c.added += 1;
+                        adds.push(Msg::AddDescriptor(pb::AddDescriptor {
+                            descriptor: d.clone(),
+                            gap_limit: win.0,
+                            start: win.1,
+                        }));
+                    }
+                }
+            }
+            for d in self.descriptors.keys() {
+                if !target.descriptors.contains_key(d) {
+                    c.removed += 1;
+                    removes.push(Msg::RemoveDescriptor(pb::RemoveDescriptor { descriptor: d.clone() }));
+                }
+            }
+        }
+
+        // Prefix buckets.
+        {
+            let add: Vec<_> = target.prefixes.difference(&self.prefixes).cloned().collect();
+            let gone: Vec<_> = self.prefixes.difference(&target.prefixes).cloned().collect();
+            c.unchanged += target.prefixes.intersection(&self.prefixes).count();
+            if !add.is_empty() {
+                c.added += add.len();
+                adds.push(Msg::AddScriptPrefixes(pb::AddScriptPrefixes {
+                    prefixes: add.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveScriptPrefixes(pb::RemoveScriptPrefixes {
+                    prefixes: gone.iter().map(|(bits, p)| pb::ScriptPrefix { prefix: p.clone(), bits: *bits }).collect(),
+                }));
+            }
+        }
+
+        // Order: category filter, then **Remove* before Add***. A removal frees
+        // its quota unit, so a reload that swaps N watches for N disjoint ones
+        // fits even when the tenant is exactly at quota. The opposite order
+        // (Add* first) is a false promise at quota: the server has no per-message
+        // ack and silently drops a quota-over add without closing the stream, so
+        // the net-new adds would be rejected, the removes would then apply, and
+        // the mirror would adopt a target the server never registered — a
+        // permanent silent divergence until the next reconnect. Remove-first
+        // cannot regress coverage of any still-wanted item: `reconcile_to` only
+        // removes items *absent* from the target, and no concrete watch key is
+        // ever both removed and added (removes are self-keys-not-in-target, adds
+        // are target-keys). The lone exception is a single scripthash that
+        // changes *mechanism* across the reload (a direct add becoming
+        // descriptor-covered, or vice versa) — invisible to this key-level diff,
+        // so it briefly unwatches between the RemoveScripts and the AddDescriptor.
+        // That sub-millisecond gap on a rare manual-reload transition is the
+        // deliberate trade for eliminating the permanent-divergence failure.
+        lead.extend(removes);
+        lead.extend(adds);
+        (lead, c)
+    }
+}
+
+/// Item counts from a [`reconcile_to`](WatchSetMirror::reconcile_to) diff.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReloadCounts {
+    added: usize,
+    removed: usize,
+    unchanged: usize,
 }
 
 /// The canonical watch-set declared by a [`watch_set_loader`] on every
@@ -469,6 +756,37 @@ impl ResilientWatchConfig {
     }
 }
 
+/// The outcome of [`ResilientWatch::reload`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadSummary {
+    /// Watch items added or changed (a changed floor / descriptor window / tx
+    /// auto-close counts as added).
+    pub added: usize,
+    /// Watch items removed.
+    pub removed: usize,
+    /// Watch items present and identical in both the old and reloaded set.
+    pub unchanged: usize,
+    /// Whether the delta was sent on the live stream now (`true`), or deferred to
+    /// the next reconnect's loader because the stream was down — or dropped
+    /// mid-reload (`false`). When `false` the mirror still reflects the reloaded
+    /// set, so the pending reconnect re-registers it from the same loader.
+    pub applied: bool,
+}
+
+/// Why a [`ResilientWatch::reload`] could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    /// `reload` requires a [`watch_set_loader`](ResilientWatchConfig::watch_set_loader);
+    /// none was configured.
+    #[error("reload requires a watch_set_loader, but none is configured")]
+    NoLoader,
+    /// The loader itself returned an error. Unlike a connect-time loader failure
+    /// (which is retried on reconnect), an explicit `reload` surfaces it so the
+    /// caller decides whether to retry.
+    #[error("watch-set loader failed: {0}")]
+    Loader(#[source] BoxError),
+}
+
 /// A `Watch` stream that reconnects, re-registers its watch-set, and re-anchors
 /// off the deterministic [`Event::CursorAccepted`] / [`Event::CursorRejected`]
 /// results on the caller's behalf.
@@ -480,7 +798,9 @@ impl ResilientWatchConfig {
 /// single-task, like [`ResilientSubscription`](crate::ResilientSubscription):
 /// interleave watch-set edits with [`next`](Self::next) calls from one task
 /// (the [`descriptor_wallet`] usage shape — react to a match, then adjust the
-/// watch-set).
+/// watch-set). When the watch-set has a durable source-of-truth, configure a
+/// [`watch_set_loader`](ResilientWatchConfig::watch_set_loader) and call
+/// [`reload`](Self::reload) to realign the live stream with that truth on demand.
 ///
 /// [`descriptor_wallet`]: https://github.com/epochbtc/satd/blob/master/satd-events-client/examples/descriptor_wallet.rs
 pub struct ResilientWatch {
@@ -679,8 +999,8 @@ impl ResilientWatch {
 
     /// Register a public output descriptor's watch window. The latest
     /// `(gap_limit, start)` per descriptor is what replays on reconnect — advance
-    /// `start` to slide the window (fine-grained mid-window script trims are not
-    /// separately preserved across a reconnect). See [`WatchHandle::add_descriptor`].
+    /// `start` to slide the window (the server reconciles the slid window). See
+    /// [`WatchHandle::add_descriptor`].
     pub async fn add_descriptor(
         &mut self,
         descriptor: impl Into<String>,
@@ -691,6 +1011,23 @@ impl ResilientWatch {
         self.mirror.add_descriptor(descriptor.clone(), gap_limit, start);
         let res = match &self.handle {
             Some(h) => Some(h.add_descriptor(descriptor, gap_limit, start).await),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
+    /// Remove a descriptor previously added with [`add_descriptor`](Self::add_descriptor),
+    /// dropping it from the mirror so it is not replayed on reconnect and (while
+    /// connected) releasing the scripthashes its window contributed whose last
+    /// owner this drops. See [`WatchHandle::remove_descriptor`].
+    pub async fn remove_descriptor(
+        &mut self,
+        descriptor: impl Into<String>,
+    ) -> Result<(), StreamError> {
+        let descriptor = descriptor.into();
+        self.mirror.remove_descriptor(&descriptor);
+        let res = match &self.handle {
+            Some(h) => Some(h.remove_descriptor(descriptor).await),
             None => None,
         };
         self.after_send(res)
@@ -768,6 +1105,85 @@ impl ResilientWatch {
             None => None,
         };
         self.after_send(res)
+    }
+
+    /// Re-run the configured [`watch_set_loader`](ResilientWatchConfig::watch_set_loader),
+    /// diff the freshly-loaded canonical set against the live watch-set, and apply
+    /// **only the delta** on the wire — realigning the subscription with the
+    /// integrator's source-of-truth without dropping and rebuilding the stream
+    /// (which would throw away the backoff / cursor re-anchor plumbing).
+    ///
+    /// This is the on-demand companion to the connect-time loader (which fires on
+    /// every reconnect, [`watch_set_loader`](ResilientWatchConfig::watch_set_loader)):
+    /// use it when the durable truth changes *while the stream is up* and you want
+    /// it pushed now — a bulk import or migration that wrote truth outside the
+    /// hot-add path, an admin/external rotation, or an operator "make the wire
+    /// match truth" reconciliation.
+    ///
+    /// Semantics:
+    ///
+    /// - **Diff, not blast.** Only added/changed/removed items are sent;
+    ///   identical items are untouched. `Remove*` / `RemoveDescriptor` lead so a
+    ///   removal frees its quota unit before the replacement `Add*` claims it —
+    ///   which is what lets a swap of N watches for N disjoint ones apply cleanly
+    ///   even when the tenant is exactly at quota (the server silently drops a
+    ///   quota-over add, so an add-first order would leave the mirror claiming
+    ///   watches the server never registered). A descriptor whose window changed
+    ///   is re-asserted (the server reconciles); a vanished descriptor is dropped
+    ///   with `RemoveDescriptor`.
+    /// - **Atomic w.r.t. concurrent edits.** `&mut self` serializes `reload`
+    ///   against `add_*` / `remove_*` / [`next`](Self::next), so no hot-add can
+    ///   interleave with the diff.
+    /// - **The reloaded set becomes the mirror.** Subsequent reconnects replay it
+    ///   (and re-run the loader), exactly as for the connect-time path.
+    /// - **Disconnected (or dropped mid-reload) defers, never errors.** With the
+    ///   stream down there is nothing to apply now; the mirror is still updated to
+    ///   the reloaded set and the next reconnect's loader re-registers it from
+    ///   truth. [`ReloadSummary::applied`] reports which happened.
+    ///
+    /// Returns [`ReloadError::NoLoader`] if no loader is configured, or
+    /// [`ReloadError::Loader`] if the loader itself fails (surfaced, not retried —
+    /// an explicit `reload` lets the caller decide).
+    pub async fn reload(&mut self) -> Result<ReloadSummary, ReloadError> {
+        let loader = self.config.watch_set_loader.clone().ok_or(ReloadError::NoLoader)?;
+        // Build the canonical set from the integrator's truth into a fresh mirror.
+        let shared = Arc::new(Mutex::new(WatchSetMirror::default()));
+        loader(WatchSetBuilder { mirror: shared.clone() })
+            .await
+            .map_err(ReloadError::Loader)?;
+        let loaded = std::mem::take(&mut *shared.lock().unwrap_or_else(|p| p.into_inner()));
+
+        // Counts (added/removed/unchanged) for the summary — advisory; the
+        // server's WatchSetResult carries the authoritative counts by effective
+        // coverage. The delta messages are discarded: reload no longer applies a
+        // client-computed Add*/Remove* delta (whose ordering could strand
+        // coverage or over-charge at quota — the Rounds 2/3 failures). It sends
+        // ONE SetWatchSet and lets the server reconcile atomically under its lock.
+        let (_delta, counts) = self.mirror.reconcile_to(&loaded);
+
+        // Push the whole desired set as a single atomic replace if connected; a
+        // send failure means the stream is gone, so defer to the reconnect loader
+        // rather than erroring. The deterministic WatchSetResult
+        // (accepted/rejected) arrives in-band on [`next`](Self::next).
+        let mut applied = false;
+        if let Some(h) = &self.handle {
+            let msg = Msg::SetWatchSet(loaded.to_set_watch_set());
+            match h.send_control(pb::SubscribeControl { msg: Some(msg) }).await {
+                Ok(()) => applied = true,
+                Err(_) => self.teardown(),
+            }
+        }
+
+        // Adopt the reloaded set as the canonical mirror regardless: a deferred
+        // reload is rebuilt from the same loader on the next reconnect.
+        self.mirror = loaded;
+
+        Ok(ReloadSummary {
+            added: counts.added,
+            removed: counts.removed,
+            unchanged: counts.unchanged,
+            applied,
+        })
     }
 
     // --- driving the stream ---------------------------------------------------
@@ -1152,6 +1568,25 @@ mod tests {
     }
 
     #[test]
+    fn mirror_removed_descriptor_is_not_replayed() {
+        let mut m = WatchSetMirror::default();
+        m.add_descriptor("wpkh(a)".into(), 20, 0);
+        m.add_descriptor("wpkh(b)".into(), 20, 0);
+        m.remove_descriptor("wpkh(a)");
+        let descs: Vec<_> = m
+            .control_messages()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Msg::AddDescriptor(d) => Some(d.descriptor),
+                _ => None,
+            })
+            .collect();
+        // The removed descriptor is gone from the replay; a reconnect re-registers
+        // only the surviving one (the fresh stream has nothing to RemoveDescriptor).
+        assert_eq!(descs, vec!["wpkh(b)".to_string()]);
+    }
+
+    #[test]
     fn mirror_empty_renders_nothing() {
         assert!(WatchSetMirror::default().control_messages().is_empty());
     }
@@ -1468,5 +1903,215 @@ mod tests {
     fn no_loader_leaves_behavior_unchanged() {
         // The default config has no loader: mirror-replay is untouched.
         assert!(ResilientWatchConfig::new().watch_set_loader.is_none());
+    }
+
+    // --- reload(): diff the live set against truth and apply the delta ---------
+
+    #[test]
+    fn reconcile_to_emits_only_the_delta_removes_before_adds() {
+        // Old set vs a target that adds, removes, and changes one of each kind.
+        let mut old = WatchSetMirror::default();
+        old.add_scripts(&[([1u8; 32], None), ([2u8; 32], Some(500))]); // 2 kept-ish
+        old.add_outpoints(&[([9u8; 32], 0)]);
+        old.add_descriptor("desc-keep".into(), 20, 0);
+        old.add_descriptor("desc-drop".into(), 20, 0);
+
+        let mut new = WatchSetMirror::default();
+        new.add_scripts(&[([1u8; 32], None), ([2u8; 32], Some(999))]); // sh2 floor changed
+        new.add_scripts(&[([3u8; 32], None)]); // sh3 new
+        // sh? none removed here besides via descriptors; outpoint 9 removed (absent)
+        new.add_descriptor("desc-keep".into(), 20, 0); // unchanged
+        // desc-drop removed; desc-new added
+        new.add_descriptor("desc-new".into(), 20, 0);
+
+        let (msgs, counts) = old.reconcile_to(&new);
+
+        // sh3 + sh2(changed) added (2), desc-new added (1) → added 3.
+        // outpoint 9 removed (1), desc-drop removed (1) → removed 2.
+        // sh1 + desc-keep unchanged → unchanged 2.
+        assert_eq!(counts.added, 3, "sh2(changed) + sh3 + desc-new");
+        assert_eq!(counts.removed, 2, "outpoint + desc-drop");
+        assert_eq!(counts.unchanged, 2, "sh1 + desc-keep");
+
+        // Every Remove*/RemoveDescriptor comes before any watch-adding Add* — a
+        // removal must free its quota unit before the replacement add claims it,
+        // so a swap at quota does not have its adds silently rejected.
+        let last_remove = msgs.iter().rposition(|m| {
+            matches!(
+                m,
+                Msg::RemoveScripts(_)
+                    | Msg::RemoveOutpoints(_)
+                    | Msg::RemoveTransactions(_)
+                    | Msg::RemoveScriptPrefixes(_)
+                    | Msg::RemoveDescriptor(_)
+            )
+        });
+        let first_add = msgs.iter().position(|m| {
+            matches!(
+                m,
+                Msg::AddScripts(_)
+                    | Msg::AddOutpoints(_)
+                    | Msg::AddTransactions(_)
+                    | Msg::AddDescriptor(_)
+                    | Msg::AddScriptPrefixes(_)
+            )
+        });
+        if let (Some(lr), Some(fa)) = (last_remove, first_add) {
+            assert!(lr < fa, "every Remove must precede every quota-consuming Add");
+        }
+        // A vanished descriptor is dropped with RemoveDescriptor, not by scripthash.
+        assert!(msgs.iter().any(|m| matches!(m, Msg::RemoveDescriptor(d) if d.descriptor == "desc-drop")));
+    }
+
+    #[test]
+    fn reconcile_disjoint_swap_removes_before_adds_for_quota_safety() {
+        // A tenant at quota N reloading N old watches → N disjoint new watches.
+        // The removes must precede the adds so the server frees the N old units
+        // before the N new adds are charged; add-first would let the server
+        // silently reject the over-quota adds and then apply the removes.
+        let mut live = WatchSetMirror::default();
+        live.add_scripts(&[([1u8; 32], None), ([2u8; 32], None), ([3u8; 32], None)]);
+        let mut target = WatchSetMirror::default();
+        target.add_scripts(&[([4u8; 32], None), ([5u8; 32], None), ([6u8; 32], None)]);
+
+        let (msgs, counts) = live.reconcile_to(&target);
+        assert_eq!((counts.added, counts.removed, counts.unchanged), (3, 3, 0));
+
+        let remove_pos = msgs.iter().position(|m| matches!(m, Msg::RemoveScripts(_)));
+        let add_pos = msgs.iter().position(|m| matches!(m, Msg::AddScripts(_)));
+        assert!(
+            remove_pos < add_pos,
+            "RemoveScripts must be sent before AddScripts so freed quota covers the replacements",
+        );
+    }
+
+    #[test]
+    fn reconcile_identical_sets_is_empty() {
+        let mut m = WatchSetMirror::default();
+        m.add_scripts(&[([1u8; 32], Some(5))]);
+        m.add_descriptor("d".into(), 20, 0);
+        let (msgs, counts) = m.reconcile_to(&m.clone());
+        assert!(msgs.is_empty(), "no churn when nothing changed");
+        assert_eq!((counts.added, counts.removed), (0, 0));
+        assert_eq!(counts.unchanged, 2);
+    }
+
+    #[test]
+    fn reconcile_categories_relaxation_emits_an_explicit_reset() {
+        // Live server is filtered to CHAIN; truth (the reload target) has no
+        // category filter. reconcile must emit SetCategories{0} ("all") so the
+        // relaxation takes effect live — not silently leave the server filtered.
+        let mut live = WatchSetMirror::default();
+        live.set_categories(crate::Categories::CHAIN);
+        let target = WatchSetMirror::default(); // no filter
+
+        let (msgs, _) = live.reconcile_to(&target);
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    Msg::SetCategories(s) => Some(s.categories),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![0],
+            "relaxing a filter to all-categories emits SetCategories{{0}}",
+        );
+
+        // Setting a filter from none, and changing between filters, still emit.
+        let none = WatchSetMirror::default();
+        let mut chain = WatchSetMirror::default();
+        chain.set_categories(crate::Categories::CHAIN);
+        assert!(
+            matches!(none.reconcile_to(&chain).0.first(), Some(Msg::SetCategories(s)) if s.categories == crate::Categories::CHAIN),
+            "setting a filter from unfiltered emits it",
+        );
+
+        // None ↔ Some(0) are both "all categories": no spurious message.
+        let mut all = WatchSetMirror::default();
+        all.set_categories(0);
+        assert!(
+            !none.reconcile_to(&all).0.iter().any(|m| matches!(m, Msg::SetCategories(_))),
+            "None and Some(0) are the same effective filter — no reset emitted",
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_without_loader_errors() {
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        assert!(matches!(w.reload().await, Err(ReloadError::NoLoader)));
+    }
+
+    #[tokio::test]
+    async fn reload_surfaces_loader_error() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new()
+                .watch_set_loader(|_b: WatchSetBuilder| async move { Err("truth down".into()) }),
+        );
+        let err = w.reload().await.expect_err("loader failure surfaces");
+        assert!(matches!(err, ReloadError::Loader(_)));
+        assert!(err.to_string().contains("truth down"));
+    }
+
+    #[tokio::test]
+    async fn reload_while_disconnected_defers_but_updates_the_mirror() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                b.add_scripts([([5u8; 32], None)]);
+                Ok(())
+            }),
+        );
+        // Pre-existing live edit the loader will not reproduce.
+        w.add_scripts([([1u8; 32], None)]).await.unwrap();
+
+        let summary = w.reload().await.expect("reload ok");
+        assert!(!summary.applied, "no live stream → deferred to reconnect loader");
+        assert_eq!(summary.added, 1, "sh5 added");
+        assert_eq!(summary.removed, 1, "stale sh1 removed");
+        // The mirror now reflects truth, so a reconnect re-registers the right set.
+        assert!(w.mirror.scripts.contains_key(&[5u8; 32]));
+        assert!(!w.mirror.scripts.contains_key(&[1u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn reload_while_connected_sends_only_the_delta() {
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().watch_set_loader(|b: WatchSetBuilder| async move {
+                // Truth: keep sh1, drop sh2, add sh3.
+                b.add_scripts([([1u8; 32], None), ([3u8; 32], None)]);
+                Ok(())
+            }),
+        );
+        w.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+
+        // Inject a live handle whose receiver we can inspect.
+        let (handle, mut rx) = crate::client::WatchHandle::for_test();
+        w.handle = Some(handle);
+
+        let summary = w.reload().await.expect("reload ok");
+        assert!(summary.applied, "connected → applied live");
+        // Advisory client counts (server's WatchSetResult is authoritative).
+        assert_eq!((summary.added, summary.removed, summary.unchanged), (1, 1, 1));
+
+        // Exactly ONE SetWatchSet carrying the whole desired set (sh1 + sh3)
+        // reached the wire — no client-computed Add*/Remove* delta.
+        let mut msgs = Vec::new();
+        while let Ok(ctrl) = rx.try_recv() {
+            msgs.push(ctrl.msg.unwrap());
+        }
+        assert_eq!(msgs.len(), 1, "reload sends exactly one control message");
+        let Msg::SetWatchSet(sws) = &msgs[0] else {
+            panic!("expected a SetWatchSet, got {:?}", msgs[0]);
+        };
+        let mut got: Vec<Vec<u8>> = sws.scripthashes.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![[1u8; 32].to_vec(), [3u8; 32].to_vec()],
+            "the snapshot is the full desired set, not a delta",
+        );
     }
 }

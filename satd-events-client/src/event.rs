@@ -298,6 +298,40 @@ pub enum Event {
         /// The server's current resume position.
         current_head: Option<Cursor>,
     },
+    /// An atomic watch-set replace ([`ResilientWatch::reload`](crate::ResilientWatch::reload),
+    /// carried as `SetWatchSet`) was applied. The live watch-set now equals the
+    /// reloaded truth; the counts are the server's authoritative diff by
+    /// **effective coverage** (a scripthash covered by both the old and new set —
+    /// even via a different mechanism — counts as `unchanged`, never gapped).
+    WatchSetReplaced {
+        /// Items newly watched.
+        added: u32,
+        /// Items released.
+        removed: u32,
+        /// Items in both the old and new set (kept without re-registration).
+        unchanged: u32,
+    },
+    /// An atomic watch-set replace was **rejected**; the live watch-set is
+    /// UNCHANGED (the prior set is still in effect). `reason` says which ceiling
+    /// refused it, and `required`/`quota` are in the matching unit:
+    /// [`QuotaExceeded`](WatchSetRejectReason::QuotaExceeded) — `required` units
+    /// vs the `quota` ceiling; [`CapExceeded`](WatchSetRejectReason::CapExceeded)
+    /// — `required` entries vs the per-connection entry cap (`quota`);
+    /// [`Malformed`](WatchSetRejectReason::Malformed) — a client bug (bad element),
+    /// `required`/`quota` are 0 and retrying the same set will not help. In every
+    /// case the client's mirror still reflects the (unapplied) reloaded set, so a
+    /// consumer that ignores this keeps an over-claiming mirror; react by
+    /// reloading a set the server accepts.
+    WatchSetRejected {
+        /// Why the replace was refused.
+        reason: WatchSetRejectReason,
+        /// What the rejected target needs: units (`QuotaExceeded`) or entries
+        /// (`CapExceeded`); 0 for `Malformed`.
+        required: u64,
+        /// The ceiling that refused it: unit quota (`QuotaExceeded`) or entry cap
+        /// (`CapExceeded`); 0 for `Malformed`.
+        quota: u64,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,
@@ -319,6 +353,41 @@ pub enum CursorRejectReason {
     NoSource,
     /// A reason code this client build does not recognize (a newer server).
     Unknown,
+}
+
+/// Why an atomic watch-set replace was declined by the server (see
+/// [`Event::WatchSetRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchSetRejectReason {
+    /// The target set's total unit cost exceeds the principal's quota (`required`
+    /// units vs the `quota` ceiling) — shed items and retry. Transient: a smaller
+    /// set fits.
+    QuotaExceeded,
+    /// The target's watch-set **entry** count (`required`) exceeds the
+    /// per-connection cap (`quota`, `streamwsmaxsubscriptions`). Distinct from
+    /// `QuotaExceeded`: this bound applies even to a no-auth connection with no
+    /// quota, and counts entries (a prefix is one) not units — shed entries and
+    /// retry.
+    CapExceeded,
+    /// The server could not parse or expand an element of the snapshot (a bad
+    /// scripthash, outpoint, txid, descriptor, or prefix). A full replace is
+    /// all-or-nothing, so the whole snapshot was refused. This is a client bug —
+    /// retrying the same set will not help.
+    Malformed,
+    /// A reason code this client build does not recognize (a newer server).
+    Unknown,
+}
+
+/// Map the proto `WatchSetRejected.Reason` enum (an `i32` on the wire) to the
+/// client enum, treating an unrecognized code as [`WatchSetRejectReason::Unknown`].
+fn watch_set_reject_reason(reason: i32) -> WatchSetRejectReason {
+    match pb::watch_set_rejected::Reason::try_from(reason) {
+        Ok(pb::watch_set_rejected::Reason::QuotaExceeded) => WatchSetRejectReason::QuotaExceeded,
+        Ok(pb::watch_set_rejected::Reason::CapExceeded) => WatchSetRejectReason::CapExceeded,
+        Ok(pb::watch_set_rejected::Reason::Malformed) => WatchSetRejectReason::Malformed,
+        Ok(pb::watch_set_rejected::Reason::Unspecified) | Err(_) => WatchSetRejectReason::Unknown,
+    }
 }
 
 impl From<pb::NodeEvent> for Event {
@@ -394,6 +463,19 @@ impl From<pb::NodeEvent> for Event {
                     current_head: rj.current_head,
                 },
                 // A result frame with no outcome set is a degenerate message.
+                None => Event::Unknown,
+            },
+            Body::SetWatchSetResult(r) => match r.outcome {
+                Some(pb::watch_set_result::Outcome::Accepted(a)) => Event::WatchSetReplaced {
+                    added: a.added,
+                    removed: a.removed,
+                    unchanged: a.unchanged,
+                },
+                Some(pb::watch_set_result::Outcome::Rejected(rj)) => Event::WatchSetRejected {
+                    reason: watch_set_reject_reason(rj.reason),
+                    required: rj.required,
+                    quota: rj.quota,
+                },
                 None => Event::Unknown,
             },
         }

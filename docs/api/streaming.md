@@ -120,6 +120,7 @@ message NodeEvent {
     TxidFinalized txid_finalized = 22;  // lifecycle auto-close, terminal (§7.4)
     PrefixMatched prefix_matched = 23;  // privacy-preserving prefix watch (§7.5)
     SetCursorResult set_cursor_result = 24;  // deterministic re-anchor ack/reject (§7.3.1)
+    WatchSetResult set_watch_set_result = 25;  // deterministic atomic-replace ack/reject (§11.2)
   }
 }
 ```
@@ -351,6 +352,8 @@ message SubscribeControl {
     RemoveTransactions   remove_transactions   = 9;
     AddScriptPrefixes    add_script_prefixes   = 10; // privacy-preserving prefix watch (§7.5)
     RemoveScriptPrefixes remove_script_prefixes = 11;
+    RemoveDescriptor     remove_descriptor     = 12; // drop a descriptor window (§11)
+    SetWatchSet          set_watch_set         = 13; // atomic whole-set replace (see below)
   }
 }
 ```
@@ -689,12 +692,17 @@ message AddDescriptor {
   uint32 gap_limit  = 2;   // window size; capped at MAX_DESCRIPTOR_WINDOW (1000)
   uint32 start      = 3;   // window start index (default 0)
 }
+
+message RemoveDescriptor {
+  string descriptor = 1;   // byte-matches the AddDescriptor string
+}
 ```
 
 The server expands the descriptor via rust-miniscript over the window
-`[start, start + gap_limit)`, derives the watch scripts, and registers them with
-the §7 matcher — the address-watching-as-outpoint-watching convenience the base
-primitive was designed for. A BIP-389 multipath descriptor (`.../<0;1>/*`) is
+`[start, start + gap_limit)`, derives the watch scripts, registers them with
+the §7 matcher, and **retains the descriptor → derived-scripthashes membership**
+for the connection — the address-watching-as-outpoint-watching convenience the
+base primitive was designed for. A BIP-389 multipath descriptor (`.../<0;1>/*`) is
 split into its branches and each branch expanded over the same window, so it
 yields up to `branches × gap_limit` scripts and costs that many watch units; the
 branch count is capped at 2 (`MAX_DESCRIPTOR_BRANCHES`) — more is rejected before
@@ -703,17 +711,104 @@ so ≤ 2000 scripts for a 2-branch descriptor) and rejects hardened-wildcard and
 secret-bearing descriptor at the type level (`Descriptor<DescriptorPublicKey>`),
 so no signing material can be submitted.
 
-**Gap-limit tracking is a client concern, by design.** An earlier approach had the
-server track derivation progress and push a `DescriptorNeedsAddresses` side-channel
-to tell the client to extend its window. We rejected it: the client knows its own
-address-generation policy and is better placed to decide when to advance. So the
-server stays **stateless** — it watches the fixed window it was asked for — and the
-client drives a sliding window by issuing a fresh `AddDescriptor` with an advanced
-`start` as funding approaches the window's high end, `Remove*`-ing the trailing
-scripts (cheap thanks to per-remove release, §9) — for a multipath descriptor that
-means removing **every** branch's scripthash for each slid index, since removal is
-by explicit scripthash and there is no `RemoveDescriptor`. The `DescriptorNeedsAddresses`
-body (field 15) is reserved for wire-compat but is never emitted.
+Each derived scripthash carries an **owner count** — the number of sources
+(a direct `AddScripts` and/or one or more descriptors) that currently watch it.
+A script's quota unit and matcher registration are released only when its **last**
+owner goes, so a scripthash shared by two descriptors, or by a descriptor and a
+direct add, is never dropped while any source still wants it.
+
+`RemoveDescriptor` drops a descriptor's whole window: every scripthash it
+contributed whose last owner this removes is released (membership is retained
+precisely so the server knows which those are — it does not re-derive). Removing
+an unknown descriptor is a no-op. Re-sending `AddDescriptor` for the same
+descriptor string with an advanced `start` **reconciles the slid window
+server-side**: scripts that left the window are released (subject to the same
+last-owner rule), scripts that entered are added, all-or-nothing on quota — the
+client no longer has to `Remove*` the trailing scripts by hand.
+
+**Gap-limit tracking is still a client concern, by design.** Retaining membership
+lets the server *manage* a window (slide, remove); it does **not** make the server
+track derivation *progress*. An earlier approach had the server follow how far the
+client had derived and push a `DescriptorNeedsAddresses` side-channel telling it to
+extend the window. We rejected that and it stays rejected: the server never tracks
+how far the client has advanced, never decides when to slide, and emits no
+unsolicited nudge. The client owns address-generation policy and drives the window
+by advancing `start` (or dropping it with `RemoveDescriptor`); the server only
+expands, watches, reconciles, and releases. The `DescriptorNeedsAddresses` body
+(field 15) is reserved for wire-compat but is never emitted.
+
+### 11.2 Atomic whole-set replace (`SetWatchSet`)
+
+`SetWatchSet` carries the **complete desired watch-set** — scripts (+floors),
+outpoints, txid lifecycles, depth alarms, descriptors (+windows), prefixes, and
+the category filter — in one message, and asks the server to *become* it:
+
+```protobuf
+message SetWatchSet {
+  uint32 categories                   = 1;  // 0 = all
+  repeated bytes scripthashes         = 2;
+  repeated uint64 min_values          = 3;  // parallel to scripthashes (empty = no floors)
+  repeated Outpoint outpoints         = 4;
+  repeated AddDescriptor descriptors  = 5;  // expanded over each window, as AddDescriptor
+  repeated ScriptPrefix prefixes      = 6;
+  repeated WatchLifecycle lifecycles  = 7;  // { txid, auto_close_depth }
+  repeated WatchDepthAlarm depth_alarms = 8; // { txid, depth }
+}
+```
+
+The server reconciles it **under the watch-set lock, by effective scripthash
+coverage** (descriptors expanded): items in both the old and new set keep their
+registration and quota lease untouched — including a scripthash whose *mechanism*
+changes across the replace (a direct add becoming descriptor-covered, or vice
+versa), which a client-side `Add*`/`Remove*` diff cannot see and would briefly
+unwatch. Departed items are released; net-new items are charged. The replace is
+**all-or-nothing on the whole target** for three independent reasons:
+
+- **Quota** — if the target's total unit cost exceeds the principal's quota the
+  watch-set is left **unchanged** (`reason = QUOTA_EXCEEDED`, `required` = units
+  needed, `quota` = the unit ceiling).
+- **Entry cap** — the replace is bounded by the same per-connection watch-set
+  **entry** cap as the incremental adds on that carrier (WebSocket
+  `streamwsmaxsubscriptions`; a prefix counts as one entry). A target with more
+  entries than the cap is refused whole (`reason = CAP_EXCEEDED`, `required` =
+  entry count, `quota` = the cap). This bound applies even to a **loopback/no-auth
+  connection**, which has no quota — so one `SetWatchSet` frame can never install
+  more than the cap. (gRPC entry-caps neither its incremental adds nor a replace;
+  quota is its bound.)
+- **Malformed input** — because a `SetWatchSet` is a *full snapshot*, any element
+  the server cannot parse or expand (a bad scripthash, outpoint, txid, descriptor,
+  or prefix — or a `min_values` length that does not match `scripthashes`) refuses
+  the **whole** snapshot (`reason = MALFORMED`, `required`/`quota` = 0) and leaves
+  the live set unchanged. It is *not* silently dropped — dropping one item would
+  shrink the snapshot and unwatch still-wanted scripts while reporting success.
+  (This is the one place the incremental `Add*` paths differ: those are
+  best-effort and skip an unparseable item, since they only *grow* the set.)
+
+Unlike the incremental adds, a replace does **not** charge the per-add rate
+limiter: it is the watch-set re-establishment primitive (reconnect / SDK reload),
+and rate-limiting it would let a reconnect storm block clients from restoring
+their watches. Steady-state size stays bounded by quota and the entry cap above.
+
+The outcome is deterministic and in-band (mirrors `SetCursorResult`):
+
+```protobuf
+message WatchSetResult {
+  oneof outcome { WatchSetAccepted accepted = 1; WatchSetRejected rejected = 2; }
+}
+message WatchSetAccepted { uint32 added = 1; uint32 removed = 2; uint32 unchanged = 3; }
+message WatchSetRejected {
+  enum Reason { REASON_UNSPECIFIED = 0; QUOTA_EXCEEDED = 1; MALFORMED = 2; CAP_EXCEEDED = 3; }
+  Reason reason = 1; uint64 required = 2; uint64 quota = 3;
+}
+```
+
+This is the primitive an SDK reload/realign uses: one round-trip, gap-free,
+quota-correct even for a same-size swap at exactly the quota ceiling — never a
+client-computed delta whose ordering can strand coverage (send `Remove*` first
+and an at-quota client is briefly unwatched; send `Add*` first and the over-quota
+adds are silently dropped). On WebSocket the same operation is
+`{"type":"set_watch_set", ...}` and the result a `{"category":"watch_set_result",
+"outcome":"accepted"|"rejected", ...}` event.
 
 ## 12. Operator limits
 

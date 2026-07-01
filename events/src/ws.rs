@@ -513,6 +513,11 @@ async fn ws_conn(
     // shared connection-scoped watch-set.
     let max_subscriptions = state.max_subscriptions;
     let prefix_bounds = (state.prefix_min_bits, state.prefix_max_bits);
+    // Bridge the deterministic result of an atomic SetWatchSet replace (applied
+    // by the inbound reader under the watch-set lock) to the outbound loop, which
+    // emits the in-band `watch_set_result`.
+    let (ws_result_tx, mut ws_result_rx) =
+        tokio::sync::mpsc::channel::<crate::watchset::ReplaceOutcome>(32);
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
@@ -523,16 +528,23 @@ async fn ws_conn(
                 last_activity.store(now_unix(), Ordering::Relaxed);
                 match msg {
                     Message::Text(t) => {
-                        let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                        apply_ws_control(
-                            &t,
-                            &handle,
-                            principal.as_ref(),
-                            &category_mask,
-                            &mut guard,
-                            max_subscriptions,
-                            prefix_bounds,
-                        );
+                        // Scope the guard so it drops before the async send below.
+                        let outcome = {
+                            let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                            apply_ws_control(
+                                &t,
+                                &handle,
+                                principal.as_ref(),
+                                &category_mask,
+                                &mut guard,
+                                max_subscriptions,
+                                prefix_bounds,
+                            )
+                        };
+                        if let Some(outcome) = outcome {
+                            // Outbound gone (tearing down) → nothing to deliver.
+                            let _ = ws_result_tx.send(outcome).await;
+                        }
                     }
                     Message::Close(_) => break,
                     // Ping is auto-answered by axum; Pong (and any other frame)
@@ -609,6 +621,13 @@ async fn ws_conn(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+            // Deterministic result of an atomic SetWatchSet replace.
+            Some(outcome) = ws_result_rx.recv() => {
+                let text = watch_set_result_json(&outcome).to_string();
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
             m = rx_match.recv() => match m {
                 Some(wm) => {
                     // Single-shot terminal matches: the registry already evicted
@@ -686,7 +705,9 @@ enum WsControl {
         #[serde(default)]
         min_depths: Vec<u32>,
     },
-    /// Expand a descriptor (rust-miniscript) into a script watch-set.
+    /// Expand a descriptor (rust-miniscript) into a script watch-set. The
+    /// descriptor → scripthashes membership is retained so the window can be
+    /// slid (re-assert reconciles) or removed cleanly.
     AddDescriptor {
         descriptor: String,
         gap_limit: u32,
@@ -695,11 +716,59 @@ enum WsControl {
         #[serde(default)]
         start: u32,
     },
+    /// Remove a descriptor previously added with `AddDescriptor`, releasing the
+    /// scripthashes its window contributed whose last owner this drops.
+    RemoveDescriptor { descriptor: String },
     /// Add privacy-preserving script-prefix buckets (§7.5). Charged by
     /// coarseness; `bits` must be within `[streamprefixminbits, streamprefixmaxbits]`.
     AddScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
     /// Remove script-prefix buckets from the watch-set.
     RemoveScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
+    /// Atomically REPLACE the whole watch-set with the snapshot carried here
+    /// (the JSON mirror of the gRPC `SetWatchSet`). Every field is the full
+    /// desired membership of its kind, not a delta. The server reconciles by
+    /// effective scripthash coverage and replies with a `watch_set_result`
+    /// event (`accepted` with counts, or `rejected` when the target exceeds the
+    /// quota — the set is then left unchanged).
+    SetWatchSet {
+        #[serde(default)]
+        categories: u32,
+        #[serde(default)]
+        scripthashes: Vec<String>,
+        #[serde(default)]
+        min_values: Vec<u64>,
+        #[serde(default)]
+        outpoints: Vec<WsOutpoint>,
+        #[serde(default)]
+        descriptors: Vec<WsDescriptor>,
+        #[serde(default)]
+        prefixes: Vec<WsScriptPrefix>,
+        #[serde(default)]
+        lifecycles: Vec<WsLifecycle>,
+        #[serde(default)]
+        depth_alarms: Vec<WsDepthAlarm>,
+    },
+}
+
+#[derive(Deserialize)]
+struct WsDescriptor {
+    descriptor: String,
+    gap_limit: u32,
+    #[serde(default)]
+    start: u32,
+}
+
+#[derive(Deserialize)]
+struct WsLifecycle {
+    txid: String,
+    #[serde(default)]
+    auto_close_depth: u32,
+}
+
+#[derive(Deserialize)]
+struct WsDepthAlarm {
+    txid: String,
+    depth: u32,
 }
 
 #[derive(Deserialize)]
@@ -753,15 +822,111 @@ fn apply_ws_control(
     watch_set: &mut WatchSet,
     max_subscriptions: usize,
     prefix_bounds: (u8, u8),
-) {
+) -> Option<crate::watchset::ReplaceOutcome> {
     let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
     let ctrl: WsControl = match serde_json::from_str(text) {
         Ok(c) => c,
         Err(e) => {
             warn!(target: "events::ws", error = %e, "ignoring malformed streamws control message");
-            return;
+            return None;
         }
     };
+
+    // SetWatchSet is an atomic replace: build the desired set, reconcile under
+    // the lock, and return the outcome so the caller can emit the deterministic
+    // `watch_set_result`. Handled before the per-add cap (a replace may shrink)
+    // and separate from the incremental match arms.
+    if let WsControl::SetWatchSet {
+        categories,
+        scripthashes,
+        min_values,
+        outpoints,
+        descriptors,
+        prefixes,
+        lifecycles,
+        depth_alarms,
+    } = &ctrl
+    {
+        // STRICT: a replace is a full snapshot, so any unparseable element refuses
+        // the whole thing (mirrors the gRPC `desired_from_proto`). Silently
+        // dropping a bad item would shrink the desired set and make `replace`
+        // unregister still-wanted watches while reporting `Accepted`. Build into a
+        // `Result` and turn the first failure into a `Malformed` outcome, leaving
+        // the live set untouched (`replace` is never called).
+        let desired: Result<crate::watchset::DesiredWatchSet, &'static str> = (|| {
+            // `min_values` is empty (no floors) or exactly parallel to
+            // `scripthashes`; a non-empty length mismatch is malformed (see the
+            // gRPC `desired_from_proto`).
+            if !min_values.is_empty() && min_values.len() != scripthashes.len() {
+                return Err("min_values length");
+            }
+            let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(scripthashes.len());
+            for (i, s) in scripthashes.iter().enumerate() {
+                let sh = parse_ws_scripthash(s).ok_or("scripthash")?;
+                scripts.push((sh, min_values.get(i).copied().unwrap_or(0)));
+            }
+            let mut descs: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(descriptors.len());
+            for d in descriptors {
+                match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
+                    Ok(shs) => descs.push((
+                        d.descriptor.clone(),
+                        shs.into_iter().map(|(_, sh)| sh).collect(),
+                    )),
+                    Err(e) => {
+                        warn!(target: "events::ws", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
+                        return Err("descriptor");
+                    }
+                }
+            }
+            let mut ops = Vec::with_capacity(outpoints.len());
+            for o in outpoints {
+                ops.push(parse_ws_outpoint(o).ok_or("outpoint")?);
+            }
+            let mut lcs = Vec::with_capacity(lifecycles.len());
+            for l in lifecycles {
+                let t = parse_ws_txid(&l.txid).ok_or("lifecycle txid")?;
+                lcs.push((t, l.auto_close_depth));
+            }
+            let mut alarms = Vec::with_capacity(depth_alarms.len());
+            for a in depth_alarms {
+                if a.depth < 1 {
+                    return Err("depth alarm depth");
+                }
+                let t = parse_ws_txid(&a.txid).ok_or("depth alarm txid")?;
+                alarms.push((t, a.depth));
+            }
+            let mut pfx = Vec::with_capacity(prefixes.len());
+            for p in prefixes {
+                pfx.push(parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).ok_or("prefix")?);
+            }
+            Ok(crate::watchset::DesiredWatchSet {
+                scripts,
+                descriptors: descs,
+                outpoints: ops,
+                lifecycles: lcs,
+                depth_alarms: alarms,
+                prefixes: pfx,
+            })
+        })();
+        let outcome = match desired {
+            Err(_) => crate::watchset::ReplaceOutcome::Malformed,
+            Ok(desired) => {
+                // Bound the replace by the same per-connection entry cap the
+                // incremental adds respect (streamwsmaxsubscriptions).
+                let outcome = watch_set.replace(principal, desired, max_subscriptions, handle);
+                // The category filter is part of the desired set: apply it only
+                // when the replace was accepted, so a rejection leaves the whole
+                // set (categories included) unchanged as `watch_set_result`
+                // reports.
+                if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+                    let mask = if *categories == 0 { u32::MAX } else { *categories };
+                    category_mask.store(mask, Ordering::Relaxed);
+                }
+                outcome
+            }
+        };
+        return Some(outcome);
+    }
     // Per-connection watch-set entry cap (`streamwsmaxsubscriptions`; 0 ⇒
     // unlimited): once the set is at/over the cap, shed any add (the
     // connection stays up — no per-message ack). Removes and category changes
@@ -781,9 +946,11 @@ fn apply_ws_control(
             cap = max_subscriptions,
             "streamws watch-set at per-connection cap; shedding add",
         );
-        return;
+        return None;
     }
     match ctrl {
+        // Handled and returned above; kept for match exhaustiveness.
+        WsControl::SetWatchSet { .. } => {}
         WsControl::SetCategories { categories } => {
             let mask = if categories == 0 { u32::MAX } else { categories };
             category_mask.store(mask, Ordering::Relaxed);
@@ -904,21 +1071,27 @@ fn apply_ws_control(
             start,
         } => match crate::descriptor::expand_descriptor(&descriptor, start, gap_limit) {
             Ok(scripts) => {
-                watch_set.add_scripts(
+                watch_set.add_descriptor(
                     principal,
+                    descriptor.clone(),
                     scripts.into_iter().map(|(_, sh)| sh),
-                    "descriptor",
                     |shs| {
                         handle.add_scripthashes(shs);
                     },
-                    // Descriptor scripts have no floor — no metadata to refresh.
-                    |_| {},
+                    |shs| {
+                        handle.remove_scripthashes(shs);
+                    },
                 );
             }
             Err(e) => {
                 warn!(target: "events::ws", error = %e, "ignoring invalid descriptor");
             }
         },
+        WsControl::RemoveDescriptor { descriptor } => {
+            watch_set.remove_descriptor(&descriptor, |shs| {
+                handle.remove_scripthashes(shs);
+            });
+        }
         WsControl::AddScriptPrefixes { prefixes } => {
             let items: Vec<((u8, u32), u64)> = prefixes
                 .iter()
@@ -938,6 +1111,44 @@ fn apply_ws_control(
             });
         }
     }
+    None
+}
+
+/// Hand-rolled JSON for the deterministic result of an atomic `SetWatchSet`
+/// replace — the JSON mirror of the `WatchSetResult` node event.
+fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_json::Value {
+    use crate::watchset::ReplaceOutcome;
+    let body = match outcome {
+        ReplaceOutcome::Accepted { added, removed, unchanged } => json!({
+            "category": "watch_set_result",
+            "outcome": "accepted",
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+        }),
+        ReplaceOutcome::Rejected { required, quota } => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "quota_exceeded",
+            "required": required,
+            "quota": quota,
+        }),
+        ReplaceOutcome::CapExceeded { limit, requested } => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "cap_exceeded",
+            "required": requested,
+            "quota": limit,
+        }),
+        ReplaceOutcome::Malformed => json!({
+            "category": "watch_set_result",
+            "outcome": "rejected",
+            "reason": "malformed",
+            "required": 0,
+            "quota": 0,
+        }),
+    };
+    json!({ "schema_version": node::events::SCHEMA_VERSION, "cursor": null, "body": body })
 }
 
 /// Hand-rolled JSON for a watch match (the proto has no `serde` derive). The
@@ -1185,6 +1396,124 @@ mod tests {
         // cap = 0 ⇒ unlimited: adds are never shed.
         apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
+    }
+
+    #[test]
+    fn set_watch_set_applies_categories_only_when_accepted() {
+        use satd_auth::{Accounting, Capability, CapabilitySet, LocalAccounting, Principal};
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let acct: Arc<dyn Accounting> = Arc::new(LocalAccounting::new());
+        // Quota of 1 unit.
+        let p = Principal::token(
+            Arc::from("tenant"),
+            CapabilitySet::EMPTY.with(Capability::StreamWatch),
+            Some(1),
+            None,
+            acct.clone(),
+        );
+        let mask = AtomicU32::new(0xF); // a distinctive pre-existing filter
+        let mut ws = WatchSet::default();
+
+        // Two scripts need 2 units > quota 1 → the whole replace is rejected, so
+        // the category filter must NOT change.
+        let ctrl = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+        );
+        let outcome = apply_ws_control(&ctrl, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::Rejected { .. })),
+            "over-quota target must be rejected",
+        );
+        assert_eq!(mask.load(Ordering::Relaxed), 0xF, "rejected replace must not touch categories");
+        assert_eq!(ws.len(), 0, "rejected replace registers nothing");
+
+        // A single script fits quota → accepted, and the category filter applies.
+        let ok = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}"]}}"#,
+            "11".repeat(32),
+        );
+        let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(mask.load(Ordering::Relaxed), 2, "accepted replace applies its category filter");
+    }
+
+    #[test]
+    fn set_watch_set_rejects_a_malformed_snapshot_and_keeps_the_live_set() {
+        // A full replace is all-or-nothing: one unparseable element must refuse
+        // the whole snapshot (Malformed) and leave the already-registered set
+        // intact — never silently drop the bad item and unregister live watches.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(0xF);
+        let mut ws = WatchSet::default();
+
+        // Establish a live set of two scripts.
+        let seed = format!(
+            r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}","{}"]}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        let outcome = apply_ws_control(&seed, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(ws.len(), 2);
+        assert_eq!(mask.load(Ordering::Relaxed), 2);
+
+        // A replace whose second scripthash is malformed (odd length) must be
+        // rejected whole — the live two-script set and category filter are kept.
+        let bad = format!(
+            r#"{{"type":"set_watch_set","categories":8,"scripthashes":["{}","zz"]}}"#,
+            "cc".repeat(32),
+        );
+        let outcome = apply_ws_control(&bad, &handle, None, &mask, &mut ws, 0, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::Malformed)),
+            "a malformed element refuses the whole snapshot",
+        );
+        assert_eq!(ws.len(), 2, "the live set is untouched by a rejected replace");
+        assert_eq!(mask.load(Ordering::Relaxed), 2, "categories are not changed by a rejected replace");
+        assert_eq!(watch_set_result_json(&crate::watchset::ReplaceOutcome::Malformed)["body"]["reason"], "malformed");
+    }
+
+    #[test]
+    fn set_watch_set_is_bounded_by_the_per_connection_entry_cap() {
+        // The SetWatchSet path must honor streamwsmaxsubscriptions like the
+        // incremental adds — otherwise one frame installs an unbounded set on a
+        // no-auth connection. No principal (loopback) → the cap is the only bound.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(0);
+        let mut ws = WatchSet::default();
+
+        // cap = 2. A 3-scripthash replace is rejected whole; nothing registers.
+        let over = format!(
+            r#"{{"type":"set_watch_set","scripthashes":["{}","{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+        );
+        let outcome = apply_ws_control(&over, &handle, None, &mask, &mut ws, 2, (8, 32));
+        assert!(
+            matches!(outcome, Some(crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })),
+            "over-cap SetWatchSet must be rejected, got {outcome:?}",
+        );
+        assert_eq!(ws.len(), 0, "a cap-rejected replace installs nothing");
+        assert_eq!(
+            watch_set_result_json(&crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })["body"]["reason"],
+            "cap_exceeded",
+        );
+
+        // A 2-scripthash replace fits the cap exactly.
+        let ok = format!(
+            r#"{{"type":"set_watch_set","scripthashes":["{}","{}"]}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+        );
+        let outcome = apply_ws_control(&ok, &handle, None, &mask, &mut ws, 2, (8, 32));
+        assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
+        assert_eq!(ws.len(), 2);
     }
 
     #[test]

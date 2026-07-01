@@ -133,13 +133,15 @@ pub use client::{
 pub use error::StreamError;
 pub use event::{
     Cursor, CursorRejectReason, Event, EvictReason, Outpoint, PrefixMatch, ScriptPrefix,
-    SpentPrevout,
+    SpentPrevout, WatchSetRejectReason,
 };
 pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,
     ResilientSubscription,
 };
-pub use resilient_watch::{ResilientWatch, ResilientWatchConfig, WatchSetBuilder};
+pub use resilient_watch::{
+    ReloadError, ReloadSummary, ResilientWatch, ResilientWatchConfig, WatchSetBuilder,
+};
 
 #[cfg(feature = "bitcoin")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]

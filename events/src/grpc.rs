@@ -1090,6 +1090,13 @@ impl NodeEventStream for NodeEventStreamSvc {
         let (reject_tx, reject_rx) =
             tokio::sync::mpsc::channel::<node::events::CursorRejectReason>(32);
 
+        // Deterministic result of an atomic SetWatchSet replace, handed from the
+        // inbound reader (which applies it under the watch-set lock) to the
+        // outbound task (which emits the in-band WatchSetResult). Same bridge
+        // shape as the SetCursor rejection channel.
+        let (ws_result_tx, mut ws_result_rx) =
+            tokio::sync::mpsc::channel::<crate::watchset::ReplaceOutcome>(32);
+
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
         // scoped watch-set, and holds a handle clone so the subscription is
@@ -1100,6 +1107,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             let watch_set = watch_set.clone();
             let reanchor_in_flight = reanchor_in_flight.clone();
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
+            let ws_result_tx = ws_result_tx;
             tokio::spawn(async move {
                 use node::events::CursorRejectReason;
                 // Hand a deterministic rejection to the outbound task. BLOCKS when
@@ -1171,6 +1179,35 @@ impl NodeEventStream for NodeEventStreamSvc {
                         if reanchor_tx.try_send(cur).is_err() {
                             reanchor_in_flight.store(false, Ordering::Release);
                         }
+                        continue;
+                    }
+                    // SetWatchSet is an atomic replace whose deterministic
+                    // WatchSetResult must reach the outbound task; apply it under
+                    // the lock, then forward the outcome (mirrors SetCursor). The
+                    // guard is scoped so it drops before the `.await` below.
+                    if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg {
+                        let outcome = match desired_from_proto(s, prefix_bounds) {
+                            // A malformed element refuses the whole snapshot before
+                            // the lock is ever taken — the live set is untouched.
+                            Err(_) => crate::watchset::ReplaceOutcome::Malformed,
+                            Ok(desired) => {
+                                let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                // gRPC entry-caps neither incremental adds nor a
+                                // replace (quota is its bound) → max_items = 0.
+                                let outcome = guard.replace(principal.as_ref(), desired, 0, &*handle);
+                                // The category filter is part of the desired set, so
+                                // apply it only when the replace was accepted — a
+                                // rejection leaves the whole set (categories
+                                // included) unchanged, as WatchSetRejected promises.
+                                if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
+                                    let mask = if s.categories == 0 { u32::MAX } else { s.categories };
+                                    category_mask.store(mask, Ordering::Relaxed);
+                                }
+                                outcome
+                            }
+                        };
+                        // Outbound gone (stream tearing down) → nothing to deliver.
+                        let _ = ws_result_tx.send(outcome).await;
                         continue;
                     }
                     let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
@@ -1309,6 +1346,14 @@ impl NodeEventStream for NodeEventStreamSvc {
                         let head = publisher.resume_cursor(last_h, last_s);
                         let ev = node::events::cursor_rejected_event(&publisher, reason, head);
                         if tx_out.send(Ok(envelope_to_proto(&ev))).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Deterministic result of an atomic SetWatchSet replace applied
+                    // by the inbound reader: emit the in-band WatchSetResult.
+                    Some(outcome) = ws_result_rx.recv() => {
+                        let ev = watch_set_result_to_proto(&edge, &outcome);
+                        if tx_out.send(Ok(ev)).await.is_err() {
                             return;
                         }
                     }
@@ -1499,28 +1544,35 @@ fn apply_control(
         }
         Some(Msg::AddDescriptor(d)) => {
             // Expand the descriptor over its [start, start+gap_limit) window and
-            // watch it (rust-miniscript). Charges one unit per net-new script.
-            // The client advances `start` to slide the window (gap-limit
-            // tracking is client-side).
+            // watch it (rust-miniscript), retaining the descriptor → scripthashes
+            // membership so it can be slid or removed cleanly. Charges one unit
+            // per net-new script. The client advances `start` to slide the window
+            // (gap-limit tracking is client-side); re-asserting reconciles.
             match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
                 Ok(scripts) => {
-                    watch_set.add_scripts(
+                    watch_set.add_descriptor(
                         principal,
+                        d.descriptor.clone(),
                         scripts.into_iter().map(|(_, sh)| sh),
-                        "descriptor",
                         |shs| {
                             handle.add_scripthashes(shs);
                         },
-                        // Descriptor-derived scripts carry no `min_value` floor,
-                        // so a re-asserted (window-overlap) script needs no
-                        // metadata refresh.
-                        |_| {},
+                        |shs| {
+                            handle.remove_scripthashes(shs);
+                        },
                     );
                 }
                 Err(e) => {
                     warn!(target: "events::grpc", error = %e, "ignoring invalid descriptor");
                 }
             }
+        }
+        Some(Msg::RemoveDescriptor(r)) => {
+            // Drop a previously-added descriptor, releasing the scripthashes its
+            // window contributed whose last owner this removes.
+            watch_set.remove_descriptor(&r.descriptor, |shs| {
+                handle.remove_scripthashes(shs);
+            });
         }
         Some(Msg::AddScriptPrefixes(a)) => {
             // Validate + price each prefix; malformed or out-of-range buckets are
@@ -1576,7 +1628,136 @@ fn apply_control(
                 "SetCursor reached apply_control unexpectedly; ignoring (handled as re-anchor upstream)",
             );
         }
+        Some(Msg::SetWatchSet(_)) => {
+            // Like SetCursor: the inbound loop intercepts SetWatchSet (an atomic
+            // replace whose deterministic WatchSetResult must reach the outbound
+            // task) before calling apply_control. Defensive arm for other callers.
+            debug!(
+                target: "events::grpc",
+                "SetWatchSet reached apply_control unexpectedly; ignoring (handled as atomic replace upstream)",
+            );
+        }
         None => {}
+    }
+}
+
+/// Build a [`DesiredWatchSet`] from a `SetWatchSet` snapshot: expand each
+/// descriptor over its window and parse the concrete kinds. `prefix_bounds`
+/// prices the prefix buckets.
+///
+/// STRICT: a `SetWatchSet` is a full replacement, so any element that fails to
+/// parse or expand fails the whole build (`Err`). Silently dropping a bad item —
+/// as the incremental `Add*` best-effort paths do — would shrink the desired set
+/// and make [`replace`](crate::watchset::WatchSet::replace) unregister
+/// previously-live watches while still reporting `Accepted`. All-or-nothing: the
+/// caller turns `Err` into a `WatchSetRejected{MALFORMED}` and leaves the live
+/// set untouched.
+fn desired_from_proto(
+    s: &pb::SetWatchSet,
+    prefix_bounds: (u8, u8),
+) -> Result<crate::watchset::DesiredWatchSet, &'static str> {
+    let (prefix_min_bits, prefix_max_bits) = prefix_bounds;
+    // `min_values` is either empty (no floors) or exactly parallel to
+    // `scripthashes`. A non-empty length mismatch is malformed: `get(i)` would
+    // otherwise silently clear floors (too few) or ignore them (too many),
+    // changing filters the client did not ask to change.
+    if !s.min_values.is_empty() && s.min_values.len() != s.scripthashes.len() {
+        return Err("min_values length");
+    }
+    let mut scripts: Vec<([u8; 32], u64)> = Vec::with_capacity(s.scripthashes.len());
+    for (i, b) in s.scripthashes.iter().enumerate() {
+        let sh = parse_scripthash(b).ok_or("scripthash")?;
+        scripts.push((sh, s.min_values.get(i).copied().unwrap_or(0)));
+    }
+    let mut descriptors: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(s.descriptors.len());
+    for d in &s.descriptors {
+        match crate::descriptor::expand_descriptor(&d.descriptor, d.start, d.gap_limit) {
+            Ok(shs) => descriptors.push((
+                d.descriptor.clone(),
+                shs.into_iter().map(|(_, sh)| sh).collect(),
+            )),
+            Err(e) => {
+                warn!(target: "events::grpc", error = %e, "SetWatchSet: rejecting snapshot for invalid descriptor");
+                return Err("descriptor");
+            }
+        }
+    }
+    let mut outpoints = Vec::with_capacity(s.outpoints.len());
+    for op in &s.outpoints {
+        outpoints.push(parse_outpoint(op).ok_or("outpoint")?);
+    }
+    let mut lifecycles = Vec::with_capacity(s.lifecycles.len());
+    for l in &s.lifecycles {
+        let t = parse_txid(&l.txid).ok_or("lifecycle txid")?;
+        lifecycles.push((t, l.auto_close_depth));
+    }
+    let mut depth_alarms = Vec::with_capacity(s.depth_alarms.len());
+    for a in &s.depth_alarms {
+        if a.depth < 1 {
+            return Err("depth alarm depth");
+        }
+        let t = parse_txid(&a.txid).ok_or("depth alarm txid")?;
+        depth_alarms.push((t, a.depth));
+    }
+    let mut prefixes = Vec::with_capacity(s.prefixes.len());
+    for p in &s.prefixes {
+        let parsed = crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits)
+            .ok_or("prefix")?;
+        prefixes.push(parsed);
+    }
+    Ok(crate::watchset::DesiredWatchSet {
+        scripts,
+        descriptors,
+        outpoints,
+        lifecycles,
+        depth_alarms,
+        prefixes,
+    })
+}
+
+/// Render a [`ReplaceOutcome`] as the in-band `WatchSetResult` node event.
+fn watch_set_result_to_proto(
+    edge: &node::events::EdgeIdentity,
+    outcome: &crate::watchset::ReplaceOutcome,
+) -> pb::NodeEvent {
+    use crate::watchset::ReplaceOutcome;
+    let outcome = match outcome {
+        ReplaceOutcome::Accepted { added, removed, unchanged } => {
+            pb::watch_set_result::Outcome::Accepted(pb::WatchSetAccepted {
+                added: *added,
+                removed: *removed,
+                unchanged: *unchanged,
+            })
+        }
+        ReplaceOutcome::Rejected { required, quota } => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::QuotaExceeded as i32,
+                required: *required,
+                quota: *quota,
+            })
+        }
+        ReplaceOutcome::CapExceeded { limit, requested } => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::CapExceeded as i32,
+                required: *requested,
+                quota: *limit,
+            })
+        }
+        ReplaceOutcome::Malformed => {
+            pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
+                reason: pb::watch_set_rejected::Reason::Malformed as i32,
+                required: 0,
+                quota: 0,
+            })
+        }
+    };
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::SetWatchSetResult(pb::WatchSetResult {
+            outcome: Some(outcome),
+        })),
     }
 }
 
@@ -1989,6 +2170,77 @@ mod tests {
 
     fn edge() -> EdgeIdentity {
         EdgeIdentity::new([0x42; 16], Some("us-east1")).unwrap()
+    }
+
+    #[test]
+    fn desired_from_proto_is_strict_all_or_nothing() {
+        // A full replace must reject the whole snapshot if any element is
+        // unparseable — never silently drop it (which would shrink the set and
+        // unregister live watches while replace() still reports Accepted).
+        let ok = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            ..Default::default()
+        };
+        let d = desired_from_proto(&ok, (8, 32)).expect("all-valid snapshot builds");
+        assert_eq!(d.scripts.len(), 2);
+
+        // One malformed scripthash (wrong length) fails the whole build.
+        let bad_sh = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 31]],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_sh, (8, 32)).is_err(), "bad scripthash rejects snapshot");
+
+        // A malformed outpoint (bad txid length) fails too.
+        let bad_op = pb::SetWatchSet {
+            outpoints: vec![pb::Outpoint { txid: vec![0u8; 31], vout: 0 }],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_op, (8, 32)).is_err(), "bad outpoint rejects snapshot");
+
+        // A depth alarm with depth 0 is invalid.
+        let bad_depth = pb::SetWatchSet {
+            depth_alarms: vec![pb::WatchDepthAlarm { txid: vec![0x33; 32], depth: 0 }],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad_depth, (8, 32)).is_err(), "depth 0 rejects snapshot");
+
+        // Non-empty min_values must be exactly parallel to scripthashes: too few
+        // (would silently clear floors) and too many (silently ignored) are both
+        // malformed. Empty is fine (no floors).
+        let too_few = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            min_values: vec![5],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&too_few, (8, 32)).is_err(), "too few floors rejects snapshot");
+        let too_many = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32]],
+            min_values: vec![5, 6],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&too_many, (8, 32)).is_err(), "too many floors rejects snapshot");
+        let parallel = pb::SetWatchSet {
+            scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
+            min_values: vec![5, 6],
+            ..Default::default()
+        };
+        let d = desired_from_proto(&parallel, (8, 32)).expect("parallel floors build");
+        assert_eq!(d.scripts, vec![([0x11; 32], 5), ([0x22; 32], 6)]);
+    }
+
+    #[test]
+    fn malformed_outcome_maps_to_rejected_malformed() {
+        let ev = watch_set_result_to_proto(&edge(), &crate::watchset::ReplaceOutcome::Malformed);
+        let Some(pb::node_event::Body::SetWatchSetResult(r)) = ev.body else {
+            panic!("expected a WatchSetResult body");
+        };
+        let Some(pb::watch_set_result::Outcome::Rejected(rj)) = r.outcome else {
+            panic!("Malformed maps to a Rejected outcome");
+        };
+        assert_eq!(rj.reason, pb::watch_set_rejected::Reason::Malformed as i32);
+        assert_eq!(rj.required, 0);
+        assert_eq!(rj.quota, 0);
     }
 
     #[test]
@@ -2598,6 +2850,7 @@ mod tests {
                 pb::node_event::Body::TxidFinalized(_) => "txid_finalized",
                 pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
                 pb::node_event::Body::SetCursorResult(_) => "set_cursor_result",
+                pb::node_event::Body::SetWatchSetResult(_) => "set_watch_set_result",
             })
             .collect();
         assert!(
@@ -3525,6 +3778,51 @@ mod tests {
             (8, 32),
         );
         assert!(reg.has_watchers(), "descriptor expansion should register a watch-set");
+    }
+
+    /// `apply_control(RemoveDescriptor)` drops the window a prior AddDescriptor
+    /// registered, leaving no watchers (no auth → unlimited).
+    #[test]
+    fn apply_control_remove_descriptor_drops_the_window() {
+        const DESC: &str = "wpkh(xpub6BosfCnifzxcFwrSzQiqu2DBVTshkCXacvNsWGYJVVhhawA7d4R5WSWGFNbi8Aw6ZRc1brxMyWMzG3DSSSSoekkudhUd9yLb6qx39T9nMdj/0/*)";
+        let reg = Arc::new(node::events::WatchRegistry::new());
+        let (handle, _rx) = reg.register(node::events::WATCH_CHANNEL_CAPACITY);
+        let mask = AtomicU32::new(u32::MAX);
+        let mut leases = WatchSet::default();
+        let add = |leases: &mut WatchSet| {
+            apply_control(
+                pb::SubscribeControl {
+                    msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
+                        descriptor: DESC.into(),
+                        gap_limit: 4,
+                        start: 0,
+                    })),
+                },
+                &handle,
+                None,
+                &mask,
+                leases,
+                (8, 32),
+            );
+        };
+        add(&mut leases);
+        assert!(reg.has_watchers(), "precondition: the window is registered");
+        assert_eq!(leases.len(), 4);
+
+        apply_control(
+            pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::RemoveDescriptor(pb::RemoveDescriptor {
+                    descriptor: DESC.into(),
+                })),
+            },
+            &handle,
+            None,
+            &mask,
+            &mut leases,
+            (8, 32),
+        );
+        assert_eq!(leases.len(), 0, "removing the descriptor drops its whole window");
+        assert!(!reg.has_watchers(), "no watchers remain after RemoveDescriptor");
     }
 
     /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set

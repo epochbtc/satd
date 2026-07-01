@@ -56,9 +56,12 @@ caps, and how to scale beyond one node.
 
 The gRPC service offers the server-streaming `Subscribe` (the firehose, with
 cursor replay) plus a **bidirectional** `Watch` whose client→server messages are
-a tagged union — `SetCursor`, `SetCategories`, and `Add`/`Remove` for scripts,
-outpoints, transactions, script-prefixes, and descriptors. New subscription
-kinds slot in additively without protocol breakage.
+a tagged union — `SetCursor`, `SetCategories`, `Add`/`Remove` for scripts,
+outpoints, transactions, script-prefixes, and descriptors, and `SetWatchSet` (an
+atomic whole-set replace: send the complete desired watch-set in one message and
+the server reconciles it under its lock by effective coverage, replying with a
+deterministic `WatchSetResult`). New subscription kinds slot in additively
+without protocol breakage.
 
 Match events delivered on the per-subscriber `Watch` channel include:
 
@@ -88,10 +91,15 @@ costs that many watch units); the branch count is capped at 2 — more is reject
 Expansion is bounded per branch (`MAX_DESCRIPTOR_WINDOW = 1000`, so at most 2000
 scripts for a 2-branch descriptor) and rejects any secret-bearing descriptor at
 the type level, so no signing material can ever be submitted — the node stays
-keyless. Gap-limit advancement is a client concern by design: the client drives a
-sliding window by issuing a fresh `AddDescriptor` with an advanced `start` and
-`Remove`-ing the trailing scripts — **all** branches' scripts for each slid index
-on a multipath descriptor, since removal is by explicit scripthash.
+keyless. The server retains the descriptor → scripthashes membership for the
+connection, so a window can be slid or dropped cleanly: re-sending `AddDescriptor`
+with an advanced `start` reconciles the slid window server-side (scripts leaving
+the window are released, scripts entering are added), and `RemoveDescriptor` drops
+the whole window. A scripthash shared with a direct add or another descriptor is
+held until its **last** owner goes. Gap-limit advancement stays a client concern
+by design: the server manages the window it is told to, but never tracks
+derivation progress or nudges the client to extend — the client decides when to
+advance `start` (or `RemoveDescriptor`).
 
 ## Cursors & replay
 
