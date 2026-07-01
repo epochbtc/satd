@@ -470,60 +470,37 @@ impl WatchSet {
             + (target_depths.len() - kept_depths)
             + (target_prefixes.len() - kept_prefixes)) as u32;
 
-        // ---- Quota: release the current reservation, acquire the target ----
-        // Release-before-acquire (under the lock) avoids transient over-quota;
-        // membership KEYS are kept (only the leases are nulled), so a rejected
-        // acquire re-leases them and the registry is never touched. `batch` is
-        // one lease, so per-item leases split cleanly (incl. multi-unit prefixes).
+        // ---- Quota: atomically swap the reservation current → target -------
+        // One locked read-modify-write in the store (`replace_watch`): no window
+        // where the old units are freed but the target's are not yet held. So a
+        // same-size swap fits at exactly the quota ceiling (no transient
+        // over-count), and a REJECT leaves the reservation — and every existing
+        // lease — exactly as it was (no rollback, no race where a concurrent
+        // stream for this principal steals momentarily-freed units). On accept the
+        // swap already handed off the old units, so defuse the old lease objects
+        // before rebuilding lest their `Drop` release the same units twice.
+        // `batch` is one lease, so per-item leases split cleanly (incl. prefixes).
         let batch: Option<satd_auth::WatchLease> = if let Some(p) = principal {
-            let old_prefix_units: Vec<(PrefixKey, u64)> = self
-                .prefixes
-                .iter()
-                .map(|(k, l)| (*k, l.as_ref().map(satd_auth::WatchLease::units).unwrap_or(0)))
-                .collect();
             let current_units = self.scripts.len() as u64
                 + self.outpoints.len() as u64
                 + self.txids.len() as u64
                 + self.tx_depths.len() as u64
-                + old_prefix_units.iter().map(|(_, u)| *u).sum::<u64>();
-            self.release_all_leases();
-            match p.acquire_watch(target_units) {
-                Ok(b) => Some(b),
-                Err(reject) => {
-                    // Target does not fit: re-acquire and re-lease the unchanged
-                    // membership (rollback), leaving the registry as it was.
-                    let quota = match &reject {
-                        satd_auth::WatchReject::QuotaExceeded(q) => q.max,
-                        _ => 0,
-                    };
-                    if let Ok(mut ob) = p.acquire_watch(current_units) {
-                        for v in self.outpoints.values_mut() {
-                            *v = ob.split_off_one();
-                        }
-                        for v in self.scripts.values_mut() {
-                            *v = ob.split_off_one();
-                        }
-                        for v in self.txids.values_mut() {
-                            *v = ob.split_off_one();
-                        }
-                        for v in self.tx_depths.values_mut() {
-                            *v = ob.split_off_one();
-                        }
-                        for (k, v) in self.prefixes.iter_mut() {
-                            let u = old_prefix_units
-                                .iter()
-                                .find(|(pk, _)| pk == k)
-                                .map(|(_, u)| *u)
-                                .unwrap_or(0);
-                            *v = ob.split_off(u);
-                        }
-                    } else {
-                        warn!(
-                            target: "events::watchset",
-                            "SetWatchSet rollback re-acquire lost a quota race; watch-set under-leased",
-                        );
-                    }
-                    return ReplaceOutcome::Rejected { required: target_units, quota };
+                + self
+                    .prefixes
+                    .values()
+                    .filter_map(|l| l.as_ref().map(satd_auth::WatchLease::units))
+                    .sum::<u64>();
+            match p.replace_watch(current_units, target_units) {
+                Ok(b) => {
+                    self.defuse_leases();
+                    Some(b)
+                }
+                Err(satd_auth::WatchReject::QuotaExceeded(q)) => {
+                    return ReplaceOutcome::Rejected { required: target_units, quota: q.max };
+                }
+                Err(_) => {
+                    // Lacks `stream:watch`: no headroom, set left unchanged.
+                    return ReplaceOutcome::Rejected { required: target_units, quota: 0 };
                 }
             }
         } else {
@@ -582,24 +559,36 @@ impl WatchSet {
         ReplaceOutcome::Accepted { added, removed, unchanged }
     }
 
-    /// Release the whole current quota reservation, keeping every membership key
-    /// (nulls the lease slots). Used by [`replace`](Self::replace) so a rejected
-    /// re-acquire can re-lease the unchanged set without a registry round-trip.
-    fn release_all_leases(&mut self) {
+    /// Defuse (drop **without** releasing) every current per-item lease. Used by
+    /// [`replace`](Self::replace) after an atomic quota swap
+    /// ([`Principal::replace_watch`](satd_auth::Principal::replace_watch)) has
+    /// already handed off the old units — their `Drop` must not release them a
+    /// second time. The maps are rebuilt wholesale immediately after.
+    fn defuse_leases(&mut self) {
         for v in self.outpoints.values_mut() {
-            *v = None;
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
         }
         for v in self.scripts.values_mut() {
-            *v = None;
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
         }
         for v in self.txids.values_mut() {
-            *v = None;
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
         }
         for v in self.tx_depths.values_mut() {
-            *v = None;
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
         }
         for v in self.prefixes.values_mut() {
-            *v = None;
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
         }
     }
 

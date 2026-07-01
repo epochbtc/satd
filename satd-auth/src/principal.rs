@@ -149,6 +149,26 @@ impl Principal {
         WatchLease::acquire(self.acct.quota(), Arc::from(self.id()), n, max)
             .map_err(WatchReject::QuotaExceeded)
     }
+
+    /// Atomically swap a watch reservation: release `release` units and acquire
+    /// `acquire`, in one step. The returned [`WatchLease`] holds the newly
+    /// `acquire`d units; the caller must [`defuse`](WatchLease::defuse) the leases
+    /// backing the released units (their units are gone via this swap). This is
+    /// the quota half of an atomic watch-set *replace*: on `Err` nothing changed
+    /// (the old reservation stands), and on `Ok` a same-size swap fits at exactly
+    /// the quota ceiling with no transient over-count and no release/re-acquire
+    /// race. See [`QuotaStore::try_replace`].
+    pub fn replace_watch(&self, release: u64, acquire: u64) -> Result<WatchLease, WatchReject> {
+        self.require(Capability::StreamWatch)
+            .map_err(WatchReject::MissingCapability)?;
+        let max = self.watch_quota.unwrap_or(u64::MAX);
+        let id: Arc<str> = Arc::from(self.id());
+        self.acct
+            .quota()
+            .try_replace(&id, release, acquire, max)
+            .map_err(WatchReject::QuotaExceeded)?;
+        Ok(WatchLease::from_reserved(self.acct.quota(), id, acquire))
+    }
 }
 
 /// Why [`Principal::acquire_watch`] refused a streaming subscription.

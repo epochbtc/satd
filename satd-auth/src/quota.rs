@@ -80,6 +80,31 @@ pub trait QuotaStore: Send + Sync {
     fn release(&self, principal_id: &str, n: u64);
     /// Units currently held by `principal_id` (diagnostics / tests).
     fn current(&self, principal_id: &str) -> u64;
+    /// **Atomically** swap a reservation: release `release` units and acquire
+    /// `acquire`, succeeding only if the post-swap total stays at or under `max`.
+    /// This is the primitive an atomic watch-set *replace* needs: releasing the
+    /// old reservation and acquiring the new one in one step means there is never
+    /// a window where the units are freed but not yet re-held — so a same-size
+    /// swap fits at exactly `max` (no transient over-count) and a rejected swap
+    /// leaves the reservation **exactly** as it was (no race where a concurrent
+    /// stream for the same principal steals the momentarily-freed units).
+    ///
+    /// The default is the non-atomic release-then-acquire; a real backend MUST
+    /// override it with a locked read-modify-write for the guarantee above.
+    fn try_replace(
+        &self,
+        principal_id: &str,
+        release: u64,
+        acquire: u64,
+        max: u64,
+    ) -> Result<(), QuotaExceeded> {
+        self.release(principal_id, release);
+        self.try_acquire(principal_id, acquire, max).inspect_err(|_| {
+            // Restore what we released so the failure is a no-op (best effort;
+            // the default path is not atomic — override for the real guarantee).
+            let _ = self.try_acquire(principal_id, release, u64::MAX);
+        })
+    }
 }
 
 /// RAII handle holding `n` watch units for a principal. Dropping it (connection
@@ -105,6 +130,26 @@ impl WatchLease {
             principal_id,
             n,
         })
+    }
+
+    /// Wrap `n` units the store has **already reserved** (e.g. via
+    /// [`QuotaStore::try_replace`]) in a lease, without charging them again. The
+    /// returned lease releases `n` on drop, exactly like [`acquire`](Self::acquire).
+    /// The caller is responsible for [`defuse`](Self::defuse)ing whatever leases
+    /// the reservation replaced, so the units are not double-released.
+    pub fn from_reserved(store: Arc<dyn QuotaStore>, principal_id: Arc<str>, n: u64) -> WatchLease {
+        WatchLease {
+            store,
+            principal_id,
+            n,
+        }
+    }
+
+    /// Consume this lease **without** releasing its units — for a lease whose
+    /// units were already handed off (e.g. released as part of an atomic
+    /// [`QuotaStore::try_replace`]), so its `Drop` must not release them again.
+    pub fn defuse(mut self) {
+        self.n = 0; // Drop then releases 0 units.
     }
 
     /// Units this lease holds.
@@ -327,6 +372,28 @@ impl QuotaStore for LocalQuotaStore {
     fn current(&self, principal_id: &str) -> u64 {
         self.held.get(principal_id).map(|v| *v).unwrap_or(0)
     }
+    fn try_replace(
+        &self,
+        principal_id: &str,
+        release: u64,
+        acquire: u64,
+        max: u64,
+    ) -> Result<(), QuotaExceeded> {
+        // Under the DashMap entry lock, so the read-modify-write is atomic: no
+        // concurrent stream for this principal can observe the released-but-not-
+        // reacquired state or steal the units mid-swap.
+        let mut held = self.held.entry(principal_id.to_string()).or_insert(0);
+        let after_release = held.saturating_sub(release);
+        if after_release.saturating_add(acquire) > max {
+            return Err(QuotaExceeded {
+                current: after_release,
+                requested: acquire,
+                max,
+            });
+        }
+        *held = after_release + acquire;
+        Ok(())
+    }
 }
 
 /// The default in-process accounting backend: a token-bucket rate limiter plus a
@@ -471,6 +538,42 @@ mod tests {
         drop(a);
         drop(c);
         assert_eq!(q.current("tenant"), 0, "all per-item leases released");
+    }
+
+    #[test]
+    fn try_replace_is_atomic_and_fits_a_same_size_swap_at_quota() {
+        let store = LocalQuotaStore::new();
+        store.try_acquire("t", 5, 5).unwrap(); // hold 5 of max 5
+        assert_eq!(store.current("t"), 5);
+
+        // A same-size swap fits at exactly the ceiling — the release and acquire
+        // are one step, so there is never a 5+5 over-count.
+        store.try_replace("t", 5, 5, 5).unwrap();
+        assert_eq!(store.current("t"), 5);
+
+        // An over-quota swap (5 - 2 + 4 = 7 > 5) is rejected and changes nothing.
+        assert!(store.try_replace("t", 2, 4, 5).is_err());
+        assert_eq!(store.current("t"), 5, "a rejected swap leaves the reservation intact");
+
+        // A shrink always fits.
+        store.try_replace("t", 5, 2, 5).unwrap();
+        assert_eq!(store.current("t"), 2);
+    }
+
+    #[test]
+    fn from_reserved_lease_releases_on_drop_and_defuse_does_not() {
+        let store: Arc<dyn QuotaStore> = Arc::new(LocalQuotaStore::new());
+        // Pretend the store already reserved 3 units (e.g. via try_replace).
+        store.try_acquire("p", 3, 10).unwrap();
+        let lease = WatchLease::from_reserved(store.clone(), Arc::from("p"), 3);
+        assert_eq!(store.current("p"), 3);
+        drop(lease);
+        assert_eq!(store.current("p"), 0, "from_reserved lease releases on drop");
+
+        store.try_acquire("p", 3, 10).unwrap();
+        let lease = WatchLease::from_reserved(store.clone(), Arc::from("p"), 3);
+        lease.defuse();
+        assert_eq!(store.current("p"), 3, "defuse drops without releasing");
     }
 
     #[test]
