@@ -163,6 +163,12 @@ pub struct GrpcEventSink {
     /// `from_cursor` request then streams live only). Never on the consensus
     /// hot path — replay reads blocks the node already holds.
     block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+    /// Full block-body + undo access for bounded historical rescan
+    /// (`RescanBlocks` on the `Watch` stream). `Some` when a chain source is
+    /// wired (production); `None` disables rescan (a `RescanBlocks` is then
+    /// rejected `NO_SOURCE`). Like `block_source`, never on the consensus hot
+    /// path — it reads blocks the node already holds.
+    scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
     /// Live outpoint/script watch registry backing the bidirectional
     /// `Watch` RPC. `None` disables `Watch` (returns `UNAVAILABLE`).
     watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
@@ -241,6 +247,7 @@ impl GrpcEventSink {
         limits: GrpcLimits,
         auth: Option<std::sync::Arc<satd_auth::TokenStore>>,
         block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+        scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
         watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
         tls: Option<GrpcTlsParams>,
     ) -> Result<Self, GrpcEventSinkError> {
@@ -296,6 +303,7 @@ impl GrpcEventSink {
             limits,
             auth,
             block_source,
+            scan_source,
             watch_registry,
             tls,
         })
@@ -336,6 +344,7 @@ impl EventSink for GrpcEventSink {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: self.limits.max_subscriptions,
             block_source: self.block_source.clone(),
+            scan_source: self.scan_source.clone(),
             watch_registry: self.watch_registry.clone(),
             prefix_min_bits: self.limits.prefix_min_bits,
             prefix_max_bits: self.limits.prefix_max_bits,
@@ -571,6 +580,9 @@ struct NodeEventStreamSvc {
     /// Read-only block-index access for durable cursor replay; `None`
     /// disables replay (forward-only).
     block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
+    /// Full block-body + undo access for bounded historical rescan; `None`
+    /// disables rescan (`RescanBlocks` → `NO_SOURCE`).
+    scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
     /// Live watch registry backing the `Watch` RPC; `None` disables it.
     watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
     /// Operator bounds on script-prefix watch granularity (§7.5).
@@ -1097,6 +1109,26 @@ impl NodeEventStream for NodeEventStreamSvc {
         let (ws_result_tx, mut ws_result_rx) =
             tokio::sync::mpsc::channel::<crate::watchset::ReplaceOutcome>(32);
 
+        // Bounded historical rescan (§6.1): a `RescanBlocks` on the inbound
+        // control stream hands its (from, to) range to the outbound task, which
+        // runs the watch-set matcher over the range and drains the matches ahead
+        // of resuming live. Same bridge shape as the SetCursor re-anchor.
+        let (rescan_tx, rescan_rx) = tokio::sync::mpsc::channel::<(u32, u32)>(1);
+        // "A rescan is in flight" — set by the inbound reader when it queues a
+        // range, cleared by the outbound task once the scan fully drains. Spans
+        // queue→drain so a concurrent RescanBlocks is rejected for the whole
+        // window (the capacity-1 channel alone does not — recv empties it at the
+        // start of the drain). Independent of the re-anchor in-flight slot: a
+        // rescan is a side query and may run alongside a re-anchor.
+        let rescan_in_flight = Arc::new(AtomicBool::new(false));
+        // Rescan rejection channel: a `RescanBlocks` the inbound reader declines
+        // (rate-limited, or a rescan already in flight) hands its reason to the
+        // outbound task for a deterministic `RescanResult{Rejected}`. Same
+        // backpressure contract as the SetCursor reject channel (blocks on full,
+        // never drops — "exactly one RescanResult per actionable RescanBlocks").
+        let (rescan_reject_tx, rescan_reject_rx) =
+            tokio::sync::mpsc::channel::<node::events::RescanRejectReason>(32);
+
         // Inbound control reader: applies watch-set mutations + category
         // changes for the life of the stream against the shared subscription-
         // scoped watch-set, and holds a handle clone so the subscription is
@@ -1108,8 +1140,12 @@ impl NodeEventStream for NodeEventStreamSvc {
             let reanchor_in_flight = reanchor_in_flight.clone();
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
             let ws_result_tx = ws_result_tx;
+            let rescan_in_flight = rescan_in_flight.clone();
+            let rescan_tx = rescan_tx;
+            let rescan_reject_tx = rescan_reject_tx;
             tokio::spawn(async move {
                 use node::events::CursorRejectReason;
+                use node::events::RescanRejectReason;
                 // Hand a deterministic rejection to the outbound task. BLOCKS when
                 // the channel is full (backpressuring the client's control stream)
                 // rather than dropping — a silently-lost rejection is the exact bug
@@ -1120,6 +1156,15 @@ impl NodeEventStream for NodeEventStreamSvc {
                 async fn reject(
                     tx: &tokio::sync::mpsc::Sender<CursorRejectReason>,
                     reason: CursorRejectReason,
+                ) {
+                    let _ = tx.send(reason).await;
+                }
+                // Rescan twin of `reject`: hand a deterministic rescan rejection
+                // to the outbound task, blocking on a full channel (backpressure)
+                // rather than dropping. `Err` = outbound gone; ignored.
+                async fn rescan_reject(
+                    tx: &tokio::sync::mpsc::Sender<RescanRejectReason>,
+                    reason: RescanRejectReason,
                 ) {
                     let _ = tx.send(reason).await;
                 }
@@ -1210,6 +1255,44 @@ impl NodeEventStream for NodeEventStreamSvc {
                         let _ = ws_result_tx.send(outcome).await;
                         continue;
                     }
+                    // RescanBlocks is a bounded historical rescan (a side query),
+                    // not a watch-set mutation: forward its range to the outbound
+                    // task (which owns the scan source + this connection's watch-
+                    // set) or a rejection reason. Range validation/clamping is
+                    // done there; here we enforce only the rate limit and the
+                    // single-in-flight guard, exactly like SetCursor.
+                    if let Some(pb::subscribe_control::Msg::RescanBlocks(rb)) = &ctrl.msg {
+                        // A rescan drives up to MAX_RESCAN_BLOCKS block-body+undo
+                        // reads and a matcher pass — heavier than a re-anchor.
+                        // Rate-limit per principal (operator/loopback bypass).
+                        if let Some(p) = principal.as_ref()
+                            && let satd_auth::RateDecision::Throttle { retry_after_secs } =
+                                p.check_rate()
+                        {
+                            debug!(
+                                target: "events::grpc",
+                                retry_after_secs,
+                                "rejecting RescanBlocks: per-principal rate limit exceeded",
+                            );
+                            rescan_reject(&rescan_reject_tx, RescanRejectReason::RateLimited).await;
+                            continue;
+                        }
+                        // Claim the single in-flight slot (queued OR draining) →
+                        // else reject ConcurrentRescan. Cleared by the outbound
+                        // task once the scan drains.
+                        if rescan_in_flight.swap(true, Ordering::AcqRel) {
+                            rescan_reject(&rescan_reject_tx, RescanRejectReason::ConcurrentRescan)
+                                .await;
+                            continue;
+                        }
+                        // We own the slot, so the capacity-1 channel is empty: a
+                        // send error can only be `Closed` (outbound gone). Release
+                        // the slot in that case.
+                        if rescan_tx.try_send((rb.from_height, rb.to_height)).is_err() {
+                            rescan_in_flight.store(false, Ordering::Release);
+                        }
+                        continue;
+                    }
                     let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
                     apply_control(
                         ctrl,
@@ -1237,6 +1320,12 @@ impl NodeEventStream for NodeEventStreamSvc {
         );
         let publisher = self.publisher.clone();
         let block_source = self.block_source.clone();
+        // Rescan (§6.1) needs full block bodies + undo (`scan_source`), the
+        // shared registry (to snapshot THIS connection's watch-set into an
+        // isolated ephemeral registry), and the handle (for its subscriber id).
+        let scan_source = self.scan_source.clone();
+        let rescan_registry = registry.clone();
+        let rescan_handle = handle.clone();
         // Resume-cursor seed: the Watch firehose has no establishment replay, so
         // seed the resume height from the CURRENT chain tip (not 0) — a client
         // that lags before any block event (e.g. one watching only matches with
@@ -1251,6 +1340,8 @@ impl NodeEventStream for NodeEventStreamSvc {
         let mut rx_match = rx_match;
         let mut reanchor_rx = reanchor_rx;
         let mut reject_rx = reject_rx;
+        let mut rescan_rx = rescan_rx;
+        let mut rescan_reject_rx = rescan_reject_rx;
         tokio::spawn(async move {
             use node::events::WatchMatch;
             // Keep the subscription alive for the task's lifetime: the
@@ -1356,6 +1447,86 @@ impl NodeEventStream for NodeEventStreamSvc {
                         if tx_out.send(Ok(ev)).await.is_err() {
                             return;
                         }
+                    }
+                    // Bounded historical rescan (§6.1): scan THIS connection's
+                    // watch-set over [from,to] and drain the confirmed matches in
+                    // height order, bracketed by a RescanResult ack and a terminal
+                    // RescanComplete. A side query — it does NOT advance the
+                    // durable forward cursor (last_h/last_s untouched), and it may
+                    // run alongside a re-anchor. `rescan_in_flight` (set by inbound)
+                    // is cleared on every exit path from this arm.
+                    Some((req_from, req_to)) = rescan_rx.recv() => {
+                        let Some(src) = scan_source.as_ref() else {
+                            rescan_in_flight.store(false, Ordering::Release);
+                            let ev = rescan_rejected_event(
+                                &edge, node::events::RescanRejectReason::NoSource, 0,
+                            );
+                            if tx_out.send(Ok(ev)).await.is_err() { return; }
+                            continue;
+                        };
+                        let tip = src.current_tip_height();
+                        // Snapshot this connection's watch-set into an isolated,
+                        // single-subscriber registry — no cross-connection leakage,
+                        // no drop-on-lag. `None` ⇒ empty watch-set.
+                        let Some(ephemeral) =
+                            rescan_registry.clone_for_rescan(rescan_handle.sub_id())
+                        else {
+                            rescan_in_flight.store(false, Ordering::Release);
+                            let ev = rescan_rejected_event(
+                                &edge, node::events::RescanRejectReason::EmptyWatchSet, tip,
+                            );
+                            if tx_out.send(Ok(ev)).await.is_err() { return; }
+                            continue;
+                        };
+                        let plan = match node::events::plan_rescan(src.as_ref(), req_from, req_to) {
+                            Ok(p) => p,
+                            Err(reason) => {
+                                rescan_in_flight.store(false, Ordering::Release);
+                                let ev = rescan_rejected_event(&edge, reason, tip);
+                                if tx_out.send(Ok(ev)).await.is_err() { return; }
+                                continue;
+                            }
+                        };
+                        // Ack in-band ahead of the matches (mirrors CursorAccepted).
+                        let ack = rescan_accepted_event(&edge, plan.from, plan.to, plan.clamped);
+                        if tx_out.send(Ok(ack)).await.is_err() { return; }
+                        // Undo is fetched only when an input-side script/prefix
+                        // match could need it (spent-prevout scriptPubKeys).
+                        let need_undo =
+                            ephemeral.has_script_watchers() || ephemeral.has_prefix_watchers();
+                        let mut matches: u64 = 0;
+                        // Reorg-safe (height,hash) resolution, then body+undo reads
+                        // and the matcher, all off the consensus hot path.
+                        for (h, hash) in src.active_chain_range(plan.from, plan.to) {
+                            let Some(block) = src.block_body(&hash) else { continue };
+                            let undo = if need_undo { src.block_undo(&hash) } else { None };
+                            for m in ephemeral.scan_block_collect(&block, h, undo.as_ref()) {
+                                matches += 1;
+                                // Rescan does not attribute descriptor matches (the
+                                // ephemeral registry holds raw scripthashes, not the
+                                // descriptor→script membership the live path keeps).
+                                let ev = watch_match_to_proto(&edge, &m, Vec::new());
+                                if tx_out.send(Ok(ev)).await.is_err() { return; }
+                            }
+                        }
+                        debug!(
+                            target: "events::grpc",
+                            from = plan.from, to = plan.to, matches,
+                            "events gRPC Watch bounded historical rescan drained",
+                        );
+                        let done = rescan_complete_event(&edge, plan.from, plan.to, matches);
+                        if tx_out.send(Ok(done)).await.is_err() { return; }
+                        rescan_in_flight.store(false, Ordering::Release);
+                    }
+                    // A rescan the inbound reader declined (rate-limited or already
+                    // in flight): deterministic rejection. Live stream unchanged.
+                    Some(reason) = rescan_reject_rx.recv() => {
+                        let tip = scan_source
+                            .as_ref()
+                            .map(|s| s.current_tip_height())
+                            .unwrap_or(0);
+                        let ev = rescan_rejected_event(&edge, reason, tip);
+                        if tx_out.send(Ok(ev)).await.is_err() { return; }
                     }
                     live = rx_live.recv() => match live {
                         Ok(env) => {
@@ -1658,6 +1829,15 @@ fn apply_control(
                 "SetWatchSet reached apply_control unexpectedly; ignoring (handled as atomic replace upstream)",
             );
         }
+        Some(Msg::RescanBlocks(_)) => {
+            // Like SetCursor/SetWatchSet: the inbound loop intercepts
+            // RescanBlocks (a bounded historical rescan, §6.1) before calling
+            // apply_control. Defensive arm for other callers.
+            debug!(
+                target: "events::grpc",
+                "RescanBlocks reached apply_control unexpectedly; ignoring (handled as rescan upstream)",
+            );
+        }
         None => {}
     }
 }
@@ -1776,6 +1956,77 @@ fn watch_set_result_to_proto(
         cursor: None,
         body: Some(pb::node_event::Body::SetWatchSetResult(pb::WatchSetResult {
             outcome: Some(outcome),
+        })),
+    }
+}
+
+/// Build the in-band `RescanResult{Accepted}` node event — the ack emitted
+/// ahead of a bounded historical rescan's matches (§6.1). Carries no cursor: a
+/// rescan is a side query and does not advance the durable forward cursor.
+fn rescan_accepted_event(
+    edge: &node::events::EdgeIdentity,
+    from_height: u32,
+    to_height: u32,
+    clamped: bool,
+) -> pb::NodeEvent {
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::RescanResult(pb::RescanResult {
+            outcome: Some(pb::rescan_result::Outcome::Accepted(pb::RescanAccepted {
+                from_height,
+                to_height,
+                clamped,
+            })),
+        })),
+    }
+}
+
+/// Build the in-band `RescanResult{Rejected}` node event for a refused rescan.
+fn rescan_rejected_event(
+    edge: &node::events::EdgeIdentity,
+    reason: node::events::RescanRejectReason,
+    tip_height: u32,
+) -> pb::NodeEvent {
+    use node::events::RescanRejectReason as R;
+    let reason = match reason {
+        R::RateLimited => pb::rescan_rejected::Reason::RateLimited,
+        R::ConcurrentRescan => pb::rescan_rejected::Reason::ConcurrentRescan,
+        R::InvalidRange => pb::rescan_rejected::Reason::InvalidRange,
+        R::RangeTooLarge => pb::rescan_rejected::Reason::RangeTooLarge,
+        R::NoSource => pb::rescan_rejected::Reason::NoSource,
+        R::EmptyWatchSet => pb::rescan_rejected::Reason::EmptyWatchSet,
+    };
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::RescanResult(pb::RescanResult {
+            outcome: Some(pb::rescan_result::Outcome::Rejected(pb::RescanRejected {
+                reason: reason as i32,
+                tip_height,
+            })),
+        })),
+    }
+}
+
+/// Build the terminal `RescanComplete` node event — the rescan range is fully
+/// scanned and every match delivered; the stream resumes its prior live position.
+fn rescan_complete_event(
+    edge: &node::events::EdgeIdentity,
+    from_height: u32,
+    to_height: u32,
+    matches: u64,
+) -> pb::NodeEvent {
+    pb::NodeEvent {
+        schema_version: node::events::SCHEMA_VERSION,
+        stamp: Some(replay_stamp(edge)),
+        cursor: None,
+        body: Some(pb::node_event::Body::RescanComplete(pb::RescanComplete {
+            from_height,
+            to_height,
+            matches,
         })),
     }
 }
@@ -2516,7 +2767,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None, None).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None, None, None).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -2526,7 +2777,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None, None, None)
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -2539,7 +2790,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None, None)
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None, None, None)
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -2575,6 +2826,7 @@ mod tests {
             false,
             publisher.clone(),
             GrpcLimits::default(),
+            None,
             None,
             None,
             None,
@@ -2629,6 +2881,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(GrpcTlsParams {
                 cert_path,
                 key_path,
@@ -2660,6 +2913,7 @@ mod tests {
             false,
             publisher,
             GrpcLimits::default(),
+            None,
             None,
             None,
             None,
@@ -2701,6 +2955,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(GrpcTlsParams {
                 cert_path,
                 key_path,
@@ -2738,6 +2993,7 @@ mod tests {
             false,
             publisher.clone(),
             limits,
+            None,
             None,
             None,
             None,
@@ -2826,7 +3082,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None, None, None)
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
@@ -2910,6 +3166,8 @@ mod tests {
                 pb::node_event::Body::PrefixMatched(_) => "prefix_matched",
                 pb::node_event::Body::SetCursorResult(_) => "set_cursor_result",
                 pb::node_event::Body::SetWatchSetResult(_) => "set_watch_set_result",
+                pb::node_event::Body::RescanResult(_) => "rescan_result",
+                pb::node_event::Body::RescanComplete(_) => "rescan_complete",
             })
             .collect();
         assert!(
@@ -2931,6 +3189,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 2,
             block_source: None,
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3078,6 +3337,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3132,6 +3392,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3206,6 +3467,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3284,6 +3546,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3341,6 +3604,7 @@ mod tests {
             max_subscriptions: 0,
             // tip 0 → no confirmed replay; isolate the mempool window.
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3400,6 +3664,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3449,6 +3714,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3489,6 +3755,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: None,
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3532,6 +3799,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: None,
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -3900,6 +4168,7 @@ mod tests {
             GrpcLimits::default(),
             None,
             None,
+            None,
             Some(registry.clone()),
             None,
         )
@@ -3995,6 +4264,7 @@ mod tests {
             GrpcLimits::default(),
             None,
             Some(Arc::new(MockBlocks { tip: 5 })),
+            None,
             Some(registry.clone()),
             None,
         )
@@ -4198,6 +4468,7 @@ mod tests {
             GrpcLimits::default(),
             Some(store),
             Some(Arc::new(MockBlocks { tip: 5 })),
+            None,
             Some(registry.clone()),
             None,
         )
@@ -4347,6 +4618,7 @@ mod tests {
             GrpcLimits::default(),
             None,
             Some(Arc::new(blocks)),
+            None,
             Some(registry.clone()),
             None,
         )
@@ -4452,6 +4724,7 @@ mod tests {
             GrpcLimits::default(),
             None,
             Some(Arc::new(blocks)),
+            None,
             Some(registry.clone()),
             None,
         )
@@ -4551,6 +4824,7 @@ mod tests {
             GrpcLimits::default(),
             None,
             None, // no block source: a re-anchor can't wake the loop either
+            None,
             Some(registry.clone()),
             None,
         )
@@ -4620,6 +4894,7 @@ mod tests {
             active_subs: Arc::new(AtomicUsize::new(0)),
             max_subscriptions: 0,
             block_source: None,
+            scan_source: None,
             watch_registry: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
@@ -4638,5 +4913,253 @@ mod tests {
         }
         // Counter stays at zero when the cap is disabled.
         assert_eq!(svc.active_subs.load(Ordering::Acquire), 0);
+    }
+
+    /// A `BlockScanSource` holding real blocks keyed by height — the block-body +
+    /// undo source a bounded historical rescan reads.
+    struct MockScanBlocks {
+        tip: u32,
+        blocks: std::collections::HashMap<u32, bitcoin::Block>,
+    }
+
+    impl node::events::BlockCursorSource for MockScanBlocks {
+        fn current_tip_height(&self) -> u32 {
+            self.tip
+        }
+        fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {
+            let hi = to.min(self.tip);
+            let lo = from.max(1);
+            (lo..=hi)
+                .filter_map(|h| self.blocks.get(&h).map(|b| (h, b.block_hash())))
+                .collect()
+        }
+    }
+
+    impl node::events::BlockScanSource for MockScanBlocks {
+        fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block> {
+            self.blocks.values().find(|b| b.block_hash() == *hash).cloned()
+        }
+        fn block_undo(&self, _hash: &BlockHash) -> Option<node::storage::undo::UndoData> {
+            None
+        }
+    }
+
+    /// End-to-end: a `RescanBlocks` over the Watch stream scans this connection's
+    /// watch-set against historical blocks and returns the matches in-band,
+    /// bracketed by `RescanResult{Accepted}` and `RescanComplete`.
+    #[tokio::test]
+    async fn watch_rescan_delivers_historical_matches() {
+        use bitcoin::hashes::Hash;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+
+        // A block at height 3 spending the watched outpoint.
+        let op = bitcoin::OutPoint {
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
+            vout: 1,
+        };
+        let spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: op,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        let block3 = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0),
+                nonce: 3,
+            },
+            txdata: vec![spend],
+        };
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(3u32, block3);
+        let scan_source: Arc<dyn node::events::BlockScanSource> =
+            Arc::new(MockScanBlocks { tip: 5, blocks });
+
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            Some(scan_source),
+            Some(registry.clone()),
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
+                .await
+                .expect("connect");
+
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0xcd, 1)],
+                })),
+            })
+            .await
+            .unwrap();
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+
+        // Wait until the watch is registered, then request the rescan.
+        for _ in 0..100 {
+            if registry.has_watchers() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registry.has_watchers(), "watch should register");
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::RescanBlocks(pb::RescanBlocks {
+                    from_height: 1,
+                    to_height: 5,
+                })),
+            })
+            .await
+            .unwrap();
+
+        // Read until RescanComplete, asserting the ack + match arrive in order.
+        // (Heartbeats from the live firehose may interleave before the rescan
+        // arm is selected; skip them.)
+        let mut saw_accept = false;
+        let mut saw_match = false;
+        let mut saw_complete = false;
+        for _ in 0..50 {
+            let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+                .await
+                .expect("timeout")
+                .expect("transport")
+                .expect("stream ended");
+            match ev.body.expect("body") {
+                pb::node_event::Body::RescanResult(r) => match r.outcome.expect("outcome") {
+                    pb::rescan_result::Outcome::Accepted(a) => {
+                        assert_eq!((a.from_height, a.to_height), (1, 5));
+                        assert!(!a.clamped, "to=5 == tip, no clamp");
+                        assert!(!saw_match && !saw_complete, "ack precedes matches");
+                        saw_accept = true;
+                    }
+                    pb::rescan_result::Outcome::Rejected(rj) => {
+                        panic!("unexpected rescan rejection: reason={}", rj.reason)
+                    }
+                },
+                pb::node_event::Body::OutpointSpent(o) => {
+                    assert_eq!(o.outpoint_vout, 1);
+                    assert!(o.confirmed, "historical rescan match is confirmed");
+                    saw_match = true;
+                }
+                pb::node_event::Body::RescanComplete(c) => {
+                    assert_eq!((c.from_height, c.to_height, c.matches), (1, 5, 1));
+                    saw_complete = true;
+                    break;
+                }
+                pb::node_event::Body::Heartbeat(_) => {} // live firehose; ignore
+                other => panic!("unexpected event during rescan: {other:?}"),
+            }
+        }
+        assert!(saw_accept, "RescanResult{{Accepted}} delivered");
+        assert!(saw_match, "OutpointSpent match delivered");
+        assert!(saw_complete, "RescanComplete delivered");
+
+        drop(ctrl_tx);
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// A `RescanBlocks` with no scan source configured is deterministically
+    /// rejected `NO_SOURCE`.
+    #[tokio::test]
+    async fn watch_rescan_without_scan_source_is_rejected() {
+        let publisher = EventPublisher::new(edge(), 64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            None, // no scan source
+            Some(registry.clone()),
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client =
+            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
+                .await
+                .expect("connect");
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
+        // Watch something so the rescan isn't rejected EMPTY_WATCH_SET first.
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+                    outpoints: vec![op_proto(0x01, 0)],
+                })),
+            })
+            .await
+            .unwrap();
+        ctrl_tx
+            .send(pb::SubscribeControl {
+                msg: Some(pb::subscribe_control::Msg::RescanBlocks(pb::RescanBlocks {
+                    from_height: 1,
+                    to_height: 3,
+                })),
+            })
+            .await
+            .unwrap();
+        let mut stream = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch")
+            .into_inner();
+
+        for _ in 0..50 {
+            let ev = tokio::time::timeout(Duration::from_secs(3), stream.message())
+                .await
+                .expect("timeout")
+                .expect("transport")
+                .expect("stream ended");
+            if let pb::node_event::Body::RescanResult(r) = ev.body.expect("body") {
+                match r.outcome.expect("outcome") {
+                    pb::rescan_result::Outcome::Rejected(rj) => {
+                        assert_eq!(rj.reason, pb::rescan_rejected::Reason::NoSource as i32);
+                        drop(ctrl_tx);
+                        let _ = shutdown_tx.send(true);
+                        return;
+                    }
+                    pb::rescan_result::Outcome::Accepted(_) => {
+                        panic!("expected NO_SOURCE rejection, got acceptance")
+                    }
+                }
+            }
+        }
+        panic!("no RescanResult received");
     }
 }

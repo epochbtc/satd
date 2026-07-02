@@ -354,6 +354,42 @@ pub enum Event {
         /// (`CapExceeded`); 0 for `Malformed`.
         quota: u64,
     },
+    /// A bounded historical rescan ([`ResilientWatch::rescan`](crate::ResilientWatch::rescan))
+    /// was **admitted**. Confirmed watch-matches for the scanned range follow
+    /// this event (in height order), terminated by a [`RescanComplete`](Event::RescanComplete).
+    /// `from_height`/`to_height` are the range the server will ACTUALLY scan:
+    /// `clamped` is true when the requested upper bound exceeded the tip and was
+    /// narrowed to it. A rescan is a side query — it does not advance the durable
+    /// cursor, and its match events carry no resume cursor.
+    RescanAccepted {
+        /// First height that will be scanned (post-clamp).
+        from_height: u32,
+        /// Last height that will be scanned (post-clamp).
+        to_height: u32,
+        /// `true` → the requested range was narrowed to what the node holds.
+        clamped: bool,
+    },
+    /// A bounded historical rescan was **not** admitted; no matches follow and
+    /// the live stream is unchanged. `tip_height` is the server's current tip so
+    /// a client can re-scope the range and retry.
+    RescanRejected {
+        /// Why the rescan was declined.
+        reason: RescanRejectReason,
+        /// The server's current active-chain tip height.
+        tip_height: u32,
+    },
+    /// Terminal marker for a bounded historical rescan: the range has been fully
+    /// scanned and every match delivered. `matches` counts the match events this
+    /// rescan emitted (0 when the range held none). After this the stream resumes
+    /// its prior live position.
+    RescanComplete {
+        /// The scanned range (post-clamp), echoing [`RescanAccepted`](Event::RescanAccepted).
+        from_height: u32,
+        /// The scanned range upper bound (post-clamp).
+        to_height: u32,
+        /// Number of match events emitted for this rescan.
+        matches: u64,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,
@@ -409,6 +445,44 @@ fn watch_set_reject_reason(reason: i32) -> WatchSetRejectReason {
         Ok(pb::watch_set_rejected::Reason::CapExceeded) => WatchSetRejectReason::CapExceeded,
         Ok(pb::watch_set_rejected::Reason::Malformed) => WatchSetRejectReason::Malformed,
         Ok(pb::watch_set_rejected::Reason::Unspecified) | Err(_) => WatchSetRejectReason::Unknown,
+    }
+}
+
+/// Why a bounded historical rescan was declined by the server (see
+/// [`Event::RescanRejected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RescanRejectReason {
+    /// Per-principal rescan rate limit exceeded — retry after a backoff.
+    RateLimited,
+    /// Another rescan is already draining on this connection (only one runs at a
+    /// time) — retry once it completes.
+    ConcurrentRescan,
+    /// `to_height < from_height`, or the range lies entirely above the tip.
+    InvalidRange,
+    /// The (clamped) span exceeds the server cap — page the range into smaller
+    /// rescans.
+    RangeTooLarge,
+    /// The server has no block-scan source (no local block bodies/undo).
+    NoSource,
+    /// The connection watches nothing — a rescan could match nothing. Register a
+    /// watch-set first.
+    EmptyWatchSet,
+    /// A reason code this client build does not recognize (a newer server).
+    Unknown,
+}
+
+/// Map the proto `RescanRejected.Reason` enum (an `i32` on the wire) to the
+/// client enum, treating an unrecognized code as [`RescanRejectReason::Unknown`].
+fn rescan_reject_reason(reason: i32) -> RescanRejectReason {
+    match pb::rescan_rejected::Reason::try_from(reason) {
+        Ok(pb::rescan_rejected::Reason::RateLimited) => RescanRejectReason::RateLimited,
+        Ok(pb::rescan_rejected::Reason::ConcurrentRescan) => RescanRejectReason::ConcurrentRescan,
+        Ok(pb::rescan_rejected::Reason::InvalidRange) => RescanRejectReason::InvalidRange,
+        Ok(pb::rescan_rejected::Reason::RangeTooLarge) => RescanRejectReason::RangeTooLarge,
+        Ok(pb::rescan_rejected::Reason::NoSource) => RescanRejectReason::NoSource,
+        Ok(pb::rescan_rejected::Reason::EmptyWatchSet) => RescanRejectReason::EmptyWatchSet,
+        Ok(pb::rescan_rejected::Reason::Unspecified) | Err(_) => RescanRejectReason::Unknown,
     }
 }
 
@@ -508,6 +582,23 @@ impl From<pb::NodeEvent> for Event {
                     quota: rj.quota,
                 },
                 None => Event::Unknown,
+            },
+            Body::RescanResult(r) => match r.outcome {
+                Some(pb::rescan_result::Outcome::Accepted(a)) => Event::RescanAccepted {
+                    from_height: a.from_height,
+                    to_height: a.to_height,
+                    clamped: a.clamped,
+                },
+                Some(pb::rescan_result::Outcome::Rejected(rj)) => Event::RescanRejected {
+                    reason: rescan_reject_reason(rj.reason),
+                    tip_height: rj.tip_height,
+                },
+                None => Event::Unknown,
+            },
+            Body::RescanComplete(c) => Event::RescanComplete {
+                from_height: c.from_height,
+                to_height: c.to_height,
+                matches: c.matches,
             },
         }
     }

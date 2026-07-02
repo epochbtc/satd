@@ -101,6 +101,108 @@ impl BlockCursorSource for crate::chain::state::ChainState {
     }
 }
 
+/// Full block-body + undo access for a **bounded historical rescan**
+/// ([`RescanBlocks`] on the Watch stream). Extends [`BlockCursorSource`]
+/// (heights + hashes only) with the two reads the matcher needs to reproduce
+/// confirmed watch-matches over a closed range: the block's transactions and
+/// its undo data (spent-prevout coins, which drive input-side script/prefix
+/// matching — the spending tx alone carries no prevout `scriptPubKey`).
+///
+/// Implemented by [`ChainState`](crate::chain::state::ChainState). Reads blocks
+/// the node already holds; **read-only and off the consensus hot path**, exactly
+/// like [`build_cursor_replay`].
+///
+/// [`RescanBlocks`]: https://docs.rs/satd-events-proto
+pub trait BlockScanSource: BlockCursorSource {
+    /// Full block for `hash`, or `None` if not held locally (pruned or
+    /// header-only). A rescan silently skips heights whose body is unavailable.
+    fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block>;
+
+    /// Undo data for `hash` (spent coins, one per non-coinbase input in connect
+    /// order), or `None` if not held. Needed only when a script or prefix is
+    /// watched; the caller skips fetching it otherwise.
+    fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData>;
+}
+
+impl BlockScanSource for crate::chain::state::ChainState {
+    fn block_body(&self, hash: &BlockHash) -> Option<bitcoin::Block> {
+        self.get_block(hash)
+    }
+
+    fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
+        self.get_undo(hash)
+    }
+}
+
+/// Span cap for a single [`RescanBlocks`]: the maximum number of blocks one
+/// bounded historical rescan may scan. Set equal to [`MAX_REPLAY_BLOCKS`] — a
+/// rescan does strictly more work per block (full body + undo read + matcher)
+/// than a forward replay (index read + event synthesis), so it is capped no
+/// looser. A client covering a wider range pages it into successive rescans.
+pub const MAX_RESCAN_BLOCKS: u32 = MAX_REPLAY_BLOCKS;
+
+/// Why a bounded historical rescan was refused. The carrier maps this to the
+/// wire `RescanRejected.Reason`. `RateLimited` / `ConcurrentRescan` / `NoSource`
+/// / `EmptyWatchSet` are decided by the carrier (rate policy, in-flight guard,
+/// source/watch-set presence); [`plan_rescan`] produces only the range verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanRejectReason {
+    /// Per-principal rescan rate limit exceeded.
+    RateLimited,
+    /// Another rescan is already draining on this connection.
+    ConcurrentRescan,
+    /// `to < from`, or the requested range lies entirely above the active tip.
+    InvalidRange,
+    /// The (clamped) span exceeds [`MAX_RESCAN_BLOCKS`].
+    RangeTooLarge,
+    /// No block-scan source is configured (no local block bodies/undo).
+    NoSource,
+    /// The connection watches nothing — a rescan could match nothing.
+    EmptyWatchSet,
+}
+
+/// The admitted, clamped range a rescan will actually scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RescanPlan {
+    /// First height to scan (inclusive).
+    pub from: u32,
+    /// Last height to scan (inclusive), clamped to the active tip.
+    pub to: u32,
+    /// The requested upper bound exceeded the tip and was narrowed to it.
+    pub clamped: bool,
+}
+
+/// Validate and clamp a requested rescan range `[from, to]` against `src`'s
+/// active chain. Pure (no block reads): rejects an inverted range, a range
+/// wholly above the tip, or one whose clamped span exceeds
+/// [`MAX_RESCAN_BLOCKS`]; otherwise returns the range to scan with the upper end
+/// clamped to the current tip (`clamped` set when narrowing occurred).
+pub fn plan_rescan(
+    src: &dyn BlockScanSource,
+    from: u32,
+    to: u32,
+) -> Result<RescanPlan, RescanRejectReason> {
+    if to < from {
+        return Err(RescanRejectReason::InvalidRange);
+    }
+    let tip = src.current_tip_height();
+    if from > tip {
+        // Nothing on the active chain to scan (the whole range is in the future).
+        return Err(RescanRejectReason::InvalidRange);
+    }
+    let hi = to.min(tip);
+    let clamped = to > tip;
+    let span = hi - from + 1;
+    if span > MAX_RESCAN_BLOCKS {
+        return Err(RescanRejectReason::RangeTooLarge);
+    }
+    Ok(RescanPlan {
+        from,
+        to: hi,
+        clamped,
+    })
+}
+
 /// Result of a durable cursor replay: the events to emit before the live
 /// stream, plus the boundary-dedup keys the live filter uses to suppress
 /// duplicates at the snapshot→live seam.
@@ -341,6 +443,69 @@ mod tests {
                 .map(|h| (h, BlockHash::from_byte_array([h as u8; 32])))
                 .collect()
         }
+    }
+
+    // Bodies are unused by `plan_rescan` (pure range planning); the flat chain
+    // holds no real blocks.
+    impl BlockScanSource for FlatChain {
+        fn block_body(&self, _hash: &BlockHash) -> Option<bitcoin::Block> {
+            None
+        }
+        fn block_undo(&self, _hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
+            None
+        }
+    }
+
+    #[test]
+    fn plan_rescan_clamps_upper_to_tip() {
+        let src = FlatChain { tip: 100 };
+        let plan = plan_rescan(&src, 10, 500).expect("admitted");
+        assert_eq!((plan.from, plan.to), (10, 100));
+        assert!(plan.clamped, "upper bound above tip → clamped");
+    }
+
+    #[test]
+    fn plan_rescan_within_chain_is_not_clamped() {
+        let src = FlatChain { tip: 100 };
+        let plan = plan_rescan(&src, 10, 90).expect("admitted");
+        assert_eq!((plan.from, plan.to, plan.clamped), (10, 90, false));
+    }
+
+    #[test]
+    fn plan_rescan_rejects_inverted_range() {
+        let src = FlatChain { tip: 100 };
+        assert_eq!(plan_rescan(&src, 50, 40), Err(RescanRejectReason::InvalidRange));
+    }
+
+    #[test]
+    fn plan_rescan_rejects_range_above_tip() {
+        let src = FlatChain { tip: 100 };
+        assert_eq!(
+            plan_rescan(&src, 101, 200),
+            Err(RescanRejectReason::InvalidRange)
+        );
+    }
+
+    #[test]
+    fn plan_rescan_rejects_span_over_cap() {
+        // A clamped span exceeding MAX_RESCAN_BLOCKS is refused.
+        let src = FlatChain {
+            tip: MAX_RESCAN_BLOCKS + 10,
+        };
+        assert_eq!(
+            plan_rescan(&src, 0, MAX_RESCAN_BLOCKS),
+            Err(RescanRejectReason::RangeTooLarge)
+        );
+        // Exactly at the cap is admitted.
+        let plan = plan_rescan(&src, 1, MAX_RESCAN_BLOCKS).expect("at-cap admitted");
+        assert_eq!(plan.to - plan.from + 1, MAX_RESCAN_BLOCKS);
+    }
+
+    #[test]
+    fn plan_rescan_single_height() {
+        let src = FlatChain { tip: 100 };
+        let plan = plan_rescan(&src, 42, 42).expect("admitted");
+        assert_eq!((plan.from, plan.to, plan.clamped), (42, 42, false));
     }
 
     fn publisher() -> std::sync::Arc<EventPublisher> {

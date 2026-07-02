@@ -1107,6 +1107,26 @@ impl ResilientWatch {
         self.after_send(res)
     }
 
+    /// Request a bounded historical rescan of the current watch-set over the
+    /// inclusive height range `[from_height, to_height]` (see
+    /// [`WatchHandle::rescan`](crate::WatchHandle::rescan)). The ack and any
+    /// matches arrive in-band on [`next`](Self::next): [`Event::RescanAccepted`]
+    /// → confirmed matches (height order) → [`Event::RescanComplete`], or
+    /// [`Event::RescanRejected`].
+    ///
+    /// Unlike [`set_cursor`](Self::set_cursor), a rescan touches **no** resilient
+    /// state: it is a side query, orthogonal to the watch-set mirror and the
+    /// resume cursor, so it is neither replayed on reconnect nor retried in
+    /// place. If the stream drops mid-rescan, re-issue it after reconnect. With
+    /// the stream currently down this is a no-op returning `Ok(())`.
+    pub async fn rescan(&mut self, from_height: u32, to_height: u32) -> Result<(), StreamError> {
+        let res = match &self.handle {
+            Some(h) => Some(h.rescan(from_height, to_height).await),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
     /// Re-run the configured [`watch_set_loader`](ResilientWatchConfig::watch_set_loader),
     /// diff the freshly-loaded canonical set against the live watch-set, and apply
     /// **only the delta** on the wire — realigning the subscription with the
