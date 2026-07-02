@@ -30,8 +30,9 @@ pub use envelope::{
 };
 pub use publisher::{EventPublisher, ENVELOPE_BROADCAST_CAPACITY};
 pub use replay::{
-    build_cursor_replay, cursor_accepted_event, cursor_rejected_event, lagged_event,
-    BlockCursorSource, CursorReplay, MAX_REPLAY_BLOCKS,
+    build_cursor_replay, cursor_accepted_event, cursor_rejected_event, lagged_event, plan_rescan,
+    BlockCursorSource, BlockScanSource, CursorReplay, RescanPlan, RescanRejectReason,
+    MAX_REPLAY_BLOCKS, MAX_RESCAN_BLOCKS,
 };
 pub use schema::SCHEMA_VERSION;
 pub use sink::EventSink;

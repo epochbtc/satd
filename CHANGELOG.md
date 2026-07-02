@@ -11,6 +11,23 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Bounded historical rescan (`RescanBlocks`).** A pull primitive on the
+  bidirectional gRPC `Watch` stream: `RescanBlocks{from_height, to_height}`
+  scans **this connection's** current watch-set against a closed, span-capped
+  active-chain range and returns the confirmed matches (`ScriptMatched`,
+  `OutpointSpent`, `TxidMatched`, `PrefixMatched`) in height order, bracketed by
+  a deterministic `RescanResult{Accepted{from,to,clamped} | Rejected{reason,
+  tip_height}}` ack and a terminal `RescanComplete{from,to,matches}`. The pull
+  dual of the forward `SetCursor` replay, which synthesizes `BlockConnected` but
+  does not replay watch *matches* — this closes the streaming-watch-set
+  cold-sync / beyond-`MAX_REPLAY_BLOCKS` gap without the client reconstructing
+  matches block-by-block. Runs the same matcher as the live path against an
+  isolated single-subscriber registry (never leaks to other connections), off
+  the consensus hot path; rate-limited per principal, one rescan in flight at a
+  time (`ConcurrentRescan`), span-capped (`MAX_RESCAN_BLOCKS`, = `MAX_REPLAY_BLOCKS`).
+  A side query — it does not advance the durable cursor. New `satd-events-client`
+  `ResilientWatch::rescan()` / `WatchHandle::rescan()` and `Event::RescanAccepted`
+  / `Event::RescanRejected` / `Event::RescanComplete`. (#454)
 - **Retire the never-emitted `DescriptorNeedsAddresses` event.** The deprecated
   gap-limit side-channel (`NodeEvent.body` field 15) is removed from the wire
   schema and its tag reserved. No server ever emitted it — gap-limit

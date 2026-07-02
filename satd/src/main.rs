@@ -1092,6 +1092,11 @@ async fn main() {
             // client can resume from a `from_cursor` (snapshot→live handoff).
             // Read-only; never on the consensus hot path.
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
+            // Scan source for bounded historical rescan (§6.1): ChainState gives
+            // the `Watch` RPC read-only block-body + undo access to reproduce
+            // confirmed watch-matches over a closed height range. Read-only;
+            // never on the consensus hot path.
+            Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockScanSource>),
             // Live watch registry backing the bidirectional `Watch` RPC.
             Some(watch_registry.clone()),
             // In-process TLS / mTLS termination when a cert+key are configured.

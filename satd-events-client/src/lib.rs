@@ -133,7 +133,7 @@ pub use client::{
 pub use error::StreamError;
 pub use event::{
     Cursor, CursorRejectReason, DescriptorMatch, Event, EvictReason, Outpoint, PrefixMatch,
-    ScriptPrefix, SpentPrevout, WatchSetRejectReason,
+    RescanRejectReason, ScriptPrefix, SpentPrevout, WatchSetRejectReason,
 };
 pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,

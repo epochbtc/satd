@@ -666,8 +666,9 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
+        let mut sink = LiveSink;
         for tx in &block.txdata {
-            scan_tx(&inner, tx, true, Some(height));
+            scan_tx(&inner, tx, true, Some(height), &mut sink);
         }
         // Input-side script/prefix matching: only meaningful with a watched
         // script or prefix and the undo data to recover the spent prevout
@@ -675,8 +676,118 @@ impl WatchRegistry {
         if let Some(undo) = undo
             && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
-            scan_block_spent_scripts(&inner, block, height, undo);
+            scan_block_spent_scripts(&inner, block, height, undo, &mut sink);
         }
+    }
+
+    /// Scan a connected block against this registry and **collect** the matches
+    /// rather than delivering them to subscriber channels — the ordered,
+    /// backpressure-safe path a bounded historical rescan
+    /// ([`run_bounded_rescan`](crate::events::run_bounded_rescan)) uses. Runs
+    /// the exact same matcher as [`scan_block`]; returns the matches in scan
+    /// order (per tx: outpoint spends, then funding-script/prefix; then the
+    /// block's input-side script/prefix matches recovered from `undo`).
+    ///
+    /// Intended for an ephemeral registry built by
+    /// [`clone_for_rescan`](Self::clone_for_rescan), which holds exactly one
+    /// subscriber's watch-set, so every collected match belongs to that
+    /// subscriber — there is no cross-subscriber leakage and no drop-on-lag.
+    pub fn scan_block_collect(
+        &self,
+        block: &Block,
+        height: u32,
+        undo: Option<&UndoData>,
+    ) -> Vec<WatchMatch> {
+        let mut sink = CollectSink { out: Vec::new() };
+        if !self.has_watchers() {
+            return sink.out;
+        }
+        let inner = self.read_inner();
+        for tx in &block.txdata {
+            scan_tx(&inner, tx, true, Some(height), &mut sink);
+        }
+        if let Some(undo) = undo
+            && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
+        {
+            scan_block_spent_scripts(&inner, block, height, undo, &mut sink);
+        }
+        sink.out
+    }
+
+    /// Build a standalone registry holding a **copy** of subscriber `id`'s
+    /// current watch-set — exact scripts (with their `min_value` floors),
+    /// outpoints, txids, and prefix buckets — for an isolated single-subscriber
+    /// historical rescan. Because the returned registry has exactly one
+    /// subscriber, matches produced against it (via
+    /// [`scan_block_collect`](Self::scan_block_collect)) can never reach any
+    /// other connection's channel.
+    ///
+    /// Depth alarms and txid-lifecycle auto-close entries are intentionally
+    /// **not** copied: a bounded rescan reproduces the confirmed
+    /// script/outpoint/txid/prefix matches a live block scan would, not the
+    /// forward-looking, stateful depth/lifecycle transitions (those have no
+    /// meaning replayed over a closed historical range).
+    ///
+    /// Returns `None` when `id` is unknown or its watch-set is empty (a rescan
+    /// that could match nothing).
+    pub fn clone_for_rescan(&self, id: SubId) -> Option<Arc<WatchRegistry>> {
+        let src = self.read_inner();
+        let sub = src.subs.get(&id)?;
+        if sub.outpoints.is_empty()
+            && sub.scripthashes.is_empty()
+            && sub.txids.is_empty()
+            && sub.prefixes.is_empty()
+        {
+            return None;
+        }
+        let registry = Arc::new(WatchRegistry::new());
+        // A single synthetic subscriber holds the copied watch-set. Its channel
+        // is never used — the collect path routes through `CollectSink`, not
+        // `deliver` — but `Subscriber` owns a `Sender`, so create a throwaway.
+        let (tx, _rx) = mpsc::channel(1);
+        let new_id = registry.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut ni = registry.lock_inner();
+            ni.subs.insert(
+                new_id,
+                Subscriber {
+                    sender: tx,
+                    outpoints: sub.outpoints.clone(),
+                    scripthashes: sub.scripthashes.clone(),
+                    txids: sub.txids.clone(),
+                    tx_depths: HashSet::new(), // depth entries are not rescanned
+                    prefixes: sub.prefixes.clone(),
+                },
+            );
+            // Rebuild the inverted indexes this one subscriber contributes.
+            for op in &sub.outpoints {
+                ni.by_outpoint.entry(*op).or_default().insert(new_id);
+            }
+            for sh in sub.scripthashes.keys() {
+                ni.by_scripthash.entry(*sh).or_default().insert(new_id);
+            }
+            for t in &sub.txids {
+                ni.by_txid.entry(*t).or_default().insert(new_id);
+            }
+            for &(bits, masked) in &sub.prefixes {
+                ni.by_prefix.entry((bits, masked)).or_default().insert(new_id);
+                *ni.prefix_lens.entry(bits).or_default() += 1;
+            }
+        }
+        // Gate counters, mirroring the `add_*` accounting: every kind bumps
+        // `watch_items` (the `has_watchers` gate); scripts/txids/prefixes each
+        // also bump their per-kind gate.
+        let n_out = sub.outpoints.len();
+        let n_scr = sub.scripthashes.len();
+        let n_txid = sub.txids.len();
+        let n_pfx = sub.prefixes.len();
+        registry
+            .watch_items
+            .fetch_add(n_out + n_scr + n_txid + n_pfx, Ordering::AcqRel);
+        registry.script_items.fetch_add(n_scr, Ordering::AcqRel);
+        registry.txid_items.fetch_add(n_txid, Ordering::AcqRel);
+        registry.prefix_items.fetch_add(n_pfx, Ordering::AcqRel);
+        Some(registry)
     }
 
     /// Scan a single mempool transaction, routing matches to subscribers
@@ -686,7 +797,7 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
-        scan_tx(&inner, tx, false, None);
+        scan_tx(&inner, tx, false, None, &mut LiveSink);
     }
 
     /// Mempool **spend-side** script matching: the unconfirmed analogue of
@@ -1128,6 +1239,7 @@ pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
 /// `fired` dedups per `(bits, masked)` bucket across the tx's outputs: one event
 /// per bucket per tx, not one per matching output. `raw_tx` is the per-tx
 /// serialization cache, filled at most once and only on a real match.
+#[allow(clippy::too_many_arguments)] // threaded matcher context + delivery sink
 fn deliver_prefix_funding(
     inner: &Inner,
     sh: &Scripthash,
@@ -1136,6 +1248,7 @@ fn deliver_prefix_funding(
     confirmed: bool,
     height: Option<u32>,
     fired: &mut HashSet<(u8, u32)>,
+    sink: &mut dyn MatchSink,
 ) {
     if inner.prefix_lens.is_empty() {
         return;
@@ -1156,15 +1269,55 @@ fn deliver_prefix_funding(
                 matched_prevouts: Vec::new(),
             }));
             for sid in subs {
-                deliver(inner, *sid, &m);
+                sink.emit(inner, *sid, &m);
             }
         }
     }
 }
 
+/// Where the matcher routes a produced match. The live path
+/// ([`LiveSink`]) delivers to the owning subscriber's channel with
+/// drop-with-notice on lag; a bounded historical rescan ([`CollectSink`])
+/// gathers them for its single ephemeral subscriber into a `Vec` for ordered,
+/// backpressure-safe forwarding. Threaded through the block-scan matcher
+/// (`scan_tx`, `deliver_prefix_funding`, `scan_block_spent_scripts`) so both
+/// paths share one matcher and cannot drift.
+trait MatchSink {
+    fn emit(&mut self, inner: &Inner, id: SubId, m: &WatchMatch);
+}
+
+/// Live delivery — the standing behavior: non-blocking `try_send` to each
+/// matched subscriber's channel (see [`deliver`]).
+struct LiveSink;
+impl MatchSink for LiveSink {
+    #[inline]
+    fn emit(&mut self, inner: &Inner, id: SubId, m: &WatchMatch) {
+        deliver(inner, id, m);
+    }
+}
+
+/// Collecting sink for a single-subscriber ephemeral registry (rescan): every
+/// emitted match belongs to that one subscriber, so it is pushed verbatim in
+/// scan order. No channel, no drops.
+struct CollectSink {
+    out: Vec<WatchMatch>,
+}
+impl MatchSink for CollectSink {
+    #[inline]
+    fn emit(&mut self, _inner: &Inner, _id: SubId, m: &WatchMatch) {
+        self.out.push(m.clone());
+    }
+}
+
 /// Match a single transaction against the watch-set and deliver to the
 /// matching subscribers. Pure given `inner`; the hot loop the matcher runs.
-fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>) {
+fn scan_tx(
+    inner: &Inner,
+    tx: &Transaction,
+    confirmed: bool,
+    height: Option<u32>,
+    sink: &mut dyn MatchSink,
+) {
     let txid = tx.compute_txid();
 
     // Inputs → watched-outpoint spends.
@@ -1178,7 +1331,7 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                 height,
             };
             for sid in subs {
-                deliver(inner, *sid, &m);
+                sink.emit(inner, *sid, &m);
             }
         }
     }
@@ -1209,12 +1362,14 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
                 let value = out.value.to_sat();
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
-                        deliver(inner, *sid, &m);
+                        sink.emit(inner, *sid, &m);
                     }
                 }
             }
             if scan_prefixes {
-                deliver_prefix_funding(inner, &sh, &mut raw_tx, tx, confirmed, height, &mut fired);
+                deliver_prefix_funding(
+                    inner, &sh, &mut raw_tx, tx, confirmed, height, &mut fired, sink,
+                );
             }
         }
     }
@@ -1229,7 +1384,7 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
             height,
         };
         for sid in subs {
-            deliver(inner, *sid, &m);
+            sink.emit(inner, *sid, &m);
         }
     }
 }
@@ -1245,7 +1400,13 @@ fn scan_tx(inner: &Inner, tx: &Transaction, confirmed: bool, height: Option<u32>
 /// one piece of spend-detection the funding-side/outpoint primitives cannot
 /// give for a script whose funding the matcher never observed (e.g. a UTXO
 /// that predates the watch).
-fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &UndoData) {
+fn scan_block_spent_scripts(
+    inner: &Inner,
+    block: &Block,
+    height: u32,
+    undo: &UndoData,
+    sink: &mut dyn MatchSink,
+) {
     let scan_scripts = !inner.by_scripthash.is_empty();
     let scan_prefixes = !inner.prefix_lens.is_empty();
     let mut undo_idx = 0usize;
@@ -1293,7 +1454,7 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                 let value = spent.amount;
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
-                        deliver(inner, *sid, &m);
+                        sink.emit(inner, *sid, &m);
                     }
                 }
             }
@@ -1327,7 +1488,7 @@ fn scan_block_spent_scripts(inner: &Inner, block: &Block, height: u32, undo: &Un
                         matched_prevouts,
                     }));
                     for sid in subs {
-                        deliver(inner, *sid, &m);
+                        sink.emit(inner, *sid, &m);
                     }
                 }
             }
@@ -1381,6 +1542,13 @@ pub struct WatchHandle {
 }
 
 impl WatchHandle {
+    /// This subscriber's registry id. Used to build an isolated ephemeral
+    /// registry for a bounded historical rescan
+    /// ([`WatchRegistry::clone_for_rescan`]).
+    pub fn sub_id(&self) -> u64 {
+        self.id
+    }
+
     /// Add outpoints to this subscriber's watch-set; returns the count
     /// newly added.
     pub fn add_outpoints(&self, outpoints: &[OutPoint]) -> usize {
@@ -3428,5 +3596,180 @@ mod tests {
             }
         }
         assert_eq!((exact, prefix), (1, 1), "one exact + one prefix spend match");
+    }
+
+    // --- Bounded historical rescan (§6.1) -----------------------------------
+
+    #[test]
+    fn clone_for_rescan_none_for_empty_watchset() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        assert!(reg.clone_for_rescan(handle.sub_id()).is_none());
+    }
+
+    #[test]
+    fn clone_for_rescan_none_for_unknown_sub() {
+        let reg = Arc::new(WatchRegistry::new());
+        assert!(reg.clone_for_rescan(999).is_none());
+    }
+
+    #[test]
+    fn rescan_collects_output_and_outpoint_matches() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        let op = outpoint(0xcc, 1);
+        assert_eq!(handle.add_scripthashes(&[sh]), 1);
+        assert_eq!(handle.add_outpoints(&[op]), 1);
+
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+        // A block funding the watched script (output side) and spending the
+        // watched outpoint.
+        let block = block_with(vec![funding_tx(spk), spending_tx(op)]);
+        let matches = eph.scan_block_collect(&block, 42, None);
+
+        let mut script = 0;
+        let mut spent = 0;
+        for m in &matches {
+            match m {
+                WatchMatch::ScriptMatched {
+                    is_output: true,
+                    height,
+                    confirmed,
+                    ..
+                } => {
+                    assert_eq!(*height, Some(42));
+                    assert!(*confirmed);
+                    script += 1;
+                }
+                WatchMatch::OutpointSpent {
+                    outpoint,
+                    height,
+                    confirmed,
+                    ..
+                } => {
+                    assert_eq!(*outpoint, op);
+                    assert_eq!(*height, Some(42));
+                    assert!(*confirmed);
+                    spent += 1;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!((script, spent), (1, 1));
+        // The collect path must NOT deliver to the live subscriber channel.
+        assert!(
+            rx.try_recv().is_err(),
+            "rescan collect must not touch the channel"
+        );
+    }
+
+    #[test]
+    fn rescan_collects_input_side_from_undo() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spent_spk = ScriptBuf::from(vec![0x52]);
+        let sh = scripthash_of(&spent_spk);
+        assert_eq!(handle.add_scripthashes(&[sh]), 1);
+
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+        assert!(eph.has_script_watchers());
+        let block = block_with(vec![coinbase_tx(), spending_tx(outpoint(0xaa, 3))]);
+        let undo = UndoData {
+            spent_coins: vec![coin_with_spk(spent_spk)],
+        };
+        let matches = eph.scan_block_collect(&block, 9, Some(&undo));
+        assert_eq!(matches.len(), 1);
+        match &matches[0] {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output,
+                confirmed,
+                height,
+                ..
+            } => {
+                assert_eq!(*scripthash, sh);
+                assert!(!*is_output, "input-side match → is_output = false");
+                assert!(*confirmed);
+                assert_eq!(*height, Some(9));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rescan_is_isolated_from_other_subscribers() {
+        // Two subscribers on the same registry watching disjoint scripts. A
+        // rescan cloned from sub A must see only A's matches, never B's — the
+        // ephemeral registry holds A's watch-set alone.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle_a, _rx_a) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let (handle_b, mut rx_b) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle_a.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x51]))]);
+        let spk_b = ScriptBuf::from(vec![0x52]);
+        handle_b.add_scripthashes(&[scripthash_of(&spk_b)]);
+
+        let eph = reg.clone_for_rescan(handle_a.sub_id()).expect("non-empty");
+        // Block funds only B's script.
+        let block = block_with(vec![funding_tx(spk_b)]);
+        assert!(
+            eph.scan_block_collect(&block, 5, None).is_empty(),
+            "A's rescan must not collect B's match"
+        );
+        // B's live channel is untouched by A's rescan (collect, not deliver).
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[test]
+    fn rescan_collects_nothing_when_range_has_no_match() {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x51]))]);
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty");
+        // Block funds a different script.
+        let block = block_with(vec![funding_tx(ScriptBuf::from(vec![0x99]))]);
+        assert!(eph.scan_block_collect(&block, 1, None).is_empty());
+    }
+
+    #[test]
+    fn rescan_preserves_min_value_floor() {
+        // A per-script `min_value` floor must survive the clone into the
+        // ephemeral registry and gate rescan matches exactly as the live path:
+        // a below-floor funding output is dropped, an at/above-floor one is
+        // collected.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+
+        // Below the floor: no match collected.
+        let below = block_with(vec![funding_tx_value(spk.clone(), 999)]);
+        assert!(
+            eph.scan_block_collect(&below, 7, None).is_empty(),
+            "sub-floor funding must be filtered in rescan, as live"
+        );
+
+        // At the floor: exactly one funding match collected.
+        let at = block_with(vec![funding_tx_value(spk, 1_000)]);
+        let matches = eph.scan_block_collect(&at, 8, None);
+        assert_eq!(matches.len(), 1, "at-floor funding must match in rescan");
+        match &matches[0] {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output: true,
+                confirmed,
+                height,
+                ..
+            } => {
+                assert_eq!(*scripthash, sh);
+                assert!(*confirmed);
+                assert_eq!(*height, Some(8));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

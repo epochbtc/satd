@@ -103,7 +103,38 @@ message SubscribeControl {
     // deterministic result — never a client-computed Add*/Remove* delta whose
     // ordering can strand coverage or over-charge at quota.
     SetWatchSet set_watch_set = 13;
+    // Bounded historical rescan of the CURRENT watch-set against a closed,
+    // span-capped active-chain height range. The pull dual of the forward
+    // SetCursor replay: where SetCursor synthesizes BlockConnected but does
+    // NOT replay watch *matches* (the client reconstructs them from the
+    // replayed blocks), RescanBlocks runs the watch-set matcher server-side,
+    // off the consensus hot path, and delivers the SAME confirmed watch-match
+    // bodies the live stream would have (ScriptMatched / OutpointSpent /
+    // TxidMatched / PrefixMatched, all confirmed=true) in height order,
+    // bracketed by a RescanResult ack up front and a terminal RescanComplete
+    // once the range is fully drained. This is how a cold or beyond-replay-
+    // window client recovers historical matches without walking blocks itself.
+    //
+    // Scans ONLY this connection's watch-set — never another subscriber's.
+    // Depth alarms and txid lifecycle transitions are NOT reproduced (they are
+    // forward-looking/stateful); a rescan yields the four confirmed match kinds
+    // above. Rate-limited per principal; at most one rescan is in flight at a
+    // time (a second is rejected RescanRejected{CONCURRENT_RESCAN}, never
+    // dropped). A rescan is a SIDE query: it does not move the durable forward
+    // cursor, and its match events carry no resume cursor. It runs independently
+    // of any in-flight SetCursor re-anchor.
+    RescanBlocks rescan_blocks = 14;
   }
+}
+
+// A bounded historical rescan request (SubscribeControl.rescan_blocks). The
+// range is INCLUSIVE and clamped to what the node holds: a from_height below
+// the available floor or a to_height above the current tip narrows the scanned
+// range (RescanAccepted.clamped). An inverted range (to < from) or a span
+// exceeding the server cap is rejected whole.
+message RescanBlocks {
+  uint32 from_height = 1; // first active-chain height to scan (inclusive)
+  uint32 to_height   = 2; // last active-chain height to scan (inclusive), >= from_height
 }
 
 // A complete watch-set snapshot for SetWatchSet. Each repeated field is the FULL
@@ -515,6 +546,55 @@ message WatchSetRejected {
   uint64 quota    = 3; // the unit ceiling (QUOTA) or entry cap (CAP); 0 for MALFORMED
 }
 
+// Deterministic outcome of a RescanBlocks, delivered in-band ahead of any
+// matches it admits (same pattern as SetCursorResult). Emitted exactly once per
+// actionable rescan. On accept, zero or more confirmed watch-match events
+// follow in height order, terminated by a RescanComplete. On reject, no matches
+// follow and the live stream is unchanged.
+message RescanResult {
+  oneof outcome {
+    RescanAccepted accepted = 1;
+    RescanRejected rejected = 2;
+  }
+}
+
+// The rescan was admitted. `from_height`/`to_height` echo the range the server
+// will ACTUALLY scan, which may be narrower than requested: `clamped` is set
+// when the requested lower bound was below the available floor or the upper
+// bound was above the current tip. The scan covers `[from_height, to_height]`
+// inclusive; matches (if any) follow, then a RescanComplete.
+message RescanAccepted {
+  uint32 from_height = 1; // first height that will be scanned (post-clamp)
+  uint32 to_height   = 2; // last height that will be scanned (post-clamp)
+  bool   clamped     = 3; // true → the requested range was narrowed to what's available
+}
+
+// The rescan was not admitted; no matches follow, the live stream is unchanged.
+// `tip_height` is the server's current active-chain tip so the client can
+// re-scope a range and retry.
+message RescanRejected {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    RATE_LIMITED       = 1; // per-principal rescan rate limit exceeded
+    CONCURRENT_RESCAN  = 2; // another rescan is already draining
+    INVALID_RANGE      = 3; // to_height < from_height, or the range is not on the active chain
+    RANGE_TOO_LARGE    = 4; // to_height - from_height + 1 exceeds the server span cap
+    NO_SOURCE          = 5; // server has no block-scan source (no local block bodies/undo)
+    EMPTY_WATCH_SET    = 6; // the connection watches nothing — a rescan would match nothing
+  }
+  Reason reason     = 1;
+  uint32 tip_height = 2; // server's current active-chain tip height
+}
+
+// Terminal marker: the rescan range has been fully scanned and every match
+// delivered. `matches` counts the match events emitted for this rescan (0 when
+// the range held none). After this the stream resumes its prior live position.
+message RescanComplete {
+  uint32 from_height = 1; // the scanned range (post-clamp), echoing RescanAccepted
+  uint32 to_height   = 2;
+  uint64 matches     = 3; // number of match events emitted for this rescan
+}
+
 // Versioned, edge-stamped envelope. The wire-level type the server
 // streams to clients.
 message NodeEvent {
@@ -547,5 +627,7 @@ message NodeEvent {
     PrefixMatched prefix_matched = 23; // privacy-preserving prefix watch (§7.5)
     SetCursorResult set_cursor_result = 24; // deterministic re-anchor ack/reject
     WatchSetResult set_watch_set_result = 25; // deterministic atomic-replace ack/reject
+    RescanResult rescan_result = 26; // deterministic historical-rescan ack/reject
+    RescanComplete rescan_complete = 27; // terminal marker: rescan range fully drained
   }
 }

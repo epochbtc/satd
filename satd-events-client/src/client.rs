@@ -404,6 +404,25 @@ impl WatchHandle {
         }))
         .await
     }
+
+    /// Request a bounded historical rescan of the current watch-set over the
+    /// inclusive height range `[from_height, to_height]`. The outcome arrives
+    /// in-band on the event stream as [`Event`](crate::Event)`::RescanAccepted` /
+    /// `RescanRejected`; on accept, confirmed watch-matches for the range follow
+    /// in height order, terminated by `RescanComplete`.
+    ///
+    /// A side query: it does not move the durable cursor and runs independently
+    /// of the live tail or any in-flight re-anchor. The server span-caps the
+    /// range and admits at most one rescan at a time (a second is rejected
+    /// `ConcurrentRescan`). `Ok(())` means the request was sent, not that it was
+    /// admitted — drive off the in-band result.
+    pub async fn rescan(&self, from_height: u32, to_height: u32) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::RescanBlocks(pb::RescanBlocks {
+            from_height,
+            to_height,
+        }))
+        .await
+    }
 }
 
 /// The maximum meaningful prefix width. The server buckets on the top 32 bits of

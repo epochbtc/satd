@@ -616,6 +616,64 @@ whereas a prefix that varies per query can be intersected back down. The firehos
 remains the only zero-disclosure option; this is the knob between it and the exact
 watches, not a replacement for either.
 
+### 7.6 Bounded historical rescan (`RescanBlocks`)
+
+`SetCursor` replay (§6.2) is forward-from-cursor and synthesizes `BlockConnected`
+events, but it does **not** replay watch *matches* — the client reconstructs them
+from the replayed blocks against its own watch-set, and the window is capped at
+`MAX_REPLAY_BLOCKS`. `RescanBlocks` is the **pull dual**: the server runs the
+matcher over a caller-specified historical range and returns the matches directly.
+
+```proto
+message RescanBlocks {          // SubscribeControl.rescan_blocks = 14
+  uint32 from_height = 1;       // inclusive
+  uint32 to_height   = 2;       // inclusive, >= from_height
+}
+```
+
+Semantics:
+
+1. **Scans this connection's watch-set only.** The rescan runs against a snapshot
+   of the requesting subscription's watch-set in an isolated, single-subscriber
+   matcher — it can never deliver to another connection. It reproduces the four
+   confirmed match bodies a live block scan would (`ScriptMatched` output- and
+   input-side, `OutpointSpent`, `TxidMatched`, `PrefixMatched`, all
+   `confirmed=true`), in height order. Depth alarms and txid-lifecycle
+   transitions are **not** reproduced — those are forward-looking/stateful and
+   have no meaning over a closed historical range.
+2. **Deterministic, in-band ack** (mirrors `SetCursorResult`). Exactly one
+   `RescanResult` precedes any matches:
+
+   ```proto
+   message RescanResult { oneof outcome {
+       RescanAccepted accepted = 1;   // from/to (post-clamp) + clamped flag
+       RescanRejected rejected = 2;   // reason + tip_height
+   } }
+   ```
+
+   The range is clamped to the current tip (`clamped` set when the requested
+   `to_height` exceeded it); an inverted range, a range wholly above the tip, or a
+   span exceeding `MAX_RESCAN_BLOCKS` (= `MAX_REPLAY_BLOCKS`, 10 000) is rejected
+   whole (`INVALID_RANGE` / `RANGE_TOO_LARGE`). Other reasons: `NO_SOURCE` (no
+   local block bodies/undo), `EMPTY_WATCH_SET`, `RATE_LIMITED`, `CONCURRENT_RESCAN`.
+3. **Terminal marker.** After the last match the server emits
+   `RescanComplete{from_height, to_height, matches}`, so the client knows the range
+   is fully drained and how many matches it produced. The stream then resumes its
+   prior live position.
+4. **A side query.** A rescan does **not** advance the durable forward cursor, and
+   its match events carry no resume cursor. It is rate-limited per principal, admits
+   one rescan in flight at a time (a second → `CONCURRENT_RESCAN`), and runs
+   independently of any in-flight `SetCursor` re-anchor.
+5. **Off the consensus hot path.** Like replay, the rescan reads blocks (and undo
+   data, only when a script/prefix is watched) the node already holds; it never
+   blocks or backpressures block connection.
+
+This closes the streaming-watch-set cold-sync / beyond-`MAX_REPLAY_BLOCKS` recovery
+gap without the client walking blocks itself. (BIP157 P2P still covers bulk
+trustless filter-based sync; this is the server-side push-model equivalent for the
+watch-set path.) SDK: `ResilientWatch::rescan(from, to)` — the ack, matches, and
+`RescanComplete` arrive in-band on `next()`.
+
 ## 8. Reorg events
 
 Reorgs are **first-class**, emitted in-process as consensus ground truth — a
