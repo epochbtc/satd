@@ -787,6 +787,28 @@ pub enum ReloadError {
     Loader(#[source] BoxError),
 }
 
+/// A transient-reject re-anchor retry deferred out of [`handle_event`] so it can
+/// be driven — and cancelled — safely from [`ResilientWatch::next`]. Recording
+/// the retry as data (rather than sleeping + re-sending inline) is what makes
+/// `next` cancel-safe: the budget counter is charged once when the retry is
+/// recorded, and the pending slot is only cleared after the re-send has been
+/// attempted, so a cancelled `next` re-enters and completes the *same* retry
+/// instead of burning the counter without the re-send reaching the wire.
+///
+/// Only the backoff *deadline* is captured — the drive re-sends the *live*
+/// `desired_cursor`, so an intervening [`set_cursor`](ResilientWatch::set_cursor)
+/// (or a connect that re-anchors from `resume`) is honoured rather than
+/// clobbered by a stale snapshot.
+///
+/// [`handle_event`]: ResilientWatch::handle_event
+#[derive(Clone, Copy)]
+struct PendingReanchor {
+    /// When the backoff sleep ends. Stored as an absolute deadline (not a
+    /// duration) so a cancelled-then-resumed drive waits out the *remaining*
+    /// backoff rather than restarting it.
+    deadline: tokio::time::Instant,
+}
+
 /// A `Watch` stream that reconnects, re-registers its watch-set, and re-anchors
 /// off the deterministic [`Event::CursorAccepted`] / [`Event::CursorRejected`]
 /// results on the caller's behalf.
@@ -826,6 +848,11 @@ pub struct ResilientWatch {
     reconnect_attempts: u32,
     /// Consecutive transient re-anchor rejects; drives the in-place retry backoff.
     reanchor_attempts: u32,
+    /// A deferred transient-reject retry awaiting its backoff + re-send, driven by
+    /// [`next`](Self::next). `Some` between recording the retry (in `handle_event`)
+    /// and completing it; keeping it in `self` rather than on `next`'s stack is
+    /// what lets a cancelled `next` resume the retry (see [`PendingReanchor`]).
+    pending_reanchor: Option<PendingReanchor>,
     /// The most recent retryable error, surfaced if `max_retries` is exhausted.
     last_error: Option<StreamError>,
 }
@@ -845,6 +872,7 @@ impl ResilientWatch {
             seeded: false,
             reconnect_attempts: 0,
             reanchor_attempts: 0,
+            pending_reanchor: None,
             last_error: None,
         }
     }
@@ -1100,6 +1128,10 @@ impl ResilientWatch {
     pub async fn set_cursor(&mut self, cursor: Cursor) -> Result<(), StreamError> {
         self.desired_cursor = Some(cursor);
         self.reanchor_attempts = 0;
+        // This live send is the fresh re-anchor; it supersedes any deferred
+        // transient-reject retry, so drop the pending slot rather than let `next`
+        // fire a redundant second `set_cursor` for the same anchor afterwards.
+        self.pending_reanchor = None;
         let res = match &self.handle {
             Some(h) => Some(h.set_cursor(cursor).await),
             None => None,
@@ -1228,9 +1260,42 @@ impl ResilientWatch {
     /// becomes a backoff + in-place retry, and only a real event (including the
     /// deterministic `CursorAccepted` / terminal `CursorRejected`, which the
     /// caller may act on) returns.
+    ///
+    /// # Cancel safety
+    ///
+    /// `next` is cancel-safe: dropping the future — e.g. losing a
+    /// `tokio::select!` race to a command arriving on another branch — never
+    /// leaves `self` holding a charged-but-unsent retry or a half-applied cursor,
+    /// so it is always safe to call `next` again afterwards. An interleaving
+    /// caller (an actor that drives `next` in a `select!` alongside a command
+    /// channel) can therefore cancel it freely.
+    ///
+    /// It suspends at four kinds of await, each of which a cancel leaves either
+    /// resumable or idempotent on re-entry:
+    ///
+    /// - The reconnect **backoff sleep** holds no uncommitted state — the
+    ///   `reconnect_attempts` bump happened on a prior iteration, so a cancel just
+    ///   re-sleeps the (recomputed) delay next time.
+    /// - **`connect()`** only commits the new `handle` / `stream` at its very end;
+    ///   a cancel partway drops the half-open stream and re-enters `connect` from
+    ///   scratch, which fully rebuilds from `resume` (the resume/commit state it
+    ///   touches is either unchanged or re-derived on the retry).
+    /// - The transport **`message()` poll** is cancel-safe (its decoder state
+    ///   lives on the retained `stream`, not on the dropped future).
+    /// - The deferred transient-reject **backoff + re-send** is recorded as
+    ///   internal state and driven from here, so a cancel mid-backoff or
+    ///   mid-re-send resumes the *same* retry on the next call — with its budget
+    ///   charged exactly once — rather than burning the counter without the
+    ///   re-send reaching the wire.
     pub async fn next(&mut self) -> Result<Event, StreamError> {
         self.commit_due()?;
         loop {
+            // Finish any deferred transient-reject retry before touching the
+            // stream. Resumable and cancel-safe (see `drive_pending_reanchor`).
+            if self.pending_reanchor.is_some() {
+                self.drive_pending_reanchor().await?;
+                continue;
+            }
             if self.stream.is_none() {
                 if self.reconnect_attempts > 0 {
                     if let Some(max) = self.config.backoff.max_retries
@@ -1330,18 +1395,24 @@ impl ResilientWatch {
                 && self.reanchor_attempts >= max
             {
                 self.reanchor_attempts = 0;
+                // Surfacing the reject ends the retry: drop any pending re-send so
+                // `next` does not fire one more `set_cursor` after we told the
+                // caller the budget is exhausted.
+                self.pending_reanchor = None;
                 return Ok(Some(ev));
             }
+            // Record the retry as resumable state and return; `next` drives the
+            // backoff + re-send via `drive_pending_reanchor`. Doing the charge here
+            // (synchronously, no await between the budget read and the counter
+            // bump) and the awaits there is what makes `next` cancel-safe: a
+            // cancelled drive resumes this same retry instead of burning the
+            // counter without the re-send landing. The deadline is absolute so a
+            // resumed drive waits out only the remaining backoff. Only the deadline
+            // is captured — the drive re-sends the live `desired_cursor`.
             let delay = self.config.backoff.delay_for(self.reanchor_attempts);
             self.reanchor_attempts = self.reanchor_attempts.saturating_add(1);
-            tokio::time::sleep(delay).await;
-            if let Some(c) = self.desired_cursor {
-                let res = match &self.handle {
-                    Some(h) => Some(h.set_cursor(c).await),
-                    None => None,
-                };
-                self.after_send(res)?;
-            }
+            self.pending_reanchor =
+                Some(PendingReanchor { deadline: tokio::time::Instant::now() + delay });
             return Ok(None);
         }
 
@@ -1364,6 +1435,34 @@ impl ResilientWatch {
             self.reanchor_attempts = 0;
         }
         Ok(Some(ev))
+    }
+
+    /// Drive a deferred transient-reject retry ([`PendingReanchor`], recorded by
+    /// `handle_event`) to completion: wait out the remaining backoff, then re-send
+    /// the current re-anchor. Cancel-safe: the pending slot is cleared only *after*
+    /// the re-send await resolves, so a cancellation before then leaves the retry
+    /// recorded for the next [`next`](Self::next) to resume — the budget was
+    /// already charged when the retry was recorded, so a resume never re-charges
+    /// it. There is no await between the send resolving and the slot clearing, so a
+    /// cancel either drops the future before the send lands (the slot survives and
+    /// the next `next` sends once) or after it lands and the slot is already
+    /// cleared — the same re-send never goes out twice. The cursor is read *live*
+    /// from `desired_cursor`, not snapshotted, so a re-anchor changed between the
+    /// record and the drive is honoured; a no-op while disconnected (no
+    /// `desired_cursor` / no `handle`) still clears the slot.
+    async fn drive_pending_reanchor(&mut self) -> Result<(), StreamError> {
+        let Some(pending) = self.pending_reanchor else {
+            return Ok(());
+        };
+        tokio::time::sleep_until(pending.deadline).await;
+        let res = match (self.desired_cursor, &self.handle) {
+            (Some(c), Some(h)) => Some(h.set_cursor(c).await),
+            _ => None,
+        };
+        // Only now that the re-send has been attempted is the retry done; a
+        // cancellation before this line leaves `pending_reanchor` set to resume.
+        self.pending_reanchor = None;
+        self.after_send(res)
     }
 
     /// Open a fresh `Watch` stream, re-register the mirrored watch-set, and
@@ -1394,6 +1493,9 @@ impl ResilientWatch {
         }
         self.desired_cursor = self.resume;
         self.reanchor_attempts = 0;
+        // `teardown` already dropped any deferred retry against the old stream;
+        // this fresh stream re-anchors from `resume` right here.
+        debug_assert!(self.pending_reanchor.is_none());
         if let Some(c) = self.resume {
             handle.set_cursor(c).await?;
         }
@@ -1422,6 +1524,11 @@ impl ResilientWatch {
     fn teardown(&mut self) {
         self.handle = None;
         self.stream = None;
+        // A deferred re-anchor retry is meaningless once the stream it targeted is
+        // gone — the reconnect re-anchors from `resume` itself. Drop it so `next`
+        // does not sleep out a stale backoff against a dead handle before
+        // reconnecting.
+        self.pending_reanchor = None;
     }
 
     /// Resolve a live control-send result: a `ControlClosed` means the stream
@@ -1724,10 +1831,12 @@ mod tests {
             reason: CursorRejectReason::RateLimited,
             current_head: None,
         };
-        // Disconnected, so the in-place re-send is a no-op; we only assert the
-        // retry budget accounting and that the reject is consumed (Ok(None))
-        // until exhausted, then surfaced.
+        // `handle_event` now records each transient reject as a pending retry
+        // (the backoff + re-send is driven by `next`); we assert the budget
+        // accounting and that the reject is consumed (Ok(None)) until exhausted,
+        // then surfaced.
         assert!(w.handle_event(reject(), None).await.unwrap().is_none(), "retry 1 consumed");
+        assert!(w.pending_reanchor.is_some(), "retry 1 deferred to a pending slot");
         assert!(w.handle_event(reject(), None).await.unwrap().is_none(), "retry 2 consumed");
         let out = w.handle_event(reject(), None).await.unwrap();
         assert!(
@@ -1735,6 +1844,144 @@ mod tests {
             "budget exhausted → surfaced for the caller to escalate"
         );
         assert_eq!(w.reanchor_attempts, 0, "counter resets after surfacing");
+    }
+
+    #[tokio::test]
+    async fn transient_reject_retry_is_cancel_safe() {
+        // Regression for #453: cancelling `next` (e.g. losing a `select!` race)
+        // while a transient-reject retry is mid-backoff must not burn the retry
+        // budget without the re-send landing. The retry lives in `self` as
+        // pending state and is driven by `drive_pending_reanchor`, so a cancelled
+        // drive resumes the *same* retry.
+        let store = Arc::new(MemStore::default());
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(Backoff {
+                // A long backoff so the drive is guaranteed to park in the sleep
+                // (never reaching the re-send) before we cancel it.
+                initial: std::time::Duration::from_secs(30),
+                max: std::time::Duration::from_secs(30),
+                multiplier: 1.0,
+                max_retries: Some(3),
+            }),
+        );
+        w.desired_cursor = Some(cur(100));
+
+        // A transient reject charges the budget once and defers the retry — no
+        // inline await in `handle_event` any more.
+        let out = w
+            .handle_event(
+                Event::CursorRejected { reason: CursorRejectReason::RateLimited, current_head: None },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_none(), "transient reject consumed");
+        assert_eq!(w.reanchor_attempts, 1, "one retry charged");
+        assert!(w.pending_reanchor.is_some(), "retry deferred to a resumable slot");
+
+        // Cancel the drive while it is parked in the 30s backoff: `biased` polls
+        // the drive first (it parks), then the 1ms timer fires and preempts it,
+        // dropping the drive future.
+        tokio::select! {
+            biased;
+            _ = w.drive_pending_reanchor() => unreachable!("30s backoff cannot have elapsed"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        assert!(w.pending_reanchor.is_some(), "a cancelled drive leaves the retry resumable");
+        assert_eq!(w.reanchor_attempts, 1, "the cancelled drive did not re-charge the budget");
+
+        // Resume to completion. Collapse the remaining backoff so the test stays
+        // fast; disconnected, so the re-send is a no-op and the slot just clears.
+        w.pending_reanchor.as_mut().unwrap().deadline = tokio::time::Instant::now();
+        w.drive_pending_reanchor().await.unwrap();
+        assert!(w.pending_reanchor.is_none(), "the resumed drive completes the retry");
+        assert_eq!(w.reanchor_attempts, 1, "resuming does not re-charge the budget");
+    }
+
+    // Drain the cursor of every `SetCursor` control message queued on a test
+    // handle's receiver, in send order.
+    fn drained_set_cursors(
+        rx: &mut tokio::sync::mpsc::Receiver<pb::SubscribeControl>,
+    ) -> Vec<Cursor> {
+        let mut out = Vec::new();
+        while let Ok(ctrl) = rx.try_recv() {
+            if let Some(Msg::SetCursor(s)) = ctrl.msg {
+                out.push(s.cursor.expect("a SetCursor carries a cursor"));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn set_cursor_supersedes_a_pending_transient_retry() {
+        // Regression for the #455 review: a deferred transient-reject retry must
+        // not re-send a now-stale anchor after the caller has explicitly
+        // re-anchored elsewhere. The exposing sequence is the #453 actor pattern —
+        // cancel `next` mid-retry, then issue `set_cursor` before resuming.
+        let store = Arc::new(MemStore::default());
+        let (handle, mut rx) = crate::client::WatchHandle::for_test();
+        let mut w = watch_with(&store);
+        w.handle = Some(handle);
+        w.desired_cursor = Some(cur(100));
+
+        // A transient reject defers a retry that would re-send the anchor at 100.
+        w.handle_event(
+            Event::CursorRejected { reason: CursorRejectReason::RateLimited, current_head: None },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(w.pending_reanchor.is_some(), "retry deferred");
+
+        // The caller now re-anchors to 200: sends set_cursor(200) live, and must
+        // supersede the deferred retry for 100.
+        w.set_cursor(cur(200)).await.unwrap();
+        assert!(w.pending_reanchor.is_none(), "explicit re-anchor drops the stale deferred retry");
+        assert_eq!(drained_set_cursors(&mut rx), vec![cur(200)], "only the fresh anchor is sent");
+
+        // Driving the (now-cleared) retry re-sends nothing — in particular not the
+        // stale 100 that would clobber the caller's 200.
+        w.drive_pending_reanchor().await.unwrap();
+        assert!(drained_set_cursors(&mut rx).is_empty(), "a superseded retry re-sends nothing");
+    }
+
+    #[tokio::test]
+    async fn a_deferred_retry_re_sends_the_live_desired_cursor() {
+        // The drive reads `desired_cursor` live, not a snapshot taken when the
+        // reject was recorded, so an anchor that moved between the reject and the
+        // drive is what re-lands on the wire.
+        let store = Arc::new(MemStore::default());
+        let (handle, mut rx) = crate::client::WatchHandle::for_test();
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig::new().cursor_store(store.clone()).backoff(Backoff {
+                initial: std::time::Duration::ZERO,
+                max: std::time::Duration::ZERO,
+                multiplier: 1.0,
+                max_retries: Some(3),
+            }),
+        );
+        w.handle = Some(handle);
+        w.desired_cursor = Some(cur(100));
+
+        // Defer a retry (recorded while the desire is 100)…
+        w.handle_event(
+            Event::CursorRejected {
+                reason: CursorRejectReason::ConcurrentReanchor,
+                current_head: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // …then the desire advances to 200 while the retry is still pending.
+        w.desired_cursor = Some(cur(200));
+
+        // The drive re-sends the live 200, never the stale 100.
+        w.drive_pending_reanchor().await.unwrap();
+        assert_eq!(drained_set_cursors(&mut rx), vec![cur(200)], "the live anchor is re-sent");
+        assert!(w.pending_reanchor.is_none(), "the retry completed");
     }
 
     // --- one-shot watch eviction sync -----------------------------------------
