@@ -1495,12 +1495,55 @@ impl NodeEventStream for NodeEventStreamSvc {
                         let need_undo =
                             ephemeral.has_script_watchers() || ephemeral.has_prefix_watchers();
                         let mut matches: u64 = 0;
-                        // Reorg-safe (height,hash) resolution, then body+undo reads
-                        // and the matcher, all off the consensus hot path.
-                        for (h, hash) in src.active_chain_range(plan.from, plan.to) {
-                            let Some(block) = src.block_body(&hash) else { continue };
-                            let undo = if need_undo { src.block_undo(&hash) } else { None };
-                            for m in ephemeral.scan_block_collect(&block, h, undo.as_ref()) {
+                        // Reorg-safe (height,hash) resolution first (an active-chain
+                        // index walk) — run on the blocking pool like the per-block
+                        // reads below, not inline on the async worker.
+                        let range = {
+                            let src = src.clone();
+                            let (from, to) = (plan.from, plan.to);
+                            match tokio::task::spawn_blocking(move || {
+                                src.active_chain_range(from, to)
+                            })
+                            .await
+                            {
+                                Ok(r) => r,
+                                // Join error ⇒ the runtime is shutting down (or the
+                                // closure panicked); end the task. The in-flight slot
+                                // is moot once the task dies.
+                                Err(_) => return,
+                            }
+                        };
+                        // Drain the range one block at a time. Each block's body+undo
+                        // read (a ≤4 MB flat-file read + full deserialize) AND the
+                        // matcher pass run on the blocking pool, NOT inline on the
+                        // async worker: a sparse watch-set over the full
+                        // MAX_RESCAN_BLOCKS span would otherwise pin one scarce
+                        // API-runtime worker for the whole scan with no yield (a
+                        // match — the only inline await — is rare). `spawn_blocking`
+                        // offloads the I/O and yields between blocks; `is_closed`
+                        // gives cheap cooperative cancellation when the client hangs
+                        // up mid-scan (the match send is the only other cancel point
+                        // and never fires on a match-less range).
+                        for (h, hash) in range {
+                            if tx_out.is_closed() {
+                                return;
+                            }
+                            let src = src.clone();
+                            let eph = ephemeral.clone();
+                            let collected = match tokio::task::spawn_blocking(move || {
+                                src.block_body(&hash).map(|block| {
+                                    let undo =
+                                        if need_undo { src.block_undo(&hash) } else { None };
+                                    eph.scan_block_collect(&block, h, undo.as_ref())
+                                })
+                            })
+                            .await
+                            {
+                                Ok(Some(v)) => v, // body held → matches (possibly empty)
+                                Ok(None) => continue, // body not held locally → skip height
+                                Err(_) => break, // join error (shutdown/panic): stop draining
+                            };
+                            for m in collected {
                                 matches += 1;
                                 // Rescan does not attribute descriptor matches (the
                                 // ephemeral registry holds raw scripthashes, not the

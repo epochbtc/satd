@@ -3731,4 +3731,45 @@ mod tests {
         let block = block_with(vec![funding_tx(ScriptBuf::from(vec![0x99]))]);
         assert!(eph.scan_block_collect(&block, 1, None).is_empty());
     }
+
+    #[test]
+    fn rescan_preserves_min_value_floor() {
+        // A per-script `min_value` floor must survive the clone into the
+        // ephemeral registry and gate rescan matches exactly as the live path:
+        // a below-floor funding output is dropped, an at/above-floor one is
+        // collected.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
+
+        let eph = reg.clone_for_rescan(handle.sub_id()).expect("non-empty watch-set");
+
+        // Below the floor: no match collected.
+        let below = block_with(vec![funding_tx_value(spk.clone(), 999)]);
+        assert!(
+            eph.scan_block_collect(&below, 7, None).is_empty(),
+            "sub-floor funding must be filtered in rescan, as live"
+        );
+
+        // At the floor: exactly one funding match collected.
+        let at = block_with(vec![funding_tx_value(spk, 1_000)]);
+        let matches = eph.scan_block_collect(&at, 8, None);
+        assert_eq!(matches.len(), 1, "at-floor funding must match in rescan");
+        match &matches[0] {
+            WatchMatch::ScriptMatched {
+                scripthash,
+                is_output: true,
+                confirmed,
+                height,
+                ..
+            } => {
+                assert_eq!(*scripthash, sh);
+                assert!(*confirmed);
+                assert_eq!(*height, Some(8));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }
