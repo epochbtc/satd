@@ -27,7 +27,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   time (`ConcurrentRescan`), span-capped (`MAX_RESCAN_BLOCKS`, = `MAX_REPLAY_BLOCKS`).
   A side query — it does not advance the durable cursor. New `satd-events-client`
   `ResilientWatch::rescan()` / `WatchHandle::rescan()` and `Event::RescanAccepted`
-  / `Event::RescanRejected` / `Event::RescanComplete`. (#453)
+  / `Event::RescanRejected` / `Event::RescanComplete`. (#454)
 - **Retire the never-emitted `DescriptorNeedsAddresses` event.** The deprecated
   gap-limit side-channel (`NodeEvent.body` field 15) is removed from the wire
   schema and its tag reserved. No server ever emitted it — gap-limit
