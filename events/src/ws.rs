@@ -1193,6 +1193,7 @@ fn watch_match_json(
             index,
             confirmed,
             height,
+            amount,
         } => json!({
             "schema_version": node::events::SCHEMA_VERSION,
             "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
@@ -1203,6 +1204,11 @@ fn watch_match_json(
                 "is_output": is_output,
                 "index": index,
                 "confirmed": confirmed,
+                // Matched value (sats): funded output value or spent-prevout
+                // value. `has_amount = false` marks "not retained at this tier"
+                // (mempool spend under `streamprevoutmeta = hash`).
+                "amount": amount.unwrap_or(0),
+                "has_amount": amount.is_some(),
                 // Empty array for a directly-watched script; one entry per
                 // descriptor whose window holds this scripthash.
                 "descriptor_matches": descriptor_matches

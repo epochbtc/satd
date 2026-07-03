@@ -217,6 +217,13 @@ pub enum Event {
         index: u32,
         /// `false` = mempool, `true` = confirmed.
         confirmed: bool,
+        /// Matched value in satoshis: the funded output value (`is_output =
+        /// true`) or the spent-prevout value (`is_output = false`). `Some` on
+        /// the funding side and for confirmed spends; `Some` for mempool spends
+        /// when the node retained the prevout value (`streamprevoutmeta >=
+        /// amount`), else `None` (hash tier). `None` lets the consumer skip the
+        /// enrichment `getrawtransaction` for the common single-coin case.
+        amount: Option<u64>,
         /// Descriptor attribution: the descriptor watch(es) this scripthash
         /// belongs to, if it was registered via `add_descriptor`. Empty for a
         /// directly-watched script. See [`DescriptorMatch`].
@@ -506,6 +513,7 @@ impl From<pb::NodeEvent> for Event {
                 is_output: s.is_output,
                 index: s.index,
                 confirmed: s.confirmed,
+                amount: s.has_amount.then_some(s.amount),
                 descriptors: s
                     .descriptor_matches
                     .into_iter()

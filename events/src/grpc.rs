@@ -2149,6 +2149,7 @@ fn watch_match_to_proto(
             index,
             confirmed,
             height,
+            amount,
         } => {
             let body = pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
                 scripthash: scripthash.to_vec(),
@@ -2157,6 +2158,8 @@ fn watch_match_to_proto(
                 index: *index,
                 confirmed: *confirmed,
                 descriptor_matches,
+                amount: amount.unwrap_or(0),
+                has_amount: amount.is_some(),
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -2646,6 +2649,7 @@ mod tests {
                 index: 0,
                 confirmed: true,
                 height: Some(100),
+                amount: Some(50_000),
             },
             vec![pb::DescriptorMatch {
                 descriptor: "wpkh(xpub)".into(),
@@ -2659,6 +2663,9 @@ mod tests {
                 assert_eq!(s.descriptor_matches[0].descriptor, "wpkh(xpub)");
                 assert_eq!(s.descriptor_matches[0].branch, 1);
                 assert_eq!(s.descriptor_matches[0].derivation_index, 7);
+                // matched value rides the event in-band (#456)
+                assert!(s.has_amount);
+                assert_eq!(s.amount, 50_000);
             }
             other => panic!("wrong body: {other:?}"),
         }

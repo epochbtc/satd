@@ -230,6 +230,15 @@ message ScriptMatched {
   // advancement remains a client concern (§11); the server tracks no derivation
   // progress, it only reports where a matched script sits.
   repeated DescriptorMatch descriptor_matches = 6;
+  // Matched value in satoshis: the funded output value for `is_output = true`,
+  // or the spent-prevout value for `is_output = false`. Governed by the same
+  // `streamprevoutmeta` tier as `SpentPrevout.amount`: always present on the
+  // funding side and for confirmed spends; present for mempool spends when
+  // `streamprevoutmeta >= amount` (the default). `has_amount` distinguishes a
+  // genuine 0-value match from "value not retained at this tier". Additive —
+  // existing consumers ignore both fields.
+  uint64 amount     = 7;
+  bool   has_amount = 8;
 }
 
 message DescriptorMatch {
