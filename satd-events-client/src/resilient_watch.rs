@@ -89,6 +89,9 @@ pub(crate) struct WatchSetMirror {
     prefixes: BTreeSet<(u32, Vec<u8>)>,
     /// The live category filter, if the caller set one.
     categories: Option<u32>,
+    /// The raw-tx opt-in (SetWatchOptions), if the caller set one. Replayed on
+    /// reconnect so `include_raw_tx` survives a stream tear-down.
+    include_raw_tx: Option<bool>,
 }
 
 impl WatchSetMirror {
@@ -160,6 +163,10 @@ impl WatchSetMirror {
         self.categories = Some(categories);
     }
 
+    fn set_watch_options(&mut self, include_raw_tx: bool) {
+        self.include_raw_tx = Some(include_raw_tx);
+    }
+
     /// Render the net watch-set into the control messages that reconstruct it on
     /// a fresh stream. The category filter goes first (so it is in effect before
     /// matches flow); the rest are grouped to match the wire shapes the
@@ -175,6 +182,12 @@ impl WatchSetMirror {
 
         if let Some(c) = self.categories {
             out.push(Msg::SetCategories(pb::SetCategories { categories: c }));
+        }
+
+        // Re-apply the raw-tx opt-in before matches flow, so replayed and live
+        // ScriptMatched carry raw_tx exactly as before the reconnect.
+        if let Some(include_raw_tx) = self.include_raw_tx {
+            out.push(Msg::SetWatchOptions(pb::SetWatchOptions { include_raw_tx }));
         }
 
         if !self.scripts.is_empty() {
@@ -627,6 +640,14 @@ impl WatchSetBuilder {
     /// Declare the live category filter. See [`ResilientWatch::set_categories`].
     pub fn set_categories(&self, categories: u32) {
         self.with(|m| m.set_categories(categories));
+    }
+
+    /// Declare the raw-tx opt-in. See
+    /// [`ResilientWatch::set_watch_options`]. A loader that wants
+    /// `raw_tx` on ScriptMatched must re-declare this each rebuild, exactly like
+    /// [`set_categories`](Self::set_categories) — the loader is canonical.
+    pub fn set_watch_options(&self, include_raw_tx: bool) {
+        self.with(|m| m.set_watch_options(include_raw_tx));
     }
 }
 
@@ -1121,6 +1142,20 @@ impl ResilientWatch {
         self.after_send(res)
     }
 
+    /// Set the per-stream raw-tx opt-in (see
+    /// [`StreamControls::set_watch_options`](crate::WatchControls::set_watch_options)).
+    /// With `include_raw_tx = true`, [`Event::ScriptMatched`](crate::Event::ScriptMatched)
+    /// carry the full serialized tx in `raw_tx`. Recorded in the mirror and
+    /// re-applied on every reconnect, so the opt-in survives a stream tear-down.
+    pub async fn set_watch_options(&mut self, include_raw_tx: bool) -> Result<(), StreamError> {
+        self.mirror.set_watch_options(include_raw_tx);
+        let res = match &self.handle {
+            Some(h) => Some(h.set_watch_options(include_raw_tx).await),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
     /// Request a mid-stream re-anchor to `cursor` (replay confirmed history from
     /// it). The outcome arrives in-band on [`next`](Self::next) as
     /// [`Event::CursorAccepted`] / [`Event::CursorRejected`]; transient rejects
@@ -1220,9 +1255,20 @@ impl ResilientWatch {
         let mut applied = false;
         if let Some(h) = &self.handle {
             let msg = Msg::SetWatchSet(loaded.to_set_watch_set());
-            match h.send_control(pb::SubscribeControl { msg: Some(msg) }).await {
-                Ok(()) => applied = true,
-                Err(_) => self.teardown(),
+            let set_res = h.send_control(pb::SubscribeControl { msg: Some(msg) }).await;
+            // SetWatchSet carries the category filter but NOT the raw-tx opt-in,
+            // so re-apply it separately when the reloaded set declares one (the
+            // reconnect path renders it via `control_messages`; this atomic-
+            // replace path must send it explicitly). Both awaits complete while
+            // `h` is borrowed; `teardown` (needs `&mut self`) runs only after.
+            let opt_res = match (&set_res, loaded.include_raw_tx) {
+                (Ok(()), Some(include_raw_tx)) => Some(h.set_watch_options(include_raw_tx).await),
+                _ => None,
+            };
+            if set_res.is_ok() && !matches!(opt_res, Some(Err(_))) {
+                applied = true;
+            } else {
+                self.teardown();
             }
         }
 
@@ -1676,6 +1722,40 @@ mod tests {
         m.set_categories(crate::Categories::CHAIN);
         let msgs = m.control_messages();
         assert!(matches!(msgs[0], Msg::SetCategories(_)), "categories lead the replay");
+    }
+
+    #[test]
+    fn mirror_raw_tx_opt_in_replayed() {
+        // The raw-tx opt-in survives a reconnect: it renders into the replay
+        // control messages, before the watch-set adds so it is in effect when
+        // matches flow. Unset → no SetWatchOptions in the replay.
+        let mut m = WatchSetMirror::default();
+        m.add_scripts(&[([9u8; 32], None)]);
+        assert!(
+            !m.control_messages()
+                .iter()
+                .any(|msg| matches!(msg, Msg::SetWatchOptions(_))),
+            "no opt-in → no SetWatchOptions replayed"
+        );
+
+        m.set_watch_options(true);
+        let msgs = m.control_messages();
+        let opt = msgs.iter().find_map(|msg| match msg {
+            Msg::SetWatchOptions(o) => Some(o.include_raw_tx),
+            _ => None,
+        });
+        assert_eq!(opt, Some(true), "opt-in replayed as SetWatchOptions{{true}}");
+        // It leads the watch-set adds (like categories), so raw_tx is on from
+        // the first replayed match.
+        let opt_pos = msgs
+            .iter()
+            .position(|msg| matches!(msg, Msg::SetWatchOptions(_)))
+            .unwrap();
+        let add_pos = msgs
+            .iter()
+            .position(|msg| matches!(msg, Msg::AddScripts(_)))
+            .unwrap();
+        assert!(opt_pos < add_pos, "options precede the watch-set adds");
     }
 
     #[test]

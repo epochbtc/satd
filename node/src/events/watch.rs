@@ -87,6 +87,13 @@ pub enum WatchMatch {
         /// (`streamprevoutmeta >= amount`), else `None` (hash tier). Serialized
         /// as `(amount, has_amount)` on the wire, mirroring `SpentPrevout`.
         amount: Option<u64>,
+        /// Full consensus-serialized matching tx, attached only when some
+        /// subscriber opted into raw-tx inlining (`raw_tx_items > 0`); `None`
+        /// otherwise — the default path never serializes. Shared `Arc` so the
+        /// per-tx serialization is done at most once and fanned out cheaply.
+        /// The per-connection encoder puts it on the wire only for a connection
+        /// that opted in; others carry the pointer and drop it.
+        raw_tx: Option<Arc<[u8]>>,
     },
     /// A watched transaction id appeared — in the mempool (`confirmed =
     /// false`) or a connected block (`confirmed = true`). The "seen/confirmed"
@@ -194,6 +201,10 @@ struct Subscriber {
     tx_depths: HashSet<(Txid, u32, DepthKind)>,
     /// Privacy-preserving script-prefix buckets, as `(bits, masked_top32)`.
     prefixes: HashSet<(u8, u32)>,
+    /// Opt-in (SetWatchOptions): inline the full serialized tx on this
+    /// subscriber's ScriptMatched events. Counted in `raw_tx_items` so the
+    /// matcher can gate serialization on a single atomic load.
+    wants_raw_tx: bool,
 }
 
 #[derive(Default)]
@@ -254,6 +265,11 @@ pub struct WatchRegistry {
     /// per-output/per-prevout prefix scan and the undo-data fetch, so a
     /// watch-set with no prefixes pays nothing for them.
     prefix_items: AtomicUsize,
+    /// Lock-free count of subscribers that opted into raw-tx inlining
+    /// (SetWatchOptions{include_raw_tx}). Gates the per-match tx serialization
+    /// so the default path (nobody opted in) pays only a single atomic load —
+    /// same philosophy as `script_items`/`prefix_items`.
+    raw_tx_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -272,6 +288,7 @@ impl WatchRegistry {
             txid_items: AtomicUsize::new(0),
             depth_items: AtomicUsize::new(0),
             prefix_items: AtomicUsize::new(0),
+            raw_tx_items: AtomicUsize::new(0),
         }
     }
 
@@ -306,6 +323,12 @@ impl WatchRegistry {
         self.prefix_items.load(Ordering::Acquire) > 0
     }
 
+    /// `true` if any subscriber opted into raw-tx inlining. Lock-free; gates
+    /// the per-match tx serialization so the default path pays only this load.
+    fn wants_any_raw_tx(&self) -> bool {
+        self.raw_tx_items.load(Ordering::Acquire) > 0
+    }
+
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(|p| p.into_inner())
     }
@@ -332,6 +355,7 @@ impl WatchRegistry {
                 txids: HashSet::new(),
                 tx_depths: HashSet::new(),
                 prefixes: HashSet::new(),
+                wants_raw_tx: false,
             },
         );
         (
@@ -656,6 +680,29 @@ impl WatchRegistry {
         self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
         self.depth_items.fetch_sub(depth_count, Ordering::AcqRel);
         self.prefix_items.fetch_sub(freed_prefixes, Ordering::AcqRel);
+        if sub.wants_raw_tx {
+            self.raw_tx_items.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Set a subscriber's raw-tx opt-in (SetWatchOptions). Idempotent: only a
+    /// genuine transition adjusts the lock-free `raw_tx_items` gate counter, so
+    /// re-sending the same value is a no-op. Unknown `id` (already deregistered)
+    /// is ignored.
+    fn set_raw_tx(&self, id: SubId, want: bool) {
+        let mut inner = self.lock_inner();
+        let Some(sub) = inner.subs.get_mut(&id) else {
+            return;
+        };
+        if sub.wants_raw_tx == want {
+            return;
+        }
+        sub.wants_raw_tx = want;
+        if want {
+            self.raw_tx_items.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.raw_tx_items.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Scan every transaction in a connected block, routing matches to
@@ -673,9 +720,10 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
+        let wants_raw = self.wants_any_raw_tx();
         let mut sink = LiveSink;
         for tx in &block.txdata {
-            scan_tx(&inner, tx, true, Some(height), &mut sink);
+            scan_tx(&inner, tx, true, Some(height), wants_raw, &mut sink);
         }
         // Input-side script/prefix matching: only meaningful with a watched
         // script or prefix and the undo data to recover the spent prevout
@@ -683,7 +731,7 @@ impl WatchRegistry {
         if let Some(undo) = undo
             && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
-            scan_block_spent_scripts(&inner, block, height, undo, &mut sink);
+            scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
         }
     }
 
@@ -710,13 +758,14 @@ impl WatchRegistry {
             return sink.out;
         }
         let inner = self.read_inner();
+        let wants_raw = self.wants_any_raw_tx();
         for tx in &block.txdata {
-            scan_tx(&inner, tx, true, Some(height), &mut sink);
+            scan_tx(&inner, tx, true, Some(height), wants_raw, &mut sink);
         }
         if let Some(undo) = undo
             && (!inner.by_scripthash.is_empty() || !inner.prefix_lens.is_empty())
         {
-            scan_block_spent_scripts(&inner, block, height, undo, &mut sink);
+            scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
         }
         sink.out
     }
@@ -764,6 +813,9 @@ impl WatchRegistry {
                     txids: sub.txids.clone(),
                     tx_depths: HashSet::new(), // depth entries are not rescanned
                     prefixes: sub.prefixes.clone(),
+                    // Inherit the raw-tx opt-in so replayed matches carry raw_tx
+                    // for an opted-in connection, matching the live stream.
+                    wants_raw_tx: sub.wants_raw_tx,
                 },
             );
             // Rebuild the inverted indexes this one subscriber contributes.
@@ -794,6 +846,9 @@ impl WatchRegistry {
         registry.script_items.fetch_add(n_scr, Ordering::AcqRel);
         registry.txid_items.fetch_add(n_txid, Ordering::AcqRel);
         registry.prefix_items.fetch_add(n_pfx, Ordering::AcqRel);
+        if sub.wants_raw_tx {
+            registry.raw_tx_items.fetch_add(1, Ordering::AcqRel);
+        }
         Some(registry)
     }
 
@@ -804,7 +859,7 @@ impl WatchRegistry {
             return;
         }
         let inner = self.read_inner();
-        scan_tx(&inner, tx, false, None, &mut LiveSink);
+        scan_tx(&inner, tx, false, None, self.wants_any_raw_tx(), &mut LiveSink);
     }
 
     /// Mempool **spend-side** script matching: the unconfirmed analogue of
@@ -865,6 +920,8 @@ impl WatchRegistry {
         // matches fire per input. `zip` aligns each input with its prevout hash
         // and tolerates a short/empty slice (delivers nothing rather than
         // misalign); `enumerate` over the zip yields the input index (1:1).
+        let wants_raw = self.wants_any_raw_tx();
+        let mut raw_tx_cache: Option<Arc<[u8]>> = None;
         let mut prefix_spends: HashMap<(u8, u32), Vec<SpentPrevoutMeta>> = HashMap::new();
         for (vin, (input, sh)) in tx.input.iter().zip(prev_scripthashes.iter()).enumerate() {
             if scan_scripts
@@ -883,6 +940,7 @@ impl WatchRegistry {
                     confirmed: false,
                     height: None,
                     amount: value,
+                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
                 };
                 for sid in subs {
                     if floor_allows(&inner, *sid, sh, value) {
@@ -913,7 +971,9 @@ impl WatchRegistry {
         if prefix_spends.is_empty() {
             return;
         }
-        let raw: Arc<[u8]> = Arc::from(bitcoin::consensus::serialize(tx));
+        // Reuse the per-tx cache: if the exact spend path above already
+        // serialized (raw-tx opt-in), the prefix deliveries share that Arc.
+        let raw = raw_tx_bytes(&mut raw_tx_cache, tx);
         for (key, matched_prevouts) in prefix_spends {
             if let Some(subs) = inner.by_prefix.get(&key) {
                 let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
@@ -1249,6 +1309,16 @@ pub fn prefix_bucket_key(prefix: &[u8], bits: u8) -> u32 {
 /// per bucket per tx, not one per matching output. `raw_tx` is the per-tx
 /// serialization cache, filled at most once and only on a real match.
 #[allow(clippy::too_many_arguments)] // threaded matcher context + delivery sink
+/// Lazily serialize `tx` once into the shared per-tx cache and return a cheap
+/// `Arc` clone. Callers gate on the raw-tx opt-in before invoking, so an
+/// un-opted stream never serializes.
+fn raw_tx_bytes(cache: &mut Option<Arc<[u8]>>, tx: &Transaction) -> Arc<[u8]> {
+    cache
+        .get_or_insert_with(|| Arc::from(bitcoin::consensus::serialize(tx)))
+        .clone()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn deliver_prefix_funding(
     inner: &Inner,
     sh: &Scripthash,
@@ -1325,6 +1395,7 @@ fn scan_tx(
     tx: &Transaction,
     confirmed: bool,
     height: Option<u32>,
+    wants_raw: bool,
     sink: &mut dyn MatchSink,
 ) {
     let txid = tx.compute_txid();
@@ -1370,6 +1441,7 @@ fn scan_tx(
                     confirmed,
                     height,
                     amount: Some(value),
+                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx, tx)),
                 };
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
@@ -1416,6 +1488,7 @@ fn scan_block_spent_scripts(
     block: &Block,
     height: u32,
     undo: &UndoData,
+    wants_raw: bool,
     sink: &mut dyn MatchSink,
 ) {
     let scan_scripts = !inner.by_scripthash.is_empty();
@@ -1430,6 +1503,9 @@ fn scan_block_spent_scripts(
         // inputs: all matched prevouts for a bucket ride one PrefixMatched (one
         // full-tx body), not one event per input.
         let mut prefix_spends: HashMap<(u8, u32), Vec<SpentPrevoutMeta>> = HashMap::new();
+        // Per-tx raw-tx serialization cache, shared by the exact spend match
+        // (raw-tx opt-in) and the prefix delivery below.
+        let mut raw_tx_cache: Option<Arc<[u8]>> = None;
         for (vin, input) in tx.input.iter().enumerate() {
             let Some(spent) = undo.spent_coins.get(undo_idx) else {
                 // Undo shorter than the block's non-coinbase inputs: should
@@ -1464,6 +1540,7 @@ fn scan_block_spent_scripts(
                     confirmed: true,
                     height: Some(height),
                     amount: Some(value),
+                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
                 };
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
@@ -1490,7 +1567,7 @@ fn scan_block_spent_scripts(
         }
         // One PrefixMatched per matched bucket, carrying all its spent prevouts.
         if !prefix_spends.is_empty() {
-            let raw: Arc<[u8]> = Arc::from(bitcoin::consensus::serialize(tx));
+            let raw = raw_tx_bytes(&mut raw_tx_cache, tx);
             for (key, matched_prevouts) in prefix_spends {
                 if let Some(subs) = inner.by_prefix.get(&key) {
                     let m = WatchMatch::PrefixMatched(Box::new(PrefixMatch {
@@ -1617,6 +1694,14 @@ impl WatchHandle {
     /// count newly added.
     pub fn add_prefixes(&self, prefixes: &[(u8, u32)]) -> usize {
         self.registry.add_prefixes(self.id, prefixes)
+    }
+
+    /// Set this subscriber's raw-tx opt-in (SetWatchOptions{include_raw_tx}).
+    /// When `true`, subsequent ScriptMatched events for this subscriber inline
+    /// the full serialized matching transaction; `false` restores the default.
+    /// Idempotent.
+    pub fn set_raw_tx(&self, want: bool) {
+        self.registry.set_raw_tx(self.id, want);
     }
 
     /// Remove script-prefix buckets; returns the count removed.
@@ -2670,6 +2755,53 @@ mod tests {
             rx.try_recv(),
             Ok(WatchMatch::ScriptMatched { .. })
         ));
+    }
+
+    #[test]
+    fn raw_tx_opt_in_gates_serialization_and_carries_tx() {
+        // SetWatchOptions{include_raw_tx}: a match carries the full serialized
+        // tx only while the subscriber is opted in. The default path (counter
+        // at 0) never attaches raw_tx — the whole point of the gate.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let spk = ScriptBuf::from(vec![0x51]);
+        let sh = scripthash_of(&spk);
+        assert_eq!(handle.add_scripthashes(&[sh]), 1);
+        let tx = funding_tx_value(spk.clone(), 5_000);
+        let serialized = bitcoin::consensus::serialize(&tx);
+
+        // Not opted in → no raw_tx (default path never serializes).
+        reg.scan_mempool_tx(&tx);
+        match rx.try_recv().expect("funding match") {
+            WatchMatch::ScriptMatched { raw_tx, .. } => {
+                assert!(raw_tx.is_none(), "no opt-in → no raw_tx");
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        // Opted in → the funding match inlines the full serialized tx.
+        handle.set_raw_tx(true);
+        reg.scan_mempool_tx(&tx);
+        match rx.try_recv().expect("funding match") {
+            WatchMatch::ScriptMatched { raw_tx, .. } => {
+                assert_eq!(
+                    raw_tx.expect("opt-in → raw_tx present").as_ref(),
+                    serialized.as_slice(),
+                    "raw_tx is the consensus-serialized matching tx"
+                );
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
+
+        // Opted back out → raw_tx drops again (gate counter returns to 0).
+        handle.set_raw_tx(false);
+        reg.scan_mempool_tx(&tx);
+        match rx.try_recv().expect("funding match") {
+            WatchMatch::ScriptMatched { raw_tx, .. } => {
+                assert!(raw_tx.is_none(), "opt-out → no raw_tx");
+            }
+            other => panic!("wrong match: {other:?}"),
+        }
     }
 
     fn coinbase_tx() -> Transaction {

@@ -1050,6 +1050,10 @@ impl NodeEventStream for NodeEventStreamSvc {
         let (handle, rx_match) = registry.register(node::events::WATCH_CHANNEL_CAPACITY);
         let handle = Arc::new(handle);
         let category_mask = Arc::new(AtomicU32::new(u32::MAX));
+        // Per-stream raw-tx opt-in (SetWatchOptions). The inbound reader flips
+        // it (and the registry gate counter); the outbound encoder reads it to
+        // decide whether to inline raw_tx on this connection's ScriptMatched.
+        let include_raw_tx = Arc::new(AtomicBool::new(false));
         let edge = *self.publisher.edge();
         let rx_live = self.publisher.subscribe();
 
@@ -1136,6 +1140,7 @@ impl NodeEventStream for NodeEventStreamSvc {
         let inbound_task = {
             let handle = handle.clone();
             let category_mask = category_mask.clone();
+            let include_raw_tx = include_raw_tx.clone();
             let watch_set = watch_set.clone();
             let reanchor_in_flight = reanchor_in_flight.clone();
             let prefix_bounds = (self.prefix_min_bits, self.prefix_max_bits);
@@ -1299,6 +1304,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                         &handle,
                         principal.as_ref(),
                         &category_mask,
+                        &include_raw_tx,
                         &mut guard,
                         prefix_bounds,
                     );
@@ -1548,7 +1554,12 @@ impl NodeEventStream for NodeEventStreamSvc {
                                 // Rescan does not attribute descriptor matches (the
                                 // ephemeral registry holds raw scripthashes, not the
                                 // descriptor→script membership the live path keeps).
-                                let ev = watch_match_to_proto(&edge, &m, Vec::new());
+                                let ev = watch_match_to_proto(
+                                    &edge,
+                                    &m,
+                                    Vec::new(),
+                                    include_raw_tx.load(Ordering::Relaxed),
+                                );
                                 if tx_out.send(Ok(ev)).await.is_err() { return; }
                             }
                         }
@@ -1634,7 +1645,12 @@ impl NodeEventStream for NodeEventStreamSvc {
                                 _ => Vec::new(),
                             };
                             if tx_out
-                                .send(Ok(watch_match_to_proto(&edge, &m, descriptor_matches)))
+                                .send(Ok(watch_match_to_proto(
+                                    &edge,
+                                    &m,
+                                    descriptor_matches,
+                                    include_raw_tx.load(Ordering::Relaxed),
+                                )))
                                 .await
                                 .is_err()
                             {
@@ -1663,6 +1679,7 @@ fn apply_control(
     handle: &node::events::WatchHandle,
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
+    include_raw_tx: &AtomicBool,
     watch_set: &mut WatchSet,
     prefix_bounds: (u8, u8),
 ) {
@@ -1853,6 +1870,14 @@ fn apply_control(
                 c.categories
             };
             category_mask.store(mask, Ordering::Relaxed);
+        }
+        Some(Msg::SetWatchOptions(o)) => {
+            // Per-stream raw-tx inlining. Store the encoder-side flag AND toggle
+            // the registry gate (the matcher serializes only when some subscriber
+            // opted in); both must agree so an opted-in stream both serializes
+            // and emits. `set_raw_tx` is idempotent, so a repeated value no-ops.
+            include_raw_tx.store(o.include_raw_tx, Ordering::Relaxed);
+            handle.set_raw_tx(o.include_raw_tx);
         }
         Some(Msg::SetCursor(_)) => {
             // Unreachable in practice: the Watch inbound loop intercepts
@@ -2122,6 +2147,7 @@ fn watch_match_to_proto(
     edge: &node::events::EdgeIdentity,
     m: &node::events::WatchMatch,
     descriptor_matches: Vec<pb::DescriptorMatch>,
+    include_raw_tx: bool,
 ) -> pb::NodeEvent {
     use bitcoin::hashes::Hash;
     use node::events::WatchMatch;
@@ -2150,7 +2176,14 @@ fn watch_match_to_proto(
             confirmed,
             height,
             amount,
+            raw_tx,
         } => {
+            // raw_tx is carried on the match only when some subscriber opted in;
+            // put it on THIS connection's wire only if this connection did.
+            let raw_tx = match (include_raw_tx, raw_tx) {
+                (true, Some(bytes)) => bytes.to_vec(),
+                _ => Vec::new(),
+            };
             let body = pb::node_event::Body::ScriptMatched(pb::ScriptMatched {
                 scripthash: scripthash.to_vec(),
                 txid: txid.as_raw_hash().to_byte_array().to_vec(),
@@ -2160,6 +2193,7 @@ fn watch_match_to_proto(
                 descriptor_matches,
                 amount: amount.unwrap_or(0),
                 has_amount: amount.is_some(),
+                raw_tx,
             });
             (cursor_from_height(*height, edge.instance_id), body)
         }
@@ -2578,6 +2612,7 @@ mod tests {
                 replacing_txid: rep,
             },
             Vec::new(),
+            false,
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidReplaced(r) => {
@@ -2594,6 +2629,7 @@ mod tests {
                 reason: node::mempool::events::EvictReason::Expiry,
             },
             Vec::new(),
+            false,
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidEvicted(r) => assert_eq!(r.reason, "expiry"),
@@ -2608,6 +2644,7 @@ mod tests {
                 height: 100,
             },
             Vec::new(),
+            false,
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidDepthReached(r) => {
@@ -2626,6 +2663,7 @@ mod tests {
                 height: 100,
             },
             Vec::new(),
+            false,
         );
         match ev.body.unwrap() {
             pb::node_event::Body::TxidFinalized(r) => assert_eq!(r.depth, 6),
@@ -2650,12 +2688,14 @@ mod tests {
                 confirmed: true,
                 height: Some(100),
                 amount: Some(50_000),
+                raw_tx: None,
             },
             vec![pb::DescriptorMatch {
                 descriptor: "wpkh(xpub)".into(),
                 branch: 1,
                 derivation_index: 7,
             }],
+            false,
         );
         match ev.body.unwrap() {
             pb::node_event::Body::ScriptMatched(s) => {
@@ -2666,9 +2706,52 @@ mod tests {
                 // matched value rides the event in-band (#456)
                 assert!(s.has_amount);
                 assert_eq!(s.amount, 50_000);
+                // raw_tx omitted unless the connection opted in.
+                assert!(s.raw_tx.is_empty(), "no opt-in → empty raw_tx");
             }
             other => panic!("wrong body: {other:?}"),
         }
+    }
+
+    #[test]
+    fn script_match_raw_tx_gated_by_include_flag() {
+        use bitcoin::hashes::Hash;
+        use node::events::WatchMatch;
+        let e = edge();
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let m = WatchMatch::ScriptMatched {
+            scripthash: [0xaa; 32],
+            txid,
+            is_output: true,
+            index: 0,
+            confirmed: true,
+            height: Some(100),
+            amount: Some(1),
+            raw_tx: Some(bytes.clone()),
+        };
+        let raw_of = |ev: pb::NodeEvent| match ev.body.unwrap() {
+            pb::node_event::Body::ScriptMatched(s) => s.raw_tx,
+            other => panic!("wrong body: {other:?}"),
+        };
+        // Opted in AND the match carries it → bytes on the wire.
+        assert_eq!(raw_of(watch_match_to_proto(&e, &m, Vec::new(), true)), vec![0xde, 0xad, 0xbe, 0xef]);
+        // Not opted in → dropped even though the match carries it.
+        assert!(raw_of(watch_match_to_proto(&e, &m, Vec::new(), false)).is_empty());
+        // Opted in but the match has no raw_tx (nobody triggered serialization)
+        // → still empty, no panic.
+        let m_none = WatchMatch::ScriptMatched {
+            scripthash: [0xaa; 32],
+            txid,
+            is_output: true,
+            index: 0,
+            confirmed: true,
+            height: Some(100),
+            amount: Some(1),
+            raw_tx: None,
+        };
+        assert!(raw_of(watch_match_to_proto(&e, &m_none, Vec::new(), true)).is_empty());
     }
 
     // sha256("grpc-sub-token") and sha256("grpc-nosub-token"), fixed vectors.
@@ -3922,7 +4005,7 @@ mod tests {
             },
             &handle,
             None,
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -3950,7 +4033,7 @@ mod tests {
             },
             &handle,
             Some(&principal),
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4002,7 +4085,7 @@ mod tests {
                 },
                 &handle,
                 Some(&principal),
-                &mask,
+                &mask, &AtomicBool::new(false),
                 &mut guard,
                 (8, 32),
             );
@@ -4056,7 +4139,7 @@ mod tests {
             },
             &handle,
             Some(&principal),
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4098,7 +4181,7 @@ mod tests {
             add(vec![op_proto(1, 0), op_proto(2, 0), op_proto(3, 0)]),
             &handle,
             Some(&principal),
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4110,7 +4193,7 @@ mod tests {
             add(vec![op_proto(1, 0), op_proto(4, 0)]),
             &handle,
             Some(&principal),
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4125,7 +4208,7 @@ mod tests {
             },
             &handle,
             Some(&principal),
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4150,7 +4233,7 @@ mod tests {
             },
             &handle,
             None,
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -4177,7 +4260,7 @@ mod tests {
                 },
                 &handle,
                 None,
-                &mask,
+                &mask, &AtomicBool::new(false),
                 leases,
                 (8, 32),
             );
@@ -4194,7 +4277,7 @@ mod tests {
             },
             &handle,
             None,
-            &mask,
+            &mask, &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
