@@ -398,14 +398,22 @@ async fn grpc_watch_script_funding_mempool_then_confirmed() {
     };
     assert_eq!(hex::encode(&s.scripthash), sh);
     assert!(s.is_output);
+    // Funded output value rides the event in-band (#456): coinbase (50 BTC)
+    // less the 10_000-sat fee, no change output.
+    assert!(s.has_amount, "funding value always carried");
+    assert_eq!(s.amount, 50 * 100_000_000 - 10_000, "funded output value");
 
     mine_n(&sn, 1).await;
-    next_event_matching(
+    let ev = next_event_matching(
         &mut stream,
         15,
         |b| matches!(b, Body::ScriptMatched(s) if s.is_output && s.confirmed),
     )
     .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert!(s.has_amount && s.amount == 50 * 100_000_000 - 10_000, "confirmed funding value");
 }
 
 /// A watched script spent by a tx input (`is_output=false`) — mempool (via the
@@ -433,14 +441,23 @@ async fn grpc_watch_script_spend_mempool_then_confirmed() {
     };
     assert_eq!(hex::encode(&s.scripthash), sh);
     assert!(!s.is_output, "input-side match");
+    // Spent-prevout value carried in-band under the default 'amount' tier
+    // (#456): the block-1 coinbase being spent is worth the full 50 BTC.
+    assert!(s.has_amount, "mempool spend value carried at default tier");
+    assert_eq!(s.amount, 50 * 100_000_000, "spent coinbase value");
 
     mine_n(&sn, 1).await;
-    next_event_matching(
+    let ev = next_event_matching(
         &mut stream,
         15,
         |b| matches!(b, Body::ScriptMatched(s) if !s.is_output && s.confirmed),
     )
     .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    // Confirmed spend recovers the value from block undo data.
+    assert!(s.has_amount && s.amount == 50 * 100_000_000, "confirmed spend value");
 }
 
 /// A watched txid, seen in the mempool then confirmed.
@@ -902,6 +919,13 @@ async fn ws_watch_script_funding() {
         })
         .await;
     assert_eq!(ev["body"]["scripthash"], sh, "event: {ev}");
+    // Matched value carried in the WS body in-band (#456).
+    assert_eq!(ev["body"]["has_amount"], true, "event: {ev}");
+    assert_eq!(
+        ev["body"]["amount"].as_u64(),
+        Some(50 * 100_000_000 - 10_000),
+        "funded output value: {ev}"
+    );
 }
 
 /// WS watch: a watched txid seen in the mempool → `txid_matched`.

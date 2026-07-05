@@ -80,6 +80,13 @@ pub enum WatchMatch {
         index: u32,
         confirmed: bool,
         height: Option<u32>,
+        /// Matched value in satoshis: the funded output value (`is_output =
+        /// true`) or the spent-prevout value (`is_output = false`). Always
+        /// `Some` on the funding side and for confirmed spends; `Some` for
+        /// mempool spends when the prevout value is retained
+        /// (`streamprevoutmeta >= amount`), else `None` (hash tier). Serialized
+        /// as `(amount, has_amount)` on the wire, mirroring `SpentPrevout`.
+        amount: Option<u64>,
     },
     /// A watched transaction id appeared — in the mempool (`confirmed =
     /// false`) or a connected block (`confirmed = true`). The "seen/confirmed"
@@ -863,6 +870,11 @@ impl WatchRegistry {
             if scan_scripts
                 && let Some(subs) = inner.by_scripthash.get(sh)
             {
+                // Mempool-input `min_value`: gate on the spent prevout's value
+                // when retained (`streamprevoutmeta >= amount`). `None` (hash
+                // tier) fails closed for a floored script (see `floor_allows`)
+                // and is carried through to the event as `has_amount = false`.
+                let value = prev_amounts.get(vin).copied();
                 let m = WatchMatch::ScriptMatched {
                     scripthash: *sh,
                     txid,
@@ -870,11 +882,8 @@ impl WatchRegistry {
                     index: vin as u32,
                     confirmed: false,
                     height: None,
+                    amount: value,
                 };
-                // Mempool-input `min_value`: gate on the spent prevout's value
-                // when retained (`streamprevoutmeta >= amount`). `None` (hash
-                // tier) fails closed for a floored script (see `floor_allows`).
-                let value = prev_amounts.get(vin).copied();
                 for sid in subs {
                     if floor_allows(&inner, *sid, sh, value) {
                         deliver(&inner, *sid, &m);
@@ -1350,6 +1359,9 @@ fn scan_tx(
             if scan_scripts
                 && let Some(subs) = inner.by_scripthash.get(&sh)
             {
+                // Output-side `min_value`: gate on the funded output's value,
+                // which is always known and always carried on the event.
+                let value = out.value.to_sat();
                 let m = WatchMatch::ScriptMatched {
                     scripthash: sh,
                     txid,
@@ -1357,9 +1369,8 @@ fn scan_tx(
                     index: vout as u32,
                     confirmed,
                     height,
+                    amount: Some(value),
                 };
-                // Output-side `min_value`: gate on the funded output's value.
-                let value = out.value.to_sat();
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
                         sink.emit(inner, *sid, &m);
@@ -1441,6 +1452,10 @@ fn scan_block_spent_scripts(
             if scan_scripts
                 && let Some(subs) = inner.by_scripthash.get(&sh)
             {
+                // Input-side `min_value`: gate on the spent prevout's value,
+                // recovered from undo data (symmetric with the output side).
+                // Always known for a confirmed spend, so always carried.
+                let value = spent.amount;
                 let m = WatchMatch::ScriptMatched {
                     scripthash: sh,
                     txid,
@@ -1448,10 +1463,8 @@ fn scan_block_spent_scripts(
                     index: vin as u32,
                     confirmed: true,
                     height: Some(height),
+                    amount: Some(value),
                 };
-                // Input-side `min_value`: gate on the spent prevout's value,
-                // recovered from undo data (symmetric with the output side).
-                let value = spent.amount;
                 for sid in subs {
                     if passes_floor(inner, *sid, &sh, value) {
                         sink.emit(inner, *sid, &m);
@@ -2567,10 +2580,13 @@ mod tests {
             WatchMatch::ScriptMatched {
                 scripthash,
                 is_output,
+                amount,
                 ..
             } => {
                 assert_eq!(scripthash, sh);
                 assert!(is_output);
+                // Funding value is always known and carried in-band.
+                assert_eq!(amount, Some(1_000), "funded output value in-band");
             }
             other => panic!("wrong match: {other:?}"),
         }
@@ -2613,11 +2629,14 @@ mod tests {
                 scripthash,
                 is_output,
                 confirmed,
+                amount,
                 ..
             } => {
                 assert_eq!(scripthash, sh);
                 assert!(!is_output, "spend side");
                 assert!(confirmed);
+                // Confirmed spend recovers the prevout value from undo → in-band.
+                assert_eq!(amount, Some(1_000), "spent prevout value in-band");
             }
             other => panic!("wrong match: {other:?}"),
         }
@@ -3430,6 +3449,7 @@ mod tests {
                 index,
                 confirmed,
                 height,
+                amount,
                 ..
             } => {
                 assert_eq!(scripthash, sh);
@@ -3437,6 +3457,8 @@ mod tests {
                 assert_eq!(index, 0, "input index");
                 assert!(!confirmed, "mempool spend is unconfirmed");
                 assert_eq!(height, None);
+                // No prevout amounts passed (hash tier) → value not retained.
+                assert_eq!(amount, None, "hash tier carries no value");
             }
             other => panic!("wrong match: {other:?}"),
         }
@@ -3460,16 +3482,18 @@ mod tests {
         reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999], &[]);
         assert!(rx.try_recv().is_err(), "999 < floor → suppressed");
 
-        // Spent value 1000 == floor → delivered.
+        // Spent value 1000 == floor → delivered, and the value rides the event.
         reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000], &[]);
         match rx.try_recv().expect("1000 >= floor → delivered") {
             WatchMatch::ScriptMatched {
                 is_output,
                 confirmed,
+                amount,
                 ..
             } => {
                 assert!(!is_output, "spend side");
                 assert!(!confirmed, "mempool");
+                assert_eq!(amount, Some(1_000), "retained prevout value in-band");
             }
             other => panic!("wrong match: {other:?}"),
         }
