@@ -460,6 +460,52 @@ async fn grpc_watch_script_spend_mempool_then_confirmed() {
     assert!(s.has_amount && s.amount == 50 * 100_000_000, "confirmed spend value");
 }
 
+/// SetWatchOptions{include_raw_tx}: a watched-script match on an opted-in stream
+/// inlines the full serialized matching transaction (#456). Default streams
+/// (no opt-in) carry an empty raw_tx — the gated default, proven by the value
+/// tests above which never see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_script_raw_tx_opt_in_inlines_full_tx() {
+    use bitcoin::hashes::Hash;
+    let (sn, wallet) = matured_node().await;
+    let dest = DeterministicWallet::from_secret([0x5e; 32])
+        .address
+        .script_pubkey();
+    let sh = scripthash_hex(&dest);
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (tx, mut stream) = client.watch(vec![add_scripts(&[&sh])]).await;
+    // Opt this stream into raw-tx inlining before any match flows.
+    tx.send(SubscribeControl {
+        msg: Some(Control::SetWatchOptions(
+            satd_events::proto::v1::SetWatchOptions { include_raw_tx: true },
+        )),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    broadcast_spend(&sn, &wallet, 0x5e, 10_000).await;
+
+    let ev = next_event_matching(
+        &mut stream,
+        15,
+        |b| matches!(b, Body::ScriptMatched(s) if s.is_output && !s.confirmed),
+    )
+    .await;
+    let Some(Body::ScriptMatched(s)) = ev.body else {
+        unreachable!()
+    };
+    assert!(!s.raw_tx.is_empty(), "opted in → raw_tx inlined");
+    // The inlined bytes deserialize to the matching transaction.
+    let decoded: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&s.raw_tx).expect("raw_tx is a valid tx");
+    assert_eq!(
+        decoded.compute_txid().as_raw_hash().to_byte_array().to_vec(),
+        s.txid,
+        "raw_tx is the matching tx"
+    );
+}
+
 /// A watched txid, seen in the mempool then confirmed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_watch_txid_mempool_then_confirmed() {

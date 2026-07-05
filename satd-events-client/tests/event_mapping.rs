@@ -23,11 +23,13 @@ fn script_matched_carries_descriptor_attribution() {
         }],
         amount: 50_000,
         has_amount: true,
+        raw_tx: vec![0xde, 0xad, 0xbe, 0xef],
     }));
     match Event::from(ev) {
-        Event::ScriptMatched { descriptors, is_output, amount, .. } => {
+        Event::ScriptMatched { descriptors, is_output, amount, raw_tx, .. } => {
             assert!(is_output);
             assert_eq!(amount, Some(50_000), "in-band matched value (#456)");
+            assert_eq!(raw_tx, Some(vec![0xde, 0xad, 0xbe, 0xef]), "opt-in raw_tx (#456)");
             assert_eq!(
                 descriptors,
                 vec![DescriptorMatch {
@@ -53,11 +55,14 @@ fn script_matched_without_descriptor_is_empty_attribution() {
         // hash tier: no value retained → has_amount=false decodes to None.
         amount: 0,
         has_amount: false,
+        // no opt-in → empty raw_tx decodes to None.
+        raw_tx: vec![],
     }));
     match Event::from(ev) {
-        Event::ScriptMatched { descriptors, amount, .. } => {
+        Event::ScriptMatched { descriptors, amount, raw_tx, .. } => {
             assert!(descriptors.is_empty());
             assert_eq!(amount, None, "has_amount=false → None (not a real 0-value)");
+            assert_eq!(raw_tx, None, "empty raw_tx → None");
         }
         other => panic!("expected ScriptMatched, got {other:?}"),
     }

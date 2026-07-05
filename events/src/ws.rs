@@ -20,7 +20,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -488,6 +488,9 @@ async fn ws_conn(
     let (handle, mut rx_match) = state.watch_registry.register(WATCH_CHANNEL_CAPACITY);
     let handle = Arc::new(handle);
     let category_mask = Arc::new(AtomicU32::new(initial_mask));
+    // Per-stream raw-tx opt-in (SetWatchOptions). Inbound flips it + the
+    // registry gate; the outbound encoder reads it to inline raw_tx.
+    let include_raw_tx = Arc::new(AtomicBool::new(false));
     // Subscribe to the live broadcast BEFORE building the replay snapshot so no
     // event is missed at the snapshot→live boundary.
     let mut rx_live = state.publisher.subscribe();
@@ -521,6 +524,7 @@ async fn ws_conn(
     let inbound = {
         let handle = handle.clone();
         let category_mask = category_mask.clone();
+        let include_raw_tx = include_raw_tx.clone();
         let watch_set = watch_set.clone();
         let last_activity = last_activity.clone();
         tokio::spawn(async move {
@@ -536,6 +540,7 @@ async fn ws_conn(
                                 &handle,
                                 principal.as_ref(),
                                 &category_mask,
+                                &include_raw_tx,
                                 &mut guard,
                                 max_subscriptions,
                                 prefix_bounds,
@@ -658,7 +663,9 @@ async fn ws_conn(
                         }
                         _ => Vec::new(),
                     };
-                    let text = watch_match_json(&wm, &attribution).to_string();
+                    let text =
+                        watch_match_json(&wm, &attribution, include_raw_tx.load(Ordering::Relaxed))
+                            .to_string();
                     if sender.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
@@ -757,6 +764,13 @@ enum WsControl {
         #[serde(default)]
         depth_alarms: Vec<WsDepthAlarm>,
     },
+    /// Per-stream delivery options (JSON mirror of gRPC `SetWatchOptions`).
+    /// `include_raw_tx=true` inlines the full serialized matching tx (hex) on
+    /// this stream's `script_matched` events; off by default.
+    SetWatchOptions {
+        #[serde(default)]
+        include_raw_tx: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -828,6 +842,7 @@ fn apply_ws_control(
     handle: &node::events::WatchHandle,
     principal: Option<&satd_auth::Principal>,
     category_mask: &AtomicU32,
+    include_raw_tx: &AtomicBool,
     watch_set: &mut WatchSet,
     max_subscriptions: usize,
     prefix_bounds: (u8, u8),
@@ -961,6 +976,12 @@ fn apply_ws_control(
         WsControl::SetCategories { categories } => {
             let mask = if categories == 0 { u32::MAX } else { categories };
             category_mask.store(mask, Ordering::Relaxed);
+        }
+        WsControl::SetWatchOptions { include_raw_tx: want } => {
+            // Store the encoder-side flag AND toggle the registry gate counter so
+            // the matcher serializes only when opted in; both must agree.
+            include_raw_tx.store(want, Ordering::Relaxed);
+            handle.set_raw_tx(want);
         }
         WsControl::AddOutpoints { outpoints } => {
             watch_set.add_outpoints(
@@ -1165,6 +1186,7 @@ fn watch_set_result_json(outcome: &crate::watchset::ReplaceOutcome) -> serde_jso
 fn watch_match_json(
     m: &WatchMatch,
     descriptor_matches: &[(std::sync::Arc<str>, u32, u32)],
+    include_raw_tx: bool,
 ) -> serde_json::Value {
     use bitcoin::hashes::Hash;
     match m {
@@ -1194,7 +1216,16 @@ fn watch_match_json(
             confirmed,
             height,
             amount,
-        } => json!({
+            raw_tx,
+        } => {
+            // Hex of the full tx when this stream opted in (SetWatchOptions) and
+            // the match carried it; `null` otherwise. Mirrors the gRPC gate.
+            let raw_tx_hex = if include_raw_tx {
+                raw_tx.as_ref().map(hex::encode)
+            } else {
+                None
+            };
+            json!({
             "schema_version": node::events::SCHEMA_VERSION,
             "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
             "body": {
@@ -1209,6 +1240,8 @@ fn watch_match_json(
                 // (mempool spend under `streamprevoutmeta = hash`).
                 "amount": amount.unwrap_or(0),
                 "has_amount": amount.is_some(),
+                // Full serialized tx (hex) when opted in; null otherwise.
+                "raw_tx": raw_tx_hex,
                 // Empty array for a directly-watched script; one entry per
                 // descriptor whose window holds this scripthash.
                 "descriptor_matches": descriptor_matches
@@ -1220,7 +1253,8 @@ fn watch_match_json(
                     }))
                     .collect::<Vec<_>>(),
             }
-        }),
+            })
+        }
         WatchMatch::TxidMatched {
             txid,
             confirmed,
@@ -1406,22 +1440,22 @@ mod tests {
             )
         };
         // cap = 2, no principal (loopback/unlimited quota).
-        apply_ws_control(&add(0), &handle, None, &mask, &mut ws, 2, (8, 32));
-        apply_ws_control(&add(1), &handle, None, &mask, &mut ws, 2, (8, 32));
+        apply_ws_control(&add(0), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
+        apply_ws_control(&add(1), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "two distinct outpoints registered");
         // At the cap → the next add is shed (connection stays up).
-        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2, (8, 32));
+        apply_ws_control(&add(2), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "add at the per-connection cap is shed");
         // A remove frees a slot; a subsequent add then succeeds.
         let rm = format!(
             r#"{{"type":"remove_outpoints","outpoints":[{{"txid":"{txid}","vout":0}}]}}"#
         );
-        apply_ws_control(&rm, &handle, None, &mask, &mut ws, 2, (8, 32));
+        apply_ws_control(&rm, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 1);
-        apply_ws_control(&add(2), &handle, None, &mask, &mut ws, 2, (8, 32));
+        apply_ws_control(&add(2), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert_eq!(ws.len(), 2, "add succeeds again after a remove frees a slot");
         // cap = 0 ⇒ unlimited: adds are never shed.
-        apply_ws_control(&add(3), &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(&add(3), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
     }
 
@@ -1449,7 +1483,7 @@ mod tests {
             "11".repeat(32),
             "22".repeat(32),
         );
-        let outcome = apply_ws_control(&ctrl, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        let outcome = apply_ws_control(&ctrl, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert!(
             matches!(outcome, Some(crate::watchset::ReplaceOutcome::Rejected { .. })),
             "over-quota target must be rejected",
@@ -1462,7 +1496,7 @@ mod tests {
             r#"{{"type":"set_watch_set","categories":2,"scripthashes":["{}"]}}"#,
             "11".repeat(32),
         );
-        let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &mut ws, 0, (8, 32));
+        let outcome = apply_ws_control(&ok, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
         assert_eq!(mask.load(Ordering::Relaxed), 2, "accepted replace applies its category filter");
     }
@@ -1483,7 +1517,7 @@ mod tests {
             "aa".repeat(32),
             "bb".repeat(32),
         );
-        let outcome = apply_ws_control(&seed, &handle, None, &mask, &mut ws, 0, (8, 32));
+        let outcome = apply_ws_control(&seed, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
         assert_eq!(ws.len(), 2);
         assert_eq!(mask.load(Ordering::Relaxed), 2);
@@ -1494,7 +1528,7 @@ mod tests {
             r#"{{"type":"set_watch_set","categories":8,"scripthashes":["{}","zz"]}}"#,
             "cc".repeat(32),
         );
-        let outcome = apply_ws_control(&bad, &handle, None, &mask, &mut ws, 0, (8, 32));
+        let outcome = apply_ws_control(&bad, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert!(
             matches!(outcome, Some(crate::watchset::ReplaceOutcome::Malformed)),
             "a malformed element refuses the whole snapshot",
@@ -1521,7 +1555,7 @@ mod tests {
             "22".repeat(32),
             "33".repeat(32),
         );
-        let outcome = apply_ws_control(&over, &handle, None, &mask, &mut ws, 2, (8, 32));
+        let outcome = apply_ws_control(&over, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert!(
             matches!(outcome, Some(crate::watchset::ReplaceOutcome::CapExceeded { limit: 2, requested: 3 })),
             "over-cap SetWatchSet must be rejected, got {outcome:?}",
@@ -1538,9 +1572,35 @@ mod tests {
             "11".repeat(32),
             "22".repeat(32),
         );
-        let outcome = apply_ws_control(&ok, &handle, None, &mask, &mut ws, 2, (8, 32));
+        let outcome = apply_ws_control(&ok, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 2, (8, 32));
         assert!(matches!(outcome, Some(crate::watchset::ReplaceOutcome::Accepted { .. })));
         assert_eq!(ws.len(), 2);
+    }
+
+    #[test]
+    fn script_match_json_amount_and_raw_tx_gate() {
+        use bitcoin::hashes::Hash;
+        let txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let m = WatchMatch::ScriptMatched {
+            scripthash: [0xaa; 32],
+            txid,
+            is_output: true,
+            index: 0,
+            confirmed: true,
+            height: Some(100),
+            amount: Some(50_000),
+            raw_tx: Some(std::sync::Arc::from(vec![0xde, 0xad, 0xbe, 0xef])),
+        };
+        // Value fields are always present; raw_tx only when opted in.
+        let off = watch_match_json(&m, &[], false);
+        assert_eq!(off["body"]["category"], "script_matched");
+        assert_eq!(off["body"]["amount"], 50_000);
+        assert_eq!(off["body"]["has_amount"], true);
+        assert!(off["body"]["raw_tx"].is_null(), "no opt-in → raw_tx null");
+
+        let on = watch_match_json(&m, &[], true);
+        assert_eq!(on["body"]["raw_tx"], "deadbeef", "opt-in → hex of the tx");
     }
 
     #[test]
@@ -1553,7 +1613,7 @@ mod tests {
             confirmed: true,
             height: Some(202),
         };
-        let v = watch_match_json(&m, &[]);
+        let v = watch_match_json(&m, &[], false);
         assert_eq!(v["body"]["category"], "txid_matched");
         assert_eq!(v["body"]["confirmed"], true);
         assert_eq!(v["body"]["txid"], "cd".repeat(32));
@@ -1571,7 +1631,7 @@ mod tests {
         let v = watch_match_json(&WatchMatch::TxidReplaced {
             txid,
             replacing_txid: rep,
-        }, &[]);
+        }, &[], false);
         assert_eq!(v["body"]["category"], "txid_replaced");
         assert_eq!(v["body"]["replacing_txid"], "22".repeat(32));
         assert!(v["cursor"].is_null(), "replaced carries no cursor");
@@ -1579,14 +1639,14 @@ mod tests {
         let v = watch_match_json(&WatchMatch::TxidEvicted {
             txid,
             reason: node::mempool::events::EvictReason::BlockConflict,
-        }, &[]);
+        }, &[], false);
         assert_eq!(v["body"]["category"], "txid_evicted");
         assert_eq!(v["body"]["reason"], "block_conflict");
 
         let v = watch_match_json(&WatchMatch::TxidUnconfirmed {
             txid,
             prev_height: 814_000,
-        }, &[]);
+        }, &[], false);
         assert_eq!(v["body"]["category"], "txid_unconfirmed");
         assert_eq!(v["body"]["prev_height"], 814_000);
 
@@ -1594,7 +1654,7 @@ mod tests {
             txid,
             depth: 3,
             height: 100,
-        }, &[]);
+        }, &[], false);
         assert_eq!(v["body"]["category"], "txid_depth_reached");
         assert_eq!(v["body"]["depth"], 3);
         assert_eq!(v["cursor"]["height"], 100);
@@ -1603,7 +1663,7 @@ mod tests {
             txid,
             depth: 6,
             height: 100,
-        }, &[]);
+        }, &[], false);
         assert_eq!(v["body"]["category"], "txid_finalized");
         assert_eq!(v["body"]["depth"], 6);
         assert_eq!(v["cursor"]["height"], 100);
@@ -1620,11 +1680,11 @@ mod tests {
         let ctrl = format!(
             r#"{{"type":"add_transactions","txids":["{txid}"],"min_depths":[1,3]}}"#
         );
-        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(&ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 2, "(X,1) and (X,3) are two items");
         // Lifecycle add (no depths) is one item.
         let ctrl = format!(r#"{{"type":"add_transactions","txids":["{txid}"]}}"#);
-        apply_ws_control(&ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(&ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "lifecycle watch adds one more item");
     }
 
@@ -1636,18 +1696,18 @@ mod tests {
         let mut ws = WatchSet::default();
         // A 16-bit prefix (2 bytes hex). No principal ⇒ loopback/unlimited.
         let ctrl = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
-        apply_ws_control(ctrl, &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(ctrl, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 1, "one prefix bucket registered");
         assert!(reg.has_prefix_watchers());
 
         // Below-min bits is dropped (filter_map) → nothing registered.
         let bad = r#"{"type":"add_script_prefixes","prefixes":[{"prefix":"ab","bits":4}]}"#;
-        apply_ws_control(bad, &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(bad, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 1, "out-of-range bits rejected, set unchanged");
 
         // Remove releases it.
         let rm = r#"{"type":"remove_script_prefixes","prefixes":[{"prefix":"abcd","bits":16}]}"#;
-        apply_ws_control(rm, &handle, None, &mask, &mut ws, 0, (8, 32));
+        apply_ws_control(rm, &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 0);
         assert!(!reg.has_prefix_watchers());
     }
@@ -1681,7 +1741,7 @@ mod tests {
                 },
             ],
         }));
-        let v = watch_match_json(&m, &[]);
+        let v = watch_match_json(&m, &[], false);
         assert_eq!(v["body"]["category"], "prefix_matched");
         assert_eq!(v["body"]["bits"], 16);
         assert_eq!(v["body"]["prefix"], "abcd");
@@ -1717,7 +1777,7 @@ mod tests {
             confirmed: true,
             height: Some(101),
         };
-        let v = watch_match_json(&m, &[]);
+        let v = watch_match_json(&m, &[], false);
         assert_eq!(v["body"]["category"], "outpoint_spent");
         assert_eq!(v["body"]["outpoint_vout"], 3);
         assert_eq!(v["body"]["confirmed"], true);

@@ -224,6 +224,11 @@ pub enum Event {
         /// amount`), else `None` (hash tier). `None` lets the consumer skip the
         /// enrichment `getrawtransaction` for the common single-coin case.
         amount: Option<u64>,
+        /// Full consensus-serialized matching transaction, present only when
+        /// this stream opted in via
+        /// [`set_watch_options`](crate::WatchControls::set_watch_options) with
+        /// `include_raw_tx = true`; `None` otherwise.
+        raw_tx: Option<Vec<u8>>,
         /// Descriptor attribution: the descriptor watch(es) this scripthash
         /// belongs to, if it was registered via `add_descriptor`. Empty for a
         /// directly-watched script. See [`DescriptorMatch`].
@@ -514,6 +519,7 @@ impl From<pb::NodeEvent> for Event {
                 index: s.index,
                 confirmed: s.confirmed,
                 amount: s.has_amount.then_some(s.amount),
+                raw_tx: (!s.raw_tx.is_empty()).then_some(s.raw_tx),
                 descriptors: s
                     .descriptor_matches
                     .into_iter()

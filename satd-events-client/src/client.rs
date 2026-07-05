@@ -379,6 +379,24 @@ impl WatchHandle {
         .await
     }
 
+    /// Set per-stream delivery options. With `include_raw_tx = true`, subsequent
+    /// [`Event::ScriptMatched`](crate::Event::ScriptMatched) on this stream carry
+    /// the full serialized matching transaction in
+    /// [`raw_tx`](crate::Event::ScriptMatched); `false` restores the default
+    /// (empty). Applies immediately; does not affect the watch-set. Bandwidth-
+    /// heavy — the value fields (`amount`) already cover the common case, so
+    /// enable this only when you need the whole transaction.
+    ///
+    /// When driving a [`ResilientWatch`](crate::ResilientWatch), prefer its
+    /// [`set_watch_options`](crate::ResilientWatch::set_watch_options) so the
+    /// opt-in is re-applied across reconnects.
+    pub async fn set_watch_options(&self, include_raw_tx: bool) -> Result<(), StreamError> {
+        self.send_msg(pb::subscribe_control::Msg::SetWatchOptions(
+            pb::SetWatchOptions { include_raw_tx },
+        ))
+        .await
+    }
+
     /// Mid-stream re-anchor: replay confirmed history forward from `cursor`, then
     /// resume live, without tearing down the watch-set. Rate-limited per
     /// principal; only one re-anchor drains at a time.

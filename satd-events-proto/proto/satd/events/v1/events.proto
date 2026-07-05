@@ -124,7 +124,24 @@ message SubscribeControl {
     // cursor, and its match events carry no resume cursor. It runs independently
     // of any in-flight SetCursor re-anchor.
     RescanBlocks rescan_blocks = 14;
+    // Per-stream delivery options. Currently one knob: `include_raw_tx`, which
+    // asks the server to inline the full consensus-serialized matching
+    // transaction on this connection's ScriptMatched events (parity with the
+    // raw_tx PrefixMatched already carries). Applies immediately and to all
+    // subsequent ScriptMatched on this stream; re-send to toggle. Off by
+    // default — bandwidth-heavy, so opt-in. Governs only the wire; the value
+    // fields (amount/has_amount) are always present regardless.
+    SetWatchOptions set_watch_options = 15;
   }
+}
+
+// Per-stream delivery options (SubscribeControl.set_watch_options). Additive:
+// new knobs slot in as new fields, all defaulting to the pre-existing behavior.
+message SetWatchOptions {
+  // When true, ScriptMatched events on this stream carry `raw_tx` (the full
+  // consensus-serialized matching transaction). When false (default), `raw_tx`
+  // is empty and the consumer uses the in-band scripthash/txid/index/amount.
+  bool include_raw_tx = 1;
 }
 
 // A bounded historical rescan request (SubscribeControl.rescan_blocks). The
@@ -239,6 +256,12 @@ message ScriptMatched {
   // existing consumers ignore both fields.
   uint64 amount     = 7;
   bool   has_amount = 8;
+  // Full consensus-serialized matching transaction, inlined ONLY when the
+  // client opted in for this stream via SetWatchOptions{include_raw_tx=true}
+  // (parity with PrefixMatched.raw_tx). Empty otherwise. Lets a consumer that
+  // needs the whole tx (e.g. multi-input net-of-change accounting) skip the
+  // enrichment getrawtransaction entirely. Bandwidth-heavy — off by default.
+  bytes raw_tx = 9;
 }
 
 message DescriptorMatch {
