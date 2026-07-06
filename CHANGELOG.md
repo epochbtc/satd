@@ -11,6 +11,23 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Optional `raw_tx` on `ScriptMatched`.** A new per-connection opt-in
+  (`SetWatchOptions{include_raw_tx}`) inlines the full matching transaction on
+  every `ScriptMatched`, at parity with `PrefixMatched.raw_tx`. Off by default
+  (bandwidth-heavy); the matcher only serializes when at least one connection
+  has opted in. New `satd-events-client` `WatchControls::set_watch_options` /
+  `ResilientWatch::set_watch_options`. (#456, #458)
+- **Matched amount on `ScriptMatched`.** `ScriptMatched` gains `amount` /
+  `has_amount`, at wire parity with `SpentPrevout` — the funded value for a
+  funding match, the spent-prevout value for a spending match. Lets an
+  exact-script `Watch` consumer skip the per-match `getrawtransaction`
+  enrichment call. Additive; existing consumers ignore both fields. (#456, #457)
+- **`ResilientWatch::next` cancel-safety fix.** Cancelling `next()` mid-retry
+  during a transient `set_cursor` re-anchor reject could burn the backoff
+  budget without the re-anchor reaching the wire and drop the reject event,
+  surfacing a `RateLimited`/`ConcurrentReanchor` rejection the wrapper is
+  supposed to absorb. The retry is now resumable state driven cancel-safely
+  from `next()`. SDK-internal; no wire-visible behavior change. (#453, #455)
 - **Bounded historical rescan (`RescanBlocks`).** A pull primitive on the
   bidirectional gRPC `Watch` stream: `RescanBlocks{from_height, to_height}`
   scans **this connection's** current watch-set against a closed, span-capped
@@ -28,6 +45,50 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   A side query — it does not advance the durable cursor. New `satd-events-client`
   `ResilientWatch::rescan()` / `WatchHandle::rescan()` and `Event::RescanAccepted`
   / `Event::RescanRejected` / `Event::RescanComplete`. (#454)
+- **Descriptor match attribution on `ScriptMatched`.** A match on a
+  descriptor-derived script now reports `descriptor_matches`: the
+  descriptor(s) whose window contains it, each with the exact `(branch,
+  derivation_index)` the server derived it at. Lets a multi-descriptor
+  consumer route a deposit to the right account directly instead of
+  re-expanding its own descriptors and maintaining a reverse
+  `scripthash → descriptor` index. Empty for a directly-watched script. (#451)
+- **Cap retained descriptors per connection (DoS guard).** A descriptor whose
+  window expands entirely to already-watched scripts skipped the quota charge
+  and rate token yet still grew the per-connection descriptor-membership map
+  unboundedly — invisible to every existing quota/watch-set-size bound. Adds
+  `MAX_DESCRIPTORS_PER_CONNECTION = 256`; re-asserting an already-retained
+  descriptor (window sliding) is unaffected. (#449)
+- **`ResilientWatch::reload()` via atomic `SetWatchSet`, and `RemoveDescriptor`
+  window management.** The server now retains the descriptor →
+  derived-scripthashes membership per connection (owner-counted, so a script
+  shared by two descriptors or a descriptor and a direct add is never dropped
+  while any source still wants it), and a new `RemoveDescriptor` control
+  message drops a descriptor's whole window in one message. On top of that,
+  `ResilientWatch::reload()` lets an integrator push a freshly-reloaded
+  watch-set as a single atomic `SetWatchSet` replace — the server reconciles
+  under its watch-set lock by effective coverage (items present in both old
+  and new set keep their registration/lease untouched), and rejects the whole
+  target on over-quota (`WatchSetRejected{QUOTA_EXCEEDED}`), over-cap
+  (`{CAP_EXCEEDED}`), or a malformed element (`{MALFORMED}`) rather than
+  silently shrinking the live set. This replaces an earlier client-computed
+  `Add*`/`Remove*` delta whose ordering could strand coverage or over-charge
+  quota on a same-size swap. (#450)
+- **Watch-set loader hook for durable-truth integrators.** An optional
+  `ResilientWatchConfig::watch_set_loader` rebuilds the canonical watch-set
+  from an integrator's own source of truth (a DB, config file, upstream
+  service) on every (re)connect, before the event stream resumes — closing
+  the gap where a process restart or a truth change while the stream was down
+  left the in-memory mirror empty or stale. Purely additive; omit it and the
+  mirror-replay behavior is unchanged. (#447, #448)
+- **Fix silently-empty watch on BIP-389 multipath descriptors.** Registering a
+  multipath descriptor (`wpkh(.../<0;1>/*)`) — the canonical export form from
+  Bitcoin Core, Sparrow, and BDK — failed inside `expand_descriptor` with no
+  ack on the control stream, so `add_descriptor` resolved `Ok` and the
+  subscription silently matched nothing. Multipath descriptors are now
+  detected and expanded per branch, capped at `MAX_DESCRIPTOR_BRANCHES = 2`
+  (matching Core and real wallets) to bound per-descriptor work; an over-cap
+  descriptor is now rejected with a clear error instead of silently dropped.
+  (#445, #446)
 - **Retire the never-emitted `DescriptorNeedsAddresses` event.** The deprecated
   gap-limit side-channel (`NodeEvent.body` field 15) is removed from the wire
   schema and its tag reserved. No server ever emitted it — gap-limit
@@ -94,12 +155,6 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   sidecar, so production nodes can be profiled with `perf -g` and symbolized
   against the exact running binary. See the
   [release notes](docs/release-notes/0.4.0-pre.md).
-- **Streaming API: mid-stream `SetCursor` re-anchor on gRPC `Watch`.** A
-  `SetCursor` on a live bidi `Watch` now replays confirmed history
-  `(cursor.height, tip]` in order ahead of the live tail (drain-replay-resume),
-  preserving the watch-set + quota leases — previously a documented no-op. Lets a
-  long-lived `Watch` re-anchor its replay position without rebuilding a large
-  watch-set. See the [release notes](docs/release-notes/0.4.0-pre.md).
 - **Streaming API: prefix mempool spend-side prevout carriage (`full` tier).**
   Under `streamprevoutmeta = full`, a mempool `PrefixMatched` now carries the real
   spent-prevout `scriptPubKey` (and, from `amount`, its value) so a chainstate-less
@@ -144,10 +199,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 | Version | Date | Notes |
 |---|---|---|
+| [0.3.2](docs/release-notes/0.3.2.md) | 2026-06-24 | Consensus fix on the 0.3.x line — median-time-past now walks the candidate block's own ancestors instead of the active-chain height index, fixing a fork-handling bug that could permanently stall a node behind the tip (canonical successor blocks rejected `time-too-old`). Surfaced on testnet4's min-difficulty timestamp sawtooth. No breaking changes; defaults stay Bitcoin Core-compatible. |
 | [0.3.1](docs/release-notes/0.3.1.md) | 2026-06-15 | Maintenance release on the 0.3.x line — all bug fixes and tooling, no breaking changes. Fee estimation reworked and unified across every surface (monotone tiers; **corrected a 4× over-report on Esplora/Electrum fee rates**, a regression since 0.3.0); `getrawmempool` verbose no longer O(N²); profilable release binaries (frame pointers + a signed per-target debuginfo sidecar); and the MCP `get_metrics_snapshot` tool now reports real address-index state. Defaults stay Bitcoin Core-compatible. |
 | [0.3.0](docs/release-notes/0.3.0.md) | 2026-06-10 | Consensus hardening — per-network softfork-activation heights (critical, non-mainnet), six block-level rules brought to Core parity, a live Core block-acceptance differential + fuzzer — and **critical storage-durability fixes** (silent UTXO/index loss after IBD/reindex, plus an offline `satd-chainstate-repair` tool). Adds `invalidateblock`/`reconsiderblock`, reliable local-tx broadcast + durable rebroadcast, opt-in bearer auth, API-surface scaling, a push-based Streaming Consumption API, drop-in `bitcoin.conf` compatibility, and canary-fleet client-compat fixes. New surfaces are opt-in — defaults stay Bitcoin Core-compatible. |
 | [0.2.1](docs/release-notes/0.2.1.md) | 2026-05-29 | Packaging only — ship `sat-tui` in tarballs (no code change from 0.2.0). |
 | [0.2.0](docs/release-notes/0.2.0.md) | 2026-05-27 | BIP 324 v2 transport, native TLS, client-side PSBT signing, Core CLI/config-compat gap closed, AssumeUTXO fast-start. **Breaking storage cleanup** — see notes. |
 | [0.1.0](docs/release-notes/0.1.0.md) | 2026-05-08 | First public release: mainnet-validated node, native Esplora/Electrum/cfilters, Core-compatible RPC/CLI, signed reproducible builds. |
 
-[Unreleased]: https://github.com/epochbtc/satd/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/epochbtc/satd/compare/v0.3.2...HEAD

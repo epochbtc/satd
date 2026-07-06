@@ -275,7 +275,14 @@ message ScriptMatched {
   uint32 index      = 4;      // vout if is_output else vin
   bool   confirmed  = 5;
   repeated DescriptorMatch descriptor_matches = 6;  // descriptor attribution (§11.1); empty for a direct watch
+  uint64 amount     = 7;      // matched value; funded output or spent-prevout, per streamprevoutmeta tier
+  bool   has_amount = 8;      // distinguishes a genuine 0-value match from "not retained at this tier"
+  bytes  raw_tx     = 9;      // full matching tx, inline; only when this stream opted in (SetWatchOptions)
 }
+
+// Per-stream delivery options (SubscribeControl.set_watch_options). Off by
+// default — raw_tx inlining is bandwidth-heavy.
+message SetWatchOptions { bool include_raw_tx = 1; }
 
 message DescriptorMatch {
   string descriptor       = 1;   // the descriptor string the client registered
@@ -301,6 +308,17 @@ resolved for validation), yielding `ScriptMatched{is_output = false, confirmed =
 false}` without re-resolving anything off the hot path. Watching the funding
 **outpoint** also surfaces the spend (via `OutpointSpent`); the script path means a
 script watcher need not separately enumerate its outpoints to see unconfirmed spends.
+
+`ScriptMatched.amount`/`has_amount` carry the matched value in-band at wire
+parity with `SpentPrevout` (§7.6.1) — always present on the funding side and
+for confirmed spends, present for mempool spends under `streamprevoutmeta >=
+amount` (the default) — so an exact-script consumer can skip the per-match
+`getrawtransaction` enrichment call and the cross-node "not found" mempool
+race it can hit. `raw_tx` goes further: the full consensus-serialized
+matching transaction, inlined only for a connection that has sent
+`SetWatchOptions{include_raw_tx = true}` (off by default; the matcher only
+pays the serialization cost when at least one connection has opted in, and
+the bytes are cached and shared across matches on the same transaction).
 
 #### 7.2.1 Per-script `min_value` floor
 
@@ -361,6 +379,8 @@ message SubscribeControl {
     RemoveScriptPrefixes remove_script_prefixes = 11;
     RemoveDescriptor     remove_descriptor     = 12; // drop a descriptor window (§11)
     SetWatchSet          set_watch_set         = 13; // atomic whole-set replace (see below)
+    RescanBlocks         rescan_blocks         = 14; // bounded historical rescan (§7.6)
+    SetWatchOptions      set_watch_options     = 15; // per-stream delivery opt-ins, e.g. raw_tx (§7.2)
   }
 }
 ```

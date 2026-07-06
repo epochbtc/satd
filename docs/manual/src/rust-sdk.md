@@ -433,11 +433,12 @@ a minor-version change. The underlying gRPC contract is the
 
 Runnable examples live in
 [`satd-events-client/examples/`](https://github.com/epochbtc/satd/tree/master/satd-events-client/examples):
-`firehose_tail`, `resilient_tail`, `watch_outpoints`, `descriptor_wallet`,
-`lifecycle_alarms`, `prefix_privacy`, and — over an encrypted transport —
-`tls_tail` and `mtls_tail`.
+`firehose_tail`, `resilient_tail`, `resilient_watch`, `watch_outpoints`,
+`descriptor_wallet`, `lifecycle_alarms`, `prefix_privacy`, and — over an
+encrypted transport — `tls_tail` and `mtls_tail`.
 
 ```sh
 cargo run -p satd-events-client --example resilient_tail -- http://127.0.0.1:50051 /tmp/satd.cursor
+cargo run -p satd-events-client --example resilient_watch -- http://127.0.0.1:50051 /tmp/satd-watch.cursor
 cargo run -p satd-events-client --example tls_tail -- https://node.example:50051 ./node-ca.pem
 ```

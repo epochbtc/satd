@@ -25,24 +25,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = events.message().await? {
         match event {
-            Event::ScriptMatched { txid, is_output, index, confirmed, .. } => {
-                println!(
-                    "descriptor hit tx={} {} idx={} ({})",
-                    hex(&txid),
-                    if is_output { "funding" } else { "spending" },
-                    index,
-                    if confirmed { "confirmed" } else { "mempool" },
-                );
-                // Gap-limit advancement is the wallet's job, and only *funding*
-                // (output-side) hits consume new addresses. This stand-in is
-                // deliberately simple: it nudges the window forward on each
-                // funding hit. A real wallet maps the matched `scripthash` back
-                // to the derived child index it registered, and only advances
-                // when funding lands near the top of the current
-                // `[start, start+gap_limit)` window — never on a spend
-                // (`is_output == false`), and never past the gap limit. (Note
-                // `index` here is the tx vout/vin, not the descriptor child
-                // index, so it can't drive advancement on its own.)
+            Event::ScriptMatched { txid, is_output, index, confirmed, descriptors, .. } => {
+                // Attribution gives the exact (branch, derivation_index) the
+                // server derived the matched script at — no need to re-expand
+                // the descriptor or maintain a reverse scripthash index.
+                for d in &descriptors {
+                    println!(
+                        "descriptor hit tx={} {} idx={} branch={} derivation={} ({})",
+                        hex(&txid),
+                        if is_output { "funding" } else { "spending" },
+                        index,
+                        d.branch,
+                        d.derivation_index,
+                        if confirmed { "confirmed" } else { "mempool" },
+                    );
+                }
+                // Gap-limit advancement is still the wallet's job, and only
+                // *funding* (output-side) hits consume new addresses: only
+                // advance once a funding match's derivation_index lands near
+                // the top of the current [start, start+gap_limit) window,
+                // never on a spend. This stand-in nudges the window forward on
+                // every funding hit instead.
                 if is_output {
                     start += 1;
                     watch.add_descriptor(descriptor, gap_limit, start).await?;

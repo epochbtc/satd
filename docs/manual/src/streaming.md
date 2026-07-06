@@ -72,7 +72,11 @@ Match events delivered on the per-subscriber `Watch` channel include:
   descriptor-derived script it carries `descriptor_matches`: which descriptor +
   the exact `(branch, derivation_index)` it was derived at (empty for a
   directly-watched script), so a multi-descriptor consumer can route a hit
-  without its own reverse index.
+  without its own reverse index. It also carries the matched value
+  (`amount`/`has_amount`, at parity with `SpentPrevout`) so an exact-script
+  consumer can skip the per-match `getrawtransaction` enrichment call, and —
+  opt-in per connection via `SetWatchOptions{include_raw_tx}`, off by default —
+  the full consensus-serialized matching transaction inline (`raw_tx`).
 - `TxidMatched` / `TxidReplaced` / `TxidEvicted` / `TxidUnconfirmed` /
   `TxidDepthReached` / `TxidFinalized` — transaction lifecycle and
   confirmation-depth alarms.
