@@ -54,7 +54,7 @@ if [[ ! -f "$KEY" ]]; then
 fi
 
 work=$(mktemp -d -t satd-sign-XXXXXX)
-trap 'rm -rf "$work"' EXIT
+trap 'unset -v MINISIGN_PASSPHRASE 2>/dev/null; rm -rf "$work"' EXIT
 cd "$work"
 
 echo ">> Downloading release artifacts for $TAG"
@@ -89,16 +89,34 @@ if [[ ${#to_sign[@]} -eq 0 ]]; then
     exit 1
 fi
 
-echo ">> Signing each artifact"
-echo "   minisign will prompt for the key passphrase once per file"
-echo "   (${#to_sign[@]} prompts expected; same primary-key passphrase each time)"
+already_signed=()
+to_do=()
 for f in "${to_sign[@]}"; do
     if [[ -f "${f}.minisig" ]]; then
-        echo "   skip $f (signature already present)"
-        continue
+        already_signed+=("$f")
+    else
+        to_do+=("$f")
     fi
-    minisign -Sm "$f" -s "$KEY"
 done
+
+if [[ ${#to_do[@]} -eq 0 ]]; then
+    echo ">> All ${#to_sign[@]} artifact(s) already signed, nothing to do"
+else
+    echo ">> Signing ${#to_do[@]} artifact(s) (${#already_signed[@]} already signed, skipping those)"
+    read -rs -p "   minisign passphrase for $KEY (entered once, reused for every artifact): " MINISIGN_PASSPHRASE
+    echo
+    i=0
+    for f in "${to_do[@]}"; do
+        i=$((i + 1))
+        printf '   [%d/%d] signing %s\n' "$i" "${#to_do[@]}" "$f"
+        if ! out=$(printf '%s\n' "$MINISIGN_PASSPHRASE" | minisign -S -s "$KEY" -m "$f" 2>&1); then
+            echo "$out" >&2
+            echo "signing failed for $f (wrong passphrase?)" >&2
+            exit 1
+        fi
+    done
+    unset -v MINISIGN_PASSPHRASE
+fi
 
 echo ">> Round-trip verifying every signature against the published pubkey"
 for f in "${to_sign[@]}"; do
