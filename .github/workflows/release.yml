@@ -64,6 +64,8 @@ on:
       - 'Dockerfile'
       - 'rust-toolchain.toml'
       - 'deny.toml'
+      - 'satd-events-proto/**'
+      - 'satd-events-client/**'
   workflow_dispatch:
 
 permissions: {}
@@ -102,6 +104,38 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny --all-features check
+
+  # Verifies satd-events-proto and satd-events-client still package cleanly
+  # for crates.io (manifest metadata, no non-registry deps, etc.) without
+  # uploading anything. The actual `cargo publish` is a manual maintainer
+  # step (contrib/release/publish-sdk-crates.sh) run after the release
+  # version bump lands — see that script's header for why order matters.
+  crates-io-dry-run:
+    name: crates.io publish dry-run (satd-events-proto, satd-events-client)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: cargo publish --dry-run (satd-events-proto)
+        run: cargo publish -p satd-events-proto --dry-run
+
+      # satd-events-client depends on satd-events-proto by version, which
+      # cannot resolve from the crates.io index until proto's first real
+      # `cargo publish` has landed — so this step fails on every run before
+      # that point, unrelated to whether the client's own manifest is sound.
+      # Soft-fail until then; flip to a hard gate (drop continue-on-error)
+      # once satd-events-proto is live on crates.io.
+      - name: cargo publish --dry-run (satd-events-client)
+        continue-on-error: true
+        run: cargo publish -p satd-events-client --all-features --dry-run
 
   # CycloneDX 1.5 SBOM for the two shipped binaries (satd, sat-cli).
   # Generated once from Cargo.lock — the dep graph is identical across

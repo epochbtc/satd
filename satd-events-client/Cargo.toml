@@ -10,9 +10,9 @@ edition.workspace = true
 license.workspace = true
 keywords = ["bitcoin", "satd", "streaming", "grpc", "mempool"]
 categories = ["api-bindings", "asynchronous", "cryptography::cryptocurrencies"]
-# Inherits the workspace `publish = false` for now (see satd-events-proto and the
-# workspace note in the root Cargo.toml); the publish flip is a dedicated PR.
-publish.workspace = true
+# Published as of the 0.4.0 release (overrides the workspace default of
+# `publish = false`; see satd-events-proto).
+publish = true
 repository.workspace = true
 
 [features]
@@ -36,7 +36,9 @@ bitcoin = ["dep:bitcoin"]
 tls = ["dep:tokio-rustls", "tonic/tls", "tonic/tls-webpki-roots"]
 
 [dependencies]
-satd-events-proto = { path = "../satd-events-proto" }
+# Cargo uses `path` for the local build and `version` to resolve the published
+# dependency; keep this in lockstep with the workspace `version`.
+satd-events-proto = { version = "=0.4.0", path = "../satd-events-proto" }
 tonic = { workspace = true }
 prost = { workspace = true }
 # Only pulled by the `tls` feature, and only to install the `ring` rustls

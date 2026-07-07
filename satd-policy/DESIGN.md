@@ -34,7 +34,12 @@ Three stances follow, and they explain almost every decision downstream:
   would accept. There is no `Reject` verdict. Consensus and validity are
   untouched by construction ([I1](#invariants)). This makes every policy
   judgment **reversible** and **lossless** — a too-broad rule is survivable and
-  fixable with one `SIGHUP`, not an irreversible drop.
+  fixable with one `SIGHUP`, not an irreversible drop. It also keeps the node
+  *informed*: a hard-rejected transaction leaves no trace, so a later child
+  spending its output would arrive with no visible parent to inherit a scope
+  from or link back to — infectious propagation (§5.2, below) and the
+  observability surfaces both depend on quarantined transactions staying
+  resident in the mempool, not dropped.
 
 - **The ceiling is acknowledged, not hidden.** Filtering cannot prevent
   confirmation; a shape with real economic demand confirms via other relay paths

@@ -211,6 +211,29 @@ Bitcoin Core requires polling `getrawmempool` or rebuilding state from
 ZMQ per-tx events. satd's stream has explicit eviction reasons and RBF
 replacement linkage.
 
+### Transaction-filtering / quarantine policy (`satd-policy`)
+
+An optional, total, statically-cost-bounded policy language
+(`policyfile=<path>`) that *quarantines* transaction shapes — withholding
+them from relay and/or block templates — without ever changing what the node
+accepts as valid; consensus is untouched by construction. Live `SIGHUP`
+reload (last-good-wins, lossless re-placement). A strict-by-default
+Lightning-enforcement danger gate refuses a rule that would withhold relay
+for L2 enforcement traffic (BOLT-3 commitment/justice/HTLC, taproot spends);
+opt out with
+`allowdangerousfilters=1`. Offline `sat-cli policylint` catches a dangerous
+rule before it is ever loaded (exit 3). Observability is additive and
+disjoint from the standard surfaces: `getpolicyinfo`, `getquarantineinfo`,
+`listquarantine`, `getquarantineentry`, `policytest`, matching MCP tools, and
+`satd_policy_*` Prometheus metrics — every standard mempool surface
+(`getrawmempool`, Electrum, Esplora, the standard MCP mempool tools) stays
+acting-class-only and byte-identical whether or not anything is quarantined.
+
+Bitcoin Core's relay policy is a fixed C++ decision tree
+(`-minrelaytxfee`/`-datacarriersize`/etc.) with no way for an operator to
+express an arbitrary shape-based withholding rule without a source patch.
+No Bitcoin Core equivalent.
+
 ### Persistent reorg log + webhook
 
 JSONL append-only log at `$datadir/reorg.log` with an in-memory

@@ -1,15 +1,17 @@
 [package]
 name = "satd-events-proto"
 description = "Generated protobuf/tonic types for the satd.events.v1 streaming API"
+readme = "README.md"
+documentation = "https://docs.rs/satd-events-proto"
+keywords = ["bitcoin", "satd", "streaming", "grpc", "protobuf"]
+categories = ["api-bindings", "encoding"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# Inherits the workspace `publish = false` for now. The crate is structured to
-# be published (it has no internal path dependencies — only tonic/prost from
-# crates.io), but flipping `publish = true` is deferred to a dedicated release
-# PR that also pins versions on downstream path deps and reconciles cargo-deny's
-# `allow-wildcard-paths` (see the workspace note in the root Cargo.toml).
-publish.workspace = true
+# Published alongside satd-events-client as of the 0.4.0 release (overrides
+# the workspace default of `publish = false`). No internal path dependencies —
+# only tonic/prost from crates.io.
+publish = true
 repository.workspace = true
 
 [dependencies]

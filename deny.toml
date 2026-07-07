@@ -41,6 +41,15 @@ ignore = [
     # workstream. Used for internal serialization in node storage where
     # data is trusted (own-process writes, own-process reads).
     { id = "RUSTSEC-2025-0141", reason = "bincode development ceased; trusted internal data only; replacement is a separate workstream" },
+
+    # quick-xml 0.26.0 — RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (unbounded
+    # allocation / O(N^2) attribute-dup-check DoS in NsReader, on untrusted
+    # XML input). Reached only via consensus's [dev-dependencies]
+    # (pprof -> inferno, flamegraph rendering for `cargo bench`) — never
+    # compiled into a shipped binary, and never fed untrusted input; inferno
+    # has not yet released a version pinning quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "dev-only via pprof/inferno flamegraph rendering; not shipped, no untrusted XML input; upstream fix not yet released" },
+    { id = "RUSTSEC-2026-0195", reason = "dev-only via pprof/inferno flamegraph rendering; not shipped, no untrusted XML input; upstream fix not yet released" },
 ]
 
 # ---------------------------------------------------------------------------
