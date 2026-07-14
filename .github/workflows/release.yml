@@ -127,14 +127,10 @@ jobs:
       - name: cargo publish --dry-run (satd-events-proto)
         run: cargo publish -p satd-events-proto --dry-run
 
-      # satd-events-client depends on satd-events-proto by version, which
-      # cannot resolve from the crates.io index until proto's first real
-      # `cargo publish` has landed — so this step fails on every run before
-      # that point, unrelated to whether the client's own manifest is sound.
-      # Soft-fail until then; flip to a hard gate (drop continue-on-error)
-      # once satd-events-proto is live on crates.io.
+      # satd-events-proto published to crates.io at 0.4.0 (2026-07-07), so
+      # satd-events-client's version dependency now resolves from the
+      # registry index — this is a hard gate like the proto step above.
       - name: cargo publish --dry-run (satd-events-client)
-        continue-on-error: true
         run: cargo publish -p satd-events-client --all-features --dry-run
 
   # CycloneDX 1.5 SBOM for the two shipped binaries (satd, sat-cli).
