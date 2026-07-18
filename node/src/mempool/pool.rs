@@ -196,10 +196,11 @@ pub struct MempoolEntry {
     /// when retained.
     pub prev_amounts: Vec<u64>,
     /// Spent prevout `scriptPubKey`s, one per input in input order, parallel to
-    /// `prev_scripthashes`. Populated only when `streamprevoutmeta` is `full`;
-    /// empty otherwise. Lets a chainstate-less client confirm a mempool prefix
-    /// spend without resolving the outpoint. Variable size + one heap
-    /// allocation/input when retained.
+    /// `prev_scripthashes`. Populated when `streamprevoutmeta` is `full` **or**
+    /// while a silent-payment scan-key watch is live (D7 — the unconfirmed SP
+    /// matcher classifies eligible inputs from these); empty otherwise. Lets a
+    /// chainstate-less client confirm a mempool prefix spend without resolving
+    /// the outpoint. Variable size + one heap allocation/input when retained.
     pub prev_scripts: Vec<ScriptBuf>,
     /// How this transaction reached the node. Recorded at admission for the
     /// transaction-policy engine (`tx.source`); unused until PR 4c.
@@ -636,6 +637,17 @@ pub struct Mempool {
     /// here instead. Wired by the opt-in subscription surface (PR 7); `None`
     /// until then, so emission is a no-op exactly like `event_tx`.
     quarantine_event_tx: Mutex<Option<broadcast::Sender<QuarantineEvent>>>,
+    /// Shared silent-payment watch gate (D7): a clone of the streaming watch
+    /// registry's `sp_items` counter, installed by [`Self::set_sp_gate`]. While
+    /// it reads `> 0` at least one connection has a silent-payment scan-key watch
+    /// live, so admission retains the full resolved prevout `scriptPubKey`s on
+    /// each entry (beyond whatever `streamprevoutmeta` alone would keep) — the
+    /// unconfirmed SP matcher needs them to classify eligible inputs and compute
+    /// the tweak. Defaults to a private zero counter (never hot) so a mempool
+    /// built without the registry — every test, and any non-streaming build —
+    /// behaves exactly as before. `ArcSwap` because installation happens once at
+    /// startup through `&self` (interior mutability) while admission reads it hot.
+    sp_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
 }
 
 impl Mempool {
@@ -669,7 +681,26 @@ impl Mempool {
             event_tx: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
+            sp_gate: arc_swap::ArcSwap::from_pointee(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Install the shared silent-payment watch gate (D7). Wired once at startup
+    /// from the streaming watch registry (`WatchRegistry::sp_gate`) so admission
+    /// can cheaply learn whether any connection has an SP scan-key watch live and
+    /// retain resolved prevout scripts accordingly. A mempool that never has this
+    /// called keeps its private zero counter and behaves as a node without silent
+    /// payments.
+    pub fn set_sp_gate(&self, gate: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.sp_gate.store(gate);
+    }
+
+    /// `true` while at least one connection has a silent-payment scan-key watch
+    /// live (the shared gate reads `> 0`). Admission consults this to decide
+    /// whether to retain full resolved prevout scripts for the unconfirmed SP
+    /// matcher. Lock-free single atomic load in the common (cold) case.
+    fn sp_gate_hot(&self) -> bool {
+        self.sp_gate.load().load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     /// Wire a broadcast sender for mempool events. Must be called
@@ -2016,7 +2047,16 @@ impl Mempool {
         } else {
             Vec::new()
         };
-        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() {
+        // Retain full prevout scripts when the operator asked for them
+        // (`streamprevoutmeta=full`) OR while a silent-payment scan-key watch is
+        // live (D7): the unconfirmed SP matcher needs the resolved prevout
+        // `scriptPubKey`s — in hand here, including in-mempool parents — to
+        // classify eligible inputs and compute the tweak, and they cannot be
+        // reconstructed off the hot path. Gate-cold (no SP watch, tier < full)
+        // this is empty exactly as before, so the event payload is byte-identical
+        // to a node without silent payments.
+        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() || self.sp_gate_hot()
+        {
             prev_outputs
                 .iter()
                 .map(|o| o.script_pubkey.clone())
@@ -4162,6 +4202,121 @@ mod tests {
             } else {
                 assert!(entry.prev_scripts.is_empty(), "{level:?}: no scripts");
             }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn mempool_sp_gate_forces_prevout_script_retention() {
+        // D7: while the shared silent-payment gate is hot, admission retains full
+        // prevout scripts even at the `Hash` tier (which alone keeps none), so the
+        // unconfirmed SP matcher can classify inputs. Gate cold ⇒ byte-identical
+        // to today (no scripts at Hash). Same CPFP admission harness as
+        // `mempool_entry_retains_prevout_meta_by_level`.
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+
+        let prevout_spk = {
+            let mut b = vec![0x00, 0x14];
+            b.extend_from_slice(&[0xcd; 20]);
+            ScriptBuf::from(b)
+        };
+        const PREVOUT_VALUE: u64 = 10_000;
+
+        // [(gate hot?, expect scripts retained?)]
+        for (hot, expect_scripts) in [(false, false), (true, true)] {
+            let (cs, _mp, dir) = make_test_env();
+            let mp = Mempool::with_config(MempoolConfig {
+                max_size_bytes: 1_000_000,
+                min_fee_rate: 0,
+                prevout_meta: PrevoutMetaLevel::Hash, // no scripts on its own
+                ..Default::default()
+            });
+            if hot {
+                let gate = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+                mp.set_sp_gate(gate);
+            }
+
+            let parent_tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_raw_hash(
+                            bitcoin::hashes::sha256d::Hash::from_byte_array([0x7a; 32]),
+                        ),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(PREVOUT_VALUE),
+                    script_pubkey: prevout_spk.clone(),
+                }],
+            };
+            let parent_txid = parent_tx.compute_txid();
+            {
+                let mut inner = mp.inner.write();
+                inner.entries.insert(
+                    parent_txid,
+                    MempoolEntry {
+                        tx: parent_tx,
+                        fee: 0,
+                        weight: 400,
+                        fee_rate: 0,
+                        time: 0,
+                        fee_delta: 0,
+                        sigop_cost: 0,
+                        prev_scripthashes: Vec::new(),
+                        prev_amounts: Vec::new(),
+                        prev_scripts: Vec::new(),
+                        source: TxSource::P2p,
+                        scope: QuarantineScope::acting(),
+                        quarantine_rule: None,
+                    },
+                );
+            }
+
+            let child_tx = Transaction {
+                version: transaction::Version(2),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent_txid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: prevout_spk.clone(),
+                }],
+            };
+            let child_txid = child_tx.compute_txid();
+            mp.accept_transaction(child_tx, &cs, &NoopVerifier, TxSource::P2p, false)
+                .expect("child admits via CPFP");
+            let entry = mp.get(&child_txid).expect("child in mempool");
+
+            if expect_scripts {
+                assert_eq!(
+                    entry.prev_scripts,
+                    vec![prevout_spk.clone()],
+                    "gate hot ⇒ full prevout script retained even at Hash tier",
+                );
+            } else {
+                assert!(
+                    entry.prev_scripts.is_empty(),
+                    "gate cold ⇒ no scripts (byte-identical to today)",
+                );
+            }
+            // Scripthash retention is unchanged by the gate.
+            assert_eq!(entry.prev_scripthashes, vec![scripthash_of(&prevout_spk)]);
 
             let _ = std::fs::remove_dir_all(&dir);
         }

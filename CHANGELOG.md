@@ -61,8 +61,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   from the block + undo data (works with the index off) and does zero extra work
   when no target is registered. Scan secrets are held in-memory per connection,
   wrapped in a zeroize-on-drop buffer, and never persisted or logged. Mirrored on
-  the WS/SSE surface. Mempool (`confirmed = false`) matching and the typed SDK
-  helpers land later.
+  the WS/SSE surface. The typed SDK helpers land later.
+- Silent payments (BIP 352): Tier 2 scan-key watch — mempool (unconfirmed)
+  matching. A registered SP watch now also matches payments in accepted-but-
+  unconfirmed transactions, emitting `SilentPaymentMatched` with
+  `confirmed = false`; the block-connect scan re-emits the same match
+  `confirmed = true` when it confirms (mirroring `ScriptMatched` mempool
+  semantics). To classify inputs the mempool matcher needs the resolved prevout
+  scripts, so while any SP watch is live the mempool retains them on each entry
+  (a shared gate — the same counter the watch registry maintains); with no SP
+  watch registered nothing extra is retained and the mempool event path is
+  byte-identical to before. Best-effort like every mempool watch: a target
+  registered after a tx was admitted matches it only once it confirms.
 
 ## Releases
 

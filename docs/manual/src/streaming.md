@@ -123,7 +123,7 @@ BIP 352 **scan-key targets**. `AddSilentPayments` (or an atomic
 `SetWatchSet.silent_payments` replace) registers up to 16 targets per connection
 (`MAX_SP_TARGETS_PER_CONNECTION`); each is a `(scan_secret b_scan, spend_pubkey
 B_spend)` pair plus optional label integers. The node then matches every
-silent-payment output that pays a registered target as blocks connect and emits a
+silent-payment output that pays a registered target and emits a
 `SilentPaymentMatched` carrying the output key and value, the transaction's public
 tweak `T`, and the output counter `k` — enough for the wallet to re-derive the
 full output key, and therefore its spending key, **offline** from its own
@@ -132,6 +132,18 @@ which the client derives locally; each costs one watch-quota unit. Matching
 recomputes from the block and its undo data with the same kernel the index uses,
 so it needs **no** `silentpaymentindex` and does zero extra work on a block when
 no target is registered.
+
+A match fires in two phases, like the `ScriptMatched` watch. When a paying
+transaction is accepted into the mempool the node emits the match with
+`confirmed = false`; when it later lands in a block it re-emits the same match
+with `confirmed = true` and a resume cursor. The unconfirmed phase is
+best-effort: a scan key registered *after* a transaction was already admitted
+matches it only once it confirms, and a replaced or evicted transaction never
+reaches the confirmed re-emit. Mempool matching needs each spent prevout's script
+to classify inputs, which the default event path does not retain — so while any
+scan key is registered the node keeps those scripts on each mempool entry (paid
+for by that watch), and drops back to retaining nothing the moment the last scan
+key goes away.
 
 > **Operator-trust trade.** A scan key lets the node run the ECDH match, so the
 > operator — and anyone who compromises the node — learns *which* outputs are

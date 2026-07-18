@@ -454,7 +454,14 @@ pub struct WatchRegistry {
     /// subscribers. Gates the per-block SP scan (compute the per-tx tweak +
     /// ECDH per target) and, via `block_undo_for_scan`, the undo-data fetch
     /// the tweak needs — so a node with no SP watchers does zero extra work.
-    sp_items: AtomicUsize,
+    ///
+    /// An `Arc` (unlike the other gate counters) because the **same** counter is
+    /// shared with the mempool admission path (`Mempool::set_sp_gate`): while it
+    /// is hot the mempool retains resolved prevout `scriptPubKey`s on each entry
+    /// so the unconfirmed SP matcher can classify inputs (D7). Cold ⇒ nothing is
+    /// retained and the mempool event path is byte-identical to a node without
+    /// silent payments.
+    sp_items: Arc<AtomicUsize>,
 }
 
 impl Default for WatchRegistry {
@@ -474,8 +481,18 @@ impl WatchRegistry {
             depth_items: AtomicUsize::new(0),
             prefix_items: AtomicUsize::new(0),
             raw_tx_items: AtomicUsize::new(0),
-            sp_items: AtomicUsize::new(0),
+            sp_items: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// A clone of the silent-payment gate counter, for the mempool admission
+    /// path (`Mempool::set_sp_gate`). While `> 0` the mempool retains resolved
+    /// prevout `scriptPubKey`s on each accepted entry so the unconfirmed SP
+    /// matcher can classify inputs; while `0` it retains nothing (D7). This is
+    /// the *same* atomic the registry bumps on add/remove — no second counter to
+    /// keep in sync.
+    pub fn sp_gate(&self) -> Arc<AtomicUsize> {
+        self.sp_items.clone()
     }
 
     /// `true` if any subscriber is watching at least one outpoint or
@@ -1256,6 +1273,53 @@ impl WatchRegistry {
         }
     }
 
+    /// Mempool **silent-payment** matching (D7): the unconfirmed analogue of the
+    /// undo-driven [`scan_block_sp`]. Runs the same BIP 352 kernel over an
+    /// accepted-but-unconfirmed tx and emits `SilentPaymentMatched` with
+    /// `confirmed = false`; the block-connect scan later re-emits the same match
+    /// with `confirmed = true` (mirroring `ScriptMatched` mempool semantics).
+    ///
+    /// `prev_scripts[i]` must be the `scriptPubKey` spent by `tx.input[i]`, in
+    /// input order — the resolved prevout scripts retained on the
+    /// [`MempoolEntry`](crate::mempool::pool::MempoolEntry) at admission *while
+    /// the SP gate was hot* (`Mempool::set_sp_gate`). When that retention did not
+    /// happen — the entry predates any SP watcher, or the slice is otherwise not
+    /// aligned 1:1 with the inputs — this returns without matching rather than
+    /// mis-classify inputs. That is the documented best-effort contract: a target
+    /// registered after a tx was admitted does not retroactively match it in the
+    /// mempool (the confirmed path or `RescanBlocks` covers it).
+    ///
+    /// Self-gates on [`has_sp_watchers`](Self::has_sp_watchers): a no-op (single
+    /// atomic load, no lock) unless at least one SP target is live.
+    pub fn scan_mempool_sp(&self, tx: &Transaction, prev_scripts: &[ScriptBuf]) {
+        if !self.has_sp_watchers() {
+            return;
+        }
+        // Without the full, input-aligned prevout script set the tweak cannot be
+        // computed correctly (an input we can't classify would be dropped and
+        // change the input hash). Require exact alignment; otherwise skip.
+        if prev_scripts.len() != tx.input.len() {
+            return;
+        }
+        let inner = self.read_inner();
+        if inner.sp_subs.is_empty() {
+            return;
+        }
+        let mut work: Vec<(SubId, SecretKey, &SpWatchTarget)> = Vec::new();
+        for sid in &inner.sp_subs {
+            if let Some(sub) = inner.subs.get(sid) {
+                for t in sub.sp_targets.values() {
+                    work.push((*sid, t.b_scan(), t));
+                }
+            }
+        }
+        if work.is_empty() {
+            return;
+        }
+        let wants_raw = self.wants_any_raw_tx();
+        scan_tx_sp(&inner, &work, tx, prev_scripts, false, None, wants_raw, &mut LiveSink);
+    }
+
     /// Arm depth entries whose txid appears in a freshly connected block,
     /// anchoring each on `(height, block_hash)`. Gated by `has_depth_watchers`.
     fn arm_depths_for_block(&self, block: &Block, height: u32) {
@@ -1914,65 +1978,99 @@ fn scan_block_sp(
             .collect();
         undo_idx += n_in;
 
-        // One tweak per eligible tx, shared across all targets.
-        let Some(entry) = compute_tweak(tx, &prevout_spks) else {
+        scan_tx_sp(
+            inner,
+            &work,
+            tx,
+            &prevout_spks,
+            true,
+            Some(height),
+            wants_raw,
+            sink,
+        );
+    }
+}
+
+/// Silent-payment scan of a **single** transaction against the pre-resolved
+/// `work` set (one `(SubId, b_scan, target)` row per registered target). Shared
+/// by the confirmed-block path ([`scan_block_sp`], `confirmed = true` +
+/// `Some(height)`) and the mempool path ([`WatchRegistry::scan_mempool_sp`],
+/// `confirmed = false` + `None`).
+///
+/// `prevout_spks[i]` must be the `scriptPubKey` spent by `tx.input[i]`, in input
+/// order (from block undo data on the confirmed side, from the retained mempool
+/// entry on the unconfirmed side). `compute_tweak` needs them to classify
+/// eligible inputs and extract the contributing pubkeys; a caller that cannot
+/// supply the full aligned set must not call this (it would silently mis-tweak).
+#[allow(clippy::too_many_arguments)]
+fn scan_tx_sp(
+    inner: &Inner,
+    work: &[(SubId, SecretKey, &SpWatchTarget)],
+    tx: &Transaction,
+    prevout_spks: &[ScriptBuf],
+    confirmed: bool,
+    height: Option<u32>,
+    wants_raw: bool,
+    sink: &mut dyn MatchSink,
+) {
+    // One tweak per eligible tx, shared across all targets.
+    let Some(entry) = compute_tweak(tx, prevout_spks) else {
+        return;
+    };
+
+    // Taproot output table: (vout, x-only key, value). Built once per tx.
+    let mut tap: Vec<(u32, XOnlyPublicKey, u64)> = Vec::new();
+    for (vout, o) in tx.output.iter().enumerate() {
+        if o.script_pubkey.is_p2tr()
+            && let Ok(xo) = XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..])
+        {
+            tap.push((vout as u32, xo, o.value.to_sat()));
+        }
+    }
+    if tap.is_empty() {
+        return; // no taproot output can carry a silent payment (fact 1a)
+    }
+    let out_xonly: Vec<XOnlyPublicKey> = tap.iter().map(|(_, xo, _)| *xo).collect();
+    let mut raw_tx_cache: Option<Arc<[u8]>> = None;
+
+    for (sid, b_scan, target) in work {
+        let matches = scan_outputs(
+            &entry.tweak,
+            b_scan,
+            &target.spend_pubkey,
+            &target.labels,
+            &out_xonly,
+        );
+        if matches.is_empty() {
             continue;
-        };
-
-        // Taproot output table: (vout, x-only key, value). Built once per tx.
-        let mut tap: Vec<(u32, XOnlyPublicKey, u64)> = Vec::new();
-        for (vout, o) in tx.output.iter().enumerate() {
-            if o.script_pubkey.is_p2tr()
-                && let Ok(xo) = XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..])
-            {
-                tap.push((vout as u32, xo, o.value.to_sat()));
-            }
         }
-        if tap.is_empty() {
-            continue; // no taproot output can carry a silent payment (fact 1a)
-        }
-        let out_xonly: Vec<XOnlyPublicKey> = tap.iter().map(|(_, xo, _)| *xo).collect();
-        let mut raw_tx_cache: Option<Arc<[u8]>> = None;
-
-        for (sid, b_scan, target) in &work {
-            let matches = scan_outputs(
-                &entry.tweak,
-                b_scan,
-                &target.spend_pubkey,
-                &target.labels,
-                &out_xonly,
-            );
-            if matches.is_empty() {
+        // Back-map each matched x-only key to its (vout, amount). A `consumed`
+        // set guards the degenerate case of two identical taproot outputs.
+        let mut consumed = vec![false; tap.len()];
+        for m in matches {
+            let Some(idx) = tap
+                .iter()
+                .enumerate()
+                .position(|(i, (_, xo, _))| !consumed[i] && *xo == m.output)
+            else {
                 continue;
-            }
-            // Back-map each matched x-only key to its (vout, amount). A `consumed`
-            // set guards the degenerate case of two identical taproot outputs.
-            let mut consumed = vec![false; tap.len()];
-            for m in matches {
-                let Some(idx) = tap
-                    .iter()
-                    .enumerate()
-                    .position(|(i, (_, xo, _))| !consumed[i] && *xo == m.output)
-                else {
-                    continue;
-                };
-                consumed[idx] = true;
-                let (vout, _, amount) = tap[idx];
-                let wm = WatchMatch::SilentPaymentMatched {
-                    scan_pubkey: target.scan_pubkey(),
-                    txid: entry.txid,
-                    vout,
-                    output_pubkey: m.output,
-                    amount,
-                    tweak: entry.tweak,
-                    k: m.k,
-                    label: m.label_m,
-                    confirmed: true,
-                    height: Some(height),
-                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
-                };
-                sink.emit(inner, *sid, &wm);
-            }
+            };
+            consumed[idx] = true;
+            let (vout, _, amount) = tap[idx];
+            let wm = WatchMatch::SilentPaymentMatched {
+                scan_pubkey: target.scan_pubkey(),
+                txid: entry.txid,
+                vout,
+                output_pubkey: m.output,
+                amount,
+                tweak: entry.tweak,
+                k: m.k,
+                label: m.label_m,
+                confirmed,
+                height,
+                raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
+            };
+            sink.emit(inner, *sid, &wm);
         }
     }
 
@@ -2444,6 +2542,12 @@ pub async fn run_watch_matcher(
                             &entry.prev_amounts,
                             &entry.prev_scripts,
                         );
+                        // Mempool silent-payment matching (D7). `prev_scripts` is
+                        // retained on the entry only while the SP gate was hot at
+                        // admission; self-gates on has_sp_watchers() so it's free
+                        // otherwise. Emits confirmed=false; scan_block re-emits
+                        // confirmed=true when the tx confirms.
+                        registry.scan_mempool_sp(&entry.tx, &entry.prev_scripts);
                     }
                 }
                 // Lifecycle: RBF replacement and policy eviction route to any
@@ -4621,5 +4725,111 @@ mod tests {
         assert_eq!(handle.remove_silent_payments(&[target.scan_pubkey()]), 1);
         assert!(!reg.has_sp_watchers());
         assert!(!reg.has_watchers());
+    }
+
+    #[test]
+    fn matches_silent_payment_in_mempool_tx() {
+        // The unconfirmed analogue of matches_silent_payment_in_connected_block:
+        // same payment, delivered via scan_mempool_sp with the prevout scripts
+        // the mempool entry retained at admission, emitted confirmed=false.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let scan_id = PublicKey::from_secret_key(&secp, &b_scan).serialize();
+
+        let (tx, undo, p0_xonly, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
+        let txid = tx.compute_txid();
+        // The prevout scripts the entry would have retained (input order).
+        let prev_scripts: Vec<ScriptBuf> = undo
+            .spent_coins
+            .iter()
+            .map(|c| c.script_pubkey.clone())
+            .collect();
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+
+        reg.scan_mempool_sp(&tx, &prev_scripts);
+
+        match rx.try_recv().expect("an unconfirmed silent-payment match") {
+            WatchMatch::SilentPaymentMatched {
+                scan_pubkey,
+                txid: got_txid,
+                vout,
+                output_pubkey,
+                amount,
+                tweak: got_tweak,
+                k,
+                label,
+                confirmed,
+                height,
+                raw_tx,
+            } => {
+                assert_eq!(scan_pubkey, scan_id);
+                assert_eq!(got_txid, txid);
+                assert_eq!(vout, 0);
+                assert_eq!(output_pubkey, p0_xonly);
+                assert_eq!(amount, 12_345);
+                assert_eq!(got_tweak, tweak);
+                assert_eq!(k, 0);
+                assert_eq!(label, None);
+                assert!(!confirmed, "mempool match is unconfirmed");
+                assert_eq!(height, None);
+                assert!(raw_tx.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one match");
+    }
+
+    #[test]
+    fn mempool_sp_requires_aligned_prevout_scripts() {
+        // Gate hot, but the prevout script set is missing/misaligned (the entry
+        // predates the watch, or a lower streamprevoutmeta tier). Skip rather
+        // than mis-classify inputs — the confirmed path will catch it.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, _undo, _, _) = sp_payment(&b_scan, &b_spend_pub, 7_000);
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+
+        // Empty (hash-tier retention): no match.
+        reg.scan_mempool_sp(&tx, &[]);
+        assert!(rx.try_recv().is_err(), "empty prevout scripts ⇒ no match");
+        // Wrong length (one input, two scripts): no match.
+        let junk = ScriptBuf::from(vec![0x51]);
+        reg.scan_mempool_sp(&tx, &[junk.clone(), junk]);
+        assert!(rx.try_recv().is_err(), "misaligned prevout scripts ⇒ no match");
+    }
+
+    #[test]
+    fn no_mempool_sp_scan_without_watchers() {
+        // Gate cold: scan_mempool_sp is a no-op even with full prevout scripts.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, _, _) = sp_payment(&b_scan, &b_spend_pub, 4_000);
+        let prev_scripts: Vec<ScriptBuf> = undo
+            .spent_coins
+            .iter()
+            .map(|c| c.script_pubkey.clone())
+            .collect();
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (_h, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        assert!(!reg.has_sp_watchers());
+        reg.scan_mempool_sp(&tx, &prev_scripts);
+        assert!(rx.try_recv().is_err(), "no SP watcher ⇒ no mempool match");
     }
 }
