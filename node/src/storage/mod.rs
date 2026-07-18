@@ -792,6 +792,22 @@ pub trait Store: Send + Sync {
         None
     }
 
+    /// Like [`Store::get_sp_tweaks_row`] but distinguishes a genuine absence
+    /// (`Ok(None)` — below activation, above tip, not-yet-backfilled) from a
+    /// storage read or decode failure (`Err`). The serving path uses this so a
+    /// transient read error or an on-disk-corrupt row is surfaced to the client
+    /// rather than silently skipped as an empty height — which, in an unclamped
+    /// tweaks-only cold-sync, would be an undetectable gap that makes a scanning
+    /// client miss payments. Default: best-effort via
+    /// [`Store::get_sp_tweaks_row`] (backends without SP storage cannot fail
+    /// distinctly from "absent").
+    fn get_sp_tweaks_row_checked(
+        &self,
+        height: u32,
+    ) -> Result<Option<node_sp_index::SpBlockRow>, StoreError> {
+        Ok(self.get_sp_tweaks_row(height))
+    }
+
     /// True when the BIP 352 tweak index is fully populated for the
     /// active chain (`sp_index.complete` marker set). Symmetric to
     /// `block_filter_index_complete`. Default: `true` for backends

@@ -161,12 +161,20 @@ A client persists the `cursor` from the last `NodeEvent` it durably processed an
 presents it on reconnect to resume.
 
 **Granularity.** `(height, tx_index)` is designed for per-transaction resume so a
-client could resume *mid-block* after a disconnect. Today resume is **block-
-granular**: `tx_index` is reserved and always `0`, because the only confirmed-side
-event is one `BlockConnected` per block. The field is a deliberate forward-
-compatible reservation — per-tx resume activates if and when per-tx confirmed
-events are introduced — not an oversight. There is no consumer driving per-tx
-granularity yet, so it is intentionally unbuilt rather than speculatively shipped.
+client could resume *mid-block* after a disconnect. For chain events resume is
+**block-granular**: `BlockConnected` uses `tx_index = 0`, the only confirmed
+chain event per block. The field is a deliberate forward-compatible reservation
+for per-tx confirmed events — not an oversight.
+
+One position is already assigned: a block's **`BlockTweaks`** aggregate carries
+`tx_index = 0xFFFFFFFF` (`u32::MAX`). It is emitted *after* that block's
+`BlockConnected`, so the maximal `tx_index` keeps it strictly ordered after the
+chain event at the same height. This matters for a **mixed** (`chain | tweaks`)
+subscription: a client that persisted a chain cursor `(h, 0)` and reconnects
+still gets block `h`'s pending tweaks re-emitted (the server detects the cursor
+sits before `0xFFFFFFFF` at that height), instead of the replay skipping to
+`h + 1` and silently dropping the tweak. A tweaks-only subscriber only ever sees
+`(h, 0xFFFFFFFF)` cursors and resumes cleanly.
 
 **Restart epoch.** `instance_id` is a **per-process** random `u64` minted once at
 startup — deliberately *not* the persisted-stable `node_id`, which cannot
@@ -746,9 +754,15 @@ serves under the existing `stream:subscribe` capability.
 - **Replay.** `from_cursor` replay for a tweaks-only subscription is
   index-backed point lookups and — because each row embeds the hash of the
   block it describes — is exempt from the `MAX_REPLAY_BLOCKS` clamp (a phone
-  cold-syncs from taproot activation in one subscription). A **mixed-category**
-  subscription keeps the clamp for every category; interleaving an unclamped
-  tweak replay with clamped chain events would break cursor ordering (§10).
+  cold-syncs from taproot activation in one subscription). The unclamped span is
+  **paged lazily**: the server reads it in bounded chunks off the async runtime
+  and streams them under channel backpressure, so peak memory is O(chunk) rather
+  than the whole taproot era, and a slow client throttles the read instead of
+  forcing the server to buffer. A storage/decode error mid-cold-sync is surfaced
+  in-band (the stream ends with an error) rather than skipped as an empty height,
+  so the gap can never pass unnoticed. A **mixed-category** subscription keeps
+  the clamp for every category; interleaving an unclamped tweak replay with
+  clamped chain events would break cursor ordering (§10).
 - **Filters.** `tweak_dust_limit` drops entries whose `max_value` is below the
   floor and sets `filtered = true`; `tweaks_only` strips `txid`/`max_value`,
   leaving the 33-byte tweak alone. Both apply per subscription, on live and

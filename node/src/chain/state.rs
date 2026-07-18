@@ -5083,13 +5083,34 @@ impl node_sp_index::SpIndex for ChainState {
         if !self.sp_index.enabled {
             return Err(node_sp_index::SpIndexError::Disabled);
         }
-        self.store
-            .get_sp_tweaks_row(height)
-            .ok_or(node_sp_index::SpIndexError::NotFound(height))
+        // Checked read: distinguish a genuine absence (NotFound) from a storage
+        // or decode failure (Storage). A silent skip on a real error would leave
+        // an undetectable gap in an unclamped tweaks-only cold-sync.
+        match self.store.get_sp_tweaks_row_checked(height) {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(node_sp_index::SpIndexError::NotFound(height)),
+            Err(e) => Err(node_sp_index::SpIndexError::Storage(e.to_string())),
+        }
     }
 
     fn is_complete(&self) -> bool {
-        self.sp_index.enabled && self.store.silent_payment_index_complete()
+        if !self.sp_index.enabled || !self.store.silent_payment_index_complete() {
+            return false;
+        }
+        // The marker alone is not authoritative: it is stamped at open time and
+        // can outlive a subsequent backfill that is still running or has failed.
+        // A redundant backfill on an already-complete datadir that hits a reorg
+        // fails mid-walk, and its stale-row cleanup can punch holes while the
+        // marker stays set — so serving off the marker alone would stream a
+        // gapped index unclamped (silently dropping heights for scanning
+        // clients). Require the backfill cursor to be quiescent (Idle or
+        // Completed) too, mirroring `render_status`'s `synced` gate so the
+        // serving surface and the `getindexinfo` status can never disagree.
+        use node_sp_index::cursor::BackfillState;
+        matches!(
+            self.store.read_sp_backfill_cursor().state,
+            BackfillState::Idle | BackfillState::Completed
+        )
     }
 }
 

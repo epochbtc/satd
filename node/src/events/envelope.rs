@@ -479,6 +479,15 @@ pub enum SetCursorOutcome {
     },
 }
 
+/// Cursor `tx_index` sentinel for a block's `BlockTweaks` aggregate. A block's
+/// tweak firehose event is emitted *after* that block's `BlockConnected`, so it
+/// sorts after every per-tx position at the same height. Using a distinct,
+/// maximal `tx_index` (rather than sharing `0` with `BlockConnected`) lets a
+/// mixed chain+tweaks subscriber that resumes from a `(h, 0)` chain cursor still
+/// receive block `h`'s pending tweaks, instead of the replay skipping straight
+/// to `h + 1`.
+pub const TWEAKS_TX_INDEX: u32 = u32::MAX;
+
 /// Durable resume position carried alongside confirmed-side events.
 ///
 /// Confirmed cursors are `(height, tx_index)` — per-transaction, so a
@@ -537,10 +546,12 @@ impl NodeEventBody {
             }),
             // A tweak firehose event advances the durable confirmed position
             // exactly like a connected block, so a tweaks subscriber can
-            // persist the cursor and resume mid-sync via `from_cursor`.
+            // persist the cursor and resume mid-sync via `from_cursor`. It sits
+            // at `TWEAKS_TX_INDEX` (after the block's chain event at the same
+            // height) so a mixed subscriber never conflates the two positions.
             NodeEventBody::BlockTweaks(bt) => Some(Cursor {
                 height: bt.height,
-                tx_index: 0,
+                tx_index: TWEAKS_TX_INDEX,
                 mempool_seq,
                 instance_id,
             }),
@@ -790,7 +801,9 @@ mod tests {
             .derive_cursor(0xABCD, 5)
             .expect("block tweaks must carry a cursor");
         assert_eq!(cur.height, 77);
-        assert_eq!(cur.tx_index, 0);
+        // Tweaks sit at the max tx_index so a mixed subscriber never conflates
+        // a block's tweak cursor with its chain cursor at the same height.
+        assert_eq!(cur.tx_index, TWEAKS_TX_INDEX);
         assert_eq!(cur.instance_id, 0xABCD);
     }
 

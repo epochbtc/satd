@@ -1066,7 +1066,25 @@ impl NodeEventStream for NodeEventStreamSvc {
                         .into_iter()
                         .map(move |e| Ok(envelope_to_proto_sp(&e, tweak_dust_limit, tweaks_only))),
                 );
-                Box::pin(replay_events.chain(live))
+                // A tweaks-only deep-replay exemption defers its (possibly
+                // whole-taproot-era) span to here rather than materializing it
+                // in the builder. Page it lazily off the index with
+                // backpressure so peak memory is bounded and no async worker is
+                // ever blocked on the multi-minute read.
+                match (r.deep_tweak_range, tweak_source) {
+                    (Some((start, end)), Some(sp)) => {
+                        let deep = deep_tweak_replay_stream(
+                            sp,
+                            self.publisher.clone(),
+                            start,
+                            end,
+                            tweak_dust_limit,
+                            tweaks_only,
+                        );
+                        Box::pin(replay_events.chain(deep).chain(live))
+                    }
+                    _ => Box::pin(replay_events.chain(live)),
+                }
             }
             None => Box::pin(live),
         };
@@ -2422,6 +2440,80 @@ fn envelope_to_proto_sp(env: &NodeEvent, dust_limit: u64, tweaks_only: bool) -> 
         },
         _ => envelope_to_proto(env),
     }
+}
+
+/// Rows read per `spawn_blocking` hop in the lazy deep-replay pager. Bounds both
+/// how long a blocking thread is held and how much is buffered at once.
+const DEEP_TWEAK_REPLAY_CHUNK: u32 = 32;
+
+/// Lazily page a tweaks-only deep-replay span `[start, end]` off the silent-
+/// payment index, for the `build_cursor_replay` deep exemption (a complete-index
+/// cold-sync waives the block clamp). The span can cover the entire taproot era,
+/// so instead of materializing it, we read it in bounded [`DEEP_TWEAK_REPLAY_CHUNK`]
+/// chunks inside `spawn_blocking` (never on an async worker) and push each block
+/// through a small bounded channel. Backpressure on that channel paces the read
+/// to the client's consumption, so peak memory is O(chunk) rather than O(chain).
+///
+/// A `NotFound` height is a genuine absence (below activation / not reached) and
+/// is skipped. Any other error (storage/decode/state) is surfaced in-band and
+/// ends the stream — a silent skip would be a client-undetectable gap in an
+/// unclamped cold-sync, exactly the failure a scanning client cannot recover
+/// from. The client then resyncs from its last durable cursor.
+fn deep_tweak_replay_stream(
+    sp: std::sync::Arc<dyn node::index::silent_payments::SpIndex>,
+    publisher: std::sync::Arc<node::events::EventPublisher>,
+    start: u32,
+    end: u32,
+    dust_limit: u64,
+    tweaks_only: bool,
+) -> ReceiverStream<Result<pb::NodeEvent, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::NodeEvent, Status>>(4);
+    tokio::spawn(async move {
+        let mut h = start;
+        'outer: while h <= end {
+            let chunk_end = h.saturating_add(DEEP_TWEAK_REPLAY_CHUNK - 1).min(end);
+            let sp_chunk = sp.clone();
+            let pub_chunk = publisher.clone();
+            // Read + render one bounded chunk off the async runtime.
+            let rendered = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<Result<pb::NodeEvent, Status>> = Vec::new();
+                for hh in h..=chunk_end {
+                    match sp_chunk.tweaks_at(hh) {
+                        Ok(row) => {
+                            let env = node::events::make_block_tweaks_event(&pub_chunk, hh, row);
+                            out.push(Ok(envelope_to_proto_sp(&env, dust_limit, tweaks_only)));
+                        }
+                        Err(node::index::silent_payments::SpIndexError::NotFound(_)) => {}
+                        Err(e) => {
+                            out.push(Err(Status::internal(format!(
+                                "silent-payment tweak read failed at height {hh}: {e}"
+                            ))));
+                            break;
+                        }
+                    }
+                }
+                out
+            })
+            .await;
+            let rendered = match rendered {
+                Ok(v) => v,
+                // The blocking task panicked or was cancelled; end the stream.
+                Err(_) => break,
+            };
+            for item in rendered {
+                let stop_after = item.is_err();
+                if tx.send(item).await.is_err() {
+                    // Client disconnected — stop reading.
+                    break 'outer;
+                }
+                if stop_after {
+                    break 'outer;
+                }
+            }
+            h = chunk_end + 1;
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Map a [`BlockTweaks`] to its proto form under a subscription's filters.

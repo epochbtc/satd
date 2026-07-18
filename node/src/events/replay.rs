@@ -21,7 +21,7 @@ use crate::chain::events::ChainEvent;
 
 use super::{
     Cursor, CursorRejectReason, EdgeStamp, EventPublisher, NodeEvent, NodeEventBody,
-    SetCursorOutcome,
+    SetCursorOutcome, TWEAKS_TX_INDEX,
 };
 
 /// Upper bound on the confirmed-block span replayed for a single `from_cursor`
@@ -232,6 +232,15 @@ pub struct CursorReplay {
     /// True when the requested replay span was older than `max_blocks` and the
     /// lower end was dropped.
     pub clamped: bool,
+    /// Set for a tweaks-only deep-replay exemption: the inclusive height range
+    /// `[start, tip]` whose `sp_tweaks` rows the carrier must stream **lazily**
+    /// rather than materialize here. The whole taproot-era tweak set can be
+    /// gigabytes, and reading it into `events` would both blow memory and (since
+    /// this helper runs on the async runtime) block a worker for minutes — so
+    /// the deep read is deferred to the carrier, which pages it off the index in
+    /// `spawn_blocking` with backpressure. `None` for every clamped/mixed replay
+    /// (those rows are already in `events`).
+    pub deep_tweak_range: Option<(u32, u32)>,
 }
 
 /// Build the durable cursor replay (snapshot→live handoff) shared by all
@@ -307,18 +316,35 @@ pub fn build_cursor_replay(
 
     let mut events: Vec<NodeEvent> = Vec::new();
     let mut confirmed_dedup: HashMap<u32, BlockHash> = HashMap::new();
+    let mut deep_tweak_range: Option<(u32, u32)> = None;
     if deep_exempt && start <= snapshot_tip {
-        // Unclamped tweaks-only cold-sync: read rows by height. Each row is
-        // self-authenticating (carries its own block hash), so no
-        // `active_chain_range` height→hash pass is needed. Below taproot
-        // activation the index has no row — `NotFound` is skipped, not an error.
-        let sp = sp.expect("deep_exempt implies a tweak source");
-        for h in start..=snapshot_tip {
-            if let Ok(row) = sp.tweaks_at(h) {
-                events.push(synth_block_tweaks(publisher, h, row));
+        // Unclamped tweaks-only cold-sync. The span can be the entire
+        // taproot era, so we do NOT read the rows here (materializing them
+        // would blow memory and block this async worker for minutes). Hand the
+        // carrier the `[start, tip]` range to page lazily off the index; each
+        // row is self-authenticating (carries its own block hash), so no
+        // height→hash pass is needed. Below activation the index has no row —
+        // the carrier skips `NotFound`, not an error.
+        deep_tweak_range = Some((start, snapshot_tip));
+    } else if (chain_on || tweaks_on) && start <= snapshot_tip {
+        // Boundary re-emit: a mixed subscriber whose cursor sits between a
+        // height's chain event (`tx_index == 0`) and its tweak aggregate
+        // (`tx_index == TWEAKS_TX_INDEX`) — chain delivered, tweak still
+        // pending — would otherwise lose that block's tweaks, because the main
+        // loop starts at `from.height + 1`. Re-emit `from.height`'s tweaks
+        // first. Skipped when the span was clamped (the client is already told
+        // to resync earlier history) or the cursor already sits at/after the
+        // tweak position for that height.
+        if tweaks_on && !clamped && from.tx_index < TWEAKS_TX_INDEX {
+            for (h, hash) in src.active_chain_range(from.height, from.height) {
+                if let Some(sp) = sp
+                    && let Ok(row) = sp.tweaks_at(h)
+                    && row.block_hash == hash
+                {
+                    events.push(synth_block_tweaks(publisher, h, row));
+                }
             }
         }
-    } else if (chain_on || tweaks_on) && start <= snapshot_tip {
         // Clamped window: walk the active chain once, interleaving each
         // height's BlockConnected (if requested) and its BlockTweaks (if
         // requested) so cursors stay monotonic across a mixed subscription.
@@ -363,6 +389,7 @@ pub fn build_cursor_replay(
         mempool_dedup_through,
         earliest_replayed: start,
         clamped,
+        deep_tweak_range,
     }
 }
 
@@ -396,7 +423,7 @@ fn synth_block_tweaks(
 ) -> NodeEvent {
     let cursor = Cursor {
         height,
-        tx_index: 0,
+        tx_index: TWEAKS_TX_INDEX,
         mempool_seq: 0,
         instance_id: publisher.instance_id(),
     };
@@ -405,6 +432,18 @@ fn synth_block_tweaks(
         Some(cursor),
         NodeEventBody::BlockTweaks(super::BlockTweaks::from_row(height, &row)),
     )
+}
+
+/// Public constructor for a confirmed `BlockTweaks` replay event. The gRPC
+/// carrier's lazy deep-replay producer reads `sp_tweaks` rows off the async
+/// runtime (in `spawn_blocking`) and renders each one through this so it shares
+/// the exact cursor/stamp of the in-helper replay path.
+pub fn make_block_tweaks_event(
+    publisher: &EventPublisher,
+    height: u32,
+    row: node_sp_index::SpBlockRow,
+) -> NodeEvent {
+    synth_block_tweaks(publisher, height, row)
 }
 
 /// Build the in-band [`NodeEventBody::Lagged`] notice a carrier emits when it
@@ -677,16 +716,21 @@ mod tests {
     #[test]
     fn tweaks_only_replay_is_unclamped_when_index_complete() {
         // tweaks-only mask (8), complete index, cursor far behind the tip: the
-        // deep-replay exemption waives the clamp and replays every block.
+        // deep-replay exemption waives the clamp and hands the carrier the whole
+        // `[start, tip]` range to page lazily (rows are NOT materialized here).
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
         let sp = MockSp { complete: true, activation: 1, tip: 50 };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10, Some(&sp));
         assert!(!r.clamped, "tweaks-only + complete index is exempt from the clamp");
         assert_eq!(r.earliest_replayed, 1);
-        assert_eq!(tweaks_count(&r), 50, "all 50 blocks replayed unclamped");
-        // No chain events on a tweaks-only subscription.
-        assert!(r.events.iter().all(|e| matches!(e.body, NodeEventBody::BlockTweaks(_))));
+        assert_eq!(
+            r.deep_tweak_range,
+            Some((1, 50)),
+            "the full span is deferred to the carrier, unclamped"
+        );
+        // Nothing is eagerly materialized on the deep path — no memory blowup.
+        assert!(r.events.is_empty(), "deep tweaks are streamed lazily, not buffered");
     }
 
     #[test]
@@ -727,14 +771,49 @@ mod tests {
     }
 
     #[test]
-    fn tweaks_replay_skips_below_activation() {
-        // Heights below taproot activation have no row; they are skipped, not
-        // errored, so the replay starts cleanly at activation.
+    fn deep_replay_defers_full_range_to_carrier() {
+        // A complete tweaks-only replay defers the entire `[start, tip]` span to
+        // the carrier regardless of activation height — the carrier's lazy pager
+        // skips `NotFound` heights below activation as it reads them (covered in
+        // the gRPC carrier tests). The builder itself materializes nothing.
         let src = FlatChain { tip: 30 };
         let pubr = publisher();
         let sp = MockSp { complete: true, activation: 20, tip: 30 };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
-        assert_eq!(tweaks_count(&r), 11, "only heights 20..=30 have rows");
+        assert_eq!(r.deep_tweak_range, Some((1, 30)));
+        assert_eq!(tweaks_count(&r), 0, "deep rows are not buffered in the builder");
+    }
+
+    #[test]
+    fn mixed_boundary_reemits_pending_tweak_on_resume() {
+        // A mixed subscriber resuming from a chain cursor `(h, 0)` — chain
+        // delivered, tweak pending — must get block h's tweak re-emitted so it
+        // is not lost when the main loop starts at h+1.
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
+        // Resume from (40, 0): last delivered was BlockConnected(40).
+        let from = Cursor { height: 40, tx_index: 0, mempool_seq: 0, instance_id: 0 };
+        let r = build_cursor_replay(&src, &pubr, from, mask, 10_000, Some(&sp));
+        // The very first replayed event is block 40's pending tweak.
+        assert!(
+            matches!(&r.events[0].body, NodeEventBody::BlockTweaks(bt) if bt.height == 40),
+            "block 40's pending tweak is re-emitted before advancing to 41"
+        );
+        // A subscriber that already saw the tweak (cursor at TWEAKS_TX_INDEX) is
+        // not re-sent it.
+        let from_after = Cursor {
+            height: 40,
+            tx_index: TWEAKS_TX_INDEX,
+            mempool_seq: 0,
+            instance_id: 0,
+        };
+        let r2 = build_cursor_replay(&src, &pubr, from_after, mask, 10_000, Some(&sp));
+        assert!(
+            !matches!(&r2.events[0].body, NodeEventBody::BlockTweaks(bt) if bt.height == 40),
+            "no boundary re-emit when the tweak cursor was already past that height"
+        );
     }
 
     #[test]
