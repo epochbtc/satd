@@ -807,15 +807,24 @@ fn backfill_index_sp(
     let cur = h.cursor();
     match cur.state {
         SState::Running | SState::Paused => Ok(sp_in_progress_response(&cur)),
-        SState::Completed => Ok(json!({
+        // The on-disk completeness marker — not the cursor state — is the
+        // source of truth for "the index is whole." The marker is cleared
+        // independently of the cursor (e.g. a run with `--silentpaymentindex=0`
+        // invalidates it on every connect while leaving the cursor `Completed`),
+        // so refuse a re-backfill only when the index is *genuinely* complete.
+        // Otherwise fall through to a fresh walk that refills the holes —
+        // `start()` accepts `Completed → Running` and re-walks from activation.
+        SState::Completed if chain.store_ref().silent_payment_index_complete() => Ok(json!({
             "started": false,
             "reason": "SP backfill already completed for this datadir",
             "state": cur.state.label(),
             "snapshot_height": cur.snapshot_height,
         })),
-        SState::Idle | SState::Cancelled | SState::Rejected | SState::Failed => {
-            sp_start_fresh(h, tx, chain, &cur)
-        }
+        SState::Idle
+        | SState::Cancelled
+        | SState::Rejected
+        | SState::Failed
+        | SState::Completed => sp_start_fresh(h, tx, chain, &cur),
     }
 }
 
