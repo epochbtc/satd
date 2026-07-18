@@ -81,6 +81,8 @@ Match events delivered on the per-subscriber `Watch` channel include:
   `TxidDepthReached` / `TxidFinalized` — transaction lifecycle and
   confirmation-depth alarms.
 - `PrefixMatched` — a privacy-preserving script-prefix match.
+- `SilentPaymentMatched` — a BIP 352 silent payment paid one of your registered
+  scan keys (see the scan-key watch below).
 
 The matcher is **decoupled from the consensus path**: a dedicated task subscribes
 to the existing chain/mempool broadcasts and *re-reads* blocks and accepted
@@ -113,6 +115,34 @@ to slide its window is always allowed). Gap-limit advancement stays a client con
 by design: the server manages the window it is told to, but never tracks
 derivation progress or nudges the client to extend — the client decides when to
 advance `start` (or `RemoveDescriptor`).
+
+### Silent-payment scan-key watch (BIP 352, Tier 2)
+
+For clients that would rather not run a per-block scan themselves, `Watch` accepts
+BIP 352 **scan-key targets**. `AddSilentPayments` (or an atomic
+`SetWatchSet.silent_payments` replace) registers up to 16 targets per connection
+(`MAX_SP_TARGETS_PER_CONNECTION`); each is a `(scan_secret b_scan, spend_pubkey
+B_spend)` pair plus optional label integers. The node then matches every
+silent-payment output that pays a registered target as blocks connect and emits a
+`SilentPaymentMatched` carrying the output key and value, the transaction's public
+tweak `T`, and the output counter `k` — enough for the wallet to re-derive the
+full output key, and therefore its spending key, **offline** from its own
+`b_scan`. Targets are removed by their identity `b_scan·G` (`RemoveSilentPayments`),
+which the client derives locally; each costs one watch-quota unit. Matching
+recomputes from the block and its undo data with the same kernel the index uses,
+so it needs **no** `silentpaymentindex` and does zero extra work on a block when
+no target is registered.
+
+> **Operator-trust trade.** A scan key lets the node run the ECDH match, so the
+> operator — and anyone who compromises the node — learns *which* outputs are
+> yours. It is **not** a spending key: `B_spend`'s private half never leaves the
+> client, so no party but you can ever spend them. The node treats the secret
+> accordingly: scan secrets live in memory for the connection's lifetime only,
+> are wrapped in a zeroize-on-drop buffer, and are never written to disk, a
+> cursor, a status RPC, or a log line. A routable events bind still requires auth
+> or mTLS, the same as every other watch kind. The zero-custody alternative is
+> Tier 1 client-side scanning (see the streaming API reference), where the scan
+> key never leaves the device.
 
 ## Cursors & replay
 

@@ -760,6 +760,13 @@ enum WsControl {
     AddScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
     /// Remove script-prefix buckets from the watch-set.
     RemoveScriptPrefixes { prefixes: Vec<WsScriptPrefix> },
+    /// Add BIP 352 silent-payment scan-key targets (Tier 2, §4). Each target is
+    /// a *watch* credential (`scan_secret` + `spend_pubkey`), never a spend key.
+    /// Capped at 16 per connection; invalid targets are skipped.
+    AddSilentPayments { targets: Vec<WsSilentPayment> },
+    /// Remove silent-payment targets by their 33-byte identity `b_scan·G`
+    /// (hex-encoded scan pubkeys).
+    RemoveSilentPayments { scan_pubkeys: Vec<String> },
     /// Atomically REPLACE the whole watch-set with the snapshot carried here
     /// (the JSON mirror of the gRPC `SetWatchSet`). Every field is the full
     /// desired membership of its kind, not a delta. The server reconciles by
@@ -783,6 +790,8 @@ enum WsControl {
         lifecycles: Vec<WsLifecycle>,
         #[serde(default)]
         depth_alarms: Vec<WsDepthAlarm>,
+        #[serde(default)]
+        silent_payments: Vec<WsSilentPayment>,
     },
     /// Per-stream delivery options (JSON mirror of gRPC `SetWatchOptions`).
     /// `include_raw_tx=true` inlines the full serialized matching tx (hex) on
@@ -819,6 +828,27 @@ struct WsScriptPrefix {
     /// Top `ceil(bits/8)` bytes of `sha256(scriptPubKey)`, hex-encoded.
     prefix: String,
     bits: u32,
+}
+
+/// A BIP 352 silent-payment scan-key target on the WS/SSE surface (Tier 2, §4).
+/// The JSON mirror of `pb::SilentPaymentTarget`. `scan_secret` is a 64-char hex
+/// `b_scan`; `spend_pubkey` is a 66-char hex compressed `B_spend`.
+#[derive(Deserialize)]
+struct WsSilentPayment {
+    scan_secret: String,
+    spend_pubkey: String,
+    #[serde(default)]
+    labels: Vec<u32>,
+}
+
+/// Parse a WS silent-payment target (hex scan secret + spend pubkey + labels)
+/// into a validated [`SpWatchTarget`](node::events::SpWatchTarget); `None` on
+/// malformed hex or an out-of-range key.
+fn parse_ws_sp_target(t: &WsSilentPayment) -> Option<node::events::SpWatchTarget> {
+    let secret_bytes = hex::decode(&t.scan_secret).ok()?;
+    let scan_secret = <[u8; 32]>::try_from(secret_bytes.as_slice()).ok()?;
+    let spend = hex::decode(&t.spend_pubkey).ok()?;
+    node::events::SpWatchTarget::new(scan_secret, &spend, t.labels.clone()).ok()
 }
 
 /// Parse a WS prefix (hex + bits) into a validated registry bucket key + its
@@ -889,6 +919,7 @@ fn apply_ws_control(
         prefixes,
         lifecycles,
         depth_alarms,
+        silent_payments,
     } = &ctrl
     {
         // STRICT: a replace is a full snapshot, so any unparseable element refuses
@@ -941,6 +972,10 @@ fn apply_ws_control(
             for p in prefixes {
                 pfx.push(parse_ws_prefix(p, prefix_min_bits, prefix_max_bits).ok_or("prefix")?);
             }
+            let mut sp = Vec::with_capacity(silent_payments.len());
+            for t in silent_payments {
+                sp.push(parse_ws_sp_target(t).ok_or("silent payment target")?);
+            }
             Ok(crate::watchset::DesiredWatchSet {
                 scripts,
                 descriptors: descs,
@@ -948,6 +983,7 @@ fn apply_ws_control(
                 lifecycles: lcs,
                 depth_alarms: alarms,
                 prefixes: pfx,
+                sp_targets: sp,
             })
         })();
         let outcome = match desired {
@@ -989,6 +1025,7 @@ fn apply_ws_control(
             | WsControl::AddDescriptor { .. }
             | WsControl::AddTransactions { .. }
             | WsControl::AddScriptPrefixes { .. }
+            | WsControl::AddSilentPayments { .. }
     );
     if is_add && max_subscriptions != 0 && watch_set.len() >= max_subscriptions {
         warn!(
@@ -1171,6 +1208,38 @@ fn apply_ws_control(
             watch_set.remove_prefixes(keys, |keys| {
                 handle.remove_prefixes(keys);
             });
+        }
+        WsControl::AddSilentPayments { targets } => {
+            // Validate each target; skip invalid ones (best-effort, like the
+            // other incremental adds). The watch-set enforces the per-connection
+            // SP cap and quota, and registers the net-new with the matcher.
+            let parsed: Vec<node::events::SpWatchTarget> =
+                targets.iter().filter_map(parse_ws_sp_target).collect();
+            if parsed.len() != targets.len() {
+                warn!(
+                    target: "events::ws",
+                    got = targets.len(),
+                    valid = parsed.len(),
+                    "ignoring invalid silent-payment target(s) in add_silent_payments",
+                );
+            }
+            if !parsed.is_empty() {
+                watch_set.add_silent_payments(principal, parsed, |ts| {
+                    handle.add_silent_payments(ts);
+                });
+            }
+        }
+        WsControl::RemoveSilentPayments { scan_pubkeys } => {
+            let ids: Vec<[u8; 33]> = scan_pubkeys
+                .iter()
+                .filter_map(|s| hex::decode(s).ok())
+                .filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok())
+                .collect();
+            if !ids.is_empty() {
+                watch_set.remove_silent_payments(ids, |ids| {
+                    handle.remove_silent_payments(ids);
+                });
+            }
         }
     }
     None
@@ -1386,6 +1455,46 @@ fn watch_match_json(
                         "has_amount": m.amount.is_some(),
                     })).collect::<Vec<_>>(),
                 }
+            })
+        }
+        WatchMatch::SilentPaymentMatched {
+            scan_pubkey,
+            txid,
+            vout,
+            output_pubkey,
+            amount,
+            tweak,
+            k,
+            label,
+            confirmed,
+            height,
+            raw_tx,
+        } => {
+            let raw_tx_hex = if include_raw_tx {
+                raw_tx.as_ref().map(hex::encode)
+            } else {
+                None
+            };
+            json!({
+            "schema_version": node::events::SCHEMA_VERSION,
+            "cursor": height.map(|h| json!({ "height": h, "tx_index": 0, "mempool_seq": 0 })),
+            "body": {
+                "category": "silent_payment_matched",
+                "scan_pubkey": hex::encode(scan_pubkey),
+                "txid": hex::encode(txid.as_raw_hash().to_byte_array()),
+                "vout": vout,
+                "output_pubkey": hex::encode(output_pubkey.serialize()),
+                "amount": amount,
+                // 33-byte public tweak T; with `k` (and the label, if any) a
+                // light client re-derives the output key offline from b_scan.
+                "tweak": hex::encode(tweak.serialize()),
+                "k": k,
+                "has_label": label.is_some(),
+                "label": label.unwrap_or(0),
+                "confirmed": confirmed,
+                "height": height,
+                "raw_tx": raw_tx_hex,
+            }
             })
         }
     }
@@ -1924,5 +2033,78 @@ mod tests {
         let empty = ReplayDedup::default();
         assert!(!empty.is_duplicate(&block_ev(5, 0x55)));
         assert!(!empty.is_duplicate(&mempool_ev(1)));
+    }
+
+    fn sp_test_pubkey(byte: u8) -> bitcoin::secp256k1::PublicKey {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap();
+        bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk)
+    }
+
+    #[test]
+    fn watch_match_json_silent_payment() {
+        use bitcoin::hashes::Hash;
+        let output = sp_test_pubkey(7).x_only_public_key().0;
+        let tweak = sp_test_pubkey(8);
+        let scan_pubkey = sp_test_pubkey(9).serialize();
+        let txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]),
+        );
+        let m = WatchMatch::SilentPaymentMatched {
+            scan_pubkey,
+            txid,
+            vout: 2,
+            output_pubkey: output,
+            amount: 7_777,
+            tweak,
+            k: 4,
+            label: Some(1),
+            confirmed: true,
+            height: Some(321),
+            raw_tx: Some(std::sync::Arc::from(vec![0xaa, 0xbb].as_slice())),
+        };
+        // Opted out: no raw_tx.
+        let v = watch_match_json(&m, &[], false);
+        assert_eq!(v["body"]["category"], "silent_payment_matched");
+        assert_eq!(v["body"]["scan_pubkey"], hex::encode(scan_pubkey));
+        assert_eq!(v["body"]["txid"], hex::encode(txid.as_raw_hash().to_byte_array()));
+        assert_eq!(v["body"]["vout"], 2);
+        assert_eq!(v["body"]["output_pubkey"], hex::encode(output.serialize()));
+        assert_eq!(v["body"]["amount"], 7_777);
+        assert_eq!(v["body"]["tweak"], hex::encode(tweak.serialize()));
+        assert_eq!(v["body"]["k"], 4);
+        assert_eq!(v["body"]["has_label"], true);
+        assert_eq!(v["body"]["label"], 1);
+        assert_eq!(v["body"]["confirmed"], true);
+        assert_eq!(v["cursor"]["height"], 321);
+        assert!(v["body"]["raw_tx"].is_null(), "opted out ⇒ no raw_tx");
+
+        // Opted in: raw_tx hex present.
+        let v = watch_match_json(&m, &[], true);
+        assert_eq!(v["body"]["raw_tx"], "aabb");
+    }
+
+    #[test]
+    fn parse_ws_sp_target_validates() {
+        let good = WsSilentPayment {
+            scan_secret: hex::encode([0x11u8; 32]),
+            spend_pubkey: hex::encode(sp_test_pubkey(2).serialize()),
+            labels: vec![0, 3],
+        };
+        assert!(parse_ws_sp_target(&good).is_some());
+        // Bad hex.
+        let bad_hex = WsSilentPayment {
+            scan_secret: "zz".to_string(),
+            spend_pubkey: hex::encode(sp_test_pubkey(2).serialize()),
+            labels: vec![],
+        };
+        assert!(parse_ws_sp_target(&bad_hex).is_none());
+        // Wrong-length secret.
+        let short = WsSilentPayment {
+            scan_secret: hex::encode([0x11u8; 31]),
+            spend_pubkey: hex::encode(sp_test_pubkey(2).serialize()),
+            labels: vec![],
+        };
+        assert!(parse_ws_sp_target(&short).is_none());
     }
 }

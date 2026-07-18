@@ -59,6 +59,15 @@ pub(crate) const MAX_TXID_DEPTH_PAIRS: usize = 65_536;
 /// map and is always allowed.
 pub(crate) const MAX_DESCRIPTORS_PER_CONNECTION: usize = 256;
 
+/// Per-connection cap on the number of BIP 352 silent-payment scan-key targets
+/// (Tier 2, §4.2.1). Each target costs one ECDH multiplication per eligible
+/// transaction in every scanned block — the ECC analogue of
+/// [`MAX_DESCRIPTORS_PER_CONNECTION`], but priced far lower because the work is
+/// per-transaction elliptic-curve math, not a hash-map lookup. 16 registered
+/// targets covers a wallet watching several accounts plus their change/label
+/// keys; a client at the cap must remove one before adding another.
+pub(crate) const MAX_SP_TARGETS_PER_CONNECTION: usize = 16;
+
 /// Build the `(txid × distinct-depth)` watch pairs for a depth-alarm
 /// add/remove, or `None` if the cross-product would exceed
 /// [`MAX_TXID_DEPTH_PAIRS`]. Depths are de-duplicated first so a client cannot
@@ -150,6 +159,8 @@ pub(crate) trait WatchRegistry {
     fn remove_tx_depths(&self, items: &[(Txid, u32)]);
     fn add_prefixes(&self, prefixes: &[PrefixKey]);
     fn remove_prefixes(&self, prefixes: &[PrefixKey]);
+    fn add_silent_payments(&self, targets: &[node::events::SpWatchTarget]);
+    fn remove_silent_payments(&self, scan_pubkeys: &[[u8; 33]]);
 }
 
 impl WatchRegistry for node::events::WatchHandle {
@@ -183,6 +194,12 @@ impl WatchRegistry for node::events::WatchHandle {
     fn remove_prefixes(&self, prefixes: &[PrefixKey]) {
         node::events::WatchHandle::remove_prefixes(self, prefixes);
     }
+    fn add_silent_payments(&self, targets: &[node::events::SpWatchTarget]) {
+        node::events::WatchHandle::add_silent_payments(self, targets);
+    }
+    fn remove_silent_payments(&self, scan_pubkeys: &[[u8; 33]]) {
+        node::events::WatchHandle::remove_silent_payments(self, scan_pubkeys);
+    }
 }
 
 /// A complete desired watch-set for [`WatchSet::replace`]. Each field is the FULL
@@ -205,6 +222,9 @@ pub(crate) struct DesiredWatchSet {
     pub depth_alarms: Vec<(Txid, u32)>,
     /// Prefix buckets with their (coarseness-priced) unit cost.
     pub prefixes: Vec<(PrefixKey, u64)>,
+    /// BIP 352 silent-payment scan-key targets (Tier 2, §4). Full membership;
+    /// deduplicated by identity (`b_scan·G`) in [`WatchSet::replace`].
+    pub sp_targets: Vec<node::events::SpWatchTarget>,
 }
 
 /// Outcome of an atomic [`WatchSet::replace`].
@@ -280,6 +300,12 @@ pub(crate) struct WatchSet {
     /// Unlike the others these are **priced by coarseness** — a coarser bucket
     /// (smaller `bits`) holds a multi-unit lease (see [`prefix_units`]).
     prefixes: HashMap<PrefixKey, Option<satd_auth::WatchLease>>,
+    /// BIP 352 silent-payment scan-key targets (Tier 2, §4), keyed by identity
+    /// `b_scan·G`, each holding its quota lease (one unit per target). Only the
+    /// identity + lease live here; the scan secret itself lives solely in the
+    /// node-side matcher registry (§4.3) — never copied into the carrier's
+    /// bookkeeping.
+    silent_payments: HashMap<[u8; 33], Option<satd_auth::WatchLease>>,
 }
 
 impl WatchSet {
@@ -556,15 +582,33 @@ impl WatchSet {
         let target_txids: HashMap<Txid, u32> = desired.lifecycles.iter().copied().collect();
         let target_depths: HashSet<(Txid, u32)> = desired.depth_alarms.iter().copied().collect();
         let target_prefixes: HashMap<PrefixKey, u64> = desired.prefixes.iter().copied().collect();
+        // Silent-payment targets: dedup by identity (`b_scan·G`), first
+        // occurrence wins. One quota unit each; no shared ownership.
+        let mut target_sp: HashMap<[u8; 33], node::events::SpWatchTarget> = HashMap::new();
+        for t in &desired.sp_targets {
+            target_sp.entry(t.scan_pubkey()).or_insert_with(|| t.clone());
+        }
+        // Per-connection SP cap applies regardless of the generic entry cap
+        // (`max_items` is 0/unlimited on the gRPC carrier). Checked before any
+        // mutation so a rejection leaves the live set untouched.
+        if target_sp.len() > MAX_SP_TARGETS_PER_CONNECTION {
+            return ReplaceOutcome::CapExceeded {
+                limit: MAX_SP_TARGETS_PER_CONNECTION as u64,
+                requested: target_sp.len() as u64,
+            };
+        }
 
         // Per-connection entry cap: bound the target the same way the incremental
         // adds are bounded on this carrier. Count effective ENTRIES (a prefix is
         // one entry regardless of its unit cost) — this matches `len()`. Checked
         // BEFORE the quota swap and any mutation, so a rejection leaves the live
         // set (and its leases) untouched. `max_items == 0` ⇒ unlimited.
-        let target_len =
-            target_scripts.len() + target_outpoints.len() + target_txids.len() + target_depths.len()
-                + target_prefixes.len();
+        let target_len = target_scripts.len()
+            + target_outpoints.len()
+            + target_txids.len()
+            + target_depths.len()
+            + target_prefixes.len()
+            + target_sp.len();
         if max_items != 0 && target_len > max_items {
             return ReplaceOutcome::CapExceeded {
                 limit: max_items as u64,
@@ -576,7 +620,8 @@ impl WatchSet {
             + target_outpoints.len() as u64
             + target_txids.len() as u64
             + target_depths.len() as u64
-            + target_prefixes.values().sum::<u64>();
+            + target_prefixes.values().sum::<u64>()
+            + target_sp.len() as u64;
 
         // ---- Diff vs the current set (registry lists + counts) -----------
         // For scripts and lifecycles the full target is re-registered so a kept
@@ -601,6 +646,12 @@ impl WatchSet {
             self.prefixes.keys().filter(|k| !target_prefixes.contains_key(*k)).copied().collect();
         let new_prefixes: Vec<PrefixKey> =
             target_prefixes.keys().filter(|k| !self.prefixes.contains_key(*k)).copied().collect();
+        // SP: departed = held identity absent from target; the full target set is
+        // re-registered (kept + new) so a kept identity's label set is refreshed
+        // in place (the node registry replaces by identity).
+        let departed_sp: Vec<[u8; 33]> =
+            self.silent_payments.keys().filter(|k| !target_sp.contains_key(*k)).copied().collect();
+        let all_target_sp: Vec<node::events::SpWatchTarget> = target_sp.values().cloned().collect();
 
         // Counts by effective coverage (kept = in both, added = net-new).
         let kept_scripts = self.scripts.len() - departed_scripts.len();
@@ -608,17 +659,25 @@ impl WatchSet {
         let kept_txids = self.txids.len() - departed_txids.len();
         let kept_depths = self.tx_depths.len() - departed_depths.len();
         let kept_prefixes = self.prefixes.len() - departed_prefixes.len();
-        let unchanged = (kept_scripts + kept_outpoints + kept_txids + kept_depths + kept_prefixes) as u32;
+        let kept_sp = self.silent_payments.len() - departed_sp.len();
+        let unchanged = (kept_scripts
+            + kept_outpoints
+            + kept_txids
+            + kept_depths
+            + kept_prefixes
+            + kept_sp) as u32;
         let removed = (departed_scripts.len()
             + departed_outpoints.len()
             + departed_txids.len()
             + departed_depths.len()
-            + departed_prefixes.len()) as u32;
+            + departed_prefixes.len()
+            + departed_sp.len()) as u32;
         let added = ((target_scripts.len() - kept_scripts)
             + (target_outpoints.len() - kept_outpoints)
             + (target_txids.len() - kept_txids)
             + (target_depths.len() - kept_depths)
-            + (target_prefixes.len() - kept_prefixes)) as u32;
+            + (target_prefixes.len() - kept_prefixes)
+            + (target_sp.len() - kept_sp)) as u32;
 
         // ---- Quota: atomically swap the reservation current → target -------
         // One locked read-modify-write in the store (`replace_watch`): no window
@@ -639,7 +698,8 @@ impl WatchSet {
                     .prefixes
                     .values()
                     .filter_map(|l| l.as_ref().map(satd_auth::WatchLease::units))
-                    .sum::<u64>();
+                    .sum::<u64>()
+                + self.silent_payments.len() as u64;
             match p.replace_watch(current_units, target_units) {
                 Ok(b) => {
                     self.defuse_leases();
@@ -665,6 +725,7 @@ impl WatchSet {
         self.txids = target_txids.keys().map(|t| (*t, take(1))).collect();
         self.tx_depths = target_depths.iter().map(|k| (*k, take(1))).collect();
         self.prefixes = target_prefixes.iter().map(|(k, units)| (*k, take(*units))).collect();
+        self.silent_payments = target_sp.keys().map(|id| (*id, take(1))).collect();
         self.script_owners = target_owners;
         self.script_direct = target_direct;
         self.descriptors = target_descriptors;
@@ -706,6 +767,14 @@ impl WatchSet {
         if !departed_prefixes.is_empty() {
             reg.remove_prefixes(&departed_prefixes);
         }
+        // SP: register the full target set (kept identities refresh their labels
+        // in place — the node registry replaces by identity); remove departed.
+        if !all_target_sp.is_empty() {
+            reg.add_silent_payments(&all_target_sp);
+        }
+        if !departed_sp.is_empty() {
+            reg.remove_silent_payments(&departed_sp);
+        }
 
         ReplaceOutcome::Accepted { added, removed, unchanged }
     }
@@ -737,6 +806,11 @@ impl WatchSet {
             }
         }
         for v in self.prefixes.values_mut() {
+            if let Some(l) = v.take() {
+                l.defuse();
+            }
+        }
+        for v in self.silent_payments.values_mut() {
             if let Some(l) = v.take() {
                 l.defuse();
             }
@@ -864,6 +938,101 @@ impl WatchSet {
         remove_items(&mut self.prefixes, incoming, unregister);
     }
 
+    /// Add silent-payment scan-key targets (Tier 2, §4), one quota unit each,
+    /// keyed by identity `b_scan·G`. Re-asserting a held identity is a no-op
+    /// (an SP target carries no mutable server-side metadata). Bounded by
+    /// [`MAX_SP_TARGETS_PER_CONNECTION`]: if the net-new targets would push the
+    /// retained count over the cap, the whole add is shed (like a descriptor
+    /// over its cap). All-or-nothing on quota. `register` receives the net-new
+    /// targets (those charged) so the caller wires them into the matcher.
+    pub(crate) fn add_silent_payments(
+        &mut self,
+        principal: Option<&satd_auth::Principal>,
+        targets: Vec<node::events::SpWatchTarget>,
+        register: impl FnOnce(&[node::events::SpWatchTarget]),
+    ) {
+        // Partition into net-new (identity not yet held); dedup within message.
+        let mut seen = HashSet::new();
+        let mut net_new: Vec<node::events::SpWatchTarget> = Vec::new();
+        for t in targets {
+            let id = t.scan_pubkey();
+            if !seen.insert(id) {
+                continue; // intra-message duplicate identity
+            }
+            if !self.silent_payments.contains_key(&id) {
+                net_new.push(t);
+            }
+        }
+        if net_new.is_empty() {
+            return;
+        }
+        // Per-connection SP cap: only net-new grows the retained set.
+        if self.silent_payments.len() + net_new.len() > MAX_SP_TARGETS_PER_CONNECTION {
+            warn!(
+                target: "events::watchset",
+                held = self.silent_payments.len(),
+                adding = net_new.len(),
+                cap = MAX_SP_TARGETS_PER_CONNECTION,
+                "silent-payment target cap exceeded; skipping add",
+            );
+            return;
+        }
+        // Per-add rate limit (mirrors `add_items_priced`): one token per
+        // effective add, after the net-new short-circuit so a no-op cannot burn
+        // the bucket.
+        if let Some(p) = principal
+            && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
+        {
+            warn!(
+                target: "events::watchset",
+                kind = "silent_payments",
+                retry_after_secs,
+                "watch add rate-limited; skipping",
+            );
+            return;
+        }
+        match principal {
+            Some(p) => match p.acquire_watch(net_new.len() as u64) {
+                Ok(mut batch) => {
+                    register(&net_new);
+                    for t in net_new {
+                        let lease = batch.split_off(1);
+                        debug_assert!(
+                            lease.is_some(),
+                            "split_off drained before all sp targets got a lease",
+                        );
+                        self.silent_payments.insert(t.scan_pubkey(), lease);
+                    }
+                }
+                Err(reject) => {
+                    warn!(
+                        target: "events::watchset",
+                        kind = "silent_payments",
+                        reject = ?reject,
+                        "watch add rejected (capability or quota)",
+                    );
+                }
+            },
+            // Auth disabled (loopback trust): unlimited, no lease.
+            None => {
+                register(&net_new);
+                for t in net_new {
+                    self.silent_payments.insert(t.scan_pubkey(), None);
+                }
+            }
+        }
+    }
+
+    /// Remove silent-payment targets by identity `b_scan·G`, releasing each
+    /// removed target's quota lease.
+    pub(crate) fn remove_silent_payments(
+        &mut self,
+        scan_pubkeys: impl IntoIterator<Item = [u8; 33]>,
+        unregister: impl FnOnce(&[[u8; 33]]),
+    ) {
+        remove_items(&mut self.silent_payments, scan_pubkeys, unregister);
+    }
+
     /// Total watched items across all kinds. Used to enforce the per-connection
     /// watch-set cap and in tests. A prefix counts as one item regardless of its
     /// (coarseness-priced) unit cost.
@@ -873,6 +1042,7 @@ impl WatchSet {
             + self.txids.len()
             + self.tx_depths.len()
             + self.prefixes.len()
+            + self.silent_payments.len()
     }
 }
 
@@ -1668,6 +1838,8 @@ mod tests {
     struct MockReg {
         added_scripts: std::cell::RefCell<Vec<Scripthash>>,
         removed_scripts: std::cell::RefCell<Vec<Scripthash>>,
+        added_sp: std::cell::RefCell<Vec<[u8; 33]>>,
+        removed_sp: std::cell::RefCell<Vec<[u8; 33]>>,
     }
     impl WatchRegistry for MockReg {
         fn add_scripthashes_with_floors(&self, items: &[(Scripthash, u64)]) {
@@ -1684,6 +1856,12 @@ mod tests {
         fn remove_tx_depths(&self, _: &[(Txid, u32)]) {}
         fn add_prefixes(&self, _: &[PrefixKey]) {}
         fn remove_prefixes(&self, _: &[PrefixKey]) {}
+        fn add_silent_payments(&self, targets: &[node::events::SpWatchTarget]) {
+            self.added_sp.borrow_mut().extend(targets.iter().map(|t| t.scan_pubkey()));
+        }
+        fn remove_silent_payments(&self, scan_pubkeys: &[[u8; 33]]) {
+            self.removed_sp.borrow_mut().extend_from_slice(scan_pubkeys);
+        }
     }
 
     fn desired_scripts(scripts: &[Scripthash]) -> DesiredWatchSet {
@@ -1694,6 +1872,7 @@ mod tests {
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
+            sp_targets: Vec::new(),
         }
     }
 
@@ -1736,6 +1915,7 @@ mod tests {
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
+            sp_targets: Vec::new(),
         };
         let reg = MockReg::default();
         let outcome = ws.replace(Some(&p), desired, 0, &reg);
@@ -1767,6 +1947,7 @@ mod tests {
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
+            sp_targets: Vec::new(),
         };
         ws.replace(Some(&p), d1, 0, &MockReg::default());
         assert_eq!(attrib(&ws, sh(1)), vec![("a".to_string(), 0, 5)], "new descriptor attributes at its coordinate");
@@ -1779,6 +1960,7 @@ mod tests {
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
+            sp_targets: Vec::new(),
         };
         ws.replace(Some(&p), d2, 0, &MockReg::default());
         assert_eq!(attrib(&ws, sh(2)), vec![("b".to_string(), 1, 9)], "replaced-in descriptor attributes correctly");
@@ -1808,6 +1990,7 @@ mod tests {
             lifecycles: Vec::new(),
             depth_alarms: Vec::new(),
             prefixes: Vec::new(),
+            sp_targets: Vec::new(),
         };
         let outcome = ws.replace(Some(&p), desired, 0, &MockReg::default());
         assert!(
@@ -2029,5 +2212,105 @@ mod tests {
         ws.remove_descriptor("A", |_| {});
         assert!(ws.descriptor_attribution(&sh(1)).is_empty(), "A's exclusive script cleared");
         assert_eq!(attrib(&ws, sh(2)), vec![("B".to_string(), 0, 0)], "B still attributes the shared script");
+    }
+
+    // ---- Silent-payment (Tier 2) watch-set tests -------------------------
+
+    /// A distinct SP target per `seed` (distinct `b_scan` ⇒ distinct identity),
+    /// all sharing one valid spend pubkey.
+    fn sp_target(seed: u8) -> node::events::SpWatchTarget {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap());
+        node::events::SpWatchTarget::new([seed; 32], &spend.serialize(), vec![]).unwrap()
+    }
+
+    #[test]
+    fn sp_add_then_remove_releases_quota() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+
+        let mut registered = 0;
+        ws.add_silent_payments(Some(&p), vec![sp_target(1), sp_target(2)], |ts| {
+            registered = ts.len();
+        });
+        assert_eq!(registered, 2);
+        assert_eq!(q.current("tenant"), 2, "two SP targets charge 2 units");
+        assert_eq!(ws.len(), 2);
+
+        // Re-asserting a held identity is not double-charged.
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {});
+        assert_eq!(q.current("tenant"), 2, "re-asserted identity is not recharged");
+
+        let mut unregistered = 0;
+        ws.remove_silent_payments([sp_target(1).scan_pubkey()], |ids| unregistered = ids.len());
+        assert_eq!(unregistered, 1);
+        assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
+        assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn sp_incremental_add_respects_cap() {
+        // No quota bound (loopback): only the SP cap gates the add.
+        let mut ws = WatchSet::default();
+        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(sp_target).collect();
+        ws.add_silent_payments(None, full, |_| {});
+        assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION);
+        // One more target over the cap is shed whole; the set is unchanged.
+        let mut registered = true;
+        ws.add_silent_payments(None, vec![sp_target(200)], |_| registered = true);
+        // (register is a no-op closure marker; assert by size instead.)
+        let _ = registered;
+        assert_eq!(ws.len(), MAX_SP_TARGETS_PER_CONNECTION, "over-cap add is shed");
+    }
+
+    #[test]
+    fn sp_replace_reconciles_and_reports() {
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        let reg = MockReg::default();
+
+        let mut d = desired_scripts(&[]);
+        d.sp_targets = vec![sp_target(1), sp_target(2)];
+        let outcome = ws.replace(Some(&p), d, 0, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 2, removed: 0, unchanged: 0 }),
+            "two SP targets added, got {outcome:?}",
+        );
+        assert_eq!(reg.added_sp.borrow().len(), 2, "both identities registered");
+        assert_eq!(q.current("tenant"), 2);
+
+        // Replace keeping target 1, dropping 2, adding 3.
+        let mut d2 = desired_scripts(&[]);
+        d2.sp_targets = vec![sp_target(1), sp_target(3)];
+        reg.added_sp.borrow_mut().clear();
+        let outcome = ws.replace(Some(&p), d2, 0, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::Accepted { added: 1, removed: 1, unchanged: 1 }),
+            "one kept, one dropped, one added, got {outcome:?}",
+        );
+        assert_eq!(
+            reg.removed_sp.borrow().as_slice(),
+            &[sp_target(2).scan_pubkey()],
+            "only target 2 departs the registry",
+        );
+        assert_eq!(q.current("tenant"), 2, "quota holds at two targets");
+    }
+
+    #[test]
+    fn sp_replace_over_cap_rejected() {
+        let mut ws = WatchSet::default();
+        let reg = MockReg::default();
+        let mut d = desired_scripts(&[]);
+        d.sp_targets = (1..=(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1)).map(sp_target).collect();
+        let outcome = ws.replace(None, d, 0, &reg);
+        assert!(
+            matches!(outcome, ReplaceOutcome::CapExceeded { limit, .. } if limit == MAX_SP_TARGETS_PER_CONNECTION as u64),
+            "over the SP cap is rejected, got {outcome:?}",
+        );
+        assert_eq!(ws.len(), 0, "rejected replace leaves the set unchanged");
+        assert!(reg.added_sp.borrow().is_empty(), "no registration on a rejected replace");
     }
 }

@@ -2689,6 +2689,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4140,6 +4141,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "zeroize",
  "zeromq",
 ]
 

@@ -856,6 +856,7 @@ token store.
 | Open a stream; receive the firehose (categories) | `stream:subscribe` | — |
 | `AddScripts` / `AddOutpoints` / `AddTransactions` / `AddDescriptor` | `stream:watch` | per-token watch quota + per-add rate limit |
 | `AddScriptPrefixes` (§7.5) | `stream:watch` | same quota, but **priced by coarseness** (see below) |
+| `AddSilentPayments` (§7.7 Tier 2) | `stream:watch` | one unit per target, capped at 16/connection (`MAX_SP_TARGETS_PER_CONNECTION`) |
 | `Remove*` | — | releases each item's unit immediately |
 
 **Quota unit (N items = N units).** A unit is one watched *item*: an `AddOutpoints`

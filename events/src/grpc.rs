@@ -86,6 +86,7 @@ impl Default for GrpcLimits {
 
 use crate::proto::v1 as pb;
 use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
+use zeroize::Zeroize;
 use crate::proto::v1::node_event_stream_server::{
     NodeEventStream, NodeEventStreamServer,
 };
@@ -1616,10 +1617,13 @@ impl NodeEventStream for NodeEventStreamSvc {
                         // Ack in-band ahead of the matches (mirrors CursorAccepted).
                         let ack = rescan_accepted_event(&edge, plan.from, plan.to, plan.clamped);
                         if tx_out.send(Ok(ack)).await.is_err() { return; }
-                        // Undo is fetched only when an input-side script/prefix
-                        // match could need it (spent-prevout scriptPubKeys).
-                        let need_undo =
-                            ephemeral.has_script_watchers() || ephemeral.has_prefix_watchers();
+                        // Undo is fetched only when a match could need the spent
+                        // prevout scriptPubKeys: an input-side script/prefix
+                        // match, or a silent-payment scan (the per-tx tweak is
+                        // computed over the inputs' prevout scripts).
+                        let need_undo = ephemeral.has_script_watchers()
+                            || ephemeral.has_prefix_watchers()
+                            || ephemeral.has_sp_watchers();
                         let mut matches: u64 = 0;
                         // Reorg-safe (height,hash) resolution first (an active-chain
                         // index walk) — run on the blocking pool like the per-block
@@ -2028,15 +2032,44 @@ fn apply_control(
                 "RescanBlocks reached apply_control unexpectedly; ignoring (handled as rescan upstream)",
             );
         }
-        Some(Msg::AddSilentPayments(_)) | Some(Msg::RemoveSilentPayments(_)) => {
-            // BIP 352 scan-key watch (§4). PR 4 reserves the schema slot; the
-            // registry lease map + matcher wiring land in PR 6. No client in
-            // this version sends these, so ignore rather than mis-handle — the
-            // real add/remove/quota handling replaces this arm in PR 6.
-            debug!(
-                target: "events::grpc",
-                "silent-payment watch control received but the matcher is not yet wired (PR 6); ignoring",
-            );
+        Some(Msg::AddSilentPayments(mut a)) => {
+            // BIP 352 scan-key watch (§4): validate each target, charge quota /
+            // enforce the per-connection cap in the watch-set, and register the
+            // net-new ones with the matcher. Invalid targets are skipped with a
+            // warning (best-effort, like the other incremental Add* paths).
+            let mut targets = Vec::with_capacity(a.targets.len());
+            for t in &a.targets {
+                match parse_sp_target(t) {
+                    Some(tgt) => targets.push(tgt),
+                    None => warn!(
+                        target: "events::grpc",
+                        "ignoring invalid silent-payment target in AddSilentPayments",
+                    ),
+                }
+            }
+            // The zeroizing target buffers now hold the secrets; scrub the wire
+            // copies rather than leave them in the dropped proto message.
+            for t in &mut a.targets {
+                t.scan_secret.zeroize();
+            }
+            if !targets.is_empty() {
+                watch_set.add_silent_payments(principal, targets, |ts| {
+                    handle.add_silent_payments(ts);
+                });
+            }
+        }
+        Some(Msg::RemoveSilentPayments(r)) => {
+            // Remove targets by their 33-byte identity `b_scan·G`.
+            let ids: Vec<[u8; 33]> = r
+                .scan_pubkeys
+                .iter()
+                .filter_map(|b| <[u8; 33]>::try_from(b.as_slice()).ok())
+                .collect();
+            if !ids.is_empty() {
+                watch_set.remove_silent_payments(ids, |ids| {
+                    handle.remove_silent_payments(ids);
+                });
+            }
         }
         None => {}
     }
@@ -2053,6 +2086,15 @@ fn apply_control(
 /// previously-live watches while still reporting `Accepted`. All-or-nothing: the
 /// caller turns `Err` into a `WatchSetRejected{MALFORMED}` and leaves the live
 /// set untouched.
+/// Validate a wire [`pb::SilentPaymentTarget`] into a [`SpWatchTarget`](node::events::SpWatchTarget):
+/// a 32-byte scan secret, a valid 33-byte compressed spend pubkey, and label
+/// integers. Returns `None` on any malformed field. The scan secret is copied
+/// into the target's zeroize-on-drop buffer; the caller scrubs the wire copy.
+fn parse_sp_target(t: &pb::SilentPaymentTarget) -> Option<node::events::SpWatchTarget> {
+    let scan_secret = <[u8; 32]>::try_from(t.scan_secret.as_slice()).ok()?;
+    node::events::SpWatchTarget::new(scan_secret, &t.spend_pubkey, t.labels.clone()).ok()
+}
+
 fn desired_from_proto(
     s: &pb::SetWatchSet,
     prefix_bounds: (u8, u8),
@@ -2104,6 +2146,12 @@ fn desired_from_proto(
             .ok_or("prefix")?;
         prefixes.push(parsed);
     }
+    let mut sp_targets = Vec::with_capacity(s.silent_payments.len());
+    for t in &s.silent_payments {
+        // STRICT (full-replacement): a malformed target fails the whole
+        // snapshot rather than silently shrinking the live SP watch-set.
+        sp_targets.push(parse_sp_target(t).ok_or("silent payment target")?);
+    }
     Ok(crate::watchset::DesiredWatchSet {
         scripts,
         descriptors,
@@ -2111,6 +2159,7 @@ fn desired_from_proto(
         lifecycles,
         depth_alarms,
         prefixes,
+        sp_targets,
     })
 }
 
@@ -2412,6 +2461,41 @@ fn watch_match_to_proto(
                     .collect(),
             });
             (cursor_from_height(pm.height, edge.instance_id), body)
+        }
+        WatchMatch::SilentPaymentMatched {
+            scan_pubkey,
+            txid,
+            vout,
+            output_pubkey,
+            amount,
+            tweak,
+            k,
+            label,
+            confirmed,
+            height,
+            raw_tx,
+        } => {
+            // raw_tx rides the match only when some subscriber opted in; put it
+            // on THIS connection's wire only if this connection did.
+            let raw_tx = match (include_raw_tx, raw_tx) {
+                (true, Some(bytes)) => bytes.to_vec(),
+                _ => Vec::new(),
+            };
+            let body = pb::node_event::Body::SilentPaymentMatched(pb::SilentPaymentMatched {
+                scan_pubkey: scan_pubkey.to_vec(),
+                txid: txid.as_raw_hash().to_byte_array().to_vec(),
+                vout: *vout,
+                output_pubkey: output_pubkey.serialize().to_vec(),
+                amount: *amount,
+                tweak: tweak.serialize().to_vec(),
+                k: *k,
+                has_label: label.is_some(),
+                label: label.unwrap_or(0),
+                confirmed: *confirmed,
+                height: height.unwrap_or(0),
+                raw_tx,
+            });
+            (cursor_from_height(*height, edge.instance_id), body)
         }
     };
     pb::NodeEvent {
@@ -5875,5 +5959,132 @@ mod tests {
             }
         }
         panic!("no RescanResult received");
+    }
+
+    #[test]
+    fn watch_match_to_proto_maps_silent_payment() {
+        let output = test_pubkey(7).x_only_public_key().0;
+        let tweak = test_pubkey(8);
+        let scan_pubkey = test_pubkey(9).serialize();
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        let m = node::events::WatchMatch::SilentPaymentMatched {
+            scan_pubkey,
+            txid,
+            vout: 3,
+            output_pubkey: output,
+            amount: 42_000,
+            tweak,
+            k: 1,
+            label: Some(7),
+            confirmed: true,
+            height: Some(880),
+            raw_tx: None,
+        };
+        let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
+        let pb::node_event::Body::SilentPaymentMatched(sp) = ev.body.unwrap() else {
+            panic!("wrong body variant");
+        };
+        assert_eq!(sp.scan_pubkey, scan_pubkey.to_vec());
+        assert_eq!(sp.txid, txid.as_raw_hash().to_byte_array().to_vec());
+        assert_eq!(sp.vout, 3);
+        assert_eq!(sp.output_pubkey, output.serialize().to_vec());
+        assert_eq!(sp.output_pubkey.len(), 32);
+        assert_eq!(sp.amount, 42_000);
+        assert_eq!(sp.tweak, tweak.serialize().to_vec());
+        assert_eq!(sp.tweak.len(), 33);
+        assert_eq!(sp.k, 1);
+        assert!(sp.has_label);
+        assert_eq!(sp.label, 7);
+        assert!(sp.confirmed);
+        assert_eq!(sp.height, 880);
+        assert!(sp.raw_tx.is_empty(), "no raw_tx opt-in");
+        assert_eq!(ev.cursor.unwrap().height, 880);
+    }
+
+    #[test]
+    fn watch_match_to_proto_sp_raw_tx_only_when_opted_in() {
+        let m = node::events::WatchMatch::SilentPaymentMatched {
+            scan_pubkey: test_pubkey(9).serialize(),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32])),
+            vout: 0,
+            output_pubkey: test_pubkey(7).x_only_public_key().0,
+            amount: 1,
+            tweak: test_pubkey(8),
+            k: 0,
+            label: None,
+            confirmed: true,
+            height: Some(1),
+            raw_tx: Some(std::sync::Arc::from(vec![0xde, 0xad].as_slice())),
+        };
+        // Opted out: raw_tx stripped even though the match carries it.
+        let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
+        let pb::node_event::Body::SilentPaymentMatched(sp) = ev.body.unwrap() else {
+            panic!("wrong body");
+        };
+        assert!(sp.raw_tx.is_empty(), "opted-out stream never gets raw_tx");
+        // Opted in: raw_tx present, and no label ⇒ has_label false.
+        let ev = watch_match_to_proto(&edge(), &m, Vec::new(), true);
+        let pb::node_event::Body::SilentPaymentMatched(sp) = ev.body.unwrap() else {
+            panic!("wrong body");
+        };
+        assert_eq!(sp.raw_tx, vec![0xde, 0xad]);
+        assert!(!sp.has_label);
+    }
+
+    #[test]
+    fn desired_from_proto_parses_silent_payments() {
+        let target = pb::SilentPaymentTarget {
+            scan_secret: vec![0x11u8; 32],
+            spend_pubkey: test_pubkey(2).serialize().to_vec(),
+            labels: vec![0, 3],
+        };
+        let ok = pb::SetWatchSet {
+            silent_payments: vec![target],
+            ..Default::default()
+        };
+        let d = desired_from_proto(&ok, (8, 32)).expect("valid SP target builds");
+        assert_eq!(d.sp_targets.len(), 1);
+
+        // A malformed scan secret (wrong length) fails the whole snapshot.
+        let bad = pb::SetWatchSet {
+            silent_payments: vec![pb::SilentPaymentTarget {
+                scan_secret: vec![0x11u8; 31],
+                spend_pubkey: test_pubkey(2).serialize().to_vec(),
+                labels: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(desired_from_proto(&bad, (8, 32)).is_err(), "bad scan secret rejects snapshot");
+    }
+
+    #[test]
+    fn parse_sp_target_rejects_bad_fields() {
+        // Wrong-length secret.
+        assert!(
+            parse_sp_target(&pb::SilentPaymentTarget {
+                scan_secret: vec![0u8; 16],
+                spend_pubkey: test_pubkey(2).serialize().to_vec(),
+                labels: vec![],
+            })
+            .is_none()
+        );
+        // Wrong-length spend pubkey.
+        assert!(
+            parse_sp_target(&pb::SilentPaymentTarget {
+                scan_secret: vec![0x11u8; 32],
+                spend_pubkey: vec![0x02u8; 32],
+                labels: vec![],
+            })
+            .is_none()
+        );
+        // Valid.
+        assert!(
+            parse_sp_target(&pb::SilentPaymentTarget {
+                scan_secret: vec![0x11u8; 32],
+                spend_pubkey: test_pubkey(2).serialize().to_vec(),
+                labels: vec![7],
+            })
+            .is_some()
+        );
     }
 }

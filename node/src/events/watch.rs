@@ -26,14 +26,18 @@
 //! and matches are dropped-with-notice, never stalling the matcher.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey, SignOnly, XOnlyPublicKey};
 use bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use node_index::keys::{scripthash_of, Scripthash};
+use node_sp_index::{compute_tweak, scan_outputs};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::{EvictReason, MempoolEvent};
@@ -43,6 +47,115 @@ use crate::storage::undo::UndoData;
 /// further behind than this loses matches (drop-with-notice) rather than
 /// backpressuring the matcher.
 pub const WATCH_CHANNEL_CAPACITY: usize = 1024;
+
+/// Signing-only secp context for deriving a scan key's identity pubkey
+/// (`b_scan·G`). Built once; the ECDH scan math itself runs inside
+/// `node_sp_index` against its own `All` context.
+fn sp_secp() -> &'static Secp256k1<SignOnly> {
+    static SECP: OnceLock<Secp256k1<SignOnly>> = OnceLock::new();
+    SECP.get_or_init(Secp256k1::signing_only)
+}
+
+/// Why a [`SpWatchTarget`] could not be constructed from wire bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpTargetError {
+    /// `scan_secret` was not a valid 32-byte secp256k1 scalar (`b_scan`).
+    BadScanSecret,
+    /// `spend_pubkey` was not a valid 33-byte compressed point (`B_spend`).
+    BadSpendPubkey,
+}
+
+impl std::fmt::Display for SpTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadScanSecret => f.write_str("invalid silent-payment scan secret"),
+            Self::BadSpendPubkey => f.write_str("invalid silent-payment spend pubkey"),
+        }
+    }
+}
+
+impl std::error::Error for SpTargetError {}
+
+/// A registered BIP 352 silent-payment scan-key watch target (Tier 2, §4).
+///
+/// The scan secret `b_scan` is the sensitive credential — it is a *watch*
+/// credential, not a spend key (the operator learns which outputs are yours,
+/// never how to spend them), but it is still secret. Per §4.3 it is held in a
+/// zeroize-on-drop buffer, is never persisted (not RocksDB, not cursor state,
+/// not any status RPC), and must never reach a log/`Debug`/`Display` line —
+/// hence no `Debug` derive on this type and a hand-written one that redacts.
+#[derive(Clone)]
+pub struct SpWatchTarget {
+    /// 33-byte compressed identity `b_scan·G`. Client-derivable, not secret;
+    /// the handle used to remove the target and to attribute a match.
+    scan_pubkey: [u8; 33],
+    /// 32-byte scan secret `b_scan`, zeroized on drop. Reconstructed into a
+    /// `SecretKey` per scan pass (a cheap range-check) rather than stored as
+    /// one, so the only long-lived copy sits in this zeroizing buffer.
+    scan_secret: Zeroizing<[u8; 32]>,
+    /// 33-byte compressed spend pubkey `B_spend`.
+    spend_pubkey: PublicKey,
+    /// Deduplicated label integers `m` (include `0` to catch change). The
+    /// server derives the label points; see `node_sp_index::scan_outputs`.
+    labels: Vec<u32>,
+}
+
+impl SpWatchTarget {
+    /// Validate and wrap a target from its wire fields: a 32-byte scan secret,
+    /// a 33-byte compressed spend pubkey, and label integers (deduplicated
+    /// here). Computes and caches the scan-pubkey identity.
+    pub fn new(
+        scan_secret: [u8; 32],
+        spend_pubkey: &[u8],
+        mut labels: Vec<u32>,
+    ) -> Result<Self, SpTargetError> {
+        let sk = SecretKey::from_slice(&scan_secret).map_err(|_| SpTargetError::BadScanSecret)?;
+        let spend = PublicKey::from_slice(spend_pubkey).map_err(|_| SpTargetError::BadSpendPubkey)?;
+        let scan_pubkey = sk.public_key(sp_secp()).serialize();
+        labels.sort_unstable();
+        labels.dedup();
+        Ok(Self {
+            scan_pubkey,
+            scan_secret: Zeroizing::new(scan_secret),
+            spend_pubkey: spend,
+            labels,
+        })
+    }
+
+    /// The 33-byte compressed identity `b_scan·G` — the target's stable,
+    /// non-secret handle (dedup key, removal key, match attribution).
+    pub fn scan_pubkey(&self) -> [u8; 33] {
+        self.scan_pubkey
+    }
+
+    /// Reconstruct the `b_scan` [`SecretKey`]. Infallible: the bytes were
+    /// range-checked in [`new`](Self::new).
+    fn b_scan(&self) -> SecretKey {
+        SecretKey::from_slice(&*self.scan_secret).expect("scan secret validated at construction")
+    }
+}
+
+impl std::fmt::Debug for SpWatchTarget {
+    /// Redacts `b_scan`; prints only the non-secret identity and label count,
+    /// mirroring the token-redaction precedent (`satd-events-client` builder).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpWatchTarget")
+            .field("scan_pubkey", &hex_id(&self.scan_pubkey))
+            .field("scan_secret", &"<redacted>")
+            .field("labels", &self.labels.len())
+            .finish()
+    }
+}
+
+/// Lower-hex a scan-pubkey for a redacted `Debug` without pulling in `hex`
+/// formatting machinery on the hot path.
+fn hex_id(id: &[u8; 33]) -> String {
+    let mut s = String::with_capacity(66);
+    for b in id {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
 
 /// A match against a registered watch-set, routed to the subscriber(s)
 /// whose watch matched.
@@ -125,6 +238,41 @@ pub enum WatchMatch {
     /// precise follow-up fetch that would re-leak the exact interest. Boxed
     /// because the payload (a whole tx) dwarfs the other variants.
     PrefixMatched(Box<PrefixMatch>),
+    /// A transaction paid a registered BIP 352 silent-payment scan-key target
+    /// (Tier 2, §4). Emitted from the confirmed-block scan (this PR); the
+    /// mempool `confirmed = false` analogue lands in PR 7.
+    SilentPaymentMatched {
+        /// The matched target's 33-byte identity `b_scan·G` — attribution,
+        /// mirroring `ScriptMatched`'s scripthash role.
+        scan_pubkey: [u8; 33],
+        /// The transaction that produced the matched output.
+        txid: Txid,
+        /// The matched output's index in the transaction.
+        vout: u32,
+        /// The matched taproot output key (x-only, 32 bytes).
+        output_pubkey: XOnlyPublicKey,
+        /// The output's value in satoshis.
+        amount: u64,
+        /// The transaction's public tweak `T` (33-byte compressed). With `k`
+        /// (and, for a labeled hit, the label), a light client re-derives the
+        /// output key — and hence its spending key — offline from `b_scan`.
+        tweak: PublicKey,
+        /// BIP 352 output counter at which this output matched.
+        k: u32,
+        /// The label integer `m` when the hit came via a registered label
+        /// (`m = 0` is change); `None` for a direct (unlabeled) match.
+        label: Option<u32>,
+        /// `true` once seen in a connected block; `false` while only in the
+        /// mempool (PR 7).
+        confirmed: bool,
+        /// Block height when `confirmed`; `None` in the mempool.
+        height: Option<u32>,
+        /// Full consensus-serialized matching tx, attached only when some
+        /// subscriber opted into raw-tx inlining; `None` otherwise. Shared
+        /// `Arc` so the per-tx serialization happens at most once — same
+        /// mechanism as `ScriptMatched`.
+        raw_tx: Option<Arc<[u8]>>,
+    },
 }
 
 /// One matched spent prevout on the spend side of a [`PrefixMatch`].
@@ -205,6 +353,10 @@ struct Subscriber {
     /// subscriber's ScriptMatched events. Counted in `raw_tx_items` so the
     /// matcher can gate serialization on a single atomic load.
     wants_raw_tx: bool,
+    /// Registered BIP 352 silent-payment scan-key targets (Tier 2, §4), keyed
+    /// by their 33-byte identity `b_scan·G` for O(1) add/remove/dedup. Holds
+    /// the (zeroize-on-drop) scan secrets; never persisted, never logged.
+    sp_targets: HashMap<[u8; 33], SpWatchTarget>,
 }
 
 #[derive(Default)]
@@ -238,6 +390,11 @@ struct Inner {
     /// lengths (typically one or two), so its cost is O(distinct lengths),
     /// independent of subscriber count.
     prefix_lens: HashMap<u8, usize>,
+    /// Subscribers with at least one silent-payment target. The SP block scan
+    /// iterates only these (not every subscriber): silent-payment matching is
+    /// not keyed by an output script, so there is no inverted index — every
+    /// SP-eligible tx is scanned against every registered target.
+    sp_subs: HashSet<SubId>,
 }
 
 /// Registry of per-subscriber outpoint/script watch-sets with O(1)
@@ -270,6 +427,11 @@ pub struct WatchRegistry {
     /// so the default path (nobody opted in) pays only a single atomic load —
     /// same philosophy as `script_items`/`prefix_items`.
     raw_tx_items: AtomicUsize,
+    /// Lock-free count of registered *silent-payment* targets across all
+    /// subscribers. Gates the per-block SP scan (compute the per-tx tweak +
+    /// ECDH per target) and, via `block_undo_for_scan`, the undo-data fetch
+    /// the tweak needs — so a node with no SP watchers does zero extra work.
+    sp_items: AtomicUsize,
 }
 
 impl Default for WatchRegistry {
@@ -289,6 +451,7 @@ impl WatchRegistry {
             depth_items: AtomicUsize::new(0),
             prefix_items: AtomicUsize::new(0),
             raw_tx_items: AtomicUsize::new(0),
+            sp_items: AtomicUsize::new(0),
         }
     }
 
@@ -329,6 +492,12 @@ impl WatchRegistry {
         self.raw_tx_items.load(Ordering::Acquire) > 0
     }
 
+    /// `true` if any subscriber has a silent-payment target. Lock-free; gates
+    /// the per-block SP scan and (via `block_undo_for_scan`) the undo fetch.
+    pub fn has_sp_watchers(&self) -> bool {
+        self.sp_items.load(Ordering::Acquire) > 0
+    }
+
     fn lock_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(|p| p.into_inner())
     }
@@ -356,6 +525,7 @@ impl WatchRegistry {
                 tx_depths: HashSet::new(),
                 prefixes: HashSet::new(),
                 wants_raw_tx: false,
+                sp_targets: HashMap::new(),
             },
         );
         (
@@ -622,6 +792,7 @@ impl WatchRegistry {
         let freed_scripts = sub.scripthashes.len();
         let freed_txids = sub.txids.len();
         let freed_prefixes = sub.prefixes.len();
+        let freed_sp = sub.sp_targets.len();
         // Alarms bump watch_items; Close entries don't (their lifecycle txid does).
         let alarm_count = sub
             .tx_depths
@@ -633,7 +804,8 @@ impl WatchRegistry {
             + sub.scripthashes.len()
             + sub.txids.len()
             + alarm_count
-            + sub.prefixes.len();
+            + sub.prefixes.len()
+            + sub.sp_targets.len();
         for op in &sub.outpoints {
             if let Some(set) = inner.by_outpoint.get_mut(op) {
                 set.remove(&id);
@@ -675,14 +847,64 @@ impl WatchRegistry {
         for (bits, masked) in prefixes {
             drop_prefix_bucket(&mut inner, id, bits, masked);
         }
+        inner.sp_subs.remove(&id);
         self.watch_items.fetch_sub(freed, Ordering::AcqRel);
         self.script_items.fetch_sub(freed_scripts, Ordering::AcqRel);
         self.txid_items.fetch_sub(freed_txids, Ordering::AcqRel);
         self.depth_items.fetch_sub(depth_count, Ordering::AcqRel);
         self.prefix_items.fetch_sub(freed_prefixes, Ordering::AcqRel);
+        self.sp_items.fetch_sub(freed_sp, Ordering::AcqRel);
         if sub.wants_raw_tx {
             self.raw_tx_items.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    /// Add silent-payment scan-key targets to a subscriber's watch-set, keyed
+    /// by their identity `b_scan·G`. Re-asserting an already-registered target
+    /// (same identity) replaces it in place and is not counted as new (dedup,
+    /// matching the quota layer). Returns the number *newly* added.
+    fn add_silent_payments(&self, id: SubId, targets: &[SpWatchTarget]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut added = 0;
+        for t in targets {
+            let is_new = match inner.subs.get_mut(&id) {
+                Some(sub) => sub.sp_targets.insert(t.scan_pubkey(), t.clone()).is_none(),
+                None => return added,
+            };
+            if is_new {
+                added += 1;
+            }
+        }
+        if inner.subs.get(&id).is_some_and(|s| !s.sp_targets.is_empty()) {
+            inner.sp_subs.insert(id);
+        }
+        // SP targets bump `watch_items` too: they are the sole watch kind that
+        // can keep the `has_watchers` block-scan gate hot for a purely
+        // silent-payment subscription.
+        self.watch_items.fetch_add(added, Ordering::AcqRel);
+        self.sp_items.fetch_add(added, Ordering::AcqRel);
+        added
+    }
+
+    /// Remove silent-payment targets by their 33-byte identity `b_scan·G`.
+    /// Returns the number removed.
+    fn remove_silent_payments(&self, id: SubId, scan_pubkeys: &[[u8; 33]]) -> usize {
+        let mut inner = self.lock_inner();
+        let mut removed = 0;
+        for pk in scan_pubkeys {
+            let Some(sub) = inner.subs.get_mut(&id) else {
+                break;
+            };
+            if sub.sp_targets.remove(pk).is_some() {
+                removed += 1;
+            }
+        }
+        if inner.subs.get(&id).is_some_and(|s| s.sp_targets.is_empty()) {
+            inner.sp_subs.remove(&id);
+        }
+        self.watch_items.fetch_sub(removed, Ordering::AcqRel);
+        self.sp_items.fetch_sub(removed, Ordering::AcqRel);
+        removed
     }
 
     /// Set a subscriber's raw-tx opt-in (SetWatchOptions). Idempotent: only a
@@ -733,6 +955,13 @@ impl WatchRegistry {
         {
             scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
         }
+        // Silent-payment (Tier 2) matching also needs the block's undo data to
+        // recover the input prevout scripts the per-tx tweak is computed over.
+        if let Some(undo) = undo
+            && !inner.sp_subs.is_empty()
+        {
+            scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+        }
     }
 
     /// Scan a connected block against this registry and **collect** the matches
@@ -767,6 +996,11 @@ impl WatchRegistry {
         {
             scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
         }
+        if let Some(undo) = undo
+            && !inner.sp_subs.is_empty()
+        {
+            scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+        }
         sink.out
     }
 
@@ -793,6 +1027,7 @@ impl WatchRegistry {
             && sub.scripthashes.is_empty()
             && sub.txids.is_empty()
             && sub.prefixes.is_empty()
+            && sub.sp_targets.is_empty()
         {
             return None;
         }
@@ -816,6 +1051,9 @@ impl WatchRegistry {
                     // Inherit the raw-tx opt-in so replayed matches carry raw_tx
                     // for an opted-in connection, matching the live stream.
                     wants_raw_tx: sub.wants_raw_tx,
+                    // Carry the SP targets so a rescan reproduces the confirmed
+                    // silent-payment matches a live block scan would.
+                    sp_targets: sub.sp_targets.clone(),
                 },
             );
             // Rebuild the inverted indexes this one subscriber contributes.
@@ -832,6 +1070,9 @@ impl WatchRegistry {
                 ni.by_prefix.entry((bits, masked)).or_default().insert(new_id);
                 *ni.prefix_lens.entry(bits).or_default() += 1;
             }
+            if !sub.sp_targets.is_empty() {
+                ni.sp_subs.insert(new_id);
+            }
         }
         // Gate counters, mirroring the `add_*` accounting: every kind bumps
         // `watch_items` (the `has_watchers` gate); scripts/txids/prefixes each
@@ -840,12 +1081,14 @@ impl WatchRegistry {
         let n_scr = sub.scripthashes.len();
         let n_txid = sub.txids.len();
         let n_pfx = sub.prefixes.len();
+        let n_sp = sub.sp_targets.len();
         registry
             .watch_items
-            .fetch_add(n_out + n_scr + n_txid + n_pfx, Ordering::AcqRel);
+            .fetch_add(n_out + n_scr + n_txid + n_pfx + n_sp, Ordering::AcqRel);
         registry.script_items.fetch_add(n_scr, Ordering::AcqRel);
         registry.txid_items.fetch_add(n_txid, Ordering::AcqRel);
         registry.prefix_items.fetch_add(n_pfx, Ordering::AcqRel);
+        registry.sp_items.fetch_add(n_sp, Ordering::AcqRel);
         if sub.wants_raw_tx {
             registry.raw_tx_items.fetch_add(1, Ordering::AcqRel);
         }
@@ -1586,6 +1829,130 @@ fn scan_block_spent_scripts(
     }
 }
 
+/// Silent-payment (Tier 2, §4) matching for a connected block: for each
+/// eligible transaction, compute the BIP 352 public tweak `T` once and scan
+/// its taproot outputs against every registered scan-key target, emitting a
+/// `SilentPaymentMatched` per matched output.
+///
+/// Like [`scan_block_spent_scripts`], this walks the block's undo data to
+/// recover each transaction's spent prevout `scriptPubKey`s — `compute_tweak`
+/// needs them to extract the contributing input pubkeys and the input hash.
+/// The `undo.spent_coins` walk is the same connect-order alignment: one `Coin`
+/// per non-coinbase input, so a running `undo_idx` tracks `tx.input`.
+///
+/// Cost is gated to zero when no target is registered (`sp_subs` empty ⇒ this
+/// is never called): per eligible tx it is one `compute_tweak` plus, per
+/// target, one ECDH and a bounded output scan.
+fn scan_block_sp(
+    inner: &Inner,
+    block: &Block,
+    height: u32,
+    undo: &UndoData,
+    wants_raw: bool,
+    sink: &mut dyn MatchSink,
+) {
+    // Resolve every watching subscriber's targets once (the `b_scan` range
+    // check happens here, not per tx). `work` holds borrows into `inner`, so
+    // the scan is allocation-light per block.
+    let mut work: Vec<(SubId, SecretKey, &SpWatchTarget)> = Vec::new();
+    for sid in &inner.sp_subs {
+        if let Some(sub) = inner.subs.get(sid) {
+            for t in sub.sp_targets.values() {
+                work.push((*sid, t.b_scan(), t));
+            }
+        }
+    }
+    if work.is_empty() {
+        return;
+    }
+
+    let mut undo_idx = 0usize;
+    for tx in &block.txdata {
+        if tx.is_coinbase() {
+            continue; // coinbase has no spent prevouts in undo (and is never eligible)
+        }
+        let n_in = tx.input.len();
+        if undo.spent_coins.len() < undo_idx + n_in {
+            // Same short-undo guard as the script path: stop rather than
+            // mis-align. Can only cause MISSED (never false) matches.
+            warn!(
+                target: "events::watch",
+                height,
+                have = undo.spent_coins.len(),
+                "resync/scan: undo shorter than non-coinbase inputs; \
+                 silent-payment matches truncated for this block"
+            );
+            return;
+        }
+        let prevout_spks: Vec<ScriptBuf> = undo.spent_coins[undo_idx..undo_idx + n_in]
+            .iter()
+            .map(|c| c.script_pubkey.clone())
+            .collect();
+        undo_idx += n_in;
+
+        // One tweak per eligible tx, shared across all targets.
+        let Some(entry) = compute_tweak(tx, &prevout_spks) else {
+            continue;
+        };
+
+        // Taproot output table: (vout, x-only key, value). Built once per tx.
+        let mut tap: Vec<(u32, XOnlyPublicKey, u64)> = Vec::new();
+        for (vout, o) in tx.output.iter().enumerate() {
+            if o.script_pubkey.is_p2tr()
+                && let Ok(xo) = XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..])
+            {
+                tap.push((vout as u32, xo, o.value.to_sat()));
+            }
+        }
+        if tap.is_empty() {
+            continue; // no taproot output can carry a silent payment (fact 1a)
+        }
+        let out_xonly: Vec<XOnlyPublicKey> = tap.iter().map(|(_, xo, _)| *xo).collect();
+        let mut raw_tx_cache: Option<Arc<[u8]>> = None;
+
+        for (sid, b_scan, target) in &work {
+            let matches = scan_outputs(
+                &entry.tweak,
+                b_scan,
+                &target.spend_pubkey,
+                &target.labels,
+                &out_xonly,
+            );
+            if matches.is_empty() {
+                continue;
+            }
+            // Back-map each matched x-only key to its (vout, amount). A `consumed`
+            // set guards the degenerate case of two identical taproot outputs.
+            let mut consumed = vec![false; tap.len()];
+            for m in matches {
+                let Some(idx) = tap
+                    .iter()
+                    .enumerate()
+                    .position(|(i, (_, xo, _))| !consumed[i] && *xo == m.output)
+                else {
+                    continue;
+                };
+                consumed[idx] = true;
+                let (vout, _, amount) = tap[idx];
+                let wm = WatchMatch::SilentPaymentMatched {
+                    scan_pubkey: target.scan_pubkey(),
+                    txid: entry.txid,
+                    vout,
+                    output_pubkey: m.output,
+                    amount,
+                    tweak: entry.tweak,
+                    k: m.k,
+                    label: m.label_m,
+                    confirmed: true,
+                    height: Some(height),
+                    raw_tx: wants_raw.then(|| raw_tx_bytes(&mut raw_tx_cache, tx)),
+                };
+                sink.emit(inner, *sid, &wm);
+            }
+        }
+    }
+}
+
 /// Whether a script match for subscriber `id` on scripthash `sh` clears that
 /// subscriber's `min_value` floor, given the matched value (the controlled
 /// coin's value: output value for funding, spent-prevout value for spending).
@@ -1708,6 +2075,20 @@ impl WatchHandle {
     pub fn remove_prefixes(&self, prefixes: &[(u8, u32)]) -> usize {
         self.registry.remove_prefixes(self.id, prefixes)
     }
+
+    /// Add silent-payment scan-key targets (Tier 2, §4); returns the count
+    /// newly added (re-asserting an existing identity replaces it in place and
+    /// is not counted). Registration itself is caller-validated
+    /// ([`SpWatchTarget::new`]); the quota/cap layer lives in the carrier.
+    pub fn add_silent_payments(&self, targets: &[SpWatchTarget]) -> usize {
+        self.registry.add_silent_payments(self.id, targets)
+    }
+
+    /// Remove silent-payment targets by 33-byte identity `b_scan·G`; returns
+    /// the count removed.
+    pub fn remove_silent_payments(&self, scan_pubkeys: &[[u8; 33]]) -> usize {
+        self.registry.remove_silent_payments(self.id, scan_pubkeys)
+    }
 }
 
 impl Drop for WatchHandle {
@@ -1788,7 +2169,10 @@ fn block_undo_for_scan(
     chain: &crate::chain::state::ChainState,
     hash: &bitcoin::BlockHash,
 ) -> Option<UndoData> {
-    if registry.has_script_watchers() || registry.has_prefix_watchers() {
+    if registry.has_script_watchers()
+        || registry.has_prefix_watchers()
+        || registry.has_sp_watchers()
+    {
         chain.get_undo(hash)
     } else {
         None
@@ -3927,5 +4311,244 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---- Silent-payment (Tier 2) matcher tests ---------------------------
+
+    /// BIP 340 tagged hash, re-implemented in the test so the expected output
+    /// key is derived independently of the kernel's private tag constants.
+    fn sp_tagged(tag: &[u8], msg: &[u8]) -> [u8; 32] {
+        use bitcoin::hashes::{Hash, HashEngine, sha256};
+        let th = sha256::Hash::hash(tag);
+        let mut e = sha256::Hash::engine();
+        e.input(th.as_ref());
+        e.input(th.as_ref());
+        e.input(msg);
+        sha256::Hash::from_engine(e).to_byte_array()
+    }
+
+    /// Raw key-path P2TR scriptPubKey (`OP_1 <32-byte x-only>`).
+    fn p2tr_spk(xonly: XOnlyPublicKey) -> ScriptBuf {
+        let mut v = Vec::with_capacity(34);
+        v.push(0x51);
+        v.push(0x20);
+        v.extend_from_slice(&xonly.serialize());
+        ScriptBuf::from(v)
+    }
+
+    fn taproot_input(op: OutPoint) -> TxIn {
+        let mut witness = Witness::new();
+        witness.push(vec![0u8; 64]); // dummy key-path signature (non-empty stack)
+        TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness,
+        }
+    }
+
+    /// Build an SP-eligible transaction paying `(b_scan, B_spend)` at output
+    /// `k = 0`, plus the undo coin for its single taproot input. Returns the
+    /// transaction, its undo, and the expected match fields.
+    #[allow(clippy::type_complexity)]
+    fn sp_payment(
+        b_scan: &SecretKey,
+        b_spend_pub: &PublicKey,
+        value: u64,
+    ) -> (Transaction, UndoData, XOnlyPublicKey, PublicKey) {
+        use bitcoin::secp256k1::Scalar;
+        let secp = Secp256k1::new();
+        // Input prevout: a key-path P2TR whose key contributes to the tweak.
+        let a_in = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+        let x_in = PublicKey::from_secret_key(&secp, &a_in).x_only_public_key().0;
+        let prevout_spk = p2tr_spk(x_in);
+        let op = outpoint(0x44, 0);
+        let input = taproot_input(op);
+
+        // Probe tx (real input + a placeholder taproot output) to derive the
+        // public tweak T; T depends only on inputs, so the output key is free.
+        let probe = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![input.clone()],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: p2tr_spk(x_in),
+            }],
+        };
+        let t = compute_tweak(&probe, std::slice::from_ref(&prevout_spk))
+            .expect("probe tx is SP-eligible")
+            .tweak;
+
+        // Receiver derivation: P_0 = B_spend + t_0·G, t_0 = H(ecdh || 0).
+        let scalar = Scalar::from_be_bytes(b_scan.secret_bytes()).unwrap();
+        let ecdh = t.mul_tweak(&secp, &scalar).unwrap();
+        let mut buf = ecdh.serialize().to_vec();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let t0 = sp_tagged(b"BIP0352/SharedSecret", &buf);
+        let t0_sk = SecretKey::from_slice(&t0).unwrap();
+        let p0 = b_spend_pub
+            .combine(&PublicKey::from_secret_key(&secp, &t0_sk))
+            .unwrap();
+        let p0_xonly = p0.x_only_public_key().0;
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![input],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: p2tr_spk(p0_xonly),
+            }],
+        };
+        let undo = UndoData {
+            spent_coins: vec![coin_with_value(prevout_spk, value)],
+        };
+        (tx, undo, p0_xonly, t)
+    }
+
+    #[test]
+    fn matches_silent_payment_in_connected_block() {
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let scan_id = PublicKey::from_secret_key(&secp, &b_scan).serialize();
+
+        let (tx, undo, p0_xonly, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
+        let txid = tx.compute_txid();
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        assert_eq!(handle.add_silent_payments(std::slice::from_ref(&target)), 1);
+        assert!(reg.has_sp_watchers());
+        assert!(reg.has_watchers(), "SP target keeps the block-scan gate hot");
+
+        let block = block_with(vec![coinbase_tx(), tx]);
+        reg.scan_block(&block, 100, Some(&undo));
+
+        match rx.try_recv().expect("a silent-payment match was delivered") {
+            WatchMatch::SilentPaymentMatched {
+                scan_pubkey,
+                txid: got_txid,
+                vout,
+                output_pubkey,
+                amount,
+                tweak: got_tweak,
+                k,
+                label,
+                confirmed,
+                height,
+                raw_tx,
+            } => {
+                assert_eq!(scan_pubkey, scan_id);
+                assert_eq!(got_txid, txid);
+                assert_eq!(vout, 0);
+                assert_eq!(output_pubkey, p0_xonly);
+                assert_eq!(amount, 12_345);
+                assert_eq!(got_tweak, tweak);
+                assert_eq!(k, 0);
+                assert_eq!(label, None);
+                assert!(confirmed);
+                assert_eq!(height, Some(100));
+                assert!(raw_tx.is_none(), "no subscriber opted into raw_tx");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one match");
+    }
+
+    #[test]
+    fn silent_payment_no_match_for_other_scan_key() {
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, _, _) = sp_payment(&b_scan, &b_spend_pub, 9_000);
+
+        // A DIFFERENT scan key must not match the payment.
+        let other_scan = SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(other_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+
+        reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 7, Some(&undo));
+        assert!(rx.try_recv().is_err(), "wrong scan key must not match");
+    }
+
+    #[test]
+    fn no_sp_scan_without_undo_or_watchers() {
+        // No SP watcher ⇒ gate cold ⇒ has_sp_watchers false.
+        let reg = Arc::new(WatchRegistry::new());
+        let (_h, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        assert!(!reg.has_sp_watchers());
+
+        // With a watcher but no undo, the SP leg cannot run (needs prevouts).
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, _undo, _, _) = sp_payment(&b_scan, &b_spend_pub, 5_000);
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_silent_payments(&[
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+        ]);
+        reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 3, None);
+        assert!(rx.try_recv().is_err(), "no undo ⇒ no SP match");
+    }
+
+    #[test]
+    fn sp_target_debug_redacts_secret() {
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![0, 3]).unwrap();
+        let dbg = format!("{target:?}");
+        assert!(dbg.contains("<redacted>"), "secret must be redacted: {dbg}");
+        assert!(
+            !dbg.contains(&hex::encode(b_scan.secret_bytes())),
+            "scan secret hex must never appear in Debug output",
+        );
+    }
+
+    #[test]
+    fn sp_target_rejects_malformed_fields() {
+        // Zero scalar is not a valid secret key.
+        assert!(matches!(
+            SpWatchTarget::new([0u8; 32], &[0x02u8; 33], vec![]),
+            Err(SpTargetError::BadScanSecret),
+        ));
+        // A 32-byte "spend pubkey" is not a valid compressed point.
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        assert!(matches!(
+            SpWatchTarget::new(b_scan.secret_bytes(), &[0x02u8; 32], vec![]),
+            Err(SpTargetError::BadSpendPubkey),
+        ));
+    }
+
+    #[test]
+    fn sp_targets_deregister_clears_gate() {
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+        assert!(reg.has_sp_watchers());
+        // Idempotent re-add is not double-counted.
+        assert_eq!(handle.add_silent_payments(std::slice::from_ref(&target)), 0);
+        // Removing the target clears the gate.
+        assert_eq!(handle.remove_silent_payments(&[target.scan_pubkey()]), 1);
+        assert!(!reg.has_sp_watchers());
+        assert!(!reg.has_watchers());
     }
 }

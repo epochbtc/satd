@@ -52,6 +52,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   or still-backfilling index is rejected in-band. New read-only JSON-RPC
   `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` serves the
   same bytes as a fallback. WS/SSE and the typed SDK helpers land later.
+- Silent payments (BIP 352): Tier 2 scan-key watch (confirmed path). A `Watch`
+  client can register scan credentials (`AddSilentPayments` /
+  `SetWatchSet.silent_payments`; up to 16/connection) and the node matches
+  BIP 352 payments server-side, emitting a `SilentPaymentMatched` per matched
+  output as blocks connect — including the public tweak `T` and output counter
+  `k` so a light client re-derives the output key offline. Matching recomputes
+  from the block + undo data (works with the index off) and does zero extra work
+  when no target is registered. Scan secrets are held in-memory per connection,
+  wrapped in a zeroize-on-drop buffer, and never persisted or logged. Mirrored on
+  the WS/SSE surface. Mempool (`confirmed = false`) matching and the typed SDK
+  helpers land later.
 
 ## Releases
 
