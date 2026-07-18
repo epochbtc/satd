@@ -90,6 +90,28 @@ replacement linkage directly. For the richer firehose with cursor replay, see
 the [Streaming Consumption API](streaming.md); `subscribemempool` is the
 lightweight JSON-RPC option.
 
+## Silent-payment block data
+
+`getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` returns the
+public BIP 352 tweak data for one block, from the tweak index
+(`-silentpaymentindex=1`, default off). It is the JSON-RPC fallback for the
+streaming `tweaks` category — the same bytes, for scripts, the
+reference-implementation differential, and integrators not yet on an SDK.
+
+*   `verbosity 0` (default) → `{ "block_hash", "height", "tweaks": ["<33-byte
+    hex>", …] }`.
+*   `verbosity 1` → each entry becomes `{ "txid", "tweak", "max_value" }`.
+*   `dust_limit` (sats, default `0`) drops entries whose largest taproot output
+    value is below the floor.
+
+Errors: `-5` for an unknown or non-active block, `-8` when the index is
+disabled, and `-1` when the block is not yet indexed at that height (the row is
+absent — a height-by-height scanner cannot proceed past a gap, but unlike BIP
+157 it cannot silently miss its own outputs either). The method is read-only. A
+light client runs one ECDH per returned tweak locally, so the scan key never
+reaches the node; for the streaming firehose with cursor replay, see the
+[Streaming Consumption API](streaming.md).
+
 ## Client-side PSBT signing (no signing RPC)
 
 By design there is **no signing RPC** — the `satd` daemon never handles private

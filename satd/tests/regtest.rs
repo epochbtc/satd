@@ -5073,6 +5073,81 @@ fn test_sp_index_from_genesis_reports_synced() {
     node.stop();
 }
 
+/// `getsilentpaymentblockdata` serves per-block tweak data over JSON-RPC:
+/// the shape at both verbosities, the dust filter, and the disabled/unknown
+/// error codes. Regtest activates taproot at height 0, so every mined block
+/// carries an (empty, coinbase-only) row.
+#[test]
+fn test_getsilentpaymentblockdata_rpc() {
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Disabled by default → -8 for any block hash.
+    let mut off = TestNode::start(&[]);
+    let best = off.rpc_call("getbestblockhash").expect("rpc");
+    let hash = best["result"].as_str().expect("blockhash").to_string();
+    let r = off
+        .rpc_call_with_params("getsilentpaymentblockdata", vec![serde_json::json!(hash)])
+        .expect("rpc");
+    assert_eq!(
+        r["error"]["code"].as_i64(),
+        Some(-8),
+        "index disabled must be -8: {}",
+        r
+    );
+    off.stop();
+
+    // Enabled: mine some blocks and serve the tip's row.
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(5), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+    let best = node.rpc_call("getbestblockhash").expect("rpc");
+    let hash = best["result"].as_str().expect("blockhash").to_string();
+
+    // verbosity 0 (default): { block_hash, height, tweaks: [...] }.
+    let r = node
+        .rpc_call_with_params(
+            "getsilentpaymentblockdata",
+            vec![serde_json::json!(hash)],
+        )
+        .expect("rpc");
+    let res = &r["result"];
+    assert_eq!(res["block_hash"].as_str(), Some(hash.as_str()), "echoes hash: {}", r);
+    assert_eq!(res["height"].as_u64(), Some(5), "tip height: {}", r);
+    assert!(res["tweaks"].is_array(), "tweaks is an array: {}", r);
+    // A coinbase-only block has no eligible transactions.
+    assert_eq!(
+        res["tweaks"].as_array().map(|a| a.len()),
+        Some(0),
+        "coinbase-only block has no tweak entries: {}",
+        r
+    );
+
+    // verbosity 1: still a (here empty) array, distinct shape when populated.
+    let r1 = node
+        .rpc_call_with_params(
+            "getsilentpaymentblockdata",
+            vec![serde_json::json!(hash), serde_json::json!(1)],
+        )
+        .expect("rpc");
+    assert!(r1["result"]["tweaks"].is_array(), "verbosity 1 tweaks array: {}", r1);
+
+    // Unknown block hash → -5.
+    let unknown = "00".repeat(32);
+    let r5 = node
+        .rpc_call_with_params(
+            "getsilentpaymentblockdata",
+            vec![serde_json::json!(unknown)],
+        )
+        .expect("rpc");
+    assert_eq!(r5["error"]["code"].as_i64(), Some(-5), "unknown block → -5: {}", r5);
+
+    node.stop();
+}
+
 /// The core PR-3 acceptance path: enable the SP index on an existing
 /// datadir that was synced with it OFF. The index reports NOT synced
 /// (holes below the tip), `backfillindex silentpayment` walks the range,

@@ -701,9 +701,10 @@ watch-set path.) SDK: `ResilientWatch::rescan(from, to)` — the ack, matches, a
 ### 7.7 Silent-payment (BIP 352) subscriptions
 
 Two consumption modes for BIP 352 silent payments ride on the streaming surface.
-Both require the node's tweak index (`silentpaymentindex=1`). **This section
-documents the wire schema; the live emit, index-backed replay, server-side
-matcher, and SDK helpers land in later changes.** The messages are additive —
+Both require the node's tweak index (`silentpaymentindex=1`). **Tier 1
+(client-side scan) is live: the node emits `BlockTweaks` per connected block and
+replays them by index on `from_cursor` resume. The Tier 2 server-side matcher
+and the typed SDK helpers land in later changes.** The messages are additive —
 existing subscribers are unaffected, and the schema version does not bump (§4).
 
 **Tier 1 — client-side scan (the recommended, zero-custody mode).** A new
@@ -733,12 +734,42 @@ message TweakEntry {
 ```
 
 Tweak data is public chain-derived data (same posture as `getblockfilter`), so it
-serves under the existing `stream:subscribe` capability. Replay for a tweaks-only
-subscription is index-backed point lookups and — because each row embeds the hash
-of the block it describes — is exempt from the `MAX_REPLAY_BLOCKS` clamp (a phone
-cold-syncs from taproot activation in one subscription); a mixed-category
-subscription keeps the clamp. A cursor pointing into a not-yet-backfilled range is
-rejected in-band (`CursorRejected`).
+serves under the existing `stream:subscribe` capability.
+
+- **Live.** On each connected block ≥ taproot activation, the node emits one
+  `BlockTweaks` (after that block's `BlockConnected`, at the same durable
+  cursor) built from the just-committed `sp_tweaks` row — but only while at
+  least one tweak subscriber is attached, so a node with the index on but no
+  tweak consumers pays nothing on the bus. The event carries the block's own
+  hash, so a client that scanned a stale block detects the reorg from the
+  `(block_hash, height)` it already holds and re-anchors like any consumer.
+- **Replay.** `from_cursor` replay for a tweaks-only subscription is
+  index-backed point lookups and — because each row embeds the hash of the
+  block it describes — is exempt from the `MAX_REPLAY_BLOCKS` clamp (a phone
+  cold-syncs from taproot activation in one subscription). A **mixed-category**
+  subscription keeps the clamp for every category; interleaving an unclamped
+  tweak replay with clamped chain events would break cursor ordering (§10).
+- **Filters.** `tweak_dust_limit` drops entries whose `max_value` is below the
+  floor and sets `filtered = true`; `tweaks_only` strips `txid`/`max_value`,
+  leaving the 33-byte tweak alone. Both apply per subscription, on live and
+  replayed events alike.
+- **In-band rejects.** A `tweaks` subscription against a node with
+  `silentpaymentindex=0` is refused with `FAILED_PRECONDITION`; a `from_cursor`
+  (replay) request while the index is still backfilling is likewise refused,
+  because serving a clamped window would let a light client silently miss
+  payments below the backfill frontier.
+
+The **WS/SSE** firehose does not serve the tweaks category in this release; use
+the gRPC `Subscribe` stream (or the JSON-RPC fallback below).
+
+**JSON-RPC fallback.** `getsilentpaymentblockdata "blockhash" ( verbosity
+dust_limit )` serves the same per-block tweak data for scripts, the
+reference-implementation differential, and integrators not yet on an SDK.
+`verbosity 0` (default) returns `{ block_hash, height, tweaks: ["<33B hex>", …] }`;
+`verbosity 1` returns each entry as `{ txid, tweak, max_value }`. `dust_limit`
+(sats) filters on stored max-values. Errors: `-5` unknown/non-active block, `-8`
+disabled index, `-1` not yet indexed at that height (row absent). It is a
+read-only method (served by a read-only listener).
 
 **Tier 2 — scan-key watch (the convenience mode).** A constrained client may
 instead register a scan credential and let the node match server-side, receiving
@@ -852,6 +883,18 @@ not compromise that. These are structural guarantees, not policies:
   watcher counts; atomics), off the consensus hot path.
 - **Listeners run on the API runtime only** (§3.1), never the core block-connecting
   runtime.
+- **The tweak deep-replay exemption is bounded by two structural facts, not a
+  policy knob.** The tweaks-only replay (§7.7) waives the `MAX_REPLAY_BLOCKS`
+  clamp only because (1) each served `sp_tweaks` row embeds the hash of the
+  block it describes, committed in the *same atomic batch* as the chainstate —
+  so a served row is self-authenticating and a mid-read reorg surfaces as a
+  hash mismatch, never as silently stale data — and (2) the exemption is gated
+  on `sp_index.complete`, so a partial index is never served as authoritative
+  (a replay request against an incomplete index is refused in-band). A
+  mixed-category subscription keeps the clamp for *all* categories: interleaving
+  an unclamped tweak replay with a clamped chain replay would emit
+  non-monotonic cursors, breaking the resume contract. These are the only
+  conditions under which the clamp is waived.
 
 ## 11. Descriptor convenience layer
 

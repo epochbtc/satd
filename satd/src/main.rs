@@ -1029,9 +1029,21 @@ async fn main() {
     );
     let event_publisher =
         node::events::EventPublisher::new(edge_identity, node::events::ENVELOPE_BROADCAST_CAPACITY);
-    event_publisher.spawn_bridges(
+    // Silent-payment tweak index read handle, wired only when
+    // `silentpaymentindex=1`. `None` ⇒ the index is off: the chain bridge emits
+    // no `BlockTweaks`, and the gRPC carrier rejects a `tweaks`-category
+    // subscription in-band. ChainState implements the read trait over the same
+    // durable rows the connect path commits atomically with the chainstate.
+    let sp_tweak_source: Option<std::sync::Arc<dyn node::index::silent_payments::SpIndex>> =
+        if chain_state.silent_payment_index_enabled() {
+            Some(chain_state.clone() as std::sync::Arc<dyn node::index::silent_payments::SpIndex>)
+        } else {
+            None
+        };
+    event_publisher.spawn_bridges_with_sp(
         events_bus_mempool_rx,
         events_bus_chain_rx,
+        sp_tweak_source.clone(),
         shutdown_rx.clone(),
     );
     event_publisher.spawn_heartbeat(
@@ -1107,6 +1119,12 @@ async fn main() {
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockScanSource>),
             // Live watch registry backing the bidirectional `Watch` RPC.
             Some(watch_registry.clone()),
+            // Silent-payment tweak index read handle for the `tweaks` firehose
+            // category (Tier 1): index-backed cursor replay + the completeness
+            // gate for the deep-replay exemption. `None` when the index is off,
+            // which the carrier reports as an in-band rejection of any
+            // `tweaks`-category subscription.
+            sp_tweak_source.clone(),
             // In-process TLS / mTLS termination when a cert+key are configured.
             // `Config::load` already validated that the cert and key are set
             // together and that mTLS implies a client CA, so a present cert is

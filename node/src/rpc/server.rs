@@ -785,6 +785,25 @@ pub async fn start(
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    // JSON-RPC fallback for the streaming `tweaks` category: serves the same
+    // per-block BIP 352 tweak data the firehose does. Not feature-gated — the
+    // silent-payment index is always compiled (runtime `silentpaymentindex=1`).
+    module.register_method("getsilentpaymentblockdata", |params, ctx, _extensions| {
+        // `getsilentpaymentblockdata <blockhash> [verbosity] [dust_limit]`.
+        let mut seq = params.sequence();
+        let block_hash: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        let verbosity: Option<u32> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        let dust_limit: Option<u64> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        indexes::get_silent_payment_block_data(&ctx.chain_state, &block_hash, verbosity, dust_limit)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("getindexinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
             ctx.backfill.as_ref(),

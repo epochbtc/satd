@@ -26,9 +26,11 @@ pub mod sink;
 pub mod watch;
 
 pub use envelope::{
-    Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody, SetCursorOutcome,
+    BlockTweaks, Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody,
+    SetCursorOutcome, SpTweakEntry, ALL_CATEGORIES_DEFAULT, CATEGORY_CHAIN, CATEGORY_HEARTBEAT,
+    CATEGORY_MEMPOOL, CATEGORY_TWEAKS, EXPLICIT_ONLY_CATEGORIES,
 };
-pub use publisher::{EventPublisher, ENVELOPE_BROADCAST_CAPACITY};
+pub use publisher::{EventPublisher, TweakSubscriberGuard, ENVELOPE_BROADCAST_CAPACITY};
 pub use replay::{
     build_cursor_replay, cursor_accepted_event, cursor_rejected_event, lagged_event, plan_rescan,
     BlockCursorSource, BlockScanSource, CursorReplay, RescanPlan, RescanRejectReason,

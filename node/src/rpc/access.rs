@@ -116,6 +116,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getreorghistory"
         | "getrpcinfo"
         | "getserverstatus"
+        | "getsilentpaymentblockdata"
         | "getsysteminfo"
         | "gettxout"
         | "gettxoutsetinfo"
@@ -277,6 +278,7 @@ mod tests {
             "testmempoolaccept",
             "waitfornewblock",
             "subscribemempool",
+            "getsilentpaymentblockdata",
         ] {
             assert_eq!(classify(m), Some(RpcAccess::Read), "{m}");
             assert!(readonly_listener_allows(m), "{m} must be allowed");

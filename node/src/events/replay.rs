@@ -247,27 +247,51 @@ pub struct CursorReplay {
 ///   daemon restarted since the cursor was issued) the stale watermark is
 ///   discarded and the full retained window is replayed.
 ///
-/// `category_mask` follows the wire convention (mempool=1, chain=2); pass
-/// `u32::MAX` for "all".
+/// `category_mask` follows the wire convention (mempool=1, chain=2, tweaks=8);
+/// pass [`ALL_CATEGORIES_DEFAULT`](super::ALL_CATEGORIES_DEFAULT) for "all".
+///
+/// `tweak_source` is the silent-payment index read handle, consulted only when
+/// the `tweaks` bit is set. A **tweaks-only** subscription (`category_mask ==
+/// tweaks`) against a complete index is exempt from the `max_blocks` clamp —
+/// each `sp_tweaks` row embeds the hash of the block it describes (§3.2), so a
+/// phone can cold-sync from taproot activation in one subscription without a
+/// height→hash lookup. A **mixed** subscription keeps the clamp for every
+/// category, so tweak and chain replay stay cursor-ordered. Callers that will
+/// not serve tweaks (or reject before replay when the index is incomplete)
+/// pass `None`.
 pub fn build_cursor_replay(
     src: &dyn BlockCursorSource,
     publisher: &EventPublisher,
     from: Cursor,
     category_mask: u32,
     max_blocks: u32,
+    tweak_source: Option<&dyn node_sp_index::SpIndex>,
 ) -> CursorReplay {
+    use super::{CATEGORY_CHAIN, CATEGORY_TWEAKS};
+
     let snapshot_tip = src.current_tip_height();
-    let chain_on = category_mask & 2 != 0;
+    let chain_on = category_mask & CATEGORY_CHAIN != 0;
+    let tweaks_on = category_mask & CATEGORY_TWEAKS != 0;
+    // The tweak read handle is only relevant when the bit is set.
+    let sp = tweak_source.filter(|_| tweaks_on);
+    // Deep-replay exemption: a tweaks-ONLY subscription against a complete
+    // index replays unclamped from the requested cursor. A partial index is
+    // never treated as authoritative (the carrier rejects a replay request in
+    // that state before calling us), so we still gate on `is_complete()`.
+    let tweaks_only_sub = category_mask == CATEGORY_TWEAKS;
+    let deep_exempt = tweaks_only_sub && sp.map(|s| s.is_complete()).unwrap_or(false);
+
     let requested_start = from.height.saturating_add(1);
     let mut start = requested_start;
     // Bound the confirmed replay span. A cursor far behind the tip would
     // otherwise stream the entire chain (a DoS amplification) and build an
     // unbounded boundary-dedup map. Replayed events carry their height cursor,
     // so a client can detect the resulting gap and full-resync the rest.
-    // Only meaningful when chain history is actually being replayed: with the
-    // chain category masked off no confirmed blocks are emitted, so the span is
-    // not clamped and `earliest_replayed`/`clamped` report "nothing skipped".
-    if chain_on && snapshot_tip >= start && snapshot_tip - start + 1 > max_blocks {
+    // Only meaningful when confirmed history is actually being replayed (chain
+    // and/or tweaks). The tweaks-only deep-replay exemption skips the clamp;
+    // every other case (chain, or mixed chain+tweaks) keeps it.
+    let clampable = (chain_on || tweaks_on) && !deep_exempt;
+    if clampable && snapshot_tip >= start && snapshot_tip - start + 1 > max_blocks {
         let clamped = snapshot_tip - max_blocks + 1;
         tracing::warn!(
             target: "events::replay",
@@ -283,10 +307,32 @@ pub fn build_cursor_replay(
 
     let mut events: Vec<NodeEvent> = Vec::new();
     let mut confirmed_dedup: HashMap<u32, BlockHash> = HashMap::new();
-    if chain_on && start <= snapshot_tip {
+    if deep_exempt && start <= snapshot_tip {
+        // Unclamped tweaks-only cold-sync: read rows by height. Each row is
+        // self-authenticating (carries its own block hash), so no
+        // `active_chain_range` height→hash pass is needed. Below taproot
+        // activation the index has no row — `NotFound` is skipped, not an error.
+        let sp = sp.expect("deep_exempt implies a tweak source");
+        for h in start..=snapshot_tip {
+            if let Ok(row) = sp.tweaks_at(h) {
+                events.push(synth_block_tweaks(publisher, h, row));
+            }
+        }
+    } else if (chain_on || tweaks_on) && start <= snapshot_tip {
+        // Clamped window: walk the active chain once, interleaving each
+        // height's BlockConnected (if requested) and its BlockTweaks (if
+        // requested) so cursors stay monotonic across a mixed subscription.
         for (h, hash) in src.active_chain_range(start, snapshot_tip) {
-            confirmed_dedup.insert(h, hash);
-            events.push(synth_block_connected(publisher, h, hash));
+            if chain_on {
+                confirmed_dedup.insert(h, hash);
+                events.push(synth_block_connected(publisher, h, hash));
+            }
+            if let Some(sp) = sp
+                && let Ok(row) = sp.tweaks_at(h)
+                && row.block_hash == hash
+            {
+                events.push(synth_block_tweaks(publisher, h, row));
+            }
         }
     }
 
@@ -335,6 +381,29 @@ fn synth_block_connected(publisher: &EventPublisher, height: u32, hash: BlockHas
         synth_stamp(publisher),
         Some(cursor),
         NodeEventBody::Chain(ChainEvent::BlockConnected { hash, height }),
+    )
+}
+
+/// Synthesize a confirmed `BlockTweaks` replay event for `height` from an
+/// `sp_tweaks` row. Positioned by the same durable `(height, tx_index=0)`
+/// cursor as the confirmed chain replay, so a tweaks subscriber can resume
+/// mid-sync. The row embeds the block hash it describes, so the event is
+/// self-authenticating with no height→hash lookup.
+fn synth_block_tweaks(
+    publisher: &EventPublisher,
+    height: u32,
+    row: node_sp_index::SpBlockRow,
+) -> NodeEvent {
+    let cursor = Cursor {
+        height,
+        tx_index: 0,
+        mempool_seq: 0,
+        instance_id: publisher.instance_id(),
+    };
+    NodeEvent::with_cursor(
+        synth_stamp(publisher),
+        Some(cursor),
+        NodeEventBody::BlockTweaks(super::BlockTweaks::from_row(height, &row)),
     )
 }
 
@@ -422,7 +491,7 @@ fn now_wall_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EdgeIdentity;
+    use crate::events::{CATEGORY_CHAIN, CATEGORY_TWEAKS, EdgeIdentity};
     use bitcoin::hashes::Hash;
 
     /// A `BlockCursorSource` with a flat synthetic active chain `[1, tip]`.
@@ -526,7 +595,7 @@ mod tests {
         let src = FlatChain { tip: 5 };
         let pubr = publisher();
         // chain-only mask (2); from height 2 ⇒ replay 3,4,5.
-        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, MAX_REPLAY_BLOCKS);
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, MAX_REPLAY_BLOCKS, None);
         assert!(!r.clamped);
         assert_eq!(r.earliest_replayed, 3, "earliest = from.height + 1");
         assert_eq!(r.events.len(), 3);
@@ -538,7 +607,7 @@ mod tests {
         let pubr = publisher();
         // max_blocks = 10; from height 2 would need 98 blocks ⇒ clamp the lower
         // end to tip - max_blocks + 1 = 91.
-        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, 10);
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 2, 10, None);
         assert!(r.clamped, "an over-window span is reported as clamped");
         assert_eq!(r.earliest_replayed, 91);
         assert_eq!(r.events.len(), 10, "exactly max_blocks replayed");
@@ -549,7 +618,7 @@ mod tests {
         let src = FlatChain { tip: 5 };
         let pubr = publisher();
         // from the tip ⇒ nothing to replay, earliest = from.height + 1, no clamp.
-        let r = build_cursor_replay(&src, &pubr, cursor(5), 2, MAX_REPLAY_BLOCKS);
+        let r = build_cursor_replay(&src, &pubr, cursor(5), 2, MAX_REPLAY_BLOCKS, None);
         assert!(!r.clamped);
         assert_eq!(r.earliest_replayed, 6);
         assert!(r.events.is_empty());
@@ -562,12 +631,119 @@ mod tests {
         // Ancient cursor that WOULD clamp if chain were on, but the chain
         // category bit (2) is masked off (mask = 1, mempool only). No confirmed
         // blocks replay, so the report must be "nothing skipped".
-        let r = build_cursor_replay(&src, &pubr, cursor(2), 1, 10);
+        let r = build_cursor_replay(&src, &pubr, cursor(2), 1, 10, None);
         assert!(!r.clamped, "no clamp reported when chain replay is masked off");
         assert_eq!(r.earliest_replayed, 3, "earliest = from.height + 1");
         assert!(
             r.events.is_empty(),
             "no confirmed blocks emitted with chain masked off"
         );
+    }
+
+    /// A mock tweak index over `[activation, tip]`. Rows carry the same
+    /// synthetic block hash `FlatChain` uses (`[height; 32]`), so the mixed
+    /// (`active_chain_range`) path's hash-match guard accepts them.
+    struct MockSp {
+        complete: bool,
+        activation: u32,
+        tip: u32,
+    }
+
+    impl node_sp_index::SpIndex for MockSp {
+        fn tweaks_at(
+            &self,
+            height: u32,
+        ) -> Result<node_sp_index::SpBlockRow, node_sp_index::SpIndexError> {
+            if height < self.activation || height > self.tip {
+                return Err(node_sp_index::SpIndexError::NotFound(height));
+            }
+            Ok(node_sp_index::SpBlockRow {
+                block_hash: BlockHash::from_byte_array([height as u8; 32]),
+                entries: vec![],
+            })
+        }
+        fn is_complete(&self) -> bool {
+            self.complete
+        }
+    }
+
+    fn tweaks_count(r: &CursorReplay) -> usize {
+        r.events
+            .iter()
+            .filter(|e| matches!(e.body, NodeEventBody::BlockTweaks(_)))
+            .count()
+    }
+
+    #[test]
+    fn tweaks_only_replay_is_unclamped_when_index_complete() {
+        // tweaks-only mask (8), complete index, cursor far behind the tip: the
+        // deep-replay exemption waives the clamp and replays every block.
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10, Some(&sp));
+        assert!(!r.clamped, "tweaks-only + complete index is exempt from the clamp");
+        assert_eq!(r.earliest_replayed, 1);
+        assert_eq!(tweaks_count(&r), 50, "all 50 blocks replayed unclamped");
+        // No chain events on a tweaks-only subscription.
+        assert!(r.events.iter().all(|e| matches!(e.body, NodeEventBody::BlockTweaks(_))));
+    }
+
+    #[test]
+    fn tweaks_only_replay_clamps_when_index_incomplete() {
+        // Without completeness the exemption does not apply, so the shared
+        // builder falls back to the clamp (the carrier additionally rejects
+        // such a replay in-band, but the builder itself must stay bounded).
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: false, activation: 1, tip: 50 };
+        let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10, Some(&sp));
+        assert!(r.clamped, "incomplete index → clamped, not exempt");
+        assert_eq!(tweaks_count(&r), 10, "clamped to the most recent max_blocks");
+    }
+
+    #[test]
+    fn mixed_replay_keeps_clamp_and_interleaves() {
+        // chain|tweaks (2|8): a mixed subscription keeps the clamp for both, and
+        // per-height ordering is BlockConnected then BlockTweaks so cursors stay
+        // monotonic.
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
+        let r = build_cursor_replay(&src, &pubr, cursor(0), mask, 10, Some(&sp));
+        assert!(r.clamped, "mixed subscription keeps the clamp");
+        assert_eq!(tweaks_count(&r), 10);
+        assert_eq!(r.events.len(), 20, "10 chain + 10 tweak events");
+        // First clamped height is 41; its chain event precedes its tweak event.
+        assert!(matches!(
+            r.events[0].body,
+            NodeEventBody::Chain(ChainEvent::BlockConnected { height: 41, .. })
+        ));
+        assert!(matches!(&r.events[1].body, NodeEventBody::BlockTweaks(bt) if bt.height == 41));
+        // Cursors are non-decreasing in height across the interleave.
+        let heights: Vec<u32> = r.events.iter().filter_map(|e| e.cursor.map(|c| c.height)).collect();
+        assert!(heights.windows(2).all(|w| w[0] <= w[1]), "cursor heights monotonic");
+    }
+
+    #[test]
+    fn tweaks_replay_skips_below_activation() {
+        // Heights below taproot activation have no row; they are skipped, not
+        // errored, so the replay starts cleanly at activation.
+        let src = FlatChain { tip: 30 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 20, tip: 30 };
+        let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
+        assert_eq!(tweaks_count(&r), 11, "only heights 20..=30 have rows");
+    }
+
+    #[test]
+    fn tweaks_source_ignored_when_bit_not_set() {
+        // A chain-only subscription never consults the tweak source.
+        let src = FlatChain { tip: 5 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 5 };
+        let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_CHAIN, 10_000, Some(&sp));
+        assert_eq!(tweaks_count(&r), 0, "no tweak events without the tweaks bit");
     }
 }

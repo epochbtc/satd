@@ -358,7 +358,16 @@ fn build_replay(
         );
         return (Vec::new(), ReplayDedup::default());
     };
-    let r = build_cursor_replay(src.as_ref(), &state.publisher, cursor, mask, MAX_REPLAY_BLOCKS);
+    // The WS/SSE firehose does not serve the tweaks category (a gRPC-only
+    // surface in this release), so it passes no tweak source.
+    let r = build_cursor_replay(
+        src.as_ref(),
+        &state.publisher,
+        cursor,
+        mask,
+        MAX_REPLAY_BLOCKS,
+        None,
+    );
     let dedup = ReplayDedup {
         confirmed: Some(Arc::new(r.confirmed_dedup)),
         mempool_through: Some(r.mempool_dedup_through),

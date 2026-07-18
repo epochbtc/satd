@@ -41,6 +41,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   a `SilentPaymentMatched` body. Additive — the schema version does not bump and
   existing subscribers are unaffected. Emit, serving, and matching land in
   later changes; this is the schema pass both SDKs build on.
+- Silent payments (BIP 352): Tier 1 serving. The node now emits a `BlockTweaks`
+  event per connected block on the gRPC `Subscribe` firehose (only while a
+  `tweaks` subscriber is attached) and replays it by index on `from_cursor`
+  resume — a tweaks-only subscription cold-syncs from taproot activation in one
+  subscription, exempt from the replay clamp because rows are self-authenticating
+  and the exemption is gated on index completeness; a mixed-category subscription
+  keeps the clamp. Per-subscription `tweak_dust_limit`/`tweaks_only` filters
+  apply on live and replayed events. A `tweaks` subscription against a disabled
+  or still-backfilling index is rejected in-band. New read-only JSON-RPC
+  `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` serves the
+  same bytes as a fallback. WS/SSE and the typed SDK helpers land later.
 
 ## Releases
 

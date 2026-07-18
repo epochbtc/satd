@@ -2309,6 +2309,11 @@ impl ChainState {
         &self.store
     }
 
+    /// Whether the silent-payment tweak index is enabled for this instance.
+    pub fn silent_payment_index_enabled(&self) -> bool {
+        self.sp_index.enabled
+    }
+
     /// Switch the coin-cache / backing-store write mode. Use `BulkLoad`
     /// during IBD to disable the WAL on RocksDB writes (major I/O win);
     /// the caller must invoke `flush_durable` periodically so crash-
@@ -5066,6 +5071,25 @@ impl ChainState {
             .get_block_index(hash)
             .map(|e| e.status == BlockStatus::Pruned)
             .unwrap_or(false)
+    }
+}
+
+/// Read-side surface for the silent-payment tweak index (the
+/// `getsilentpaymentblockdata` RPC, the streaming `tweaks` category replay,
+/// and the D4 rescan fast path). Backed by the same durable rows the connect
+/// path commits atomically with the chainstate.
+impl node_sp_index::SpIndex for ChainState {
+    fn tweaks_at(&self, height: u32) -> Result<node_sp_index::SpBlockRow, node_sp_index::SpIndexError> {
+        if !self.sp_index.enabled {
+            return Err(node_sp_index::SpIndexError::Disabled);
+        }
+        self.store
+            .get_sp_tweaks_row(height)
+            .ok_or(node_sp_index::SpIndexError::NotFound(height))
+    }
+
+    fn is_complete(&self) -> bool {
+        self.sp_index.enabled && self.store.silent_payment_index_complete()
     }
 }
 

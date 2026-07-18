@@ -1031,3 +1031,107 @@ fn map_filter_index_err(e: node_filter_index::IndexError) -> (i32, String) {
         IndexError::Storage(s) => (-1, format!("filter storage error: {s}")),
     }
 }
+
+/// `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` — the
+/// JSON-RPC fallback for the streaming `tweaks` category. Serves the same
+/// per-block BIP 352 tweak data the firehose does (§3.5), so scripts, the
+/// reference-implementation differential, and integrators not yet on an SDK
+/// can scan without a stream.
+///
+/// - `verbosity 0` (default): `{ block_hash, height, tweaks: ["<33B hex>", …] }`.
+/// - `verbosity 1`: `tweaks` entries become `{ txid, tweak, max_value }`.
+/// - `dust_limit` (sats, default 0) drops entries whose stored max taproot
+///   output value is below the floor, on either verbosity.
+///
+/// Errors (per the design's serving-gate contract):
+/// - `-5` (`RPC_INVALID_ADDRESS_OR_KEY`): unknown or non-active block.
+/// - `-8` (`RPC_INVALID_PARAMETER`): the index is disabled, or `verbosity` is
+///   out of range.
+/// - `-1` (`RPC_MISC_ERROR`): the block is not yet indexed at that height (row
+///   absent — the height-by-height scanner cannot proceed past a missing row,
+///   but unlike BIP 157 it cannot silently miss its own outputs either).
+pub fn get_silent_payment_block_data(
+    chain: &Arc<ChainState>,
+    block_hash_hex: &str,
+    verbosity: Option<u32>,
+    dust_limit: Option<u64>,
+) -> Result<Value, (i32, String)> {
+    use bitcoin::BlockHash;
+    use bitcoin::hashes::hex::FromHex;
+    use node_sp_index::{SpIndex, SpIndexError};
+
+    let verbosity = verbosity.unwrap_or(0);
+    if verbosity > 1 {
+        return Err((-8, format!("verbosity must be 0 or 1, got {verbosity}")));
+    }
+    let dust_limit = dust_limit.unwrap_or(0);
+
+    let raw = <[u8; 32]>::from_hex(block_hash_hex)
+        .map_err(|e| (-5, format!("blockhash must be hex of length 64: {e}")))?;
+    // The user typed the display (reversed) form; `from_byte_array` wants
+    // consensus byte order. Reverse before constructing the hash.
+    let mut consensus = raw;
+    consensus.reverse();
+    let block_hash =
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(consensus));
+
+    let entry = chain
+        .get_block_index(&block_hash)
+        .ok_or_else(|| (-5, "block not found".to_string()))?;
+    let height = entry.height;
+
+    // Active-chain check: the tweak index is height-keyed, so a stale/fork/
+    // header-only hash must not resolve to the active block's row.
+    match chain.get_block_hash_by_height(height) {
+        Some(active) if active == block_hash => {}
+        _ => {
+            return Err((-5, "tweak data not found for non-active block".to_string()));
+        }
+    }
+
+    let row = chain.tweaks_at(height).map_err(|e| match e {
+        SpIndexError::Disabled => (-8, "silent payment index is disabled".to_string()),
+        SpIndexError::Incomplete => (
+            -1,
+            "silent payment index is not synced to this height yet".to_string(),
+        ),
+        SpIndexError::NotFound(h) => (
+            -1,
+            format!("silent payment tweak data not yet indexed at height {h}"),
+        ),
+        SpIndexError::Storage(s) => (-1, format!("silent payment index storage error: {s}")),
+    })?;
+
+    // The row is self-authenticating (§3.2): confirm it describes the block we
+    // resolved, guarding against a concurrent reorg between the height lookup
+    // and the index read.
+    if row.block_hash != block_hash {
+        return Err((
+            -5,
+            "tweak data not found: concurrent reorg displaced the requested block".to_string(),
+        ));
+    }
+
+    let mut tweaks: Vec<Value> = Vec::with_capacity(row.entries.len());
+    for e in &row.entries {
+        if dust_limit != 0 && e.max_taproot_value.to_sat() < dust_limit {
+            continue;
+        }
+        let tweak_hex = hex::encode(e.tweak.serialize());
+        if verbosity == 0 {
+            tweaks.push(json!(tweak_hex));
+        } else {
+            tweaks.push(json!({
+                "txid": e.txid.to_string(),
+                "tweak": tweak_hex,
+                "max_value": e.max_taproot_value.to_sat(),
+            }));
+        }
+    }
+
+    Ok(json!({
+        "block_hash": block_hash.to_string(),
+        "height": height,
+        "tweaks": tweaks,
+    }))
+}
