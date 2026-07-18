@@ -319,6 +319,13 @@ impl CoinCache {
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
             || !batch.chain_tx_puts.is_empty()
+            // Silent-payment tweak rows ride the chainstate batch. They only
+            // ever enter `pending` alongside a connect/disconnect (which set
+            // block_index/tip), so today this is redundant — but guarding it
+            // here means a future path that buffers SP rows without a
+            // co-occurring block-index/tip write can't silently drop them.
+            || !batch.sp_tweak_puts.is_empty()
+            || !batch.sp_tweak_removes.is_empty()
             || has_filter_rows;
 
         if has_data {
