@@ -50,14 +50,17 @@ pub struct SubscribeOptions {
 
 impl SubscribeOptions {
     fn into_request(self) -> pb::SubscribeRequest {
+        // `..Default::default()` (not an explicit field list) so this compiles
+        // against both the released `satd-events-proto` this crate is pinned to
+        // and the newer in-workspace schema: fields added later (e.g. the BIP 352
+        // `tweak_dust_limit` / `tweaks_only` knobs) default to the pre-existing
+        // behavior without being named here. A typed builder lands once the proto
+        // is released and the pin advances (PR 8).
         pb::SubscribeRequest {
             categories: self.categories,
             since_seq: self.since_seq,
             from_cursor: self.from_cursor,
-            // BIP 352 tweak knobs (§3.5): the typed builder for these lands with
-            // the SP SDK helpers (PR 8). Default to the pre-existing behavior.
-            tweak_dust_limit: None,
-            tweaks_only: None,
+            ..Default::default()
         }
     }
 }

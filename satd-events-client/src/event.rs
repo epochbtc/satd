@@ -614,12 +614,15 @@ impl From<pb::NodeEvent> for Event {
                 to_height: c.to_height,
                 matches: c.matches,
             },
-            // BIP 352 (§3.5/§4): the wire schema is allocated (PR 4), but the
-            // typed `Event::BlockTweaks` / `Event::SilentPaymentMatched` variants
-            // and their decoding land with the SP SDK helpers (PR 8). Until then
-            // these surface as Unknown rather than being silently dropped by a
-            // catch-all — the match stays exhaustive so PR 8 is forced to wire them.
-            Body::BlockTweaks(_) | Body::SilentPaymentMatched(_) => Event::Unknown,
+            // Forward-compatible catch-all. This crate is published to crates.io
+            // and version-pinned to the *released* `satd-events-proto`, so it must
+            // compile against both that (older) schema and the newer in-workspace
+            // one. A `_` arm lets a newer proto's bodies (e.g. the BIP 352
+            // `BlockTweaks` / `SilentPaymentMatched` allocated in the SP schema
+            // pass) map to `Unknown` without referencing symbols the released
+            // proto lacks. Typed decoding for those lands once the proto is
+            // released and the pin advances (PR 8).
+            _ => Event::Unknown,
         }
     }
 }

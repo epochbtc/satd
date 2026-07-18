@@ -317,10 +317,12 @@ impl WatchSetMirror {
                 .iter()
                 .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
                 .collect(),
-            // BIP 352 scan-key targets (§4): ResilientWatch does not yet track
-            // SP targets in its net set — that reconciliation lands with the SP
-            // SDK helpers (PR 8). Empty until then.
-            silent_payments: Vec::new(),
+            // `..Default::default()` for the same reason as SubscribeRequest in
+            // client.rs: this published crate must compile against both the pinned
+            // released proto and the newer in-workspace schema. Fields added later
+            // (e.g. the BIP 352 `silent_payments` targets) default to empty here;
+            // ResilientWatch begins tracking SP targets in its net set in PR 8.
+            ..Default::default()
         }
     }
 
