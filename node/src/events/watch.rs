@@ -37,7 +37,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 use node_index::keys::{scripthash_of, Scripthash};
-use node_sp_index::{compute_tweak, scan_outputs};
+use node_sp_index::{TweakEntry, compute_tweak, scan_outputs};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::{EvictReason, MempoolEvent};
@@ -1022,6 +1022,31 @@ impl WatchRegistry {
         height: u32,
         undo: Option<&UndoData>,
     ) -> Vec<WatchMatch> {
+        self.scan_block_collect_accel(block, height, undo, None)
+    }
+
+    /// [`scan_block_collect`](Self::scan_block_collect) with the optional D4
+    /// silent-payment fast path. When `sp_tweaks` is `Some`, the SP leg reads the
+    /// tweaks straight from that (already block-hash-verified) `sp_tweaks` index
+    /// row via [`scan_block_sp_from_tweaks`], skipping the undo read and per-tx
+    /// `compute_tweak` the recompute path ([`scan_block_sp`]) does. When it is
+    /// `None`, the SP leg recomputes from `undo` exactly as the live path — so
+    /// the two are result-identical (the acceleration differential test asserts
+    /// it) and the caller may pass `None` whenever the index is disabled,
+    /// incomplete, or the row is absent / hash-mismatched for this block.
+    ///
+    /// The non-SP legs (outpoint / funding-script / txid, and input-side
+    /// script/prefix from `undo`) are unaffected by the fast path: they still run
+    /// exactly as in `scan_block_collect`. The rescan loop therefore only reads
+    /// `undo` when a script/prefix watch needs it *or* the SP leg is on the
+    /// recompute path.
+    pub fn scan_block_collect_accel(
+        &self,
+        block: &Block,
+        height: u32,
+        undo: Option<&UndoData>,
+        sp_tweaks: Option<&[TweakEntry]>,
+    ) -> Vec<WatchMatch> {
         let mut sink = CollectSink { out: Vec::new() };
         if !self.has_watchers() {
             return sink.out;
@@ -1036,10 +1061,20 @@ impl WatchRegistry {
         {
             scan_block_spent_scripts(&inner, block, height, undo, wants_raw, &mut sink);
         }
-        if let Some(undo) = undo
-            && !inner.sp_subs.is_empty()
-        {
-            scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+        if !inner.sp_subs.is_empty() {
+            match sp_tweaks {
+                // D4 fast path: authoritative stored tweaks (index complete +
+                // row.block_hash verified by the caller) — no undo needed.
+                Some(entries) => {
+                    scan_block_sp_from_tweaks(&inner, block, height, entries, wants_raw, &mut sink);
+                }
+                // Recompute path: needs undo to derive each tweak.
+                None => {
+                    if let Some(undo) = undo {
+                        scan_block_sp(&inner, block, height, undo, wants_raw, &mut sink);
+                    }
+                }
+            }
         }
         sink.out
     }
@@ -2043,11 +2078,50 @@ fn scan_tx_sp(
     wants_raw: bool,
     sink: &mut dyn MatchSink,
 ) {
-    // One tweak per eligible tx, shared across all targets.
+    // One tweak per eligible tx, shared across all targets. Recompute path.
     let Some(entry) = compute_tweak(tx, prevout_spks) else {
         return;
     };
+    sp_scan_tx_outputs(
+        inner,
+        work,
+        tx,
+        entry.txid,
+        &entry.tweak,
+        confirmed,
+        height,
+        wants_raw,
+        sink,
+    );
+}
 
+/// Scan one transaction's taproot outputs against every target in `work`, given
+/// an **already-known** public tweak `T` and the tx's `txid`. The half of the SP
+/// match that follows the tweak — building the taproot output table, running
+/// `scan_outputs` per target, and emitting matches — with the tweak source
+/// factored out so it is shared by:
+///
+/// - [`scan_tx_sp`], which recomputes `T` from the tx + its prevout scripts
+///   (`compute_tweak`); and
+/// - [`scan_block_sp_from_tweaks`], the D4 rescan fast path, which reads `T`
+///   straight from a verified `sp_tweaks` index row (skipping the undo read and
+///   per-tx `compute_tweak`).
+///
+/// Both paths run the identical `scan_outputs` kernel over the identical outputs,
+/// so acceleration can never change results — the differential acceptance test
+/// asserts this.
+#[allow(clippy::too_many_arguments)]
+fn sp_scan_tx_outputs(
+    inner: &Inner,
+    work: &[(SubId, SecretKey, &SpWatchTarget)],
+    tx: &Transaction,
+    txid: Txid,
+    tweak: &PublicKey,
+    confirmed: bool,
+    height: Option<u32>,
+    wants_raw: bool,
+    sink: &mut dyn MatchSink,
+) {
     // Taproot output table: (vout, x-only key, value). Built once per tx.
     let mut tap: Vec<(u32, XOnlyPublicKey, u64)> = Vec::new();
     for (vout, o) in tx.output.iter().enumerate() {
@@ -2064,13 +2138,7 @@ fn scan_tx_sp(
     let mut raw_tx_cache: Option<Arc<[u8]>> = None;
 
     for (sid, b_scan, target) in work {
-        let matches = scan_outputs(
-            &entry.tweak,
-            b_scan,
-            &target.spend_pubkey,
-            &target.labels,
-            &out_xonly,
-        );
+        let matches = scan_outputs(tweak, b_scan, &target.spend_pubkey, &target.labels, &out_xonly);
         if matches.is_empty() {
             continue;
         }
@@ -2089,11 +2157,11 @@ fn scan_tx_sp(
             let (vout, _, amount) = tap[idx];
             let wm = WatchMatch::SilentPaymentMatched {
                 scan_pubkey: target.scan_pubkey(),
-                txid: entry.txid,
+                txid,
                 vout,
                 output_pubkey: m.output,
                 amount,
-                tweak: entry.tweak,
+                tweak: *tweak,
                 k: m.k,
                 label: m.label_m,
                 confirmed,
@@ -2102,6 +2170,65 @@ fn scan_tx_sp(
             };
             sink.emit(inner, *sid, &wm);
         }
+    }
+}
+
+/// D4 index-accelerated confirmed-block SP scan: instead of recomputing each
+/// eligible tx's tweak from undo data ([`scan_block_sp`]), take the tweaks
+/// **straight from a verified `sp_tweaks` index row**. The caller
+/// ([`WatchRegistry::scan_block_collect_accel`], driven by the rescan loop) has
+/// already confirmed the index is complete and the row's `block_hash` matches
+/// the block being scanned, so the stored tweaks are authoritative for this
+/// block; this fn just maps each row entry's `txid` to its transaction and runs
+/// the same `scan_outputs` kernel [`scan_tx_sp`] would, emitting `confirmed =
+/// true` matches at `height`.
+///
+/// The win over recompute is exactly the undo read plus one `compute_tweak`
+/// (input classification + an EC mult) per eligible tx — skipped here. Row
+/// entries name only eligible txs, so a block with no SP-eligible tx contributes
+/// no work regardless of block size.
+fn scan_block_sp_from_tweaks(
+    inner: &Inner,
+    block: &Block,
+    height: u32,
+    entries: &[TweakEntry],
+    wants_raw: bool,
+    sink: &mut dyn MatchSink,
+) {
+    let mut work: Vec<(SubId, SecretKey, &SpWatchTarget)> = Vec::new();
+    for sid in &inner.sp_subs {
+        if let Some(sub) = inner.subs.get(sid) {
+            for t in sub.sp_targets.values() {
+                work.push((*sid, t.b_scan(), t));
+            }
+        }
+    }
+    if work.is_empty() || entries.is_empty() {
+        return;
+    }
+    // txid → stored tweak. Row entries are one per SP-eligible tx (small); the
+    // map lets us pair each with its transaction without relying on block order.
+    let by_txid: HashMap<Txid, &PublicKey> =
+        entries.iter().map(|e| (e.txid, &e.tweak)).collect();
+    for tx in &block.txdata {
+        if tx.is_coinbase() {
+            continue;
+        }
+        let txid = tx.compute_txid();
+        let Some(tweak) = by_txid.get(&txid) else {
+            continue; // not an SP-eligible tx per the index
+        };
+        sp_scan_tx_outputs(
+            inner,
+            &work,
+            tx,
+            txid,
+            tweak,
+            true,
+            Some(height),
+            wants_raw,
+            sink,
+        );
     }
 }
 
@@ -4885,5 +5012,116 @@ mod tests {
         assert!(!reg.has_sp_watchers());
         reg.scan_mempool_sp(&tx, &prev_scripts);
         assert!(rx.try_recv().is_err(), "no SP watcher ⇒ no mempool match");
+    }
+
+    /// Build a rescan-ready ephemeral registry watching `(b_scan, B_spend)`.
+    fn sp_rescan_eph(b_scan: &SecretKey, b_spend_pub: &PublicKey) -> Arc<WatchRegistry> {
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let target =
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        handle.add_silent_payments(std::slice::from_ref(&target));
+        // Keep the handle alive for the registry's lifetime by leaking it into the
+        // ephemeral clone: clone_for_rescan copies the watch-set, so the original
+        // handle can drop, but we return the ephemeral registry.
+        reg.clone_for_rescan(handle.sub_id())
+            .expect("non-empty watch-set")
+    }
+
+    #[test]
+    fn sp_rescan_fast_path_matches_recompute() {
+        // D4 acceleration differential (unit level): the fast path (stored
+        // tweaks, no undo) produces byte-identical matches to the recompute path
+        // (undo, no stored tweaks). Same payment, both paths, compared directly.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, _p0, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
+        let txid = tx.compute_txid();
+        let block = block_with(vec![coinbase_tx(), tx]);
+        let eph = sp_rescan_eph(&b_scan, &b_spend_pub);
+
+        // Recompute: undo present, no stored tweaks.
+        let recompute = eph.scan_block_collect_accel(&block, 100, Some(&undo), None);
+        // Fast path: stored tweaks (as the index would hold), no undo.
+        let entries = vec![TweakEntry {
+            txid,
+            tweak,
+            max_taproot_value: Amount::from_sat(12_345),
+        }];
+        let accel = eph.scan_block_collect_accel(&block, 100, None, Some(&entries));
+
+        assert_eq!(recompute.len(), 1, "recompute finds the payment");
+        assert_eq!(accel, recompute, "fast path is identical to recompute");
+    }
+
+    #[test]
+    fn sp_rescan_fast_path_absent_row_finds_nothing() {
+        // The fast path only scans txids the index vouched for. An empty row, or
+        // one naming a different tx, yields no fast-path match — the recompute
+        // fallback (which the grpc loop selects on row absence/hash-mismatch) is
+        // what would catch such a block.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, _p0, tweak) = sp_payment(&b_scan, &b_spend_pub, 8_000);
+        let block = block_with(vec![coinbase_tx(), tx]);
+        let eph = sp_rescan_eph(&b_scan, &b_spend_pub);
+
+        // Empty stored row ⇒ no fast-path match.
+        assert!(
+            eph.scan_block_collect_accel(&block, 5, None, Some(&[])).is_empty(),
+            "empty row ⇒ no fast-path match",
+        );
+        // Row naming a different tx ⇒ no match for this block's payment.
+        let other_txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0xee; 32],
+        ));
+        let wrong_entries = vec![TweakEntry {
+            txid: other_txid,
+            tweak,
+            max_taproot_value: Amount::from_sat(8_000),
+        }];
+        assert!(
+            eph.scan_block_collect_accel(&block, 5, None, Some(&wrong_entries))
+                .is_empty(),
+            "row for a different tx ⇒ no match",
+        );
+        // The recompute path (the fallback) still finds the payment.
+        assert_eq!(
+            eph.scan_block_collect_accel(&block, 5, Some(&undo), None).len(),
+            1,
+            "recompute fallback still matches",
+        );
+    }
+
+    #[test]
+    fn sp_rescan_fast_path_wrong_tweak_no_false_match() {
+        // A corrupt stored tweak for the right txid cannot manufacture a false
+        // positive: scan_outputs derives a different candidate output key that
+        // won't equal the block's actual output.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, _undo, _p0, _tweak) = sp_payment(&b_scan, &b_spend_pub, 6_000);
+        let txid = tx.compute_txid();
+        let block = block_with(vec![coinbase_tx(), tx]);
+        let eph = sp_rescan_eph(&b_scan, &b_spend_pub);
+
+        let wrong_tweak =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x77u8; 32]).unwrap());
+        let entries = vec![TweakEntry {
+            txid,
+            tweak: wrong_tweak,
+            max_taproot_value: Amount::from_sat(6_000),
+        }];
+        assert!(
+            eph.scan_block_collect_accel(&block, 9, None, Some(&entries))
+                .is_empty(),
+            "wrong stored tweak ⇒ no false-positive match",
+        );
     }
 }

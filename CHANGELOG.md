@@ -73,6 +73,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   watch registered nothing extra is retained and the mempool event path is
   byte-identical to before. Best-effort like every mempool watch: a target
   registered after a tx was admitted matches it only once it confirms.
+- Silent payments (BIP 352): index-accelerated rescan (D4). A `RescanBlocks`
+  over a scan-key watch-set now takes the stored tweaks straight from the
+  `sp_tweaks` index when it is enabled and complete — skipping the undo read and
+  per-tx tweak recomputation on each block — gated per block on the row's
+  embedded `block_hash` matching the block being scanned; a missing or
+  mismatched row (or a disabled/incomplete index) transparently falls back to
+  recomputing that block. Both paths run the same kernel, so acceleration never
+  changes which payments a rescan finds. No new surface or config; a scan-key
+  cold-sync just gets faster when the index is on.
 
 ## Releases
 

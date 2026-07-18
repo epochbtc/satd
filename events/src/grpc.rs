@@ -1472,6 +1472,10 @@ impl NodeEventStream for NodeEventStreamSvc {
         // shared registry (to snapshot THIS connection's watch-set into an
         // isolated ephemeral registry), and the handle (for its subscriber id).
         let scan_source = self.scan_source.clone();
+        // SP index read handle for the D4 rescan fast path (§4.2.5): when the
+        // index is complete, per-block stored tweaks replace the undo-recompute
+        // SP leg. `None` (index off) ⇒ rescan always recomputes.
+        let rescan_tweak_source = self.tweak_source.clone();
         let rescan_registry = registry.clone();
         let rescan_handle = handle.clone();
         // Resume-cursor seed: the Watch firehose has no establishment replay, so
@@ -1643,11 +1647,22 @@ impl NodeEventStream for NodeEventStreamSvc {
                         if tx_out.send(Ok(ack)).await.is_err() { return; }
                         // Undo is fetched only when a match could need the spent
                         // prevout scriptPubKeys: an input-side script/prefix
-                        // match, or a silent-payment scan (the per-tx tweak is
-                        // computed over the inputs' prevout scripts).
-                        let need_undo = ephemeral.has_script_watchers()
-                            || ephemeral.has_prefix_watchers()
-                            || ephemeral.has_sp_watchers();
+                        // match, or a silent-payment scan on the recompute path
+                        // (its per-tx tweak is computed over the inputs' prevout
+                        // scripts). The SP **fast path** (D4) reads tweaks from the
+                        // index instead, so it needs no undo — decided per block
+                        // below, since a missing/mismatched row falls back to
+                        // recompute for that block.
+                        let need_undo_nonsp = ephemeral.has_script_watchers()
+                            || ephemeral.has_prefix_watchers();
+                        let has_sp = ephemeral.has_sp_watchers();
+                        // Fast path is eligible only when the index is complete;
+                        // per-block row presence + block_hash verification gate it
+                        // further (fall back to recompute otherwise).
+                        let use_sp_accel = has_sp
+                            && rescan_tweak_source
+                                .as_ref()
+                                .is_some_and(|sp| sp.is_complete());
                         let mut matches: u64 = 0;
                         // Reorg-safe (height,hash) resolution first (an active-chain
                         // index walk) — run on the blocking pool like the per-block
@@ -1684,11 +1699,33 @@ impl NodeEventStream for NodeEventStreamSvc {
                             }
                             let src = src.clone();
                             let eph = ephemeral.clone();
+                            let sp_src = if use_sp_accel {
+                                rescan_tweak_source.clone()
+                            } else {
+                                None
+                            };
                             let collected = match tokio::task::spawn_blocking(move || {
                                 src.block_body(&hash).map(|block| {
+                                    // D4 fast path: use the stored tweaks only when
+                                    // the row is present AND its embedded block_hash
+                                    // matches the block being scanned; a storage
+                                    // error, absent row, or mismatch falls back to
+                                    // recompute (which needs undo). Both paths run
+                                    // the same kernel, so results are identical.
+                                    let sp_row = sp_src
+                                        .as_ref()
+                                        .and_then(|sp| sp.tweaks_at(h).ok())
+                                        .filter(|row| row.block_hash == hash);
+                                    let need_undo =
+                                        need_undo_nonsp || (has_sp && sp_row.is_none());
                                     let undo =
                                         if need_undo { src.block_undo(&hash) } else { None };
-                                    eph.scan_block_collect(&block, h, undo.as_ref())
+                                    eph.scan_block_collect_accel(
+                                        &block,
+                                        h,
+                                        undo.as_ref(),
+                                        sp_row.as_ref().map(|row| row.entries.as_slice()),
+                                    )
                                 })
                             })
                             .await
