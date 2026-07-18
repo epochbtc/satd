@@ -405,8 +405,14 @@ message SilentPaymentMatched {
 // (distinguishing "indexed, none" from "not indexed"). The envelope carries the
 // standard durable cursor, so tweak subscriptions resume exactly like any other.
 // Live emit + index-backed replay land in a later change; this reserves the slot.
+//
+// BYTE ORDER: every hash and txid in this file — here and in TweakEntry,
+// SilentPaymentMatched, and the watch messages — is serialized in *internal*
+// byte order (the wire/consensus order), NOT the reversed order shown in block
+// explorers or `getblock` JSON. Clients deriving keys from these bytes must not
+// reverse them.
 message BlockTweaks {
-  bytes  block_hash = 1;
+  bytes  block_hash = 1;   // 32 bytes, internal byte order
   uint32 height     = 2;
   repeated TweakEntry entries = 3; // empty = indexed block, no eligible txs
   bool   filtered   = 4;           // true when a per-subscription dust limit dropped entries
