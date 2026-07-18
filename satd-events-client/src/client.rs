@@ -54,6 +54,10 @@ impl SubscribeOptions {
             categories: self.categories,
             since_seq: self.since_seq,
             from_cursor: self.from_cursor,
+            // BIP 352 tweak knobs (§3.5): the typed builder for these lands with
+            // the SP SDK helpers (PR 8). Default to the pre-existing behavior.
+            tweak_dust_limit: None,
+            tweaks_only: None,
         }
     }
 }

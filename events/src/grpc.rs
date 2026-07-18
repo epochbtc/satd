@@ -1906,6 +1906,16 @@ fn apply_control(
                 "RescanBlocks reached apply_control unexpectedly; ignoring (handled as rescan upstream)",
             );
         }
+        Some(Msg::AddSilentPayments(_)) | Some(Msg::RemoveSilentPayments(_)) => {
+            // BIP 352 scan-key watch (§4). PR 4 reserves the schema slot; the
+            // registry lease map + matcher wiring land in PR 6. No client in
+            // this version sends these, so ignore rather than mis-handle — the
+            // real add/remove/quota handling replaces this arm in PR 6.
+            debug!(
+                target: "events::grpc",
+                "silent-payment watch control received but the matcher is not yet wired (PR 6); ignoring",
+            );
+        }
         None => {}
     }
 }
@@ -3237,6 +3247,8 @@ mod tests {
             .subscribe(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: None,
             })
             .await
@@ -3301,6 +3313,8 @@ mod tests {
                 pb::node_event::Body::SetWatchSetResult(_) => "set_watch_set_result",
                 pb::node_event::Body::RescanResult(_) => "rescan_result",
                 pb::node_event::Body::RescanComplete(_) => "rescan_complete",
+                pb::node_event::Body::BlockTweaks(_) => "block_tweaks",
+                pb::node_event::Body::SilentPaymentMatched(_) => "silent_payment_matched",
             })
             .collect();
         assert!(
@@ -3331,6 +3345,8 @@ mod tests {
             Request::new(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: None,
             })
         };
@@ -3480,6 +3496,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 2,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -3534,6 +3552,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 2,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 4,
                     tx_index: 0,
@@ -3610,6 +3630,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 2,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 3,
                     tx_index: 0,
@@ -3689,6 +3711,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 2,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -3747,6 +3771,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 1, // mempool only
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -3808,6 +3834,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 1,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -3857,6 +3885,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 2,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -3897,6 +3927,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -3943,6 +3975,8 @@ mod tests {
             .subscribe(Request::new(pb::SubscribeRequest {
                 categories: 0,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: None,
             }))
             .await
@@ -5038,6 +5072,8 @@ mod tests {
                 svc.subscribe(Request::new(pb::SubscribeRequest {
                     categories: 0,
                     since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                     from_cursor: None,
                 }))
                 .await

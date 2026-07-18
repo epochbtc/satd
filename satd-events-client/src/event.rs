@@ -614,6 +614,12 @@ impl From<pb::NodeEvent> for Event {
                 to_height: c.to_height,
                 matches: c.matches,
             },
+            // BIP 352 (§3.5/§4): the wire schema is allocated (PR 4), but the
+            // typed `Event::BlockTweaks` / `Event::SilentPaymentMatched` variants
+            // and their decoding land with the SP SDK helpers (PR 8). Until then
+            // these surface as Unknown rather than being silently dropped by a
+            // catch-all — the match stays exhaustive so PR 8 is forced to wire them.
+            Body::BlockTweaks(_) | Body::SilentPaymentMatched(_) => Event::Unknown,
         }
     }
 }

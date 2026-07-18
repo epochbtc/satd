@@ -132,6 +132,21 @@ message SubscribeControl {
     // default — bandwidth-heavy, so opt-in. Governs only the wire; the value
     // fields (amount/has_amount) are always present regardless.
     SetWatchOptions set_watch_options = 15;
+    // BIP 352 silent-payment scan-key watch (Tier 2, §4). Register one or more
+    // scan credentials (b_scan + B_spend + label ints); the server runs the
+    // BIP 352 matcher over eligible txs (confirmed blocks + mempool) and emits
+    // SilentPaymentMatched for outputs paying any registered target. Each
+    // target costs one ECDH per eligible tx, so the per-connection cap is small
+    // (MAX_SP_TARGETS_PER_CONNECTION = 16); charges one watch-quota unit per
+    // target. Scan secrets are held in-memory per-connection only, zeroized on
+    // drop, and never persisted or logged (§4, D3). Requires the stream:watch
+    // capability. Server-side matching lands in a later change; this tag
+    // reserves the schema slot.
+    AddSilentPayments    add_silent_payments    = 16;
+    // Remove silent-payment targets previously added, identified by scan
+    // pubkey (b_scan·G, 33 bytes) — the client-derivable identity that never
+    // echoes the secret. Releases each target's watch-quota unit.
+    RemoveSilentPayments remove_silent_payments = 17;
   }
 }
 
@@ -167,6 +182,7 @@ message SetWatchSet {
   repeated ScriptPrefix prefixes      = 6;
   repeated WatchLifecycle lifecycles  = 7; // txid lifecycle watches
   repeated WatchDepthAlarm depth_alarms = 8; // single-shot (txid, depth) alarms
+  repeated SilentPaymentTarget silent_payments = 9; // BIP 352 scan-key targets (§4)
 }
 
 // One txid lifecycle watch in a SetWatchSet snapshot. `auto_close_depth` matches
@@ -215,6 +231,23 @@ message RemoveTransactions { repeated bytes txids = 1; repeated uint32 min_depth
 message ScriptPrefix         { bytes prefix = 1; uint32 bits = 2; }
 message AddScriptPrefixes    { repeated ScriptPrefix prefixes = 1; }
 message RemoveScriptPrefixes { repeated ScriptPrefix prefixes = 1; }
+
+// One BIP 352 silent-payment scan-key target (§4). A watch credential — the
+// scan secret is disclosed to the node so it can run ECDH per eligible tx, but
+// it is NOT a spending key (spend authority stays with B_spend's private key,
+// which is never sent). Held in-memory per-connection, zeroized on drop, never
+// persisted or logged (D3). Identified for removal by its scan pubkey
+// (b_scan·G), which the client derives locally and which never echoes the
+// secret. Registration validates: scan_secret is a 32-byte scalar in range,
+// spend_pubkey a valid 33-byte compressed point, labels are deduplicated, and
+// the scan pubkey is not already registered on this connection.
+message SilentPaymentTarget {
+  bytes scan_secret      = 1;  // 32-byte b_scan (watch credential, not a spend key)
+  bytes spend_pubkey     = 2;  // 33-byte compressed B_spend
+  repeated uint32 labels = 3;  // label ints m; the server derives label points. Include 0 to catch change.
+}
+message AddSilentPayments    { repeated SilentPaymentTarget targets = 1; }
+message RemoveSilentPayments { repeated bytes scan_pubkeys = 1; } // identity = b_scan·G (33 bytes each)
 
 // A watched outpoint was spent.
 message OutpointSpent {
@@ -341,15 +374,67 @@ message PrefixMatched {
   repeated SpentPrevout matched_prevouts = 5;
 }
 
+// A transaction paid a registered BIP 352 silent-payment target (Tier 2, §4).
+// Emitted on the Watch stream by the scan-key matcher: one event per matched
+// output. `scan_pubkey` attributes the match to the registered target (mirrors
+// DescriptorMatch's attribution role), never echoing the scan secret. The
+// `tweak` + `k` pair lets the client re-derive the output key offline without
+// the node ever holding a spending key. Mempool matches arrive `confirmed=false`
+// and are re-emitted `confirmed=true` on block connect (D7).
+message SilentPaymentMatched {
+  bytes  scan_pubkey   = 1;  // registered target identity (b_scan·G, 33 bytes)
+  bytes  txid          = 2;
+  uint32 vout          = 3;
+  bytes  output_pubkey = 4;  // 32-byte x-only taproot output key
+  uint64 amount        = 5;  // output value in satoshis
+  bytes  tweak         = 6;  // 33-byte shared-secret tweak; with `k`, derives the output key offline
+  uint32 k             = 7;  // output counter for this tx (BIP 352 k)
+  bool   has_label     = 8;  // true when the match hit a registered label
+  uint32 label         = 9;  // the label int that matched (valid only when has_label)
+  bool   confirmed     = 10; // false on mempool acceptance; re-emitted true on block connect (D7)
+  uint32 height        = 11; // block height when confirmed; 0 in the mempool
+  bytes  raw_tx        = 12; // full serialized tx, only under SetWatchOptions.include_raw_tx
+}
+
+// A block's BIP 352 tweak data (Tier 1, §3.5), streamed on the Subscribe
+// firehose to consumers that requested the `tweaks` category (bit 8 — an
+// explicit request, NOT part of the categories=0 "all" default, so a
+// pre-existing 0-subscriber never starts receiving tweak volume after an
+// upgrade). One event per connected block at/above taproot activation; the
+// `entries` list is empty for an indexed block with no eligible transactions
+// (distinguishing "indexed, none" from "not indexed"). The envelope carries the
+// standard durable cursor, so tweak subscriptions resume exactly like any other.
+// Live emit + index-backed replay land in a later change; this reserves the slot.
+message BlockTweaks {
+  bytes  block_hash = 1;
+  uint32 height     = 2;
+  repeated TweakEntry entries = 3; // empty = indexed block, no eligible txs
+  bool   filtered   = 4;           // true when a per-subscription dust limit dropped entries
+}
+
+// One eligible transaction's tweak within a BlockTweaks. `tweak` is always
+// present (33-byte compressed public tweak T = input_hash · A). `txid` and
+// `max_value` are omitted (empty / zero) under a `tweaks_only` subscription,
+// which streams the compact tweak bytes alone.
+message TweakEntry {
+  bytes  tweak     = 1;  // 33-byte compressed public tweak — always present
+  bytes  txid      = 2;  // omitted under tweaks_only
+  uint64 max_value = 3;  // largest eligible output value (sats); omitted under tweaks_only
+}
+
 // Filter knobs for a subscription. All optional; an unset field means
 // "no filter" (the server applies its own defaults).
 message SubscribeRequest {
-  // Bitfield: mempool=1, chain=2, heartbeat=4. Zero means "all".
-  // Unknown bits are silently ignored — the server treats the request
-  // as "any of the known categories I recognize that you set"; it does
-  // not error on unrecognized bits so a newer client can address an
-  // older server without a hard incompatibility during a rolling
-  // upgrade.
+  // Bitfield: mempool=1, chain=2, heartbeat=4, tweaks=8 (BIP 352, §3.5).
+  // Zero means "all" — EXCEPT `tweaks`, which is explicit-request only and is
+  // NOT included in the "all" expansion, so a pre-existing categories=0
+  // subscriber does not begin receiving tweak volume after a node upgrade. The
+  // `tweaks` bit requires silentpaymentindex=1; a request that sets it against
+  // a node without the index is rejected in-band. Unknown bits are silently
+  // ignored — the server treats the request as "any of the known categories I
+  // recognize that you set"; it does not error on unrecognized bits so a newer
+  // client can address an older server without a hard incompatibility during a
+  // rolling upgrade.
   uint32 categories = 1;
 
   // Forward-only filter. The server begins each subscription from the
@@ -370,6 +455,19 @@ message SubscribeRequest {
   // an in-memory window. If the server has no block source configured,
   // replay is skipped and the subscription is forward-only.
   optional Cursor from_cursor = 3;
+
+  // BIP 352 tweak subscription knobs (§3.5); apply only when the `tweaks`
+  // category (bit 8) is requested, ignored otherwise. Additive — a request that
+  // omits them gets the pre-existing behavior (unfiltered, full entries).
+  //
+  // Server-side dust filter on the streamed BlockTweaks entries: an entry whose
+  // `max_value` is below this floor (satoshis) is dropped and the block's
+  // `filtered` flag is set. 0 (default) = unfiltered.
+  optional uint64 tweak_dust_limit = 4;
+  // Compact mode: when true, TweakEntry carries the 33-byte tweak alone (txid
+  // and max_value omitted) — the minimal payload a client-side ECDH scan needs.
+  // False (default) = full entries.
+  optional bool tweaks_only = 5;
 }
 
 // Durable resume position. Confirmed-side cursors are `(height,
@@ -661,5 +759,7 @@ message NodeEvent {
     WatchSetResult set_watch_set_result = 25; // deterministic atomic-replace ack/reject
     RescanResult rescan_result = 26; // deterministic historical-rescan ack/reject
     RescanComplete rescan_complete = 27; // terminal marker: rescan range fully drained
+    BlockTweaks block_tweaks = 28; // BIP 352 per-block tweak data (Subscribe `tweaks` category, §3.5)
+    SilentPaymentMatched silent_payment_matched = 29; // BIP 352 scan-key watch match (Watch stream, §4)
   }
 }

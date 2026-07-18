@@ -317,6 +317,10 @@ impl WatchSetMirror {
                 .iter()
                 .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
                 .collect(),
+            // BIP 352 scan-key targets (§4): ResilientWatch does not yet track
+            // SP targets in its net set — that reconciliation lands with the SP
+            // SDK helpers (PR 8). Empty until then.
+            silent_payments: Vec::new(),
         }
     }
 

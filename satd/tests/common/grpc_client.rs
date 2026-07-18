@@ -145,6 +145,8 @@ impl GrpcStreamClient {
             .subscribe(SubscribeRequest {
                 categories,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor,
             })
             .await
@@ -164,6 +166,8 @@ impl GrpcStreamClient {
             .subscribe(SubscribeRequest {
                 categories,
                 since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
                 from_cursor: None,
             })
             .await?;
