@@ -213,6 +213,13 @@ pub struct RocksDbStore {
     /// filter backfill / reindex.
     #[cfg(feature = "block-filter-index")]
     blockfilterindex_enabled: bool,
+    /// Whether per-block BIP 352 silent-payment-index emission is active.
+    /// Same invalidation contract as the address / filter flags: when
+    /// `false` and a block connects, the persisted `sp_index.complete`
+    /// marker is cleared atomically so an SP tweak-serving surface
+    /// refuses until the operator runs an SP backfill / reindex. Always
+    /// compiled (the SP index follows the address-index model).
+    silentpaymentindex_enabled: bool,
     /// Shared LRU across all column families. Cloneable Arc; the FFI layer
     /// is thread-safe for `set_capacity`, so a clone plus an interior mutex
     /// is enough to allow live resize from a separate task.
@@ -624,6 +631,12 @@ impl RocksDbStore {
             // completeness marker atomically.
             #[cfg(feature = "block-filter-index")]
             blockfilterindex_enabled: false,
+            // Default false (the runtime opt-in is `--silentpaymentindex=1`);
+            // main.rs flips it via `with_silentpaymentindex_enabled`. Same
+            // cleared-marker invariant as the addr / filter flags: when the
+            // index is off, every connected block clears the SP completeness
+            // marker atomically.
+            silentpaymentindex_enabled: false,
             block_cache: parking_lot::Mutex::new(block_cache),
             block_cache_capacity: std::sync::atomic::AtomicUsize::new(cache_bytes),
             tuning,
@@ -801,6 +814,36 @@ impl RocksDbStore {
                 .unwrap_or(false);
             store.write_block_filter_index_complete(!block_index_has_rows)?;
         }
+
+        // sp_index.complete marker — same three-state open-time logic as
+        // the filter marker above.
+        //
+        //   - Fresh datadir (no `block_index` rows yet) → stamp true. A
+        //     from-genesis sync with `--silentpaymentindex=1` populates
+        //     every block at/above taproot activation with no holes, so
+        //     it is complete by construction.
+        //   - Legacy datadir without the marker (block_index has rows but
+        //     the flag was never written) → stamp false. An SP tweak
+        //     serving surface refuses until the operator runs
+        //     `backfillindex silentpayment` (PR-3) or `--reindex-chainstate`.
+        //   - Marker already present → don't touch it. Backfill
+        //     `mark_silent_payment_index_complete` re-stamps true; per-block
+        //     `write_batch_mode` clears it when silentpaymentindex is
+        //     disabled at runtime (set after `with_silentpaymentindex_enabled`).
+        if store.read_silent_payment_index_complete().is_none() {
+            let block_index_has_rows = store
+                .db
+                .cf_handle(CF_BLOCK_INDEX)
+                .and_then(|cf| {
+                    store
+                        .db
+                        .iterator_cf(&cf, IteratorMode::Start)
+                        .next()
+                        .map(|item| item.is_ok())
+                })
+                .unwrap_or(false);
+            store.write_silent_payment_index_complete(!block_index_has_rows)?;
+        }
         Ok(store)
     }
 
@@ -839,6 +882,56 @@ impl RocksDbStore {
             );
         }
         self
+    }
+
+    /// Set whether per-block BIP 352 silent-payment-index emission is
+    /// active. Call before any `write_batch_mode` runs so the persisted
+    /// `sp_index.complete` marker stays consistent with the configured
+    /// behaviour. Default is `false` (matches the `--silentpaymentindex=0`
+    /// default). Always compiled — the SP index follows the address-index
+    /// model, not a cargo feature.
+    pub fn with_silentpaymentindex_enabled(mut self, enabled: bool) -> Self {
+        self.silentpaymentindex_enabled = enabled;
+        if !enabled {
+            tracing::info!(
+                target: "storage",
+                "silent-payment index emission disabled; future block connects will clear \
+                 the sp_index.complete marker — the tweak-serving surfaces will refuse to \
+                 serve until a backfill / reindex completes."
+            );
+        }
+        self
+    }
+
+    /// Read the `sp_index.complete` marker from the metadata CF. Returns
+    /// `None` when the key doesn't exist (fresh datadir or pre-marker
+    /// upgrade) so the open-time stamp can distinguish "never set" from
+    /// an explicit false.
+    fn read_silent_payment_index_complete(&self) -> Option<bool> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self
+            .db
+            .get_cf(&cf, node_sp_index::cursor::META_KEY_COMPLETE)
+        {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
+    }
+
+    /// Write the `sp_index.complete` marker. `true` means the index has
+    /// no holes from taproot activation to the tip.
+    fn write_silent_payment_index_complete(&self, value: bool) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(
+                &cf,
+                node_sp_index::cursor::META_KEY_COMPLETE,
+                [u8::from(value)],
+            )
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Read the `outpoint_spend.complete` marker from the metadata CF.
@@ -1250,6 +1343,17 @@ impl Store for RocksDbStore {
             wb.put_cf(&cf_meta, BLOCK_FILTER_INDEX_COMPLETE_KEY, [0u8]);
         }
 
+        // Same invalidation contract for the BIP 352 SP-index marker.
+        // When `silentpaymentindex` is disabled at runtime and a block
+        // connects/disconnects, the sp_tweaks CF diverges from the chain;
+        // clear the marker atomically so the tweak-serving surfaces refuse
+        // until a backfill / reindex re-fills the range.
+        if !self.silentpaymentindex_enabled
+            && (!batch.coin_puts.is_empty() || !batch.coin_removes.is_empty())
+        {
+            wb.put_cf(&cf_meta, node_sp_index::cursor::META_KEY_COMPLETE, [0u8]);
+        }
+
         // Block index
         //
         // Dominance filter: a HeaderOnly write must never clobber an
@@ -1599,6 +1703,33 @@ impl Store for RocksDbStore {
             }
         }
 
+        // Metadata: SP-index backfill cursor advance. Atomic with the
+        // cf_sp_tweaks writes above so a kill -9 mid-batch leaves cursor
+        // and rows in lockstep. Same all-zero snapshot-hash sentinel as
+        // the filter advance.
+        if let Some(adv) = &batch.sp_backfill_cursor_advance {
+            use node_sp_index::cursor as scur;
+            wb.put_cf(&cf_meta, scur::META_KEY_STATE, [adv.state.as_byte()]);
+            wb.put_cf(
+                &cf_meta,
+                scur::META_KEY_CURSOR_HEIGHT,
+                adv.cursor_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                scur::META_KEY_SNAPSHOT_HEIGHT,
+                adv.snapshot_height.to_be_bytes(),
+            );
+            wb.put_cf(
+                &cf_meta,
+                scur::META_KEY_STARTED_AT,
+                adv.started_at_unix.to_be_bytes(),
+            );
+            if adv.snapshot_tip_hash != [0u8; 32] {
+                wb.put_cf(&cf_meta, scur::META_KEY_SNAPSHOT_HASH, adv.snapshot_tip_hash);
+            }
+        }
+
         // Metadata: tip
         if let Some(hash) = &batch.tip {
             wb.put_cf(&cf_meta, TIP_KEY, hash_bytes(hash));
@@ -1929,6 +2060,12 @@ impl Store for RocksDbStore {
         self.write_chain_tx_backfill_complete(true)?;
         #[cfg(feature = "block-filter-index")]
         self.write_block_filter_index_complete(true)?;
+        // BIP 352 SP index: -reindex-chainstate re-emits tweak rows from
+        // genesis via connect_block, so the index is complete afterward.
+        // If silentpaymentindex is disabled at runtime the per-block clear
+        // resets this to false on the first connect (same as the filter
+        // marker), so re-stamping true here is safe either way.
+        self.write_silent_payment_index_complete(true)?;
         Ok(())
     }
 
@@ -1967,6 +2104,7 @@ impl Store for RocksDbStore {
         self.write_chain_tx_backfill_complete(true)?;
         #[cfg(feature = "block-filter-index")]
         self.write_block_filter_index_complete(true)?;
+        self.write_silent_payment_index_complete(true)?;
         Ok(())
     }
 
@@ -2283,6 +2421,100 @@ impl Store for RocksDbStore {
             self.db.get_cf(&cf, node_sp_index::cursor::META_KEY_COMPLETE),
             Ok(Some(v)) if v.first() == Some(&1)
         )
+    }
+
+    fn mark_silent_payment_index_complete(&self) -> Result<(), StoreError> {
+        self.write_silent_payment_index_complete(true)
+    }
+
+    fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
+        use node_sp_index::cursor as scur;
+        let cf = self.cf(CF_METADATA);
+        let read_u8 = |k: &[u8]| -> Option<u8> {
+            self.db
+                .get_cf(&cf, k)
+                .ok()
+                .flatten()
+                .and_then(|v| v.first().copied())
+        };
+        let read_u32_be = |k: &[u8]| -> Option<u32> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 4 {
+                    Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                } else {
+                    None
+                }
+            })
+        };
+        let read_u64_be = |k: &[u8]| -> Option<u64> {
+            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+                if v.len() == 8 {
+                    Some(u64::from_be_bytes([
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                    ]))
+                } else {
+                    None
+                }
+            })
+        };
+        let snapshot_tip_hash: [u8; 32] = self
+            .db
+            .get_cf(&cf, scur::META_KEY_SNAPSHOT_HASH)
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&v);
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        scur::BackfillCursor {
+            state: read_u8(scur::META_KEY_STATE)
+                .map(scur::BackfillState::from_byte)
+                .unwrap_or(scur::BackfillState::Idle),
+            cursor_height: read_u32_be(scur::META_KEY_CURSOR_HEIGHT).unwrap_or(0),
+            snapshot_height: read_u32_be(scur::META_KEY_SNAPSHOT_HEIGHT).unwrap_or(0),
+            started_at_unix: read_u64_be(scur::META_KEY_STARTED_AT).unwrap_or(0),
+            snapshot_tip_hash,
+        }
+    }
+
+    fn read_sp_backfill_last_error(&self) -> Option<String> {
+        use node_sp_index::cursor as scur;
+        let cf = self.cf(CF_METADATA);
+        self.db
+            .get_cf(&cf, scur::META_KEY_LAST_ERROR)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn write_sp_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        use node_sp_index::cursor as scur;
+        let cf = self.cf(CF_METADATA);
+        let bytes = if msg.len() <= scur::LAST_ERROR_MAX_BYTES {
+            msg.as_bytes().to_vec()
+        } else {
+            let mut idx = scur::LAST_ERROR_MAX_BYTES;
+            while idx > 0 && !msg.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            msg.as_bytes()[..idx].to_vec()
+        };
+        if bytes.is_empty() {
+            self.db
+                .delete_cf(&cf, scur::META_KEY_LAST_ERROR)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        } else {
+            self.db
+                .put_cf(&cf, scur::META_KEY_LAST_ERROR, bytes)
+                .map_err(|e| StoreError::Database(e.to_string()))
+        }
     }
 
     fn lookup_spend(

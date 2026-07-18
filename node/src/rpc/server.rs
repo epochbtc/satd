@@ -243,6 +243,18 @@ pub struct RpcContext {
     /// supervisor is running; `None` when the binary was built without
     /// the supervisor wired (tests, embedded uses).
     pub backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
+    /// Whether the BIP 352 silent-payment index is enabled at runtime —
+    /// used by `getindexinfo` and `backfillindex` to populate the
+    /// `silentpayments.enabled` field and gate backfill requests.
+    pub sp_index_enabled: bool,
+    /// SP-index backfill handle. `Some` when the SP-index supervisor is
+    /// wired (default in production); `None` for tests without a backfill
+    /// thread. Always compiled — the SP index follows the address-index
+    /// model, not a cargo feature.
+    pub sp_backfill: Option<Arc<crate::index::silent_payments::BackfillHandle>>,
+    /// Channel to the SP-index backfill supervisor task.
+    pub sp_backfill_cmd_tx:
+        Option<tokio::sync::mpsc::Sender<crate::index::silent_payments::BackfillCommand>>,
     /// Runtime listener status — read by `getserverstatus`. Mutated by
     /// the satd binary after each optional listener (Esplora,
     /// Electrum, Electrum TLS) successfully binds.
@@ -396,6 +408,11 @@ pub async fn start(
     address_index_enabled: bool,
     backfill: Option<Arc<BackfillHandle>>,
     backfill_cmd_tx: Option<tokio::sync::mpsc::Sender<BackfillCommand>>,
+    sp_index_enabled: bool,
+    sp_backfill: Option<Arc<crate::index::silent_payments::BackfillHandle>>,
+    sp_backfill_cmd_tx: Option<
+        tokio::sync::mpsc::Sender<crate::index::silent_payments::BackfillCommand>,
+    >,
     listener_status: Arc<ServerListenerStatus>,
     #[cfg(feature = "block-filter-index")] blockfilterindex_enabled: bool,
     #[cfg(feature = "block-filter-index")] filter_index: Option<
@@ -434,6 +451,9 @@ pub async fn start(
         address_index_enabled,
         backfill,
         backfill_cmd_tx,
+        sp_index_enabled,
+        sp_backfill,
+        sp_backfill_cmd_tx,
         listener_status,
         #[cfg(feature = "block-filter-index")]
         blockfilterindex_enabled,
@@ -771,6 +791,8 @@ pub async fn start(
             &ctx.chain_state,
             ctx.address_index_enabled,
             ctx.chain_state.tip_height(),
+            ctx.sp_index_enabled,
+            ctx.sp_backfill.as_ref(),
             #[cfg(feature = "block-filter-index")]
             ctx.blockfilterindex_enabled,
             #[cfg(feature = "block-filter-index")]
@@ -788,6 +810,9 @@ pub async fn start(
             &ctx.chain_state,
             ctx.address_index_enabled,
             &target,
+            ctx.sp_backfill.as_ref(),
+            ctx.sp_backfill_cmd_tx.as_ref(),
+            ctx.sp_index_enabled,
             #[cfg(feature = "block-filter-index")]
             ctx.filter_backfill.as_ref(),
             #[cfg(feature = "block-filter-index")]
@@ -805,6 +830,7 @@ pub async fn start(
         indexes::pause_index(
             ctx.backfill.as_ref(),
             &target,
+            ctx.sp_backfill.as_ref(),
             #[cfg(feature = "block-filter-index")]
             ctx.filter_backfill.as_ref(),
         )
@@ -818,6 +844,7 @@ pub async fn start(
         indexes::resume_index(
             ctx.backfill.as_ref(),
             &target,
+            ctx.sp_backfill.as_ref(),
             #[cfg(feature = "block-filter-index")]
             ctx.filter_backfill.as_ref(),
         )
@@ -831,6 +858,7 @@ pub async fn start(
         indexes::cancel_index(
             ctx.backfill.as_ref(),
             &target,
+            ctx.sp_backfill.as_ref(),
             #[cfg(feature = "block-filter-index")]
             ctx.filter_backfill.as_ref(),
         )

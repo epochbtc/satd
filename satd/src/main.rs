@@ -410,7 +410,8 @@ async fn main() {
     let store = Box::new(
         raw_store
             .with_addressindex_enabled(config.addressindex)
-            .with_blockfilterindex_enabled(config.blockfilterindex),
+            .with_blockfilterindex_enabled(config.blockfilterindex)
+            .with_silentpaymentindex_enabled(config.silentpaymentindex),
     );
 
     // Handle -reindex: clear everything, will rebuild from flat files
@@ -1791,6 +1792,63 @@ async fn main() {
         });
     }
 
+    // BIP 352 SP-index backfill state machine. Mirrors the filter-index
+    // setup above: read persisted cursor, build handle, log on restored
+    // state, conditionally auto-resume. Always compiled (runtime opt-in
+    // via `--silentpaymentindex=1`), so no cargo gate.
+    let silentpaymentindex_runtime: bool = config.silentpaymentindex;
+
+    let sp_initial_cursor = chain_state.store_ref().read_sp_backfill_cursor();
+    if !matches!(
+        sp_initial_cursor.state,
+        node::index::silent_payments::BackfillState::Idle
+    ) {
+        tracing::info!(
+            state = %sp_initial_cursor.state.label(),
+            cursor_height = sp_initial_cursor.cursor_height,
+            snapshot_height = sp_initial_cursor.snapshot_height,
+            "sp-index backfill cursor restored from metadata"
+        );
+    }
+    let sp_backfill_handle = std::sync::Arc::new(node::index::silent_payments::BackfillHandle::new(
+        sp_initial_cursor,
+    ));
+
+    let (sp_backfill_cmd_tx, sp_backfill_cmd_rx) =
+        tokio::sync::mpsc::channel::<node::index::silent_payments::BackfillCommand>(1);
+    {
+        let handle = sp_backfill_handle.clone();
+        let chain = chain_state.clone();
+        let sp_cfg = node::index::silent_payments::SpIndexConfig {
+            enabled: silentpaymentindex_runtime,
+        };
+        let shutdown = shutdown_rx.clone();
+        let auto_resume_state = matches!(
+            handle.cursor().state,
+            node::index::silent_payments::BackfillState::Running
+                | node::index::silent_payments::BackfillState::Paused
+        );
+        let resume_on_start = silentpaymentindex_runtime && auto_resume_state;
+        if !resume_on_start && auto_resume_state && !silentpaymentindex_runtime {
+            tracing::warn!(
+                state = %handle.cursor().state.label(),
+                "sp-index backfill cursor is active but silentpaymentindex=0; \
+                 supervisor will NOT auto-resume — re-enable the index and restart"
+            );
+        }
+        tokio::spawn(async move {
+            sp_backfill_supervisor(
+                handle,
+                chain,
+                sp_cfg,
+                sp_backfill_cmd_rx,
+                shutdown,
+                resume_on_start,
+            )
+            .await;
+        });
+    }
+
     // Keep a clone of the shutdown sender in main so Ctrl-C / SIGTERM
     // can broadcast shutdown to all watch receivers (including the
     // backfill supervisor + runner). The RPC server takes its own
@@ -1945,6 +2003,11 @@ async fn main() {
         config.addressindex,
         Some(backfill_handle.clone()),
         Some(backfill_cmd_tx.clone()),
+        // BIP 352 SP index: always compiled (runtime opt-in), passed
+        // unconditionally like the address-index handle.
+        config.silentpaymentindex,
+        Some(sp_backfill_handle.clone()),
+        Some(sp_backfill_cmd_tx.clone()),
         listener_status.clone(),
         // BIP 158 filter index: passed unconditionally because `node`'s
         // `block-filter-index` feature is always on in any workspace
@@ -3601,6 +3664,134 @@ async fn persist_filter_failed_with_cleanup(
     let msg = format!("{}", err);
     if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
         tracing::warn!(error = %p, "failed to persist filter-index Failed state");
+    }
+}
+
+// ============================================================================
+// SP-index backfill supervisor (mirrors the filter-index pattern above for
+// BIP 352 tweak rows). Single-pass walk from taproot activation, no temp CF,
+// no tail-catch-up.
+// ============================================================================
+
+/// SP-index backfill supervisor. Same lifecycle as
+/// `filter_backfill_supervisor` but for the silent-payment tweak
+/// backfill.
+async fn sp_backfill_supervisor(
+    handle: std::sync::Arc<node::index::silent_payments::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::silent_payments::SpIndexConfig,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<node::index::silent_payments::BackfillCommand>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    resume_on_start: bool,
+) {
+    if resume_on_start {
+        tracing::info!("sp-index backfill: auto-resuming from persisted cursor");
+        spawn_sp_runner(handle.clone(), chain.clone(), cfg.clone(), shutdown.clone()).await;
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("sp-index backfill supervisor: shutdown");
+                    return;
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    return;
+                };
+                match cmd {
+                    node::index::silent_payments::BackfillCommand::Start => {
+                        spawn_sp_runner(
+                            handle.clone(),
+                            chain.clone(),
+                            cfg.clone(),
+                            shutdown.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn spawn_sp_runner(
+    handle: std::sync::Arc<node::index::silent_payments::BackfillHandle>,
+    chain: std::sync::Arc<node::chain::state::ChainState>,
+    cfg: node::index::silent_payments::SpIndexConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let handle_for_failure = handle.clone();
+    let chain_for_failure = chain.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let runner = node::index::silent_payments::BackfillRunner {
+            handle,
+            chain,
+            cfg,
+            shutdown,
+        };
+        runner.run()
+    });
+    let result = join.await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(node::index::silent_payments::BackfillError::Shutdown)) => {
+            tracing::info!("sp-index backfill: stopped for shutdown (resume on next start)");
+        }
+        Ok(Err(node::index::silent_payments::BackfillError::Cancelled)) => {
+            tracing::info!("sp-index backfill: cancelled by operator");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "sp-index backfill runner exited with error");
+            persist_sp_failed_with_cleanup(&handle_for_failure, &chain_for_failure, &e).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "sp-index backfill runner task panicked");
+            let msg = format!("runner panicked: {}", e);
+            if let Err(p) =
+                handle_for_failure.mark_failed(chain_for_failure.store_ref().as_ref(), &msg)
+            {
+                tracing::warn!(error = %p, "failed to persist Failed state after sp runner panic");
+            }
+        }
+    }
+}
+
+async fn persist_sp_failed_with_cleanup(
+    handle: &std::sync::Arc<node::index::silent_payments::BackfillHandle>,
+    chain: &std::sync::Arc<node::chain::state::ChainState>,
+    err: &node::index::silent_payments::BackfillError,
+) {
+    use node::index::silent_payments::BackfillError;
+    let cleanup_needed = matches!(err, BackfillError::ReorgInvalidated { .. });
+    if cleanup_needed {
+        let chain_clone = chain.clone();
+        let handle_clone = handle.clone();
+        let cleanup_join = tokio::task::spawn_blocking(move || {
+            node::index::silent_payments::BackfillRunner::cleanup_stale_rows_after_reorg(
+                chain_clone.as_ref(),
+                handle_clone.as_ref(),
+            )
+        })
+        .await;
+        match cleanup_join {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "sp-index reorg cleanup failed; proceeding to mark Failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sp-index reorg cleanup task panicked");
+            }
+        }
+    }
+    let msg = format!("{}", err);
+    if let Err(p) = handle.mark_failed(chain.store_ref().as_ref(), &msg) {
+        tracing::warn!(error = %p, "failed to persist sp-index Failed state");
     }
 }
 

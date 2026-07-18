@@ -23,6 +23,7 @@ use std::time::Instant;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::net::manager::PeerManager;
+use crate::storage::Store as _;
 
 /// A node is "ready" when its connected tip is within this many blocks of
 /// the best headers tip observed from peers.
@@ -311,6 +312,21 @@ impl MetricsContext {
             &[],
             sp_stats.row_removes,
         );
+        // Deferred-backfill progress ratio (0.0–1.0). Reads the persisted
+        // SP-index backfill cursor: 0.0 when idle / not started, 1.0 on
+        // completion. A float gauge, so emitted directly rather than via
+        // the u64 `metric` helper.
+        let sp_backfill_ratio = self
+            .chain_state
+            .store_ref()
+            .read_sp_backfill_cursor()
+            .progress_ratio();
+        let _ = writeln!(
+            out,
+            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed (0.0 idle/none, 1.0 complete)."
+        );
+        let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
+        let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
 
         // Transaction-filtering policy metrics (design §10, PR 7c). Extracted to
         // a free function so the I8-invisibility invariant (a node with no

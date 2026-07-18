@@ -19,6 +19,7 @@ use crate::index::address::{
 };
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter;
+use crate::index::silent_payments;
 use crate::storage::Store;
 
 /// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
@@ -48,11 +49,14 @@ use crate::storage::Store;
 /// `synced` field reads the `block_filter_index.complete` marker
 /// directly so a fresh-from-genesis sync with `--blockfilterindex=basic`
 /// reports `synced: true` once it reaches the chain tip.
+#[allow(clippy::too_many_arguments)]
 pub fn get_index_info(
     backfill: Option<&Arc<BackfillHandle>>,
     chain: &Arc<ChainState>,
     address_enabled: bool,
     best_block_height: u32,
+    sp_index_enabled: bool,
+    sp_backfill: Option<&Arc<silent_payments::BackfillHandle>>,
     #[cfg(feature = "block-filter-index")] block_filter_index_enabled: bool,
     #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Value {
@@ -153,6 +157,49 @@ pub fn get_index_info(
         bfi.insert("backfill".into(), Value::Object(bf));
         top.insert("basic block filter index".into(), Value::Object(bfi));
     }
+
+    // BIP 352 silent-payment tweak index sibling. `sp_index_enabled` is
+    // the runtime config bit (`--silentpaymentindex=1`); `synced` reads
+    // the on-disk completeness marker AND requires no backfill to be
+    // mid-flight. Both must be true before the tweak-serving surfaces
+    // (streaming `tweaks` category / `getsilentpaymentblockdata`, PR-5)
+    // return data.
+    {
+        let sp_complete = chain.store_ref().silent_payment_index_complete();
+        let report = silent_payments::render_status(
+            sp_backfill.map(|h| h.as_ref()),
+            sp_index_enabled,
+            sp_complete,
+        );
+        let mut spi = serde_json::Map::new();
+        spi.insert("synced".into(), json!(report.synced));
+        spi.insert("best_block_height".into(), json!(best_block_height));
+
+        let cursor_state = sp_backfill
+            .map(|h| h.cursor().state)
+            .unwrap_or(silent_payments::BackfillState::Idle);
+        let active = matches!(
+            cursor_state,
+            silent_payments::BackfillState::Running | silent_payments::BackfillState::Paused
+        );
+        let estimated_remaining_seconds = estimate_sp_remaining_seconds(&report);
+        let mut bf = serde_json::Map::new();
+        bf.insert("active".into(), json!(active));
+        bf.insert("state".into(), json!(cursor_state.label()));
+        bf.insert("cursor_height".into(), json!(report.cursor_height));
+        bf.insert("snapshot_height".into(), json!(report.snapshot_height));
+        bf.insert(
+            "estimated_remaining_seconds".into(),
+            json!(estimated_remaining_seconds),
+        );
+        if cursor_state == silent_payments::BackfillState::Failed
+            && let Some(msg) = chain.store_ref().read_sp_backfill_last_error()
+        {
+            bf.insert("last_error".into(), json!(msg));
+        }
+        spi.insert("backfill".into(), Value::Object(bf));
+        top.insert("silentpayments".into(), Value::Object(spi));
+    }
     Value::Object(top)
 }
 
@@ -161,6 +208,27 @@ pub fn get_index_info(
 /// linear `progress_ratio` (no two-pass weighting).
 #[cfg(feature = "block-filter-index")]
 fn estimate_filter_remaining_seconds(report: &filter::StatusReport) -> u64 {
+    if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
+        return 0;
+    }
+    if report.started_at_unix == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now <= report.started_at_unix {
+        return 0;
+    }
+    let elapsed = now - report.started_at_unix;
+    let remaining_ratio = 1.0 - report.progress_ratio;
+    ((elapsed as f64) * (remaining_ratio / report.progress_ratio)) as u64
+}
+
+/// ETA estimator for the single-pass SP-index backfill. Same shape as the
+/// filter estimator — reads the linear `progress_ratio`.
+fn estimate_sp_remaining_seconds(report: &silent_payments::StatusReport) -> u64 {
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }
@@ -222,6 +290,9 @@ pub fn backfill_index(
     chain: &Arc<ChainState>,
     address_index_enabled: bool,
     target: &str,
+    sp_backfill: Option<&Arc<silent_payments::BackfillHandle>>,
+    sp_cmd_tx: Option<&tokio::sync::mpsc::Sender<silent_payments::BackfillCommand>>,
+    sp_index_enabled: bool,
     #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
     #[cfg(feature = "block-filter-index")] filter_cmd_tx: Option<
         &tokio::sync::mpsc::Sender<filter::BackfillCommand>,
@@ -236,6 +307,9 @@ pub fn backfill_index(
             chain,
             block_filter_index_enabled,
         );
+    }
+    if target == "silentpayment" {
+        return backfill_index_sp(sp_backfill, sp_cmd_tx, chain, sp_index_enabled);
     }
     if target != "address" {
         return Err((-8, format!("unknown index target '{}'", target)));
@@ -422,6 +496,7 @@ fn require_active_backfill(handle: &Arc<BackfillHandle>) -> Result<(), (i32, Str
 pub fn pause_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    sp_backfill: Option<&Arc<silent_payments::BackfillHandle>>,
     #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
     #[cfg(feature = "block-filter-index")]
@@ -429,6 +504,12 @@ pub fn pause_index(
         let h = filter_backfill
             .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
         require_active_filter_backfill(h)?;
+        h.pause();
+        return Ok(json!({"paused": true, "state": h.cursor().state.label()}));
+    }
+    if target == "silentpayment" {
+        let h = sp_backfill.ok_or((-32603, "SP backfill handle not initialized".to_string()))?;
+        require_active_sp_backfill(h)?;
         h.pause();
         return Ok(json!({"paused": true, "state": h.cursor().state.label()}));
     }
@@ -444,6 +525,7 @@ pub fn pause_index(
 pub fn resume_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    sp_backfill: Option<&Arc<silent_payments::BackfillHandle>>,
     #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
     #[cfg(feature = "block-filter-index")]
@@ -451,6 +533,12 @@ pub fn resume_index(
         let h = filter_backfill
             .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
         require_active_filter_backfill(h)?;
+        h.resume();
+        return Ok(json!({"resumed": true, "state": h.cursor().state.label()}));
+    }
+    if target == "silentpayment" {
+        let h = sp_backfill.ok_or((-32603, "SP backfill handle not initialized".to_string()))?;
+        require_active_sp_backfill(h)?;
         h.resume();
         return Ok(json!({"resumed": true, "state": h.cursor().state.label()}));
     }
@@ -466,6 +554,7 @@ pub fn resume_index(
 pub fn cancel_index(
     backfill: Option<&Arc<BackfillHandle>>,
     target: &str,
+    sp_backfill: Option<&Arc<silent_payments::BackfillHandle>>,
     #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
 ) -> Result<Value, (i32, String)> {
     #[cfg(feature = "block-filter-index")]
@@ -473,6 +562,12 @@ pub fn cancel_index(
         let h = filter_backfill
             .ok_or((-32603, "filter backfill handle not initialized".to_string()))?;
         require_active_filter_backfill(h)?;
+        h.cancel();
+        return Ok(json!({"cancelled": true, "state": h.cursor().state.label()}));
+    }
+    if target == "silentpayment" {
+        let h = sp_backfill.ok_or((-32603, "SP backfill handle not initialized".to_string()))?;
+        require_active_sp_backfill(h)?;
         h.cancel();
         return Ok(json!({"cancelled": true, "state": h.cursor().state.label()}));
     }
@@ -663,6 +758,156 @@ fn map_filter_backfill_err(e: filter::BackfillError) -> (i32, String) {
             "block filter index is disabled; enable --blockfilterindex=basic first".into(),
         ),
         other => (-32603, format!("filter backfill setup failed: {}", other)),
+    }
+}
+
+/// Mirror of `require_active_backfill` for the SP-index family.
+fn require_active_sp_backfill(
+    handle: &Arc<silent_payments::BackfillHandle>,
+) -> Result<(), (i32, String)> {
+    use silent_payments::BackfillState;
+    let state = handle.cursor().state;
+    match state {
+        BackfillState::Running | BackfillState::Paused => Ok(()),
+        _ => Err((
+            -8,
+            format!(
+                "no SP backfill is in progress (state: {}); pause/resume/cancel apply only to running or paused backfills",
+                state.label()
+            ),
+        )),
+    }
+}
+
+/// SP-index `backfillindex silentpayment` handler. Single-pass walk from
+/// taproot activation → tip; the synchronous setup runs `preflight_disk`,
+/// captures the active-chain anchor, and atomically persists `Running`
+/// before signalling the supervisor. Same lifecycle as the filter
+/// handler.
+fn backfill_index_sp(
+    backfill: Option<&Arc<silent_payments::BackfillHandle>>,
+    cmd_tx: Option<&tokio::sync::mpsc::Sender<silent_payments::BackfillCommand>>,
+    chain: &Arc<ChainState>,
+    sp_index_enabled: bool,
+) -> Result<Value, (i32, String)> {
+    use silent_payments::BackfillState as SState;
+    if !sp_index_enabled {
+        return Err((
+            -8,
+            "silent-payment index is disabled (--silentpaymentindex=0); enable it before requesting a backfill"
+                .into(),
+        ));
+    }
+    let h = backfill.ok_or((-32603, "SP backfill handle not initialized".to_string()))?;
+    let tx = cmd_tx.ok_or((
+        -32603,
+        "SP backfill supervisor not running — restart the daemon to wire it".to_string(),
+    ))?;
+
+    let cur = h.cursor();
+    match cur.state {
+        SState::Running | SState::Paused => Ok(sp_in_progress_response(&cur)),
+        SState::Completed => Ok(json!({
+            "started": false,
+            "reason": "SP backfill already completed for this datadir",
+            "state": cur.state.label(),
+            "snapshot_height": cur.snapshot_height,
+        })),
+        SState::Idle | SState::Cancelled | SState::Rejected | SState::Failed => {
+            sp_start_fresh(h, tx, chain, &cur)
+        }
+    }
+}
+
+fn sp_in_progress_response(cur: &silent_payments::BackfillCursor) -> Value {
+    json!({
+        "started": false,
+        "reason": "SP backfill already in progress",
+        "state": cur.state.label(),
+        "cursor_height": cur.cursor_height,
+        "snapshot_height": cur.snapshot_height,
+    })
+}
+
+fn sp_start_fresh(
+    h: &Arc<silent_payments::BackfillHandle>,
+    tx: &tokio::sync::mpsc::Sender<silent_payments::BackfillCommand>,
+    chain: &Arc<ChainState>,
+    prev: &silent_payments::BackfillCursor,
+) -> Result<Value, (i32, String)> {
+    silent_payments::preflight_disk(chain).map_err(map_sp_backfill_err)?;
+
+    let (tip_hash, tip_height) = chain.tip_snapshot();
+    let store = chain.store_ref();
+
+    // Chain at (or before) taproot activation: no SP-eligible blocks
+    // exist yet, so there's nothing to walk. Stamp the completeness
+    // marker synchronously and Complete without spawning a runner — the
+    // marker means "no holes below the tip", which is trivially true when
+    // there are no eligible blocks. A later block connect above activation
+    // is handled by the live emit path (which keeps the index whole).
+    let walk_start = crate::validation::script::activation_heights(chain.network)
+        .taproot
+        .max(1);
+    if tip_height < walk_start {
+        h.reset_flags();
+        h.start(store.as_ref(), tip_height, tip_hash.to_byte_array())
+            .map_err(map_sp_backfill_err)?;
+        h.mark_completed(store.as_ref())
+            .map_err(map_sp_backfill_err)?;
+        return Ok(json!({
+            "started": true,
+            "completed": true,
+            "reason": "chain has not reached taproot activation — no eligible blocks",
+            "previous_state": prev.state.label(),
+        }));
+    }
+
+    let permit = match tx.try_reserve() {
+        Ok(p) => p,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return Ok(json!({
+                "started": false,
+                "reason": "another SP backfill start is already queued",
+                "state": prev.state.label(),
+            }));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err((
+                -32603,
+                "SP backfill supervisor channel closed; restart the daemon".to_string(),
+            ));
+        }
+    };
+
+    h.reset_flags();
+    match h.start(store.as_ref(), tip_height, tip_hash.to_byte_array()) {
+        Ok(()) => {}
+        Err(silent_payments::BackfillError::AlreadyRunning(_)) => {
+            drop(permit);
+            return Ok(sp_in_progress_response(&h.cursor()));
+        }
+        Err(e) => {
+            drop(permit);
+            return Err(map_sp_backfill_err(e));
+        }
+    }
+    permit.send(silent_payments::BackfillCommand::Start);
+    Ok(json!({
+        "started": true,
+        "previous_state": prev.state.label(),
+        "snapshot_height": tip_height,
+    }))
+}
+
+fn map_sp_backfill_err(e: silent_payments::BackfillError) -> (i32, String) {
+    use silent_payments::BackfillError as E;
+    match e {
+        E::SilentPaymentIndexDisabled => (
+            -8,
+            "silent-payment index is disabled; enable --silentpaymentindex=1 first".into(),
+        ),
+        other => (-32603, format!("SP backfill setup failed: {}", other)),
     }
 }
 

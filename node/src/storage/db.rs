@@ -42,6 +42,8 @@ pub struct InMemoryStore {
     /// opt-in), mirroring the always-present `outpoint_spend` map.
     sp_tweaks: parking_lot::RwLock<std::collections::HashMap<u32, node_sp_index::SpBlockRow>>,
     sp_complete: parking_lot::RwLock<bool>,
+    sp_backfill_cursor: parking_lot::RwLock<node_sp_index::cursor::BackfillCursor>,
+    sp_backfill_last_error: parking_lot::RwLock<Option<String>>,
 }
 
 impl Default for InMemoryStore {
@@ -89,6 +91,10 @@ impl InMemoryStore {
             // stamp it explicitly (or drive a from-genesis connect chain,
             // which needs no backfill).
             sp_complete: parking_lot::RwLock::new(true),
+            sp_backfill_cursor: parking_lot::RwLock::new(
+                node_sp_index::cursor::BackfillCursor::idle(),
+            ),
+            sp_backfill_last_error: parking_lot::RwLock::new(None),
         }
     }
 
@@ -247,6 +253,16 @@ impl Store for InMemoryStore {
             }
             for height in batch.sp_tweak_removes {
                 sp.remove(&height);
+            }
+        }
+        if let Some(adv) = batch.sp_backfill_cursor_advance {
+            let mut cur = self.sp_backfill_cursor.write();
+            cur.state = adv.state;
+            cur.cursor_height = adv.cursor_height;
+            cur.snapshot_height = adv.snapshot_height;
+            cur.started_at_unix = adv.started_at_unix;
+            if adv.snapshot_tip_hash != [0u8; 32] {
+                cur.snapshot_tip_hash = adv.snapshot_tip_hash;
             }
         }
 
@@ -423,6 +439,29 @@ impl Store for InMemoryStore {
 
     fn silent_payment_index_complete(&self) -> bool {
         *self.sp_complete.read()
+    }
+
+    fn mark_silent_payment_index_complete(&self) -> Result<(), StoreError> {
+        *self.sp_complete.write() = true;
+        Ok(())
+    }
+
+    fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
+        *self.sp_backfill_cursor.read()
+    }
+
+    fn read_sp_backfill_last_error(&self) -> Option<String> {
+        self.sp_backfill_last_error.read().clone()
+    }
+
+    fn write_sp_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        let mut slot = self.sp_backfill_last_error.write();
+        if msg.is_empty() {
+            *slot = None;
+        } else {
+            *slot = Some(msg.to_string());
+        }
+        Ok(())
     }
 
     #[cfg(feature = "block-filter-index")]
