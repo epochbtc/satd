@@ -6,3 +6,4 @@
 pub mod address;
 pub mod filter;
 pub mod outpoint_spend;
+pub mod silent_payments;

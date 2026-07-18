@@ -129,6 +129,18 @@ pub struct StoreBatch {
     /// Mirrors `backfill_cursor_advance` for the address-index family.
     #[cfg(feature = "block-filter-index")]
     pub filter_backfill_cursor_advance: Option<FilterBackfillCursorWrite>,
+    /// BIP 352 silent-payment tweak rows, `(height, row)`. Populated by
+    /// `connect_block`'s end-of-loop emit when the SP index is
+    /// runtime-enabled and the height is at/above taproot activation.
+    /// Always compiled (runtime opt-in, not a cargo feature) — the SP
+    /// index follows the address-index model, so these fields are never
+    /// `cfg`-gated.
+    pub sp_tweak_puts: Vec<(u32, node_sp_index::SpBlockRow)>,
+    /// Heights whose `sp_tweaks` row should be dropped. Used by
+    /// `disconnect_block` when reversing a connected block. One row per
+    /// height (keyed by `height_be`), so a single entry drops the block's
+    /// tweak row; a subsequent connect at the same height overwrites it.
+    pub sp_tweak_removes: Vec<u32>,
 }
 
 /// Atomic cursor update emitted by the backfill task at each batch boundary.
@@ -294,6 +306,24 @@ impl StoreBatch {
                 self.filter_backfill_cursor_advance = other.filter_backfill_cursor_advance;
             }
         }
+
+        // SP index: last-writer-wins by height. A connect → disconnect →
+        // connect at the same height (an A→B→A reorg) must end with the
+        // put winning, and a connect at a height whose row is in the prior
+        // batch's removes must drop the remove. Mirrors the filter merge,
+        // keyed by `u32` height instead of `(type, height)`.
+        if !other.sp_tweak_removes.is_empty() {
+            let drop: std::collections::HashSet<u32> =
+                other.sp_tweak_removes.iter().copied().collect();
+            self.sp_tweak_puts.retain(|(h, _)| !drop.contains(h));
+        }
+        if !other.sp_tweak_puts.is_empty() {
+            let drop: std::collections::HashSet<u32> =
+                other.sp_tweak_puts.iter().map(|(h, _)| *h).collect();
+            self.sp_tweak_removes.retain(|h| !drop.contains(h));
+        }
+        self.sp_tweak_puts.extend(other.sp_tweak_puts);
+        self.sp_tweak_removes.extend(other.sp_tweak_removes);
     }
 }
 
@@ -715,5 +745,23 @@ pub trait Store: Send + Sync {
         Err(StoreError::Database(
             "write_filter_backfill_last_error not supported on this backend".into(),
         ))
+    }
+
+    /// Read the decoded BIP 352 tweak row for the block at `height`.
+    /// `None` when the row doesn't exist (below taproot activation, above
+    /// tip, or a not-yet-backfilled range) or the backend has no SP-index
+    /// storage. The row carries the hash of the block it describes
+    /// (§3.2), so callers verify identity without a height→hash lookup.
+    /// Default: `None`.
+    fn get_sp_tweaks_row(&self, _height: u32) -> Option<node_sp_index::SpBlockRow> {
+        None
+    }
+
+    /// True when the BIP 352 tweak index is fully populated for the
+    /// active chain (`sp_index.complete` marker set). Symmetric to
+    /// `block_filter_index_complete`. Default: `true` for backends
+    /// without SP-index storage.
+    fn silent_payment_index_complete(&self) -> bool {
+        true
     }
 }

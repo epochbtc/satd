@@ -558,6 +558,13 @@ async fn main() {
             enabled: config.blockfilterindex,
             peer_serve: config.peerblockfilters,
         },
+        // BIP 352 silent-payment tweak index: off unless
+        // `--silentpaymentindex=1`. When disabled the per-block emit is a
+        // no-op and defaults are byte-identical to a node that never set
+        // it.
+        node::index::silent_payments::SpIndexConfig {
+            enabled: config.silentpaymentindex,
+        },
     ) {
         Ok(mut cs) => {
             // Custom signet (BIP 325): enables block-solution validation

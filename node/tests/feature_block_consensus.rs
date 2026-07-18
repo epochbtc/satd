@@ -241,6 +241,7 @@ fn connect(store: &dyn Store, block: &Block, height: u32, mtp: u32) -> Satd {
         address_index: &Default::default(),
         #[cfg(feature = "block-filter-index")]
         filter_index: &Default::default(),
+        sp_index: &Default::default(),
         phase_tracker: None,
     })
     .map(|_| ())

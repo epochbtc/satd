@@ -341,6 +341,7 @@ impl BackgroundChainState {
         let addr_index = crate::index::address::AddressIndexConfig::default();
         #[cfg(feature = "block-filter-index")]
         let filter_index = crate::index::filter::FilterIndexConfig::default();
+        let sp_index = crate::index::silent_payments::SpIndexConfig::default();
 
         let batch = connect::connect_block(&connect::ConnectParams {
             store: store_ref,
@@ -355,6 +356,7 @@ impl BackgroundChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &addr_index,
+            sp_index: &sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
             phase_tracker: None,

@@ -57,6 +57,7 @@ pub fn disconnect_block(
     prev_hash: bitcoin::BlockHash,
     address_index: &AddressIndexConfig,
     #[cfg(feature = "block-filter-index")] filter_index: &FilterIndexConfig,
+    sp_index: &crate::index::silent_payments::SpIndexConfig,
 ) -> Result<StoreBatch, DisconnectError> {
     let mut batch = StoreBatch::default();
 
@@ -187,6 +188,15 @@ pub fn disconnect_block(
     #[cfg(feature = "block-filter-index")]
     if let Some(key) = crate::index::filter::filter_remove_key(filter_index, block_height) {
         batch.filter_removes.push(key);
+    }
+
+    // BIP 352 tweak index: drop this height's row. Keyed by height, so a
+    // single entry drops the block's tweak row; a subsequent connect of a
+    // different block at the same height overwrites it deterministically.
+    // A remove for a height with no row (e.g. below taproot activation) is
+    // a harmless no-op delete.
+    if sp_index.enabled {
+        batch.sp_tweak_removes.push(block_height);
     }
 
     Ok(batch)
@@ -379,6 +389,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -395,7 +406,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // coin_removes should contain the coinbase output(s)
         let coinbase_txid = block.txdata[0].compute_txid();
@@ -415,6 +426,134 @@ mod tests {
 
         // Tip should be set to prev_hash
         assert_eq!(batch.tip, Some(prev_hash));
+    }
+
+    /// SP index write path: connect stamps a row per block (present even
+    /// when empty), disconnect drops it, reconnect restores an identical
+    /// row, and a disabled index writes nothing. Uses coinbase-only
+    /// blocks — the tweak-contents correctness is proven against the
+    /// BIP 352 vectors in `node-sp-index`; here we prove the plumbing.
+    #[test]
+    fn test_sp_index_connect_disconnect_reconnect() {
+        use crate::index::silent_payments::SpIndexConfig;
+        let sp_on = SpIndexConfig { enabled: true };
+
+        let store = InMemoryStore::new();
+        let prev_hash = BlockHash::all_zeros();
+        let block = make_coinbase_only_block(1, prev_hash);
+        let block_hash = block.block_hash();
+
+        let connect = |sp: &SpIndexConfig| {
+            connect_block(&ConnectParams {
+                store: &store,
+                block: &block,
+                height: 1,
+                parent_chainwork: &[0u8; 32],
+                flat_pos: default_pos(),
+                script_verifier: &NoopVerifier,
+                median_time_past: 0,
+                network: Network::Regtest,
+                pre_verified_txs: None,
+                num_threads: 1,
+                precomputed_txids: None,
+                address_index: &Default::default(),
+                sp_index: sp,
+                #[cfg(feature = "block-filter-index")]
+                filter_index: &Default::default(),
+                phase_tracker: None,
+            })
+            .unwrap()
+        };
+
+        // Enabled: one row at height 1 (regtest taproot activation = 0),
+        // present but empty (coinbase-only block has no eligible tx), and
+        // carrying the block's own hash — self-authenticating.
+        let batch = connect(&sp_on);
+        assert_eq!(batch.sp_tweak_puts.len(), 1);
+        assert_eq!(batch.sp_tweak_puts[0].0, 1);
+        store.write_batch(batch).unwrap();
+        let row = store.get_sp_tweaks_row(1).expect("row present after connect");
+        assert_eq!(row.block_hash, block_hash);
+        assert!(row.entries.is_empty());
+
+        // Disconnect drops the row.
+        let undo = UndoData::default();
+        let disc = disconnect_block(
+            &block,
+            &undo,
+            1,
+            prev_hash,
+            &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            &Default::default(),
+            &sp_on,
+        )
+        .unwrap();
+        assert_eq!(disc.sp_tweak_removes, vec![1]);
+        store.write_batch(disc).unwrap();
+        assert!(
+            store.get_sp_tweaks_row(1).is_none(),
+            "row gone after disconnect"
+        );
+
+        // Reconnect restores a byte-identical row.
+        let rebatch = connect(&sp_on);
+        store.write_batch(rebatch).unwrap();
+        let row2 = store
+            .get_sp_tweaks_row(1)
+            .expect("row present after reconnect");
+        assert_eq!(row2, row, "reconnected row identical to the original");
+    }
+
+    /// Flag off ⇒ zero behavior change: connect emits no SP rows and
+    /// disconnect removes none.
+    #[test]
+    fn test_sp_index_disabled_emits_nothing() {
+        let store = InMemoryStore::new();
+        let prev_hash = BlockHash::all_zeros();
+        let block = make_coinbase_only_block(1, prev_hash);
+
+        let batch = connect_block(&ConnectParams {
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+        assert!(
+            batch.sp_tweak_puts.is_empty(),
+            "disabled index emits no rows"
+        );
+        store.write_batch(batch).unwrap();
+        assert!(store.get_sp_tweaks_row(1).is_none());
+
+        let disc = disconnect_block(
+            &block,
+            &UndoData::default(),
+            1,
+            prev_hash,
+            &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            disc.sp_tweak_removes.is_empty(),
+            "disabled index removes nothing"
+        );
     }
 
     #[test]
@@ -439,6 +578,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -454,7 +594,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // The spent coin should be restored
         assert_eq!(batch.coin_puts.len(), 1, "should restore exactly one spent coin");
@@ -499,6 +639,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -514,7 +655,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         let (restored_op, restored_coin) = &batch.coin_puts[0];
         assert_eq!(*restored_op, outpoint);
@@ -529,7 +670,7 @@ mod tests {
         let block = make_coinbase_only_block(5, BlockHash::all_zeros());
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 5, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         assert_eq!(batch.height_hash_removes, vec![5]);
     }
@@ -542,7 +683,7 @@ mod tests {
         let block = make_coinbase_only_block(3, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 3, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         assert_eq!(batch.tip, Some(prev_hash));
     }
@@ -646,6 +787,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -661,7 +803,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // All 3 txs' outputs should be in coin_removes
         // coinbase has 1 output, tx1 has 1, tx2 has 1 = 3 total
@@ -767,6 +909,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -782,7 +925,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, height, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // All 3 spent inputs should be restored
         assert_eq!(batch.coin_puts.len(), 3);
@@ -834,6 +977,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -853,7 +997,7 @@ mod tests {
         assert!(store.get_coin(&other_op).is_some());
 
         // Disconnect
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
         store.write_batch(batch).unwrap();
 
         // The other coin should still be present
@@ -886,6 +1030,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -922,7 +1067,7 @@ mod tests {
         assert!(store.get_coin(&outpoint).is_none());
 
         // Disconnect
-        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let disconnect_batch = disconnect_block(&block, &undo, 1, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
         store.write_batch(disconnect_batch).unwrap();
 
         // After disconnect, the original coin should be back
@@ -943,6 +1088,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -968,7 +1114,7 @@ mod tests {
         let block = make_coinbase_only_block(10, prev_hash);
         let undo = UndoData::default();
 
-        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 10, prev_hash, &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // Should still remove coinbase outputs
         assert!(!batch.coin_removes.is_empty());
@@ -1004,6 +1150,7 @@ mod tests {
                 num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1032,7 +1179,7 @@ mod tests {
 
         store.write_batch(connect_batch).unwrap();
 
-        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default()).unwrap();
+        let batch = disconnect_block(&block, &undo, 1, BlockHash::all_zeros(), &Default::default(), #[cfg(feature = "block-filter-index")] &Default::default(), &Default::default()).unwrap();
 
         // Every txid that was added by connect_block must be removed by
         // disconnect_block.
@@ -1074,6 +1221,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1103,6 +1251,7 @@ mod tests {
             BlockHash::all_zeros(),
             &cfg,
             #[cfg(feature = "block-filter-index")]
+            &Default::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1145,6 +1294,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &disabled,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1169,6 +1319,7 @@ mod tests {
             BlockHash::all_zeros(),
             &disabled,
             #[cfg(feature = "block-filter-index")]
+            &Default::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1199,6 +1350,7 @@ mod tests {
             BlockHash::all_zeros(),
             &Default::default(),
             &fcfg,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(batch.filter_removes.len(), 1);
@@ -1221,6 +1373,7 @@ mod tests {
             BlockHash::all_zeros(),
             &Default::default(),
             &crate::index::filter::FilterIndexConfig::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(batch.filter_removes.is_empty());
@@ -1248,6 +1401,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1269,6 +1423,7 @@ mod tests {
             BlockHash::all_zeros(),
             &Default::default(),
             #[cfg(feature = "block-filter-index")]
+            &Default::default(),
             &Default::default(),
         );
         let err = match result {
@@ -1317,7 +1472,8 @@ mod tests {
             450,
         4,
         Default::default(),
-        Default::default(),)
+        Default::default(),
+            Default::default(),)
         .unwrap();
 
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();

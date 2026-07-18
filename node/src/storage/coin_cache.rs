@@ -644,6 +644,8 @@ impl Store for CoinCache {
             || !batch.outpoint_spend_removes.is_empty()
             || !batch.addr_backfill_temp_puts.is_empty()
             || batch.backfill_cursor_advance.is_some()
+            || !batch.sp_tweak_puts.is_empty()
+            || !batch.sp_tweak_removes.is_empty()
             || has_filter
             || {
                 #[cfg(feature = "block-filter-index")]
@@ -685,6 +687,8 @@ impl Store for CoinCache {
                     filter_removes: batch.filter_removes,
                     #[cfg(feature = "block-filter-index")]
                     filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
+                    sp_tweak_puts: batch.sp_tweak_puts,
+                    sp_tweak_removes: batch.sp_tweak_removes,
                 };
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
@@ -722,6 +726,8 @@ impl Store for CoinCache {
                     filter_removes: batch.filter_removes,
                     #[cfg(feature = "block-filter-index")]
                     filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
+                    sp_tweak_puts: batch.sp_tweak_puts,
+                    sp_tweak_removes: batch.sp_tweak_removes,
                     ..Default::default()
                 };
                 pending.merge(addr_only);

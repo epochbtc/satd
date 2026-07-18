@@ -265,6 +265,7 @@ pub fn repair_lost_connect_delta(
         num_threads,
         precomputed_txids: None,
         address_index,
+        sp_index: &Default::default(),
         #[cfg(feature = "block-filter-index")]
         filter_index: &Default::default(),
         phase_tracker: None,
@@ -544,6 +545,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &AddressIndexConfig::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
