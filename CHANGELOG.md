@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Silent payments (BIP 352): new workspace-internal `node-sp-index` crate — the
+  shared BIP 352 kernel (input extraction, public tweak `T = input_hash · A`,
+  scan loop) plus the `sp_tweaks` row/key codec, backfill cursor, read trait,
+  and config. Validated against the BIP 352 v1.1.0 test vectors. Foundation
+  only; not yet wired into the daemon.
+
 ## Releases
 
 | Version | Date | Notes |
