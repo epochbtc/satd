@@ -1318,6 +1318,11 @@ impl WatchRegistry {
         }
         let wants_raw = self.wants_any_raw_tx();
         scan_tx_sp(&inner, &work, tx, prev_scripts, false, None, wants_raw, &mut LiveSink);
+        // Scrub the reconstructed `b_scan` SecretKeys before `work` drops (see
+        // scan_block_sp; secp256k1 0.29 has no zeroize-on-drop).
+        for (_, sk, _) in &mut work {
+            sk.non_secure_erase();
+        }
     }
 
     /// Arm depth entries whose txid appears in a freshly connected block,
@@ -1989,6 +1994,13 @@ fn scan_block_sp(
             sink,
         );
     }
+
+    // Best-effort scrub of the reconstructed `b_scan` SecretKeys before `work`
+    // drops (secp256k1 0.29 has no zeroize-on-drop), so a live block scan leaves
+    // no plaintext scan secrets in freed memory (§4.3).
+    for (_, sk, _) in &mut work {
+        sk.non_secure_erase();
+    }
 }
 
 /// Silent-payment scan of a **single** transaction against the pre-resolved
@@ -2072,14 +2084,6 @@ fn scan_tx_sp(
             };
             sink.emit(inner, *sid, &wm);
         }
-    }
-
-    // The reconstructed `b_scan` SecretKeys in `work` have no zeroize-on-drop
-    // (secp256k1 0.29 only offers `non_secure_erase`). Best-effort scrub before
-    // they drop so a live block scan does not leave plaintext scan secrets in
-    // freed memory (§4.3, "clear intermediate secrets").
-    for (_, sk, _) in &mut work {
-        sk.non_secure_erase();
     }
 }
 
