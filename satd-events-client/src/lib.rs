@@ -127,13 +127,13 @@ mod resilience;
 mod resilient_watch;
 
 pub use client::{
-    AutoClose, Categories, EventStream, StreamClient, StreamClientBuilder, SubscribeOptions,
-    WatchHandle,
+    AutoClose, Categories, EventStream, SilentPaymentTarget, StreamClient, StreamClientBuilder,
+    SubscribeOptions, WatchHandle,
 };
 pub use error::StreamError;
 pub use event::{
     Cursor, CursorRejectReason, DescriptorMatch, Event, EvictReason, Outpoint, PrefixMatch,
-    RescanRejectReason, ScriptPrefix, SpentPrevout, WatchSetRejectReason,
+    RescanRejectReason, ScriptPrefix, SpentPrevout, TweakEntry, WatchSetRejectReason,
 };
 pub use resilience::{
     Backoff, CursorStore, FileCursorStore, LagPolicy, NoopCursorStore, ResilientConfig,

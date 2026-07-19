@@ -82,6 +82,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   recomputing that block. Both paths run the same kernel, so acceleration never
   changes which payments a rescan finds. No new surface or config; a scan-key
   cold-sync just gets faster when the index is on.
+- Silent payments (BIP 352): Rust SDK (`satd-events-client`) support for both
+  consumption modes. Typed `Event::BlockTweaks` (Tier 1) and
+  `Event::SilentPaymentMatched` (Tier 2); a `Categories::TWEAKS` bit and
+  `SubscribeOptions::tweak_dust_limit` / `tweaks_only`; `WatchHandle` and
+  `ResilientWatch` / `WatchSetBuilder` `add_silent_payments` /
+  `remove_silent_payments` helpers (scan keys re-register on reconnect); and two
+  runnable examples — `sp_light_scan.rs` (client-side scan off the tweaks
+  firehose, scan key never sent) and `sp_wallet.rs` (scan-key watch, deriving
+  each match's spending key offline from `tweak` + `k`).
 
 ## Releases
 

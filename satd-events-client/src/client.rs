@@ -33,6 +33,13 @@ impl Categories {
     pub const CHAIN: u32 = 2;
     /// Heartbeats.
     pub const HEARTBEAT: u32 = 4;
+    /// BIP 352 silent-payment per-block tweaks (Tier 1 client-side scan). Unlike
+    /// the other bits this is **not** part of the [`ALL`](Self::ALL) (`0`)
+    /// default: a subscription must request it explicitly, so an existing
+    /// `0`-subscriber never starts receiving tweak volume after a node upgrade.
+    /// Requires the node's tweak index (`silentpaymentindex=1`); a `tweaks`
+    /// subscription against a node with it disabled is refused in-band.
+    pub const TWEAKS: u32 = 8;
 }
 
 /// Options for a [`StreamClient::subscribe`] firehose.
@@ -46,23 +53,95 @@ pub struct SubscribeOptions {
     /// Forward-only dedup filter: drop events with `seq <= since_seq`. Use after
     /// a brief reconnect within the broadcast window — not for durable replay.
     pub since_seq: Option<u64>,
+    /// Silent-payment tweak dust floor (satoshis): drop [`TweakEntry`](crate::TweakEntry)
+    /// whose `max_value` is below this, and flag the block `filtered`. Only
+    /// meaningful with the [`TWEAKS`](Categories::TWEAKS) category. `None` = keep
+    /// every tweak.
+    pub tweak_dust_limit: Option<u64>,
+    /// Compact tweak form: when `true`, tweak entries carry only the 33-byte
+    /// tweak (no `txid`/`max_value`), minimizing bytes for a pure client-side
+    /// scan. Only meaningful with the [`TWEAKS`](Categories::TWEAKS) category.
+    pub tweaks_only: bool,
 }
 
 impl SubscribeOptions {
+    // `..Default::default()` is redundant against the current workspace proto but
+    // retained so this published crate still compiles if the schema grows fields
+    // ahead of this literal (the same resilience the released-proto pin needs).
+    #[allow(clippy::needless_update)]
     fn into_request(self) -> pb::SubscribeRequest {
-        // `..Default::default()` (not an explicit field list) so this compiles
-        // against both the released `satd-events-proto` this crate is pinned to
-        // and the newer in-workspace schema: fields added later (e.g. the BIP 352
-        // `tweak_dust_limit` / `tweaks_only` knobs) default to the pre-existing
-        // behavior without being named here. A typed builder lands once the proto
-        // is released and the pin advances (PR 8).
         pb::SubscribeRequest {
             categories: self.categories,
             since_seq: self.since_seq,
             from_cursor: self.from_cursor,
+            tweak_dust_limit: self.tweak_dust_limit,
+            // Send the flag only when set, so a default subscription is
+            // byte-identical to one built before these knobs existed.
+            tweaks_only: self.tweaks_only.then_some(true),
             ..Default::default()
         }
     }
+}
+
+/// A BIP 352 scan-key watch target (Tier 2): a `(scan_secret, spend_pubkey)`
+/// pair plus optional labels, registered via
+/// [`WatchHandle::add_silent_payments`]. The node runs the ECDH match and pushes
+/// [`Event::SilentPaymentMatched`](crate::Event::SilentPaymentMatched).
+///
+/// `scan_secret` is a **watch credential**, not a spending key: disclosing it
+/// lets the node (and anyone who compromises it) learn *which* outputs are
+/// yours, but never spend them — spend authority stays with `B_spend`'s private
+/// half, which is never sent. `Debug` redacts the scan secret.
+#[derive(Clone)]
+pub struct SilentPaymentTarget {
+    /// 32-byte scan secret `b_scan`.
+    pub scan_secret: [u8; 32],
+    /// 33-byte compressed spend public key `B_spend` (public half only).
+    pub spend_pubkey: [u8; 33],
+    /// Receiver label integers to also match. Include `0` to catch change.
+    pub labels: Vec<u32>,
+}
+
+impl core::fmt::Debug for SilentPaymentTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SilentPaymentTarget")
+            .field("scan_secret", &"<redacted>")
+            .field("spend_pubkey", &hex_lower(&self.spend_pubkey))
+            .field("labels", &self.labels)
+            .finish()
+    }
+}
+
+impl SilentPaymentTarget {
+    pub(crate) fn to_proto(&self) -> pb::SilentPaymentTarget {
+        pb::SilentPaymentTarget {
+            scan_secret: self.scan_secret.to_vec(),
+            spend_pubkey: self.spend_pubkey.to_vec(),
+            labels: self.labels.clone(),
+        }
+    }
+
+    /// The target's identity `b_scan·G` (33-byte compressed) — the key used to
+    /// remove it ([`WatchHandle::remove_silent_payments`]) and how a
+    /// [`ResilientWatch`](crate::ResilientWatch) tracks it. Requires the
+    /// `bitcoin` feature (enabled by default) for the elliptic-curve derivation.
+    #[cfg(feature = "bitcoin")]
+    pub fn scan_pubkey(&self) -> Result<[u8; 33], StreamError> {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let sk = SecretKey::from_slice(&self.scan_secret)
+            .map_err(|_| StreamError::InvalidArgument("scan_secret is not a valid scalar".into()))?;
+        let secp = Secp256k1::signing_only();
+        Ok(PublicKey::from_secret_key(&secp, &sk).serialize())
+    }
+}
+
+/// Lowercase hex, for redacting `Debug` impls (no external dep).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// A live stream of typed [`Event`]s, shared by `Subscribe` and `Watch`.
@@ -373,6 +452,48 @@ impl WatchHandle {
         }
         self.send_msg(pb::subscribe_control::Msg::RemoveScriptPrefixes(
             pb::RemoveScriptPrefixes { prefixes },
+        ))
+        .await
+    }
+
+    /// Register BIP 352 scan-key watch targets (Tier 2). The node runs the ECDH
+    /// match server-side and pushes an
+    /// [`Event::SilentPaymentMatched`](crate::Event::SilentPaymentMatched) for
+    /// every output paying one of them. Up to 16 targets per connection; each
+    /// charges one watch-quota unit. Re-registering an existing target (same
+    /// `b_scan·G`) refreshes its labels.
+    ///
+    /// The `scan_secret` is a watch credential disclosed to the node — see
+    /// [`SilentPaymentTarget`]. This helper moves bytes only; validate the field
+    /// widths yourself (32-byte secret, 33-byte pubkey) or let the server reject
+    /// a malformed target.
+    pub async fn add_silent_payments(
+        &self,
+        targets: impl IntoIterator<Item = SilentPaymentTarget>,
+    ) -> Result<(), StreamError> {
+        let targets: Vec<pb::SilentPaymentTarget> =
+            targets.into_iter().map(|t| t.to_proto()).collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::AddSilentPayments(
+            pb::AddSilentPayments { targets },
+        ))
+        .await
+    }
+
+    /// Remove scan-key watch targets by their identity `b_scan·G` (33-byte
+    /// compressed, from [`SilentPaymentTarget::scan_pubkey`]), releasing quota.
+    pub async fn remove_silent_payments(
+        &self,
+        scan_pubkeys: impl IntoIterator<Item = [u8; 33]>,
+    ) -> Result<(), StreamError> {
+        let scan_pubkeys: Vec<Vec<u8>> = scan_pubkeys.into_iter().map(|k| k.to_vec()).collect();
+        if scan_pubkeys.is_empty() {
+            return Ok(());
+        }
+        self.send_msg(pb::subscribe_control::Msg::RemoveSilentPayments(
+            pb::RemoveSilentPayments { scan_pubkeys },
         ))
         .await
     }

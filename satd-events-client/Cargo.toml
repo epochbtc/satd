@@ -66,6 +66,14 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 name = "prefix_privacy"
 required-features = ["bitcoin"]
 
+[[example]]
+name = "sp_wallet"
+required-features = ["bitcoin"]
+
+[[example]]
+name = "sp_light_scan"
+required-features = ["bitcoin"]
+
 # TLS / mTLS examples use the `tls`-gated builder methods (`tls_ca_pem`,
 # `tls_client_identity`); gating them keeps a `--no-default-features --examples`
 # build clean.
