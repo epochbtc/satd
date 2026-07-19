@@ -1712,10 +1712,34 @@ impl NodeEventStream for NodeEventStreamSvc {
                                     // error, absent row, or mismatch falls back to
                                     // recompute (which needs undo). Both paths run
                                     // the same kernel, so results are identical.
-                                    let sp_row = sp_src
-                                        .as_ref()
-                                        .and_then(|sp| sp.tweaks_at(h).ok())
-                                        .filter(|row| row.block_hash == hash);
+                                    let sp_row = match sp_src.as_ref().map(|sp| sp.tweaks_at(h)) {
+                                        // Present and self-authenticating: fast path.
+                                        Some(Ok(row)) if row.block_hash == hash => Some(row),
+                                        // Present but a different block (reorg) →
+                                        // recompute; absent row (NotFound) → recompute.
+                                        Some(Ok(_))
+                                        | Some(Err(
+                                            node::index::silent_payments::SpIndexError::NotFound(_),
+                                        )) => None,
+                                        // A storage/decode fault is result-safe (the
+                                        // undo recompute below is authoritative) but,
+                                        // unlike NotFound, must not vanish silently — a
+                                        // persistent fault would disable the fast path
+                                        // for the whole rescan with no trace. Log at
+                                        // debug (this loops over up to MAX_RESCAN_BLOCKS
+                                        // blocks; warn would spam).
+                                        Some(Err(e)) => {
+                                            debug!(
+                                                target: "events::grpc",
+                                                height = h,
+                                                error = %e,
+                                                "rescan: sp_tweaks read failed; \
+                                                 recomputing this block from undo",
+                                            );
+                                            None
+                                        }
+                                        None => None, // acceleration disabled
+                                    };
                                     let need_undo =
                                         need_undo_nonsp || (has_sp && sp_row.is_none());
                                     let undo =
