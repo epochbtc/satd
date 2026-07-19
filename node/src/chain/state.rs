@@ -5093,6 +5093,10 @@ impl node_sp_index::SpIndex for ChainState {
         }
     }
 
+    fn activation_height(&self) -> u32 {
+        crate::validation::script::activation_heights(self.network).taproot
+    }
+
     fn is_complete(&self) -> bool {
         if !self.sp_index.enabled || !self.store.silent_payment_index_complete() {
             return false;

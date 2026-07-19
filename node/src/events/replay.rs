@@ -321,11 +321,21 @@ pub fn build_cursor_replay(
         // Unclamped tweaks-only cold-sync. The span can be the entire
         // taproot era, so we do NOT read the rows here (materializing them
         // would blow memory and block this async worker for minutes). Hand the
-        // carrier the `[start, tip]` range to page lazily off the index; each
-        // row is self-authenticating (carries its own block hash), so no
-        // height→hash pass is needed. Below activation the index has no row —
-        // the carrier skips `NotFound`, not an error.
-        deep_tweak_range = Some((start, snapshot_tip));
+        // carrier the range to page lazily off the index; each row is
+        // self-authenticating (carries its own block hash), so no height→hash
+        // pass is needed.
+        //
+        // Clamp the lower end up to taproot activation: below it the index has
+        // no row *by construction*, so serving that sub-range would be nothing
+        // but skipped `NotFound`s. Clamping means every height the carrier
+        // reads MUST have a row in a complete index — so the pager can treat a
+        // `NotFound` as a genuine hole (punched by a concurrent backfill/reorg
+        // that left the completeness marker set) and surface it in-band, rather
+        // than a client-undetectable silent skip.
+        let deep_start = start.max(sp.map(|s| s.activation_height()).unwrap_or(start));
+        if deep_start <= snapshot_tip {
+            deep_tweak_range = Some((deep_start, snapshot_tip));
+        }
     } else if (chain_on || tweaks_on) && start <= snapshot_tip {
         // Boundary re-emit: a mixed subscriber whose cursor sits between a
         // height's chain event (`tx_index == 0`) and its tweak aggregate
@@ -704,6 +714,9 @@ mod tests {
         fn is_complete(&self) -> bool {
             self.complete
         }
+        fn activation_height(&self) -> u32 {
+            self.activation
+        }
     }
 
     fn tweaks_count(r: &CursorReplay) -> usize {
@@ -771,17 +784,30 @@ mod tests {
     }
 
     #[test]
-    fn deep_replay_defers_full_range_to_carrier() {
-        // A complete tweaks-only replay defers the entire `[start, tip]` span to
-        // the carrier regardless of activation height — the carrier's lazy pager
-        // skips `NotFound` heights below activation as it reads them (covered in
-        // the gRPC carrier tests). The builder itself materializes nothing.
+    fn deep_replay_clamps_range_lower_end_to_activation() {
+        // A complete tweaks-only replay defers the deep span to the carrier and
+        // clamps its lower end UP to taproot activation: below activation the
+        // index has no row by construction, so serving it would be nothing but
+        // skipped `NotFound`s. Clamping lets the carrier's pager treat any
+        // `NotFound` it then reads as a genuine hole rather than a silent skip.
+        // The builder itself materializes nothing.
         let src = FlatChain { tip: 30 };
         let pubr = publisher();
         let sp = MockSp { complete: true, activation: 20, tip: 30 };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
-        assert_eq!(r.deep_tweak_range, Some((1, 30)));
+        assert_eq!(r.deep_tweak_range, Some((20, 30)));
         assert_eq!(tweaks_count(&r), 0, "deep rows are not buffered in the builder");
+    }
+
+    #[test]
+    fn deep_replay_range_empty_when_activation_above_tip() {
+        // If the chain has not reached activation, the clamped lower end passes
+        // the tip and there is nothing to defer.
+        let src = FlatChain { tip: 15 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 20, tip: 15 };
+        let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
+        assert_eq!(r.deep_tweak_range, None);
     }
 
     #[test]

@@ -992,6 +992,17 @@ impl NodeEventStream for NodeEventStreamSvc {
                 last_h = (*h).max(last_h);
             }
             last_s = r.mempool_dedup_through.max(last_s);
+            // A deep tweaks-only cold-sync streams `[start, end]` through a
+            // separate stream that bypasses the live closure below, so `last_h`
+            // would otherwise still point at the request cursor for the whole
+            // multi-minute read. Seed it to the deep tail: if the client lags
+            // right after the cold-sync (the slow-phone case this feature is
+            // built for), the `Lagged` resume cursor then points at `end`, not
+            // ~taproot activation — resuming from activation would re-run the
+            // entire ~240k-block cold-sync and can livelock.
+            if let Some((_, end)) = r.deep_tweak_range {
+                last_h = end.max(last_h);
+            }
         }
 
         // `sub_guard` is moved into the live stream closure so the
@@ -1071,6 +1082,18 @@ impl NodeEventStream for NodeEventStreamSvc {
                 // in the builder. Page it lazily off the index with
                 // backpressure so peak memory is bounded and no async worker is
                 // ever blocked on the multi-minute read.
+                //
+                // A block that connects in the race window between `rx =
+                // subscribe()` and the snapshot tip is both read by the deep
+                // pager (height <= snapshot_tip) and buffered live, so its
+                // `BlockTweaks` can be delivered twice at the seam (bounded to
+                // the 1-2 blocks in that window). This duplicate is deliberate:
+                // it is the safe failure mode. A blanket "drop live tweaks at
+                // height <= snapshot_tip" would instead lose a block's tweaks if
+                // a reorg replaced it mid-cold-sync (the live re-emit carries the
+                // post-reorg tweaks the already-passed pager did not). Scanning
+                // clients re-derive candidates idempotently, so a repeated
+                // BlockTweaks costs a re-scan, never a wrong result.
                 match (r.deep_tweak_range, tweak_source) {
                     (Some((start, end)), Some(sp)) => {
                         let deep = deep_tweak_replay_stream(
@@ -2454,11 +2477,15 @@ const DEEP_TWEAK_REPLAY_CHUNK: u32 = 32;
 /// through a small bounded channel. Backpressure on that channel paces the read
 /// to the client's consumption, so peak memory is O(chunk) rather than O(chain).
 ///
-/// A `NotFound` height is a genuine absence (below activation / not reached) and
-/// is skipped. Any other error (storage/decode/state) is surfaced in-band and
-/// ends the stream — a silent skip would be a client-undetectable gap in an
-/// unclamped cold-sync, exactly the failure a scanning client cannot recover
-/// from. The client then resyncs from its last durable cursor.
+/// The range handed here is already clamped to `[activation, tip]` (the builder
+/// raises the lower end to taproot activation), so every height MUST carry a row
+/// in a complete index. A `NotFound` is therefore NOT a benign below-activation
+/// absence — it is a genuine hole (a concurrent backfill/reorg punched it while
+/// the completeness marker stayed set), so it is surfaced in-band and ends the
+/// stream, exactly like a storage/decode error. A silent skip would be a
+/// client-undetectable gap in an unclamped cold-sync, the one failure a scanning
+/// client cannot recover from. The client then resyncs from its last durable
+/// cursor.
 fn deep_tweak_replay_stream(
     sp: std::sync::Arc<dyn node::index::silent_payments::SpIndex>,
     publisher: std::sync::Arc<node::events::EventPublisher>,
@@ -2483,7 +2510,16 @@ fn deep_tweak_replay_stream(
                             let env = node::events::make_block_tweaks_event(&pub_chunk, hh, row);
                             out.push(Ok(envelope_to_proto_sp(&env, dust_limit, tweaks_only)));
                         }
-                        Err(node::index::silent_payments::SpIndexError::NotFound(_)) => {}
+                        // Range is clamped to `[activation, tip]`, so a missing
+                        // row here is a hole, not a below-activation absence.
+                        Err(node::index::silent_payments::SpIndexError::NotFound(_)) => {
+                            out.push(Err(Status::internal(format!(
+                                "silent-payment tweak index hole at height {hh} during unclamped \
+                                 cold-sync: index reported complete but the row is missing \
+                                 (concurrent backfill/reorg?); resync from your last cursor"
+                            ))));
+                            break;
+                        }
                         Err(e) => {
                             out.push(Err(Status::internal(format!(
                                 "silent-payment tweak read failed at height {hh}: {e}"
@@ -3725,6 +3761,10 @@ mod tests {
         }
         fn is_complete(&self) -> bool {
             self.complete
+        }
+        fn activation_height(&self) -> u32 {
+            // This mock carries a row for every height in `[1, tip]`.
+            1
         }
     }
 

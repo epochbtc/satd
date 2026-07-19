@@ -397,19 +397,52 @@ async fn bridge_chain(
                     if let Some((height, hash)) = connected
                         && let Some(src) = tweak_source.as_deref()
                         && publisher.has_tweak_subscribers()
-                        && let Ok(row) = src.tweaks_at(height)
                     {
-                        if row.block_hash == hash {
-                            publisher.publish(NodeEventBody::BlockTweaks(
-                                BlockTweaks::from_row(height, &row),
-                            ));
-                        } else {
-                            debug!(
-                                target: "events",
-                                height,
-                                "sp_tweaks row hash mismatch on connect (reorg race); \
-                                 deferring BlockTweaks emit",
-                            );
+                        match src.tweaks_at(height) {
+                            Ok(row) if row.block_hash == hash => {
+                                publisher.publish(NodeEventBody::BlockTweaks(
+                                    BlockTweaks::from_row(height, &row),
+                                ));
+                            }
+                            Ok(_) => {
+                                debug!(
+                                    target: "events",
+                                    height,
+                                    "sp_tweaks row hash mismatch on connect (reorg race); \
+                                     deferring BlockTweaks emit",
+                                );
+                            }
+                            // Below taproot activation no row exists (benign, and
+                            // the common case for a pre-activation connect). A miss
+                            // at/above activation on a just-committed block is
+                            // unexpected but bounded — the live tweaks subscriber
+                            // misses this block and recovers it on its next
+                            // from_cursor replay/reconnect. Never a silent skip.
+                            Err(node_sp_index::SpIndexError::NotFound(_)) => {
+                                if height >= src.activation_height() {
+                                    debug!(
+                                        target: "events",
+                                        height,
+                                        "sp_tweaks row absent on connect at/above activation; \
+                                         live BlockTweaks skipped (client replay will recover)",
+                                    );
+                                }
+                            }
+                            // A transient storage/decode fault reading the
+                            // just-committed row would otherwise vanish silently,
+                            // leaving a live tweaks subscriber with an (h-1, h+1)
+                            // cursor jump it cannot detect until it reconnects.
+                            // Surface it so a degraded index is observable.
+                            Err(e) => {
+                                warn!(
+                                    target: "events",
+                                    height,
+                                    error = %e,
+                                    "sp_tweaks read failed on connect; live BlockTweaks skipped \
+                                     for this block (a tweaks subscriber must resync from its \
+                                     cursor to recover it)",
+                                );
+                            }
                         }
                     }
                 }

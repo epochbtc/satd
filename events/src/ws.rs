@@ -284,14 +284,20 @@ impl FirehoseQuery {
 }
 
 fn mask_from(categories: Option<u32>) -> u32 {
+    // The WS/SSE firehose does not serve the tweaks category this release, so
+    // the tweaks bit is stripped from EVERY mask, default or explicit:
+    //   - "all" (`0`/absent) maps to the default, which already excludes tweaks,
+    //     so a legacy subscriber never begins receiving tweak volume after a node
+    //     upgrade.
+    //   - an explicit request keeps its other bits but never the tweaks bit — a
+    //     WS client that asks for `categories=8` gets an empty stream, not live
+    //     `BlockTweaks`. Those are published to the shared broadcast the moment
+    //     any gRPC client attaches, so without this strip the WS live filter
+    //     would forward them (its replay already returns empty). Tier 1 tweak
+    //     consumption is gRPC-only.
     match categories {
-        // "all" excludes explicit-only categories (tweaks): the WS/SSE firehose
-        // does not serve tweaks this release, and a legacy `0`/absent subscriber
-        // must never begin receiving tweak volume after a node upgrade. Live
-        // `BlockTweaks` are published to the shared broadcast the moment any
-        // gRPC client attaches, so `u32::MAX` here would leak them.
         None | Some(0) => node::events::ALL_CATEGORIES_DEFAULT,
-        Some(c) => c,
+        Some(c) => c & !node::events::CATEGORY_TWEAKS,
     }
 }
 
