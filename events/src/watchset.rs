@@ -939,31 +939,42 @@ impl WatchSet {
     }
 
     /// Add silent-payment scan-key targets (Tier 2, §4), one quota unit each,
-    /// keyed by identity `b_scan·G`. Re-asserting a held identity is a no-op
-    /// (an SP target carries no mutable server-side metadata). Bounded by
-    /// [`MAX_SP_TARGETS_PER_CONNECTION`]: if the net-new targets would push the
-    /// retained count over the cap, the whole add is shed (like a descriptor
-    /// over its cap). All-or-nothing on quota. `register` receives the net-new
-    /// targets (those charged) so the caller wires them into the matcher.
+    /// keyed by identity `b_scan·G`. A target whose identity is already held is
+    /// **re-registered in place**, not dropped: its label set is mutable
+    /// server-side metadata (labels drive `scan_outputs`' label points), so a
+    /// re-assert carrying a changed label set — e.g. a wallet that starts
+    /// catching its own change (`m = 0`) after registering label-less — must
+    /// reach the matcher or those payments are silently missed. The matcher
+    /// replaces the target in place and counts only genuinely-new identities, so
+    /// a re-assert charges no quota unit and does not grow the retained set.
+    /// Bounded by [`MAX_SP_TARGETS_PER_CONNECTION`]: if the net-new targets would
+    /// push the retained count over the cap, the whole add is shed (like a
+    /// descriptor over its cap). All-or-nothing on quota. `register` receives the
+    /// net-new targets AND the re-asserted ones so the caller applies label
+    /// updates in the matcher.
     pub(crate) fn add_silent_payments(
         &mut self,
         principal: Option<&satd_auth::Principal>,
         targets: Vec<node::events::SpWatchTarget>,
         register: impl FnOnce(&[node::events::SpWatchTarget]),
     ) {
-        // Partition into net-new (identity not yet held); dedup within message.
+        // Partition into net-new (identity not yet held) and re-asserts (held;
+        // may carry a changed label set). Dedup within the message.
         let mut seen = HashSet::new();
         let mut net_new: Vec<node::events::SpWatchTarget> = Vec::new();
+        let mut reassert: Vec<node::events::SpWatchTarget> = Vec::new();
         for t in targets {
             let id = t.scan_pubkey();
             if !seen.insert(id) {
                 continue; // intra-message duplicate identity
             }
-            if !self.silent_payments.contains_key(&id) {
+            if self.silent_payments.contains_key(&id) {
+                reassert.push(t);
+            } else {
                 net_new.push(t);
             }
         }
-        if net_new.is_empty() {
+        if net_new.is_empty() && reassert.is_empty() {
             return;
         }
         // Per-connection SP cap: only net-new grows the retained set.
@@ -978,8 +989,8 @@ impl WatchSet {
             return;
         }
         // Per-add rate limit (mirrors `add_items_priced`): one token per
-        // effective add, after the net-new short-circuit so a no-op cannot burn
-        // the bucket.
+        // effective add/update, after the empty short-circuit so a fully-empty
+        // message cannot burn the bucket.
         if let Some(p) = principal
             && let satd_auth::RateDecision::Throttle { retry_after_secs } = p.check_rate()
         {
@@ -991,32 +1002,52 @@ impl WatchSet {
             );
             return;
         }
+        // Register net-new first (indices `[0, n_new)`) then the re-asserts, and
+        // call `register` (an `FnOnce`) exactly once with the final slice.
+        let n_new = net_new.len();
+        let mut to_register = net_new;
+        to_register.extend(reassert);
         match principal {
-            Some(p) => match p.acquire_watch(net_new.len() as u64) {
-                Ok(mut batch) => {
-                    register(&net_new);
-                    for t in net_new {
-                        let lease = batch.split_off(1);
-                        debug_assert!(
-                            lease.is_some(),
-                            "split_off drained before all sp targets got a lease",
-                        );
-                        self.silent_payments.insert(t.scan_pubkey(), lease);
+            Some(p) => {
+                // Charge quota for net-new only; re-asserts (label updates) are
+                // free. `acquire_watch` only when there is something to charge.
+                let batch = if n_new > 0 {
+                    match p.acquire_watch(n_new as u64) {
+                        Ok(b) => Some(b),
+                        Err(reject) => {
+                            warn!(
+                                target: "events::watchset",
+                                kind = "silent_payments",
+                                reject = ?reject,
+                                "watch add rejected (capability or quota)",
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
+                };
+                match batch {
+                    Some(mut b) => {
+                        register(&to_register);
+                        for t in to_register.iter().take(n_new) {
+                            let lease = b.split_off(1);
+                            debug_assert!(
+                                lease.is_some(),
+                                "split_off drained before all sp targets got a lease",
+                            );
+                            self.silent_payments.insert(t.scan_pubkey(), lease);
+                        }
+                    }
+                    // Nothing net-new (n_new == 0) or quota denied: apply only
+                    // the re-asserted label updates; retain nothing new.
+                    None => register(&to_register[n_new..]),
                 }
-                Err(reject) => {
-                    warn!(
-                        target: "events::watchset",
-                        kind = "silent_payments",
-                        reject = ?reject,
-                        "watch add rejected (capability or quota)",
-                    );
-                }
-            },
+            }
             // Auth disabled (loopback trust): unlimited, no lease.
             None => {
-                register(&net_new);
-                for t in net_new {
+                register(&to_register);
+                for t in to_register.iter().take(n_new) {
                     self.silent_payments.insert(t.scan_pubkey(), None);
                 }
             }
@@ -2248,6 +2279,34 @@ mod tests {
         assert_eq!(unregistered, 1);
         assert_eq!(q.current("tenant"), 1, "per-remove release frees one unit");
         assert_eq!(ws.len(), 1);
+    }
+
+    #[test]
+    fn sp_reassert_reregisters_for_label_updates() {
+        // A held scan key re-added (e.g. a wallet that starts catching its own
+        // change by adding label 0) must reach the matcher so its label set is
+        // updated in place — before this fix a held identity was dropped from
+        // `net_new` and `register` was never called, silently missing every
+        // labeled/change payment. It must still not be recharged or grow the set.
+        let (p, acct) = tenant(10);
+        let q = acct.quota();
+        let mut ws = WatchSet::default();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |_| {});
+        assert_eq!(ws.len(), 1);
+        assert_eq!(q.current("tenant"), 1);
+
+        let id1 = sp_target(1).scan_pubkey();
+        let mut forwarded: Vec<[u8; 33]> = Vec::new();
+        ws.add_silent_payments(Some(&p), vec![sp_target(1)], |ts| {
+            forwarded = ts.iter().map(|t| t.scan_pubkey()).collect();
+        });
+        assert_eq!(
+            forwarded,
+            vec![id1],
+            "a re-asserted identity is forwarded to the matcher (label update), not dropped",
+        );
+        assert_eq!(ws.len(), 1, "re-assert does not grow the retained set");
+        assert_eq!(q.current("tenant"), 1, "re-assert charges no quota unit");
     }
 
     #[test]

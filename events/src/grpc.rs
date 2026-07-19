@@ -1281,7 +1281,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                 ) {
                     let _ = tx.send(reason).await;
                 }
-                while let Ok(Some(ctrl)) = inbound.message().await {
+                while let Ok(Some(mut ctrl)) = inbound.message().await {
                     // `SetCursor` is a mid-stream re-anchor, not a watch-set
                     // mutation: forward its cursor to the outbound task (or a
                     // rejection reason if it cannot be admitted) instead of
@@ -1343,37 +1343,61 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // WatchSetResult must reach the outbound task; apply it under
                     // the lock, then forward the outcome (mirrors SetCursor). The
                     // guard is scoped so it drops before the `.await` below.
-                    if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg {
-                        let outcome = match desired_from_proto(s, prefix_bounds) {
-                            // A malformed element refuses the whole snapshot before
-                            // the lock is ever taken — the live set is untouched.
-                            Err(_) => crate::watchset::ReplaceOutcome::Malformed,
-                            Ok(desired) => {
-                                let mut guard = watch_set.lock().unwrap_or_else(|p| p.into_inner());
-                                // gRPC entry-caps neither incremental adds nor a
-                                // replace (quota is its bound) → max_items = 0.
-                                let outcome = guard.replace(principal.as_ref(), desired, 0, &*handle);
-                                // The category filter is part of the desired set, so
-                                // apply it only when the replace was accepted — a
-                                // rejection leaves the whole set (categories
-                                // included) unchanged, as WatchSetRejected promises.
-                                if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
-                                    let mask = if s.categories == 0 {
-                                        node::events::ALL_CATEGORIES_DEFAULT
-                                    } else {
-                                        s.categories
-                                    };
-                                    // Watch never serves the tweaks firehose (a
-                                    // Subscribe-only category); strip the bit so a
-                                    // control update cannot forward shared-broadcast
-                                    // `BlockTweaks` past the Subscribe path's
-                                    // index/completeness/dust-limit validation.
-                                    category_mask
-                                        .store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
+                    if matches!(ctrl.msg, Some(pb::subscribe_control::Msg::SetWatchSet(_))) {
+                        // Compute the replace outcome under a tightly-scoped
+                        // immutable borrow so the mutable secret-scrub below can
+                        // reborrow `ctrl`.
+                        let outcome = {
+                            let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &ctrl.msg else {
+                                unreachable!("matched SetWatchSet above")
+                            };
+                            match desired_from_proto(s, prefix_bounds) {
+                                // A malformed element refuses the whole snapshot before
+                                // the lock is ever taken — the live set is untouched.
+                                Err(_) => crate::watchset::ReplaceOutcome::Malformed,
+                                Ok(desired) => {
+                                    let mut guard =
+                                        watch_set.lock().unwrap_or_else(|p| p.into_inner());
+                                    // gRPC entry-caps neither incremental adds nor a
+                                    // replace (quota is its bound) → max_items = 0.
+                                    let outcome =
+                                        guard.replace(principal.as_ref(), desired, 0, &*handle);
+                                    // The category filter is part of the desired set, so
+                                    // apply it only when the replace was accepted — a
+                                    // rejection leaves the whole set (categories
+                                    // included) unchanged, as WatchSetRejected promises.
+                                    if matches!(
+                                        outcome,
+                                        crate::watchset::ReplaceOutcome::Accepted { .. }
+                                    ) {
+                                        let mask = if s.categories == 0 {
+                                            node::events::ALL_CATEGORIES_DEFAULT
+                                        } else {
+                                            s.categories
+                                        };
+                                        // Watch never serves the tweaks firehose (a
+                                        // Subscribe-only category); strip the bit so a
+                                        // control update cannot forward shared-broadcast
+                                        // `BlockTweaks` past the Subscribe path's
+                                        // index/completeness/dust-limit validation.
+                                        category_mask.store(
+                                            mask & !node::events::CATEGORY_TWEAKS,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    outcome
                                 }
-                                outcome
                             }
                         };
+                        // `desired_from_proto` copied each scan secret into a
+                        // zeroize-on-drop buffer; scrub the plaintext wire copies so
+                        // `b_scan` does not linger in the dropped proto's freed heap
+                        // (mirrors the AddSilentPayments path below).
+                        if let Some(pb::subscribe_control::Msg::SetWatchSet(s)) = &mut ctrl.msg {
+                            for t in &mut s.silent_payments {
+                                t.scan_secret.zeroize();
+                            }
+                        }
                         // Outbound gone (stream tearing down) → nothing to deliver.
                         let _ = ws_result_tx.send(outcome).await;
                         continue;
@@ -2091,8 +2115,12 @@ fn apply_control(
 /// integers. Returns `None` on any malformed field. The scan secret is copied
 /// into the target's zeroize-on-drop buffer; the caller scrubs the wire copy.
 fn parse_sp_target(t: &pb::SilentPaymentTarget) -> Option<node::events::SpWatchTarget> {
-    let scan_secret = <[u8; 32]>::try_from(t.scan_secret.as_slice()).ok()?;
-    node::events::SpWatchTarget::new(scan_secret, &t.spend_pubkey, t.labels.clone()).ok()
+    let mut scan_secret = <[u8; 32]>::try_from(t.scan_secret.as_slice()).ok()?;
+    // `new` copies the secret into a zeroize-on-drop buffer; scrub this
+    // transient stack copy (a bare `[u8; 32]`, which is not cleared on drop).
+    let out = node::events::SpWatchTarget::new(scan_secret, &t.spend_pubkey, t.labels.clone()).ok();
+    scan_secret.zeroize();
+    out
 }
 
 fn desired_from_proto(

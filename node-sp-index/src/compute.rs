@@ -292,7 +292,9 @@ pub fn scan_outputs(
     // Precompute label points: compressed(label_m·G) → (m, label scalar).
     let mut label_map: HashMap<[u8; 33], (u32, Scalar)> = HashMap::new();
     for &m in label_ms {
-        let mut buf = b_scan.secret_bytes().to_vec();
+        // `buf` holds the raw scan secret `b_scan`; wrap it so the heap copy is
+        // cleared on drop rather than left in freed memory (§4.3).
+        let mut buf = zeroize::Zeroizing::new(b_scan.secret_bytes().to_vec());
         buf.extend_from_slice(&m.to_be_bytes());
         let label = tagged_hash(TAG_LABEL, &buf);
         if let (Ok(sk), Ok(scalar)) = (SecretKey::from_slice(&label), Scalar::from_be_bytes(label))

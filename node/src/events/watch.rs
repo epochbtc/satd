@@ -1874,7 +1874,8 @@ fn scan_block_sp(
         let n_in = tx.input.len();
         if undo.spent_coins.len() < undo_idx + n_in {
             // Same short-undo guard as the script path: stop rather than
-            // mis-align. Can only cause MISSED (never false) matches.
+            // mis-align. Can only cause MISSED (never false) matches. `break`
+            // (not `return`) so the `work` scan-secret scrub below still runs.
             warn!(
                 target: "events::watch",
                 height,
@@ -1882,7 +1883,7 @@ fn scan_block_sp(
                 "resync/scan: undo shorter than non-coinbase inputs; \
                  silent-payment matches truncated for this block"
             );
-            return;
+            break;
         }
         let prevout_spks: Vec<ScriptBuf> = undo.spent_coins[undo_idx..undo_idx + n_in]
             .iter()
@@ -1950,6 +1951,14 @@ fn scan_block_sp(
                 sink.emit(inner, *sid, &wm);
             }
         }
+    }
+
+    // The reconstructed `b_scan` SecretKeys in `work` have no zeroize-on-drop
+    // (secp256k1 0.29 only offers `non_secure_erase`). Best-effort scrub before
+    // they drop so a live block scan does not leave plaintext scan secrets in
+    // freed memory (§4.3, "clear intermediate secrets").
+    for (_, sk, _) in &mut work {
+        sk.non_secure_erase();
     }
 }
 
@@ -2173,7 +2182,22 @@ fn block_undo_for_scan(
         || registry.has_prefix_watchers()
         || registry.has_sp_watchers()
     {
-        chain.get_undo(hash)
+        let undo = chain.get_undo(hash);
+        if undo.is_none() {
+            // A watcher wants the block's undo (input-side script/prefix or
+            // silent-payment matching) but it is unavailable (pruned or a
+            // storage miss). `scan_block` then does funding/outpoint matching
+            // only, silently missing every input-side and SP match for this
+            // block. Surface it so the gap is observable rather than a silent
+            // hole in a watcher's delivery.
+            debug!(
+                target: "events::watch",
+                block = %hash,
+                "block undo unavailable; input-side script/prefix and \
+                 silent-payment matches skipped for this block",
+            );
+        }
+        undo
     } else {
         None
     }
