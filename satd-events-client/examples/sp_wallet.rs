@@ -47,11 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = events.message().await? {
         if let Event::SilentPaymentMatched {
-            txid, vout, output_pubkey, amount, tweak, k, confirmed, ..
+            txid, vout, output_pubkey, amount, tweak, k, label, confirmed, ..
         } = event
         {
-            // Re-derive the full spending key offline from T and k.
-            let spend_key = derive_spend_key(&secp, &b_scan, &b_spend, &tweak, k)?;
+            // Re-derive the full spending key offline from T, k, and (for a
+            // labelled/change output) the label m the node reported.
+            let spend_key = derive_spend_key(&secp, &b_scan, &b_spend, &tweak, k, label)?;
             // Sanity-check: its public key must equal the matched output key.
             let derived = PublicKey::from_secret_key(&secp, &spend_key)
                 .x_only_public_key()
@@ -74,13 +75,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// BIP 352 receiver derivation: the spending key for output counter `k` is
 /// `d = b_spend + t_k (mod n)`, where `t_k = hash_BIP0352/SharedSecret(b_scan·T ‖ k)`.
-/// (Labelled outputs add the label tweak; omitted here for brevity.)
+///
+/// For a **labelled** output (the node reports `label = Some(m)` — e.g. `m = 0`
+/// for your own change), the receiver also added the label tweak
+/// `label_m = hash_BIP0352/Label(b_scan ‖ ser32(m))`, so the spending key is
+/// `d = b_spend + t_k + label_m (mod n)`. Omitting it — a common copy-paste
+/// mistake — yields a key that does NOT control the output, so the change is
+/// unspendable; the self-check in `main` prints `MISMATCH` when this happens.
 fn derive_spend_key(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     b_scan: &SecretKey,
     b_spend: &SecretKey,
     tweak: &[u8],
     k: u32,
+    label: Option<u32>,
 ) -> Result<SecretKey, Box<dyn std::error::Error>> {
     let t = PublicKey::from_slice(tweak)?;
     // ecdh = b_scan · T
@@ -88,7 +96,15 @@ fn derive_spend_key(
     let mut msg = ecdh.serialize().to_vec();
     msg.extend_from_slice(&k.to_be_bytes());
     let t_k = tagged_hash(b"BIP0352/SharedSecret", &msg);
-    Ok(b_spend.add_tweak(&Scalar::from_be_bytes(t_k)?)?)
+    let mut d = b_spend.add_tweak(&Scalar::from_be_bytes(t_k)?)?;
+    if let Some(m) = label {
+        // label_m = hash_BIP0352/Label(ser256(b_scan) ‖ ser32(m))
+        let mut lbuf = b_scan.secret_bytes().to_vec();
+        lbuf.extend_from_slice(&m.to_be_bytes());
+        let label_m = tagged_hash(b"BIP0352/Label", &lbuf);
+        d = d.add_tweak(&Scalar::from_be_bytes(label_m)?)?;
+    }
+    Ok(d)
 }
 
 /// BIP 340 tagged hash: `SHA256(SHA256(tag) ‖ SHA256(tag) ‖ msg)`.
