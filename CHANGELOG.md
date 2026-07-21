@@ -83,6 +83,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   changes which payments a rescan finds. No new surface or config; a scan-key
   cold-sync just gets faster when the index is on.
 - docs: Operator Manual style pass: controlled glossary, shorter sentences, standardized callouts (house style in `docs/manual/STYLE.md`); fixed stale `par`, `debug.log`, and release-target statements
+- **Storage / Core compat**: read (and optionally write) Bitcoin Core v28+
+  XOR-obfuscated block files — the `blocks/xor.dat` key is honored
+  automatically, making the documented "reuse a Core `blocks/` directory"
+  migration work against modern Core datadirs; `blocksxor` is now a real
+  option (fresh satd dirs stay plaintext by default).
 
 ## Releases
 

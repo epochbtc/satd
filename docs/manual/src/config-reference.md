@@ -102,6 +102,7 @@ startup error.
 |---|---|---|---|---|
 | `datadir` | platform default | restart | core | Data directory. |
 | `blocksdir` | `<datadir>/blocks` | restart | core | Alternative location for `blocks/` and flat-file undo data. |
+| `blocksxor` | unset | restart | core | Blocks-dir `*.dat` XOR obfuscation (Core v28+ `blocks/xor.dat`). Unset: honor an existing key (an obfuscated Core v28+ `blocks/` dir reads with no config) and initialize fresh dirs plaintext. `1`: also generate a random key on a brand-new blocks dir (Core's default). `0`: demand plaintext; refuses a dir with a nonzero stored key. |
 | `conf` | `bitcoin.conf` in datadir | restart | core | Config file path. |
 | `includeconf` | none | restart | core | Additional config file to splice in; honored only inside a config file. |
 | `pid` | none | restart | core | Write PID to file. |
@@ -451,7 +452,7 @@ warning names the satd equivalent where one exists. This covers the long tail:
 | `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the option has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
 | `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
-| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `blocksxor`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
+| `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)
 

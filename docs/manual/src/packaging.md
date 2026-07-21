@@ -50,7 +50,8 @@ $DATADIR/                         # default: $HOME/.bitcoin (Core-compat)
     ├── blocks/
     │   ├── blk00000.dat          # flat-file block storage (state)
     │   ├── blk00001.dat
-    │   └── ...
+    │   ├── ...
+    │   └── xor.dat               # 8-byte obfuscation key (Core v28+ compat; all-zero = plaintext)
     ├── chainstate/               # RocksDB instance (state)
     │   ├── *.sst                 # SST files (the bulk of disk usage)
     │   ├── CURRENT, MANIFEST-*   # RocksDB metadata

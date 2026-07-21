@@ -3247,6 +3247,7 @@ impl PeerManager {
         let prefetch_handle = crate::chain::prefetch::start_prefetcher(
             store,
             chain_state.blocks_dir().to_path_buf(),
+            chain_state.blocks_xor_key(),
             chain_state.tip_height() + 1,
             prefetch_workers,
             128, // lookahead blocks

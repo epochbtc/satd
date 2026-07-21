@@ -478,13 +478,23 @@ to see which lines had no effect. The intended migration is:
 
 1. Stop `bitcoind`. Keep the flat-file `blocks/` directory if you want
    to skip re-downloading the chain (satd reuses the same flat-file
-   layout).
+   layout, including the XOR obfuscation Core v28.0+ applies by default:
+   the key in `blocks/xor.dat` is read automatically, no config needed).
+   Core's `rev*.dat` undo files and `blocks/index` are ignored — satd
+   keeps undo data and the block index in RocksDB.
 2. Move the Core `chainstate/`, `indexes/`, and `wallets/` directories
    aside (satd doesn't read them).
 3. Start satd with the same `bitcoin.conf`. `-reindex-chainstate`
    replays the flat files into the RocksDB chainstate.
 4. Optional: `backfillindex address` and `backfillindex blockfilter` to
    populate the satd-specific indices from disk.
+
+One deliberate divergence: Core initializes a *new* blocks dir with a
+random obfuscation key (its `-blocksxor` defaults to on since v28.0);
+satd leaves a freshly created blocks dir plaintext unless you set
+`blocksxor=1`. Either way the key lives in `blocks/xor.dat`, so a
+directory written by one implementation is readable by the other
+(a plaintext dir by any Core version, an obfuscated one by v28+).
 
 Backfills run concurrently with live block validation, so the node
 serves correctly with partial history while they progress. End-to-end

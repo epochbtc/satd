@@ -767,6 +767,16 @@ pub struct Config {
     pub reindex: bool,
     pub reindex_chainstate: bool,
     pub check_block_index: bool,
+    /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
+    /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
+    /// `None` (unset, the default) honors whatever key the dir already
+    /// carries — an obfuscated Core v28+ `blocks/` directory reads
+    /// transparently, and a fresh dir is initialized plaintext (zero key,
+    /// satd's native format). `Some(true)` additionally generates a random
+    /// key when initializing a brand-new blocks dir (Core's default
+    /// behavior); `Some(false)` demands plaintext and refuses to start on
+    /// a dir whose stored key is nonzero (Core parity).
+    pub blocksxor: Option<bool>,
     // P2P
     pub maxconnections: usize,
     /// Maximum simultaneous inbound peers from the same source IP
@@ -2903,6 +2913,13 @@ impl Config {
             prune,
             reindex: cli.reindex.unwrap_or(false),
             reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
+            // Three-state on purpose: unset ≠ 0. Unset honors an existing
+            // xor.dat (the Core v28+ blocks-dir reuse path needs no config);
+            // an explicit 0 is Core's "demand plaintext" and hard-fails on
+            // a keyed dir rather than being accepted-and-ignored.
+            blocksxor: cli
+                .blocksxor
+                .or_else(|| file_get("blocksxor").and_then(|v| parse_bool(&v))),
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -4451,6 +4468,20 @@ pub struct CliArgs {
     )]
     pub reindex_chainstate: Option<bool>,
 
+    /// Bitcoin Core's `-blocksxor` (v28+). Unset: honor an existing
+    /// `blocks/xor.dat` key and keep fresh dirs plaintext.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "XOR-obfuscate a freshly initialized blocks dir with a random key \
+                (Core v28+ xor.dat); an existing key is always honored, and \
+                blocksxor=0 refuses a dir with a nonzero stored key"
+    )]
+    pub blocksxor: Option<bool>,
+
     #[arg(
         long = "checkblockindex",
         value_name = "BOOL",
@@ -5489,6 +5520,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "forcednsseed",
         "fixedseeds",
         "blocksonly",
+        "blocksxor",
         "v2transport",
         "v2only",
         "externalip",
@@ -5567,6 +5599,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "signet",
         "listen",
         "blocksonly",
+        "blocksxor",
         "v2transport",
         "v2only",
         "dns",
@@ -6043,6 +6076,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "reindex",
     "reindexchainstate",
     "checkblockindex",
+    "blocksxor",
     "dbcache",
     "storageprofile",
     "prefetchworkers",
@@ -6189,7 +6223,7 @@ const CORE_V30_KEYS: &[&str] = &[
     "acceptnonstdtxn", "acceptstalefeeestimates", "addnode", "addresstype", "alertnotify", "allowignoredconf",
     "asmap", "assumevalid", "avoidpartialspends", "bantime", "bind", "blockfilterindex",
     "blockmaxweight", "blockmintxfee", "blocknotify", "blockreconstructionextratxn", "blockreservedweight", "blocksdir",
-    "blocksonly", "blocksxor", "blockversion", "bytespersigop", "capturemessages", "chain",
+    "blocksonly", "blockversion", "bytespersigop", "capturemessages", "chain",
     "changetype", "checkaddrman", "checkblockindex", "checkblocks", "checklevel", "checkmempool",
     "checkpoints", "cjdnsreachable", "coinstatsindex", "conf", "connect", "consolidatefeerate",
     "daemon", "daemonwait", "datacarrier", "datacarriersize", "datadir", "dbbatchsize",
@@ -7142,6 +7176,7 @@ rpcport=8332
             prune: None,
             reindex: Some(false),
             reindex_chainstate: Some(false),
+            blocksxor: None,
             checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
@@ -7420,6 +7455,7 @@ rpcport=8332
             prune: None,
             reindex: Some(false),
             reindex_chainstate: Some(false),
+            blocksxor: None,
             checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
@@ -9561,6 +9597,55 @@ rpcport=39999
         );
         let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
         assert!(!cfg.networkactive);
+    }
+
+    /// `blocksxor` is honored, not skipped: it is a known key with Core's
+    /// three-state semantics — unset (`None`) honors an existing
+    /// `blocks/xor.dat`, explicit `1`/`0` map to Core's enable/disable.
+    #[test]
+    fn blocksxor_is_known_and_three_state() {
+        assert!(is_known_config_key("blocksxor"));
+        assert_eq!(classify_unsupported_key("blocksxor"), None);
+        // Honored keys must not also sit in the recognized-but-ignored
+        // Core list, or the skip-warning path would shadow real support.
+        assert!(!is_core_v30_key("blocksxor"));
+
+        // Unset stays None — "honor whatever the blocks dir carries" must
+        // be distinguishable from an explicit blocksxor=0.
+        let cfg = Config::from_cli(CliArgs::try_parse_from(["satd", "--regtest"]).unwrap()).unwrap();
+        assert_eq!(cfg.blocksxor, None);
+
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from(["satd", "--regtest", "--blocksxor=1"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.blocksxor, Some(true));
+
+        // Core-style `-noblocksxor` negation and single-dash form.
+        let argv = normalize_args(
+            ["satd", "--regtest", "-noblocksxor"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert_eq!(cfg.blocksxor, Some(false));
+
+        // Config-file value resolves; explicit CLI wins over the file.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let conf_path = tmpdir.path().join("bitcoin.conf");
+        std::fs::write(&conf_path, "blocksxor=1\n").unwrap();
+        let base = [
+            "satd",
+            "--regtest",
+            "--datadir",
+            tmpdir.path().to_str().unwrap(),
+            "--conf",
+            conf_path.to_str().unwrap(),
+        ];
+        let cfg = Config::from_cli(CliArgs::try_parse_from(base).unwrap()).unwrap();
+        assert_eq!(cfg.blocksxor, Some(true));
+        let mut with_cli = base.to_vec();
+        with_cli.push("--blocksxor=0");
+        let cfg = Config::from_cli(CliArgs::try_parse_from(with_cli).unwrap()).unwrap();
+        assert_eq!(cfg.blocksxor, Some(false));
     }
 
     #[test]

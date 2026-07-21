@@ -100,6 +100,16 @@ pub fn audit_blockfiles(
 ) -> Result<BlockfileAuditReport, AuditError> {
     let started = Instant::now();
 
+    // Blocks-dir obfuscation key (Core v28+ `xor.dat`; zero = plaintext).
+    // Record headers are stored XORed with it, so sizing each record
+    // requires de-obfuscating the 8 header bytes we pull.
+    let xor_key = crate::storage::flatfile::read_xor_key(blocks_dir).map_err(|e| {
+        AuditError::Io {
+            path: blocks_dir.join("xor.dat").display().to_string(),
+            source: e,
+        }
+    })?;
+
     // 1. Walk block_index, bucket entries by file_number.
     let mut by_file: HashMap<u32, Vec<u32>> = HashMap::new();
     let scan_stats = store
@@ -180,7 +190,7 @@ pub fn audit_blockfiles(
                 // on-disk byte is slack (trailing).
                 (0u64, 0u64, 0u64, file_size, positions.len() as u64)
             } else {
-                measure_file(blocks_dir, file_no, positions, file_size)?
+                measure_file(blocks_dir, file_no, positions, file_size, &xor_key)?
             };
 
         unresolved_entries += unresolved;
@@ -227,6 +237,7 @@ fn measure_file(
     file_no: u32,
     mut positions: Vec<u32>,
     file_size: u64,
+    xor_key: &[u8; 8],
 ) -> Result<(u64, u64, u64, u64, u64), AuditError> {
     positions.sort_unstable();
     let path = blocks_dir.join(format!("blk{:05}.dat", file_no));
@@ -267,6 +278,7 @@ fn measure_file(
                 source: e,
             });
         }
+        crate::storage::flatfile::xor_in_place(&mut header, xor_key, pos64);
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
         let record_size = 8 + size;
         if pos64 + record_size > file_size {

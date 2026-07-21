@@ -433,7 +433,15 @@ async fn main() {
         }
     }
 
-    let flat_files = match FlatFileManager::new(&blocks_dir) {
+    // Blocks-dir obfuscation (Core v28+ `xor.dat`): unset honors whatever
+    // key the dir carries (plaintext for fresh dirs); explicit
+    // -blocksxor=1/0 maps to Core's enable/disable semantics.
+    let xor_mode = match config.blocksxor {
+        None => node::storage::flatfile::XorMode::Auto,
+        Some(true) => node::storage::flatfile::XorMode::Enabled,
+        Some(false) => node::storage::flatfile::XorMode::Disabled,
+    };
+    let flat_files = match FlatFileManager::with_xor_mode(&blocks_dir, xor_mode) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error initializing block storage: {}", e);

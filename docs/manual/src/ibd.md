@@ -177,6 +177,11 @@ equivalent.
   existing block files, and preserves the flat block files (Core-compatible).
   It is faster than a full `-reindex` when only the chainstate is suspect.
 
+Both work against block files written by Bitcoin Core, including the
+XOR-obfuscated files Core v28.0+ produces by default. The key in
+`blocks/xor.dat` is picked up automatically (see `blocksxor` in the
+[Configuration Flag Reference](config-reference.md)).
+
 A reindex on a synced mainnet node runs for hours. The shipped `systemd` unit
 handles this without tripping the start timeout; see "Reindex resilience" in
 [Packaging](packaging.md).

@@ -33,8 +33,9 @@ pub struct PreprocessedBlock {
 }
 
 /// Read a block from a flat file without holding the FlatFileManager mutex.
-/// Replicates the `read_block_direct` pattern from `ChainState`.
-fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos) -> Option<Block> {
+/// Replicates the `read_block_direct` pattern from `ChainState`, including
+/// de-obfuscation with the blocks-dir xor key (Core v28+ `xor.dat`).
+fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8]) -> Option<Block> {
     let path = blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
     let mut file = File::open(&path).ok()?;
     // Flat file layout: [magic:4][size:4][block_data:size]
@@ -42,9 +43,14 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos) -> Option<Block> {
     file.seek(SeekFrom::Start(pos.data_pos as u64)).ok()?;
     let mut header = [0u8; 8];
     file.read_exact(&mut header).ok()?;
+    crate::storage::flatfile::xor_in_place(&mut header, xor_key, pos.data_pos as u64);
     let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if size == 0 || size > 4_000_000 {
+        return None;
+    }
     let mut data = vec![0u8; size];
     file.read_exact(&mut data).ok()?;
+    crate::storage::flatfile::xor_in_place(&mut data, xor_key, pos.data_pos as u64 + 8);
     bitcoin::consensus::deserialize(&data).ok()
 }
 
@@ -75,9 +81,11 @@ fn compute_mtp(store: &dyn Store, height: u32) -> u32 {
 /// 3. Computes MTP via read-only store lookups
 /// 4. Computes txids and runs context-free `check_transaction`
 /// 5. Speculatively resolves UTXO inputs (cache warming)
+#[allow(clippy::too_many_arguments)]
 pub fn prefetch_block(
     store: &dyn Store,
     blocks_dir: &Path,
+    blocks_xor_key: &[u8; 8],
     height: u32,
     _assumevalid: bool,
     primary_engine: PrimaryEngine,
@@ -99,7 +107,7 @@ pub fn prefetch_block(
         file_number: entry.file_number,
         data_pos: entry.data_pos,
     };
-    let block = read_block_from_file(blocks_dir, &flat_pos)?;
+    let block = read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
 
     // 4. Compute MTP (read-only store lookups)
     let mtp = compute_mtp(store, height);
@@ -265,6 +273,7 @@ pub type PrefetchBuffer = Arc<parking_lot::Mutex<HashMap<u32, PreprocessedBlock>
 pub fn start_prefetcher(
     store: Arc<dyn Store + Send + Sync>,
     blocks_dir: PathBuf,
+    blocks_xor_key: [u8; 8],
     start_height: u32,
     num_workers: usize,
     lookahead: usize,
@@ -301,6 +310,7 @@ pub fn start_prefetcher(
                                 if let Some(pre) = prefetch_block(
                                     &*w_store,
                                     &w_dir,
+                                    &blocks_xor_key,
                                     height,
                                     assumevalid,
                                     primary_engine,
@@ -382,6 +392,6 @@ mod tests {
             file_number: 999,
             data_pos: 0,
         };
-        assert!(read_block_from_file(Path::new("/nonexistent"), &pos).is_none());
+        assert!(read_block_from_file(Path::new("/nonexistent"), &pos, &[0u8; 8]).is_none());
     }
 }
