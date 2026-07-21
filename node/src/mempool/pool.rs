@@ -703,6 +703,18 @@ impl Mempool {
         self.sp_gate.load().load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
+    /// Whether the operator authorized emitting full prevout `scriptPubKey`s to
+    /// streaming watchers (`streamprevoutmeta = full`). This is the *policy*
+    /// signal, distinct from whether scripts happen to be *retained* at
+    /// admission: silent-payment matching (D7) retains full scripts via
+    /// [`sp_gate_hot`](Self::sp_gate_hot) even under `hash`/`amount`, but those
+    /// are for internal matching only and must not be exposed to prefix
+    /// watchers. The mempool spend-side matcher gates external `script_pubkey`
+    /// emission on this, not on the mere presence of `prev_scripts`.
+    pub fn streams_prevout_scripts(&self) -> bool {
+        self.config.read().prevout_meta.retains_script()
+    }
+
     /// Wire a broadcast sender for mempool events. Must be called
     /// once at startup before any mempool mutations that should be
     /// observed by subscribers.

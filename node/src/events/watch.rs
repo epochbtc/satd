@@ -1170,6 +1170,15 @@ impl WatchRegistry {
     /// outpoint/txid matches are handled by
     /// [`scan_mempool_tx`](Self::scan_mempool_tx); call both per accepted tx.
     ///
+    /// `scripts_authorized` is the operator's `streamprevoutmeta = full` policy
+    /// signal ([`Mempool::streams_prevout_scripts`](crate::mempool::pool::Mempool::streams_prevout_scripts)).
+    /// The prevout `scriptPubKey` is emitted to prefix watchers **only** when it
+    /// is `true`. This is deliberately gated on the *policy*, not on the mere
+    /// presence of `prev_scripts`: silent-payment matching (D7) retains full
+    /// scripts at admission whenever a scan-key watch is live, even under
+    /// `hash`/`amount`, and those must never leak into a prefix watcher's payload
+    /// as if the operator had authorized full-script metadata.
+    ///
     /// Self-gates on [`has_script_watchers`](Self::has_script_watchers) /
     /// [`has_prefix_watchers`](Self::has_prefix_watchers): a no-op (and no
     /// serialization) unless some spend-side watch is live, so the per-input
@@ -1187,6 +1196,7 @@ impl WatchRegistry {
         prev_scripthashes: &[Scripthash],
         prev_amounts: &[u64],
         prev_scripts: &[ScriptBuf],
+        scripts_authorized: bool,
     ) {
         if !self.has_script_watchers() && !self.has_prefix_watchers() {
             return;
@@ -1232,11 +1242,19 @@ impl WatchRegistry {
                 }
             }
             if scan_prefixes {
-                // Carry whatever the retention tier kept: the full prevout script
-                // under `full` (else empty → client resolves it itself), and the
-                // value under `>= amount` (the default). The outpoint is always
-                // known (from the spending tx).
-                let script_pubkey = prev_scripts.get(vin).cloned().unwrap_or_default();
+                // Carry whatever the operator authorized: the full prevout script
+                // only under `streamprevoutmeta = full` (else empty → client
+                // resolves it itself), and the value under `>= amount` (the
+                // default). The outpoint is always known (from the spending tx).
+                // Gate on the *policy* (`scripts_authorized`), not on the presence
+                // of `prev_scripts`: D7 silent-payment matching retains full
+                // scripts at admission even under `hash`/`amount`, and those must
+                // not leak into a prefix watcher's payload.
+                let script_pubkey = if scripts_authorized {
+                    prev_scripts.get(vin).cloned().unwrap_or_default()
+                } else {
+                    ScriptBuf::new()
+                };
                 let amount = prev_amounts.get(vin).copied();
                 let top = prefix_top32(sh);
                 for &bits in inner.prefix_lens.keys() {
@@ -2545,6 +2563,10 @@ pub async fn run_watch_matcher(
                             &entry.prev_scripthashes,
                             &entry.prev_amounts,
                             &entry.prev_scripts,
+                            // Emit prevout scripts to prefix watchers only when the
+                            // operator authorized full-script metadata — never
+                            // merely because D7 SP retention filled `prev_scripts`.
+                            mempool.streams_prevout_scripts(),
                         );
                         // Mempool silent-payment matching (D7). `prev_scripts` is
                         // retained on the entry only while the SP gate was hot at
@@ -3887,7 +3909,7 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         let tx = spending_tx(op);
-        reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[], true);
 
         match rx.try_recv().expect("mempool spend-side prefix match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -3919,7 +3941,7 @@ mod tests {
 
         // A spend whose prevout hashes into a different 16-bit bucket.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54, 0x55]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[], true);
         assert!(rx.try_recv().is_err(), "prevout outside the bucket must not match");
     }
 
@@ -3939,6 +3961,7 @@ mod tests {
             &[scripthash_of(&spent_spk)],
             &[],
             &[],
+            true,
         );
         assert!(rx.try_recv().is_err(), "no prefix watchers → no spend-side delivery");
     }
@@ -3965,7 +3988,7 @@ mod tests {
             output: vec![],
         };
         // Both inputs spend the same script → same bucket (input-aligned hashes).
-        reg.scan_mempool_spent_scripts(&tx, &[sh, sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh, sh], &[], &[], true);
 
         match rx.try_recv().expect("one aggregated mempool spend match") {
             WatchMatch::PrefixMatched(pm) => {
@@ -4008,7 +4031,7 @@ mod tests {
             ],
             output: vec![],
         };
-        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b], &[], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[sh_a, sh_b], &[], &[], true);
 
         // Collect both events and map each bucket to the single outpoint it carries.
         let mut by_bucket: std::collections::HashMap<(u8, u32), Vec<OutPoint>> =
@@ -4050,7 +4073,7 @@ mod tests {
             let reg = Arc::new(WatchRegistry::new());
             let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
             handle.add_prefixes(&[b]);
-            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], std::slice::from_ref(&spk));
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], std::slice::from_ref(&spk), true);
             match rx.try_recv().expect("prefix spend match") {
                 WatchMatch::PrefixMatched(pm) => {
                     assert_eq!(pm.matched_prevouts.len(), 1);
@@ -4068,7 +4091,7 @@ mod tests {
             let reg = Arc::new(WatchRegistry::new());
             let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
             handle.add_prefixes(&[b]);
-            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], &[]);
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], &[], true);
             match rx.try_recv().expect("prefix spend match") {
                 WatchMatch::PrefixMatched(pm) => {
                     let m = &pm.matched_prevouts[0];
@@ -4084,12 +4107,38 @@ mod tests {
             let reg = Arc::new(WatchRegistry::new());
             let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
             handle.add_prefixes(&[b]);
-            reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[]);
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[], &[], true);
             match rx.try_recv().expect("prefix spend match") {
                 WatchMatch::PrefixMatched(pm) => {
                     let m = &pm.matched_prevouts[0];
                     assert!(m.script_pubkey.is_empty(), "hash tier: no script");
                     assert_eq!(m.amount, None, "hash tier: no amount");
+                }
+                other => panic!("wrong match: {other:?}"),
+            }
+        }
+
+        // The security gate (deep-review F6): even when `prev_scripts` IS present
+        // — as it is whenever a silent-payment scan-key watch is live, since D7
+        // retains full scripts at admission regardless of `streamprevoutmeta` —
+        // an unauthorized tier (`scripts_authorized = false`) must NOT expose the
+        // real script to a prefix watcher. Otherwise an SP watch on one
+        // connection would silently upgrade every prefix watcher to `full`.
+        {
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+            handle.add_prefixes(&[b]);
+            // prev_scripts non-empty (SP-retained) but the operator did not
+            // authorize full-script emission.
+            reg.scan_mempool_spent_scripts(&tx, &[sh], &[5_000], std::slice::from_ref(&spk), false);
+            match rx.try_recv().expect("prefix spend match") {
+                WatchMatch::PrefixMatched(pm) => {
+                    let m = &pm.matched_prevouts[0];
+                    assert!(
+                        m.script_pubkey.is_empty(),
+                        "unauthorized tier must not leak SP-retained script to prefix watcher"
+                    );
+                    assert_eq!(m.amount, Some(5_000), "value still carried under >= amount");
                 }
                 other => panic!("wrong match: {other:?}"),
             }
@@ -4111,7 +4160,7 @@ mod tests {
         assert!(reg.has_script_watchers());
 
         let op = outpoint(0xaa, 3);
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[], &[], true);
 
         match rx.try_recv().expect("mempool exact-script spend match") {
             WatchMatch::ScriptMatched {
@@ -4150,11 +4199,11 @@ mod tests {
 
         let op = outpoint(0xaa, 3);
         // Spent value 999 < floor → suppressed.
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[999], &[], true);
         assert!(rx.try_recv().is_err(), "999 < floor → suppressed");
 
         // Spent value 1000 == floor → delivered, and the value rides the event.
-        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(op), &[sh], &[1_000], &[], true);
         match rx.try_recv().expect("1000 >= floor → delivered") {
             WatchMatch::ScriptMatched {
                 is_output,
@@ -4183,7 +4232,7 @@ mod tests {
         assert_eq!(handle.add_scripthashes_with_floors(&[(sh, 1_000)]), 1);
 
         // Empty amounts (hash tier) + a non-zero floor → fail closed.
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[], true);
         assert!(
             rx.try_recv().is_err(),
             "floored script + no amount available → suppressed (fail-closed)"
@@ -4192,7 +4241,7 @@ mod tests {
         // A second subscriber with no floor still gets the match.
         let (handle2, mut rx2) = reg.register(WATCH_CHANNEL_CAPACITY);
         assert_eq!(handle2.add_scripthashes(&[sh]), 1);
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[], true);
         assert!(
             matches!(rx2.try_recv(), Ok(WatchMatch::ScriptMatched { .. })),
             "no-floor watcher delivers regardless of amount availability"
@@ -4225,7 +4274,7 @@ mod tests {
             output: vec![],
         };
         // prev_scripthashes aligned to inputs: only index 2 is the watched hash.
-        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[], &[]);
+        reg.scan_mempool_spent_scripts(&tx, &[other, other, watched], &[], &[], true);
 
         match rx.try_recv().expect("the matching input fires") {
             WatchMatch::ScriptMatched { scripthash, is_output, index, confirmed, .. } => {
@@ -4246,7 +4295,7 @@ mod tests {
         handle.add_scripthashes(&[scripthash_of(&ScriptBuf::from(vec![0x52]))]);
         // A spend of a different (unwatched) prevout script.
         let other = scripthash_of(&ScriptBuf::from(vec![0x53, 0x54]));
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xbb, 0)), &[other], &[], &[], true);
         assert!(rx.try_recv().is_err(), "unwatched prevout script must not match");
     }
 
@@ -4264,6 +4313,7 @@ mod tests {
             &[scripthash_of(&ScriptBuf::from(vec![0x52]))],
             &[],
             &[],
+            true,
         );
         assert!(rx.try_recv().is_err(), "no spend-side watcher → no spend-side delivery");
     }
@@ -4280,7 +4330,7 @@ mod tests {
         handle.add_scripthashes(&[sh]);
         handle.add_prefixes(&[bucket(&sh, 12)]);
 
-        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[]);
+        reg.scan_mempool_spent_scripts(&spending_tx(outpoint(0xaa, 3)), &[sh], &[], &[], true);
 
         let (mut exact, mut prefix) = (0, 0);
         while let Ok(m) = rx.try_recv() {
