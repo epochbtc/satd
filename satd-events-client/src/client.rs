@@ -112,6 +112,19 @@ impl core::fmt::Debug for SilentPaymentTarget {
     }
 }
 
+impl Drop for SilentPaymentTarget {
+    /// Scrub the retained scan secret on drop. `b_scan` is a watch credential —
+    /// the long-lived copies held by a `ResilientWatch` mirror (and any clones)
+    /// must not linger in freed memory once a target is removed or the mirror is
+    /// torn down. (The transient `Vec<u8>` a `to_proto` copy places on the wire
+    /// is owned by the outbound message and cleared with it; this covers every
+    /// in-process copy the SDK retains.)
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.scan_secret.zeroize();
+    }
+}
+
 impl SilentPaymentTarget {
     pub(crate) fn to_proto(&self) -> pb::SilentPaymentTarget {
         pb::SilentPaymentTarget {
@@ -132,6 +145,21 @@ impl SilentPaymentTarget {
             .map_err(|_| StreamError::InvalidArgument("scan_secret is not a valid scalar".into()))?;
         let secp = Secp256k1::signing_only();
         Ok(PublicKey::from_secret_key(&secp, &sk).serialize())
+    }
+
+    /// Validate **both** curve values — the `scan_secret` scalar and the
+    /// `spend_pubkey` point — and return the identity `b_scan·G`. Client-side
+    /// validation turns a malformed target into a deterministic
+    /// [`InvalidArgument`](StreamError::InvalidArgument) at the call site instead
+    /// of a silent server-side skip that would return `Ok(())` while installing
+    /// no watch (and repeat the invalid target on every resilient reconnect).
+    /// Requires the `bitcoin` feature (enabled by default).
+    #[cfg(feature = "bitcoin")]
+    pub fn validate(&self) -> Result<[u8; 33], StreamError> {
+        let id = self.scan_pubkey()?; // validates the b_scan scalar
+        bitcoin::secp256k1::PublicKey::from_slice(&self.spend_pubkey)
+            .map_err(|_| StreamError::InvalidArgument("spend_pubkey is not a valid point".into()))?;
+        Ok(id)
     }
 }
 
@@ -464,15 +492,24 @@ impl WatchHandle {
     /// `b_scan·G`) refreshes its labels.
     ///
     /// The `scan_secret` is a watch credential disclosed to the node — see
-    /// [`SilentPaymentTarget`]. This helper moves bytes only; validate the field
-    /// widths yourself (32-byte secret, 33-byte pubkey) or let the server reject
-    /// a malformed target.
+    /// [`SilentPaymentTarget`]. With the `bitcoin` feature (the default) each
+    /// target's `scan_secret` and `spend_pubkey` are validated as curve values
+    /// up front (see [`SilentPaymentTarget::validate`]), so a malformed target is
+    /// a deterministic [`InvalidArgument`](StreamError::InvalidArgument) here
+    /// rather than a silent server-side skip that returns `Ok(())` while
+    /// installing no watch. Without the feature this helper moves bytes only —
+    /// validate the field widths yourself or let the server reject a malformed
+    /// target.
     pub async fn add_silent_payments(
         &self,
         targets: impl IntoIterator<Item = SilentPaymentTarget>,
     ) -> Result<(), StreamError> {
-        let targets: Vec<pb::SilentPaymentTarget> =
-            targets.into_iter().map(|t| t.to_proto()).collect();
+        let targets: Vec<SilentPaymentTarget> = targets.into_iter().collect();
+        #[cfg(feature = "bitcoin")]
+        for t in &targets {
+            t.validate()?;
+        }
+        let targets: Vec<pb::SilentPaymentTarget> = targets.iter().map(|t| t.to_proto()).collect();
         if targets.is_empty() {
             return Ok(());
         }

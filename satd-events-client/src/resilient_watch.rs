@@ -1784,17 +1784,31 @@ fn validate_prefixes(
         .collect()
 }
 
-/// Derive each scan-key target's identity `b_scan·G` (the mirror key and the
-/// removal identity) so it can be recorded once and re-registered on reconnect.
-/// Fails with [`StreamError::InvalidArgument`] on a malformed `scan_secret`.
+/// Validate each scan-key target and derive its identity `b_scan·G` (the mirror
+/// key and the removal identity), **deduplicating by identity** so the same set
+/// drives both the mirror mutation and the wire message.
+///
+/// Both curve values are validated ([`SilentPaymentTarget::validate`]), so a
+/// malformed `scan_secret` *or* `spend_pubkey` is a deterministic
+/// [`StreamError::InvalidArgument`] here rather than a silent server-side skip.
+///
+/// Dedup is last-wins and happens once, before the caller mutates the mirror or
+/// transmits: without it, a batch carrying the same identity twice would send
+/// both duplicates on the wire (where the server keeps the *first*) while the
+/// mirror's map keeps the *last* — so a later reconnect replay would install a
+/// different spend key/labels than the live server currently holds. Collapsing
+/// to one target per identity up front keeps the initial install, the mirror,
+/// and every reconnect in agreement.
 #[cfg(feature = "bitcoin")]
 fn sp_mirror_entries(
     targets: impl IntoIterator<Item = SilentPaymentTarget>,
 ) -> Result<Vec<([u8; 33], SilentPaymentTarget)>, StreamError> {
-    targets
-        .into_iter()
-        .map(|t| Ok((t.scan_pubkey()?, t)))
-        .collect()
+    let mut deduped: BTreeMap<[u8; 33], SilentPaymentTarget> = BTreeMap::new();
+    for t in targets {
+        let id = t.validate()?;
+        deduped.insert(id, t); // last-wins on a repeated identity
+    }
+    Ok(deduped.into_iter().collect())
 }
 
 /// Whether a `connect()` failure should be retried by reconnecting. Adds
@@ -1961,6 +1975,42 @@ mod tests {
     #[test]
     fn mirror_empty_renders_nothing() {
         assert!(WatchSetMirror::default().control_messages().is_empty());
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn sp_mirror_entries_validates_and_dedups() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let key = |b: u8| {
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap()).serialize()
+        };
+        let b_scan = [0x11u8; 32];
+        let (spend_a, spend_b) = (key(0x22), key(0x33));
+
+        // Two targets with the SAME scan identity (same b_scan) but different
+        // spend key/labels: dedup collapses to one, last-wins — so the mirror,
+        // the wire message, and every reconnect replay all agree.
+        let t1 = SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_a, labels: vec![0] };
+        let t2 =
+            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_b, labels: vec![1, 2] };
+        let entries = sp_mirror_entries([t1, t2]).expect("valid targets");
+        assert_eq!(entries.len(), 1, "same identity collapses to one entry");
+        assert_eq!(entries[0].1.spend_pubkey, spend_b, "last write wins");
+        assert_eq!(entries[0].1.labels, vec![1, 2]);
+
+        // A malformed spend_pubkey is rejected up front (deterministic), not
+        // silently accepted and skipped by the server.
+        let mut bad_spend = spend_a;
+        bad_spend[0] = 0x01; // invalid compressed-point prefix
+        let bad =
+            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: bad_spend, labels: vec![] };
+        assert!(matches!(sp_mirror_entries([bad]), Err(StreamError::InvalidArgument(_))));
+
+        // A malformed scan_secret (zero scalar) is likewise rejected.
+        let bad2 =
+            SilentPaymentTarget { scan_secret: [0u8; 32], spend_pubkey: spend_a, labels: vec![] };
+        assert!(matches!(sp_mirror_entries([bad2]), Err(StreamError::InvalidArgument(_))));
     }
 
     // --- a CursorStore we can assert against ----------------------------------
