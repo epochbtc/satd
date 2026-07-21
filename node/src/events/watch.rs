@@ -2204,6 +2204,12 @@ fn scan_block_sp_from_tweaks(
         }
     }
     if work.is_empty() || entries.is_empty() {
+        // Erase any reconstructed b_scan copies before the early return (§4.3):
+        // `entries.is_empty()` with a non-empty `work` would otherwise leave
+        // scan secrets in freed memory.
+        for (_, sk, _) in &mut work {
+            sk.non_secure_erase();
+        }
         return;
     }
     // txid → stored tweak. Row entries are one per SP-eligible tx (small); the
@@ -2229,6 +2235,11 @@ fn scan_block_sp_from_tweaks(
             wants_raw,
             sink,
         );
+    }
+    // Erase the reconstructed b_scan copies (§4.3); the accelerated fast path
+    // builds them exactly like the recompute path, which erases identically.
+    for (_, sk, _) in &mut work {
+        sk.non_secure_erase();
     }
 }
 
