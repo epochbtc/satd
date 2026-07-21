@@ -317,6 +317,36 @@ pub fn build_cursor_replay(
     let mut events: Vec<NodeEvent> = Vec::new();
     let mut confirmed_dedup: HashMap<u32, BlockHash> = HashMap::new();
     let mut deep_tweak_range: Option<(u32, u32)> = None;
+
+    // Boundary re-emit (mixed chain+tweaks): a subscriber whose cursor sits
+    // between a height's chain event (`tx_index == 0`) and its tweak aggregate
+    // (`tx_index == TWEAKS_TX_INDEX`) — chain delivered, tweak still pending —
+    // must get `from.height`'s tweaks re-emitted first, since the main loop
+    // below starts at `from.height + 1`. This is a SAME-height re-emit, so it
+    // MUST run independently of the future-height replay guard: when the client
+    // reconnects at the tip (`from.height == snapshot_tip`), `start` is
+    // `snapshot_tip + 1` and both the deep and clamped branches below are
+    // skipped — yet that block's pending tweak would otherwise be lost forever.
+    // Skipped when the span was clamped (client already told to resync earlier
+    // history), when the cursor already sits at/after the tweak position for
+    // that height, when the tweaks-only deep path owns the range, or when
+    // `from.height` is not on the active chain.
+    if tweaks_on
+        && !deep_exempt
+        && !clamped
+        && from.tx_index < TWEAKS_TX_INDEX
+        && from.height <= snapshot_tip
+    {
+        for (h, hash) in src.active_chain_range(from.height, from.height) {
+            if let Some(sp) = sp
+                && let Ok(row) = sp.tweaks_at(h)
+                && row.block_hash == hash
+            {
+                events.push(synth_block_tweaks(publisher, h, row));
+            }
+        }
+    }
+
     if deep_exempt && start <= snapshot_tip {
         // Unclamped tweaks-only cold-sync. The span can be the entire
         // taproot era, so we do NOT read the rows here (materializing them
@@ -337,27 +367,10 @@ pub fn build_cursor_replay(
             deep_tweak_range = Some((deep_start, snapshot_tip));
         }
     } else if (chain_on || tweaks_on) && start <= snapshot_tip {
-        // Boundary re-emit: a mixed subscriber whose cursor sits between a
-        // height's chain event (`tx_index == 0`) and its tweak aggregate
-        // (`tx_index == TWEAKS_TX_INDEX`) — chain delivered, tweak still
-        // pending — would otherwise lose that block's tweaks, because the main
-        // loop starts at `from.height + 1`. Re-emit `from.height`'s tweaks
-        // first. Skipped when the span was clamped (the client is already told
-        // to resync earlier history) or the cursor already sits at/after the
-        // tweak position for that height.
-        if tweaks_on && !clamped && from.tx_index < TWEAKS_TX_INDEX {
-            for (h, hash) in src.active_chain_range(from.height, from.height) {
-                if let Some(sp) = sp
-                    && let Ok(row) = sp.tweaks_at(h)
-                    && row.block_hash == hash
-                {
-                    events.push(synth_block_tweaks(publisher, h, row));
-                }
-            }
-        }
         // Clamped window: walk the active chain once, interleaving each
         // height's BlockConnected (if requested) and its BlockTweaks (if
-        // requested) so cursors stay monotonic across a mixed subscription.
+        // requested) so cursors stay monotonic across a mixed subscription. The
+        // same-height boundary re-emit for `from.height` already ran above.
         for (h, hash) in src.active_chain_range(start, snapshot_tip) {
             if chain_on {
                 confirmed_dedup.insert(h, hash);
@@ -840,6 +853,39 @@ mod tests {
             !matches!(&r2.events[0].body, NodeEventBody::BlockTweaks(bt) if bt.height == 40),
             "no boundary re-emit when the tweak cursor was already past that height"
         );
+    }
+
+    #[test]
+    fn mixed_boundary_reemits_pending_tweak_at_tip() {
+        // Regression (round-2 High): the SAME-height boundary re-emit must run
+        // even when `from.height == snapshot_tip`. Here the client received
+        // BlockConnected(50) at the tip and disconnected before BlockTweaks(50);
+        // resuming from (50, 0) sets start = 51 > tip, so BOTH the deep and
+        // clamped branches are skipped. Before the fix the pending tweak was lost
+        // permanently; now it is re-emitted.
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
+        let from = Cursor { height: 50, tx_index: 0, mempool_seq: 0, instance_id: 0 };
+        let r = build_cursor_replay(&src, &pubr, from, mask, 10_000, Some(&sp));
+        assert_eq!(tweaks_count(&r), 1, "the tip's pending tweak is re-emitted at-tip");
+        assert!(
+            matches!(&r.events[0].body, NodeEventBody::BlockTweaks(bt) if bt.height == 50),
+            "block 50's pending tweak is delivered even though start > snapshot_tip"
+        );
+        assert!(
+            !r.events.iter().any(|e| matches!(
+                e.body,
+                NodeEventBody::Chain(ChainEvent::BlockConnected { .. })
+            )),
+            "no confirmed chain events beyond the tip"
+        );
+        // And a client that already saw the tip tweak is not re-sent it.
+        let from_after =
+            Cursor { height: 50, tx_index: TWEAKS_TX_INDEX, mempool_seq: 0, instance_id: 0 };
+        let r2 = build_cursor_replay(&src, &pubr, from_after, mask, 10_000, Some(&sp));
+        assert_eq!(tweaks_count(&r2), 0, "no re-emit once the tweak cursor passed the tip");
     }
 
     #[test]
