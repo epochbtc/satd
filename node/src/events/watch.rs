@@ -63,6 +63,8 @@ pub enum SpTargetError {
     BadScanSecret,
     /// `spend_pubkey` was not a valid 33-byte compressed point (`B_spend`).
     BadSpendPubkey,
+    /// The (deduplicated) label list exceeds [`MAX_SP_LABELS_PER_TARGET`].
+    TooManyLabels,
 }
 
 impl std::fmt::Display for SpTargetError {
@@ -70,9 +72,21 @@ impl std::fmt::Display for SpTargetError {
         match self {
             Self::BadScanSecret => f.write_str("invalid silent-payment scan secret"),
             Self::BadSpendPubkey => f.write_str("invalid silent-payment spend pubkey"),
+            Self::TooManyLabels => f.write_str("too many silent-payment labels for one target"),
         }
     }
 }
+
+/// Upper bound on the number of distinct receiver labels a single scan-key
+/// target may carry. Labels are otherwise unbounded on the wire, yet the
+/// per-connection target cap (16) and the watch quota charge per *target*, not
+/// per label — so without this cap
+/// one target could carry a transport-sized label list, and the matcher would
+/// derive a label point (an EC multiply) per label on **every** SP-eligible
+/// transaction, a CPU/memory amplification an attacker controls. A real wallet
+/// uses a handful (change is label 0); 16 is generous while keeping the
+/// per-connection worst case bounded (16 targets × 16 labels).
+pub const MAX_SP_LABELS_PER_TARGET: usize = 16;
 
 impl std::error::Error for SpTargetError {}
 
@@ -103,7 +117,10 @@ pub struct SpWatchTarget {
 impl SpWatchTarget {
     /// Validate and wrap a target from its wire fields: a 32-byte scan secret,
     /// a 33-byte compressed spend pubkey, and label integers (deduplicated
-    /// here). Computes and caches the scan-pubkey identity.
+    /// here). Computes and caches the scan-pubkey identity. Rejects a target
+    /// whose deduplicated label list exceeds [`MAX_SP_LABELS_PER_TARGET`] —
+    /// labels are otherwise unbounded on the wire yet quota is charged per
+    /// target, so the cap bounds per-eligible-tx matcher work.
     pub fn new(
         scan_secret: [u8; 32],
         spend_pubkey: &[u8],
@@ -114,6 +131,12 @@ impl SpWatchTarget {
         let scan_pubkey = sk.public_key(sp_secp()).serialize();
         labels.sort_unstable();
         labels.dedup();
+        // Cap *after* dedup so duplicates in the request don't count against the
+        // limit, but a genuinely oversized distinct set is rejected whole (the
+        // caller shed the target rather than silently truncating labels).
+        if labels.len() > MAX_SP_LABELS_PER_TARGET {
+            return Err(SpTargetError::TooManyLabels);
+        }
         Ok(Self {
             scan_pubkey,
             scan_secret: Zeroizing::new(scan_secret),
@@ -4554,6 +4577,30 @@ mod tests {
             SpWatchTarget::new(b_scan.secret_bytes(), &[0x02u8; 32], vec![]),
             Err(SpTargetError::BadSpendPubkey),
         ));
+    }
+
+    #[test]
+    fn sp_target_caps_labels() {
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let spend = PublicKey::from_secret_key(&secp, &b_spend).serialize();
+
+        // Exactly the cap of *distinct* labels is accepted.
+        let at_cap: Vec<u32> = (0..MAX_SP_LABELS_PER_TARGET as u32).collect();
+        assert!(SpWatchTarget::new(b_scan.secret_bytes(), &spend, at_cap).is_ok());
+
+        // One distinct label over the cap is rejected whole (not truncated).
+        let over_cap: Vec<u32> = (0..=MAX_SP_LABELS_PER_TARGET as u32).collect();
+        assert!(matches!(
+            SpWatchTarget::new(b_scan.secret_bytes(), &spend, over_cap),
+            Err(SpTargetError::TooManyLabels),
+        ));
+
+        // Duplicates collapse before the cap: a huge list of one repeated label
+        // is fine (dedup runs first).
+        let dupes = vec![7u32; MAX_SP_LABELS_PER_TARGET * 100];
+        assert!(SpWatchTarget::new(b_scan.secret_bytes(), &spend, dupes).is_ok());
     }
 
     #[test]

@@ -844,11 +844,21 @@ struct WsSilentPayment {
 /// Parse a WS silent-payment target (hex scan secret + spend pubkey + labels)
 /// into a validated [`SpWatchTarget`](node::events::SpWatchTarget); `None` on
 /// malformed hex or an out-of-range key.
+///
+/// Decodes the scan secret through zeroize-on-drop buffers so the plaintext
+/// `b_scan` copies this parse creates (the decoded `Vec` and the `[u8; 32]`
+/// array) do not linger in freed memory once parsing finishes (§4.3);
+/// `SpWatchTarget::new` copies the bytes into its own zeroizing buffer. (The raw
+/// hex `String` on the inbound `WsControl` is scrubbed only by that message's
+/// drop — the gRPC Tier-2 surface additionally scrubs its wire field in place.)
 fn parse_ws_sp_target(t: &WsSilentPayment) -> Option<node::events::SpWatchTarget> {
-    let secret_bytes = hex::decode(&t.scan_secret).ok()?;
-    let scan_secret = <[u8; 32]>::try_from(secret_bytes.as_slice()).ok()?;
+    use zeroize::Zeroize;
+    let secret_bytes = zeroize::Zeroizing::new(hex::decode(&t.scan_secret).ok()?);
+    let mut scan_secret = <[u8; 32]>::try_from(secret_bytes.as_slice()).ok()?;
     let spend = hex::decode(&t.spend_pubkey).ok()?;
-    node::events::SpWatchTarget::new(scan_secret, &spend, t.labels.clone()).ok()
+    let out = node::events::SpWatchTarget::new(scan_secret, &spend, t.labels.clone()).ok();
+    scan_secret.zeroize();
+    out
 }
 
 /// Parse a WS prefix (hex + bits) into a validated registry bucket key + its
