@@ -966,7 +966,11 @@ fn apply_ws_control(
                     } else {
                         *categories
                     };
-                    category_mask.store(mask, Ordering::Relaxed);
+                    // WS/SSE never serves the tweaks firehose (a Subscribe-only
+                    // category); strip the bit so a control update cannot opt this
+                    // stream into shared-broadcast `BlockTweaks` and bypass the
+                    // Subscribe path's index/completeness/dust-limit validation.
+                    category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
                 }
                 outcome
             }
@@ -1003,7 +1007,9 @@ fn apply_ws_control(
             } else {
                 categories
             };
-            category_mask.store(mask, Ordering::Relaxed);
+            // Strip the tweaks bit: WS/SSE never serves the firehose (see the
+            // SetWatchSet path above).
+            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
         }
         WsControl::SetWatchOptions { include_raw_tx: want } => {
             // Store the encoder-side flag AND toggle the registry gate counter so

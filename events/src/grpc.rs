@@ -1362,7 +1362,13 @@ impl NodeEventStream for NodeEventStreamSvc {
                                     } else {
                                         s.categories
                                     };
-                                    category_mask.store(mask, Ordering::Relaxed);
+                                    // Watch never serves the tweaks firehose (a
+                                    // Subscribe-only category); strip the bit so a
+                                    // control update cannot forward shared-broadcast
+                                    // `BlockTweaks` past the Subscribe path's
+                                    // index/completeness/dust-limit validation.
+                                    category_mask
+                                        .store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
                                 }
                                 outcome
                             }
@@ -1983,7 +1989,9 @@ fn apply_control(
             } else {
                 c.categories
             };
-            category_mask.store(mask, Ordering::Relaxed);
+            // Strip the tweaks bit: Watch never serves the firehose (see the
+            // SetWatchSet path above).
+            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
         }
         Some(Msg::SetWatchOptions(o)) => {
             // Per-stream raw-tx inlining. Store the encoder-side flag AND toggle
@@ -2533,8 +2541,21 @@ fn deep_tweak_replay_stream(
             .await;
             let rendered = match rendered {
                 Ok(v) => v,
-                // The blocking task panicked or was cancelled; end the stream.
-                Err(_) => break,
+                // The blocking render task panicked or was cancelled. Surface it
+                // in-band so the client sees an errored stream and resyncs from
+                // its cursor. Ending silently here would let the client treat a
+                // truncated cold-sync as complete: the subscribe path pre-seeds
+                // `last_h` to this deep range's end, so a later lag/resume cursor
+                // would falsely claim every deep height was delivered.
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(Status::internal(
+                            "silent-payment deep cold-sync aborted: tweak render task \
+                             failed (panic/cancel); resync from your last cursor",
+                        )))
+                        .await;
+                    break;
+                }
             };
             for item in rendered {
                 let stop_after = item.is_err();
