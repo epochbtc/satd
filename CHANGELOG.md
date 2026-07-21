@@ -82,6 +82,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   recomputing that block. Both paths run the same kernel, so acceleration never
   changes which payments a rescan finds. No new surface or config; a scan-key
   cold-sync just gets faster when the index is on.
+- docs: Operator Manual style pass: controlled glossary, shorter sentences, standardized callouts (house style in `docs/manual/STYLE.md`); fixed stale `par`, `debug.log`, and release-target statements
 
 ## Releases
 

@@ -1,37 +1,40 @@
 # Getting Started: Consuming Events
 
-This chapter is the guided path from *nothing* to a durable, reconnect-surviving
-consumer of satd's Streaming Consumption API. It is deliberately narrative — one
-thread of a story, one runnable step at a time. Each step names the concept and
-then links to the two reference chapters that own the detail:
+This chapter takes you from nothing to a durable, reconnect-surviving consumer
+of satd's Streaming Consumption API, one runnable step at a time. Each step
+names the concept, then links to the two reference chapters that own the
+detail:
 
-- the [Streaming Consumption API](streaming.md) chapter — the wire protocol,
+- the [Streaming Consumption API](streaming.md) chapter: the wire protocol,
   transports, watch-sets, cursors, quotas, and operator limits;
-- the [Rust SDK (`satd-events-client`)](rust-sdk.md) chapter — every type and
+- the [Rust SDK (`satd-events-client`)](rust-sdk.md) chapter: every type and
   method, in isolation.
 
-Reach for those when you want the full signature or the edge cases. Here we just
-build the thing.
+Read those when you need a full signature or an edge case.
 
-We use the Rust SDK throughout. Nothing here is Rust-specific at the protocol
-level: WebSocket/SSE consumers follow the same sequence over the JSON rendering
-(see the [Transports](streaming.md) section).
+The tutorial uses the Rust SDK throughout. Nothing here is Rust-specific at the
+protocol level: WebSocket and SSE consumers follow the same sequence over the
+JSON rendering (see the [Transports](streaming.md) section).
 
-**Prerequisites.** A running satd node with the events gRPC listener enabled
-(`eventsgrpcbind = 127.0.0.1:50051`), and a project that depends on
-`satd-events-client`. For a loopback node no token is needed; a remote node
-needs bearer auth or mTLS — [Step 8](#step-8--going-remote-safely) returns to that.
+## Prerequisites
 
-## Step 1 — Choose a transport
+You need a running node with the events gRPC listener enabled
+(`eventsgrpcbind = 127.0.0.1:50051`) and a project that depends on
+`satd-events-client`. A loopback node needs no token. A remote node needs
+bearer auth or mTLS; [Step 8](#step-8-go-remote-safely) covers that.
 
-One schema, three transports: **gRPC** (the primary programmatic surface),
-**JSON-over-WebSocket** (`GET /ws`, with a control channel), and **SSE**
-(`GET /sse`, a read-only browser/`curl` firehose). If you are writing a service,
-use gRPC — it is the only transport with the full bidirectional watch-set control
-channel. Details and the port model are in the
-[Transports](streaming.md) section. The rest of this tutorial is gRPC.
+## Step 1: Choose a transport
 
-## Step 2 — Connect
+The API has one schema and three transports: gRPC (the primary programmatic
+surface), JSON over WebSocket (`GET /ws`, with a control channel), and SSE
+(`GET /sse`, a read-only firehose for browsers and `curl`).
+
+If you are writing a service, use gRPC. It is the only transport with the full
+bidirectional watch-set control channel. The transport details and the port
+model are in the [Transports](streaming.md) section. The rest of this tutorial
+uses gRPC.
+
+## Step 2: Connect
 
 ```rust,ignore
 use satd_events_client::{StreamClient, SubscribeOptions, Categories, Event};
@@ -42,14 +45,14 @@ let mut client = StreamClient::builder("http://127.0.0.1:50051")
     .await?;
 ```
 
-That's a plaintext loopback connection — fine for a node on the same host. TLS,
-mTLS, and bearer tokens are one builder call each; see
-[Connecting](rust-sdk.md) and [Step 8](#step-8--going-remote-safely).
+This opens a plaintext loopback connection, which is fine for a node on the
+same host. TLS, mTLS, and bearer tokens are one builder call each; see
+[Connecting](rust-sdk.md) and [Step 8](#step-8-go-remote-safely).
 
-## Step 3 — Tail the firehose
+## Step 3: Tail the firehose
 
-Before watching anything specific, prove the pipe works by tailing the raw event
-firehose — every block and mempool transition the node sees:
+Before you watch anything specific, prove the pipe works. Tail the raw event
+firehose, every block and mempool transition the node sees:
 
 ```rust,ignore
 let mut events = client.subscribe(SubscribeOptions {
@@ -67,15 +70,15 @@ while let Some(event) = events.message().await? {
 }
 ```
 
-`Event` is a flat enum, so you `match` rather than unwrap nested options. Full
-firehose semantics — categories, the captured `Cursor`, lag notices — are under
-[Firehose — `subscribe`](rust-sdk.md).
+`Event` is a flat enum, so you `match` on it instead of unwrapping nested
+options. The full firehose semantics (categories, the captured `Cursor`, lag
+notices) are under [the `subscribe` reference](rust-sdk.md).
 
-## Step 4 — Watch something and react
+## Step 4: Watch something and react
 
-The firehose is the wrong tool for "tell me about *my* scripts" — that's a
-watch-set. Open the bidirectional `watch` stream, register interest, and react to
-matches:
+The firehose is the wrong tool for tracking your own scripts; that is a
+watch-set. Open the bidirectional `watch` stream, register interest, and react
+to matches:
 
 ```rust,ignore
 let (watch, mut events) = client.watch().await?;
@@ -83,30 +86,30 @@ let (watch, mut events) = client.watch().await?;
 // A direct script watch, with an optional per-script value floor (sat).
 watch.add_scripts([(scripthash, Some(100_000))]).await?;
 
-// Or a whole wallet from its exported descriptor — the server expands the
+// Or a whole wallet from its exported descriptor: the server expands the
 // gap-limit window and derives the scripts for you (keyless: public-key-only).
 watch.add_descriptor(descriptor, /*gap*/ 20, /*start*/ 0).await?;
 
 while let Some(event) = events.message().await? {
     if let Event::ScriptMatched { txid, descriptors, .. } = event {
-        // `descriptors` attributes a descriptor-derived hit back to its
-        // descriptor + exact (branch, derivation_index) — empty for a direct
-        // watch — so a multi-wallet consumer routes the hit with no reverse index.
+        // `descriptors` maps a descriptor-derived hit back to its descriptor
+        // and exact (branch, derivation_index); it is empty for a direct
+        // watch. A multi-wallet consumer routes the hit with no reverse index.
         println!("hit {txid} ({} descriptor attributions)", descriptors.len());
     }
 }
 ```
 
-Outpoint, txid-lifecycle, and confirmation-depth watches are the same shape —
-every kind, and the sharp edges the typed helpers smooth over, are under
-[Watches — `watch`](rust-sdk.md).
+Outpoint, txid-lifecycle, and confirmation-depth watches all take the same
+shape. Every watch kind, and the edge cases the typed helpers handle, are under
+[the `watch` reference](rust-sdk.md).
 
-## Step 5 — Make it survive a reconnect
+## Step 5: Make it survive a reconnect
 
-The `watch` above loses its watch-set and its place in the stream the moment the
-connection drops. `resilient_watch` fixes both: it re-registers the watch-set on
-every reconnect and resumes from a persisted cursor, so a network blip or a
-process restart is invisible to your logic.
+The `watch` stream above loses its watch-set and its place in the stream the
+moment the connection drops. `resilient_watch` fixes both. It re-registers the
+watch-set on every reconnect and resumes from a persisted cursor, so a network
+blip or a process restart is invisible to your logic.
 
 ```rust,ignore
 use satd_events_client::{ResilientWatchConfig, FileCursorStore, Event, AutoClose};
@@ -128,20 +131,22 @@ loop {
 }
 ```
 
-Kill the node's listener and bring it back: the wrapper reconnects with backoff,
-re-registers the set, and re-anchors the cursor — deterministically, off the
-in-band `CursorAccepted`/`CursorRejected` result rather than hope. This is the
-right default for any long-lived consumer. See
-[Durable watch — `resilient_watch`](rust-sdk.md).
+Kill the node's listener and bring it back: the wrapper reconnects with
+backoff, re-registers the set, and re-anchors the cursor. Re-anchoring is
+deterministic, driven by the in-band `CursorAccepted`/`CursorRejected` result.
+Use this wrapper as the default for any long-lived consumer. See
+[the `resilient_watch` reference](rust-sdk.md).
 
-## Step 6 — Bind the watch-set to your source of truth
+## Step 6: Bind the watch-set to your source of truth
 
 The mirror `resilient_watch` keeps is authoritative only if you build the set
-once and never change it. Real consumers have a **durable** source of truth — a
-DB table of watched addresses — that changes while the process runs. Give the
-wrapper a `watch_set_loader` and it rebuilds the canonical set from that truth on
-every reconnect (and on a fresh start rehydrates from truth, not from an empty
-mirror):
+once and never change it. Real consumers have a durable source of truth, such
+as a database table of watched addresses, and it changes while the process
+runs.
+
+Give the wrapper a `watch_set_loader`. The wrapper then rebuilds the canonical
+set from that truth on every reconnect, and on a fresh start it rehydrates from
+truth, not from an empty mirror:
 
 ```rust,ignore
 let config = ResilientWatchConfig::new()
@@ -160,27 +165,27 @@ let config = ResilientWatchConfig::new()
     });
 ```
 
-When the truth changes *while the stream is up* — a bulk import, an operator
-"make the wire match truth now" — call `watch.reload().await?`. It re-runs the
-loader and pushes the whole desired set as a single atomic `SetWatchSet`, which
-the server reconciles by effective coverage under its lock and answers
-deterministically (`WatchSetReplaced` or `WatchSetRejected { reason, .. }` —
-`QuotaExceeded`, `CapExceeded`, or `Malformed`). No client-computed delta can
-strand coverage. Full semantics: the loader and `reload()` subsections of
-[Durable watch — `resilient_watch`](rust-sdk.md).
+When the truth changes while the stream is up, after a bulk import for
+example, call `watch.reload().await?`. It re-runs the loader and pushes the
+whole desired set as a single atomic `SetWatchSet`. The server reconciles the
+set by effective coverage under its lock and answers deterministically:
+`WatchSetReplaced`, or `WatchSetRejected { reason, .. }` with `QuotaExceeded`,
+`CapExceeded`, or `Malformed`. No client-computed delta can strand coverage.
+The full semantics are in the loader and `reload()` subsections of
+[the `resilient_watch` reference](rust-sdk.md).
 
-## Step 7 — Watch privately with a script prefix
+## Step 7: Watch privately with a script prefix
 
-Every step so far tells the node *exactly* which scripts you care about. For a
+Every step so far tells the node exactly which scripts you care about. For a
 custodian, an exchange, or a privacy-sensitive wallet, that interest set is
-itself sensitive — the node operator learns precisely whom you watch. A **prefix
+itself sensitive: the node operator learns exactly whom you watch. A **prefix
 watch** breaks that link.
 
 You register only a coarse `bits`-bit prefix of `sha256(scriptPubKey)`. The
-server delivers **every** transaction that falls in that `2^-bits` bucket — so it
-learns only the bucket, never your exact script — and you filter the decoys out
-locally. `PrefixWatcher` (the `bitcoin` feature) computes the buckets to register
-and does the local filtering:
+server delivers every transaction that falls in that `2^-bits` bucket, so it
+learns only the bucket, never your exact script. You filter the decoys out
+locally. `PrefixWatcher` (behind the `bitcoin` feature) computes the buckets to
+register and does the local filtering:
 
 ```rust,ignore
 use satd_events_client::{PrefixWatcher, Event};
@@ -197,28 +202,27 @@ while let Some(event) = events.message().await? {
         for f in &hits.funding  { /* a genuine funding match */ }
         for s in &hits.spending { /* a genuine spend match  */ }
         if hits.has_unresolved() {
-            // A spend-side prevout the server didn't retain (mempool below the
-            // `full` tier). Resolve the outpoint yourself before concluding
-            // non-match — never treat "absent" as "not mine".
+            // A spend-side prevout the server did not retain (mempool below
+            // the `full` tier). Resolve the outpoint yourself before you
+            // conclude non-match; do not treat "absent" as "not mine".
         }
     }
 }
 ```
 
-The privacy/bandwidth trade-off is the `bits` knob: fewer bits means a larger
-bucket, more decoy traffic, and a weaker link between you and any one script.
-`filter` deliberately never issues a precise follow-up fetch — that would re-leak
-the interest the bucket exists to hide. Retention tiers for the spend side are
-governed by `streamprevoutmeta`; both the tiers and the full mechanism are in
-[Prefix watches](rust-sdk.md) and the
-[Streaming API](streaming.md) chapter.
+`bits` sets the privacy/bandwidth trade-off. Fewer bits means a larger bucket,
+more decoy traffic, and a weaker link between you and any one script. `filter`
+never issues a precise follow-up fetch, because that would re-leak the interest
+the bucket exists to hide. The `streamprevoutmeta` option governs spend-side
+retention; the retention tiers and the full mechanism are in
+[Prefix watches](rust-sdk.md) and the [Streaming API](streaming.md) chapter.
 
-## Step 8 — Going remote safely
+## Step 8: Go remote safely
 
-Everything above assumed a loopback node. A **remote** bind must be encrypted and
-authenticated — the bearer token and the entire event stream travel in the clear
-over plaintext `http://`. Add TLS (public-CA or a pinned self-signed CA) and a
-token, or mutual TLS, with one builder call each:
+Every step above assumed a loopback node. A remote bind must be encrypted and
+authenticated: over plaintext `http://`, the bearer token and the entire event
+stream travel in the clear. Add TLS (a public CA or a pinned self-signed CA)
+and a token, or mutual TLS, with one builder call each:
 
 ```rust,ignore
 let mut client = StreamClient::builder("https://node.example:50051")
@@ -229,23 +233,24 @@ let mut client = StreamClient::builder("https://node.example:50051")
     .await?;
 ```
 
-The node-side config (`eventsgrpctlscert`, `eventsgrpcmtls`,
-`eventsgrpcallowremote`) is in the
-[Transport encryption](streaming.md) section; the client-side builder options,
-including mTLS client identity, are under [TLS / mTLS](rust-sdk.md).
+The node-side options (`eventsgrpctlscert`, `eventsgrpcmtls`,
+`eventsgrpcallowremote`) are in the [Transport encryption](streaming.md)
+section. The client-side builder options, including the mTLS client identity,
+are under [TLS / mTLS](rust-sdk.md).
 
 ## Where to next
 
-You now have the whole arc: connect → firehose → watch-set → durable →
-truth-bound → private → remote. From here, follow the reference chapters for the
-detail this tutorial deferred:
+The tutorial covered the full sequence: connect, tail the firehose, register a
+watch-set, make it durable, bind it to your source of truth, watch privately,
+and go remote. The reference chapters cover what this tutorial deferred:
 
-- **Quotas and error handling** — watch quota, rate limits, and which
+- **Quotas and error handling.** The watch quota, the rate limits, and which
   `StreamError`s are retryable: [Errors](rust-sdk.md) and the
   [Authentication & quotas](streaming.md) section.
-- **Cursors and replay** — exact confirmed-side replay vs. best-effort mempool
-  replay, and the replay-truncation `ReplayGap`: [Cursors & replay](streaming.md).
-- **Runnable examples** — `firehose_tail`, `resilient_tail`, `watch_outpoints`,
-  `descriptor_wallet`, `lifecycle_alarms`, `prefix_privacy`, `tls_tail`,
+- **Cursors and replay.** Exact confirmed-side replay, best-effort mempool
+  replay, and the replay-truncation `ReplayGap`:
+  [Cursors & replay](streaming.md).
+- **Runnable examples.** `firehose_tail`, `resilient_tail`, `watch_outpoints`,
+  `descriptor_wallet`, `lifecycle_alarms`, `prefix_privacy`, `tls_tail`, and
   `mtls_tail`, in
   [`satd-events-client/examples/`](https://github.com/epochbtc/satd/tree/master/satd-events-client/examples).
