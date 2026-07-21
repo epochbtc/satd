@@ -83,6 +83,19 @@ impl SubscribeOptions {
     }
 }
 
+/// Server-enforced cap on the number of *distinct* labels one scan-key target
+/// may carry (mirrors the node's `MAX_SP_LABELS_PER_TARGET`). The server rejects
+/// an over-label target; enforcing the same bound client-side turns that into a
+/// deterministic error at the call site instead of a silent skip.
+pub const MAX_SP_LABELS_PER_TARGET: usize = 16;
+
+/// Server-enforced cap on the number of scan-key targets per connection (mirrors
+/// the node's `MAX_SP_TARGETS_PER_CONNECTION`). The server silently sheds an
+/// over-cap add; a stateful [`ResilientWatch`](crate::ResilientWatch) enforces
+/// this bound before recording/sending so it never mirrors and replays a target
+/// the server dropped.
+pub const MAX_SP_TARGETS_PER_CONNECTION: usize = 16;
+
 /// A BIP 352 scan-key watch target (Tier 2): a `(scan_secret, spend_pubkey)`
 /// pair plus optional labels, registered via
 /// [`WatchHandle::add_silent_payments`]. The node runs the ECDH match and pushes
@@ -159,6 +172,18 @@ impl SilentPaymentTarget {
         let id = self.scan_pubkey()?; // validates the b_scan scalar
         bitcoin::secp256k1::PublicKey::from_slice(&self.spend_pubkey)
             .map_err(|_| StreamError::InvalidArgument("spend_pubkey is not a valid point".into()))?;
+        // Mirror the server's per-target label cap: an over-label target is
+        // otherwise silently skipped by the node while the client believes it
+        // was installed (and a resilient reconnect replays it forever).
+        let mut labels = self.labels.clone();
+        labels.sort_unstable();
+        labels.dedup();
+        if labels.len() > MAX_SP_LABELS_PER_TARGET {
+            return Err(StreamError::InvalidArgument(format!(
+                "too many silent-payment labels: {} distinct (max {MAX_SP_LABELS_PER_TARGET})",
+                labels.len()
+            )));
+        }
         Ok(id)
     }
 }

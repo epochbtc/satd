@@ -1236,6 +1236,22 @@ impl ResilientWatch {
         if entries.is_empty() {
             return Ok(());
         }
+        // Mirror the server's per-connection target cap. Count only NET-NEW
+        // identities (re-asserting a held identity to refresh its labels is free,
+        // exactly as the carrier reconciles); reject an add that would exceed the
+        // cap instead of letting the server silently shed it — which the mirror
+        // would otherwise record and replay on every reconnect, forever.
+        let held = self.mirror.silent_payments.len();
+        let net_new = entries
+            .iter()
+            .filter(|(id, _)| !self.mirror.silent_payments.contains_key(id))
+            .count();
+        if held + net_new > crate::client::MAX_SP_TARGETS_PER_CONNECTION {
+            return Err(StreamError::InvalidArgument(format!(
+                "silent-payment target cap exceeded: {held} held + {net_new} new > {}",
+                crate::client::MAX_SP_TARGETS_PER_CONNECTION
+            )));
+        }
         self.mirror.add_silent_payments(&entries);
         let targets: Vec<pb::SilentPaymentTarget> =
             entries.iter().map(|(_, t)| t.to_proto()).collect();
@@ -2011,6 +2027,64 @@ mod tests {
         let bad2 =
             SilentPaymentTarget { scan_secret: [0u8; 32], spend_pubkey: spend_a, labels: vec![] };
         assert!(matches!(sp_mirror_entries([bad2]), Err(StreamError::InvalidArgument(_))));
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[tokio::test]
+    async fn sp_add_enforces_connection_cap() {
+        use crate::client::MAX_SP_TARGETS_PER_CONNECTION;
+        let spend = valid_spend_pubkey();
+        let target = |i: u8| SilentPaymentTarget {
+            scan_secret: [i; 32],
+            spend_pubkey: spend,
+            labels: vec![0],
+        };
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // Exactly the cap of distinct targets is accepted.
+        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(target).collect();
+        w.add_silent_payments(full).await.expect("cap-exact add accepted");
+        // Re-asserting a held identity at the cap is free (net-new = 0).
+        w.add_silent_payments([target(1)]).await.expect("re-assert at cap is free");
+        // A further DISTINCT target is rejected deterministically rather than
+        // silently shed by the server and replayed forever by the mirror.
+        let err = w
+            .add_silent_payments([target(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1)])
+            .await
+            .expect_err("over-cap add must be rejected");
+        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[tokio::test]
+    async fn sp_add_enforces_label_cap() {
+        use crate::client::MAX_SP_LABELS_PER_TARGET;
+        let spend = valid_spend_pubkey();
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // One distinct label over the cap is rejected up front.
+        let over = SilentPaymentTarget {
+            scan_secret: [1u8; 32],
+            spend_pubkey: spend,
+            labels: (0..=MAX_SP_LABELS_PER_TARGET as u32).collect(),
+        };
+        let err = w.add_silent_payments([over]).await.expect_err("over-label rejected");
+        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+        // Exactly the cap is accepted.
+        let ok = SilentPaymentTarget {
+            scan_secret: [1u8; 32],
+            spend_pubkey: spend,
+            labels: (0..MAX_SP_LABELS_PER_TARGET as u32).collect(),
+        };
+        w.add_silent_payments([ok]).await.expect("cap-exact labels accepted");
+    }
+
+    /// A valid compressed spend point for SP target test fixtures.
+    #[cfg(feature = "bitcoin")]
+    fn valid_spend_pubkey() -> [u8; 33] {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap()).serialize()
     }
 
     // --- a CursorStore we can assert against ----------------------------------

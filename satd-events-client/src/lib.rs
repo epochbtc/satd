@@ -127,8 +127,8 @@ mod resilience;
 mod resilient_watch;
 
 pub use client::{
-    AutoClose, Categories, EventStream, SilentPaymentTarget, StreamClient, StreamClientBuilder,
-    SubscribeOptions, WatchHandle,
+    AutoClose, Categories, EventStream, MAX_SP_LABELS_PER_TARGET, MAX_SP_TARGETS_PER_CONNECTION,
+    SilentPaymentTarget, StreamClient, StreamClientBuilder, SubscribeOptions, WatchHandle,
 };
 pub use error::StreamError;
 pub use event::{
