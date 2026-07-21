@@ -2100,9 +2100,9 @@ impl Mempool {
         inner.account_insert(scope, tx_size);
 
         if !conflicts.is_empty() {
-            tracing::info!(%txid, fee, fee_rate, replaced = conflicts.len(), "RBF replacement accepted to mempool");
+            tracing::debug!(%txid, fee, fee_rate, replaced = conflicts.len(), "RBF replacement accepted to mempool");
         } else {
-            tracing::info!(%txid, fee, fee_rate, ancestors = ancestors.len(), "Transaction accepted to mempool");
+            tracing::debug!(%txid, fee, fee_rate, ancestors = ancestors.len(), "Transaction accepted to mempool");
         }
 
         // Drop the write lock before emitting events — broadcast sends

@@ -88,6 +88,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   automatically, making the documented "reuse a Core `blocks/` directory"
   migration work against modern Core datadirs; `blocksxor` is now a real
   option (fresh satd dirs stay plaintext by default).
+- Log hygiene: per-transaction mempool-acceptance lines are now logged at `debug` instead of `info` (they no longer flood the log during normal operation), and ANSI color is auto-detected — escapes are suppressed when stdout is not a terminal or when `NO_COLOR` is set, so piped/`journald`-captured logs stay clean.
 
 ## Releases
 

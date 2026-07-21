@@ -90,10 +90,16 @@ async fn main() {
     let env_filter = config::build_env_filter(&config);
     let (filter_layer, filter_reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     {
+        use std::io::IsTerminal as _;
         use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         let registry = tracing_subscriber::registry().with(filter_layer);
+        // Only colorize when stdout is an actual terminal and the operator
+        // hasn't opted out via NO_COLOR (https://no-color.org). Under journald
+        // / a pipe, `is_terminal()` is false, so we don't leak ANSI escapes
+        // into captured logs.
+        let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         // Shared fmt knobs (`-logthreadnames` / `-logsourcelocations`) are
         // plain runtime bools on the same layer type; `-logtimestamps=0`
         // toggles `.without_time()`, which changes the layer's type, so each
@@ -104,6 +110,7 @@ async fn main() {
                 // `fields.message`, plus any per-event structured fields.
                 let l = tracing_subscriber::fmt::layer()
                     .json()
+                    .with_ansi(ansi)
                     .with_current_span(true)
                     .with_span_list(false)
                     .with_thread_names(config.log_thread_names)
@@ -117,6 +124,7 @@ async fn main() {
             }
             config::LogFormat::Text => {
                 let l = tracing_subscriber::fmt::layer()
+                    .with_ansi(ansi)
                     .with_thread_names(config.log_thread_names)
                     .with_file(config.log_source_locations)
                     .with_line_number(config.log_source_locations);
