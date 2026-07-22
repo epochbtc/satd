@@ -292,6 +292,26 @@ impl MetricsContext {
             );
         }
 
+        // BIP 352 silent-payment tweak index. Row counters are process-
+        // wide and count only rows actually committed to RocksDB.
+        let sp_stats = crate::index::silent_payments::stats::snapshot();
+        metric(
+            &mut out,
+            "satd_spindex_rows_total",
+            "Cumulative count of silent-payment tweak rows committed to RocksDB since process start (one per block at/above taproot activation).",
+            "counter",
+            &[],
+            sp_stats.rows,
+        );
+        metric(
+            &mut out,
+            "satd_spindex_row_removes_total",
+            "Cumulative count of silent-payment tweak-row removals committed to RocksDB (reorg disconnects).",
+            "counter",
+            &[],
+            sp_stats.row_removes,
+        );
+
         // Transaction-filtering policy metrics (design §10, PR 7c). Extracted to
         // a free function so the I8-invisibility invariant (a node with no
         // non-empty ruleset renders a byte-identical page) is unit-testable

@@ -54,6 +54,12 @@ const CF_FILTER_HEADER: &str = "block_filter_header";
 /// on Completed or Cancelled.
 const CF_ADDR_BACKFILL_TEMP: &str = "addr_backfill_outpoint_to_scripthash";
 
+/// BIP 352 silent-payment tweak index. One row per block from taproot
+/// activation upward, keyed `height_be[4]`. Always compiled (runtime
+/// opt-in, not a cargo feature); single-sourced from the codec crate so
+/// the name can never drift.
+const CF_SP_TWEAKS: &str = node_sp_index::CF_SP_TWEAKS;
+
 /// Every column family this store can create, plus RocksDB's default CF.
 /// `flush_durable` flushes exactly this list (filtered to the CFs that
 /// exist on the open DB), so a CF missing here would silently lose its
@@ -74,6 +80,7 @@ const ALL_CFS: &[&str] = &[
     CF_FILTER,
     CF_FILTER_HEADER,
     CF_ADDR_BACKFILL_TEMP,
+    CF_SP_TWEAKS,
 ];
 
 const TIP_KEY: &[u8] = b"tip";
@@ -432,6 +439,14 @@ impl RocksDbStore {
             // (txid) lets `outspends` for a tx fan out cheaply.
             // Also hot — write rate matches addr_spending.
             ColumnFamilyDescriptor::new(CF_OUTPOINT_SPEND, make_cf_opts(true, 16, Some(32), true)),
+            // BIP 352 silent-payment tweak index. Bloom on (point lookups
+            // for serving and the rescan fast path dominate); 16 MB
+            // write-buf because per-block emission is write-heavy during
+            // IBD when enabled. No prefix extractor: keys are 4-byte
+            // `height_be`, so access is point-lookup / height-range like
+            // the filter CF. Created unconditionally — the runtime flag,
+            // not a cargo feature, gates emission.
+            ColumnFamilyDescriptor::new(CF_SP_TWEAKS, make_cf_opts(true, 16, None, false)),
         ];
 
         // BIP 158 filter index. Bloom on (point lookups dominate
@@ -940,11 +955,16 @@ impl RocksDbStore {
                 | CF_OUTPOINT_SPEND
                 | CF_FILTER
                 | CF_FILTER_HEADER
+                | CF_SP_TWEAKS
         );
         #[cfg(not(feature = "block-filter-index"))]
         let bloom = matches!(
             name,
-            CF_COINS | CF_ADDR_FUNDING_V2 | CF_ADDR_SPENDING_V2 | CF_OUTPOINT_SPEND
+            CF_COINS
+                | CF_ADDR_FUNDING_V2
+                | CF_ADDR_SPENDING_V2
+                | CF_OUTPOINT_SPEND
+                | CF_SP_TWEAKS
         );
         let write_buf_mb = match name {
             CF_COINS => 64,
@@ -956,6 +976,7 @@ impl RocksDbStore {
             CF_FILTER => 16,
             #[cfg(feature = "block-filter-index")]
             CF_FILTER_HEADER => 8,
+            CF_SP_TWEAKS => 16,
             _ => 2,
         };
 
@@ -1084,6 +1105,7 @@ impl RocksDbStore {
             #[cfg(feature = "block-filter-index")]
             CF_FILTER_HEADER,
             CF_ADDR_BACKFILL_TEMP,
+            CF_SP_TWEAKS,
         ];
         names
             .iter()
@@ -1473,6 +1495,25 @@ impl Store for RocksDbStore {
             }
         }
 
+        // BIP 352 silent-payment tweak rows. Same atomic-with-chainstate
+        // guarantee as the filter rows: a crash mid-write rolls the tweak
+        // rows back with the chain segment, so a served row can never
+        // describe a block whose chainstate is only partially committed.
+        // The row embeds its block hash, so it is self-authenticating on
+        // read. Empty-batch fast-path skips the CF handle lookup.
+        let sp_put_count = batch.sp_tweak_puts.len() as u64;
+        let sp_remove_count = batch.sp_tweak_removes.len() as u64;
+        if !batch.sp_tweak_puts.is_empty() || !batch.sp_tweak_removes.is_empty() {
+            use node_sp_index::encode_sp_key;
+            let cf_sp = self.cf(CF_SP_TWEAKS);
+            for (height, row) in &batch.sp_tweak_puts {
+                wb.put_cf(&cf_sp, encode_sp_key(*height), row.encode());
+            }
+            for height in &batch.sp_tweak_removes {
+                wb.delete_cf(&cf_sp, encode_sp_key(*height));
+            }
+        }
+
         // Backfill temp CF: only present while a backfill is in flight.
         // We refuse to commit a batch that produced temp puts but
         // arrived at the store after the CF was already dropped — that
@@ -1630,6 +1671,12 @@ impl Store for RocksDbStore {
         if spending_remove_count > 0 {
             crate::index::address::stats::add_spending_removes(spending_remove_count);
         }
+        if sp_put_count > 0 {
+            crate::index::silent_payments::stats::add_rows(sp_put_count);
+        }
+        if sp_remove_count > 0 {
+            crate::index::silent_payments::stats::add_row_removes(sp_remove_count);
+        }
         Ok(())
     }
 
@@ -1725,6 +1772,7 @@ impl Store for RocksDbStore {
             #[cfg(feature = "block-filter-index")]
             CF_FILTER_HEADER,
             CF_ADDR_BACKFILL_TEMP,
+            CF_SP_TWEAKS,
         ];
         names
             .iter()
@@ -1853,6 +1901,9 @@ impl Store for RocksDbStore {
             cfs.push(CF_FILTER);
             cfs.push(CF_FILTER_HEADER);
         }
+        // BIP 352 tweak index: same reasoning — -reindex-chainstate
+        // rebuilds rows from genesis via the connect_block emit path.
+        cfs.push(CF_SP_TWEAKS);
         for cf_name in cfs {
             self.drop_and_recreate_cf(cf_name)?;
         }
@@ -1893,6 +1944,7 @@ impl Store for RocksDbStore {
             CF_ADDR_SPENDING_V2,
             CF_OUTPOINT_SPEND,
             CF_CHAIN_TX,
+            CF_SP_TWEAKS,
         ];
         #[cfg(feature = "block-filter-index")]
         {
@@ -2197,6 +2249,40 @@ impl Store for RocksDbStore {
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
         self.write_block_filter_index_complete(true)
+    }
+
+    fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {
+        let cf = self.cf(CF_SP_TWEAKS);
+        let raw = self
+            .db
+            .get_cf(&cf, node_sp_index::encode_sp_key(height))
+            .ok()
+            .flatten()?;
+        match node_sp_index::SpBlockRow::decode(&raw) {
+            Ok(row) => Some(row),
+            Err(e) => {
+                // The row is written by our own codec inside the
+                // chainstate-atomic batch, so a decode failure means
+                // on-disk corruption or a version this binary predates —
+                // surface it loudly and refuse to serve rather than
+                // fabricate a partial row.
+                tracing::error!(
+                    target: "storage",
+                    "sp_tweaks row at height {height} failed to decode: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    fn silent_payment_index_complete(&self) -> bool {
+        // Default false when the marker is missing — under-claim rather
+        // than over-claim, same convention as the filter/address indexes.
+        let cf = self.cf(CF_METADATA);
+        matches!(
+            self.db.get_cf(&cf, node_sp_index::cursor::META_KEY_COMPLETE),
+            Ok(Some(v)) if v.first() == Some(&1)
+        )
     }
 
     fn lookup_spend(

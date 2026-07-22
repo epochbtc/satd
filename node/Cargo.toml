@@ -50,6 +50,7 @@ tls-config = { path = "../tls-config" }
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
 node-filter-index = { path = "../node-filter-index" }
+node-sp-index = { path = "../node-sp-index" }
 satd-auth = { path = "../satd-auth" }
 # Transaction-filtering policy engine (the DSL). The mempool admission path
 # compiles a ruleset at startup and evaluates it once per transaction (§7).

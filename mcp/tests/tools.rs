@@ -32,7 +32,8 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
             450,
         4,
         Default::default(),
-        Default::default(),)
+        Default::default(),
+            Default::default(),)
         .unwrap(),
     );
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
@@ -591,6 +592,7 @@ mod mining {
                 AssumeValid::Disabled,
                 450,
             4,
+            Default::default(),
             Default::default(),
             Default::default(),)
             .unwrap(),

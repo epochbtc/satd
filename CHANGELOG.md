@@ -16,6 +16,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   scan loop) plus the `sp_tweaks` row/key codec, backfill cursor, read trait,
   and config. Validated against the BIP 352 v1.1.0 test vectors. Foundation
   only; not yet wired into the daemon.
+- Silent payments (BIP 352): index write path. New `silentpaymentindex=1`
+  runtime flag (default off, always compiled) makes `connect_block` stamp one
+  self-authenticating tweak row per block at/above taproot activation (present
+  even when empty), committed atomically with the chainstate; reorg disconnects
+  remove it. `-reindex-chainstate` rebuilds it. New `satd_spindex_rows_total` /
+  `satd_spindex_row_removes_total` metrics. Off ⇒ defaults byte-identical to
+  0.4.0. Serving surfaces land in a later change.
 
 ## Releases
 

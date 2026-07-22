@@ -38,6 +38,10 @@ pub struct InMemoryStore {
     filter_backfill_cursor: parking_lot::RwLock<node_filter_index::cursor::BackfillCursor>,
     #[cfg(feature = "block-filter-index")]
     filter_backfill_last_error: parking_lot::RwLock<Option<String>>,
+    /// BIP 352 tweak rows, keyed by height. Always compiled (runtime
+    /// opt-in), mirroring the always-present `outpoint_spend` map.
+    sp_tweaks: parking_lot::RwLock<std::collections::HashMap<u32, node_sp_index::SpBlockRow>>,
+    sp_complete: parking_lot::RwLock<bool>,
 }
 
 impl Default for InMemoryStore {
@@ -80,6 +84,11 @@ impl InMemoryStore {
             ),
             #[cfg(feature = "block-filter-index")]
             filter_backfill_last_error: parking_lot::RwLock::new(None),
+            sp_tweaks: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            // Match the RocksDb default: tests that want a complete marker
+            // stamp it explicitly (or drive a from-genesis connect chain,
+            // which needs no backfill).
+            sp_complete: parking_lot::RwLock::new(true),
         }
     }
 
@@ -224,6 +233,20 @@ impl Store for InMemoryStore {
                 if adv.snapshot_tip_hash != [0u8; 32] {
                     cur.snapshot_tip_hash = adv.snapshot_tip_hash;
                 }
+            }
+        }
+
+        // BIP 352 tweak rows — always compiled. Puts then removes; a
+        // height present in both is dropped (removes win), matching the
+        // RocksDB WriteBatch's last-op-per-key semantics for a disconnect
+        // that follows a connect in the same coalesced batch.
+        if !batch.sp_tweak_puts.is_empty() || !batch.sp_tweak_removes.is_empty() {
+            let mut sp = self.sp_tweaks.write();
+            for (height, row) in batch.sp_tweak_puts {
+                sp.insert(height, row);
+            }
+            for height in batch.sp_tweak_removes {
+                sp.remove(&height);
             }
         }
 
@@ -392,6 +415,14 @@ impl Store for InMemoryStore {
 
     fn lookup_spend(&self, outpoint: &OutPoint) -> Result<Option<SpendingRef>, StoreError> {
         Ok(self.outpoint_spend.read().get(outpoint).copied())
+    }
+
+    fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {
+        self.sp_tweaks.read().get(&height).cloned()
+    }
+
+    fn silent_payment_index_complete(&self) -> bool {
+        *self.sp_complete.read()
     }
 
     #[cfg(feature = "block-filter-index")]

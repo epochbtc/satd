@@ -673,6 +673,7 @@ fn field_specs() -> Vec<FieldSpec> {
         // ---- Indexing ----
         restart!("txindex", txindex),
         restart!("addressindex", addressindex),
+        restart!("silentpaymentindex", silentpaymentindex),
         live!("addrindexsubscriptions", addrindexsubscriptions, |c, h| h
             .addr_sub_registry
             .set_max_subs(c.addrindexsubscriptions)),

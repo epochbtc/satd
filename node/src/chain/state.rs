@@ -254,6 +254,11 @@ pub struct ChainState {
     /// row-removal in `disconnect_block`.
     #[cfg(feature = "block-filter-index")]
     filter_index: crate::index::filter::FilterIndexConfig,
+    /// BIP 352 silent-payment tweak index runtime config. Threaded into
+    /// every `connect_block` / `disconnect_block` call like
+    /// `address_index`. Always present (runtime opt-in, not a cargo
+    /// feature).
+    sp_index: crate::index::silent_payments::SpIndexConfig,
     /// Persistent reorg history + optional webhook dispatch.
     /// Lazily initialized by `open_reorg_log` — may be absent in tests
     /// that don't care about reorg observability.
@@ -348,6 +353,7 @@ impl ChainState {
         num_threads: usize,
         address_index: crate::index::address::AddressIndexConfig,
         filter_index: crate::index::filter::FilterIndexConfig,
+        sp_index: crate::index::silent_payments::SpIndexConfig,
     ) -> Result<Self, ChainError> {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -441,6 +447,7 @@ impl ChainState {
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     num_threads,
                     address_index,
+                    sp_index,
                     #[cfg(feature = "block-filter-index")]
                     filter_index,
                     reorg_log: std::sync::OnceLock::new(),
@@ -511,6 +518,7 @@ impl ChainState {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &address_index,
+            sp_index: &sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &filter_index,
             phase_tracker: None,
@@ -535,6 +543,7 @@ impl ChainState {
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             num_threads,
             address_index,
+            sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index,
             reorg_log: std::sync::OnceLock::new(),
@@ -2738,6 +2747,7 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
             address_index: &self.address_index,
+            sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
@@ -3021,6 +3031,7 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: Some(phases),
@@ -3276,6 +3287,7 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: Some(&pre.txids),
             address_index: &self.address_index,
+            sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
@@ -3326,6 +3338,7 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
@@ -3559,6 +3572,7 @@ impl ChainState {
                 num_threads: self.num_threads,
                 precomputed_txids: None,
                 address_index: &self.address_index,
+                sp_index: &self.sp_index,
                 #[cfg(feature = "block-filter-index")]
                 filter_index: &self.filter_index,
                 phase_tracker: None,
@@ -3992,6 +4006,7 @@ impl ChainState {
                         num_threads: 1,
                         precomputed_txids: None,
                         address_index: &self.address_index,
+                        sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
                         phase_tracker: None,
@@ -4076,6 +4091,7 @@ impl ChainState {
             num_threads: self.num_threads,
             precomputed_txids: None,
             address_index: &self.address_index,
+            sp_index: &self.sp_index,
             #[cfg(feature = "block-filter-index")]
             filter_index: &self.filter_index,
             phase_tracker: None,
@@ -4376,6 +4392,7 @@ impl ChainState {
                 &self.address_index,
                 #[cfg(feature = "block-filter-index")]
                 &self.filter_index,
+                &self.sp_index,
             )?;
             combined_batch.merge(batch);
 
@@ -4859,6 +4876,7 @@ impl ChainState {
                     num_threads: 1,
                     precomputed_txids: None,
                     address_index: &self.address_index,
+                    sp_index: &self.sp_index,
                     #[cfg(feature = "block-filter-index")]
                     filter_index: &self.filter_index,
                     phase_tracker: None,
@@ -5305,6 +5323,7 @@ pub(crate) mod tests {
             4,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
         .unwrap();
         (cs, dir)
@@ -5631,6 +5650,7 @@ pub(crate) mod tests {
             AssumeValid::Disabled,
             450,
             4,
+            Default::default(),
             Default::default(),
             Default::default(),
         )
@@ -6770,6 +6790,7 @@ pub(crate) mod tests {
             4,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
         .unwrap();
 
@@ -7631,6 +7652,7 @@ pub(crate) mod tests {
             4,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
         .unwrap();
 
@@ -7967,6 +7989,7 @@ pub(crate) mod tests {
             AssumeValid::Hash(block1_hash),
             450,
             4,
+            Default::default(),
             Default::default(),
             Default::default(),
         )
@@ -8772,6 +8795,7 @@ pub(crate) mod tests {
             AssumeValid::Disabled,
             450,
             4,
+            Default::default(),
             Default::default(),
             Default::default(),
         )

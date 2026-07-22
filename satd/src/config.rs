@@ -624,6 +624,10 @@ pub struct Config {
     /// `--addressindex=0` or `-noindex=address`. Backs the native
     /// Electrum and Esplora subsystems.
     pub addressindex: bool,
+    /// BIP 352 silent-payment tweak index. **Off by default**; enable
+    /// via `--silentpaymentindex=1`. Always compiled (runtime opt-in),
+    /// so a node that leaves it off is byte-for-byte unchanged.
+    pub silentpaymentindex: bool,
     /// Maximum concurrent per-scripthash status subscriptions. Caps
     /// memory growth from the per-scripthash broadcast registry.
     /// Default 10000 — generous for typical xpub-derivation patterns.
@@ -2136,6 +2140,14 @@ impl Config {
             .or_else(|| file_get("addressindex").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
 
+        // BIP 352 silent-payment tweak index. Off by default (runtime
+        // opt-in); enabling it on an existing datadir triggers a backfill
+        // (PR-3). Defaults byte-identical to a node that never sets it.
+        let silentpaymentindex = cli
+            .silentpaymentindex
+            .or_else(|| file_get("silentpaymentindex").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         // Per-scripthash subscription cap. Default 10000 covers
         // typical xpub-derivation patterns; operators serving public
         // Electrum/Esplora endpoints may want to raise this.
@@ -2852,6 +2864,7 @@ impl Config {
             networkactive,
             txindex,
             addressindex,
+            silentpaymentindex,
             addrindexsubscriptions,
             esplora,
             esplora_bind,
@@ -4139,6 +4152,16 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Maintain a BIP 352 silent-payment tweak index (default: false). Accepts 0/1/true/false."
+    )]
+    pub silentpaymentindex: Option<bool>,
+
+    #[arg(
+        long,
         value_name = "N",
         help = "Maximum concurrent per-scripthash subscriptions (default: 10000)"
     )]
@@ -5416,6 +5439,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "networkactive",
         "txindex",
         "addressindex",
+        "silentpaymentindex",
         "addrindexsubscriptions",
         "esplora",
         "esplorabind",
@@ -5553,6 +5577,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "proxyrandomize",
         "txindex",
         "addressindex",
+        "silentpaymentindex",
         "peerblockfilters",
         "mempoolfullrbf",
         "datacarrier",
@@ -5958,6 +5983,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     // Indexing
     "txindex",
     "addressindex",
+    "silentpaymentindex",
     "addrindexsubscriptions",
     "blockfilterindex",
     "peerblockfilters",
@@ -7077,6 +7103,7 @@ rpcport=8332
             networkactive: None,
             txindex: None,
             addressindex: None,
+            silentpaymentindex: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,
@@ -7354,6 +7381,7 @@ rpcport=8332
             networkactive: None,
             txindex: None,
             addressindex: None,
+            silentpaymentindex: None,
             addrindexsubscriptions: None,
             esplora: None,
             esplorabind: None,

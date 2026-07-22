@@ -71,6 +71,13 @@ pub enum ConnectError {
     #[cfg(feature = "block-filter-index")]
     #[error("block filter index emit failed: {0}")]
     FilterIndexEmit(String),
+    /// BIP 352 tweak construction failed for the connecting block.
+    /// Like `FilterIndexEmit`, unreachable on the live path (the
+    /// prev-output-script map is populated from the same coins resolved
+    /// for verification); the variant surfaces a real error rather than a
+    /// panic on a synthetic fixture with a missing prevout.
+    #[error("silent payment index emit failed: {0}")]
+    SpIndexEmit(String),
 }
 
 /// Decode the block height from a BIP 34 coinbase scriptSig.
@@ -290,6 +297,11 @@ pub struct ConnectParams<'a> {
     /// layer via `with_blockfilterindex_enabled`).
     #[cfg(feature = "block-filter-index")]
     pub filter_index: &'a crate::index::filter::FilterIndexConfig,
+    /// BIP 352 silent-payment tweak index runtime config. When
+    /// `enabled`, the end-of-tx-loop emit produces one `sp_tweaks` row
+    /// per block at/above taproot activation. Always present (runtime
+    /// opt-in, not a cargo feature) — mirrors `address_index`.
+    pub sp_index: &'a crate::index::silent_payments::SpIndexConfig,
     /// Per-phase heartbeat tracker. When `Some`, the connect path
     /// stamps a new phase + wall-clock timestamp at each major
     /// transition (pre-resolve, verify-dispatch, verify-join, etc.).
@@ -306,14 +318,14 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
-        address_index, filter_index, phase_tracker,
+        address_index, filter_index, sp_index, phase_tracker,
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
-        address_index, phase_tracker,
+        address_index, sp_index, phase_tracker,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -323,6 +335,19 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     let address_index: &crate::index::address::AddressIndexConfig = address_index;
     #[cfg(feature = "block-filter-index")]
     let filter_index: &crate::index::filter::FilterIndexConfig = filter_index;
+    let sp_index: &crate::index::silent_payments::SpIndexConfig = sp_index;
+    // The prev-output-script map is needed by both the BIP 158 filter
+    // index and the BIP 352 tweak index. Populate it when either wants it.
+    let want_prev_output_scripts = {
+        #[cfg(feature = "block-filter-index")]
+        {
+            filter_index.enabled || sp_index.enabled
+        }
+        #[cfg(not(feature = "block-filter-index"))]
+        {
+            sp_index.enabled
+        }
+    };
     let num_threads = *num_threads;
     let flat_pos = *flat_pos;
     let phase_tracker = *phase_tracker;
@@ -379,12 +404,12 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // Fast lookup for coins created earlier in this block (intra-block spends).
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
-    // Block-wide prev-output script map for BIP 158 filter construction.
-    // Populated alongside `prev_outputs` inside the per-tx loop and
-    // consumed by the emit helper at end-of-loop. No-op when the
-    // filter index is disabled (we still pay one HashMap insertion per
-    // input, which is cheap and dominated by the script verification).
-    #[cfg(feature = "block-filter-index")]
+    // Block-wide prev-output script map for BIP 158 filter construction
+    // and BIP 352 tweak extraction. Populated alongside `prev_outputs`
+    // inside the per-tx loop and consumed by the emit helpers at
+    // end-of-loop. Empty (and unpopulated) when neither index wants it —
+    // see `want_prev_output_scripts`. Always declared: the SP emit is not
+    // cargo-feature-gated.
     let mut block_prev_output_scripts: HashMap<OutPoint, bitcoin::ScriptBuf> = HashMap::new();
 
     // --- UTXO pre-resolution for external inputs ---
@@ -539,10 +564,10 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     script_pubkey: coin.script_pubkey.clone(),
                 });
 
-                // BIP 158 SCRIPT_FILTER input set: every non-coinbase
-                // input contributes its prev-output scriptPubKey.
-                #[cfg(feature = "block-filter-index")]
-                if filter_index.enabled {
+                // BIP 158 SCRIPT_FILTER input set / BIP 352 input
+                // classification: every non-coinbase input contributes its
+                // prev-output scriptPubKey to the block-wide map.
+                if want_prev_output_scripts {
                     block_prev_output_scripts
                         .insert(outpoint, coin.script_pubkey.clone());
                 }
@@ -787,6 +812,24 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         }
     }
 
+    // BIP 352 silent-payment tweak emission. Same end-of-loop hook as the
+    // filter index. One row per block at/above taproot activation, present
+    // even when empty so row-presence means "indexed, no eligible txs".
+    // Below activation, nothing on chain is SP-eligible and no row is
+    // written at all (§3.2). No-op when the index is disabled at runtime.
+    if sp_index.enabled
+        && height >= crate::validation::script::activation_heights(network).taproot
+        && let Some(row) = crate::index::silent_payments::build_sp_row(
+            sp_index,
+            block,
+            block_hash,
+            &block_prev_output_scripts,
+        )
+        .map_err(|e| ConnectError::SpIndexEmit(format!("{e}")))?
+    {
+        batch.sp_tweak_puts.push((height, row));
+    }
+
     // Build BlockIndexEntry
     let chainwork = add_u256(parent_chainwork, &work_for_bits(block.header.bits));
     let entry = BlockIndexEntry {
@@ -864,6 +907,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -969,6 +1013,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1253,6 +1298,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1278,6 +1324,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1303,6 +1350,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1328,6 +1376,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1353,6 +1402,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1380,6 +1430,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1405,6 +1456,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1430,6 +1482,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1455,6 +1508,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1487,6 +1541,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1512,6 +1567,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1537,6 +1593,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1614,6 +1671,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1680,6 +1738,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1758,6 +1817,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1857,6 +1917,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1882,6 +1943,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -1955,6 +2017,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2032,6 +2095,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2061,6 +2125,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2180,6 +2245,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2223,6 +2289,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2261,6 +2328,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &Default::default(),
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2331,6 +2399,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2369,6 +2438,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2411,6 +2481,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &disabled,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2445,6 +2516,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             phase_tracker: None,
@@ -2484,6 +2556,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
         })
@@ -2517,6 +2590,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
         })
@@ -2554,6 +2628,7 @@ mod tests {
             num_threads: 1,
             precomputed_txids: None,
             address_index: &cfg,
+            sp_index: &Default::default(),
             filter_index: &fcfg,
             phase_tracker: None,
         })

@@ -2668,6 +2668,7 @@ dependencies = [
  "lru 0.16.4",
  "node-filter-index",
  "node-index",
+ "node-sp-index",
  "parking_lot",
  "rand 0.8.6",
  "rcgen",
