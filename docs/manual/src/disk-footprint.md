@@ -24,6 +24,7 @@ will track the chain's growth.
 | `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~140 GB |
 | `outpoint_spend` | UTXO → the input that spent it | `prev_txid[32] ‖ vout` | 76 B | ~100 GB |
 | `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB |
+| `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~4 GB |
 | `coins` | the live UTXO set | `txid[32] ‖ vout` | ~28 B varint | ~tens of MB |
 | `undo` | per-block disconnect data | `block_hash[32]` | ~28 B / input | small (rolling) |
 
@@ -119,8 +120,39 @@ The indices are opt-in per surface. Match the disk to what you serve:
 | `getrawtransaction <txid>` anywhere | `-txindex=1` | `tx_index` |
 | Electrum / Esplora address history | `-addressindex=1` (implies `-txindex=1` for Electrum) | `addr_funding_v2`, `addr_spending_v2`, `outpoint_spend`, `tx_index` |
 | BIP 157/158 light-client service | `-blockfilterindex=basic -peerblockfilters=1` | `block_filter`, `block_filter_header` |
+| BIP 352 silent-payment scanning or serving | `-silentpaymentindex=1` | `sp_tweaks` |
 
 When a surface is off, its CF is never written and the disk is never spent.
+
+## Silent-payment index
+
+`sp_tweaks` holds one BIP 352 public tweak per eligible transaction, grouped
+into one row per block. The `silentpaymentindex` option enables it, and it is
+off by default. Two surfaces read it: the streaming `tweaks` firehose and
+index-accelerated scan-key-watch rescans (see
+[Streaming Consumption API](streaming.md)).
+
+The index starts at taproot activation, not at genesis, because pre-taproot
+blocks carry no silent payments. Each indexed block writes a row even with no
+eligible transaction, so an empty row means "indexed, none" rather than "not
+indexed". Every row embeds the hash of the block it describes, so a reader
+authenticates it without the height-to-hash index.
+
+A node that syncs from genesis with the option set builds the index inline. To
+add the index to an existing datadir, run a backfill:
+
+```sh
+sat-cli backfillindex silentpayment
+```
+
+The backfill walks from taproot activation to the tip and resumes across a
+restart. `getindexinfo` reports a `silentpayments` section with the synced flag
+and the backfill progress. Until a backfill completes, the tweak-serving
+surfaces refuse a request rather than return a partial result.
+
+> **Note.** At roughly 4 GB on mainnet, `sp_tweaks` is small next to the
+> address indices. About 85% of tweaks describe dust outputs; a subscription
+> can drop them with a `tweak_dust_limit`.
 
 ## Compaction
 

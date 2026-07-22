@@ -245,6 +245,7 @@ startup error.
 | `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions. |
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
+| `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
 
 ## Mempool / relay policy
 
