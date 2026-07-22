@@ -141,6 +141,12 @@ pub struct StoreBatch {
     /// height (keyed by `height_be`), so a single entry drops the block's
     /// tweak row; a subsequent connect at the same height overwrites it.
     pub sp_tweak_removes: Vec<u32>,
+    /// Persist a silent-payment-index backfill cursor advance atomically
+    /// with the tweak rows it describes. `None` for non-backfill writes.
+    /// Always compiled (the SP index follows the address-index model, not
+    /// a cargo feature), so this field is never `cfg`-gated. Mirrors
+    /// `filter_backfill_cursor_advance` for the filter family.
+    pub sp_backfill_cursor_advance: Option<SpBackfillCursorWrite>,
 }
 
 /// Atomic cursor update emitted by the backfill task at each batch boundary.
@@ -178,6 +184,25 @@ pub struct FilterBackfillCursorWrite {
     pub started_at_unix: u64,
     /// Active-chain anchor recorded at `start()` time. Same all-zero
     /// "don't care" sentinel semantics as the address-index variant.
+    pub snapshot_tip_hash: [u8; 32],
+}
+
+/// Atomic cursor update for the BIP 352 silent-payment-index backfill
+/// task. Persisted in CF_METADATA under the `spindex.backfill.*`
+/// namespace. Single-pass walk so there is no `pass` field. Bundling the
+/// advance into the same `StoreBatch` as the tweak rows it describes
+/// guarantees we never observe a half-advanced cursor on resume. Always
+/// compiled (runtime opt-in, not a cargo feature).
+#[derive(Debug, Clone, Copy)]
+pub struct SpBackfillCursorWrite {
+    pub state: node_sp_index::cursor::BackfillState,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    pub started_at_unix: u64,
+    /// Active-chain anchor recorded at `start()` time. Same all-zero
+    /// "don't care" sentinel semantics as the filter/address variants:
+    /// per-block advances write the sentinel so the anchor recorded by
+    /// `start()` is preserved.
     pub snapshot_tip_hash: [u8; 32],
 }
 
@@ -324,6 +349,16 @@ impl StoreBatch {
         }
         self.sp_tweak_puts.extend(other.sp_tweak_puts);
         self.sp_tweak_removes.extend(other.sp_tweak_removes);
+
+        // SP-index backfill cursor advance: incoming wins. Same shape as
+        // the filter/address advance — the runner emits at most one
+        // advance per WriteBatch, so we only ever need last-writer-wins
+        // for the CoinCache pending-batch coalesce path (which the
+        // backfill never feeds into; it writes through
+        // `Store::write_batch` directly).
+        if other.sp_backfill_cursor_advance.is_some() {
+            self.sp_backfill_cursor_advance = other.sp_backfill_cursor_advance;
+        }
     }
 }
 
@@ -763,5 +798,35 @@ pub trait Store: Send + Sync {
     /// without SP-index storage.
     fn silent_payment_index_complete(&self) -> bool {
         true
+    }
+
+    /// Stamp `sp_index.complete` true. Called by the SP-index backfill
+    /// runner when it finishes the snapshot range. Default: error so
+    /// non-Rocks backends fail loud rather than silently no-op.
+    fn mark_silent_payment_index_complete(&self) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "mark_silent_payment_index_complete not supported on this backend".into(),
+        ))
+    }
+
+    /// Read the persisted SP-index backfill cursor from metadata.
+    /// Default: idle. Mirrors `read_filter_backfill_cursor` but reads the
+    /// `spindex.backfill.*` keyspace.
+    fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
+        node_sp_index::cursor::BackfillCursor::idle()
+    }
+
+    /// Read the persisted last-error message that goes with the SP-index
+    /// `BackfillState::Failed`. Default: `None`.
+    fn read_sp_backfill_last_error(&self) -> Option<String> {
+        None
+    }
+
+    /// Write or clear the persisted SP-index-backfill last-error message.
+    /// Pass an empty string to clear.
+    fn write_sp_backfill_last_error(&self, _msg: &str) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "write_sp_backfill_last_error not supported on this backend".into(),
+        ))
     }
 }

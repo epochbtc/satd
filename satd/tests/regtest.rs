@@ -5007,6 +5007,210 @@ fn poll_backfill_state(
     );
 }
 
+/// Poll `getindexinfo.silentpayments.backfill.state` until it reaches one
+/// of `expected` (or `synced` inferred from a completed/idle + synced
+/// combination). Mirrors `poll_backfill_state` but for the SP sibling.
+fn poll_sp_backfill_state(
+    node: &TestNode,
+    expected: &[&str],
+    deadline: std::time::Duration,
+) -> serde_json::Value {
+    let start = Instant::now();
+    let mut last = serde_json::Value::Null;
+    while start.elapsed() < deadline {
+        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let bf = &r["result"]["silentpayments"]["backfill"];
+        let state_str = bf["state"].as_str().unwrap_or("");
+        for label in expected {
+            if state_str == *label {
+                return r;
+            }
+            if *label == "synced" && (state_str == "completed" || state_str == "idle") {
+                return r;
+            }
+        }
+        last = r;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "timeout waiting for SP backfill state {:?}; last response: {}",
+        expected, last
+    );
+}
+
+/// A fresh-from-genesis sync with `--silentpaymentindex=1` reports the SP
+/// index as synced without any explicit backfill: every connected block
+/// at/above taproot activation (height 0 on regtest) is emitted live, so
+/// the index is whole by construction and the open-time marker stamp
+/// leaves it complete.
+#[test]
+fn test_sp_index_from_genesis_reports_synced() {
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(10), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let r = node.rpc_call("getindexinfo").expect("rpc");
+    let spi = &r["result"]["silentpayments"];
+    assert!(spi.is_object(), "expected silentpayments key, got: {}", r);
+    assert!(
+        spi["synced"].as_bool().unwrap_or(false),
+        "fresh --silentpaymentindex=1 sync must report synced=true without a backfill: {}",
+        r
+    );
+    // The backfill cursor is Idle (never run) on a from-genesis datadir.
+    assert_eq!(
+        spi["backfill"]["state"].as_str(),
+        Some("idle"),
+        "from-genesis datadir needs no backfill, cursor should be idle: {}",
+        r
+    );
+
+    node.stop();
+}
+
+/// The core PR-3 acceptance path: enable the SP index on an existing
+/// datadir that was synced with it OFF. The index reports NOT synced
+/// (holes below the tip), `backfillindex silentpayment` walks the range,
+/// and afterwards the index reports synced with a snapshot height at the
+/// tip.
+#[test]
+fn test_sp_index_enable_on_existing_datadir_backfills() {
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // Phase 1: sync with the SP index OFF (the default). Connecting blocks
+    // with the index disabled clears the completeness marker.
+    let mut node = TestNode::start(&[]);
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(20), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    // Phase 2: restart with the index ON, same datadir. The marker stays
+    // false (open-time stamp only touches a never-set marker), so the
+    // index must report not-synced until a backfill runs.
+    node.restart_preserving_datadir(&["--silentpaymentindex=1"]);
+    let r = node.rpc_call("getindexinfo").expect("rpc");
+    assert_eq!(
+        r["result"]["silentpayments"]["synced"].as_bool(),
+        Some(false),
+        "SP index enabled on an existing datadir must report not-synced before backfill: {}",
+        r
+    );
+
+    // Phase 3: run the deferred backfill to completion.
+    let started = node
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
+        .expect("rpc");
+    assert_eq!(
+        started["result"]["started"].as_bool(),
+        Some(true),
+        "expected started=true on an incomplete datadir: {}",
+        started
+    );
+
+    let final_resp = poll_sp_backfill_state(&node, &["completed"], Duration::from_secs(30));
+    let bf = &final_resp["result"]["silentpayments"]["backfill"];
+    assert_eq!(bf["active"].as_bool(), Some(false));
+    assert!(
+        final_resp["result"]["silentpayments"]["synced"]
+            .as_bool()
+            .unwrap_or(false),
+        "synced must be true after SP backfill completion: {}",
+        final_resp
+    );
+    assert!(
+        bf["snapshot_height"].as_u64().unwrap_or(0) >= 20,
+        "snapshot height should reflect the tip at start: {}",
+        final_resp
+    );
+
+    node.stop();
+}
+
+/// With the SP index disabled (the default), `backfillindex silentpayment`
+/// rejects with an operator-friendly -8 error rather than writing rows to
+/// a CF nobody reads.
+#[test]
+fn test_sp_index_backfill_disabled_returns_error() {
+    let mut node = TestNode::start(&[]);
+    let r = node
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
+        .expect("rpc");
+    assert_eq!(r["error"]["code"].as_i64(), Some(-8));
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("disabled") || msg.contains("silentpaymentindex=0"),
+        "error should explain the SP index is disabled; got: {}",
+        msg
+    );
+    node.stop();
+}
+
+/// Pause an SP backfill mid-run, observe the paused state, resume, and
+/// wait for completion. Uses `SATD_SP_BACKFILL_DEBUG_DELAY_MS` to slow the
+/// runner so the test can race the pause flag in. Exercises the
+/// `pauseindex`/`resumeindex silentpayment` control RPCs end to end.
+#[test]
+fn test_sp_index_backfill_pause_resume() {
+    // The cursor is Idle on a fresh --silentpaymentindex=1 datadir, so a
+    // backfillindex starts a real (redundant-but-valid) walk we can pause.
+    let mut node = TestNode::start_with_env(
+        &["--silentpaymentindex=1"],
+        &[("SATD_SP_BACKFILL_DEBUG_DELAY_MS", "30")],
+    );
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(30), serde_json::json!(addr)],
+        )
+        .expect("rpc");
+
+    let started = node
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
+        .expect("rpc");
+    assert_eq!(
+        started["result"]["started"].as_bool(),
+        Some(true),
+        "expected started=true: {}",
+        started
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let pause_resp = node
+        .rpc_call_with_params("pauseindex", vec![serde_json::json!("silentpayment")])
+        .expect("rpc");
+    assert_eq!(
+        pause_resp["result"]["paused"].as_bool(),
+        Some(true),
+        "pauseindex should accept while running: {}",
+        pause_resp
+    );
+
+    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    assert_eq!(
+        mid["result"]["silentpayments"]["backfill"]["active"].as_bool(),
+        Some(true),
+        "{}",
+        mid
+    );
+
+    let resume_resp = node
+        .rpc_call_with_params("resumeindex", vec![serde_json::json!("silentpayment")])
+        .expect("rpc");
+    assert_eq!(resume_resp["result"]["resumed"].as_bool(), Some(true));
+
+    poll_sp_backfill_state(&node, &["completed"], Duration::from_secs(60));
+
+    node.stop();
+}
+
 /// `backfillindex address` starts a real two-pass backfill on a
 /// non-AssumeUTXO datadir. Replaces the M7-era "no-op" test once the
 /// genesis→tip walk landed.

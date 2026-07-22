@@ -12,11 +12,18 @@
 //! address-index model — the only new dependency surface is
 //! `bitcoin::secp256k1`, already in the tree (design decision D5).
 
+pub mod backfill;
 pub mod emit;
+pub mod runner;
 pub mod stats;
 
+pub use backfill::{
+    BackfillError, BackfillHandle, PREFLIGHT_REQUIRED_FREE_BYTES, StatusReport, render_status,
+};
 pub use emit::{EmitError, build_sp_row};
+pub use runner::{BackfillCommand, BackfillRunner, preflight_disk};
 
+pub use node_sp_index::cursor::{self, BackfillCursor, BackfillState};
 pub use node_sp_index::{
     CF_SP_TWEAKS, SP_TWEAKS_VERSION, SpBlockRow, SpIndexConfig, SpIndexError, TweakEntry,
     compute_tweak, eligible_inputs, scan_outputs,

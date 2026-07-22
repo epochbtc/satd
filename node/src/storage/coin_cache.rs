@@ -653,6 +653,7 @@ impl Store for CoinCache {
             || batch.backfill_cursor_advance.is_some()
             || !batch.sp_tweak_puts.is_empty()
             || !batch.sp_tweak_removes.is_empty()
+            || batch.sp_backfill_cursor_advance.is_some()
             || has_filter
             || {
                 #[cfg(feature = "block-filter-index")]
@@ -696,6 +697,7 @@ impl Store for CoinCache {
                     filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
                     sp_tweak_puts: batch.sp_tweak_puts,
                     sp_tweak_removes: batch.sp_tweak_removes,
+                    sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
                 };
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
@@ -735,6 +737,7 @@ impl Store for CoinCache {
                     filter_backfill_cursor_advance: batch.filter_backfill_cursor_advance,
                     sp_tweak_puts: batch.sp_tweak_puts,
                     sp_tweak_removes: batch.sp_tweak_removes,
+                    sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
                     ..Default::default()
                 };
                 pending.merge(addr_only);
@@ -1213,6 +1216,53 @@ impl Store for CoinCache {
     #[cfg(feature = "block-filter-index")]
     fn mark_block_filter_index_complete(&self) -> Result<(), StoreError> {
         self.inner.mark_block_filter_index_complete()
+    }
+
+    // BIP 352 SP-index forwarders. Always compiled (the SP index follows
+    // the address-index model). Without these, the trait defaults
+    // (`silent_payment_index_complete` → true, `read_sp_backfill_cursor`
+    // → idle) would leak through the CoinCache wrapper and mask both the
+    // upgrade-gap detection done at store-open and the persisted backfill
+    // cursor, so `getindexinfo` would wrongly report synced and the
+    // supervisor would never auto-resume.
+    fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {
+        // Pending-batch peek first: a just-connected block's tweak row may
+        // not have flushed to the inner store yet. Last-writer-wins by
+        // height mirrors `StoreBatch::merge`.
+        let pending = self.pending_batch.lock();
+        if pending.sp_tweak_removes.contains(&height) {
+            return None;
+        }
+        if let Some((_, row)) = pending
+            .sp_tweak_puts
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == height)
+        {
+            return Some(row.clone());
+        }
+        drop(pending);
+        self.inner.get_sp_tweaks_row(height)
+    }
+
+    fn silent_payment_index_complete(&self) -> bool {
+        self.inner.silent_payment_index_complete()
+    }
+
+    fn mark_silent_payment_index_complete(&self) -> Result<(), StoreError> {
+        self.inner.mark_silent_payment_index_complete()
+    }
+
+    fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
+        self.inner.read_sp_backfill_cursor()
+    }
+
+    fn read_sp_backfill_last_error(&self) -> Option<String> {
+        self.inner.read_sp_backfill_last_error()
+    }
+
+    fn write_sp_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        self.inner.write_sp_backfill_last_error(msg)
     }
 
     fn lookup_spend(

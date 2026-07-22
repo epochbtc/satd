@@ -23,6 +23,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   remove it. `-reindex-chainstate` rebuilds it. New `satd_spindex_rows_total` /
   `satd_spindex_row_removes_total` metrics. Off ⇒ defaults byte-identical to
   0.4.0. Serving surfaces land in a later change.
+- Silent payments (BIP 352): deferred backfill for enabling the index on an
+  existing datadir. `backfillindex silentpayment` walks every block from taproot
+  activation to the tip (undo-based, anchored, resumable across restart) and
+  stamps a completeness marker; `pauseindex`/`resumeindex`/`cancelindex
+  silentpayment` control it. `getindexinfo` gains a `silentpayments` section
+  (synced + backfill progress) and a `satd_spindex_backfill_progress_ratio`
+  gauge is exported. Until a backfill completes (or the sync ran from genesis
+  with the index on), the index reports not-synced so tweak-serving surfaces
+  refuse rather than return holes.
 
 ## Releases
 
