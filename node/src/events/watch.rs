@@ -1332,28 +1332,27 @@ impl WatchRegistry {
     /// `confirmed = false`; the block-connect scan later re-emits the same match
     /// with `confirmed = true` (mirroring `ScriptMatched` mempool semantics).
     ///
-    /// `prev_scripts[i]` must be the `scriptPubKey` spent by `tx.input[i]`, in
-    /// input order — the resolved prevout scripts retained on the
-    /// [`MempoolEntry`](crate::mempool::pool::MempoolEntry) at admission *while
-    /// the SP gate was hot* (`Mempool::set_sp_gate`). When that retention did not
-    /// happen — the entry predates any SP watcher, or the slice is otherwise not
-    /// aligned 1:1 with the inputs — this returns without matching rather than
-    /// mis-classify inputs. That is the documented best-effort contract: a target
-    /// registered after a tx was admitted does not retroactively match it in the
-    /// mempool (the confirmed path or `RescanBlocks` covers it).
+    /// `tweak` is the BIP 352 public tweak `T = input_hash · A`, computed once at
+    /// admission from the resolved prevout scripts and cached on the
+    /// [`MempoolEntry`](crate::mempool::pool::MempoolEntry) (`sp_tweak`) *while
+    /// the SP gate was hot* (`Mempool::set_sp_gate`). `None` when that did not
+    /// happen — the entry predates any SP watcher, or the tx carries no silent
+    /// payment — in which case this returns without matching. That is the
+    /// documented best-effort contract: a target registered after a tx was
+    /// admitted does not retroactively match it in the mempool (the confirmed
+    /// path or `RescanBlocks` covers it). Because the tweak is precomputed, this
+    /// no longer recomputes it per scan and no longer needs the retained prevout
+    /// scripts.
     ///
     /// Self-gates on [`has_sp_watchers`](Self::has_sp_watchers): a no-op (single
     /// atomic load, no lock) unless at least one SP target is live.
-    pub fn scan_mempool_sp(&self, tx: &Transaction, prev_scripts: &[ScriptBuf]) {
+    pub fn scan_mempool_sp(&self, tx: &Transaction, tweak: Option<&TweakEntry>) {
         if !self.has_sp_watchers() {
             return;
         }
-        // Without the full, input-aligned prevout script set the tweak cannot be
-        // computed correctly (an input we can't classify would be dropped and
-        // change the input hash). Require exact alignment; otherwise skip.
-        if prev_scripts.len() != tx.input.len() {
+        let Some(entry) = tweak else {
             return;
-        }
+        };
         let inner = self.read_inner();
         if inner.sp_subs.is_empty() {
             return;
@@ -1370,7 +1369,17 @@ impl WatchRegistry {
             return;
         }
         let wants_raw = self.wants_any_raw_tx();
-        scan_tx_sp(&inner, &work, tx, prev_scripts, false, None, wants_raw, &mut LiveSink);
+        sp_scan_tx_outputs(
+            &inner,
+            &work,
+            tx,
+            entry.txid,
+            &entry.tweak,
+            false,
+            None,
+            wants_raw,
+            &mut LiveSink,
+        );
         // Scrub the reconstructed `b_scan` SecretKeys before `work` drops (see
         // scan_block_sp; secp256k1 0.29 has no zeroize-on-drop).
         for (_, sk, _) in &mut work {
@@ -2057,16 +2066,16 @@ fn scan_block_sp(
 }
 
 /// Silent-payment scan of a **single** transaction against the pre-resolved
-/// `work` set (one `(SubId, b_scan, target)` row per registered target). Shared
-/// by the confirmed-block path ([`scan_block_sp`], `confirmed = true` +
-/// `Some(height)`) and the mempool path ([`WatchRegistry::scan_mempool_sp`],
-/// `confirmed = false` + `None`).
+/// `work` set (one `(SubId, b_scan, target)` row per registered target). Used by
+/// the confirmed-block path ([`scan_block_sp`], `confirmed = true` +
+/// `Some(height)`); it recomputes the tweak from the tx's prevout scripts. The
+/// mempool path ([`WatchRegistry::scan_mempool_sp`]) instead reads the tweak
+/// cached on the entry at admission and calls [`sp_scan_tx_outputs`] directly.
 ///
 /// `prevout_spks[i]` must be the `scriptPubKey` spent by `tx.input[i]`, in input
-/// order (from block undo data on the confirmed side, from the retained mempool
-/// entry on the unconfirmed side). `compute_tweak` needs them to classify
-/// eligible inputs and extract the contributing pubkeys; a caller that cannot
-/// supply the full aligned set must not call this (it would silently mis-tweak).
+/// order (from block undo data). `compute_tweak` needs them to classify eligible
+/// inputs and extract the contributing pubkeys; a caller that cannot supply the
+/// full aligned set must not call this (it would silently mis-tweak).
 #[allow(clippy::too_many_arguments)]
 fn scan_tx_sp(
     inner: &Inner,
@@ -2706,12 +2715,12 @@ pub async fn run_watch_matcher(
                             // merely because D7 SP retention filled `prev_scripts`.
                             mempool.streams_prevout_scripts(),
                         );
-                        // Mempool silent-payment matching (D7). `prev_scripts` is
-                        // retained on the entry only while the SP gate was hot at
-                        // admission; self-gates on has_sp_watchers() so it's free
-                        // otherwise. Emits confirmed=false; scan_block re-emits
-                        // confirmed=true when the tx confirms.
-                        registry.scan_mempool_sp(&entry.tx, &entry.prev_scripts);
+                        // Mempool silent-payment matching (D7). The tweak is
+                        // computed and cached (`sp_tweak`) at admission only while
+                        // the SP gate was hot; self-gates on has_sp_watchers() so
+                        // it's free otherwise. Emits confirmed=false; scan_block
+                        // re-emits confirmed=true when the tx confirms.
+                        registry.scan_mempool_sp(&entry.tx, entry.sp_tweak.as_ref());
                     }
                 }
                 // Lifecycle: RBF replacement and policy eviction route to any
@@ -4922,8 +4931,8 @@ mod tests {
     #[test]
     fn matches_silent_payment_in_mempool_tx() {
         // The unconfirmed analogue of matches_silent_payment_in_connected_block:
-        // same payment, delivered via scan_mempool_sp with the prevout scripts
-        // the mempool entry retained at admission, emitted confirmed=false.
+        // same payment, delivered via scan_mempool_sp with the tweak the mempool
+        // entry cached at admission (`sp_tweak`), emitted confirmed=false.
         let secp = Secp256k1::new();
         let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
         let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
@@ -4932,12 +4941,14 @@ mod tests {
 
         let (tx, undo, p0_xonly, tweak) = sp_payment(&b_scan, &b_spend_pub, 12_345);
         let txid = tx.compute_txid();
-        // The prevout scripts the entry would have retained (input order).
+        // The prevout scripts admission resolves (input order); the cached tweak
+        // is computed from them by the same kernel the block path uses.
         let prev_scripts: Vec<ScriptBuf> = undo
             .spent_coins
             .iter()
             .map(|c| c.script_pubkey.clone())
             .collect();
+        let cached = compute_tweak(&tx, &prev_scripts).expect("eligible tx yields a tweak");
 
         let reg = Arc::new(WatchRegistry::new());
         let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
@@ -4945,7 +4956,7 @@ mod tests {
             SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
         handle.add_silent_payments(std::slice::from_ref(&target));
 
-        reg.scan_mempool_sp(&tx, &prev_scripts);
+        reg.scan_mempool_sp(&tx, Some(&cached));
 
         match rx.try_recv().expect("an unconfirmed silent-payment match") {
             WatchMatch::SilentPaymentMatched {
@@ -4979,10 +4990,12 @@ mod tests {
     }
 
     #[test]
-    fn mempool_sp_requires_aligned_prevout_scripts() {
-        // Gate hot, but the prevout script set is missing/misaligned (the entry
-        // predates the watch, or a lower streamprevoutmeta tier). Skip rather
-        // than mis-classify inputs — the confirmed path will catch it.
+    fn mempool_sp_none_tweak_no_match() {
+        // Gate hot, but no tweak was cached at admission — the entry predates the
+        // watch (gate was cold when it was admitted), so `sp_tweak` is `None`.
+        // Skip rather than match — the confirmed path or a rescan will catch it.
+        // (Prevout-script alignment is enforced at admission now, so a
+        // misaligned set can no longer reach the scan.)
         let secp = Secp256k1::new();
         let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
         let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
@@ -4995,18 +5008,13 @@ mod tests {
             SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
         handle.add_silent_payments(std::slice::from_ref(&target));
 
-        // Empty (hash-tier retention): no match.
-        reg.scan_mempool_sp(&tx, &[]);
-        assert!(rx.try_recv().is_err(), "empty prevout scripts ⇒ no match");
-        // Wrong length (one input, two scripts): no match.
-        let junk = ScriptBuf::from(vec![0x51]);
-        reg.scan_mempool_sp(&tx, &[junk.clone(), junk]);
-        assert!(rx.try_recv().is_err(), "misaligned prevout scripts ⇒ no match");
+        reg.scan_mempool_sp(&tx, None);
+        assert!(rx.try_recv().is_err(), "no cached tweak ⇒ no match");
     }
 
     #[test]
     fn no_mempool_sp_scan_without_watchers() {
-        // Gate cold: scan_mempool_sp is a no-op even with full prevout scripts.
+        // Gate cold: scan_mempool_sp is a no-op even with a valid cached tweak.
         let secp = Secp256k1::new();
         let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
         let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
@@ -5017,11 +5025,12 @@ mod tests {
             .iter()
             .map(|c| c.script_pubkey.clone())
             .collect();
+        let cached = compute_tweak(&tx, &prev_scripts).expect("eligible tx yields a tweak");
 
         let reg = Arc::new(WatchRegistry::new());
         let (_h, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
         assert!(!reg.has_sp_watchers());
-        reg.scan_mempool_sp(&tx, &prev_scripts);
+        reg.scan_mempool_sp(&tx, Some(&cached));
         assert!(rx.try_recv().is_err(), "no SP watcher ⇒ no mempool match");
     }
 
