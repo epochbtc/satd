@@ -2,11 +2,58 @@
 //! `NodeEvent.body` tagged union, so consumers `match` on a flat enum instead
 //! of unwrapping nested protobuf `Option`s.
 //!
-//! Hashes and txids are carried as raw `Vec<u8>` here; the optional `bitcoin`
-//! feature layers typed conversions on top (the prefix-watch re-filter and
-//! scripthash helpers).
+//! Hashes and txids are carried as raw `Vec<u8>` in **internal (consensus)
+//! byte order** — the order the wire and key derivation use, *not* the reversed
+//! order block explorers and Bitcoin Core JSON-RPC display. Convert at the edge:
+//! [`parse_txid`] returns a typed [`bitcoin::Txid`] (whose `Display` is explorer
+//! order, and which drops into `bitcoin`-ecosystem APIs) with the `bitcoin`
+//! feature, and [`display_hex`] returns a display-order hex string with no extra
+//! dependency. Only hashes/txids are byte-reversed for display — do not apply
+//! either helper to a public key or tweak (`output_pubkey`, `tweak`).
 
 use satd_events_proto::v1 as pb;
+
+/// Render a raw wire hash/txid (32 bytes, **internal / consensus byte order**,
+/// as every hash and txid on this API is carried) as a lowercase hex string in
+/// the reversed **display order** used by block explorers and Bitcoin Core
+/// JSON-RPC.
+///
+/// Use it on a hash or txid field (`txid`, `block_hash`, …). Do **not** apply
+/// it to a public key or tweak: those are raw bytes but are *not* reversed for
+/// display. Needs no optional dependency; for a typed value use [`parse_txid`].
+///
+/// ```
+/// # use satd_events_client::display_hex;
+/// let internal: Vec<u8> = (0u8..32).collect(); // 00,01,…,1f
+/// assert!(display_hex(&internal).starts_with("1f1e1d")); // reversed
+/// ```
+pub fn display_hex(internal_hash: &[u8]) -> String {
+    internal_hash
+        .iter()
+        .rev()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Parse a raw wire txid (32 bytes, internal/consensus byte order) into a typed
+/// [`bitcoin::Txid`]. The returned value's `Display` is the usual explorer /
+/// JSON-RPC order, and it hands straight to `bitcoin`-ecosystem APIs
+/// (`bitcoincore-rpc`, comparison against `getrawtransaction`, …).
+///
+/// A thin wrapper over [`bitcoin::Txid::from_slice`]; the block-hash equivalent
+/// is `bitcoin::BlockHash::from_slice(bytes)`.
+///
+/// ```
+/// # use satd_events_client::{parse_txid, display_hex};
+/// let raw: Vec<u8> = (0u8..32).collect();
+/// let txid = parse_txid(&raw).unwrap();
+/// assert_eq!(txid.to_string(), display_hex(&raw)); // both reverse to display order
+/// ```
+#[cfg(feature = "bitcoin")]
+pub fn parse_txid(raw: &[u8]) -> Result<bitcoin::Txid, bitcoin::hashes::FromSliceError> {
+    use bitcoin::hashes::Hash as _;
+    bitcoin::Txid::from_slice(raw)
+}
 
 /// Durable resume position, re-exported from the wire schema. Persist the
 /// value returned by [`EventStream::cursor`](crate::EventStream::cursor) and
@@ -16,7 +63,8 @@ pub use satd_events_proto::v1::Cursor;
 /// An outpoint (`txid:vout`), raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outpoint {
-    /// Transaction id, 32 raw bytes (internal byte order).
+    /// Transaction id, 32 raw bytes (internal byte order — [`parse_txid`] or
+    /// [`display_hex`] for a typed value / explorer-order string).
     pub txid: Vec<u8>,
     /// Output index.
     pub vout: u32,
@@ -87,8 +135,9 @@ pub struct TweakEntry {
     /// Always present — this is what a client feeds its own `b_scan` into to
     /// scan the transaction's outputs locally.
     pub tweak: Vec<u8>,
-    /// The transaction's txid (internal/consensus byte order). Empty when the
-    /// subscription set `tweaks_only` (the compact, tweak-alone form).
+    /// The transaction's txid (internal/consensus byte order — [`parse_txid`] /
+    /// [`display_hex`]). Empty when the subscription set `tweaks_only` (the
+    /// compact, tweak-alone form).
     pub txid: Vec<u8>,
     /// The largest taproot output value in the transaction, in satoshis — a cap
     /// on what a payment here could be worth, for client-side dust triage. `0`
@@ -448,7 +497,8 @@ pub enum Event {
         /// The registered target's identity `b_scan·G` (33 bytes) this output
         /// paid — echoes which of your scan keys matched, never the secret.
         scan_pubkey: Vec<u8>,
-        /// The paying transaction's txid (internal byte order).
+        /// The paying transaction's txid (internal byte order — [`parse_txid`] /
+        /// [`display_hex`]).
         txid: Vec<u8>,
         /// The matched output's index.
         vout: u32,

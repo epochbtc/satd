@@ -18,7 +18,7 @@
 //! ```
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use satd_events_client::{Event, SilentPaymentTarget, StreamClient};
+use satd_events_client::{parse_txid, Event, SilentPaymentTarget, StreamClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,13 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .0
                 .serialize();
             let ok = derived == output_pubkey.as_slice();
-            // `txid` arrives in internal (wire) byte order — see the field docs.
-            // Render it through `bitcoin::Txid` so it prints in the usual
-            // display/explorer order, matching `getblock` / block explorers.
+            // `txid` is internal (wire) byte order; `parse_txid` gives a
+            // `bitcoin::Txid` whose Display is the usual explorer / JSON-RPC
+            // order — and which you'd hand straight to bitcoincore-rpc.
+            let txid = parse_txid(&txid).expect("32-byte txid");
             println!(
                 "paid {} sat at {}:{} ({}) — spend key {} [{}]",
                 amount,
-                txid_display(&txid),
+                txid,
                 vout,
                 if confirmed { "confirmed" } else { "mempool" },
                 hex(&spend_key.secret_bytes()),
@@ -123,14 +124,4 @@ fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Render a raw internal-order txid (as carried on every SDK event) in the
-/// usual display/explorer order. The wire deliberately uses internal byte
-/// order — `bitcoin::Txid` reverses it for `Display`.
-fn txid_display(raw: &[u8]) -> String {
-    use bitcoin::hashes::Hash;
-    bitcoin::Txid::from_slice(raw)
-        .map(|t| t.to_string())
-        .unwrap_or_else(|_| hex(raw))
 }

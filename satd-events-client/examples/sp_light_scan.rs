@@ -29,7 +29,7 @@
 //! ```
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use satd_events_client::{Categories, Event, StreamClient, SubscribeOptions};
+use satd_events_client::{display_hex, Categories, Event, StreamClient, SubscribeOptions};
 
 /// How many outputs per transaction to probe (`k = 0..N`). A real scanner keeps
 /// going until a `k` misses; a couple is plenty to illustrate.
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!(
                             "block {height} tx {} tweak {}.. k={k}{lbl}: candidate output key {} \
                              (candidate spend key {})",
-                            txid_display(&entry.txid),
+                            display_hex(&entry.txid),
                             &hex(&entry.tweak)[..12],
                             hex(&c.output_key),
                             hex(&c.spend_key),
@@ -155,16 +155,6 @@ fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
     eng.input(th.as_ref());
     eng.input(msg);
     sha256::Hash::from_engine(eng).to_byte_array()
-}
-
-/// Render a raw internal-order txid (as carried on every SDK event) in the
-/// usual display/explorer order. `entry.txid` is empty under a `tweaks_only`
-/// subscription (not used here), in which case this yields an empty string.
-fn txid_display(raw: &[u8]) -> String {
-    use bitcoin::hashes::Hash;
-    bitcoin::Txid::from_slice(raw)
-        .map(|t| t.to_string())
-        .unwrap_or_else(|_| hex(raw))
 }
 
 fn hex(bytes: &[u8]) -> String {
