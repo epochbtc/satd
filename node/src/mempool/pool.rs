@@ -230,6 +230,12 @@ pub struct MempoolEntry {
     pub quarantine_rule: Option<String>,
 }
 
+impl crate::events::publisher::MempoolTweakSource for Mempool {
+    fn cached_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
+        self.cached_sp_tweak(txid)
+    }
+}
+
 /// Statistics about the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolInfo {
@@ -660,6 +666,13 @@ pub struct Mempool {
     /// behaves exactly as before. `ArcSwap` because installation happens once at
     /// startup through `&self` (interior mutability) while admission reads it hot.
     sp_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
+    /// Shared mempool-tweak firehose gate (Tier 1.5): a clone of the event
+    /// publisher's `mempool_tweak_subscribers` counter, installed by
+    /// [`Self::set_mempool_tweaks_gate`]. While it reads `> 0` at least one
+    /// streaming subscriber requested `mempool_tweaks`, so admission computes and
+    /// caches the tweak even with no Tier-2 SP scan-key watch live — giving the
+    /// bridge something to emit. Same private-zero-counter default as `sp_gate`.
+    mempool_tweaks_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
 }
 
 impl Mempool {
@@ -694,6 +707,9 @@ impl Mempool {
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
             sp_gate: arc_swap::ArcSwap::from_pointee(std::sync::atomic::AtomicUsize::new(0)),
+            mempool_tweaks_gate: arc_swap::ArcSwap::from_pointee(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
         }
     }
 
@@ -713,6 +729,32 @@ impl Mempool {
     /// matcher. Lock-free single atomic load in the common (cold) case.
     fn sp_gate_hot(&self) -> bool {
         self.sp_gate.load().load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Install the shared mempool-tweak firehose gate (Tier 1.5). Wired once at
+    /// startup from the event publisher's `mempool_tweaks_gate()` so admission
+    /// learns whether any streaming subscriber requested `mempool_tweaks` and
+    /// computes the cached tweak accordingly. A mempool without this call keeps
+    /// its private zero counter and never computes a tweak for the firehose.
+    pub fn set_mempool_tweaks_gate(&self, gate: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.mempool_tweaks_gate.store(gate);
+    }
+
+    /// `true` while at least one streaming subscriber requested `mempool_tweaks`
+    /// (the shared gate reads `> 0`). Consulted alongside [`sp_gate_hot`] to
+    /// decide whether admission computes the BIP 352 tweak. Lock-free.
+    fn mempool_tweaks_hot(&self) -> bool {
+        self.mempool_tweaks_gate
+            .load()
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// The BIP 352 tweak cached at admission for `txid`, if the entry is still in
+    /// the mempool and carried one (admitted while a tweak gate was hot). Backs
+    /// [`crate::events::publisher::MempoolTweakSource`] for the firehose bridge.
+    pub fn cached_sp_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
+        self.inner.read().entries.get(txid).and_then(|e| e.sp_tweak.clone())
     }
 
     /// Whether the operator authorized emitting full prevout `scriptPubKey`s to
@@ -2082,14 +2124,15 @@ impl Mempool {
         } else {
             Vec::new()
         };
-        // Silent-payment tweak (D7): while an SP scan-key watch is live, compute
-        // the BIP 352 public tweak `T = input_hash · A` once here — the resolved
+        // Silent-payment tweak: while an SP scan-key watch (D7, Tier 2) OR a
+        // `mempool_tweaks` firehose subscriber (Tier 1.5) is live, compute the
+        // BIP 352 public tweak `T = input_hash · A` once here — the resolved
         // prevout `scriptPubKey`s (including in-mempool parents) are in hand and
         // cannot be reconstructed off the hot path. The ~73-byte result is cached
-        // on the entry so the unconfirmed matcher never recomputes it and no
-        // per-input script vector is retained for SP alone. Gate-cold this is
-        // `None` with no EC work, so a node without silent payments is unchanged.
-        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() {
+        // on the entry so the unconfirmed matcher never recomputes it and the
+        // firehose bridge can read it by txid. Gate-cold this is `None` with no
+        // EC work, so a node without silent payments is unchanged.
+        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
             let spks: Vec<ScriptBuf> =
                 prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
             compute_tweak(&tx, &spks)

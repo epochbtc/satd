@@ -376,6 +376,20 @@ pub struct SpTweakEntry {
     pub max_value: u64,
 }
 
+impl SpTweakEntry {
+    /// Build from an in-memory `compute_tweak` result — the mempool-cached tweak
+    /// carried by [`NodeEventBody::MempoolTweak`]. Field-for-field identical to
+    /// the mapping [`BlockTweaks::from_row`] uses, so a mempool tweak and its
+    /// later confirmed `BlockTweaks` entry are byte-identical.
+    pub fn from_tweak_entry(e: &node_sp_index::TweakEntry) -> Self {
+        Self {
+            tweak: e.tweak,
+            txid: e.txid,
+            max_value: e.max_taproot_value.to_sat(),
+        }
+    }
+}
+
 impl BlockTweaks {
     /// Build the event from a decoded `sp_tweaks` row and its height.
     pub fn from_row(height: u32, row: &node_sp_index::SpBlockRow) -> Self {
@@ -408,6 +422,13 @@ pub enum NodeEventBody {
     /// Tier 1). Published when `silentpaymentindex=1` and the `tweaks`
     /// category has subscribers; category bit [`CATEGORY_TWEAKS`].
     BlockTweaks(BlockTweaks),
+    /// One accepted-but-unconfirmed transaction's public silent-payment tweak
+    /// (BIP 352, "Tier 1.5"). Published at admission when the mempool caches a
+    /// tweak (`sp_tweak`) and a `tweaks`-category subscriber set `mempool_tweaks`;
+    /// category bit [`CATEGORY_TWEAKS`]. Ephemeral: carries no durable cursor and
+    /// is excluded from the replay ring, so a `from_cursor` resume never yields
+    /// one (missed admissions surface at confirmation via [`BlockTweaks`]).
+    MempoolTweak(SpTweakEntry),
     Heartbeat {
         /// Nanoseconds since the [`super::EventPublisher`] was
         /// constructed. Lets downstream consumers measure end-to-end
@@ -606,6 +627,7 @@ impl NodeEvent {
             NodeEventBody::Mempool(_) => CATEGORY_MEMPOOL,
             NodeEventBody::Chain(_) => CATEGORY_CHAIN,
             NodeEventBody::BlockTweaks(_) => CATEGORY_TWEAKS,
+            NodeEventBody::MempoolTweak(_) => CATEGORY_TWEAKS,
             NodeEventBody::Heartbeat { .. } => CATEGORY_HEARTBEAT,
             // A lag notice is a control signal, not a content category: it
             // must reach every subscriber regardless of the category mask, so
@@ -790,6 +812,35 @@ mod tests {
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_MEMPOOL, 0);
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_CHAIN, 0);
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_HEARTBEAT, 0);
+    }
+
+    fn tweak_entry_fixture() -> node_sp_index::TweakEntry {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x44; 32]).unwrap());
+        node_sp_index::TweakEntry {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
+            ),
+            tweak: pk,
+            max_taproot_value: bitcoin::Amount::from_sat(12_345),
+        }
+    }
+
+    #[test]
+    fn mempool_tweak_is_tweaks_category_and_ephemeral() {
+        let te = tweak_entry_fixture();
+        let sp = SpTweakEntry::from_tweak_entry(&te);
+        // Field-for-field mapping matches BlockTweaks::from_row.
+        assert_eq!(sp.tweak, te.tweak);
+        assert_eq!(sp.txid, te.txid);
+        assert_eq!(sp.max_value, te.max_taproot_value.to_sat());
+
+        let env = NodeEvent::new(stamp(), NodeEventBody::MempoolTweak(sp));
+        // Rides the tweaks category (bit 8), like BlockTweaks.
+        assert_eq!(env.category_bit(), CATEGORY_TWEAKS);
+        // Ephemeral: no durable cursor (unlike BlockTweaks, which anchors one).
+        assert!(env.body.derive_cursor(1, 42).is_none());
     }
 
     #[test]

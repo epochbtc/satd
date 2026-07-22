@@ -909,6 +909,22 @@ impl NodeEventStream for NodeEventStreamSvc {
         let tweak_sub_guard = wants_tweaks.then(|| self.publisher.tweak_subscriber_guard());
         let tweak_dust_limit = req.tweak_dust_limit.unwrap_or(0);
         let tweaks_only = req.tweaks_only.unwrap_or(false);
+        // Tier 1.5: `mempool_tweaks` is a modifier on the tweaks category. Setting
+        // it without bit 8 is a client error — reject in-band rather than silently
+        // ignore it (there would be nothing to modify, and the client would wait
+        // forever for mempool volume it can't receive).
+        let mempool_tweaks = req.mempool_tweaks.unwrap_or(false);
+        if mempool_tweaks && !wants_tweaks {
+            debug!(target: "events::grpc", code = "invalid_argument", "rejecting Subscribe: mempool_tweaks set without the tweaks category (bit 8)");
+            return Err(Status::invalid_argument(
+                "mempool_tweaks requires the tweaks category (bit 8)",
+            ));
+        }
+        // Raise the mempool-tweak-subscriber count (the mempool's second admission
+        // gate) for the stream's lifetime, so admission computes the cached tweak
+        // and the mempool bridge emits `MempoolTweak` while we are listening.
+        let mempool_tweak_sub_guard =
+            mempool_tweaks.then(|| self.publisher.mempool_tweak_subscriber_guard());
 
         // Subscribe to the live broadcast FIRST, before reading the tip for
         // replay. This is the snapshot→live handoff ordering that guarantees
@@ -1016,10 +1032,26 @@ impl NodeEventStream for NodeEventStreamSvc {
             // Held for the stream's lifetime so the chain bridge keeps emitting
             // live tweak events while this subscriber is attached.
             let _keep_tweak_slot = &tweak_sub_guard;
+            // Held so the mempool keeps computing + the bridge keeps emitting
+            // live mempool tweaks while this subscriber is attached.
+            let _keep_mp_tweak_slot = &mempool_tweak_sub_guard;
             match item {
                 Ok(env) => {
                     if (env.category_bit() & category_mask) == 0 {
                         return None;
+                    }
+                    // MempoolTweak (Tier 1.5) is a modifier on the tweaks
+                    // category: deliver it only to subscribers that opted in, and
+                    // drop it when its value is below this subscription's dust
+                    // floor (a single-entry event has no `filtered` flag — the
+                    // whole event is dropped). BlockTweaks is unaffected.
+                    if let NodeEventBody::MempoolTweak(entry) = &env.body {
+                        if !mempool_tweaks {
+                            return None;
+                        }
+                        if tweak_dust_limit != 0 && entry.max_value < tweak_dust_limit {
+                            return None;
+                        }
                     }
                     if since_seq > 0 && env.stamp.seq <= since_seq {
                         return None;
@@ -2785,6 +2817,22 @@ fn block_tweaks_to_proto(
     }
 }
 
+/// Map a mempool-time [`SpTweakEntry`](node::events::SpTweakEntry) to its proto
+/// [`pb::MempoolTweak`]. The entry is always full — `txid` is required for the
+/// client's confirm-time dedup, so `tweaks_only` compaction does not apply. The
+/// dust floor and the `mempool_tweaks` opt-in are enforced upstream (a dropped
+/// tweak never reaches here). Hashes use internal byte order, like every body.
+fn mempool_tweak_to_proto(e: &node::events::SpTweakEntry) -> pb::MempoolTweak {
+    use bitcoin::hashes::Hash;
+    pb::MempoolTweak {
+        entry: Some(pb::TweakEntry {
+            tweak: e.tweak.serialize().to_vec(),
+            txid: e.txid.as_raw_hash().to_byte_array().to_vec(),
+            max_value: e.max_value,
+        }),
+    }
+}
+
 fn cursor_to_proto(c: node::events::Cursor) -> pb::Cursor {
     pb::Cursor {
         height: c.height,
@@ -2847,6 +2895,11 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         // path applies per-subscription filters via `block_tweaks_to_proto`;
         // this covers any other conversion site for exhaustiveness.
         NodeEventBody::BlockTweaks(bt) => Body::BlockTweaks(block_tweaks_to_proto(bt, 0, false)),
+        // The `mempool_tweaks` opt-in and dust floor are applied upstream in the
+        // Subscribe live-stream filter (a below-floor or unwanted MempoolTweak is
+        // dropped before conversion); this maps the survivor to its full proto
+        // form. `tweaks_only` never applies — the txid is always present.
+        NodeEventBody::MempoolTweak(entry) => Body::MempoolTweak(mempool_tweak_to_proto(entry)),
         NodeEventBody::Heartbeat { uptime_ns } => Body::Heartbeat(pb::Heartbeat {
             uptime_ns: *uptime_ns,
         }),
@@ -3050,6 +3103,60 @@ mod tests {
             assert_eq!(e.max_value, 0, "max_value stripped under tweaks_only");
         }
         assert!(!pb.filtered, "tweaks_only alone is not a dust filter");
+    }
+
+    #[test]
+    fn mempool_tweak_to_proto_carries_full_entry() {
+        // A mempool tweak always carries the full entry — the txid is required
+        // for the client's confirm-time dedup, so `tweaks_only` never applies.
+        let sp = node::events::SpTweakEntry {
+            tweak: test_pubkey(3),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32])),
+            max_value: 77_000,
+        };
+        let pb = mempool_tweak_to_proto(&sp);
+        let entry = pb.entry.expect("entry present");
+        assert_eq!(entry.tweak.len(), 33, "33-byte compressed tweak");
+        assert_eq!(entry.txid.len(), 32, "txid always present");
+        // Internal byte order (not reversed) — matches every other body.
+        use bitcoin::hashes::Hash as _;
+        assert_eq!(entry.txid, sp.txid.as_raw_hash().to_byte_array().to_vec());
+        assert_eq!(entry.max_value, 77_000);
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_mempool_tweaks_without_tweaks_category() {
+        // `mempool_tweaks` is a modifier on the tweaks category (bit 8). Setting
+        // it alone (categories=0, which is "all" but never includes tweaks) is a
+        // client error — reject in-band rather than wait forever for volume that
+        // can't come.
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 4,
+            block_source: None,
+            scan_source: None,
+            watch_registry: None,
+            tweak_source: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
+        };
+        let req = Request::new(pb::SubscribeRequest {
+            categories: 0,
+            since_seq: None,
+            tweak_dust_limit: None,
+            tweaks_only: None,
+            mempool_tweaks: Some(true),
+            from_cursor: None,
+        });
+        let err = match svc.subscribe(req).await {
+            Ok(_) => panic!("must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // The rejected subscription must not leak a slot.
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3772,6 +3879,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             })
             .await
@@ -3838,6 +3946,7 @@ mod tests {
                 pb::node_event::Body::RescanComplete(_) => "rescan_complete",
                 pb::node_event::Body::BlockTweaks(_) => "block_tweaks",
                 pb::node_event::Body::SilentPaymentMatched(_) => "silent_payment_matched",
+                pb::node_event::Body::MempoolTweak(_) => "mempool_tweak",
             })
             .collect();
         assert!(
@@ -3871,6 +3980,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             })
         };
@@ -4064,6 +4174,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -4121,6 +4232,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 4,
                     tx_index: 0,
@@ -4200,6 +4312,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 3,
                     tx_index: 0,
@@ -4279,6 +4392,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             }))
             .await;
@@ -4306,6 +4420,7 @@ mod tests {
             mp_tx.subscribe(),
             ch_tx.subscribe(),
             Some(sp.clone()),
+            None,
             shutdown_rx,
         );
 
@@ -4328,6 +4443,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             }))
             .await
@@ -4341,6 +4457,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             }))
             .await
@@ -4417,6 +4534,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -4478,6 +4596,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -4542,6 +4661,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -4594,6 +4714,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -4637,6 +4758,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -4686,6 +4808,7 @@ mod tests {
                 since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                 from_cursor: None,
             }))
             .await
@@ -5790,6 +5913,7 @@ mod tests {
                     since_seq: None,
                 tweak_dust_limit: None,
                 tweaks_only: None,
+                mempool_tweaks: None,
                     from_cursor: None,
                 }))
                 .await
