@@ -2689,6 +2689,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2720,6 +2721,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -4140,6 +4142,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "zeroize",
  "zeromq",
 ]
 

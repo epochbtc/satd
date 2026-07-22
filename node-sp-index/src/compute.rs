@@ -60,11 +60,18 @@ pub struct TweakEntry {
 /// wallet adds to its spend key to derive the full spending key
 /// (`d = b_spend + priv_key_tweak mod n`). `label_m` is the label integer
 /// when the match came via a label (`m = 0` is change), else `None`.
+///
+/// `k` is the BIP 352 output counter at which this output matched: the
+/// scanner probes `P_k = B_spend + hash_BIP0352/SharedSecret(ecdh || k)·G`
+/// for `k = 0, 1, …` and increments `k` on each hit. Reporting it lets a
+/// light client re-derive the output key offline from the public tweak `T`
+/// and its own `b_scan` alone (Tier-2 `SilentPaymentMatched.k`, §4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpMatch {
     pub output: XOnlyPublicKey,
     pub priv_key_tweak: [u8; 32],
     pub label_m: Option<u32>,
+    pub k: u32,
 }
 
 /// Process-wide secp context. BIP 352 needs both signing (`t_k·G`) and
@@ -285,7 +292,9 @@ pub fn scan_outputs(
     // Precompute label points: compressed(label_m·G) → (m, label scalar).
     let mut label_map: HashMap<[u8; 33], (u32, Scalar)> = HashMap::new();
     for &m in label_ms {
-        let mut buf = b_scan.secret_bytes().to_vec();
+        // `buf` holds the raw scan secret `b_scan`; wrap it so the heap copy is
+        // cleared on drop rather than left in freed memory (§4.3).
+        let mut buf = zeroize::Zeroizing::new(b_scan.secret_bytes().to_vec());
         buf.extend_from_slice(&m.to_be_bytes());
         let label = tagged_hash(TAG_LABEL, &buf);
         if let (Ok(sk), Ok(scalar)) = (SecretKey::from_slice(&label), Scalar::from_be_bytes(label))
@@ -324,6 +333,7 @@ pub fn scan_outputs(
                         output: *out,
                         priv_key_tweak: t_k,
                         label_m: None,
+                        k,
                     },
                 ));
                 break;
@@ -350,6 +360,7 @@ pub fn scan_outputs(
                             output: *out,
                             priv_key_tweak: tweak_sk.secret_bytes(),
                             label_m: Some(*m),
+                            k,
                         },
                     ));
                     break;
