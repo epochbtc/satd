@@ -4,6 +4,125 @@ use std::path::{Path, PathBuf};
 
 const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
 
+/// The all-zero XOR key: on-disk bytes are stored as-is (plaintext).
+const ZERO_XOR_KEY: [u8; 8] = [0u8; 8];
+
+/// How to initialize the blocks-dir obfuscation key when `blocks/xor.dat`
+/// is absent. An *existing* `xor.dat` is always honored regardless of mode
+/// (except that [`XorMode::Disabled`] refuses a nonzero stored key, matching
+/// Bitcoin Core's fatal error for `-blocksxor=0`).
+///
+/// Bitcoin Core v28.0+ XOR-obfuscates `blk*.dat` / `rev*.dat` payloads on
+/// disk with a random 8-byte key persisted in `blocks/xor.dat` (default
+/// `-blocksxor=1`). Each byte at absolute file offset `o` is stored as
+/// `plain[o] ^ key[o % 8]`. Supporting that key is what lets satd reuse a
+/// modern Core `blocks/` directory; plaintext (the zero key) remains satd's
+/// native format and fully supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XorMode {
+    /// satd's default: honor an existing key; initialize a missing
+    /// `xor.dat` to the zero key so fresh satd datadirs stay plaintext.
+    #[default]
+    Auto,
+    /// Core's `-blocksxor=1`: honor an existing key; generate a *random*
+    /// key when initializing a brand-new (first-run) blocks dir. Like
+    /// Core, an already-populated plaintext dir keeps the zero key —
+    /// existing files cannot be obfuscated retroactively.
+    Enabled,
+    /// Core's `-blocksxor=0`: demand plaintext. Initializes a missing
+    /// `xor.dat` to the zero key and refuses to open a blocks dir whose
+    /// stored key is nonzero (Core parity — silently ignoring the key
+    /// would corrupt every subsequent write).
+    Disabled,
+}
+
+/// XOR `data` in place against the repeating 8-byte `key`, where `data[0]`
+/// sits at absolute file offset `offset`. No-op for the zero key, so the
+/// plaintext path costs one comparison. Processes 8 bytes per step via a
+/// phase-rotated `u64` so full-file de-obfuscation during `-reindex` runs at
+/// memory bandwidth rather than byte-at-a-time.
+pub(crate) fn xor_in_place(data: &mut [u8], key: &[u8; 8], offset: u64) {
+    if *key == ZERO_XOR_KEY {
+        return;
+    }
+    // rot[i] == key[(offset + i) % 8]: the key phase-shifted to `offset`.
+    let phase = (offset % 8) as usize;
+    let mut rot = [0u8; 8];
+    for (i, r) in rot.iter_mut().enumerate() {
+        *r = key[(phase + i) % 8];
+    }
+    let word = u64::from_ne_bytes(rot);
+    let mut chunks = data.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let v = u64::from_ne_bytes(chunk.try_into().unwrap()) ^ word;
+        chunk.copy_from_slice(&v.to_ne_bytes());
+    }
+    for (i, b) in chunks.into_remainder().iter_mut().enumerate() {
+        *b ^= rot[i % 8];
+    }
+}
+
+/// Read the blocks-dir obfuscation key from `blocks/xor.dat`, or the zero
+/// key if the file does not exist. Read-only companion to the loading done
+/// by [`FlatFileManager::with_xor_mode`] for consumers (e.g. the block-file
+/// audit) that inspect raw record headers without opening a manager.
+pub fn read_xor_key(blocks_dir: &Path) -> std::io::Result<[u8; 8]> {
+    let path = blocks_dir.join("xor.dat");
+    match std::fs::read(&path) {
+        Ok(bytes) => bytes.as_slice().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: expected exactly 8 key bytes, found {}",
+                    path.display(),
+                    bytes.len()
+                ),
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ZERO_XOR_KEY),
+        Err(e) => Err(e),
+    }
+}
+
+/// Load the obfuscation key per `mode`, creating `xor.dat` if missing.
+/// Mirrors Bitcoin Core's `InitBlocksdirXorKey`: a dir is "first-run" when
+/// it contains only hidden (dot-prefixed) entries — a `.lock` file may
+/// already exist, so an empty-dir check would be too strict.
+fn init_xor_key(blocks_dir: &Path, mode: XorMode) -> std::io::Result<[u8; 8]> {
+    let path = blocks_dir.join("xor.dat");
+    if path.exists() {
+        let key = read_xor_key(blocks_dir)?;
+        if mode == XorMode::Disabled && key != ZERO_XOR_KEY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "blocksxor=0 but {} holds the nonzero key {} — the existing \
+                     *.dat files are XOR-obfuscated with it and cannot be read as \
+                     plaintext. Remove blocksxor=0 to use the stored key.",
+                    path.display(),
+                    key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                ),
+            ));
+        }
+        return Ok(key);
+    }
+
+    let first_run = std::fs::read_dir(blocks_dir)?.try_fold(true, |acc, entry| {
+        entry.map(|e| acc && e.file_name().to_string_lossy().starts_with('.'))
+    })?;
+    let key = if mode == XorMode::Enabled && first_run {
+        rand::random::<[u8; 8]>()
+    } else {
+        ZERO_XOR_KEY
+    };
+    // create_new: never clobber a key racing into existence — a wrong key
+    // silently corrupts every subsequent write.
+    let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+    f.write_all(&key)?;
+    f.sync_all()?;
+    Ok(key)
+}
+
 /// Position of a block within the flat file set.
 #[derive(Debug, Clone, Copy)]
 pub struct FlatFilePos {
@@ -25,11 +144,22 @@ pub struct FlatFileManager {
     dirty: bool,
     /// Cached read handles keyed by file number (small LRU).
     read_cache: std::collections::HashMap<u32, File>,
+    /// Blocks-dir obfuscation key from `xor.dat` (Core v28+). The zero key
+    /// means plaintext and short-circuits every XOR call.
+    xor_key: [u8; 8],
 }
 
 impl FlatFileManager {
+    /// Open `blocks_dir` with [`XorMode::Auto`]: honor an existing
+    /// `xor.dat` (so Core v28+ obfuscated dirs read transparently),
+    /// initialize fresh dirs to plaintext.
     pub fn new(blocks_dir: &Path) -> std::io::Result<Self> {
+        Self::with_xor_mode(blocks_dir, XorMode::Auto)
+    }
+
+    pub fn with_xor_mode(blocks_dir: &Path, mode: XorMode) -> std::io::Result<Self> {
         std::fs::create_dir_all(blocks_dir)?;
+        let xor_key = init_xor_key(blocks_dir, mode)?;
 
         // Find the latest file and its size
         let mut file_num = 0u32;
@@ -58,12 +188,18 @@ impl FlatFileManager {
             write_handle: None,
             dirty: false,
             read_cache: std::collections::HashMap::new(),
+            xor_key,
         })
     }
 
     /// Get the blocks directory path.
     pub fn blocks_dir(&self) -> &Path {
         &self.blocks_dir
+    }
+
+    /// The active `xor.dat` obfuscation key (zero = plaintext).
+    pub fn xor_key(&self) -> [u8; 8] {
+        self.xor_key
     }
 
     fn file_path(&self, file_number: u32) -> PathBuf {
@@ -115,9 +251,22 @@ impl FlatFileManager {
             }
         };
 
-        file.write_all(&network_magic)?;
-        file.write_all(&(block_data.len() as u32).to_le_bytes())?;
-        file.write_all(block_data)?;
+        if self.xor_key == ZERO_XOR_KEY {
+            file.write_all(&network_magic)?;
+            file.write_all(&(block_data.len() as u32).to_le_bytes())?;
+            file.write_all(block_data)?;
+        } else {
+            // Obfuscated (Core v28+ `xor.dat`): every on-disk byte is
+            // XORed with the key at its absolute file offset.
+            let mut header = [0u8; 8];
+            header[..4].copy_from_slice(&network_magic);
+            header[4..].copy_from_slice(&(block_data.len() as u32).to_le_bytes());
+            xor_in_place(&mut header, &self.xor_key, self.current_pos);
+            file.write_all(&header)?;
+            let mut payload = block_data.to_vec();
+            xor_in_place(&mut payload, &self.xor_key, self.current_pos + 8);
+            file.write_all(&payload)?;
+        }
 
         self.current_pos += record_size;
         self.dirty = true;
@@ -188,10 +337,30 @@ impl FlatFileManager {
         // Read magic (4 bytes) + size (4 bytes)
         let mut header = [0u8; 8];
         file.read_exact(&mut header)?;
+        xor_in_place(&mut header, &self.xor_key, pos.data_pos as u64);
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+        // A record never exceeds one flat file (write_block rolls over).
+        // A larger size means a corrupt header or data written under a
+        // different xor key — fail cleanly instead of attempting a
+        // multi-GB allocation off garbage length bytes.
+        if size as u64 + 8 > MAX_FILE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "block record at blk{:05}.dat:{} claims {} bytes (max {}): \
+                     corrupt header or mismatched blocks-dir xor key",
+                    pos.file_number,
+                    pos.data_pos,
+                    size,
+                    MAX_FILE_SIZE - 8,
+                ),
+            ));
+        }
 
         let mut data = vec![0u8; size];
         file.read_exact(&mut data)?;
+        xor_in_place(&mut data, &self.xor_key, pos.data_pos as u64 + 8);
         Ok(data)
     }
 
@@ -225,7 +394,7 @@ impl FlatFileManager {
             if !path.exists() {
                 break;
             }
-            match Self::scan_one_file(&path, file_num, &mut count, &mut visit)? {
+            match self.scan_one_file(&path, file_num, &mut count, &mut visit)? {
                 std::ops::ControlFlow::Break(()) => return Ok(count),
                 std::ops::ControlFlow::Continue(()) => {}
             }
@@ -256,7 +425,7 @@ impl FlatFileManager {
             if !path.exists() {
                 continue;
             }
-            match Self::scan_one_file(&path, file_num, &mut count, &mut visit)? {
+            match self.scan_one_file(&path, file_num, &mut count, &mut visit)? {
                 std::ops::ControlFlow::Break(()) => return Ok(count),
                 std::ops::ControlFlow::Continue(()) => {}
             }
@@ -268,6 +437,7 @@ impl FlatFileManager {
     /// visitor. Updates `count` per block successfully read. Returns
     /// `Break` if the visitor short-circuits.
     fn scan_one_file<F>(
+        &self,
         path: &std::path::Path,
         file_num: u32,
         count: &mut u64,
@@ -276,12 +446,30 @@ impl FlatFileManager {
     where
         F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
     {
-        let data = match std::fs::read(path) {
+        let mut data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => return Ok(std::ops::ControlFlow::Continue(())),
         };
+        xor_in_place(&mut data, &self.xor_key, 0);
+        let key = &self.xor_key;
         let mut offset = 0usize;
         while offset + 8 <= data.len() {
+            // Terminate on zero-preallocated padding. Bitcoin Core extends
+            // its current blk file in chunks of raw zeros written *without*
+            // obfuscation, so after de-obfuscation a padding byte at
+            // absolute offset `o` reads as `key[o % 8]`. A whole header of
+            // that pattern is EOF padding, not a record (a real record
+            // matching it needs magic AND length to collide with the key
+            // phase: ~2^-64). With the zero key this degenerates to the
+            // classic all-zero header, which the size == 0 check below
+            // also catches.
+            if data[offset..offset + 8]
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == key[(offset + i) % 8])
+            {
+                break;
+            }
             let size = u32::from_le_bytes([
                 data[offset + 4],
                 data[offset + 5],
@@ -546,6 +734,262 @@ mod tests {
         assert_eq!(mgr.read_block(&pos_a).unwrap(), vec![0xAA; 1024]);
         assert_eq!(mgr.read_block(&pos_c).unwrap(), vec![0xCC; 1024]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "satd-flatfile-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Reference implementation: byte-at-a-time absolute-offset XOR, the
+    /// operation Bitcoin Core's `util::Xor` performs on blocksdir files.
+    fn naive_xor(data: &mut [u8], key: &[u8; 8], offset: u64) {
+        for (i, b) in data.iter_mut().enumerate() {
+            *b ^= key[((offset as usize) + i) % 8];
+        }
+    }
+
+    #[test]
+    fn xor_in_place_matches_naive_at_all_phases() {
+        let key = [0x1d, 0x02, 0xff, 0x80, 0x00, 0xa5, 0x5a, 0x33];
+        for offset in 0u64..17 {
+            for len in 0usize..40 {
+                let plain: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+                let mut fast = plain.clone();
+                let mut slow = plain.clone();
+                xor_in_place(&mut fast, &key, offset);
+                naive_xor(&mut slow, &key, offset);
+                assert_eq!(fast, slow, "offset={offset} len={len}");
+                // Involution: applying twice restores the plaintext.
+                xor_in_place(&mut fast, &key, offset);
+                assert_eq!(fast, plain, "offset={offset} len={len}");
+            }
+        }
+        // Zero key is a strict no-op.
+        let mut buf = vec![0xAB; 32];
+        xor_in_place(&mut buf, &ZERO_XOR_KEY, 5);
+        assert_eq!(buf, vec![0xAB; 32]);
+    }
+
+    #[test]
+    fn keyed_round_trip_with_rotation_reopen_and_scan() {
+        let dir = temp_dir("keyed-rt");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        // Fresh dir + Enabled = random key (Core -blocksxor=1 first run).
+        let (positions, key) = {
+            let mut mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Enabled).unwrap();
+            let key = mgr.xor_key();
+            let mut positions = Vec::new();
+            positions.push(mgr.write_block(&[0x11; 300], magic).unwrap());
+            positions.push(mgr.write_block(&[0x22; 5000], magic).unwrap());
+            // Force rotation into a second file so the key phase restarts
+            // at a fresh absolute offset 0.
+            mgr.current_pos = MAX_FILE_SIZE - 4;
+            positions.push(mgr.write_block(&[0x33; 700], magic).unwrap());
+            assert_eq!(positions[2].file_number, 1);
+            (positions, key)
+        };
+        // On-disk bytes must NOT contain the plaintext run when keyed.
+        if key != ZERO_XOR_KEY {
+            let raw = std::fs::read(dir.join("blk00000.dat")).unwrap();
+            assert_ne!(&raw[8..16], &[0x11; 8], "payload must be obfuscated on disk");
+        }
+
+        // Reopen with the plain constructor: xor.dat is honored automatically.
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(mgr.xor_key(), key);
+        assert_eq!(mgr.read_block(&positions[0]).unwrap(), vec![0x11; 300]);
+        assert_eq!(mgr.read_block(&positions[1]).unwrap(), vec![0x22; 5000]);
+        assert_eq!(mgr.read_block(&positions[2]).unwrap(), vec![0x33; 700]);
+
+        // The reindex scan path de-obfuscates too.
+        let mut seen = Vec::new();
+        let count = mgr
+            .for_each_block(|data, pos| {
+                seen.push((data.to_vec(), pos.file_number, pos.data_pos));
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(seen[0].0, vec![0x11; 300]);
+        assert_eq!(seen[2].0, vec![0x33; 700]);
+        assert_eq!(seen[2].1, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Golden cross-check against an independently-constructed obfuscated
+    /// file: build the plaintext record image, XOR it with the reference
+    /// (naive) implementation exactly the way Core stores it, drop in an
+    /// `xor.dat`, and require both read paths to recover the payloads.
+    #[test]
+    fn core_style_obfuscated_dir_reads_back() {
+        let dir = temp_dir("core-golden");
+        std::fs::create_dir_all(&dir).unwrap();
+        let magic = [0xf9, 0xbe, 0xb4, 0xd9]; // mainnet
+        let key = [0x8f, 0x1a, 0x00, 0xc4, 0x5e, 0x21, 0xd0, 0x77];
+        let payloads: [&[u8]; 2] = [b"first mainnet-ish block payload", b"second"];
+
+        let mut image = Vec::new();
+        let mut positions = Vec::new();
+        for p in payloads {
+            positions.push(image.len() as u32);
+            image.extend_from_slice(&magic);
+            image.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            image.extend_from_slice(p);
+        }
+        naive_xor(&mut image, &key, 0);
+        std::fs::write(dir.join("blk00000.dat"), &image).unwrap();
+        std::fs::write(dir.join("xor.dat"), key).unwrap();
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(mgr.xor_key(), key);
+        for (p, &data_pos) in payloads.iter().zip(&positions) {
+            let pos = FlatFilePos { file_number: 0, data_pos };
+            assert_eq!(mgr.read_block(&pos).unwrap(), *p);
+        }
+        let mut seen = Vec::new();
+        mgr.for_each_block(|data, _| {
+            seen.push(data.to_vec());
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(seen, payloads.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core zero-preallocates the tail of the current blk file with raw
+    /// (unobfuscated) zeros. The scan must stop there, not chain garbage.
+    #[test]
+    fn scan_terminates_on_raw_zero_padding_under_nonzero_key() {
+        let dir = temp_dir("padding");
+        std::fs::create_dir_all(&dir).unwrap();
+        let magic = [0xf9, 0xbe, 0xb4, 0xd9];
+        let key = [0x07, 0xc3, 0x19, 0x00, 0xee, 0x42, 0x9d, 0x61];
+        std::fs::write(dir.join("xor.dat"), key).unwrap();
+
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        mgr.write_block(b"real block", magic).unwrap();
+        // Simulate Core's preallocation: raw zeros appended after the record.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.join("blk00000.dat"))
+                .unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+        }
+        let mut seen = 0u32;
+        let count = mgr
+            .for_each_block(|data, _| {
+                assert_eq!(data, b"real block");
+                seen += 1;
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(seen, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xor_key_initialization_matrix() {
+        // Fresh dir, Auto: plaintext zero key, xor.dat created.
+        let dir = temp_dir("init-auto");
+        let mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(mgr.xor_key(), ZERO_XOR_KEY);
+        assert_eq!(std::fs::read(dir.join("xor.dat")).unwrap(), vec![0u8; 8]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Fresh dir, Disabled: zero key.
+        let dir = temp_dir("init-disabled");
+        let mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Disabled).unwrap();
+        assert_eq!(mgr.xor_key(), ZERO_XOR_KEY);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Fresh dir containing only hidden entries is still "first run":
+        // Enabled generates a random key (2^-64 flake accepted).
+        let dir = temp_dir("init-enabled");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".lock"), b"").unwrap();
+        let mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Enabled).unwrap();
+        assert_ne!(mgr.xor_key(), ZERO_XOR_KEY);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Populated plaintext dir (blk files, xor.dat gone — the pre-xor
+        // satd upgrade path), Enabled: NOT first run, so the key stays
+        // zero — existing plaintext can't be obfuscated retroactively.
+        let dir = temp_dir("init-populated");
+        {
+            let mut mgr = FlatFileManager::new(&dir).unwrap();
+            mgr.write_block(b"old plaintext block", [0xfa, 0xbf, 0xb5, 0xda])
+                .unwrap();
+        }
+        std::fs::remove_file(dir.join("xor.dat")).unwrap();
+        let mut mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Enabled).unwrap();
+        assert_eq!(mgr.xor_key(), ZERO_XOR_KEY);
+        assert_eq!(
+            mgr.read_block(&FlatFilePos { file_number: 0, data_pos: 0 })
+                .unwrap(),
+            b"old plaintext block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Disabled + stored nonzero key: refuse (Core parity).
+        let dir = temp_dir("init-conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xor.dat"), [1u8; 8]).unwrap();
+        let err = FlatFileManager::with_xor_mode(&dir, XorMode::Disabled)
+            .err()
+            .expect("must refuse nonzero stored key with Disabled");
+        assert!(err.to_string().contains("blocksxor=0"), "{err}");
+        // Auto and Enabled both honor it.
+        assert_eq!(FlatFileManager::new(&dir).unwrap().xor_key(), [1u8; 8]);
+        assert_eq!(
+            FlatFileManager::with_xor_mode(&dir, XorMode::Enabled)
+                .unwrap()
+                .xor_key(),
+            [1u8; 8]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Truncated xor.dat: hard error, never guess a key.
+        let dir = temp_dir("init-badlen");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xor.dat"), [1u8; 5]).unwrap();
+        assert!(FlatFileManager::new(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading under the wrong key must fail cleanly (garbage length is
+    /// rejected), never allocate off garbage or hand back scrambled bytes
+    /// as a "block".
+    #[test]
+    fn wrong_key_read_errors_cleanly() {
+        let dir = temp_dir("wrong-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xor.dat"), [0xAA; 8]).unwrap();
+        let pos = {
+            let mut mgr = FlatFileManager::new(&dir).unwrap();
+            mgr.write_block(&[0x44; 2048], [0xf9, 0xbe, 0xb4, 0xd9]).unwrap()
+        };
+        // Swap the key out from under the files.
+        std::fs::write(dir.join("xor.dat"), [0x55; 8]).unwrap();
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let res = mgr.read_block(&pos);
+        match res {
+            Err(_) => {}
+            Ok(data) => assert_ne!(data, vec![0x44; 2048], "must not decode under wrong key"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

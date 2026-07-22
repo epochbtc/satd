@@ -221,6 +221,10 @@ pub struct ChainState {
     flat_files: Arc<Mutex<FlatFileManager>>,
     /// Path to the blocks directory, for mutex-free reads.
     blocks_dir: PathBuf,
+    /// Blocks-dir obfuscation key (Core v28+ `xor.dat`; zero = plaintext),
+    /// captured from the `FlatFileManager` so the mutex-free direct readers
+    /// (`read_block_direct`, the prefetch pipeline) de-obfuscate the same way.
+    blocks_xor_key: [u8; 8],
     tip: RwLock<ChainTip>,
     pub network: Network,
     script_verifier: Arc<dyn ScriptVerifier>,
@@ -358,6 +362,7 @@ impl ChainState {
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
         let blocks_dir = flat_files.blocks_dir().to_path_buf();
+        let blocks_xor_key = flat_files.xor_key();
 
         let checkpoints = checkpoints::checkpoints_for_network(network);
 
@@ -433,6 +438,7 @@ impl ChainState {
                     store,
                     flat_files: Arc::new(Mutex::new(flat_files)),
                     blocks_dir,
+                    blocks_xor_key,
                     tip: RwLock::new(ChainTip {
                         hash: tip_hash,
                         height: entry.height,
@@ -529,6 +535,7 @@ impl ChainState {
             store,
             flat_files: Arc::new(Mutex::new(flat_files)),
             blocks_dir,
+            blocks_xor_key,
             tip: RwLock::new(ChainTip {
                 hash: genesis_hash,
                 height: 0,
@@ -2345,6 +2352,11 @@ impl ChainState {
         &self.blocks_dir
     }
 
+    /// Blocks-dir obfuscation key (Core v28+ `xor.dat`; zero = plaintext).
+    pub fn blocks_xor_key(&self) -> [u8; 8] {
+        self.blocks_xor_key
+    }
+
     /// Scan flat files and repair `block_index` entries above the current
     /// tip that are stuck in `HeaderOnly` despite the block data being
     /// present on disk.
@@ -2841,6 +2853,7 @@ impl ChainState {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, "read_block_direct: header read failed: {}", e);
             return None;
         }
+        crate::storage::flatfile::xor_in_place(&mut header, &self.blocks_xor_key, pos.data_pos as u64);
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if size == 0 || size > 4_000_000 {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: invalid block size");
@@ -2851,6 +2864,7 @@ impl ChainState {
             tracing::warn!(file = %path.display(), pos = pos.data_pos, size, "read_block_direct: data read failed: {}", e);
             return None;
         }
+        crate::storage::flatfile::xor_in_place(&mut data, &self.blocks_xor_key, pos.data_pos as u64 + 8);
         match bitcoin::consensus::deserialize(&data) {
             Ok(block) => Some(block),
             Err(e) => {
@@ -3133,6 +3147,7 @@ impl ChainState {
         let prefetch = crate::chain::prefetch::start_prefetcher(
             self.store_ref().clone() as Arc<dyn crate::storage::Store + Send + Sync>,
             self.blocks_dir().to_path_buf(),
+            self.blocks_xor_key,
             start_height,
             workers,
             128, // lookahead blocks, matching the IBD connect loop
