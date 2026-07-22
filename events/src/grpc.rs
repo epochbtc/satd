@@ -6060,6 +6060,32 @@ mod tests {
     }
 
     #[test]
+    fn watch_match_to_proto_sp_unconfirmed_has_no_cursor() {
+        // D7 mempool match: confirmed=false, height=None ⇒ height 0 on the wire
+        // and NO cursor (an unconfirmed event is not a resumable chain position).
+        let m = node::events::WatchMatch::SilentPaymentMatched {
+            scan_pubkey: test_pubkey(9).serialize(),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32])),
+            vout: 2,
+            output_pubkey: test_pubkey(7).x_only_public_key().0,
+            amount: 9_000,
+            tweak: test_pubkey(8),
+            k: 0,
+            label: None,
+            confirmed: false,
+            height: None,
+            raw_tx: None,
+        };
+        let ev = watch_match_to_proto(&edge(), &m, Vec::new(), false);
+        assert!(ev.cursor.is_none(), "unconfirmed match carries no cursor");
+        let pb::node_event::Body::SilentPaymentMatched(sp) = ev.body.unwrap() else {
+            panic!("wrong body");
+        };
+        assert!(!sp.confirmed);
+        assert_eq!(sp.height, 0);
+    }
+
+    #[test]
     fn desired_from_proto_parses_silent_payments() {
         let target = pb::SilentPaymentTarget {
             scan_secret: vec![0x11u8; 32],

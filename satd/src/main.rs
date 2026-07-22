@@ -1057,6 +1057,13 @@ async fn main() {
     // matcher is spawned below once the mempool handle is wired.
     let watch_registry = std::sync::Arc::new(node::events::WatchRegistry::new());
 
+    // Share the registry's silent-payment gate with the mempool (D7). While any
+    // connection has an SP scan-key watch live, admission retains resolved
+    // prevout scripts on each entry so the unconfirmed SP matcher can classify
+    // inputs; cold, the mempool event path is byte-identical to a node without
+    // silent payments. Same atomic on both sides — no second counter to sync.
+    mempool.set_sp_gate(watch_registry.sp_gate());
+
     // Validate + clamp the script-prefix watch granularity bounds (§7.5) once,
     // shared by the gRPC `Watch` and `--streamws` carriers. Invariant:
     // 1 <= min <= max <= 32 (the bucket key is the top 32 bits of the
