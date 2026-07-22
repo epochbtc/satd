@@ -195,6 +195,31 @@ Bitcoin Core implements BIP 157/158 indexing but the P2P serving arm is
 limited; satd's is the modern light-client path for Zeus-embedded,
 Blixt, and Mutiny.
 
+### BIP 352 silent-payment tweak index (`node-sp-index`)
+
+Index (`--silentpaymentindex=1`, default off, always compiled) that
+computes one public tweak per eligible transaction (`T = input_hash · A`)
+and stores it, with the transaction's largest taproot output value, in a
+per-block row committed atomically with the chainstate. Each row embeds
+the hash of the block it describes, so a served row is self-authenticating.
+Deferred backfill via `backfillindex silentpayment` for datadirs synced
+before the index landed.
+
+Two consumption modes on the streaming API (see the wire spec in
+`docs/api/streaming.md`): a **client-side scan** firehose (`tweaks`
+category, bit 8 — explicit-request only, never in the `categories = 0`
+default) that streams each block's tweak data for local one-ECDH-per-tx
+scanning (the scan key never leaves the device), and a JSON-RPC fallback
+`getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` serving
+the same bytes for scripts and integrators. Tweaks-only replay cold-syncs
+from taproot activation in one subscription (exempt from the replay clamp
+because rows are self-authenticating and the exemption is gated on index
+completeness).
+
+Bitcoin Core has no silent-payment index; wallets must scan blocks
+themselves. satd moves the tweak computation server-side while keeping
+scanning (and thus the scan key) on the client.
+
 ### Mempool subscription stream
 
 `subscribemempool` JSON-RPC WS subscription emitting structured events:

@@ -10,18 +10,19 @@
 //! handles the new external-transport pipeline.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use node_sp_index::SpIndex;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
 
-use super::envelope::{Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
+use super::envelope::{BlockTweaks, Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
 use super::sink::EventSink;
 
 /// Capacity of the envelope broadcast channel. Sized 4× the existing
@@ -80,6 +81,25 @@ pub struct EventPublisher {
     /// `publish`'s pop bound must match the capacity the ring was built
     /// with.
     replay_ring_cap: usize,
+    /// Live count of streaming subscribers on the `tweaks` (silent-payment)
+    /// category. The chain bridge only does the per-block `sp_tweaks` lookup
+    /// and `BlockTweaks` emit when this is non-zero — a node with the index
+    /// enabled but no tweak subscribers pays nothing on the bus. Carriers
+    /// hold a [`TweakSubscriberGuard`] for a tweak subscription's lifetime.
+    tweak_subscribers: Arc<AtomicUsize>,
+}
+
+/// RAII counter for an active `tweaks`-category subscription. Increments the
+/// publisher's tweak-subscriber count on construction and decrements it on
+/// drop, so the chain bridge's live-emit gate reflects real demand.
+pub struct TweakSubscriberGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for TweakSubscriberGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl EventPublisher {
@@ -97,7 +117,24 @@ impl EventPublisher {
             started_monotonic: Instant::now(),
             replay_ring: Mutex::new(VecDeque::with_capacity(replay_ring_cap)),
             replay_ring_cap,
+            tweak_subscribers: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Register an active `tweaks`-category subscription. The returned guard
+    /// keeps the tweak-subscriber count raised for as long as it is held; drop
+    /// it when the subscription ends. While at least one guard is live and a
+    /// tweak source is wired, the chain bridge emits `BlockTweaks` per block.
+    pub fn tweak_subscriber_guard(&self) -> TweakSubscriberGuard {
+        self.tweak_subscribers.fetch_add(1, Ordering::Relaxed);
+        TweakSubscriberGuard {
+            count: self.tweak_subscribers.clone(),
+        }
+    }
+
+    /// Whether any `tweaks`-category subscriber is currently attached.
+    pub fn has_tweak_subscribers(&self) -> bool {
+        self.tweak_subscribers.load(Ordering::Relaxed) > 0
     }
 
     /// Subscribe to the envelope stream. Each call returns a fresh
@@ -182,7 +219,12 @@ impl EventPublisher {
         // missed (best-effort, bounded window). Lock poisoning would only
         // happen if a holder panicked mid-update; recover the guard rather
         // than propagate a panic into the publish path.
-        {
+        //
+        // `BlockTweaks` is deliberately excluded: it is replayed from the
+        // durable index by height (never from this ring), and a busy chain's
+        // tweak volume would otherwise evict the mempool transitions the ring
+        // exists to retain.
+        if !matches!(env.body, NodeEventBody::BlockTweaks(_)) {
             let mut ring = self
                 .replay_ring
                 .lock()
@@ -218,13 +260,33 @@ impl EventPublisher {
             .collect()
     }
 
-    /// Spawn the bridge tasks: one for the mempool broadcast and one
-    /// for the chain broadcast. Each task runs until the broadcast
-    /// sender is closed or `shutdown` flips to `true`.
+    /// Spawn the bridge tasks with no silent-payment tweak emit (the common
+    /// case for callers that do not serve the `tweaks` category — including
+    /// the unit/integration tests). Delegates to [`Self::spawn_bridges_with_sp`].
     pub fn spawn_bridges(
         self: &Arc<Self>,
         mempool_rx: broadcast::Receiver<MempoolEvent>,
         chain_rx: broadcast::Receiver<ChainEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) {
+        self.spawn_bridges_with_sp(mempool_rx, chain_rx, None, shutdown);
+    }
+
+    /// Spawn the bridge tasks: one for the mempool broadcast and one
+    /// for the chain broadcast. Each task runs until the broadcast
+    /// sender is closed or `shutdown` flips to `true`.
+    ///
+    /// `tweak_source` is the silent-payment index read handle (present only
+    /// when `silentpaymentindex=1`); `tweak_subscribers` is the live count of
+    /// `tweaks`-category streaming subscribers, incremented by the carrier. On
+    /// each connected block the chain bridge emits a `BlockTweaks` envelope
+    /// **only** when the index is enabled and that count is non-zero — a node
+    /// with the index on but no tweak subscribers pays nothing on the bus.
+    pub fn spawn_bridges_with_sp(
+        self: &Arc<Self>,
+        mempool_rx: broadcast::Receiver<MempoolEvent>,
+        chain_rx: broadcast::Receiver<ChainEvent>,
+        tweak_source: Option<Arc<dyn SpIndex>>,
         shutdown: watch::Receiver<bool>,
     ) {
         // Mempool bridge.
@@ -239,7 +301,7 @@ impl EventPublisher {
         {
             let publisher = self.clone();
             tokio::spawn(async move {
-                bridge_chain(publisher, chain_rx, shutdown).await;
+                bridge_chain(publisher, chain_rx, tweak_source, shutdown).await;
             });
         }
     }
@@ -306,6 +368,7 @@ async fn bridge_mempool(
 async fn bridge_chain(
     publisher: Arc<EventPublisher>,
     mut rx: broadcast::Receiver<ChainEvent>,
+    tweak_source: Option<Arc<dyn SpIndex>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -313,7 +376,76 @@ async fn bridge_chain(
             biased;
             _ = shutdown.changed() => return,
             res = rx.recv() => match res {
-                Ok(ev) => publisher.publish(NodeEventBody::Chain(ev)),
+                Ok(ev) => {
+                    // Emit the chain event first, then — when the index is on
+                    // and a `tweaks` subscriber is listening — the same
+                    // block's public tweak data as a trailing event at the
+                    // same height. The row was committed atomically with the
+                    // block in `connect_block`, so a point lookup by height
+                    // returns the just-connected block's row. We guard on the
+                    // row's embedded block hash (self-authenticating, §3.2):
+                    // if it does not match the connected hash, a reorg has
+                    // already advanced the height slot, and the correct
+                    // `BlockTweaks` will be emitted when that block's own
+                    // `BlockConnected` is bridged — skipping here avoids a
+                    // duplicate/mislabeled early emit.
+                    let connected = match &ev {
+                        ChainEvent::BlockConnected { height, hash } => Some((*height, *hash)),
+                        _ => None,
+                    };
+                    publisher.publish(NodeEventBody::Chain(ev));
+                    if let Some((height, hash)) = connected
+                        && let Some(src) = tweak_source.as_deref()
+                        && publisher.has_tweak_subscribers()
+                    {
+                        match src.tweaks_at(height) {
+                            Ok(row) if row.block_hash == hash => {
+                                publisher.publish(NodeEventBody::BlockTweaks(
+                                    BlockTweaks::from_row(height, &row),
+                                ));
+                            }
+                            Ok(_) => {
+                                debug!(
+                                    target: "events",
+                                    height,
+                                    "sp_tweaks row hash mismatch on connect (reorg race); \
+                                     deferring BlockTweaks emit",
+                                );
+                            }
+                            // Below taproot activation no row exists (benign, and
+                            // the common case for a pre-activation connect). A miss
+                            // at/above activation on a just-committed block is
+                            // unexpected but bounded — the live tweaks subscriber
+                            // misses this block and recovers it on its next
+                            // from_cursor replay/reconnect. Never a silent skip.
+                            Err(node_sp_index::SpIndexError::NotFound(_)) => {
+                                if height >= src.activation_height() {
+                                    debug!(
+                                        target: "events",
+                                        height,
+                                        "sp_tweaks row absent on connect at/above activation; \
+                                         live BlockTweaks skipped (client replay will recover)",
+                                    );
+                                }
+                            }
+                            // A transient storage/decode fault reading the
+                            // just-committed row would otherwise vanish silently,
+                            // leaving a live tweaks subscriber with an (h-1, h+1)
+                            // cursor jump it cannot detect until it reconnects.
+                            // Surface it so a degraded index is observable.
+                            Err(e) => {
+                                warn!(
+                                    target: "events",
+                                    height,
+                                    error = %e,
+                                    "sp_tweaks read failed on connect; live BlockTweaks skipped \
+                                     for this block (a tweaks subscriber must resync from its \
+                                     cursor to recover it)",
+                                );
+                            }
+                        }
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "chain bridge lagged");
                 }

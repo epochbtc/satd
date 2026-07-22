@@ -172,6 +172,12 @@ pub struct GrpcEventSink {
     /// Live outpoint/script watch registry backing the bidirectional
     /// `Watch` RPC. `None` disables `Watch` (returns `UNAVAILABLE`).
     watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
+    /// Silent-payment tweak index read handle for the `tweaks` firehose
+    /// category. `Some` when `silentpaymentindex=1`; `None` disables the
+    /// category (a `tweaks` subscription is rejected in-band). Backs
+    /// index-point-lookup cursor replay and the deep-replay-exemption
+    /// completeness gate. Read-only; never on the consensus hot path.
+    tweak_source: Option<std::sync::Arc<dyn node::index::silent_payments::SpIndex>>,
     /// In-process TLS termination, `Some` when an events-gRPC TLS cert/key are
     /// configured. When present, each accepted connection is TLS-handshaked
     /// (and mTLS-verified) before tonic serves it.
@@ -249,6 +255,7 @@ impl GrpcEventSink {
         block_source: Option<std::sync::Arc<dyn node::events::BlockCursorSource>>,
         scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
         watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
+        tweak_source: Option<std::sync::Arc<dyn node::index::silent_payments::SpIndex>>,
         tls: Option<GrpcTlsParams>,
     ) -> Result<Self, GrpcEventSinkError> {
         let addr: SocketAddr = bind
@@ -305,6 +312,7 @@ impl GrpcEventSink {
             block_source,
             scan_source,
             watch_registry,
+            tweak_source,
             tls,
         })
     }
@@ -346,6 +354,7 @@ impl EventSink for GrpcEventSink {
             block_source: self.block_source.clone(),
             scan_source: self.scan_source.clone(),
             watch_registry: self.watch_registry.clone(),
+            tweak_source: self.tweak_source.clone(),
             prefix_min_bits: self.limits.prefix_min_bits,
             prefix_max_bits: self.limits.prefix_max_bits,
         };
@@ -585,6 +594,9 @@ struct NodeEventStreamSvc {
     scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
     /// Live watch registry backing the `Watch` RPC; `None` disables it.
     watch_registry: Option<std::sync::Arc<node::events::WatchRegistry>>,
+    /// Silent-payment tweak index read handle for the `tweaks` firehose
+    /// category; `None` disables it (a `tweaks` subscription is rejected).
+    tweak_source: Option<std::sync::Arc<dyn node::index::silent_payments::SpIndex>>,
     /// Operator bounds on script-prefix watch granularity (§7.5).
     prefix_min_bits: u8,
     prefix_max_bits: u8,
@@ -839,19 +851,63 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         // 0 means "all categories" — same convention as the in-process
         // `EventSink`. Otherwise it's a bitfield (mempool=1, chain=2,
-        // heartbeat=4). Unknown bits are silently ignored: a future
+        // heartbeat=4, tweaks=8). Unknown bits are silently ignored: a future
         // server may add new categories without forcing older clients
         // to upgrade. We could `return Err(invalid_argument)` if the
         // mask covers no known bit, but that would also reject the
         // legitimate "subscribe to a category my server doesn't know
         // about yet" case during a rolling upgrade — easier to log
-        // and let the stream be empty.
+        // and let the stream be empty. `tweaks` is excluded from the "all"
+        // default (see `ALL_CATEGORIES_DEFAULT`): a legacy `0`-subscriber must
+        // never begin receiving tweak volume after a node upgrade.
         let category_mask = if req.categories == 0 {
-            u32::MAX
+            node::events::ALL_CATEGORIES_DEFAULT
         } else {
             req.categories
         };
         let since_seq = req.since_seq.unwrap_or(0);
+
+        // Silent-payment `tweaks` category (bit 8) is explicit-request only and
+        // requires the tweak index. Reject in-band before attaching a receiver:
+        //   * index disabled  → the category cannot be served at all;
+        //   * replay requested (`from_cursor`) against an incomplete index →
+        //     historical tweaks below the backfill frontier are missing, and
+        //     silently serving a clamped window would make a light client miss
+        //     payments. Refuse until the index is complete.
+        // `tweak_source` is threaded to the replay builder only when the client
+        // actually asked for tweaks.
+        let wants_tweaks = category_mask & node::events::CATEGORY_TWEAKS != 0;
+        let tweak_source = if wants_tweaks {
+            self.tweak_source.clone()
+        } else {
+            None
+        };
+        if wants_tweaks {
+            match &tweak_source {
+                None => {
+                    debug!(target: "events::grpc", code = "failed_precondition", "rejecting Subscribe: tweaks category requires silentpaymentindex=1");
+                    return Err(Status::failed_precondition(
+                        "the tweaks category requires silentpaymentindex=1",
+                    ));
+                }
+                Some(sp) if req.from_cursor.is_some() && !sp.is_complete() => {
+                    debug!(target: "events::grpc", code = "failed_precondition", "rejecting Subscribe: tweak replay requested while index still backfilling");
+                    return Err(Status::failed_precondition(
+                        "silent payment index is still backfilling; tweak replay is \
+                         unavailable until it is complete",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // Keep the tweak-subscriber count raised for the stream's lifetime so
+        // the chain bridge emits live `BlockTweaks` while we are listening.
+        // Held (never read) inside the live stream closure, dropped on
+        // disconnect. Per-subscription tweak filters: `dust_limit` drops
+        // entries below a value floor; `tweaks_only` strips txid/max_value.
+        let tweak_sub_guard = wants_tweaks.then(|| self.publisher.tweak_subscriber_guard());
+        let tweak_dust_limit = req.tweak_dust_limit.unwrap_or(0);
+        let tweaks_only = req.tweaks_only.unwrap_or(false);
 
         // Subscribe to the live broadcast FIRST, before reading the tip for
         // replay. This is the snapshot→live handoff ordering that guarantees
@@ -893,6 +949,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                         from,
                         category_mask,
                         MAX_REPLAY_BLOCKS,
+                        tweak_source.as_deref(),
                     );
                     debug!(
                         target: "events::grpc",
@@ -935,6 +992,17 @@ impl NodeEventStream for NodeEventStreamSvc {
                 last_h = (*h).max(last_h);
             }
             last_s = r.mempool_dedup_through.max(last_s);
+            // A deep tweaks-only cold-sync streams `[start, end]` through a
+            // separate stream that bypasses the live closure below, so `last_h`
+            // would otherwise still point at the request cursor for the whole
+            // multi-minute read. Seed it to the deep tail: if the client lags
+            // right after the cold-sync (the slow-phone case this feature is
+            // built for), the `Lagged` resume cursor then points at `end`, not
+            // ~taproot activation — resuming from activation would re-run the
+            // entire ~240k-block cold-sync and can livelock.
+            if let Some((_, end)) = r.deep_tweak_range {
+                last_h = end.max(last_h);
+            }
         }
 
         // `sub_guard` is moved into the live stream closure so the
@@ -944,6 +1012,9 @@ impl NodeEventStream for NodeEventStreamSvc {
         // server shuts down).
         let live = BroadcastStream::new(rx).filter_map(move |item| {
             let _keep_slot = &sub_guard;
+            // Held for the stream's lifetime so the chain bridge keeps emitting
+            // live tweak events while this subscriber is attached.
+            let _keep_tweak_slot = &tweak_sub_guard;
             match item {
                 Ok(env) => {
                     if (env.category_bit() & category_mask) == 0 {
@@ -981,7 +1052,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                     if let Some(c) = &env.cursor {
                         last_h = c.height;
                     }
-                    Some(Ok(envelope_to_proto(&env)))
+                    Some(Ok(envelope_to_proto_sp(&env, tweak_dust_limit, tweaks_only)))
                 }
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // Tell the client in-band: how many events were dropped and
@@ -1001,9 +1072,42 @@ impl NodeEventStream for NodeEventStreamSvc {
                 // the best-effort mempool window) are built by the shared
                 // helper as `NodeEvent`s; convert each to proto and emit before
                 // joining the live stream.
-                let replay_events =
-                    tokio_stream::iter(r.events.into_iter().map(|e| Ok(envelope_to_proto(&e))));
-                Box::pin(replay_events.chain(live))
+                let replay_events = tokio_stream::iter(
+                    r.events
+                        .into_iter()
+                        .map(move |e| Ok(envelope_to_proto_sp(&e, tweak_dust_limit, tweaks_only))),
+                );
+                // A tweaks-only deep-replay exemption defers its (possibly
+                // whole-taproot-era) span to here rather than materializing it
+                // in the builder. Page it lazily off the index with
+                // backpressure so peak memory is bounded and no async worker is
+                // ever blocked on the multi-minute read.
+                //
+                // A block that connects in the race window between `rx =
+                // subscribe()` and the snapshot tip is both read by the deep
+                // pager (height <= snapshot_tip) and buffered live, so its
+                // `BlockTweaks` can be delivered twice at the seam (bounded to
+                // the 1-2 blocks in that window). This duplicate is deliberate:
+                // it is the safe failure mode. A blanket "drop live tweaks at
+                // height <= snapshot_tip" would instead lose a block's tweaks if
+                // a reorg replaced it mid-cold-sync (the live re-emit carries the
+                // post-reorg tweaks the already-passed pager did not). Scanning
+                // clients re-derive candidates idempotently, so a repeated
+                // BlockTweaks costs a re-scan, never a wrong result.
+                match (r.deep_tweak_range, tweak_source) {
+                    (Some((start, end)), Some(sp)) => {
+                        let deep = deep_tweak_replay_stream(
+                            sp,
+                            self.publisher.clone(),
+                            start,
+                            end,
+                            tweak_dust_limit,
+                            tweaks_only,
+                        );
+                        Box::pin(replay_events.chain(deep).chain(live))
+                    }
+                    _ => Box::pin(replay_events.chain(live)),
+                }
             }
             None => Box::pin(live),
         };
@@ -1049,7 +1153,10 @@ impl NodeEventStream for NodeEventStreamSvc {
 
         let (handle, rx_match) = registry.register(node::events::WATCH_CHANNEL_CAPACITY);
         let handle = Arc::new(handle);
-        let category_mask = Arc::new(AtomicU32::new(u32::MAX));
+        // Excludes the explicit-only `tweaks` bit from the "all" default, so a
+        // `Watch` subscriber never receives `BlockTweaks` unless it asks (the
+        // tweak firehose is a `Subscribe`-side category).
+        let category_mask = Arc::new(AtomicU32::new(node::events::ALL_CATEGORIES_DEFAULT));
         // Per-stream raw-tx opt-in (SetWatchOptions). The inbound reader flips
         // it (and the registry gate counter); the outbound encoder reads it to
         // decide whether to inline raw_tx on this connection's ScriptMatched.
@@ -1250,8 +1357,18 @@ impl NodeEventStream for NodeEventStreamSvc {
                                 // rejection leaves the whole set (categories
                                 // included) unchanged, as WatchSetRejected promises.
                                 if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
-                                    let mask = if s.categories == 0 { u32::MAX } else { s.categories };
-                                    category_mask.store(mask, Ordering::Relaxed);
+                                    let mask = if s.categories == 0 {
+                                        node::events::ALL_CATEGORIES_DEFAULT
+                                    } else {
+                                        s.categories
+                                    };
+                                    // Watch never serves the tweaks firehose (a
+                                    // Subscribe-only category); strip the bit so a
+                                    // control update cannot forward shared-broadcast
+                                    // `BlockTweaks` past the Subscribe path's
+                                    // index/completeness/dust-limit validation.
+                                    category_mask
+                                        .store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
                                 }
                                 outcome
                             }
@@ -1406,6 +1523,9 @@ impl NodeEventStream for NodeEventStreamSvc {
                             cur,
                             mask,
                             MAX_REPLAY_BLOCKS,
+                            // The `Watch` re-anchor does not serve the tweaks
+                            // firehose (a `Subscribe`-side category).
+                            None,
                         );
                         // Ack the re-anchor in-band, ahead of the replay batch, so
                         // the client knows replay is now running (and from where —
@@ -1865,11 +1985,13 @@ fn apply_control(
         }
         Some(Msg::SetCategories(c)) => {
             let mask = if c.categories == 0 {
-                u32::MAX
+                node::events::ALL_CATEGORIES_DEFAULT
             } else {
                 c.categories
             };
-            category_mask.store(mask, Ordering::Relaxed);
+            // Strip the tweaks bit: Watch never serves the firehose (see the
+            // SetWatchSet path above).
+            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
         }
         Some(Msg::SetWatchOptions(o)) => {
             // Per-stream raw-tx inlining. Store the encoder-side flag AND toggle
@@ -2334,6 +2456,162 @@ fn envelope_to_proto(env: &NodeEvent) -> pb::NodeEvent {
     }
 }
 
+/// Convert an envelope to proto, applying the subscription's per-subscription
+/// `tweaks` filters (`dust_limit`, `tweaks_only`) to a [`BlockTweaks`] body.
+/// Every other body is identical to [`envelope_to_proto`].
+fn envelope_to_proto_sp(env: &NodeEvent, dust_limit: u64, tweaks_only: bool) -> pb::NodeEvent {
+    match &env.body {
+        NodeEventBody::BlockTweaks(bt) => pb::NodeEvent {
+            schema_version: env.schema_version,
+            stamp: Some(stamp_to_proto(&env.stamp)),
+            cursor: env.cursor.map(cursor_to_proto),
+            body: Some(pb::node_event::Body::BlockTweaks(block_tweaks_to_proto(
+                bt, dust_limit, tweaks_only,
+            ))),
+        },
+        _ => envelope_to_proto(env),
+    }
+}
+
+/// Rows read per `spawn_blocking` hop in the lazy deep-replay pager. Bounds both
+/// how long a blocking thread is held and how much is buffered at once.
+const DEEP_TWEAK_REPLAY_CHUNK: u32 = 32;
+
+/// Lazily page a tweaks-only deep-replay span `[start, end]` off the silent-
+/// payment index, for the `build_cursor_replay` deep exemption (a complete-index
+/// cold-sync waives the block clamp). The span can cover the entire taproot era,
+/// so instead of materializing it, we read it in bounded [`DEEP_TWEAK_REPLAY_CHUNK`]
+/// chunks inside `spawn_blocking` (never on an async worker) and push each block
+/// through a small bounded channel. Backpressure on that channel paces the read
+/// to the client's consumption, so peak memory is O(chunk) rather than O(chain).
+///
+/// The range handed here is already clamped to `[activation, tip]` (the builder
+/// raises the lower end to taproot activation), so every height MUST carry a row
+/// in a complete index. A `NotFound` is therefore NOT a benign below-activation
+/// absence — it is a genuine hole (a concurrent backfill/reorg punched it while
+/// the completeness marker stayed set), so it is surfaced in-band and ends the
+/// stream, exactly like a storage/decode error. A silent skip would be a
+/// client-undetectable gap in an unclamped cold-sync, the one failure a scanning
+/// client cannot recover from. The client then resyncs from its last durable
+/// cursor.
+fn deep_tweak_replay_stream(
+    sp: std::sync::Arc<dyn node::index::silent_payments::SpIndex>,
+    publisher: std::sync::Arc<node::events::EventPublisher>,
+    start: u32,
+    end: u32,
+    dust_limit: u64,
+    tweaks_only: bool,
+) -> ReceiverStream<Result<pb::NodeEvent, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::NodeEvent, Status>>(4);
+    tokio::spawn(async move {
+        let mut h = start;
+        'outer: while h <= end {
+            let chunk_end = h.saturating_add(DEEP_TWEAK_REPLAY_CHUNK - 1).min(end);
+            let sp_chunk = sp.clone();
+            let pub_chunk = publisher.clone();
+            // Read + render one bounded chunk off the async runtime.
+            let rendered = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<Result<pb::NodeEvent, Status>> = Vec::new();
+                for hh in h..=chunk_end {
+                    match sp_chunk.tweaks_at(hh) {
+                        Ok(row) => {
+                            let env = node::events::make_block_tweaks_event(&pub_chunk, hh, row);
+                            out.push(Ok(envelope_to_proto_sp(&env, dust_limit, tweaks_only)));
+                        }
+                        // Range is clamped to `[activation, tip]`, so a missing
+                        // row here is a hole, not a below-activation absence.
+                        Err(node::index::silent_payments::SpIndexError::NotFound(_)) => {
+                            out.push(Err(Status::internal(format!(
+                                "silent-payment tweak index hole at height {hh} during unclamped \
+                                 cold-sync: index reported complete but the row is missing \
+                                 (concurrent backfill/reorg?); resync from your last cursor"
+                            ))));
+                            break;
+                        }
+                        Err(e) => {
+                            out.push(Err(Status::internal(format!(
+                                "silent-payment tweak read failed at height {hh}: {e}"
+                            ))));
+                            break;
+                        }
+                    }
+                }
+                out
+            })
+            .await;
+            let rendered = match rendered {
+                Ok(v) => v,
+                // The blocking render task panicked or was cancelled. Surface it
+                // in-band so the client sees an errored stream and resyncs from
+                // its cursor. Ending silently here would let the client treat a
+                // truncated cold-sync as complete: the subscribe path pre-seeds
+                // `last_h` to this deep range's end, so a later lag/resume cursor
+                // would falsely claim every deep height was delivered.
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(Status::internal(
+                            "silent-payment deep cold-sync aborted: tweak render task \
+                             failed (panic/cancel); resync from your last cursor",
+                        )))
+                        .await;
+                    break;
+                }
+            };
+            for item in rendered {
+                let stop_after = item.is_err();
+                if tx.send(item).await.is_err() {
+                    // Client disconnected — stop reading.
+                    break 'outer;
+                }
+                if stop_after {
+                    break 'outer;
+                }
+            }
+            h = chunk_end + 1;
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
+/// Map a [`BlockTweaks`] to its proto form under a subscription's filters.
+/// `dust_limit` drops entries whose `max_value` is below the floor (setting
+/// `filtered`); `tweaks_only` strips `txid`/`max_value`, leaving the 33-byte
+/// tweak alone. Hashes use internal byte order, matching the other bodies.
+fn block_tweaks_to_proto(
+    bt: &node::events::BlockTweaks,
+    dust_limit: u64,
+    tweaks_only: bool,
+) -> pb::BlockTweaks {
+    use bitcoin::hashes::Hash;
+    let mut filtered = false;
+    let entries = bt
+        .entries
+        .iter()
+        .filter(|e| {
+            let keep = dust_limit == 0 || e.max_value >= dust_limit;
+            if !keep {
+                filtered = true;
+            }
+            keep
+        })
+        .map(|e| pb::TweakEntry {
+            tweak: e.tweak.serialize().to_vec(),
+            txid: if tweaks_only {
+                Vec::new()
+            } else {
+                e.txid.as_raw_hash().to_byte_array().to_vec()
+            },
+            max_value: if tweaks_only { 0 } else { e.max_value },
+        })
+        .collect();
+    pb::BlockTweaks {
+        block_hash: bt.block_hash.as_raw_hash().to_byte_array().to_vec(),
+        height: bt.height,
+        entries,
+        filtered,
+    }
+}
+
 fn cursor_to_proto(c: node::events::Cursor) -> pb::Cursor {
     pb::Cursor {
         height: c.height,
@@ -2392,6 +2670,10 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
     match body {
         NodeEventBody::Mempool(mp) => Body::Mempool(mempool_event_to_proto(mp)),
         NodeEventBody::Chain(ch) => Body::Chain(chain_event_to_proto(ch)),
+        // Unfiltered mapping (no dust limit, full entries) — the `Subscribe`
+        // path applies per-subscription filters via `block_tweaks_to_proto`;
+        // this covers any other conversion site for exhaustiveness.
+        NodeEventBody::BlockTweaks(bt) => Body::BlockTweaks(block_tweaks_to_proto(bt, 0, false)),
         NodeEventBody::Heartbeat { uptime_ns } => Body::Heartbeat(pb::Heartbeat {
             uptime_ns: *uptime_ns,
         }),
@@ -2532,6 +2814,69 @@ mod tests {
 
     fn edge() -> EdgeIdentity {
         EdgeIdentity::new([0x42; 16], Some("us-east1")).unwrap()
+    }
+
+    fn test_pubkey(byte: u8) -> bitcoin::secp256k1::PublicKey {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap();
+        bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk)
+    }
+
+    fn sample_block_tweaks() -> node::events::BlockTweaks {
+        node::events::BlockTweaks {
+            block_hash: BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([9u8; 32]),
+            ),
+            height: 100,
+            entries: vec![
+                node::events::SpTweakEntry {
+                    tweak: test_pubkey(1),
+                    txid: Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
+                    ),
+                    max_value: 1_000,
+                },
+                node::events::SpTweakEntry {
+                    tweak: test_pubkey(2),
+                    txid: Txid::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
+                    ),
+                    max_value: 50_000,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn block_tweaks_to_proto_unfiltered() {
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, false);
+        assert_eq!(pb.height, 100);
+        assert!(!pb.filtered, "no dust limit ⇒ not filtered");
+        assert_eq!(pb.entries.len(), 2);
+        assert_eq!(pb.entries[0].tweak.len(), 33, "33-byte compressed tweak");
+        assert_eq!(pb.entries[0].txid.len(), 32, "txid present");
+        assert_eq!(pb.entries[0].max_value, 1_000);
+    }
+
+    #[test]
+    fn block_tweaks_to_proto_dust_limit_sets_filtered() {
+        // A floor above the smaller entry drops it and flags `filtered`.
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 10_000, false);
+        assert_eq!(pb.entries.len(), 1, "sub-floor entry dropped");
+        assert_eq!(pb.entries[0].max_value, 50_000);
+        assert!(pb.filtered, "a dust limit dropped an entry");
+    }
+
+    #[test]
+    fn block_tweaks_to_proto_tweaks_only_strips_fields() {
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, true);
+        assert_eq!(pb.entries.len(), 2);
+        for e in &pb.entries {
+            assert_eq!(e.tweak.len(), 33, "tweak always present");
+            assert!(e.txid.is_empty(), "txid stripped under tweaks_only");
+            assert_eq!(e.max_value, 0, "max_value stripped under tweaks_only");
+        }
+        assert!(!pb.filtered, "tweaks_only alone is not a dust filter");
     }
 
     #[test]
@@ -2910,7 +3255,7 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None, None, None).await {
+        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None, None, None, None).await {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -2920,7 +3265,7 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None, None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None, None, None, None)
             .await
             .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
@@ -2933,7 +3278,7 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None, None, None)
+        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None, None, None, None)
             .await
             .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
@@ -2969,6 +3314,7 @@ mod tests {
             false,
             publisher.clone(),
             GrpcLimits::default(),
+            None,
             None,
             None,
             None,
@@ -3025,6 +3371,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(GrpcTlsParams {
                 cert_path,
                 key_path,
@@ -3056,6 +3403,7 @@ mod tests {
             false,
             publisher,
             GrpcLimits::default(),
+            None,
             None,
             None,
             None,
@@ -3099,6 +3447,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(GrpcTlsParams {
                 cert_path,
                 key_path,
@@ -3136,6 +3485,7 @@ mod tests {
             false,
             publisher.clone(),
             limits,
+            None,
             None,
             None,
             None,
@@ -3225,7 +3575,7 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None, None, None)
+        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None, None, None, None)
             .await
             .expect("bind");
         let actual = sink.local_addr().unwrap();
@@ -3338,6 +3688,7 @@ mod tests {
             block_source: None,
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3401,6 +3752,47 @@ mod tests {
                     )
                 })
                 .collect()
+        }
+    }
+
+    /// A mock silent-payment index: a row per height in `[1, tip]` whose block
+    /// hash matches the `[h; 32]` convention `MockBlocks`/`ch_tx` use, so the
+    /// live-emit and replay hash-match guards accept it.
+    struct MockSp {
+        tip: u32,
+        complete: bool,
+    }
+    impl node::index::silent_payments::SpIndex for MockSp {
+        fn tweaks_at(
+            &self,
+            height: u32,
+        ) -> Result<
+            node::index::silent_payments::SpBlockRow,
+            node::index::silent_payments::SpIndexError,
+        > {
+            if height == 0 || height > self.tip {
+                return Err(node::index::silent_payments::SpIndexError::NotFound(height));
+            }
+            Ok(node::index::silent_payments::SpBlockRow {
+                block_hash: BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([height as u8; 32]),
+                ),
+                entries: vec![],
+            })
+        }
+        fn is_complete(&self) -> bool {
+            self.complete
+        }
+        fn activation_height(&self) -> u32 {
+            // This mock carries a row for every height in `[1, tip]`.
+            1
+        }
+    }
+
+    fn tweaks_height(ev: &pb::NodeEvent) -> Option<u32> {
+        match ev.body.as_ref()? {
+            pb::node_event::Body::BlockTweaks(bt) => Some(bt.height),
+            _ => None,
         }
     }
 
@@ -3488,6 +3880,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3545,6 +3938,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3622,6 +4016,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3688,6 +4083,141 @@ mod tests {
         let _ = shutdown_tx.send(true);
     }
 
+    /// A `tweaks` subscription against a node with the index disabled
+    /// (`tweak_source = None`) is rejected in-band with FAILED_PRECONDITION,
+    /// before any receiver is attached.
+    #[tokio::test]
+    async fn tweaks_subscription_rejected_when_index_disabled() {
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: None,
+            scan_source: None,
+            watch_registry: None,
+            tweak_source: None, // index disabled
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
+        };
+        let res = svc
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: node::events::CATEGORY_TWEAKS,
+                since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
+                from_cursor: None,
+            }))
+            .await;
+        match res {
+            Ok(_) => panic!("tweaks with disabled index must be rejected"),
+            Err(status) => assert_eq!(status.code(), tonic::Code::FailedPrecondition),
+        }
+    }
+
+    /// The explicit-bit contract (design §3.5 acceptance): a `categories = 0`
+    /// ("all") subscriber receives chain events but NOT `BlockTweaks`, while a
+    /// `categories = 8` subscriber does. Also exercises the live-emit path: the
+    /// chain bridge emits a tweak event per connected block only because a tweak
+    /// subscriber is attached.
+    #[tokio::test]
+    async fn tweaks_explicit_bit_gates_delivery() {
+        use tokio_stream::StreamExt as _;
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp: Arc<dyn node::index::silent_payments::SpIndex> =
+            Arc::new(MockSp { tip: 100, complete: true });
+        publisher.spawn_bridges_with_sp(
+            mp_tx.subscribe(),
+            ch_tx.subscribe(),
+            Some(sp.clone()),
+            shutdown_rx,
+        );
+
+        let mk_svc = || NodeEventStreamSvc {
+            publisher: publisher.clone(),
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 0,
+            block_source: Some(Arc::new(MockBlocks { tip: 0 })),
+            scan_source: None,
+            watch_registry: None,
+            tweak_source: Some(sp.clone()),
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
+        };
+
+        // Subscriber A: categories = 0 ("all") — must NOT receive tweaks.
+        let mut all = mk_svc()
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: 0,
+                since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
+                from_cursor: None,
+            }))
+            .await
+            .expect("subscribe all")
+            .into_inner();
+        // Subscriber B: categories = 8 — must receive tweaks. Attaching it
+        // raises the tweak-subscriber count so the bridge emits live.
+        let mut tweaks = mk_svc()
+            .subscribe(Request::new(pb::SubscribeRequest {
+                categories: node::events::CATEGORY_TWEAKS,
+                since_seq: None,
+                tweak_dust_limit: None,
+                tweaks_only: None,
+                from_cursor: None,
+            }))
+            .await
+            .expect("subscribe tweaks")
+            .into_inner();
+
+        // Give both subscribers time to attach (so the tweak-subscriber count is
+        // raised before the block connects).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mk = |h: u32| ChainEvent::BlockConnected {
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [h as u8; 32],
+            )),
+            height: h,
+        };
+        ch_tx.send(mk(7)).unwrap();
+
+        // Subscriber B is tweaks-only (categories = 8), so it filters out the
+        // chain event and its first delivered item is the BlockTweaks at h=7.
+        let ev = tokio::time::timeout(Duration::from_secs(2), tweaks.next())
+            .await
+            .expect("tweaks ready")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tweaks_height(&ev), Some(7), "categories=8 receives BlockTweaks");
+
+        // Subscriber A: receives the chain event but NOT the tweak event. Its
+        // next delivered item must be the next block's chain event, never the
+        // tweak at h=7.
+        let ev = tokio::time::timeout(Duration::from_secs(2), all.next())
+            .await
+            .expect("chain ready for all")
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain_height(&ev), Some(7));
+        ch_tx.send(mk(8)).unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), all.next())
+            .await
+            .expect("next chain for all")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chain_height(&ev),
+            Some(8),
+            "categories=0 must skip the h=7 tweak and see the h=8 chain event next",
+        );
+        assert!(tweaks_height(&ev).is_none());
+        let _ = shutdown_tx.send(true);
+    }
+
     /// A cursor far behind the tip clamps the replay span to
     /// `MAX_REPLAY_BLOCKS` (the whole chain is never streamed over the event
     /// channel). The replayed window starts at `tip - MAX_REPLAY_BLOCKS + 1`.
@@ -3703,6 +4233,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3763,6 +4294,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3825,6 +4357,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 0 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3877,6 +4410,7 @@ mod tests {
             block_source: Some(Arc::new(MockBlocks { tip: 5 })),
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3920,6 +4454,7 @@ mod tests {
             block_source: None,
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -3966,6 +4501,7 @@ mod tests {
             block_source: None,
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -4338,6 +4874,7 @@ mod tests {
             None,
             Some(registry.clone()),
             None,
+            None,
         )
         .await
         .expect("bind");
@@ -4433,6 +4970,7 @@ mod tests {
             Some(Arc::new(MockBlocks { tip: 5 })),
             None,
             Some(registry.clone()),
+            None,
             None,
         )
         .await
@@ -4638,6 +5176,7 @@ mod tests {
             None,
             Some(registry.clone()),
             None,
+            None,
         )
         .await
         .expect("bind");
@@ -4788,6 +5327,7 @@ mod tests {
             None,
             Some(registry.clone()),
             None,
+            None,
         )
         .await
         .expect("bind");
@@ -4894,6 +5434,7 @@ mod tests {
             None,
             Some(registry.clone()),
             None,
+            None,
         )
         .await
         .expect("bind");
@@ -4994,6 +5535,7 @@ mod tests {
             None,
             Some(registry.clone()),
             None,
+            None,
         )
         .await
         .expect("bind");
@@ -5063,6 +5605,7 @@ mod tests {
             block_source: None,
             scan_source: None,
             watch_registry: None,
+            tweak_source: None,
             prefix_min_bits: 8,
             prefix_max_bits: 32,
         };
@@ -5164,6 +5707,7 @@ mod tests {
             None,
             Some(scan_source),
             Some(registry.clone()),
+            None,
             None,
         )
         .await
@@ -5272,6 +5816,7 @@ mod tests {
             None,
             None, // no scan source
             Some(registry.clone()),
+            None,
             None,
         )
         .await

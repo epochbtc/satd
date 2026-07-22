@@ -284,9 +284,20 @@ impl FirehoseQuery {
 }
 
 fn mask_from(categories: Option<u32>) -> u32 {
+    // The WS/SSE firehose does not serve the tweaks category this release, so
+    // the tweaks bit is stripped from EVERY mask, default or explicit:
+    //   - "all" (`0`/absent) maps to the default, which already excludes tweaks,
+    //     so a legacy subscriber never begins receiving tweak volume after a node
+    //     upgrade.
+    //   - an explicit request keeps its other bits but never the tweaks bit — a
+    //     WS client that asks for `categories=8` gets an empty stream, not live
+    //     `BlockTweaks`. Those are published to the shared broadcast the moment
+    //     any gRPC client attaches, so without this strip the WS live filter
+    //     would forward them (its replay already returns empty). Tier 1 tweak
+    //     consumption is gRPC-only.
     match categories {
-        None | Some(0) => u32::MAX,
-        Some(c) => c,
+        None | Some(0) => node::events::ALL_CATEGORIES_DEFAULT,
+        Some(c) => c & !node::events::CATEGORY_TWEAKS,
     }
 }
 
@@ -358,7 +369,16 @@ fn build_replay(
         );
         return (Vec::new(), ReplayDedup::default());
     };
-    let r = build_cursor_replay(src.as_ref(), &state.publisher, cursor, mask, MAX_REPLAY_BLOCKS);
+    // The WS/SSE firehose does not serve the tweaks category (a gRPC-only
+    // surface in this release), so it passes no tweak source.
+    let r = build_cursor_replay(
+        src.as_ref(),
+        &state.publisher,
+        cursor,
+        mask,
+        MAX_REPLAY_BLOCKS,
+        None,
+    );
     let dedup = ReplayDedup {
         confirmed: Some(Arc::new(r.confirmed_dedup)),
         mempool_through: Some(r.mempool_dedup_through),
@@ -941,8 +961,16 @@ fn apply_ws_control(
                 // set (categories included) unchanged as `watch_set_result`
                 // reports.
                 if matches!(outcome, crate::watchset::ReplaceOutcome::Accepted { .. }) {
-                    let mask = if *categories == 0 { u32::MAX } else { *categories };
-                    category_mask.store(mask, Ordering::Relaxed);
+                    let mask = if *categories == 0 {
+                        node::events::ALL_CATEGORIES_DEFAULT
+                    } else {
+                        *categories
+                    };
+                    // WS/SSE never serves the tweaks firehose (a Subscribe-only
+                    // category); strip the bit so a control update cannot opt this
+                    // stream into shared-broadcast `BlockTweaks` and bypass the
+                    // Subscribe path's index/completeness/dust-limit validation.
+                    category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
                 }
                 outcome
             }
@@ -974,8 +1002,14 @@ fn apply_ws_control(
         // Handled and returned above; kept for match exhaustiveness.
         WsControl::SetWatchSet { .. } => {}
         WsControl::SetCategories { categories } => {
-            let mask = if categories == 0 { u32::MAX } else { categories };
-            category_mask.store(mask, Ordering::Relaxed);
+            let mask = if categories == 0 {
+                node::events::ALL_CATEGORIES_DEFAULT
+            } else {
+                categories
+            };
+            // Strip the tweaks bit: WS/SSE never serves the firehose (see the
+            // SetWatchSet path above).
+            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
         }
         WsControl::SetWatchOptions { include_raw_tx: want } => {
             // Store the encoder-side flag AND toggle the registry gate counter so
@@ -1363,9 +1397,21 @@ mod tests {
 
     #[test]
     fn mask_defaults_to_all() {
-        assert_eq!(mask_from(None), u32::MAX);
-        assert_eq!(mask_from(Some(0)), u32::MAX);
+        assert_eq!(mask_from(None), node::events::ALL_CATEGORIES_DEFAULT);
+        assert_eq!(mask_from(Some(0)), node::events::ALL_CATEGORIES_DEFAULT);
         assert_eq!(mask_from(Some(2)), 2);
+    }
+
+    #[test]
+    fn default_mask_excludes_tweaks() {
+        // The WS/SSE "all" default must never carry the explicit-only tweaks
+        // bit, or a legacy `0`-subscriber would start receiving the tweak
+        // firehose the moment a gRPC client attaches (shared broadcast).
+        assert_eq!(mask_from(None) & node::events::CATEGORY_TWEAKS, 0);
+        assert_eq!(mask_from(Some(0)) & node::events::CATEGORY_TWEAKS, 0);
+        // Non-tweak categories are still present in the default.
+        assert_ne!(mask_from(None) & node::events::CATEGORY_CHAIN, 0);
+        assert_ne!(mask_from(None) & node::events::CATEGORY_MEMPOOL, 0);
     }
 
     #[test]

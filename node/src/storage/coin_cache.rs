@@ -1245,6 +1245,25 @@ impl Store for CoinCache {
         self.inner.get_sp_tweaks_row(height)
     }
 
+    fn get_sp_tweaks_row_checked(
+        &self,
+        height: u32,
+    ) -> Result<Option<node_sp_index::SpBlockRow>, StoreError> {
+        // Mirror `get_sp_tweaks_row`'s pending-batch peek so the wrapper cannot
+        // fake an empty height for a row still buffered — then delegate to the
+        // inner checked read so a storage/decode error is preserved rather than
+        // swallowed into `None` (which would silently gap an unclamped replay).
+        let pending = self.pending_batch.lock();
+        if pending.sp_tweak_removes.contains(&height) {
+            return Ok(None);
+        }
+        if let Some((_, row)) = pending.sp_tweak_puts.iter().rev().find(|(h, _)| *h == height) {
+            return Ok(Some(row.clone()));
+        }
+        drop(pending);
+        self.inner.get_sp_tweaks_row_checked(height)
+    }
+
     fn silent_payment_index_complete(&self) -> bool {
         self.inner.silent_payment_index_complete()
     }

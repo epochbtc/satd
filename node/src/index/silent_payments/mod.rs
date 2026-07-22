@@ -25,6 +25,6 @@ pub use runner::{BackfillCommand, BackfillRunner, preflight_disk};
 
 pub use node_sp_index::cursor::{self, BackfillCursor, BackfillState};
 pub use node_sp_index::{
-    CF_SP_TWEAKS, SP_TWEAKS_VERSION, SpBlockRow, SpIndexConfig, SpIndexError, TweakEntry,
+    CF_SP_TWEAKS, SP_TWEAKS_VERSION, SpBlockRow, SpIndex, SpIndexConfig, SpIndexError, TweakEntry,
     compute_tweak, eligible_inputs, scan_outputs,
 };

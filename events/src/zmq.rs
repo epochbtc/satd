@@ -299,6 +299,12 @@ async fn publish(
             // Watch stream (gRPC/WS); like `Lagged` it never reaches the ZMQ
             // fanout. No Core-compat topic.
         }
+        NodeEventBody::BlockTweaks(_) => {
+            // Silent-payment tweak data is a native streaming firehose category
+            // (gRPC `Subscribe`); it has no Bitcoin Core-compat ZMQ topic. The
+            // full envelope is still available on `nodeevent` for consumers who
+            // subscribe to the tweaks category there.
+        }
     }
     Ok(())
 }

@@ -329,6 +329,72 @@ impl Serialize for EdgeStamp {
     }
 }
 
+/// Subscriber category bits, matching the gRPC `SubscribeRequest.categories`
+/// bitfield. A subscriber requesting `0` receives [`ALL_CATEGORIES_DEFAULT`]
+/// — every category *except* the explicit-only ones (see
+/// [`EXPLICIT_ONLY_CATEGORIES`]).
+pub const CATEGORY_MEMPOOL: u32 = 1;
+pub const CATEGORY_CHAIN: u32 = 2;
+pub const CATEGORY_HEARTBEAT: u32 = 4;
+/// Silent-payment tweak firehose (BIP 352, Tier 1). Explicit-request only —
+/// **not** part of the `categories = 0` default, so a pre-existing subscriber
+/// never begins receiving tweak volume after a node upgrade.
+pub const CATEGORY_TWEAKS: u32 = 8;
+
+/// Categories excluded from the `categories = 0` ("all") default: opt-in,
+/// high-volume, or custody-adjacent streams a legacy subscriber must not begin
+/// receiving after a node upgrade. Currently just [`CATEGORY_TWEAKS`].
+pub const EXPLICIT_ONLY_CATEGORIES: u32 = CATEGORY_TWEAKS;
+
+/// The mask a `categories = 0` request expands to: every bit (forward-compat
+/// for rolling upgrades — a client may request a category a mixed-version
+/// server does not know yet) *except* the explicit-only categories.
+pub const ALL_CATEGORIES_DEFAULT: u32 = !EXPLICIT_ONLY_CATEGORIES;
+
+/// One block's public silent-payment tweak data, carried by
+/// [`NodeEventBody::BlockTweaks`]. Built from the just-committed `sp_tweaks`
+/// row (which embeds the block hash it describes, §3.2 of the SP design), so a
+/// served envelope is self-authenticating without a height→hash lookup. The
+/// per-subscription `dust_limit` / `tweaks_only` knobs are applied downstream
+/// by the carrier, not here — this internal event always carries the full row.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockTweaks {
+    pub block_hash: bitcoin::BlockHash,
+    pub height: u32,
+    pub entries: Vec<SpTweakEntry>,
+}
+
+/// One indexed transaction's tweak entry inside a [`BlockTweaks`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SpTweakEntry {
+    /// 33-byte compressed public tweak `T = input_hash · A` (serializes as
+    /// hex on the JSON carriers).
+    pub tweak: bitcoin::secp256k1::PublicKey,
+    pub txid: bitcoin::Txid,
+    /// Largest eligible taproot output value in the transaction, in satoshis —
+    /// drives the light-client dust filter without fetching the tx.
+    pub max_value: u64,
+}
+
+impl BlockTweaks {
+    /// Build the event from a decoded `sp_tweaks` row and its height.
+    pub fn from_row(height: u32, row: &node_sp_index::SpBlockRow) -> Self {
+        Self {
+            block_hash: row.block_hash,
+            height,
+            entries: row
+                .entries
+                .iter()
+                .map(|e| SpTweakEntry {
+                    tweak: e.tweak,
+                    txid: e.txid,
+                    max_value: e.max_taproot_value.to_sat(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Body variants carried by [`NodeEvent`]. The discriminator field is
 /// `category` (rendered snake_case: `mempool`, `chain`, `heartbeat`) —
 /// distinct from the inner `MempoolEvent`'s and `ChainEvent`'s own
@@ -338,6 +404,10 @@ impl Serialize for EdgeStamp {
 pub enum NodeEventBody {
     Mempool(MempoolEvent),
     Chain(ChainEvent),
+    /// One connected block's public silent-payment tweak data (BIP 352,
+    /// Tier 1). Published when `silentpaymentindex=1` and the `tweaks`
+    /// category has subscribers; category bit [`CATEGORY_TWEAKS`].
+    BlockTweaks(BlockTweaks),
     Heartbeat {
         /// Nanoseconds since the [`super::EventPublisher`] was
         /// constructed. Lets downstream consumers measure end-to-end
@@ -409,6 +479,15 @@ pub enum SetCursorOutcome {
     },
 }
 
+/// Cursor `tx_index` sentinel for a block's `BlockTweaks` aggregate. A block's
+/// tweak firehose event is emitted *after* that block's `BlockConnected`, so it
+/// sorts after every per-tx position at the same height. Using a distinct,
+/// maximal `tx_index` (rather than sharing `0` with `BlockConnected`) lets a
+/// mixed chain+tweaks subscriber that resumes from a `(h, 0)` chain cursor still
+/// receive block `h`'s pending tweaks, instead of the replay skipping straight
+/// to `h + 1`.
+pub const TWEAKS_TX_INDEX: u32 = u32::MAX;
+
 /// Durable resume position carried alongside confirmed-side events.
 ///
 /// Confirmed cursors are `(height, tx_index)` — per-transaction, so a
@@ -465,6 +544,17 @@ impl NodeEventBody {
                 mempool_seq,
                 instance_id,
             }),
+            // A tweak firehose event advances the durable confirmed position
+            // exactly like a connected block, so a tweaks subscriber can
+            // persist the cursor and resume mid-sync via `from_cursor`. It sits
+            // at `TWEAKS_TX_INDEX` (after the block's chain event at the same
+            // height) so a mixed subscriber never conflates the two positions.
+            NodeEventBody::BlockTweaks(bt) => Some(Cursor {
+                height: bt.height,
+                tx_index: TWEAKS_TX_INDEX,
+                mempool_seq,
+                instance_id,
+            }),
             _ => None,
         }
     }
@@ -508,13 +598,15 @@ impl NodeEvent {
 
     /// Categorize this envelope for subscriber filters. Bitfield values
     /// match the gRPC `SubscribeRequest.categories` semantics: `mempool=1`,
-    /// `chain=2`, `heartbeat=4`. A subscriber requesting `0` receives all
-    /// categories (the conservative default).
+    /// `chain=2`, `heartbeat=4`, `tweaks=8`. A subscriber requesting `0`
+    /// receives [`ALL_CATEGORIES_DEFAULT`] — every category except the
+    /// explicit-only ones (`tweaks`), which must be requested by bit.
     pub fn category_bit(&self) -> u32 {
         match &self.body {
-            NodeEventBody::Mempool(_) => 1,
-            NodeEventBody::Chain(_) => 2,
-            NodeEventBody::Heartbeat { .. } => 4,
+            NodeEventBody::Mempool(_) => CATEGORY_MEMPOOL,
+            NodeEventBody::Chain(_) => CATEGORY_CHAIN,
+            NodeEventBody::BlockTweaks(_) => CATEGORY_TWEAKS,
+            NodeEventBody::Heartbeat { .. } => CATEGORY_HEARTBEAT,
             // A lag notice is a control signal, not a content category: it
             // must reach every subscriber regardless of the category mask, so
             // it sets all bits (and carriers emit it directly, bypassing the
@@ -667,6 +759,59 @@ mod tests {
         assert_eq!(env_m.category_bit(), 1);
         assert_eq!(env_c.category_bit(), 2);
         assert_eq!(env_h.category_bit(), 4);
+    }
+
+    fn block_tweaks_env(height: u32) -> NodeEvent {
+        NodeEvent::new(
+            stamp(),
+            NodeEventBody::BlockTweaks(BlockTweaks {
+                block_hash: BlockHash::from_raw_hash(
+                    bitcoin::hashes::sha256d::Hash::from_byte_array([4u8; 32]),
+                ),
+                height,
+                entries: vec![],
+            }),
+        )
+    }
+
+    #[test]
+    fn tweaks_category_is_explicit_only() {
+        // The tweak firehose carries bit 8 and is deliberately excluded from
+        // the `categories = 0` ("all") default — a legacy subscriber must never
+        // begin receiving tweak volume after an upgrade.
+        assert_eq!(CATEGORY_TWEAKS, 8);
+        assert_eq!(block_tweaks_env(100).category_bit(), CATEGORY_TWEAKS);
+        assert_eq!(
+            ALL_CATEGORIES_DEFAULT & CATEGORY_TWEAKS,
+            0,
+            "tweaks must NOT be in the all-categories default",
+        );
+        // Every non-explicit-only category IS in the default.
+        assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_MEMPOOL, 0);
+        assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_CHAIN, 0);
+        assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_HEARTBEAT, 0);
+    }
+
+    #[test]
+    fn block_tweaks_derives_durable_cursor() {
+        // A tweak event advances the durable confirmed position like a
+        // connected block, so a tweaks subscriber can resume via `from_cursor`.
+        let cur = block_tweaks_env(77)
+            .body
+            .derive_cursor(0xABCD, 5)
+            .expect("block tweaks must carry a cursor");
+        assert_eq!(cur.height, 77);
+        // Tweaks sit at the max tx_index so a mixed subscriber never conflates
+        // a block's tweak cursor with its chain cursor at the same height.
+        assert_eq!(cur.tx_index, TWEAKS_TX_INDEX);
+        assert_eq!(cur.instance_id, 0xABCD);
+    }
+
+    #[test]
+    fn block_tweaks_serializes_with_category_tag() {
+        let v = serde_json::to_value(block_tweaks_env(9)).unwrap();
+        assert_eq!(v["body"]["category"], "block_tweaks");
+        assert_eq!(v["body"]["height"], 9);
     }
 
     #[test]

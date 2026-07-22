@@ -2390,26 +2390,42 @@ impl Store for RocksDbStore {
     }
 
     fn get_sp_tweaks_row(&self, height: u32) -> Option<node_sp_index::SpBlockRow> {
+        // Error-swallowing convenience view over the checked read: a read or
+        // decode failure logs loudly and returns `None` (callers on this path —
+        // e.g. the disconnect/undo bookkeeping — treat absent and errored
+        // alike). The serving path uses `get_sp_tweaks_row_checked` instead so
+        // it can surface the error to the client.
+        match self.get_sp_tweaks_row_checked(height) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(target: "storage", "{e}");
+                None
+            }
+        }
+    }
+
+    fn get_sp_tweaks_row_checked(
+        &self,
+        height: u32,
+    ) -> Result<Option<node_sp_index::SpBlockRow>, StoreError> {
         let cf = self.cf(CF_SP_TWEAKS);
         let raw = self
             .db
             .get_cf(&cf, node_sp_index::encode_sp_key(height))
-            .ok()
-            .flatten()?;
-        match node_sp_index::SpBlockRow::decode(&raw) {
-            Ok(row) => Some(row),
-            Err(e) => {
-                // The row is written by our own codec inside the
-                // chainstate-atomic batch, so a decode failure means
-                // on-disk corruption or a version this binary predates —
-                // surface it loudly and refuse to serve rather than
-                // fabricate a partial row.
-                tracing::error!(
-                    target: "storage",
+            .map_err(|e| {
+                StoreError::Database(format!("sp_tweaks read at height {height} failed: {e}"))
+            })?;
+        match raw {
+            None => Ok(None),
+            // The row is written by our own codec inside the chainstate-atomic
+            // batch, so a decode failure means on-disk corruption or a version
+            // this binary predates — surface it rather than fabricate a partial
+            // row or fake an empty height.
+            Some(bytes) => node_sp_index::SpBlockRow::decode(&bytes).map(Some).map_err(|e| {
+                StoreError::Database(format!(
                     "sp_tweaks row at height {height} failed to decode: {e}"
-                );
-                None
-            }
+                ))
+            }),
         }
     }
 

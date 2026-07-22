@@ -26,4 +26,13 @@ pub trait SpIndex: Send + Sync {
     /// The rescan fast path and the tweaks-only deep-replay exemption
     /// both require this to be `true`.
     fn is_complete(&self) -> bool;
+
+    /// The taproot-activation height — the lowest height that carries a
+    /// tweak row (§3.2). Below it the index has no row *by construction*,
+    /// so the deep-replay pager clamps its unclamped cold-sync span to
+    /// `[activation, tip]`; a `NotFound` at/above this height in a complete
+    /// index is therefore a genuine hole (a concurrent backfill/reorg
+    /// punched it), not a benign below-activation absence, and must surface
+    /// in-band rather than pass as a silent skip.
+    fn activation_height(&self) -> u32;
 }
