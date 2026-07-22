@@ -1,32 +1,35 @@
 # Electrum Protocol Server
 
-satd ships a native **Electrum protocol** server (the `electrum-proto` crate),
-serving the JSON-RPC-over-TCP protocol that BlueWallet, Sparrow, Nunchuk,
-Electrum, and most hardware-wallet coordinators speak. It is a query layer over
-satd's own chainstate and address-history index — **not** a separate `electrs` /
-Fulcrum process with its own copy of the data. satd's combined index is larger on
-disk than a standalone electrs/Fulcrum index — the trade is disk for consistency
-and single-process operation; see [Disk Footprint & Indices](disk-footprint.md)
-for the "why native + shared chainstate" rationale.
+satd ships a native **Electrum protocol** server (the `electrum-proto`
+crate), serving the JSON-RPC-over-TCP protocol that BlueWallet, Sparrow,
+Nunchuk, Electrum, and most hardware-wallet coordinators speak. It is a
+query layer over satd's own chainstate and address-history index, not a
+separate `electrs` or Fulcrum process with its own copy of the data. satd's
+combined index is larger on disk than a standalone electrs/Fulcrum index:
+the trade is disk for consistency and single-process operation. See
+[Disk Footprint & Indices](disk-footprint.md) for the rationale behind the
+native, shared-chainstate design.
 
-It is **off by default**. Enable with `--electrum=1`; it requires
-`--addressindex=1` (for scripthash history) **and** `--txindex=1` (for the
-confirmed-transaction and merkle-proof methods), both enforced at startup.
+The server is off by default. Enable it with `--electrum=1`. It needs
+the address index for scripthash history (on by default) and
+`--txindex=1` for the confirmed-transaction and merkle-proof methods
+(off by default). Startup fails if either index is disabled.
 
-- **Protocol version:** `1.4` — advertised as both `protocol_min` and
-  `protocol_max` (satd serves a single protocol version).
-- **Transport:** line-delimited JSON-RPC over plain TCP (default
-  `127.0.0.1:50001`) and/or TLS (default port 50002). Expose over Tor / `.onion`
-  rather than directly on the LAN.
+- Protocol version: `1.4`, advertised as both `protocol_min` and
+  `protocol_max`. satd serves a single protocol version.
+- Transport: line-delimited JSON-RPC over plain TCP (default
+  `127.0.0.1:50001`) and/or TLS (default port 50002). Expose the server
+  over Tor / `.onion` rather than directly on the LAN.
 
-> **Authentication.** Electrum is loopback by default. It supports native TLS and
-> mutual TLS (`--electrumtlsbind` + `--electrummtls…`); the unified bearer-token
-> layer does not gate Electrum (client-cert principals are a documented future
-> seam). See [Authentication & Authorization](authentication.md).
+> **Note.** Electrum is loopback by default. It supports native TLS and
+> mutual TLS (`--electrumtlsbind` + `--electrummtls…`). The unified
+> bearer-token layer does not gate Electrum; client-certificate principals
+> are planned but not yet implemented. See
+> [Authentication & Authorization](authentication.md).
 
 ## Configuration
 
-| CLI flag | Default | Notes |
+| Flag | Default | Notes |
 |---|---|---|
 | `--electrum=<0\|1>` | `0` | Enable the Electrum server. Requires `--addressindex=1` and `--txindex=1`. |
 | `--electrumbind=<addr:port>` | `127.0.0.1:50001` | Plain-TCP listener bind. |
@@ -39,17 +42,17 @@ confirmed-transaction and merkle-proof methods), both enforced at startup.
 | `--electrummaxconns=<n>` | `64` | Hard cap on simultaneously-open connections. |
 | `--electrummaxsubsperconn=<n>` | `1000` | Per-connection scripthash subscription cap. |
 | `--electrumrequesttimeout=<secs>` | `30` | Per-request handler timeout. |
-| `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets (e.g. Sparrow) batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
+| `--electrummaxbatchrequests=<n>` | `100` | Max requests per JSON-RPC batch line. Wallets such as Sparrow batch their whole gap-limit window of `scripthash.subscribe` calls at scan time, so a low cap fails the scan. |
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
 | `--electrumbanner=<text>` | `powered by satd <version>` | Override for `server.banner`. |
 
-The server runs on satd's [isolated API runtime](api-scaling.md) (`--api-threads`),
-so Electrum load cannot starve block connection.
+The server runs on satd's [isolated API runtime](api-scaling.md)
+(`--api-threads`), so Electrum load cannot starve block connection.
 
 ## Supported methods
 
-A scripthash is the SHA-256 of an output `scriptPubKey`, **reversed** (hex),
+A scripthash is the SHA-256 of an output `scriptPubKey`, reversed (hex),
 exactly as in the Electrum protocol.
 
 ### Server / session
@@ -61,7 +64,7 @@ exactly as in the Electrum protocol.
 | `server.banner` | Server banner text (configurable via `--electrumbanner`). |
 | `server.donation_address` | Configured donation address (empty if unset). |
 | `server.features` | Feature/identity dict: genesis hash, `protocol_min`/`protocol_max` (both `1.4`), hosts, etc. |
-| `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set — no peer gossip). |
+| `server.peers.subscribe` | Peer-server discovery list (satd returns an empty set; no peer gossip). |
 
 ### Headers & blocks
 
@@ -104,26 +107,26 @@ exactly as in the Electrum protocol.
 
 ## Subscriptions
 
-Two push subscriptions are supported and counted against
+Two push subscriptions are supported, both counted against
 `--electrummaxsubsperconn`:
 
-- `blockchain.headers.subscribe` — a `blockchain.headers.subscribe` notification
-  on every new tip.
-- `blockchain.scripthash.subscribe` — a `blockchain.scripthash.subscribe`
+- `blockchain.headers.subscribe`: a `blockchain.headers.subscribe`
+  notification on every new tip.
+- `blockchain.scripthash.subscribe`: a `blockchain.scripthash.subscribe`
   notification carrying the new status hash whenever a watched scripthash's
-  history changes (mempool or confirmed). Because the index is updated inside the
-  same `connect_block` / `disconnect_block` batch as the chainstate, a
-  subscriber can never observe a status out of sync with the tip.
+  history changes, in the mempool or confirmed. The index is updated inside
+  the same `connect_block` / `disconnect_block` batch as the chainstate, so
+  a subscriber can never observe a status out of sync with the tip.
 
 ## Notes & differences
 
-- `--txindex` is **required** for `blockchain.transaction.get` /
-  `get_merkle` / `id_from_pos`; `--addressindex` (on by default) backs every
+- `--txindex` is required for `blockchain.transaction.get`, `get_merkle`,
+  and `id_from_pos`. `--addressindex` (on by default) backs every
   `scripthash.*` method.
-- satd advertises a single protocol version (`protocol_min == protocol_max ==
-  1.4`); it does not negotiate a range.
-- `server.peers.subscribe` returns an empty list — satd does not participate in
-  Electrum peer gossip.
+- satd advertises a single protocol version (`protocol_min == protocol_max
+  == 1.4`); it does not negotiate a range.
+- `server.peers.subscribe` returns an empty list: satd does not participate
+  in Electrum peer gossip.
 - The protocol layer is vendored from `romanz/electrs` (MIT; attribution in
-  `electrum-proto/vendor/electrs.MIT`) and adapted to satd's `AddressIndex` trait
-  over the shared RocksDB.
+  `electrum-proto/vendor/electrs.MIT`) and adapted to satd's `AddressIndex`
+  trait over the shared RocksDB.

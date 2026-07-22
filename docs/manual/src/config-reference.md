@@ -1,86 +1,82 @@
 # Configuration Flag Reference
 
-This chapter is the complete reference for every configuration key satd
-recognizes — what it does, its default, whether it reloads live on `SIGHUP`, and
-whether it is **Bitcoin Core-compatible** or a **satd extension**.
+This chapter is the complete reference for every config key satd recognizes:
+what it does, its default, whether it reloads live on `SIGHUP`, and whether it
+is Bitcoin Core-compatible or a satd extension.
 
-For *how* configuration is sourced and the live-reload mechanics, see
+For how configuration is sourced and how live reload works, see
 [Configuration, Tuning & Reload](configuration.md). This chapter is the flat
-per-key index. The auth-related keys (`authfile`, `*authbearer`/`*auth`,
+per-key index. The auth keys (`authfile`, `*authbearer`/`*auth`,
 `*allowremote`, cookie/`rpcuser`/`rpcauth`) are explained in context in
-[Authentication & Authorization](authentication.md); the sync / consensus /
+[Authentication & Authorization](authentication.md). The sync, consensus, and
 storage-tuning keys (`assumevalid`, `consensus`, `shadow*`, `dbcache`,
 `prefetchworkers`, `maxahead`, `storageprofile`, the `rocksdb*` / `compaction*`
-family, reindex) in [Initial Block Download & Fast Sync](ibd.md).
+family, reindex) are covered in [Initial Block Download & Fast Sync](ibd.md).
 
 ## How satd reads configuration
 
-**Goal: drop in your existing Bitcoin Core `bitcoin.conf` and have it just
-work.** satd reads Core's configuration surface directly — same
-`bitcoin.conf` / `satd.conf` `key=value` + `[network]` section syntax and the
-same CLI flag names (`-datadir`, `-rpcport`, …). Supported-flag names and
-semantics track **Bitcoin Core v30**.
+The goal is that an existing Bitcoin Core `bitcoin.conf` drops in and works.
+satd reads Core's configuration surface directly: the same
+`bitcoin.conf` / `satd.conf` `key=value` and `[network]` section syntax, and
+the same flag names (`-datadir`, `-rpcport`, …). Supported names and semantics
+track Bitcoin Core v30.
 
-- **Resolution order:** `-conf=<path>` if given, else `<datadir>/bitcoin.conf`,
-  else `<datadir>/satd.conf`. **CLI flags always win** over file values.
-- **What happens to each config-file key** (the four-way disposition that makes
-  drop-in safe):
-  1. **Honored** — satd implements it. The common operator surface.
-  2. **Skipped with a warning** — a recognized Core v30 option satd doesn't
-     implement but is *safe to skip*. The node **still starts**; a `WARN` line
-     names the ignored key (and the satd equivalent, if any). This is what lets
-     a real `bitcoin.conf` boot unedited.
-  3. **Rejected at load** — a small set where silently skipping would mislead
-     you about the node's **security / exposure / privacy** posture (see
+- **Resolution order.** `-conf=<path>` if given, else `<datadir>/bitcoin.conf`,
+  else `<datadir>/satd.conf`. Flags override file values.
+- **Key disposition.** Each config-file key gets one of four treatments:
+  1. **Honored.** satd implements it. This is the common case.
+  2. **Skipped with a warning.** A recognized Core v30 option satd does not
+     implement but that is safe to skip. The node still starts, and a `WARN`
+     line names the ignored key and the satd equivalent, if any. This is what
+     lets a real `bitcoin.conf` boot unedited.
+  3. **Rejected at load.** A small set where skipping would mislead you about
+     the node's security, exposure, or privacy posture (see
      [Unsupported Core keys](#unsupported-core-keys-skipped-vs-rejected)).
-     Fail-closed with guidance.
-  4. **Rejected as a typo** — a key that is neither a satd option nor a known
-     Core v30 option. Rejected so a fat-fingered security option (e.g.
-     `rpcusser=`) can't silently disable auth.
-- **Never *silently* ignored.** Skipped keys always warn; nothing a config asks
-  for is dropped without the operator being told.
-- **`-profile=<preset>`** seeds a hardware/role profile (`archival`,
-  `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`); explicit flags
+     satd fails closed with guidance.
+  4. **Rejected as a typo.** A key that is neither a satd option nor a known
+     Core v30 option. Rejection stops a mistyped security option such as
+     `rpcusser=` from silently disabling auth.
+- No key is silently ignored. Skipped keys always warn; nothing a config asks
+  for is dropped without a log line.
+- `-profile=<preset>` seeds a hardware/role profile (`archival`,
+  `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`). Explicit flags
   override the profile's values.
 
-> **Compatibility is pinned to Bitcoin Core v30 — and only v30.** The
-> drop-in target is a frozen, verifiable surface, not "whatever Core ships
-> next." Keys Core *adds* in v31 or later (e.g. `limitclustercount`,
-> `limitclustersize`, `privatebroadcast`, `txospenderindex`) are **not**
-> recognized and are rejected as typos until this pin is deliberately bumped.
-> Keys Core *removed* at or before v30 (e.g. `upnp`, `maxorphantx`) are
-> likewise not honored. If you migrate a `bitcoin.conf` from a newer Core, a
-> v31+ key will fail to start satd with an "unknown key" error — that is
-> intentional, not a bug.
+> **Note.** Compatibility is pinned to Bitcoin Core v30, a frozen and
+> verifiable surface. Keys Core adds in v31 or later (for example
+> `limitclustercount`, `limitclustersize`, `privatebroadcast`,
+> `txospenderindex`) are not recognized and are rejected as typos until the
+> pin is bumped. Keys Core removed at or before v30 (for example `upnp`,
+> `maxorphantx`) are likewise not honored. A `bitcoin.conf` migrated from a
+> newer Core that contains a v31+ key stops satd at startup with an "unknown
+> key" error. This is intentional.
 
-> **Building on satd? Don't poll or shell-hook — stream.** This reference is
-> for *operating* the node. If you are writing software that consumes node
-> state (blocks, mempool, address activity, reorgs), the supported integration
-> path is the **[Streaming Consumption API](streaming.md)** (gRPC / WebSocket /
-> ZMQ): reorg-safe, durable cursor replay, decoupled from consensus. The Core
-> `*notify` shell hooks and ad-hoc RPC polling are provided for compatibility
-> and quick scripts only — they have no delivery guarantee, no replay, and no
-> reorg awareness.
+> **Note.** This reference is for operating the node. To write software that
+> consumes node state (blocks, mempool, address activity, reorgs), use the
+> [Streaming Consumption API](streaming.md) (gRPC, WebSocket, or ZMQ). It is
+> reorg-safe, supports durable cursor replay, and is decoupled from consensus.
+> The Core `*notify` shell hooks and RPC polling exist for compatibility and
+> quick scripts only. They have no delivery guarantee, no replay, and no reorg
+> awareness.
 
 ## Legend
 
-- **Reload** — `hot`: applied live on `SIGHUP` (`systemctl reload satd`).
+- **Reload.** `hot`: applied live on `SIGHUP` (`systemctl reload satd`).
   `restart`: wired into long-lived state at startup; reported as "restart
-  required" on reload, never silently ignored. (TLS *certificate contents*
-  reload via `SIGUSR1` even where the key is `restart` — see
-  [Live TLS Certificate Reload](configuration.md#live-tls-certificate-reload-sigusr1).)
-- **Compat** — `core`: same key name **and** substantially the same semantics as
+  required" on reload, never silently ignored. TLS certificate contents reload
+  via `SIGUSR1` even where the key is `restart`; see
+  [Live TLS Certificate Reload](configuration.md#live-tls-certificate-reload-sigusr1).
+- **Compat.** `core`: same key name and substantially the same semantics as
   Bitcoin Core. `satd`: a satd-specific extension (no Core equivalent, or
-  satd-only semantics). Best-effort classification; a key "modeled on" Core
-  behavior but without a Core flag of the same name is `satd`.
+  satd-only semantics). The classification is best-effort; a key modeled on
+  Core behavior but without a Core flag of the same name is `satd`.
 
-> **Every key listed in the per-category tables below is _honored_**
-> (disposition #1 — satd implements it). Recognized Core v30 keys satd does
-> **not** honor are not in these tables; they are enumerated, with their
-> warn-and-skip or fail-closed disposition, under
-> [Unsupported Core keys: skipped vs rejected](#unsupported-core-keys-skipped-vs-rejected).
-> So: in a table here ⇒ supported; in the unsupported-keys section ⇒
-> warn-and-continue (or rejected); in neither ⇒ rejected as a typo.
+> **Note.** Every key in the per-category tables below is honored: satd
+> implements it. Recognized Core v30 keys satd does not honor are not in these
+> tables. They are listed, with their warn-and-skip or fail-closed disposition,
+> under [Unsupported Core keys: skipped vs
+> rejected](#unsupported-core-keys-skipped-vs-rejected). A key in neither
+> place is rejected as a typo.
 
 ---
 
@@ -94,11 +90,11 @@ semantics track **Bitcoin Core v30**.
 | `signet` | off | restart | core | Use the signet network. |
 | `chain` | main | restart | core | Unified network selector: `main`\|`test`\|`signet`\|`regtest`\|`testnet4`. Alternative to the per-net flags. |
 
-The bare selectors (`signet=1`, `testnet4=1`, …) and `chain=` are honored both on
-the command line and in `bitcoin.conf` (Bitcoin Core parity). CLI selectors take
-precedence over the config file. Selecting more than one network — two bare
-selectors, or a `chain=` that disagrees with a bare selector — is a startup
-error rather than a silent pick.
+The bare selectors (`signet=1`, `testnet4=1`, …) and `chain=` are honored both
+on the command line and in `bitcoin.conf`, as in Bitcoin Core. Command-line
+selectors take precedence over the config file. Selecting more than one network
+(two bare selectors, or a `chain=` that disagrees with a bare selector) is a
+startup error.
 
 ## Filesystem
 
@@ -115,7 +111,7 @@ error rather than a silent pick.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `daemon` | off | restart | core | Run in background; accepted for compatibility (no-op — use systemd). |
+| `daemon` | off | restart | core | Run in background; accepted for compatibility (no-op; use systemd). |
 | `server` | on | restart | core | Accept RPC commands; accepted for compatibility (always on). |
 | `logformat` | text | restart | satd | Log output format: `text` or `json`. Only verbosity hot-reloads, not the format. |
 | `logtimestamps` | on | restart | core | Prepend a timestamp to each log line. Disable (`-nologtimestamps`) when journald / the container runtime already stamps lines. |
@@ -123,7 +119,7 @@ error rather than a silent pick.
 | `logsourcelocations` | off | restart | core | Prepend source `file:line` to each log line. |
 | `debug` | none | hot | core | Enable debug logging for a category (repeatable; bare/`all`/`1` = everything). |
 | `debugexclude` | none | hot | core | Disable debug logging for a category `debug` would otherwise enable. |
-| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets not already overridden — it does **not** lower a more specific `-debug`/`RUST_LOG` directive (so `-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
+| `loglevel` | info | hot | core | Global verbosity (`trace`/`debug`/`info`/`warn`/`error`) or a per-category override (`net:debug`). Maps onto satd's `tracing` filter: a bare level sets the default for targets without an override, and does not lower a more specific `-debug`/`RUST_LOG` directive (`-debug=net -loglevel=error` still logs `net` at debug). A `category:level` pair overrides that subsystem. |
 | `allowignoredconf` | off | restart | core | Suppress startup warnings about `includeconf` files satd had to ignore. |
 | `maxshutdownsecs` | 30 | hot | satd | Max graceful-shutdown flush duration (seconds) before force exit. |
 
@@ -137,7 +133,7 @@ error rather than a silent pick.
 | `rpcuser` | none | hot | core | RPC username. |
 | `rpcpassword` | none | hot | core | RPC password. |
 | `rpcthreads` | 16 | restart | core | Max concurrent in-flight RPC method calls. |
-| `rpcworkqueue` | 64 | restart | core | Max queued RPC requests beyond `rpcthreads` before HTTP 429 (Core returns 503 — documented divergence). |
+| `rpcworkqueue` | 64 | restart | core | Max queued RPC requests beyond `rpcthreads` before HTTP 429 (Core returns 503; documented divergence). |
 | `apithreads` | `max(2, cores/4)` | restart | satd | Worker threads for the isolated API runtime (Esplora/Electrum/events gRPC/metrics). |
 | `rpcreadonlybind` | none | restart | satd | Bind an opt-in read-only JSON-RPC listener (reads + mempool submit) on the API runtime. |
 | `rpcreadonlyport` | 8330 | restart | satd | Default port for `rpcreadonlybind` entries without an explicit port. |
@@ -161,7 +157,7 @@ error rather than a silent pick.
 
 ## RPC TLS
 
-(satd-specific — Core's RPC is HTTP-only behind a TLS-terminating sidecar.)
+(satd-specific; Core's RPC is HTTP-only behind a TLS-terminating sidecar.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
@@ -178,10 +174,10 @@ error rather than a silent pick.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `listen` | on | restart | core | Accept P2P connections. |
-| `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); toggle at runtime with the `setnetworkactive` RPC. |
+| `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); change it at runtime with the `setnetworkactive` RPC. |
 | `blocksonly` | false | hot | core | Suppress P2P transaction relay; locally-submitted txs still relayed. |
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
-| `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy / anti-surveillance lever). |
+| `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy hardening). |
 | `externalip` | none | hot | core | External address to advertise to peers (repeatable). |
 | `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). |
 | `whitelistrelay` | on | hot | core | Grant `relay` to whitelisted peers with default permissions (relay their txes even under `-blocksonly`). Entries with an explicit `perms@` prefix are unaffected. |
@@ -206,24 +202,24 @@ error rather than a silent pick.
 | `signetseednode` | built-in seeds | restart | core | Additional signet seed node (repeatable; signet only). |
 | `signetchallenge` | default signet | restart | core | Custom signet challenge script, hex (BIP 325; signet only). |
 
-> **BIP35 `mempool` requests.** satd answers a peer's `mempool` message
-> (which asks us to announce our entire mempool) only for peers granted the
-> `mempool` net permission — `-whitelist=mempool@<subnet>`, `all@<subnet>`,
-> or a bare `-whitelist=<subnet>` entry (whose implicit permission set
-> includes `mempool`, as in Core). It is **not** implied by `noban@`. The
+> **Note.** satd answers a peer's BIP35 `mempool` message (a request to
+> announce our entire mempool) only for peers granted the `mempool` net
+> permission: `-whitelist=mempool@<subnet>`, `all@<subnet>`, or a bare
+> `-whitelist=<subnet>` entry, whose implicit permission set includes
+> `mempool`, as in Core. The permission is not implied by `noban@`. The
 > response honors the requesting peer's fee filter, and dumps to one peer
-> are rate-limited (at most one per 30 s). satd does not advertise
-> `NODE_BLOOM` (BIP37 bloom filters are unsupported); `mempool` requests
-> from peers without the permission are ignored — softer than Bitcoin Core
-> with bloom disabled, which disconnects such peers unless they have
-> `noban`.
+> are rate-limited to at most one per 30 s. satd does not advertise
+> `NODE_BLOOM` (BIP37 bloom filters are unsupported). `mempool` requests
+> from peers without the permission are ignored, which is softer than
+> Bitcoin Core with bloom disabled: Core disconnects such peers unless
+> they have `noban`.
 
 ## Proxy / Tor
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections. |
-| `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are simply not negotiated. Set `=0` to opt out. |
+| `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are not negotiated. Set `=0` to opt out. |
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
 | `torpassword` | none | restart | core | Tor control port password (for a `HashedControlPassword` setup). Leave unset to use SAFECOOKIE cookie auth. |
@@ -253,7 +249,7 @@ error rather than a silent pick.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains it as a toggle. |
+| `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains the flag. |
 | `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB. |
 | `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. |
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. |
@@ -264,13 +260,13 @@ error rather than a silent pick.
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `rebroadcastinterval` | 0 (auto) | hot | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers take it (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time; the pending set is persisted in `mempool.dat` so it also survives restarts. A SIGHUP interval change applies after the in-flight sleep completes. |
-| `broadcastconfirmpeers` | 1 | hot | satd | Distinct peer **IPs** that must take a locally-broadcast tx — fetch it from us via `getdata` (primary signal) or announce it back via `inv` — before it is considered propagated and rebroadcast stops. Counted per IP, not per connection, so a reconnecting host is one witness. Raising it demands wider observed propagation before giving up retries. |
+| `broadcastconfirmpeers` | 1 | hot | satd | Distinct peer IPs that must take a locally-broadcast tx before it counts as propagated and rebroadcast stops. A peer takes a tx by fetching it via `getdata` (the primary signal) or announcing it back via `inv`. Counted per IP, not per connection, so a reconnecting host is one witness. Raising it demands wider observed propagation before retries stop. |
 | `permitbaremultisig` | on | hot | core | Allow bare multisig outputs. |
-| `acceptnonstdtxn` | off | hot | core | Relay and accept non-standard transactions (bypass the standardness relay checks — oversize, dust, OP_RETURN/datacarrier, non-standard scripts). Consensus rules are never relaxed. Intended for test/dev networks. |
+| `acceptnonstdtxn` | off | hot | core | Relay and accept non-standard transactions (bypass the standardness relay checks: oversize, dust, OP_RETURN/datacarrier, non-standard scripts). Consensus rules are never relaxed. Intended for test/dev networks. |
 
 ## Esplora
 
-(satd-specific — native Esplora REST server. See [Esplora REST API](esplora.md).)
+(satd-specific; native Esplora REST server. See [Esplora REST API](esplora.md).)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
@@ -294,7 +290,7 @@ error rather than a silent pick.
 
 ## Electrum
 
-(satd-specific — native Electrum protocol server.)
+(satd-specific; native Electrum protocol server.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
@@ -345,12 +341,12 @@ error rather than a silent pick.
 |---|---|---|---|---|
 | `blockmaxweight` | 4000000 | restart | core | Maximum block weight for templates. |
 | `blockmintxfee` | 1000 sat/kvB | restart | core | Minimum tx fee for the block template. |
-| `par` | — | restart | core | Script-verification threads; accepted for compatibility (no-op). |
+| `par` | unset | restart | core | Script-verification threads (Core name). When `shadowworkers` is unset, a positive value sets the shadow-verification worker count. It does not size the connect path. |
 
 ## Events
 
-(satd-specific event bus. The `eventszmq*` spelling is satd's — Core uses
-per-topic `-zmqpub*=<addr>` flags — but the `hashtx`/`hashblock` payloads are
+(satd-specific event bus. The `eventszmq*` spelling is satd's; Core uses
+per-topic `-zmqpub*=<addr>` flags. The `hashtx`/`hashblock` payloads are
 Core ZMQ wire-format compatible.)
 
 | Key | Default | Reload | Compat | Description |
@@ -358,7 +354,7 @@ Core ZMQ wire-format compatible.)
 | `eventsnodeid` | auto (persisted to `<datadir>/node_id`) | restart | satd | Stable per-node identifier (32-char hex) stamped on events envelopes. |
 | `eventsregion` | none | restart | satd | Optional region tag (≤8 ASCII bytes) on events envelopes. |
 | `eventsgrpcbind` | off | restart | satd | host:port to bind the events gRPC streaming server. |
-| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` **or** `eventsgrpcmtls`). |
+| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` or `eventsgrpcmtls`). |
 | `eventsgrpcauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on events gRPC (requires `authfile`). |
 | `eventsgrpcmaxconns` | 64 (`0` disables) | restart | satd | Hard cap on simultaneously-open events gRPC connections. |
 | `eventsgrpcmaxsubscriptions` | 256 (`0` disables) | restart | satd | Hard cap on concurrent events gRPC `Subscribe` streams. |
@@ -389,28 +385,28 @@ Core ZMQ wire-format compatible.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task (a slow hook never stalls block connection — notifications coalesce instead). The command body is not logged (it may embed credentials). |
+| `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task; a slow hook never stalls block connection, because notifications coalesce instead. The command body is not logged (it may embed credentials). |
 | `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). Runs serially like `blocknotify`. |
-| `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached — a slow hook doesn't delay the daemon. Prefer a systemd `ExecStartPost=`. |
+| `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached, so a slow hook does not delay startup. Prefer a systemd `ExecStartPost=`. |
 | `shutdownnotify` | none | restart | core | Shell command run once at the start of a graceful shutdown, before the final flush (no `%s`). Bounded by `maxshutdownsecs` so a hung hook can't wedge teardown. Prefer a systemd `ExecStopPost=`. |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 
-> **Notifications are convenience, not the integration path.** The `*notify`
-> shell hooks (`blocknotify`, `alertnotify`, `startupnotify`, `shutdownnotify`)
-> exist for drop-in Bitcoin Core compatibility and quick scripts. They are
-> best-effort, fire-and-forget shell execs with no delivery guarantee, no
-> replay, and no reorg awareness. **To build on satd, use the [Streaming
-> Consumption API](streaming.md)** (gRPC / WebSocket / ZMQ) — it is reorg-safe,
-> offers durable cursor replay, and is decoupled from consensus. For lifecycle
-> actions, prefer your service manager (systemd `ExecStartPost=` /
-> `ExecStopPost=`). satd honors these four hooks; only `walletnotify` is
-> unsupported (satd is keyless — watch scripts via the streaming/Esplora API).
-> A node started with any of these hooks logs this guidance at startup.
+> **Note.** The `*notify` shell hooks (`blocknotify`, `alertnotify`,
+> `startupnotify`, `shutdownnotify`) exist for drop-in Bitcoin Core
+> compatibility and quick scripts. They are best-effort shell execs with no
+> delivery guarantee, no replay, and no reorg awareness. To build on satd, use
+> the [Streaming Consumption API](streaming.md) (gRPC, WebSocket, or ZMQ): it
+> is reorg-safe, offers durable cursor replay, and is decoupled from
+> consensus. For lifecycle actions, prefer your service manager (systemd
+> `ExecStartPost=` / `ExecStopPost=`). satd honors these four hooks. Only
+> `walletnotify` is unsupported: satd is keyless, so watch scripts via the
+> streaming or Esplora API. A node started with any of these hooks logs this
+> guidance at startup.
 
 ## MCP
 
-(satd-specific — Model Context Protocol server.)
+(satd-specific; Model Context Protocol server.)
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
@@ -441,45 +437,43 @@ one of two ways so that an existing `bitcoin.conf` still drops in.
 
 ### Skipped with a warning (the node still starts)
 
-Recognized Core v30 options satd doesn't implement but that are **safe to skip**
-are ignored with a startup `WARN` line — the node boots without them. The warning
-names the satd equivalent where one exists. This covers the low-value long tail,
-e.g.:
+Recognized Core v30 options satd doesn't implement, but that are safe to skip,
+are ignored with a startup `WARN` line; the node boots without them. The
+warning names the satd equivalent where one exists. This covers the long tail:
 
 | Key(s) | Warning guidance |
 |---|---|
 | `rest` | satd ships native Esplora REST instead of Core's `/rest/`; enable with `-esplora` (on by default). |
 | `zmqpub*` (`hashtx`/`hashblock`/`rawtx`/`rawblock`/`sequence` + `*hwm`) | Core's per-topic ZMQ is replaced by the events bus (`-eventszmqbind` + `-eventszmqhashtx`/`-eventszmqhashblock`, Core wire-format). |
 | `peerbloomfilters` | BIP37 unsupported (privacy/DoS); use BIP157/158 (`-blockfilterindex`/`-peerblockfilters`). |
-| `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown — same as Core v30.) |
+| `natpmp` | satd doesn't implement PCP/NAT-PMP port mapping; configure port forwarding externally. (`upnp` was removed in Core v29 and is rejected as unknown, as in Core v30.) |
 | `debuglogfile`, `shrinkdebugfile`, `printtoconsole`, `logratelimit` | satd logs to stdout/journald; no `debug.log`. |
-| `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the toggle has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
+| `logtimemicros` | satd's logger always emits sub-second timestamps; there is no seconds-only mode, so the option has no effect. Use `-logtimestamps=0` to drop timestamps entirely. |
 | `maxorphantx` | Removed in Core v30 too. |
 | `wallet`, `walletdir`, `walletnotify`, … | satd is keyless (no wallet); use external wallets + PSBT, and watch scripts via the streaming/Esplora API. |
 | `coinstatsindex`, `loadblock`, `checkblocks`/`checklevel`, `bytespersigop`, `maxsigcachesize`, `blockversion`, `printpriority`, `txreconciliation`, `discover`, `persistmempoolv1`, `acceptstalefeeestimates`, `blocksxor`, `settings`, `daemonwait`, `deprecatedrpc`, `rpcdoccheck`, … | Recognized Core v30 options satd does not implement; skipped (generic warning). |
 
 ### Rejected at load (fail-closed)
 
-A small set stays **fatal**, because silently skipping them would mislead you
-about the node's **security / exposure / privacy** posture. Each rejects with an
+A small set stays fatal, because silently skipping them would mislead you
+about the node's security, exposure, or privacy posture. Each rejects with an
 actionable message:
 
 | Key(s) | Reason |
 |---|---|
-| `i2psam`, `i2pacceptincoming` | I2P out of scope — skipping would route traffic over clearnet instead of the privacy network you configured. Tor is satd's anonymity network (`-proxy`/`-onion`/`-torcontrol`). |
+| `i2psam`, `i2pacceptincoming` | I2P is out of scope; skipping would route traffic over clearnet instead of the privacy network you configured. Tor is satd's anonymity network (`-proxy`/`-onion`/`-torcontrol`). |
 | `rpcwhitelist`, `rpcwhitelistdefault` | satd uses capability-scoped bearer tokens (`-authfile`); skipping would leave RPC less restricted than your Core config intends. See [Authentication & Authorization](authentication.md). |
 
 ### Typos
 
-A key that is **neither a satd option nor a known Core v30 option** is rejected
-at load as a likely typo — this is what stops a fat-fingered `rpcusser=` from
-silently disabling authentication. Note this also catches **Core v31+ keys**:
-the compatibility surface is frozen at v30, so a key Core only added later is
-treated as unknown until the pin is deliberately bumped.
+A key that is neither a satd option nor a known Core v30 option is rejected at
+load as a likely typo. This is what stops a mistyped `rpcusser=` from silently
+disabling authentication. The same rule catches Core v31+ keys: the
+compatibility surface is frozen at v30, so a key Core only added later is
+treated as unknown until the pin is bumped.
 
-> **Compatibility scope.** "Supported" is the commonly-used Core v30 operator
-> surface, with semantics pinned to **Core v30 only** (not later releases). The
-> long tail is skipped-with-warning rather than honored. To consume node
-> events from your own software, use the
-> [Streaming Consumption API](streaming.md), not the `*notify` hooks or RPC
-> polling.
+> **Note.** "Supported" means the commonly used Core v30 operator surface,
+> with semantics pinned to Core v30 (not later releases). The long tail is
+> skipped with a warning rather than honored. To consume node events from your
+> own software, use the [Streaming Consumption API](streaming.md) instead of
+> the `*notify` hooks or RPC polling.
