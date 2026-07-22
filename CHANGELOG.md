@@ -32,6 +32,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   gauge is exported. Until a backfill completes (or the sync ran from genesis
   with the index on), the index reports not-synced so tweak-serving surfaces
   refuse rather than return holes.
+- Silent payments (BIP 352): streaming-API wire schema (`satd-events-proto`) for
+  both consumption modes. Tier 1 adds a `tweaks` firehose category (bit 8 —
+  explicit-request only, not part of the `categories=0` default) with per-block
+  `BlockTweaks`/`TweakEntry` bodies and `tweak_dust_limit`/`tweaks_only`
+  subscription knobs; Tier 2 adds a scan-key watch kind
+  (`AddSilentPayments`/`RemoveSilentPayments`, `SetWatchSet.silent_payments`) and
+  a `SilentPaymentMatched` body. Additive — the schema version does not bump and
+  existing subscribers are unaffected. Emit, serving, and matching land in
+  later changes; this is the schema pass both SDKs build on.
 
 ## Releases
 

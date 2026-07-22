@@ -614,6 +614,15 @@ impl From<pb::NodeEvent> for Event {
                 to_height: c.to_height,
                 matches: c.matches,
             },
+            // Forward-compatible catch-all. This crate is published to crates.io
+            // and version-pinned to the *released* `satd-events-proto`, so it must
+            // compile against both that (older) schema and the newer in-workspace
+            // one. A `_` arm lets a newer proto's bodies (e.g. the BIP 352
+            // `BlockTweaks` / `SilentPaymentMatched` allocated in the SP schema
+            // pass) map to `Unknown` without referencing symbols the released
+            // proto lacks. Typed decoding for those lands once the proto is
+            // released and the pin advances (PR 8).
+            _ => Event::Unknown,
         }
     }
 }

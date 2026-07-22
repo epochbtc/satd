@@ -121,6 +121,10 @@ message NodeEvent {
     PrefixMatched prefix_matched = 23;  // privacy-preserving prefix watch (§7.5)
     SetCursorResult set_cursor_result = 24;  // deterministic re-anchor ack/reject (§7.3.1)
     WatchSetResult set_watch_set_result = 25;  // deterministic atomic-replace ack/reject (§11.2)
+    RescanResult   rescan_result       = 26;  // deterministic historical-rescan ack/reject (§7.6)
+    RescanComplete rescan_complete     = 27;  // terminal marker: rescan range drained (§7.6)
+    BlockTweaks    block_tweaks        = 28;  // BIP 352 per-block tweak data (§7.7)
+    SilentPaymentMatched silent_payment_matched = 29;  // BIP 352 scan-key watch match (§7.7)
   }
 }
 ```
@@ -693,6 +697,89 @@ gap without the client walking blocks itself. (BIP157 P2P still covers bulk
 trustless filter-based sync; this is the server-side push-model equivalent for the
 watch-set path.) SDK: `ResilientWatch::rescan(from, to)` — the ack, matches, and
 `RescanComplete` arrive in-band on `next()`.
+
+### 7.7 Silent-payment (BIP 352) subscriptions
+
+Two consumption modes for BIP 352 silent payments ride on the streaming surface.
+Both require the node's tweak index (`silentpaymentindex=1`). **This section
+documents the wire schema; the live emit, index-backed replay, server-side
+matcher, and SDK helpers land in later changes.** The messages are additive —
+existing subscribers are unaffected, and the schema version does not bump (§4).
+
+**Tier 1 — client-side scan (the recommended, zero-custody mode).** A new
+firehose category streams every block's public tweak data; the client runs the
+one-ECDH-per-transaction scan locally, so the scan key never leaves the device.
+The `tweaks` category is **bit 8**, and unlike the other category bits it is
+**not** part of the `categories = 0` ("all") default — a pre-existing
+`0`-subscriber never begins receiving tweak volume after a node upgrade; a client
+must set bit 8 explicitly. `SubscribeRequest` gains two tweak-only knobs:
+
+```proto
+// SubscribeRequest additions (apply only when the tweaks bit is set):
+//   uint64 tweak_dust_limit = 4;  // drop entries whose max_value is below this floor; 0 = unfiltered
+//   bool   tweaks_only      = 5;  // compact entries: 33-byte tweak alone, no txid/max_value
+
+message BlockTweaks {              // NodeEvent body 28 — one per connected block ≥ taproot activation
+  bytes  block_hash           = 1;
+  uint32 height               = 2;
+  repeated TweakEntry entries = 3; // empty = indexed block with no eligible txs
+  bool   filtered             = 4; // a per-subscription dust limit dropped entries
+}
+message TweakEntry {
+  bytes  tweak     = 1;  // 33-byte compressed public tweak T = input_hash · A (always present)
+  bytes  txid      = 2;  // omitted under tweaks_only
+  uint64 max_value = 3;  // largest eligible output value in sats; omitted under tweaks_only
+}
+```
+
+Tweak data is public chain-derived data (same posture as `getblockfilter`), so it
+serves under the existing `stream:subscribe` capability. Replay for a tweaks-only
+subscription is index-backed point lookups and — because each row embeds the hash
+of the block it describes — is exempt from the `MAX_REPLAY_BLOCKS` clamp (a phone
+cold-syncs from taproot activation in one subscription); a mixed-category
+subscription keeps the clamp. A cursor pointing into a not-yet-backfilled range is
+rejected in-band (`CursorRejected`).
+
+**Tier 2 — scan-key watch (the convenience mode).** A constrained client may
+instead register a scan credential and let the node match server-side, receiving
+push-only wakeups. The scan secret is disclosed to the node so it can run ECDH,
+but it is **not** a spending key — spend authority stays with `B_spend`'s private
+key, which is never sent. Scan secrets are held **in-memory per-connection only**,
+zeroized on drop, and never persisted or logged. Registered on the `Watch` stream:
+
+```proto
+message SilentPaymentTarget {
+  bytes scan_secret      = 1;  // 32-byte b_scan (a watch credential, not a spend key)
+  bytes spend_pubkey     = 2;  // 33-byte compressed B_spend
+  repeated uint32 labels = 3;  // label ints; the server derives label points. Include 0 to catch change.
+}
+message AddSilentPayments    { repeated SilentPaymentTarget targets = 1; }  // SubscribeControl 16
+message RemoveSilentPayments { repeated bytes scan_pubkeys = 1; }           // SubscribeControl 17; id = b_scan·G (33B)
+// SetWatchSet gains: repeated SilentPaymentTarget silent_payments = 9;  (full desired membership)
+
+message SilentPaymentMatched {  // NodeEvent body 29 — one per matched output, on the Watch stream
+  bytes  scan_pubkey   = 1;  // registered target identity (b_scan·G) — never echoes the secret
+  bytes  txid          = 2;
+  uint32 vout          = 3;
+  bytes  output_pubkey = 4;  // 32-byte x-only taproot output key
+  uint64 amount        = 5;  // sats
+  bytes  tweak         = 6;  // 33-byte shared-secret tweak; with k, derives the output key offline
+  uint32 k             = 7;  // BIP 352 output counter for this tx
+  bool   has_label     = 8;
+  uint32 label         = 9;  // valid only when has_label
+  bool   confirmed     = 10; // false on mempool acceptance; re-emitted true on block connect
+  uint32 height        = 11; // block height when confirmed; 0 in the mempool
+  bytes  raw_tx        = 12; // only under SetWatchOptions.include_raw_tx
+}
+```
+
+Each target costs one ECDH per eligible transaction, so it is priced accordingly:
+the per-connection cap is `MAX_SP_TARGETS_PER_CONNECTION = 16`, each target
+charges one watch-quota unit, and registration needs the `stream:watch`
+capability. A target is identified for removal by its scan **pubkey**, which the
+client derives locally. Mempool matches (`confirmed = false`) are re-emitted
+`confirmed = true` on block connect, the same best-effort contract as every other
+mempool watch kind.
 
 ## 8. Reorg events
 
