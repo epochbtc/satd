@@ -133,6 +133,14 @@ recomputes from the block and its undo data with the same kernel the index uses,
 so it needs **no** `silentpaymentindex` and does zero extra work on a block when
 no target is registered.
 
+A fresh wallet cold-syncs its history by registering its scan key and then
+issuing a bounded `RescanBlocks` over the taproot-activation-to-tip window. That
+rescan produces exactly the confirmed matches the live path would; when
+`silentpaymentindex` is enabled and fully synced it also runs faster, reading
+each block's tweaks from the index instead of recomputing them (verified per
+block against the stored row's block hash, falling back to recompute on any
+mismatch). The index only changes rescan speed, never which payments are found.
+
 A match fires in two phases, like the `ScriptMatched` watch. When a paying
 transaction is accepted into the mempool the node emits the match with
 `confirmed = false`; when it later lands in a block it re-emits the same match

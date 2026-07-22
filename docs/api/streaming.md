@@ -697,8 +697,18 @@ Semantics:
    one rescan in flight at a time (a second → `CONCURRENT_RESCAN`), and runs
    independently of any in-flight `SetCursor` re-anchor.
 5. **Off the consensus hot path.** Like replay, the rescan reads blocks (and undo
-   data, only when a script/prefix is watched) the node already holds; it never
-   blocks or backpressures block connection.
+   data, when a script/prefix is watched or a silent-payment scan recomputes) the
+   node already holds; it never blocks or backpressures block connection.
+6. **Index-accelerated for silent payments (D4).** A scan-key rescan normally
+   recomputes each block's tweaks from undo data. When `silentpaymentindex` is
+   enabled and complete, it instead reads the tweaks from the `sp_tweaks` index —
+   skipping the undo read and per-tx tweak math — gated per block on the stored
+   row's embedded `block_hash` matching the block being scanned; a row that is
+   absent, hash-mismatched, or from an incomplete index falls back to recompute
+   for that block. Both paths run the identical kernel, so the fast path changes
+   only speed, never results (an on-vs-off rescan over a reorg-heavy history
+   produces identical matches). The same self-authenticating property that makes
+   the `tweaks` deep-replay exemption safe (§10) underwrites this fast path.
 
 This closes the streaming-watch-set cold-sync / beyond-`MAX_REPLAY_BLOCKS` recovery
 gap without the client walking blocks itself. (BIP157 P2P still covers bulk
@@ -709,11 +719,13 @@ watch-set path.) SDK: `ResilientWatch::rescan(from, to)` — the ack, matches, a
 ### 7.7 Silent-payment (BIP 352) subscriptions
 
 Two consumption modes for BIP 352 silent payments ride on the streaming surface.
-Both require the node's tweak index (`silentpaymentindex=1`). **Tier 1
-(client-side scan) is live: the node emits `BlockTweaks` per connected block and
-replays them by index on `from_cursor` resume. The Tier 2 server-side matcher
-and the typed SDK helpers land in later changes.** The messages are additive —
-existing subscribers are unaffected, and the schema version does not bump (§4).
+**Tier 1 (client-side scan) is live: the node emits `BlockTweaks` per connected
+block and replays them by index on `from_cursor` resume, and requires the node's
+tweak index (`silentpaymentindex=1`). Tier 2 (server-side scan-key matching) is
+live for both confirmed and mempool payments and works with the index off
+(recompute); a complete index only accelerates its rescan cold-sync. The typed
+SDK helpers land in a later change.** The messages are additive — existing
+subscribers are unaffected, and the schema version does not bump (§4).
 
 **Tier 1 — client-side scan (the recommended, zero-custody mode).** A new
 firehose category streams every block's public tweak data; the client runs the
