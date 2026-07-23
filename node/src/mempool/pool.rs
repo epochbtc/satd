@@ -11,6 +11,7 @@ use crate::mempool::policy_engine::{self, PolicyCtx};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
+use node_sp_index::{compute_tweak, TweakEntry};
 
 /// Capacity of the broadcast channel for `subscribemempool`. Large
 /// enough to absorb short bursts; a subscriber that lags past this
@@ -196,12 +197,23 @@ pub struct MempoolEntry {
     /// when retained.
     pub prev_amounts: Vec<u64>,
     /// Spent prevout `scriptPubKey`s, one per input in input order, parallel to
-    /// `prev_scripthashes`. Populated when `streamprevoutmeta` is `full` **or**
-    /// while a silent-payment scan-key watch is live (D7 — the unconfirmed SP
-    /// matcher classifies eligible inputs from these); empty otherwise. Lets a
-    /// chainstate-less client confirm a mempool prefix spend without resolving
-    /// the outpoint. Variable size + one heap allocation/input when retained.
+    /// `prev_scripthashes`. Populated only when `streamprevoutmeta` is `full`;
+    /// empty otherwise. Lets a chainstate-less client confirm a mempool prefix
+    /// spend without resolving the outpoint. Variable size + one heap
+    /// allocation/input when retained. (Silent-payment matching no longer drives
+    /// this retention — it reads the cached `sp_tweak` instead; see below.)
     pub prev_scripts: Vec<ScriptBuf>,
+    /// Cached BIP 352 public tweak `T = input_hash · A` for this transaction,
+    /// computed once at admission from the resolved prevout `scriptPubKey`s
+    /// while a silent-payment scan-key watch was live (`sp_gate_hot`). `Some`
+    /// only for an SP-eligible tx admitted while the gate was hot; `None`
+    /// otherwise — gate cold, or the tx carries no silent payment (coinbase, no
+    /// taproot output, no eligible input, …). The unconfirmed SP matcher reads
+    /// this directly instead of recomputing from retained prevout scripts, so a
+    /// hot SP watch keeps only ~73 bytes here rather than the full per-input
+    /// script vector. Byte-identical by construction to the `sp_tweaks` index
+    /// row the same tx yields at confirmation (shared `compute_tweak` kernel).
+    pub sp_tweak: Option<TweakEntry>,
     /// How this transaction reached the node. Recorded at admission for the
     /// transaction-policy engine (`tx.source`); unused until PR 4c.
     pub source: TxSource,
@@ -2059,22 +2071,30 @@ impl Mempool {
         } else {
             Vec::new()
         };
-        // Retain full prevout scripts when the operator asked for them
-        // (`streamprevoutmeta=full`) OR while a silent-payment scan-key watch is
-        // live (D7): the unconfirmed SP matcher needs the resolved prevout
-        // `scriptPubKey`s — in hand here, including in-mempool parents — to
-        // classify eligible inputs and compute the tweak, and they cannot be
-        // reconstructed off the hot path. Gate-cold (no SP watch, tier < full)
-        // this is empty exactly as before, so the event payload is byte-identical
-        // to a node without silent payments.
-        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() || self.sp_gate_hot()
-        {
+        // Retain full prevout scripts only when the operator asked for them
+        // (`streamprevoutmeta=full`); gate-cold this is empty, so the event
+        // payload is byte-identical to a node without silent payments.
+        let prev_scripts: Vec<ScriptBuf> = if cfg.prevout_meta.retains_script() {
             prev_outputs
                 .iter()
                 .map(|o| o.script_pubkey.clone())
                 .collect()
         } else {
             Vec::new()
+        };
+        // Silent-payment tweak (D7): while an SP scan-key watch is live, compute
+        // the BIP 352 public tweak `T = input_hash · A` once here — the resolved
+        // prevout `scriptPubKey`s (including in-mempool parents) are in hand and
+        // cannot be reconstructed off the hot path. The ~73-byte result is cached
+        // on the entry so the unconfirmed matcher never recomputes it and no
+        // per-input script vector is retained for SP alone. Gate-cold this is
+        // `None` with no EC work, so a node without silent payments is unchanged.
+        let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() {
+            let spks: Vec<ScriptBuf> =
+                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
+            compute_tweak(&tx, &spks)
+        } else {
+            None
         };
 
         let entry_weight_u64 = weight as u64;
@@ -2092,6 +2112,7 @@ impl Mempool {
                 prev_scripthashes,
                 prev_amounts,
                 prev_scripts,
+                sp_tweak,
                 source,
                 scope,
                 quarantine_rule: quarantine_rule.clone(),
@@ -3037,6 +3058,7 @@ impl Mempool {
                 quarantine_rule: None,
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
             },
         );
     }
@@ -3071,6 +3093,7 @@ impl Mempool {
                 quarantine_rule: None,
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
             },
         );
         inner.unbroadcast.entry(txid).or_default();
@@ -3113,6 +3136,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
                 source: TxSource::Rpc,
                 scope,
                 quarantine_rule: None,
@@ -3147,6 +3171,7 @@ impl Mempool {
                 prev_scripthashes: Vec::new(),
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
                 source: TxSource::Rpc,
                 scope,
                 quarantine_rule: None,
@@ -3261,6 +3286,7 @@ mod tests {
                 quarantine_rule: None,
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
             },
         );
         inner.total_bytes = low_size;
@@ -3809,6 +3835,7 @@ mod tests {
                     quarantine_rule: None,
                     prev_amounts: Vec::new(),
                     prev_scripts: Vec::new(),
+                    sp_tweak: None,
                 },
             );
         }
@@ -3940,6 +3967,7 @@ mod tests {
                     quarantine_rule: None,
                     prev_amounts: Vec::new(),
                     prev_scripts: Vec::new(),
+                    sp_tweak: None,
                 },
             );
             for input in &child_tx.input {
@@ -3961,6 +3989,7 @@ mod tests {
                     quarantine_rule: None,
                     prev_amounts: Vec::new(),
                     prev_scripts: Vec::new(),
+                    sp_tweak: None,
                 },
             );
         }
@@ -4058,6 +4087,7 @@ mod tests {
                     quarantine_rule: None,
                     prev_amounts: Vec::new(),
                     prev_scripts: Vec::new(),
+                    sp_tweak: None,
                 },
             );
         }
@@ -4159,6 +4189,7 @@ mod tests {
                         prev_scripthashes: Vec::new(),
                         prev_amounts: Vec::new(),
                         prev_scripts: Vec::new(),
+                        sp_tweak: None,
                         source: TxSource::P2p,
                         scope: QuarantineScope::acting(),
                         quarantine_rule: None,
@@ -4220,25 +4251,33 @@ mod tests {
     }
 
     #[test]
-    fn mempool_sp_gate_forces_prevout_script_retention() {
-        // D7: while the shared silent-payment gate is hot, admission retains full
-        // prevout scripts even at the `Hash` tier (which alone keeps none), so the
-        // unconfirmed SP matcher can classify inputs. Gate cold ⇒ byte-identical
-        // to today (no scripts at Hash). Same CPFP admission harness as
-        // `mempool_entry_retains_prevout_meta_by_level`.
+    fn mempool_sp_gate_caches_tweak_not_scripts() {
+        // D7 (revised): while the shared silent-payment gate is hot, admission
+        // computes and caches the BIP 352 tweak on the entry (`sp_tweak`) rather
+        // than retaining the full prevout scripts. At the `Hash` tier no scripts
+        // are ever retained now (gate hot or cold); the cached tweak is
+        // byte-identical to a fresh `compute_tweak` over the same tx + prevout
+        // script, and `None` when the gate is cold. Same CPFP admission harness
+        // as `mempool_entry_retains_prevout_meta_by_level`, but with an
+        // SP-eligible child: a taproot key-path spend into a taproot output.
         use bitcoin::blockdata::locktime::absolute::LockTime;
         use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
 
-        let prevout_spk = {
-            let mut b = vec![0x00, 0x14];
-            b.extend_from_slice(&[0xcd; 20]);
+        // A real P2TR scriptPubKey (0x51 0x20 <x-only>) so the input contributes
+        // a liftable pubkey and the output is a taproot sink.
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x0a; 32]).unwrap();
+        let (xonly, _) = sk.x_only_public_key(&secp);
+        let p2tr_spk = {
+            let mut b = vec![0x51, 0x20];
+            b.extend_from_slice(&xonly.serialize());
             ScriptBuf::from(b)
         };
         const PREVOUT_VALUE: u64 = 10_000;
 
-        // [(gate hot?, expect scripts retained?)]
-        for (hot, expect_scripts) in [(false, false), (true, true)] {
+        for hot in [false, true] {
             let (cs, _mp, dir) = make_test_env();
             let mp = Mempool::with_config(MempoolConfig {
                 max_size_bytes: 1_000_000,
@@ -4267,7 +4306,7 @@ mod tests {
                 }],
                 output: vec![TxOut {
                     value: Amount::from_sat(PREVOUT_VALUE),
-                    script_pubkey: prevout_spk.clone(),
+                    script_pubkey: p2tr_spk.clone(),
                 }],
             };
             let parent_txid = parent_tx.compute_txid();
@@ -4286,6 +4325,7 @@ mod tests {
                         prev_scripthashes: Vec::new(),
                         prev_amounts: Vec::new(),
                         prev_scripts: Vec::new(),
+                        sp_tweak: None,
                         source: TxSource::P2p,
                         scope: QuarantineScope::acting(),
                         quarantine_rule: None,
@@ -4293,6 +4333,8 @@ mod tests {
                 );
             }
 
+            // Key-path spend: a single (dummy) witness element makes the input a
+            // key-path taproot spend, so it contributes the prevout's x-only key.
             let child_tx = Transaction {
                 version: transaction::Version(2),
                 lock_time: LockTime::ZERO,
@@ -4303,32 +4345,40 @@ mod tests {
                     },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    witness: {
+                        let mut w = Witness::new();
+                        w.push(vec![0u8; 64]);
+                        w
+                    },
                 }],
                 output: vec![TxOut {
                     value: Amount::from_sat(9_000),
-                    script_pubkey: prevout_spk.clone(),
+                    script_pubkey: p2tr_spk.clone(),
                 }],
             };
             let child_txid = child_tx.compute_txid();
+            let expected = compute_tweak(&child_tx, std::slice::from_ref(&p2tr_spk))
+                .expect("eligible child yields a tweak");
             mp.accept_transaction(child_tx, &cs, &NoopVerifier, TxSource::P2p, false)
                 .expect("child admits via CPFP");
             let entry = mp.get(&child_txid).expect("child in mempool");
 
-            if expect_scripts {
+            // Scripts are never retained at the Hash tier now, regardless of gate.
+            assert!(
+                entry.prev_scripts.is_empty(),
+                "SP gate no longer forces prevout-script retention",
+            );
+            if hot {
                 assert_eq!(
-                    entry.prev_scripts,
-                    vec![prevout_spk.clone()],
-                    "gate hot ⇒ full prevout script retained even at Hash tier",
+                    entry.sp_tweak.as_ref(),
+                    Some(&expected),
+                    "gate hot ⇒ tweak cached, byte-identical to compute_tweak",
                 );
             } else {
-                assert!(
-                    entry.prev_scripts.is_empty(),
-                    "gate cold ⇒ no scripts (byte-identical to today)",
-                );
+                assert!(entry.sp_tweak.is_none(), "gate cold ⇒ no tweak computed");
             }
             // Scripthash retention is unchanged by the gate.
-            assert_eq!(entry.prev_scripthashes, vec![scripthash_of(&prevout_spk)]);
+            assert_eq!(entry.prev_scripthashes, vec![scripthash_of(&p2tr_spk)]);
 
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4526,6 +4576,7 @@ mod tests {
                     prev_scripthashes: Vec::new(),
                     prev_amounts: Vec::new(),
                     prev_scripts: Vec::new(),
+                    sp_tweak: None,
                     source: TxSource::Rpc,
                     scope,
                     quarantine_rule: None,
@@ -5963,6 +6014,7 @@ mod tests {
                 quarantine_rule: None,
                 prev_amounts: Vec::new(),
                 prev_scripts: Vec::new(),
+                sp_tweak: None,
             },
         );
         txid
