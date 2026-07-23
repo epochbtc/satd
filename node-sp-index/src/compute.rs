@@ -223,7 +223,11 @@ pub fn eligible_inputs(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Vec<Publ
 /// taproot output (fact 1a — it can carry no silent payment). A p2tr
 /// `scriptPubKey` is exactly `OP_1 OP_PUSHBYTES_32 <32-byte key>` (34 bytes), so
 /// the x-only key is the trailing 32 bytes.
-fn taproot_outputs(tx: &Transaction) -> Vec<TaprootOutput> {
+///
+/// Public so the streaming carrier can re-derive a confirmed transaction's
+/// outputs from the block when a `tweak_outputs` subscriber opts into them (the
+/// lean on-chain index does not persist them).
+pub fn taproot_outputs(tx: &Transaction) -> Vec<TaprootOutput> {
     tx.output
         .iter()
         .enumerate()

@@ -148,6 +148,7 @@ impl GrpcStreamClient {
                 tweak_dust_limit: None,
                 tweaks_only: None,
                 mempool_tweaks: None,
+                tweak_outputs: None,
                 from_cursor,
             })
             .await
@@ -170,6 +171,7 @@ impl GrpcStreamClient {
                 tweak_dust_limit: None,
                 tweaks_only: None,
                 mempool_tweaks: None,
+                tweak_outputs: None,
                 from_cursor: None,
             })
             .await?;

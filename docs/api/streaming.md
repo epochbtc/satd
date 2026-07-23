@@ -742,6 +742,7 @@ must set bit 8 explicitly. `SubscribeRequest` gains two tweak-only knobs:
 //   uint64 tweak_dust_limit = 4;  // drop entries whose max_value is below this floor; 0 = unfiltered
 //   bool   tweaks_only      = 5;  // compact entries: 33-byte tweak alone, no txid/max_value (BlockTweaks only)
 //   bool   mempool_tweaks   = 6;  // also stream MempoolTweak at admission (Tier 1.5); default off
+//   bool   tweak_outputs    = 7;  // include taproot_outputs on BlockTweaks entries; default off (MempoolTweak always has them)
 
 message BlockTweaks {              // NodeEvent body 28 — one per connected block ≥ taproot activation
   bytes  block_hash           = 1;
@@ -791,6 +792,21 @@ serves under the existing `stream:subscribe` capability.
   floor and sets `filtered = true`; `tweaks_only` strips `txid`/`max_value`,
   leaving the 33-byte tweak alone. Both apply per subscription, on live and
   replayed events alike.
+- **Outputs (`tweak_outputs`).** Off by default the confirmed firehose is lean —
+  a `BlockTweaks` `TweakEntry` carries no `taproot_outputs`, and a client that
+  wants to confirm a candidate fetches the block (which it holds or can request).
+  Set `tweak_outputs = true` and the server re-derives each entry's taproot
+  outputs from the block and includes them, so the match is confirmed in-band.
+  It is a **modifier on the `tweaks` category** — refused with `INVALID_ARGUMENT`
+  without bit 8, and with `FAILED_PRECONDITION` on a node with no block source.
+  Outputs are re-derived at serve time (the on-disk index stores none, so there
+  is no size increase and no reindex), which means a `from_cursor` cold-sync with
+  `tweak_outputs` reads each block — heavier than a lean cold-sync, and the reason
+  it is opt-in. The read is paced by the client's consumption (demand-driven
+  streams with backpressure), so it cannot be used to make the node read faster
+  than the client consumes. `tweaks_only` and `tweak_outputs` compose: the former
+  strips `txid`/`max_value`, the latter still adds the outputs the subscriber
+  asked for. Unaffected on `MempoolTweak`, which carries its outputs regardless.
 - **In-band rejects.** A `tweaks` subscription against a node with
   `silentpaymentindex=0` is refused with `FAILED_PRECONDITION`; a `from_cursor`
   (replay) request while the index is still backfilling is likewise refused,

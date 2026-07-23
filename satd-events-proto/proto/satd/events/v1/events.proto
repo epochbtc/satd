@@ -523,6 +523,18 @@ message SubscribeRequest {
   // `from_cursor` resume never yields one (missed admissions surface at
   // confirmation via BlockTweaks). `tweak_dust_limit` applies.
   optional bool mempool_tweaks = 6;
+
+  // Include the transaction's taproot outputs on each BlockTweaks TweakEntry
+  // (`taproot_outputs`), so a client confirms a derived output key against the
+  // actual on-chain output without fetching the block. Default false keeps the
+  // confirmed firehose lean (the block is the fallback). A MempoolTweak carries
+  // its outputs regardless of this flag (there is no block to fall back to).
+  // A modifier on the `tweaks` category: setting it without bit 8 is rejected
+  // in-band (invalid_argument); a node with no block source rejects it
+  // (failed_precondition). The server re-derives the outputs from the block at
+  // serve time — the on-disk index does not store them — so a cold-sync with
+  // this set reads each block (heavier than a lean cold-sync).
+  optional bool tweak_outputs = 7;
 }
 
 // Durable resume position. Confirmed-side cursors are `(height,
