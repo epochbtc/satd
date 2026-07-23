@@ -1056,10 +1056,21 @@ async fn main() {
         } else {
             None
         };
+    // Mempool-tweak firehose source (Tier 1.5): the mempool serves the tweak it
+    // cached at each admission, keyed by txid. Always wired — emission is gated
+    // by the `mempool_tweaks` subscriber count, which only rises for an accepted
+    // `tweaks`-category subscription (itself rejected in-band without the index).
+    let mempool_tweak_source: Option<std::sync::Arc<dyn node::events::MempoolTweakSource>> =
+        Some(mempool.clone() as std::sync::Arc<dyn node::events::MempoolTweakSource>);
+    // Share the publisher's `mempool_tweaks` subscriber count with the mempool as
+    // its second admission gate, so a firehose subscriber's presence is what
+    // makes admission compute the cached tweak (even with no Tier-2 SP watch).
+    mempool.set_mempool_tweaks_gate(event_publisher.mempool_tweaks_gate());
     event_publisher.spawn_bridges_with_sp(
         events_bus_mempool_rx,
         events_bus_chain_rx,
         sp_tweak_source.clone(),
+        mempool_tweak_source,
         shutdown_rx.clone(),
     );
     event_publisher.spawn_heartbeat(

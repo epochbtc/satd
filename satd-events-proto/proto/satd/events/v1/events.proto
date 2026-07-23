@@ -428,6 +428,25 @@ message TweakEntry {
   uint64 max_value = 3;  // largest eligible output value (sats); omitted under tweaks_only
 }
 
+// A single accepted-but-unconfirmed transaction's BIP 352 tweak, streamed at
+// mempool admission ("Tier 1.5", §3.5) to Subscribe consumers that requested
+// the `tweaks` category (bit 8) AND set `mempool_tweaks = true`. This completes
+// the zero-custody story: mempool-latency silent-payment detection without
+// uploading a scan key. Ephemeral and best-effort, like the mempool itself:
+//   - Emitted at admission and on re-admission after a block disconnect.
+//   - No retraction on RBF/eviction — a replacement emits its own tweak; the
+//     `tweaks`-category BlockTweaks at connect is the authoritative confirmed
+//     record. Clients dedup by txid (`entry.txid`, always present here).
+//   - NOT replayable: excluded from the durable cursor and the replay ring. A
+//     client that reconnects and missed admissions catches those payments at
+//     confirmation via BlockTweaks.
+// The `entry.txid` is always populated (never omitted) — `tweaks_only` compact
+// mode does not apply to mempool tweaks, since the txid is required for the
+// confirm-time dedup. The `tweak_dust_limit` filter still applies.
+message MempoolTweak {
+  TweakEntry entry = 1;  // same shape as a BlockTweaks entry; txid internal order
+}
+
 // Filter knobs for a subscription. All optional; an unset field means
 // "no filter" (the server applies its own defaults).
 message SubscribeRequest {
@@ -472,8 +491,19 @@ message SubscribeRequest {
   optional uint64 tweak_dust_limit = 4;
   // Compact mode: when true, TweakEntry carries the 33-byte tweak alone (txid
   // and max_value omitted) — the minimal payload a client-side ECDH scan needs.
-  // False (default) = full entries.
+  // False (default) = full entries. Applies to BlockTweaks only; MempoolTweak
+  // always carries the full entry (its txid is needed for confirm-time dedup).
   optional bool tweaks_only = 5;
+
+  // Mempool-time tweak emission ("Tier 1.5", §3.5). When true, the server also
+  // streams a MempoolTweak at each SP-eligible transaction's admission, giving
+  // zero-custody clients mempool-latency detection. A modifier on the `tweaks`
+  // category: setting it without bit 8 is rejected in-band (invalid_argument).
+  // False (default) = block-tweaks only, so a cold-syncing wallet never receives
+  // mempool volume. Ephemeral/best-effort: MempoolTweak is not replayable, so a
+  // `from_cursor` resume never yields one (missed admissions surface at
+  // confirmation via BlockTweaks). `tweak_dust_limit` applies.
+  optional bool mempool_tweaks = 6;
 }
 
 // Durable resume position. Confirmed-side cursors are `(height,
@@ -767,5 +797,6 @@ message NodeEvent {
     RescanComplete rescan_complete = 27; // terminal marker: rescan range fully drained
     BlockTweaks block_tweaks = 28; // BIP 352 per-block tweak data (Subscribe `tweaks` category, §3.5)
     SilentPaymentMatched silent_payment_matched = 29; // BIP 352 scan-key watch match (Watch stream, §4)
+    MempoolTweak mempool_tweak = 30; // BIP 352 mempool-time tweak (Subscribe `tweaks` + mempool_tweaks, §3.5)
   }
 }

@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use node_sp_index::SpIndex;
+use bitcoin::Txid;
+use node_sp_index::{SpIndex, TweakEntry};
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
@@ -22,7 +23,19 @@ use tracing::{debug, info, warn};
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
 
-use super::envelope::{BlockTweaks, Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody};
+use super::envelope::{
+    BlockTweaks, Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody, SpTweakEntry,
+};
+
+/// Read handle for the mempool's admission-cached silent-payment tweaks, keyed
+/// by txid. Implemented by [`crate::mempool::pool::Mempool`]; the mempool bridge
+/// consults it on each `Enter` when a `mempool_tweaks` subscriber is listening,
+/// mirroring how the chain bridge reads [`SpIndex`] for confirmed `BlockTweaks`.
+/// Returns `None` when the entry is gone (raced eviction/RBF) or was admitted
+/// while the tweak gate was cold — both benign, best-effort skips.
+pub trait MempoolTweakSource: Send + Sync {
+    fn cached_tweak(&self, txid: &Txid) -> Option<TweakEntry>;
+}
 use super::sink::EventSink;
 
 /// Capacity of the envelope broadcast channel. Sized 4× the existing
@@ -87,6 +100,14 @@ pub struct EventPublisher {
     /// enabled but no tweak subscribers pays nothing on the bus. Carriers
     /// hold a [`TweakSubscriberGuard`] for a tweak subscription's lifetime.
     tweak_subscribers: Arc<AtomicUsize>,
+    /// Live count of subscribers that additionally requested `mempool_tweaks`
+    /// (Tier 1.5). The mempool bridge only looks up an admitted tx's cached
+    /// tweak and emits a `MempoolTweak` when this is non-zero. Shared with the
+    /// mempool's second admission gate (via [`Self::mempool_tweaks_gate`]) so a
+    /// firehose subscriber's presence is what makes admission compute the tweak.
+    /// Carriers hold a [`MempoolTweakSubscriberGuard`] for the subscription's
+    /// lifetime.
+    mempool_tweak_subscribers: Arc<AtomicUsize>,
 }
 
 /// RAII counter for an active `tweaks`-category subscription. Increments the
@@ -97,6 +118,19 @@ pub struct TweakSubscriberGuard {
 }
 
 impl Drop for TweakSubscriberGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII counter for an active `mempool_tweaks` subscription. Raises the
+/// publisher's mempool-tweak-subscriber count (which doubles as the mempool's
+/// second admission gate) for as long as it is held.
+pub struct MempoolTweakSubscriberGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for MempoolTweakSubscriberGuard {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::Relaxed);
     }
@@ -118,6 +152,7 @@ impl EventPublisher {
             replay_ring: Mutex::new(VecDeque::with_capacity(replay_ring_cap)),
             replay_ring_cap,
             tweak_subscribers: Arc::new(AtomicUsize::new(0)),
+            mempool_tweak_subscribers: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -135,6 +170,30 @@ impl EventPublisher {
     /// Whether any `tweaks`-category subscriber is currently attached.
     pub fn has_tweak_subscribers(&self) -> bool {
         self.tweak_subscribers.load(Ordering::Relaxed) > 0
+    }
+
+    /// Register an active `mempool_tweaks` subscription. The returned guard keeps
+    /// the mempool-tweak-subscriber count raised until dropped; while any guard
+    /// is live and a mempool tweak source is wired, the mempool bridge emits a
+    /// `MempoolTweak` at each SP-eligible admission.
+    pub fn mempool_tweak_subscriber_guard(&self) -> MempoolTweakSubscriberGuard {
+        self.mempool_tweak_subscribers.fetch_add(1, Ordering::Relaxed);
+        MempoolTweakSubscriberGuard {
+            count: self.mempool_tweak_subscribers.clone(),
+        }
+    }
+
+    /// Whether any `mempool_tweaks` subscriber is currently attached.
+    pub fn has_mempool_tweak_subscribers(&self) -> bool {
+        self.mempool_tweak_subscribers.load(Ordering::Relaxed) > 0
+    }
+
+    /// The mempool-tweak-subscriber counter, shared with the mempool as its
+    /// second admission gate (`Mempool::set_mempool_tweaks_gate`). While it reads
+    /// `> 0`, admission computes and caches the tweak even with no Tier-2 SP
+    /// scan-key watch live, so the firehose has something to emit.
+    pub fn mempool_tweaks_gate(&self) -> Arc<AtomicUsize> {
+        self.mempool_tweak_subscribers.clone()
     }
 
     /// Subscribe to the envelope stream. Each call returns a fresh
@@ -223,8 +282,13 @@ impl EventPublisher {
         // `BlockTweaks` is deliberately excluded: it is replayed from the
         // durable index by height (never from this ring), and a busy chain's
         // tweak volume would otherwise evict the mempool transitions the ring
-        // exists to retain.
-        if !matches!(env.body, NodeEventBody::BlockTweaks(_)) {
+        // exists to retain. `MempoolTweak` is excluded too: it is ephemeral and
+        // best-effort (no durable cursor), so it is never replayed — a client
+        // that missed an admission catches the payment at confirmation.
+        if !matches!(
+            env.body,
+            NodeEventBody::BlockTweaks(_) | NodeEventBody::MempoolTweak(_)
+        ) {
             let mut ring = self
                 .replay_ring
                 .lock()
@@ -269,7 +333,7 @@ impl EventPublisher {
         chain_rx: broadcast::Receiver<ChainEvent>,
         shutdown: watch::Receiver<bool>,
     ) {
-        self.spawn_bridges_with_sp(mempool_rx, chain_rx, None, shutdown);
+        self.spawn_bridges_with_sp(mempool_rx, chain_rx, None, None, shutdown);
     }
 
     /// Spawn the bridge tasks: one for the mempool broadcast and one
@@ -287,6 +351,7 @@ impl EventPublisher {
         mempool_rx: broadcast::Receiver<MempoolEvent>,
         chain_rx: broadcast::Receiver<ChainEvent>,
         tweak_source: Option<Arc<dyn SpIndex>>,
+        mempool_tweak_source: Option<Arc<dyn MempoolTweakSource>>,
         shutdown: watch::Receiver<bool>,
     ) {
         // Mempool bridge.
@@ -294,7 +359,7 @@ impl EventPublisher {
             let publisher = self.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                bridge_mempool(publisher, mempool_rx, shutdown).await;
+                bridge_mempool(publisher, mempool_rx, mempool_tweak_source, shutdown).await;
             });
         }
         // Chain bridge.
@@ -348,6 +413,7 @@ impl EventPublisher {
 async fn bridge_mempool(
     publisher: Arc<EventPublisher>,
     mut rx: broadcast::Receiver<MempoolEvent>,
+    mempool_tweak_source: Option<Arc<dyn MempoolTweakSource>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -355,7 +421,28 @@ async fn bridge_mempool(
             biased;
             _ = shutdown.changed() => return,
             res = rx.recv() => match res {
-                Ok(ev) => publisher.publish(NodeEventBody::Mempool(ev)),
+                Ok(ev) => {
+                    // On admission, follow the mempool event with the tx's cached
+                    // public tweak (Tier 1.5) — but only when a `mempool_tweaks`
+                    // subscriber is listening and the source is wired. The txid is
+                    // captured before `ev` moves into `publish`. Symmetric to the
+                    // chain bridge's `BlockTweaks` emit: the source (here the
+                    // mempool) is consulted by key; a `None` means the entry is
+                    // gone (raced eviction/RBF) or was admitted gate-cold — a
+                    // benign, best-effort skip.
+                    let admitted =
+                        matches!(ev, MempoolEvent::Enter { .. }).then(|| *ev.txid());
+                    publisher.publish(NodeEventBody::Mempool(ev));
+                    if let Some(txid) = admitted
+                        && let Some(src) = mempool_tweak_source.as_deref()
+                        && publisher.has_mempool_tweak_subscribers()
+                        && let Some(tweak) = src.cached_tweak(&txid)
+                    {
+                        publisher.publish(NodeEventBody::MempoolTweak(
+                            SpTweakEntry::from_tweak_entry(&tweak),
+                        ));
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "mempool bridge lagged");
                 }
@@ -512,6 +599,34 @@ mod tests {
         }
     }
 
+    /// A `TweakEntry` whose txid matches `enter_event(byte)`, so a fake source
+    /// can answer the bridge's lookup for that admission.
+    fn tweak_entry(byte: u8) -> TweakEntry {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
+        let txid =
+            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]));
+        TweakEntry {
+            txid,
+            tweak: pk,
+            max_taproot_value: bitcoin::Amount::from_sat(50_000),
+        }
+    }
+
+    /// Mempool-tweak source that answers only for `byte`'s txid (mirrors an
+    /// entry that cached a tweak at admission). `None` for anything else.
+    struct FakeTweakSource {
+        byte: u8,
+    }
+    impl MempoolTweakSource for FakeTweakSource {
+        fn cached_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
+            let want =
+                Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([self.byte; 32]));
+            (txid == &want).then(|| tweak_entry(self.byte))
+        }
+    }
+
     #[tokio::test]
     async fn bridge_converts_mempool_event_with_stamp() {
         let publisher = EventPublisher::new(edge(), 16);
@@ -540,6 +655,117 @@ mod tests {
         assert_eq!(envs[0].stamp.seq, 1);
 
         let _ = shutdown_tx.send(true);
+    }
+
+    #[test]
+    fn mempool_tweak_guard_gates_and_shares_counter() {
+        let publisher = EventPublisher::new(edge(), 16);
+        assert!(!publisher.has_mempool_tweak_subscribers());
+        // The gate accessor shares the same atomic the guard raises.
+        let gate = publisher.mempool_tweaks_gate();
+        assert_eq!(gate.load(Ordering::Relaxed), 0);
+        {
+            let _g = publisher.mempool_tweak_subscriber_guard();
+            assert!(publisher.has_mempool_tweak_subscribers());
+            assert_eq!(gate.load(Ordering::Relaxed), 1);
+        }
+        // Dropped guard decrements both views.
+        assert!(!publisher.has_mempool_tweak_subscribers());
+        assert_eq!(gate.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_emits_mempool_tweak_when_subscribed() {
+        let publisher = EventPublisher::new(edge(), 16);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let sink = CaptureSink::new();
+        let received = sink.received.clone();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        // A live mempool_tweaks subscription + a source that has the cached tweak.
+        let _guard = publisher.mempool_tweak_subscriber_guard();
+        let src: Arc<dyn MempoolTweakSource> = Arc::new(FakeTweakSource { byte: 1 });
+        publisher.spawn_bridges_with_sp(
+            mp_tx.subscribe(),
+            ch_tx.subscribe(),
+            None,
+            Some(src),
+            shutdown_rx,
+        );
+        tokio::task::yield_now().await;
+
+        mp_tx.send(enter_event(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let envs = received.lock().clone();
+        // The Enter, then its MempoolTweak (in that order).
+        assert_eq!(envs.len(), 2, "Enter + MempoolTweak");
+        assert!(matches!(
+            envs[0].body,
+            NodeEventBody::Mempool(MempoolEvent::Enter { .. })
+        ));
+        match &envs[1].body {
+            NodeEventBody::MempoolTweak(e) => {
+                assert_eq!(e.max_value, 50_000);
+                assert_eq!(
+                    e.txid,
+                    Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([1; 32]))
+                );
+            }
+            other => panic!("expected MempoolTweak, got {other:?}"),
+        }
+        // Ephemeral: the tweak carries no durable cursor and is not in the
+        // mempool replay window; only the Enter is replayable.
+        assert!(envs[1].cursor.is_none(), "MempoolTweak has no cursor");
+        assert_eq!(
+            publisher.replay_mempool_since(0).len(),
+            1,
+            "replay ring holds the Enter but not the MempoolTweak",
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn bridge_no_mempool_tweak_without_subscriber_or_cache() {
+        // (a) subscriber present but source has no cached tweak → no emit.
+        // (b) source has the tweak but no subscriber → no emit.
+        for (with_sub, byte) in [(true, 9u8), (false, 1u8)] {
+            let publisher = EventPublisher::new(edge(), 16);
+            let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+            let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let sink = CaptureSink::new();
+            let received = sink.received.clone();
+            publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+            let guard = with_sub.then(|| publisher.mempool_tweak_subscriber_guard());
+            // Source only answers for txid byte 1; case (a) sends Enter(1) but
+            // the source is byte 9 (miss), case (b) matches but no subscriber.
+            let src: Arc<dyn MempoolTweakSource> = Arc::new(FakeTweakSource { byte });
+            publisher.spawn_bridges_with_sp(
+                mp_tx.subscribe(),
+                ch_tx.subscribe(),
+                None,
+                Some(src),
+                shutdown_rx,
+            );
+            tokio::task::yield_now().await;
+
+            mp_tx.send(enter_event(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let envs = received.lock().clone();
+            assert_eq!(envs.len(), 1, "only the Enter, no MempoolTweak");
+            assert!(matches!(
+                envs[0].body,
+                NodeEventBody::Mempool(MempoolEvent::Enter { .. })
+            ));
+            drop(guard);
+            let _ = shutdown_tx.send(true);
+        }
     }
 
     #[tokio::test]

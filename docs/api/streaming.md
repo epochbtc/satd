@@ -125,6 +125,7 @@ message NodeEvent {
     RescanComplete rescan_complete     = 27;  // terminal marker: rescan range drained (§7.6)
     BlockTweaks    block_tweaks        = 28;  // BIP 352 per-block tweak data (§7.7)
     SilentPaymentMatched silent_payment_matched = 29;  // BIP 352 scan-key watch match (§7.7)
+    MempoolTweak   mempool_tweak       = 30;  // BIP 352 mempool-time tweak, Tier 1.5 (§7.7)
   }
 }
 ```
@@ -738,7 +739,8 @@ must set bit 8 explicitly. `SubscribeRequest` gains two tweak-only knobs:
 ```proto
 // SubscribeRequest additions (apply only when the tweaks bit is set):
 //   uint64 tweak_dust_limit = 4;  // drop entries whose max_value is below this floor; 0 = unfiltered
-//   bool   tweaks_only      = 5;  // compact entries: 33-byte tweak alone, no txid/max_value
+//   bool   tweaks_only      = 5;  // compact entries: 33-byte tweak alone, no txid/max_value (BlockTweaks only)
+//   bool   mempool_tweaks   = 6;  // also stream MempoolTweak at admission (Tier 1.5); default off
 
 message BlockTweaks {              // NodeEvent body 28 — one per connected block ≥ taproot activation
   bytes  block_hash           = 1;
@@ -750,6 +752,9 @@ message TweakEntry {
   bytes  tweak     = 1;  // 33-byte compressed public tweak T = input_hash · A (always present)
   bytes  txid      = 2;  // omitted under tweaks_only
   uint64 max_value = 3;  // largest eligible output value in sats; omitted under tweaks_only
+}
+message MempoolTweak {             // NodeEvent body 30 — one per SP-eligible admission (Tier 1.5)
+  TweakEntry entry = 1;            // always full: txid required for confirm-time dedup (tweaks_only n/a)
 }
 ```
 
@@ -785,8 +790,35 @@ serves under the existing `stream:subscribe` capability.
   because serving a clamped window would let a light client silently miss
   payments below the backfill frontier.
 
-The **WS/SSE** firehose does not serve the tweaks category in this release; use
-the gRPC `Subscribe` stream (or the JSON-RPC fallback below).
+**Tier 1.5 — mempool-time tweaks (`mempool_tweaks`).** Setting `mempool_tweaks =
+true` alongside the `tweaks` bit additionally streams a **`MempoolTweak`** (body
+30) at each SP-eligible transaction's admission, so a zero-custody client detects
+an incoming payment at mempool latency without uploading a scan key — the same
+latency Tier 2 gets, without the key disclosure. The tweak `T = input_hash · A`
+is public data (no custody reason to confirmation-gate it), computed once at
+admission with the same kernel the index uses, so a mempool tweak and its later
+`BlockTweaks` entry are byte-identical.
+
+- **Modifier, not a category.** `mempool_tweaks` requires the `tweaks` bit;
+  setting it alone is refused with `INVALID_ARGUMENT`. Default `false`, so a
+  cold-syncing wallet that wants only block tweaks never receives mempool volume.
+- **Ephemeral, best-effort** — like the mempool itself. Emitted at admission and
+  on re-admission after a block disconnect. **No retraction** on RBF/eviction: a
+  replacement emits its own tweak (different inputs → different tweak), and
+  `BlockTweaks` at connect remains the authoritative confirmed record. Clients
+  **dedup by txid** (`entry.txid`, always present — `tweaks_only` does not apply).
+- **Not replayable.** `MempoolTweak` carries no durable cursor and is excluded
+  from the replay window, so a `from_cursor` resume never yields one. A client
+  that reconnects and missed an admission catches that payment at confirmation
+  via `BlockTweaks` — no gap, just confirmation-latency for the missed window.
+- **Dust floor.** `tweak_dust_limit` applies: a `MempoolTweak` whose `max_value`
+  is below the floor is dropped (a single-entry event has no `filtered` flag).
+- **Zero cost when unused.** The node computes a mempool tweak only while a
+  `mempool_tweaks` subscriber is attached; otherwise admission does no EC work.
+
+The **WS/SSE** firehose does not serve the tweaks category in this release
+(neither `BlockTweaks` nor `MempoolTweak`); use the gRPC `Subscribe` stream (or
+the JSON-RPC fallback below).
 
 **JSON-RPC fallback.** `getsilentpaymentblockdata "blockhash" ( verbosity
 dust_limit )` serves the same per-block tweak data for scripts, the

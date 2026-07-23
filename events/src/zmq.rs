@@ -305,6 +305,12 @@ async fn publish(
             // full envelope is still available on `nodeevent` for consumers who
             // subscribe to the tweaks category there.
         }
+        NodeEventBody::MempoolTweak(_) => {
+            // Mempool-time tweak (Tier 1.5): like BlockTweaks, no Core-compat ZMQ
+            // topic. It reaches the shared broadcast only while a gRPC
+            // `mempool_tweaks` subscriber is attached, and is still available on
+            // the catch-all `nodeevent` topic — consistent with BlockTweaks.
+        }
     }
     Ok(())
 }

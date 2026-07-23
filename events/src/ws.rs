@@ -435,7 +435,15 @@ async fn sse_firehose(
         let publisher = publisher.clone();
         async move {
             match item {
-                Ok(env) if (env.category_bit() & mask) != 0 && !dedup.is_duplicate(&env) => {
+                // MempoolTweak (Tier 1.5) has no opt-in on the WS/SSE surface, so
+                // it is never delivered here — otherwise a gRPC client opting into
+                // mempool tweaks would leak mempool volume onto every WS tweaks
+                // subscriber via the shared broadcast. WS stays BlockTweaks-only.
+                Ok(env)
+                    if (env.category_bit() & mask) != 0
+                        && !matches!(env.body, NodeEventBody::MempoolTweak(_))
+                        && !dedup.is_duplicate(&env) =>
+                {
                     last_s.store(env.stamp.seq, Ordering::Relaxed);
                     if let Some(c) = &env.cursor {
                         last_h.store(c.height, Ordering::Relaxed);
@@ -618,7 +626,12 @@ async fn ws_conn(
             }
             ev = rx_live.recv() => match ev {
                 Ok(env) => {
+                    // MempoolTweak (Tier 1.5) is gRPC-only: no WS opt-in surface,
+                    // so it is dropped here to avoid leaking mempool volume to WS
+                    // tweaks subscribers via the shared broadcast (see the SSE
+                    // path). WS stays BlockTweaks-only.
                     if (env.category_bit() & category_mask.load(Ordering::Relaxed)) != 0
+                        && !matches!(env.body, NodeEventBody::MempoolTweak(_))
                         && !dedup.is_duplicate(&env)
                     {
                         last_s = env.stamp.seq;
