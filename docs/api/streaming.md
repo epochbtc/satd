@@ -724,9 +724,10 @@ Two consumption modes for BIP 352 silent payments ride on the streaming surface.
 block and replays them by index on `from_cursor` resume, and requires the node's
 tweak index (`silentpaymentindex=1`). Tier 2 (server-side scan-key matching) is
 live for both confirmed and mempool payments and works with the index off
-(recompute); a complete index only accelerates its rescan cold-sync. The typed
-SDK helpers land in a later change.** The messages are additive — existing
-subscribers are unaffected, and the schema version does not bump (§4).
+(recompute); a complete index only accelerates its rescan cold-sync. The Rust
+SDK (`satd-events-client`) exposes both modes with typed events and helpers (see
+below).** The messages are additive — existing subscribers are unaffected, and
+the schema version does not bump (§4).
 
 **Tier 1 — client-side scan (the recommended, zero-custody mode).** A new
 firehose category streams every block's public tweak data; the client runs the
@@ -869,6 +870,17 @@ capability. A target is identified for removal by its scan **pubkey**, which the
 client derives locally. Mempool matches (`confirmed = false`) are re-emitted
 `confirmed = true` on block connect, the same best-effort contract as every other
 mempool watch kind.
+
+**SDK (`satd-events-client`).** Both modes are typed. Tier 1: subscribe with
+`Categories::TWEAKS` (plus `SubscribeOptions::tweak_dust_limit` / `tweaks_only`)
+and consume `Event::BlockTweaks`; the runnable `examples/sp_light_scan.rs` does
+the client-side ECDH with `bitcoin::secp256k1` and never sends the scan key.
+Tier 2: `WatchHandle::add_silent_payments` / `remove_silent_payments` (and the
+`ResilientWatch` / `WatchSetBuilder` equivalents, which re-register scan keys on
+every reconnect — the D3 custody model) register `SilentPaymentTarget`s and
+deliver `Event::SilentPaymentMatched`; `examples/sp_wallet.rs` re-derives each
+match's spending key offline from `tweak` + `k`. The scan-key helpers need the
+crate's default `bitcoin` feature (to derive the removal identity `b_scan·G`).
 
 ## 8. Reorg events
 

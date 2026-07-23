@@ -43,7 +43,9 @@ use std::sync::{Arc, Mutex};
 use satd_events_proto::v1 as pb;
 use satd_events_proto::v1::subscribe_control::Msg;
 
-use crate::client::{validate_prefix, AutoClose, EventStream, StreamClient, WatchHandle};
+use crate::client::{
+    validate_prefix, AutoClose, EventStream, SilentPaymentTarget, StreamClient, WatchHandle,
+};
 use crate::error::StreamError;
 use crate::event::{Cursor, CursorRejectReason, Event};
 use crate::resilience::{Backoff, CursorStore, NoopCursorStore};
@@ -87,6 +89,12 @@ pub(crate) struct WatchSetMirror {
     descriptors: BTreeMap<String, (u32, u32)>,
     /// Script-prefix buckets, as `(bits, prefix)` (validated on insert).
     prefixes: BTreeSet<(u32, Vec<u8>)>,
+    /// BIP 352 scan-key targets, keyed by identity `b_scan·G` (33 bytes) — the
+    /// removal key, and how a same-key re-register (refreshed labels) dedups. The
+    /// value's `Debug` redacts the scan secret. Re-registered across reconnects,
+    /// which is exactly the D3 custody model (the scan key is disclosed anew each
+    /// time — never persisted server-side).
+    silent_payments: BTreeMap<[u8; 33], SilentPaymentTarget>,
     /// The live category filter, if the caller set one.
     categories: Option<u32>,
     /// The raw-tx opt-in (SetWatchOptions), if the caller set one. Replayed on
@@ -156,6 +164,21 @@ impl WatchSetMirror {
     fn remove_prefixes(&mut self, items: &[pb::ScriptPrefix]) {
         for sp in items {
             self.prefixes.remove(&(sp.bits, sp.prefix.clone()));
+        }
+    }
+
+    // Only populated via the `bitcoin`-gated entry points (which derive the
+    // scan_pubkey key); without that feature the SP map simply stays empty.
+    #[cfg(feature = "bitcoin")]
+    fn add_silent_payments(&mut self, entries: &[([u8; 33], SilentPaymentTarget)]) {
+        for (scan_pubkey, target) in entries {
+            self.silent_payments.insert(*scan_pubkey, target.clone());
+        }
+    }
+
+    fn remove_silent_payments(&mut self, scan_pubkeys: &[[u8; 33]]) {
+        for k in scan_pubkeys {
+            self.silent_payments.remove(k);
         }
     }
 
@@ -261,6 +284,11 @@ impl WatchSetMirror {
             out.push(Msg::AddScriptPrefixes(pb::AddScriptPrefixes { prefixes }));
         }
 
+        if !self.silent_payments.is_empty() {
+            let targets = self.silent_payments.values().map(|t| t.to_proto()).collect();
+            out.push(Msg::AddSilentPayments(pb::AddSilentPayments { targets }));
+        }
+
         out
     }
 
@@ -271,6 +299,9 @@ impl WatchSetMirror {
     /// message: the server reconciles it under its lock by effective coverage, so
     /// there is no client-computed Add*/Remove* ordering to strand coverage or
     /// over-charge at quota.
+    // `..Default::default()` (below) is redundant against the current workspace
+    // proto but retained for forward-compat if the schema grows fields.
+    #[allow(clippy::needless_update)]
     fn to_set_watch_set(&self) -> pb::SetWatchSet {
         let scripthashes: Vec<Vec<u8>> = self.scripts.keys().map(|h| h.to_vec()).collect();
         let min_values = if self.scripts.values().any(Option::is_some) {
@@ -317,11 +348,11 @@ impl WatchSetMirror {
                 .iter()
                 .map(|(t, d)| pb::WatchDepthAlarm { txid: t.to_vec(), depth: *d })
                 .collect(),
+            silent_payments: self.silent_payments.values().map(|t| t.to_proto()).collect(),
             // `..Default::default()` for the same reason as SubscribeRequest in
             // client.rs: this published crate must compile against both the pinned
-            // released proto and the newer in-workspace schema. Fields added later
-            // (e.g. the BIP 352 `silent_payments` targets) default to empty here;
-            // ResilientWatch begins tracking SP targets in its net set in PR 8.
+            // released proto and the newer in-workspace schema — any field a
+            // still-newer proto adds defaults to empty here without being named.
             ..Default::default()
         }
     }
@@ -523,6 +554,39 @@ impl WatchSetMirror {
             }
         }
 
+        // Silent-payment scan-key targets, keyed by identity `b_scan·G`. New key,
+        // or same key with changed labels/spend key → AddSilentPayments (the
+        // server refreshes labels on re-register); vanished key → Remove.
+        {
+            let mut changed: Vec<pb::SilentPaymentTarget> = Vec::new();
+            for (id, t) in &target.silent_payments {
+                match self.silent_payments.get(id) {
+                    Some(cur)
+                        if cur.labels == t.labels && cur.spend_pubkey == t.spend_pubkey =>
+                    {
+                        c.unchanged += 1;
+                    }
+                    _ => changed.push(t.to_proto()),
+                }
+            }
+            let gone: Vec<Vec<u8>> = self
+                .silent_payments
+                .keys()
+                .filter(|id| !target.silent_payments.contains_key(*id))
+                .map(|id| id.to_vec())
+                .collect();
+            if !changed.is_empty() {
+                c.added += changed.len();
+                adds.push(Msg::AddSilentPayments(pb::AddSilentPayments { targets: changed }));
+            }
+            if !gone.is_empty() {
+                c.removed += gone.len();
+                removes.push(Msg::RemoveSilentPayments(pb::RemoveSilentPayments {
+                    scan_pubkeys: gone,
+                }));
+            }
+        }
+
         // Order: category filter, then **Remove* before Add***. A removal frees
         // its quota unit, so a reload that swaps N watches for N disjoint ones
         // fits even when the tenant is exactly at quota. The opposite order
@@ -640,6 +704,24 @@ impl WatchSetBuilder {
             return Ok(());
         }
         self.with(|m| m.add_prefixes(&validated));
+        Ok(())
+    }
+
+    /// Declare BIP 352 scan-key watch targets. Each target's identity `b_scan·G`
+    /// is derived once (hence the `bitcoin` feature and the fallible return) and
+    /// recorded so it re-registers on every reconnect — the D3 custody model.
+    /// See [`ResilientWatch::add_silent_payments`].
+    #[cfg(feature = "bitcoin")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
+    pub fn add_silent_payments(
+        &self,
+        targets: impl IntoIterator<Item = SilentPaymentTarget>,
+    ) -> Result<(), StreamError> {
+        let entries = sp_mirror_entries(targets)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.with(|m| m.add_silent_payments(&entries));
         Ok(())
     }
 
@@ -1128,6 +1210,79 @@ impl ResilientWatch {
                 h.send_control(pb::SubscribeControl {
                     msg: Some(Msg::RemoveScriptPrefixes(pb::RemoveScriptPrefixes {
                         prefixes: validated,
+                    })),
+                })
+                .await,
+            ),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
+    /// Register BIP 352 scan-key watch targets (Tier 2). Recorded in the mirror
+    /// and **re-registered on every reconnect** — the scan key is disclosed anew
+    /// each time and never persisted server-side, which is exactly the intended
+    /// custody model. Matches arrive as
+    /// [`Event::SilentPaymentMatched`](crate::Event::SilentPaymentMatched).
+    /// Requires the `bitcoin` feature (default) to derive each target's identity.
+    /// See [`WatchHandle::add_silent_payments`].
+    #[cfg(feature = "bitcoin")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "bitcoin")))]
+    pub async fn add_silent_payments(
+        &mut self,
+        targets: impl IntoIterator<Item = SilentPaymentTarget>,
+    ) -> Result<(), StreamError> {
+        let entries = sp_mirror_entries(targets)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Mirror the server's per-connection target cap. Count only NET-NEW
+        // identities (re-asserting a held identity to refresh its labels is free,
+        // exactly as the carrier reconciles); reject an add that would exceed the
+        // cap instead of letting the server silently shed it — which the mirror
+        // would otherwise record and replay on every reconnect, forever.
+        let held = self.mirror.silent_payments.len();
+        let net_new = entries
+            .iter()
+            .filter(|(id, _)| !self.mirror.silent_payments.contains_key(id))
+            .count();
+        if held + net_new > crate::client::MAX_SP_TARGETS_PER_CONNECTION {
+            return Err(StreamError::InvalidArgument(format!(
+                "silent-payment target cap exceeded: {held} held + {net_new} new > {}",
+                crate::client::MAX_SP_TARGETS_PER_CONNECTION
+            )));
+        }
+        self.mirror.add_silent_payments(&entries);
+        let targets: Vec<pb::SilentPaymentTarget> =
+            entries.iter().map(|(_, t)| t.to_proto()).collect();
+        let res = match &self.handle {
+            Some(h) => Some(
+                h.send_control(pb::SubscribeControl {
+                    msg: Some(Msg::AddSilentPayments(pb::AddSilentPayments { targets })),
+                })
+                .await,
+            ),
+            None => None,
+        };
+        self.after_send(res)
+    }
+
+    /// Remove scan-key watch targets by their identity `b_scan·G` (33 bytes),
+    /// releasing quota. See [`WatchHandle::remove_silent_payments`].
+    pub async fn remove_silent_payments(
+        &mut self,
+        scan_pubkeys: impl IntoIterator<Item = [u8; 33]>,
+    ) -> Result<(), StreamError> {
+        let scan_pubkeys: Vec<[u8; 33]> = scan_pubkeys.into_iter().collect();
+        if scan_pubkeys.is_empty() {
+            return Ok(());
+        }
+        self.mirror.remove_silent_payments(&scan_pubkeys);
+        let res = match &self.handle {
+            Some(h) => Some(
+                h.send_control(pb::SubscribeControl {
+                    msg: Some(Msg::RemoveSilentPayments(pb::RemoveSilentPayments {
+                        scan_pubkeys: scan_pubkeys.iter().map(|k| k.to_vec()).collect(),
                     })),
                 })
                 .await,
@@ -1645,6 +1800,33 @@ fn validate_prefixes(
         .collect()
 }
 
+/// Validate each scan-key target and derive its identity `b_scan·G` (the mirror
+/// key and the removal identity), **deduplicating by identity** so the same set
+/// drives both the mirror mutation and the wire message.
+///
+/// Both curve values are validated ([`SilentPaymentTarget::validate`]), so a
+/// malformed `scan_secret` *or* `spend_pubkey` is a deterministic
+/// [`StreamError::InvalidArgument`] here rather than a silent server-side skip.
+///
+/// Dedup is last-wins and happens once, before the caller mutates the mirror or
+/// transmits: without it, a batch carrying the same identity twice would send
+/// both duplicates on the wire (where the server keeps the *first*) while the
+/// mirror's map keeps the *last* — so a later reconnect replay would install a
+/// different spend key/labels than the live server currently holds. Collapsing
+/// to one target per identity up front keeps the initial install, the mirror,
+/// and every reconnect in agreement.
+#[cfg(feature = "bitcoin")]
+fn sp_mirror_entries(
+    targets: impl IntoIterator<Item = SilentPaymentTarget>,
+) -> Result<Vec<([u8; 33], SilentPaymentTarget)>, StreamError> {
+    let mut deduped: BTreeMap<[u8; 33], SilentPaymentTarget> = BTreeMap::new();
+    for t in targets {
+        let id = t.validate()?;
+        deduped.insert(id, t); // last-wins on a repeated identity
+    }
+    Ok(deduped.into_iter().collect())
+}
+
 /// Whether a `connect()` failure should be retried by reconnecting. Adds
 /// `ControlClosed` and `WatchSetLoader` to the transport-retryable set: a
 /// freshly-opened stream that rejects the watch-set replay is a transient
@@ -1809,6 +1991,100 @@ mod tests {
     #[test]
     fn mirror_empty_renders_nothing() {
         assert!(WatchSetMirror::default().control_messages().is_empty());
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn sp_mirror_entries_validates_and_dedups() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let key = |b: u8| {
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[b; 32]).unwrap()).serialize()
+        };
+        let b_scan = [0x11u8; 32];
+        let (spend_a, spend_b) = (key(0x22), key(0x33));
+
+        // Two targets with the SAME scan identity (same b_scan) but different
+        // spend key/labels: dedup collapses to one, last-wins — so the mirror,
+        // the wire message, and every reconnect replay all agree.
+        let t1 = SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_a, labels: vec![0] };
+        let t2 =
+            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: spend_b, labels: vec![1, 2] };
+        let entries = sp_mirror_entries([t1, t2]).expect("valid targets");
+        assert_eq!(entries.len(), 1, "same identity collapses to one entry");
+        assert_eq!(entries[0].1.spend_pubkey, spend_b, "last write wins");
+        assert_eq!(entries[0].1.labels, vec![1, 2]);
+
+        // A malformed spend_pubkey is rejected up front (deterministic), not
+        // silently accepted and skipped by the server.
+        let mut bad_spend = spend_a;
+        bad_spend[0] = 0x01; // invalid compressed-point prefix
+        let bad =
+            SilentPaymentTarget { scan_secret: b_scan, spend_pubkey: bad_spend, labels: vec![] };
+        assert!(matches!(sp_mirror_entries([bad]), Err(StreamError::InvalidArgument(_))));
+
+        // A malformed scan_secret (zero scalar) is likewise rejected.
+        let bad2 =
+            SilentPaymentTarget { scan_secret: [0u8; 32], spend_pubkey: spend_a, labels: vec![] };
+        assert!(matches!(sp_mirror_entries([bad2]), Err(StreamError::InvalidArgument(_))));
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[tokio::test]
+    async fn sp_add_enforces_connection_cap() {
+        use crate::client::MAX_SP_TARGETS_PER_CONNECTION;
+        let spend = valid_spend_pubkey();
+        let target = |i: u8| SilentPaymentTarget {
+            scan_secret: [i; 32],
+            spend_pubkey: spend,
+            labels: vec![0],
+        };
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // Exactly the cap of distinct targets is accepted.
+        let full: Vec<_> = (1..=MAX_SP_TARGETS_PER_CONNECTION as u8).map(target).collect();
+        w.add_silent_payments(full).await.expect("cap-exact add accepted");
+        // Re-asserting a held identity at the cap is free (net-new = 0).
+        w.add_silent_payments([target(1)]).await.expect("re-assert at cap is free");
+        // A further DISTINCT target is rejected deterministically rather than
+        // silently shed by the server and replayed forever by the mirror.
+        let err = w
+            .add_silent_payments([target(MAX_SP_TARGETS_PER_CONNECTION as u8 + 1)])
+            .await
+            .expect_err("over-cap add must be rejected");
+        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[tokio::test]
+    async fn sp_add_enforces_label_cap() {
+        use crate::client::MAX_SP_LABELS_PER_TARGET;
+        let spend = valid_spend_pubkey();
+        let store = Arc::new(MemStore::default());
+        let mut w = watch_with(&store);
+        // One distinct label over the cap is rejected up front.
+        let over = SilentPaymentTarget {
+            scan_secret: [1u8; 32],
+            spend_pubkey: spend,
+            labels: (0..=MAX_SP_LABELS_PER_TARGET as u32).collect(),
+        };
+        let err = w.add_silent_payments([over]).await.expect_err("over-label rejected");
+        assert!(matches!(err, StreamError::InvalidArgument(_)), "got {err:?}");
+        // Exactly the cap is accepted.
+        let ok = SilentPaymentTarget {
+            scan_secret: [1u8; 32],
+            spend_pubkey: spend,
+            labels: (0..MAX_SP_LABELS_PER_TARGET as u32).collect(),
+        };
+        w.add_silent_payments([ok]).await.expect("cap-exact labels accepted");
+    }
+
+    /// A valid compressed spend point for SP target test fixtures.
+    #[cfg(feature = "bitcoin")]
+    fn valid_spend_pubkey() -> [u8; 33] {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22u8; 32]).unwrap()).serialize()
     }
 
     // --- a CursorStore we can assert against ----------------------------------

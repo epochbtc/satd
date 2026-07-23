@@ -55,6 +55,10 @@ tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 bitcoin = { workspace = true, optional = true }
+# Zeroize-on-drop for the retained scan secret (`b_scan` is a watch credential —
+# it must not linger in freed heap once a target is dropped/removed). Tiny,
+# no_std-capable, so it does not compromise the lean-dependency goal.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -64,6 +68,14 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # `--no-default-features --examples` build clean.
 [[example]]
 name = "prefix_privacy"
+required-features = ["bitcoin"]
+
+[[example]]
+name = "sp_wallet"
+required-features = ["bitcoin"]
+
+[[example]]
+name = "sp_light_scan"
 required-features = ["bitcoin"]
 
 # TLS / mTLS examples use the `tls`-gated builder methods (`tls_ca_pem`,

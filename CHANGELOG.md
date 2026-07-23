@@ -89,6 +89,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   migration work against modern Core datadirs; `blocksxor` is now a real
   option (fresh satd dirs stay plaintext by default).
 - Log hygiene: per-transaction mempool-acceptance lines are now logged at `debug` instead of `info` (they no longer flood the log during normal operation), and ANSI color is auto-detected — escapes are suppressed when stdout is not a terminal or when `NO_COLOR` is set, so piped/`journald`-captured logs stay clean.
+- Silent payments (BIP 352): Rust SDK (`satd-events-client`) support for both
+  consumption modes. Typed `Event::BlockTweaks` (Tier 1) and
+  `Event::SilentPaymentMatched` (Tier 2); a `Categories::TWEAKS` bit and
+  `SubscribeOptions::tweak_dust_limit` / `tweaks_only`; `WatchHandle` and
+  `ResilientWatch` / `WatchSetBuilder` `add_silent_payments` /
+  `remove_silent_payments` helpers (scan keys re-register on reconnect); and two
+  runnable examples — `sp_light_scan.rs` (client-side scan off the tweaks
+  firehose, scan key never sent) and `sp_wallet.rs` (scan-key watch, deriving
+  each match's spending key offline from `tweak` + `k`).
 
 ## Releases
 

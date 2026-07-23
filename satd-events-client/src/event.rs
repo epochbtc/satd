@@ -2,11 +2,58 @@
 //! `NodeEvent.body` tagged union, so consumers `match` on a flat enum instead
 //! of unwrapping nested protobuf `Option`s.
 //!
-//! Hashes and txids are carried as raw `Vec<u8>` here; the optional `bitcoin`
-//! feature layers typed conversions on top (the prefix-watch re-filter and
-//! scripthash helpers).
+//! Hashes and txids are carried as raw `Vec<u8>` in **internal (consensus)
+//! byte order** — the order the wire and key derivation use, *not* the reversed
+//! order block explorers and Bitcoin Core JSON-RPC display. Convert at the edge:
+//! [`parse_txid`] returns a typed [`bitcoin::Txid`] (whose `Display` is explorer
+//! order, and which drops into `bitcoin`-ecosystem APIs) with the `bitcoin`
+//! feature, and [`display_hex`] returns a display-order hex string with no extra
+//! dependency. Only hashes/txids are byte-reversed for display — do not apply
+//! either helper to a public key or tweak (`output_pubkey`, `tweak`).
 
 use satd_events_proto::v1 as pb;
+
+/// Render a raw wire hash/txid (32 bytes, **internal / consensus byte order**,
+/// as every hash and txid on this API is carried) as a lowercase hex string in
+/// the reversed **display order** used by block explorers and Bitcoin Core
+/// JSON-RPC.
+///
+/// Use it on a hash or txid field (`txid`, `block_hash`, …). Do **not** apply
+/// it to a public key or tweak: those are raw bytes but are *not* reversed for
+/// display. Needs no optional dependency; for a typed value use [`parse_txid`].
+///
+/// ```
+/// # use satd_events_client::display_hex;
+/// let internal: Vec<u8> = (0u8..32).collect(); // 00,01,…,1f
+/// assert!(display_hex(&internal).starts_with("1f1e1d")); // reversed
+/// ```
+pub fn display_hex(internal_hash: &[u8]) -> String {
+    internal_hash
+        .iter()
+        .rev()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Parse a raw wire txid (32 bytes, internal/consensus byte order) into a typed
+/// [`bitcoin::Txid`]. The returned value's `Display` is the usual explorer /
+/// JSON-RPC order, and it hands straight to `bitcoin`-ecosystem APIs
+/// (`bitcoincore-rpc`, comparison against `getrawtransaction`, …).
+///
+/// A thin wrapper over [`bitcoin::Txid::from_slice`]; the block-hash equivalent
+/// is `bitcoin::BlockHash::from_slice(bytes)`.
+///
+/// ```
+/// # use satd_events_client::{parse_txid, display_hex};
+/// let raw: Vec<u8> = (0u8..32).collect();
+/// let txid = parse_txid(&raw).unwrap();
+/// assert_eq!(txid.to_string(), display_hex(&raw)); // both reverse to display order
+/// ```
+#[cfg(feature = "bitcoin")]
+pub fn parse_txid(raw: &[u8]) -> Result<bitcoin::Txid, bitcoin::hashes::FromSliceError> {
+    use bitcoin::hashes::Hash as _;
+    bitcoin::Txid::from_slice(raw)
+}
 
 /// Durable resume position, re-exported from the wire schema. Persist the
 /// value returned by [`EventStream::cursor`](crate::EventStream::cursor) and
@@ -16,7 +63,8 @@ pub use satd_events_proto::v1::Cursor;
 /// An outpoint (`txid:vout`), raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outpoint {
-    /// Transaction id, 32 raw bytes (internal byte order).
+    /// Transaction id, 32 raw bytes (internal byte order — [`parse_txid`] or
+    /// [`display_hex`] for a typed value / explorer-order string).
     pub txid: Vec<u8>,
     /// Output index.
     pub vout: u32,
@@ -77,6 +125,24 @@ pub struct ScriptPrefix {
     pub prefix: Vec<u8>,
     /// Prefix length in bits.
     pub bits: u32,
+}
+
+/// One transaction's public silent-payment tweak, carried in a
+/// [`Event::BlockTweaks`] for Tier 1 client-side scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TweakEntry {
+    /// 33-byte compressed public tweak `T = input_hash · A` for the transaction.
+    /// Always present — this is what a client feeds its own `b_scan` into to
+    /// scan the transaction's outputs locally.
+    pub tweak: Vec<u8>,
+    /// The transaction's txid (internal/consensus byte order — [`parse_txid`] /
+    /// [`display_hex`]). Empty when the subscription set `tweaks_only` (the
+    /// compact, tweak-alone form).
+    pub txid: Vec<u8>,
+    /// The largest taproot output value in the transaction, in satoshis — a cap
+    /// on what a payment here could be worth, for client-side dust triage. `0`
+    /// under `tweaks_only`.
+    pub max_value: u64,
 }
 
 /// A spent prevout that matched a prefix bucket (the spend side of a
@@ -402,6 +468,61 @@ pub enum Event {
         /// Number of match events emitted for this rescan.
         matches: u64,
     },
+    /// One connected block's silent-payment tweaks — the Tier 1 (client-side
+    /// scan, zero-custody) firehose payload. Arrives only for a subscription that
+    /// set the [`TWEAKS`](crate::Categories::TWEAKS) category bit. For each entry,
+    /// a client computes `T · b_scan` with its own scan secret and derives the
+    /// candidate output key(s), so the scan key never leaves the device. See
+    /// [`examples/sp_light_scan.rs`].
+    BlockTweaks {
+        /// The block these tweaks describe (internal/consensus byte order).
+        block_hash: Vec<u8>,
+        /// The block's height.
+        height: u32,
+        /// One entry per silent-payment-eligible transaction in the block.
+        entries: Vec<TweakEntry>,
+        /// `true` when a `tweak_dust_limit` or `tweaks_only` filter dropped or
+        /// trimmed entries in this block (so an empty `entries` may mean
+        /// "filtered out", not "none present").
+        filtered: bool,
+    },
+    /// A BIP 352 silent payment paid a registered scan key — the Tier 2
+    /// (scan-key watch, convenience) match, delivered on the `Watch` stream to a
+    /// connection that registered the target via
+    /// [`WatchHandle::add_silent_payments`](crate::WatchHandle::add_silent_payments).
+    /// The node ran the ECDH; `tweak` + `k` let the wallet re-derive the output
+    /// key — and, with its `b_spend`, the spending key — **offline**. See
+    /// [`examples/sp_wallet.rs`].
+    SilentPaymentMatched {
+        /// The registered target's identity `b_scan·G` (33 bytes) this output
+        /// paid — echoes which of your scan keys matched, never the secret.
+        scan_pubkey: Vec<u8>,
+        /// The paying transaction's txid (internal byte order — [`parse_txid`] /
+        /// [`display_hex`]).
+        txid: Vec<u8>,
+        /// The matched output's index.
+        vout: u32,
+        /// The matched taproot output key (32-byte x-only).
+        output_pubkey: Vec<u8>,
+        /// The output value in satoshis.
+        amount: u64,
+        /// The transaction's 33-byte public tweak `T`. With `k`, re-derive the
+        /// full output key offline: `P_k = B_spend + hash(b_scan·T || k)·G`.
+        tweak: Vec<u8>,
+        /// The BIP 352 output counter for this match — the `k` in the derivation.
+        k: u32,
+        /// The matched label integer, when the output paid a registered label
+        /// (e.g. change is commonly label `0`); `None` for an unlabeled match.
+        label: Option<u32>,
+        /// `true` once seen in a connected block; `false` while only in the
+        /// mempool (re-emitted `true` on confirmation).
+        confirmed: bool,
+        /// The confirming block height; `None` while unconfirmed.
+        height: Option<u32>,
+        /// The full serialized transaction, only when this connection opted in
+        /// via `SetWatchOptions.include_raw_tx`; `None` otherwise.
+        raw_tx: Option<Vec<u8>>,
+    },
     /// A body this client build does not recognize (a newer server arm), or an
     /// event with no body set. Ignored by well-behaved consumers.
     Unknown,
@@ -614,14 +735,42 @@ impl From<pb::NodeEvent> for Event {
                 to_height: c.to_height,
                 matches: c.matches,
             },
-            // Forward-compatible catch-all. This crate is published to crates.io
-            // and version-pinned to the *released* `satd-events-proto`, so it must
-            // compile against both that (older) schema and the newer in-workspace
-            // one. A `_` arm lets a newer proto's bodies (e.g. the BIP 352
-            // `BlockTweaks` / `SilentPaymentMatched` allocated in the SP schema
-            // pass) map to `Unknown` without referencing symbols the released
-            // proto lacks. Typed decoding for those lands once the proto is
-            // released and the pin advances (PR 8).
+            // BIP 352 silent payments (§7.7). Tier 1 firehose tweaks and the
+            // Tier 2 scan-key match.
+            Body::BlockTweaks(b) => Event::BlockTweaks {
+                block_hash: b.block_hash,
+                height: b.height,
+                entries: b
+                    .entries
+                    .into_iter()
+                    .map(|e| TweakEntry {
+                        tweak: e.tweak,
+                        txid: e.txid,
+                        max_value: e.max_value,
+                    })
+                    .collect(),
+                filtered: b.filtered,
+            },
+            Body::SilentPaymentMatched(s) => Event::SilentPaymentMatched {
+                scan_pubkey: s.scan_pubkey,
+                txid: s.txid,
+                vout: s.vout,
+                output_pubkey: s.output_pubkey,
+                amount: s.amount,
+                tweak: s.tweak,
+                k: s.k,
+                label: s.has_label.then_some(s.label),
+                confirmed: s.confirmed,
+                // `height` is 0 on the wire while unconfirmed; surface `None`.
+                height: s.confirmed.then_some(s.height),
+                raw_tx: (!s.raw_tx.is_empty()).then_some(s.raw_tx),
+            },
+            // Forward-compatible catch-all: any body a still-newer proto adds maps
+            // to `Unknown`. It is unreachable against the *current* workspace proto
+            // (every body above is now typed), but retained so this crate keeps
+            // compiling if the schema grows ahead of these arms — the same
+            // resilience the SP bodies themselves relied on before they were typed.
+            #[allow(unreachable_patterns)]
             _ => Event::Unknown,
         }
     }

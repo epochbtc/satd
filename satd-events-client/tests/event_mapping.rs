@@ -221,3 +221,105 @@ fn set_cursor_result_without_outcome_is_unknown() {
     }));
     assert_eq!(Event::from(ev), Event::Unknown);
 }
+
+#[test]
+fn silent_payment_matched_confirmed_carries_tweak_and_k() {
+    let ev = node_event(pb::node_event::Body::SilentPaymentMatched(
+        pb::SilentPaymentMatched {
+            scan_pubkey: vec![0x02; 33],
+            txid: vec![0x33; 32],
+            vout: 2,
+            output_pubkey: vec![0x44; 32],
+            amount: 100_000,
+            tweak: vec![0x03; 33],
+            k: 5,
+            has_label: true,
+            label: 7,
+            confirmed: true,
+            height: 880_000,
+            raw_tx: vec![0xaa, 0xbb],
+        },
+    ));
+    match Event::from(ev) {
+        Event::SilentPaymentMatched {
+            scan_pubkey,
+            vout,
+            amount,
+            tweak,
+            k,
+            label,
+            confirmed,
+            height,
+            raw_tx,
+            ..
+        } => {
+            assert_eq!(scan_pubkey, vec![0x02; 33]);
+            assert_eq!(vout, 2);
+            assert_eq!(amount, 100_000);
+            assert_eq!(tweak, vec![0x03; 33]);
+            assert_eq!(k, 5);
+            assert_eq!(label, Some(7), "has_label → Some(label)");
+            assert!(confirmed);
+            assert_eq!(height, Some(880_000), "confirmed → Some(height)");
+            assert_eq!(raw_tx, Some(vec![0xaa, 0xbb]), "opt-in raw_tx");
+        }
+        other => panic!("expected SilentPaymentMatched, got {other:?}"),
+    }
+}
+
+#[test]
+fn silent_payment_matched_unconfirmed_has_no_height_or_label() {
+    let ev = node_event(pb::node_event::Body::SilentPaymentMatched(
+        pb::SilentPaymentMatched {
+            scan_pubkey: vec![0x02; 33],
+            txid: vec![0x33; 32],
+            vout: 0,
+            output_pubkey: vec![0x44; 32],
+            amount: 1,
+            tweak: vec![0x03; 33],
+            k: 0,
+            has_label: false,
+            label: 0,
+            confirmed: false,
+            // 0 on the wire while unconfirmed.
+            height: 0,
+            raw_tx: vec![],
+        },
+    ));
+    match Event::from(ev) {
+        Event::SilentPaymentMatched { label, confirmed, height, raw_tx, .. } => {
+            assert_eq!(label, None, "has_label=false → None (not label 0)");
+            assert!(!confirmed, "mempool match is unconfirmed");
+            assert_eq!(height, None, "unconfirmed → None (not height 0)");
+            assert_eq!(raw_tx, None, "no opt-in → None");
+        }
+        other => panic!("expected SilentPaymentMatched, got {other:?}"),
+    }
+}
+
+#[test]
+fn block_tweaks_maps_entries() {
+    let ev = node_event(pb::node_event::Body::BlockTweaks(pb::BlockTweaks {
+        block_hash: vec![0x55; 32],
+        height: 840_000,
+        entries: vec![
+            pb::TweakEntry { tweak: vec![0x03; 33], txid: vec![0x66; 32], max_value: 50_000 },
+            // tweaks_only compact form: no txid/max_value.
+            pb::TweakEntry { tweak: vec![0x02; 33], txid: vec![], max_value: 0 },
+        ],
+        filtered: true,
+    }));
+    match Event::from(ev) {
+        Event::BlockTweaks { block_hash, height, entries, filtered } => {
+            assert_eq!(block_hash, vec![0x55; 32]);
+            assert_eq!(height, 840_000);
+            assert!(filtered);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].tweak, vec![0x03; 33]);
+            assert_eq!(entries[0].txid, vec![0x66; 32]);
+            assert_eq!(entries[0].max_value, 50_000);
+            assert!(entries[1].txid.is_empty(), "tweaks_only entry has no txid");
+        }
+        other => panic!("expected BlockTweaks, got {other:?}"),
+    }
+}
