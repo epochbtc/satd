@@ -4158,6 +4158,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "zeroize",
 ]
 
 [[package]]
