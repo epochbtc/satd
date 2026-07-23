@@ -303,9 +303,19 @@ fn block_tweaks_maps_entries() {
         block_hash: vec![0x55; 32],
         height: 840_000,
         entries: vec![
-            pb::TweakEntry { tweak: vec![0x03; 33], txid: vec![0x66; 32], max_value: 50_000 },
-            // tweaks_only compact form: no txid/max_value.
-            pb::TweakEntry { tweak: vec![0x02; 33], txid: vec![], max_value: 0 },
+            // A `tweak_outputs`-enriched entry carries its taproot outputs.
+            pb::TweakEntry {
+                tweak: vec![0x03; 33],
+                txid: vec![0x66; 32],
+                max_value: 50_000,
+                taproot_outputs: vec![pb::TaprootOutput {
+                    vout: 1,
+                    output_pubkey: vec![0xAB; 32],
+                    value: 50_000,
+                }],
+            },
+            // tweaks_only compact form: no txid/max_value, and no outputs.
+            pb::TweakEntry { tweak: vec![0x02; 33], txid: vec![], max_value: 0, taproot_outputs: vec![] },
         ],
         filtered: true,
     }));
@@ -318,7 +328,12 @@ fn block_tweaks_maps_entries() {
             assert_eq!(entries[0].tweak, vec![0x03; 33]);
             assert_eq!(entries[0].txid, vec![0x66; 32]);
             assert_eq!(entries[0].max_value, 50_000);
+            assert_eq!(entries[0].taproot_outputs.len(), 1);
+            assert_eq!(entries[0].taproot_outputs[0].vout, 1);
+            assert_eq!(entries[0].taproot_outputs[0].output_pubkey, vec![0xAB; 32]);
+            assert_eq!(entries[0].taproot_outputs[0].value, 50_000);
             assert!(entries[1].txid.is_empty(), "tweaks_only entry has no txid");
+            assert!(entries[1].taproot_outputs.is_empty());
         }
         other => panic!("expected BlockTweaks, got {other:?}"),
     }
@@ -328,13 +343,27 @@ fn block_tweaks_maps_entries() {
 fn mempool_tweak_maps_to_typed_event() {
     // Tier 1.5: a mempool tweak carries a single, always-full entry.
     let ev = node_event(pb::node_event::Body::MempoolTweak(pb::MempoolTweak {
-        entry: Some(pb::TweakEntry { tweak: vec![0x03; 33], txid: vec![0x77; 32], max_value: 33_000 }),
+        entry: Some(pb::TweakEntry {
+            tweak: vec![0x03; 33],
+            txid: vec![0x77; 32],
+            max_value: 33_000,
+            taproot_outputs: vec![pb::TaprootOutput {
+                vout: 0,
+                output_pubkey: vec![0xCD; 32],
+                value: 33_000,
+            }],
+        }),
     }));
     match Event::from(ev) {
         Event::MempoolTweak { entry } => {
             assert_eq!(entry.tweak, vec![0x03; 33]);
             assert_eq!(entry.txid, vec![0x77; 32], "txid always present on a mempool tweak");
             assert_eq!(entry.max_value, 33_000);
+            // A mempool tweak always carries the tx's taproot outputs so the
+            // match is confirmed at admission without a fetch.
+            assert_eq!(entry.taproot_outputs.len(), 1);
+            assert_eq!(entry.taproot_outputs[0].output_pubkey, vec![0xCD; 32]);
+            assert_eq!(entry.taproot_outputs[0].value, 33_000);
         }
         other => panic!("expected MempoolTweak, got {other:?}"),
     }

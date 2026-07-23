@@ -5069,6 +5069,7 @@ mod tests {
             txid,
             tweak,
             max_taproot_value: Amount::from_sat(12_345),
+            taproot_outputs: Vec::new(),
         }];
         let accel = eph.scan_block_collect_accel(&block, 100, None, Some(&entries));
 
@@ -5103,6 +5104,7 @@ mod tests {
             txid: other_txid,
             tweak,
             max_taproot_value: Amount::from_sat(8_000),
+            taproot_outputs: Vec::new(),
         }];
         assert!(
             eph.scan_block_collect_accel(&block, 5, None, Some(&wrong_entries))
@@ -5137,6 +5139,7 @@ mod tests {
             txid,
             tweak: wrong_tweak,
             max_taproot_value: Amount::from_sat(6_000),
+            taproot_outputs: Vec::new(),
         }];
         assert!(
             eph.scan_block_collect_accel(&block, 9, None, Some(&entries))

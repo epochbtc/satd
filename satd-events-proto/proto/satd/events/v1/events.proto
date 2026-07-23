@@ -418,6 +418,16 @@ message BlockTweaks {
   bool   filtered   = 4;           // true when a per-subscription dust limit dropped entries
 }
 
+// One of a transaction's taproot (BIP 341) outputs — a scan candidate for a
+// silent-payment client. Carried in TweakEntry.taproot_outputs so a client can
+// confirm a derived output key against the actual on-chain output without
+// fetching the transaction.
+message TaprootOutput {
+  uint32 vout          = 1;  // output index within the transaction
+  bytes  output_pubkey = 2;  // 32-byte x-only taproot output key, INTERNAL byte order (do not reverse)
+  uint64 value         = 3;  // output value in satoshis
+}
+
 // One eligible transaction's tweak within a BlockTweaks. `tweak` is always
 // present (33-byte compressed public tweak T = input_hash · A). `txid` and
 // `max_value` are omitted (empty / zero) under a `tweaks_only` subscription,
@@ -426,6 +436,15 @@ message TweakEntry {
   bytes  tweak     = 1;  // 33-byte compressed public tweak — always present
   bytes  txid      = 2;  // omitted under tweaks_only
   uint64 max_value = 3;  // largest eligible output value (sats); omitted under tweaks_only
+
+  // The transaction's taproot outputs (vout, x-only key, value) — the scan
+  // candidates a client checks its derived P_k against, so a match is confirmed
+  // without a getrawtransaction that races mempool eviction. Always populated on
+  // a MempoolTweak (cheap, and there is no block to fall back to). On a
+  // BlockTweaks entry it is present only when the subscription set
+  // `tweak_outputs` (the confirmed stream stays lean by default — the block is
+  // the fallback). Empty otherwise.
+  repeated TaprootOutput taproot_outputs = 4;
 }
 
 // A single accepted-but-unconfirmed transaction's BIP 352 tweak, streamed at

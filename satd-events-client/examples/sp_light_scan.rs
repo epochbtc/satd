@@ -11,20 +11,23 @@
 //! candidate `P_k = B_spend + hash(b_scan·T ‖ k)·G` **and**, for each label `m`
 //! the receiver uses (BIP 352 §5; include `0` to catch your own change), the
 //! labelled candidate `P_k + label_m·G`. A candidate is *yours* iff its taproot
-//! output actually appears on-chain: the tweaks stream deliberately carries only
-//! tweaks, so a full wallet confirms membership against the block's taproot
-//! outputs from its own chain access (a `getblock`, or a BIP 157 compact-filter
-//! test of the candidate script) — that lookup is the wallet's, not the events
-//! SDK's. This example derives and prints the candidate output keys and the
-//! *candidate* spending key you would hold if a candidate proves to be on-chain,
-//! which is the whole cryptographic core of a light-client scanner.
+//! output actually appears in the transaction. When the tweak event carries the
+//! transaction's taproot outputs (`entry.taproot_outputs`), this example
+//! confirms the match **in-band** — comparing each derived key against the
+//! carried outputs, no `getblock`/`getrawtransaction` needed. Otherwise it falls
+//! back to printing the candidate key for the wallet to look up against the
+//! block from its own chain access.
 //!
 //! The `tweaks` category requires the node's tweak index (`silentpaymentindex=1`)
 //! and is not part of the default category set — request it explicitly.
 //!
-//! This example also sets `mempool_tweaks` (Tier 1.5), so it scans each payment
-//! at **mempool admission** as well as at confirmation — mempool-latency
-//! detection with the scan key still on the device. A mempool hit and its later
+//! This example sets `mempool_tweaks` (Tier 1.5), so it scans each payment at
+//! **mempool admission** as well as at confirmation — mempool-latency detection
+//! with the scan key still on the device. A `MempoolTweak` **always** carries
+//! `taproot_outputs` (there is no block to fall back to, and fetching an
+//! unconfirmed tx races eviction), so the mempool match is always confirmed
+//! in-band; the confirmed `BlockTweaks` entries stay lean here (set
+//! `tweak_outputs` to carry the outputs there too). A mempool hit and its later
 //! confirmed hit share a txid, so a real scanner dedups on `entry.txid`.
 //!
 //! Requires the default `bitcoin` feature.
@@ -61,7 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
     // Request ONLY the tweaks category (bit 8, explicit — not in the default),
-    // and opt into mempool-time tweaks so payments surface at admission too.
+    // and opt into mempool-time tweaks so payments surface at admission too. A
+    // `MempoolTweak` carries the transaction's taproot outputs, so its match is
+    // confirmed in-band below; the lean `BlockTweaks` entries do not (set
+    // `tweak_outputs` to include them there too), so the block path falls back to
+    // printing the candidate key for the wallet to look up against the block.
     let mut events = client
         .subscribe(SubscribeOptions {
             categories: Categories::TWEAKS,
@@ -108,17 +115,37 @@ fn scan_entry(
                 Some(m) => format!(" label={m}"),
                 None => String::new(),
             };
-            // The scriptPubKey a wallet would look for on-chain is the P2TR
-            // wrapping `output_key`; the spend key is a *candidate* until that
-            // output is confirmed present.
-            println!(
-                "{where_} tx {} tweak {}.. k={k}{lbl}: candidate output key {} \
-                 (candidate spend key {})",
-                display_hex(&entry.txid),
-                &hex(&entry.tweak)[..12],
-                hex(&c.output_key),
-                hex(&c.spend_key),
-            );
+            // If the event carries the tx's taproot outputs (always for a
+            // MempoolTweak; for BlockTweaks when `tweak_outputs` was set), confirm
+            // the match in-band: a candidate is ours iff its key is one of them.
+            if let Some(o) = entry
+                .taproot_outputs
+                .iter()
+                .find(|o| o.output_pubkey.as_slice() == c.output_key.as_slice())
+            {
+                println!(
+                    "{where_} tx {} k={k}{lbl}: ✓ MATCH — output vout={} value={} sats is yours \
+                     (spend key {})",
+                    display_hex(&entry.txid),
+                    o.vout,
+                    o.value,
+                    hex(&c.spend_key),
+                );
+            } else if entry.taproot_outputs.is_empty() {
+                // No outputs in the event (a lean BlockTweaks with tweak_outputs
+                // off). Fall back to the candidate key for the wallet to look up
+                // against the block from its own chain access.
+                println!(
+                    "{where_} tx {} tweak {}.. k={k}{lbl}: candidate output key {} \
+                     — confirm against the block (candidate spend key {})",
+                    display_hex(&entry.txid),
+                    &hex(&entry.tweak)[..12],
+                    hex(&c.output_key),
+                    hex(&c.spend_key),
+                );
+            }
+            // else: outputs present but this candidate is not among them — not
+            // ours at this k; a real scanner stops probing once a k misses.
         }
     }
     Ok(())

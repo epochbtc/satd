@@ -133,7 +133,8 @@ pub use client::{
 pub use error::StreamError;
 pub use event::{
     display_hex, Cursor, CursorRejectReason, DescriptorMatch, Event, EvictReason, Outpoint,
-    PrefixMatch, RescanRejectReason, ScriptPrefix, SpentPrevout, TweakEntry, WatchSetRejectReason,
+    PrefixMatch, RescanRejectReason, ScriptPrefix, SpentPrevout, TaprootOutput, TweakEntry,
+    WatchSetRejectReason,
 };
 /// Parse a raw wire txid into a typed [`bitcoin::Txid`]. Requires the `bitcoin`
 /// feature.

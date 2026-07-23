@@ -45,15 +45,42 @@ const TAG_INPUTS: &[u8] = b"BIP0352/Inputs";
 const TAG_SHARED_SECRET: &[u8] = b"BIP0352/SharedSecret";
 const TAG_LABEL: &[u8] = b"BIP0352/Label";
 
+/// One of a transaction's taproot (BIP 341) outputs: the scan candidates a
+/// silent-payment client checks its derived `P_k` against. `output_key` is the
+/// 32-byte x-only taproot output key in internal (consensus) byte order — the
+/// raw `scriptPubKey` push, never reversed — so a client compares it directly
+/// against `P_k.x_only_public_key().serialize()` without a byte flip.
+///
+/// The key is stored as raw bytes rather than a parsed `XOnlyPublicKey`: a
+/// taproot output commitment need not be a valid curve point until it is spent,
+/// and dropping an unparseable one would silently desync `vout` numbering and
+/// the `max_value` cap from the on-chain outputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaprootOutput {
+    pub vout: u32,
+    pub output_key: [u8; 32],
+    pub value: Amount,
+}
+
 /// One indexed transaction: the public tweak plus the fields satd stores
 /// alongside it (design decision D6). `max_taproot_value` is the largest
 /// value among the transaction's taproot outputs — it drives the
 /// light-client dust-limit filter without the client fetching the tx.
+///
+/// `taproot_outputs` is the full list of the transaction's taproot outputs
+/// (`vout`, x-only key, value), populated only where the entry is freshly
+/// computed — the mempool-admission cache path — so a `MempoolTweak` carries
+/// enough to confirm a match without a `getrawtransaction` that races eviction.
+/// It is deliberately NOT persisted in the on-chain tweak index (the row codec
+/// drops it), so an entry decoded from the index carries an empty list; the
+/// `BlockTweaks` carrier re-derives outputs from the block when a subscriber
+/// opts in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TweakEntry {
     pub txid: Txid,
     pub tweak: PublicKey,
     pub max_taproot_value: Amount,
+    pub taproot_outputs: Vec<TaprootOutput>,
 }
 
 /// One output a scan key matched, with the per-output private-key tweak a
@@ -191,15 +218,26 @@ pub fn eligible_inputs(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Vec<Publ
     keys
 }
 
-/// The largest value among the transaction's taproot (BIP 341) outputs,
-/// or `None` if it has none (fact 1a — a transaction with no taproot
-/// output can carry no silent payment).
-fn max_taproot_output_value(tx: &Transaction) -> Option<Amount> {
+/// Every taproot (BIP 341) output of the transaction, in `vout` order: the scan
+/// candidates for a silent-payment client. Empty when the transaction has no
+/// taproot output (fact 1a — it can carry no silent payment). A p2tr
+/// `scriptPubKey` is exactly `OP_1 OP_PUSHBYTES_32 <32-byte key>` (34 bytes), so
+/// the x-only key is the trailing 32 bytes.
+fn taproot_outputs(tx: &Transaction) -> Vec<TaprootOutput> {
     tx.output
         .iter()
-        .filter(|o| o.script_pubkey.is_p2tr())
-        .map(|o| o.value)
-        .max()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey.is_p2tr())
+        .map(|(vout, o)| {
+            let mut output_key = [0u8; 32];
+            output_key.copy_from_slice(&o.script_pubkey.as_bytes()[2..34]);
+            TaprootOutput {
+                vout: vout as u32,
+                output_key,
+                value: o.value,
+            }
+        })
+        .collect()
 }
 
 /// True if any spent prevout is a SegWit output of version > 1 — such a
@@ -228,7 +266,9 @@ pub fn compute_tweak(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Option<Twe
     if tx.is_coinbase() {
         return None;
     }
-    let max_taproot_value = max_taproot_output_value(tx)?;
+    let taproot_outputs = taproot_outputs(tx);
+    // fact 1a: no taproot output → not silent-payment eligible.
+    let max_taproot_value = taproot_outputs.iter().map(|o| o.value).max()?;
     if spends_future_segwit(prevout_spks) {
         return None;
     }
@@ -261,6 +301,7 @@ pub fn compute_tweak(tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Option<Twe
         txid: tx.compute_txid(),
         tweak,
         max_taproot_value,
+        taproot_outputs,
     })
 }
 
@@ -415,5 +456,66 @@ mod tests {
         assert!(parse_compressed(&[0u8; 32]).is_none());
         // 33 bytes but not a valid compressed point (bad prefix byte).
         assert!(parse_compressed(&[0x01; 33]).is_none());
+    }
+
+    #[test]
+    fn taproot_outputs_collects_only_p2tr_in_vout_order() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{ScriptBuf, Transaction, TxOut, XOnlyPublicKey};
+
+        // Two distinct valid x-only keys for two taproot outputs, plus a
+        // non-taproot output wedged between them so vout numbering is exercised.
+        let key_a = [0x02u8; 32];
+        let key_b = {
+            let mut k = [0x03u8; 32];
+            k[31] = 0x07;
+            k
+        };
+        // Sanity: both are parseable x-only points (so the p2tr builder accepts
+        // them), but the collector must not depend on that.
+        let xa = XOnlyPublicKey::from_slice(&key_a).unwrap();
+        let xb = XOnlyPublicKey::from_slice(&key_b).unwrap();
+
+        let p2tr = |x: XOnlyPublicKey| {
+            // OP_1 OP_PUSHBYTES_32 <32-byte key>
+            let mut spk = vec![0x51, 0x20];
+            spk.extend_from_slice(&x.serialize());
+            ScriptBuf::from(spk)
+        };
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: p2tr(xa),
+                },
+                // A p2wpkh output (OP_0 <20>) — must be skipped, and must not
+                // shift the vout of the taproot output that follows it.
+                TxOut {
+                    value: Amount::from_sat(9999),
+                    script_pubkey: ScriptBuf::from(vec![0x00, 0x14].into_iter().chain([0x11; 20]).collect::<Vec<u8>>()),
+                },
+                TxOut {
+                    value: Amount::from_sat(5000),
+                    script_pubkey: p2tr(xb),
+                },
+            ],
+        };
+
+        let outs = taproot_outputs(&tx);
+        assert_eq!(outs.len(), 2, "only the two p2tr outputs are collected");
+        assert_eq!(outs[0].vout, 0);
+        assert_eq!(outs[0].output_key, xa.serialize());
+        assert_eq!(outs[0].value, Amount::from_sat(1000));
+        // vout 1 (p2wpkh) skipped, but the second taproot output keeps vout 2.
+        assert_eq!(outs[1].vout, 2);
+        assert_eq!(outs[1].output_key, xb.serialize());
+        assert_eq!(outs[1].value, Amount::from_sat(5000));
+        // The stored key is the raw scriptPubKey push, internal byte order.
+        assert_eq!(outs[1].output_key, key_b);
     }
 }

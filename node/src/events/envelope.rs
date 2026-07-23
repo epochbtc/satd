@@ -364,6 +364,28 @@ pub struct BlockTweaks {
     pub entries: Vec<SpTweakEntry>,
 }
 
+/// One of a transaction's taproot outputs inside an [`SpTweakEntry`] — a scan
+/// candidate a client checks its derived `P_k` against. `output_key` is the
+/// 32-byte x-only taproot output key in internal byte order (serializes as hex
+/// on the JSON carriers, unreversed like every other key/hash on this surface).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpTaprootOutput {
+    pub vout: u32,
+    #[serde(serialize_with = "serialize_bytes_as_hex")]
+    pub output_key: [u8; 32],
+    pub value: u64,
+}
+
+impl SpTaprootOutput {
+    fn from_index(o: &node_sp_index::TaprootOutput) -> Self {
+        Self {
+            vout: o.vout,
+            output_key: o.output_key,
+            value: o.value.to_sat(),
+        }
+    }
+}
+
 /// One indexed transaction's tweak entry inside a [`BlockTweaks`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SpTweakEntry {
@@ -374,24 +396,37 @@ pub struct SpTweakEntry {
     /// Largest eligible taproot output value in the transaction, in satoshis —
     /// drives the light-client dust filter without fetching the tx.
     pub max_value: u64,
+    /// The transaction's taproot outputs — populated on the mempool-admission
+    /// path (`from_tweak_entry`), empty on the index-decoded `BlockTweaks` path
+    /// (`from_row`), which the carrier re-derives from the block only when a
+    /// subscriber opts in. See [`node_sp_index::TaprootOutput`].
+    pub taproot_outputs: Vec<SpTaprootOutput>,
 }
 
 impl SpTweakEntry {
     /// Build from an in-memory `compute_tweak` result — the mempool-cached tweak
-    /// carried by [`NodeEventBody::MempoolTweak`]. Field-for-field identical to
-    /// the mapping [`BlockTweaks::from_row`] uses, so a mempool tweak and its
-    /// later confirmed `BlockTweaks` entry are byte-identical.
+    /// carried by [`NodeEventBody::MempoolTweak`]. Carries the transaction's
+    /// taproot outputs so a zero-custody client confirms a match at admission
+    /// without a `getrawtransaction` that races eviction.
     pub fn from_tweak_entry(e: &node_sp_index::TweakEntry) -> Self {
         Self {
             tweak: e.tweak,
             txid: e.txid,
             max_value: e.max_taproot_value.to_sat(),
+            taproot_outputs: e
+                .taproot_outputs
+                .iter()
+                .map(SpTaprootOutput::from_index)
+                .collect(),
         }
     }
 }
 
 impl BlockTweaks {
-    /// Build the event from a decoded `sp_tweaks` row and its height.
+    /// Build the event from a decoded `sp_tweaks` row and its height. The row is
+    /// read from the lean on-chain index, which does not persist per-output
+    /// data, so `taproot_outputs` is empty here — a `tweak_outputs` subscriber's
+    /// entries are enriched from the block downstream by the carrier.
     pub fn from_row(height: u32, row: &node_sp_index::SpBlockRow) -> Self {
         Self {
             block_hash: row.block_hash,
@@ -403,6 +438,7 @@ impl BlockTweaks {
                     tweak: e.tweak,
                     txid: e.txid,
                     max_value: e.max_taproot_value.to_sat(),
+                    taproot_outputs: Vec::new(),
                 })
                 .collect(),
         }
@@ -545,6 +581,14 @@ pub struct Cursor {
 /// (which only preserves 53 bits of integer precision).
 fn serialize_u64_as_str<S: Serializer>(v: &u64, ser: S) -> Result<S::Ok, S::Error> {
     ser.serialize_str(&v.to_string())
+}
+
+/// Serialize a fixed 32-byte key as a lowercase hex string — used for the
+/// taproot `output_key`, whose bytes are already in internal (consensus) order
+/// and are rendered unreversed, matching the `tweak`/`txid` convention on this
+/// surface.
+fn serialize_bytes_as_hex<S: Serializer>(v: &[u8; 32], ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&hex::encode(v))
 }
 
 impl NodeEventBody {
@@ -824,6 +868,11 @@ mod tests {
             ),
             tweak: pk,
             max_taproot_value: bitcoin::Amount::from_sat(12_345),
+            taproot_outputs: vec![node_sp_index::TaprootOutput {
+                vout: 1,
+                output_key: [0xAB; 32],
+                value: bitcoin::Amount::from_sat(12_345),
+            }],
         }
     }
 
@@ -835,6 +884,12 @@ mod tests {
         assert_eq!(sp.tweak, te.tweak);
         assert_eq!(sp.txid, te.txid);
         assert_eq!(sp.max_value, te.max_taproot_value.to_sat());
+        // The mempool path carries the transaction's taproot outputs (the
+        // race-killing payload), unlike the index-decoded BlockTweaks path.
+        assert_eq!(sp.taproot_outputs.len(), 1);
+        assert_eq!(sp.taproot_outputs[0].vout, 1);
+        assert_eq!(sp.taproot_outputs[0].output_key, [0xAB; 32]);
+        assert_eq!(sp.taproot_outputs[0].value, 12_345);
 
         let env = NodeEvent::new(stamp(), NodeEventBody::MempoolTweak(sp));
         // Rides the tweaks category (bit 8), like BlockTweaks.
