@@ -26,7 +26,9 @@ pub mod keys;
 pub mod trait_def;
 pub mod types;
 
-pub use compute::{K_MAX, SpMatch, TweakEntry, compute_tweak, eligible_inputs, scan_outputs};
+pub use compute::{
+    K_MAX, SpMatch, TaprootOutput, TweakEntry, compute_tweak, eligible_inputs, scan_outputs,
+};
 pub use config::SpIndexConfig;
 pub use cursor::{BackfillCursor, BackfillState};
 pub use keys::{

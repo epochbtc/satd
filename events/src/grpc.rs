@@ -2807,6 +2807,11 @@ fn block_tweaks_to_proto(
                 e.txid.as_raw_hash().to_byte_array().to_vec()
             },
             max_value: if tweaks_only { 0 } else { e.max_value },
+            // Empty unless a `tweak_outputs` subscriber's entries were enriched
+            // from the block upstream (the lean index carries no per-output data).
+            // `tweaks_only` strips txid/max_value but not outputs — they are what
+            // that subscriber asked for.
+            taproot_outputs: sp_taproot_outputs_to_proto(&e.taproot_outputs),
         })
         .collect();
     pb::BlockTweaks {
@@ -2829,8 +2834,28 @@ fn mempool_tweak_to_proto(e: &node::events::SpTweakEntry) -> pb::MempoolTweak {
             tweak: e.tweak.serialize().to_vec(),
             txid: e.txid.as_raw_hash().to_byte_array().to_vec(),
             max_value: e.max_value,
+            // Always populated on a mempool tweak: there is no block to fall back
+            // to, so carrying the outputs is what lets a client confirm the match
+            // at admission without a getrawtransaction that races eviction.
+            taproot_outputs: sp_taproot_outputs_to_proto(&e.taproot_outputs),
         }),
     }
+}
+
+/// Map internal [`SpTaprootOutput`](node::events::SpTaprootOutput)s to their
+/// proto form. `output_key` is 32-byte x-only in internal byte order, carried
+/// through unreversed like every other key/hash on this surface.
+fn sp_taproot_outputs_to_proto(
+    outputs: &[node::events::SpTaprootOutput],
+) -> Vec<pb::TaprootOutput> {
+    outputs
+        .iter()
+        .map(|o| pb::TaprootOutput {
+            vout: o.vout,
+            output_pubkey: o.output_key.to_vec(),
+            value: o.value,
+        })
+        .collect()
 }
 
 fn cursor_to_proto(c: node::events::Cursor) -> pb::Cursor {
@@ -3061,6 +3086,13 @@ mod tests {
                         bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
                     ),
                     max_value: 1_000,
+                    // Populated as a `tweak_outputs`-enriched entry would be, to
+                    // exercise the proto passthrough.
+                    taproot_outputs: vec![node::events::SpTaprootOutput {
+                        vout: 0,
+                        output_key: [0xA1; 32],
+                        value: 1_000,
+                    }],
                 },
                 node::events::SpTweakEntry {
                     tweak: test_pubkey(2),
@@ -3068,6 +3100,7 @@ mod tests {
                         bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
                     ),
                     max_value: 50_000,
+                    taproot_outputs: Vec::new(),
                 },
             ],
         }
@@ -3082,6 +3115,15 @@ mod tests {
         assert_eq!(pb.entries[0].tweak.len(), 33, "33-byte compressed tweak");
         assert_eq!(pb.entries[0].txid.len(), 32, "txid present");
         assert_eq!(pb.entries[0].max_value, 1_000);
+        // Enriched entry's taproot outputs pass through to the wire.
+        assert_eq!(pb.entries[0].taproot_outputs.len(), 1);
+        assert_eq!(pb.entries[0].taproot_outputs[0].vout, 0);
+        assert_eq!(pb.entries[0].taproot_outputs[0].output_pubkey.len(), 32);
+        assert_eq!(pb.entries[0].taproot_outputs[0].value, 1_000);
+        assert!(
+            pb.entries[1].taproot_outputs.is_empty(),
+            "un-enriched entry carries no outputs"
+        );
     }
 
     #[test]
@@ -3102,6 +3144,9 @@ mod tests {
             assert!(e.txid.is_empty(), "txid stripped under tweaks_only");
             assert_eq!(e.max_value, 0, "max_value stripped under tweaks_only");
         }
+        // Outputs are what a `tweak_outputs` subscriber asked for; `tweaks_only`
+        // strips txid/max_value but must not strip them.
+        assert_eq!(pb.entries[0].taproot_outputs.len(), 1);
         assert!(!pb.filtered, "tweaks_only alone is not a dust filter");
     }
 
@@ -3113,6 +3158,11 @@ mod tests {
             tweak: test_pubkey(3),
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32])),
             max_value: 77_000,
+            taproot_outputs: vec![node::events::SpTaprootOutput {
+                vout: 2,
+                output_key: [0xC3; 32],
+                value: 77_000,
+            }],
         };
         let pb = mempool_tweak_to_proto(&sp);
         let entry = pb.entry.expect("entry present");
@@ -3122,6 +3172,12 @@ mod tests {
         use bitcoin::hashes::Hash as _;
         assert_eq!(entry.txid, sp.txid.as_raw_hash().to_byte_array().to_vec());
         assert_eq!(entry.max_value, 77_000);
+        // A mempool tweak always carries the tx's taproot outputs (internal
+        // byte order, unreversed) so a match is confirmed without a fetch.
+        assert_eq!(entry.taproot_outputs.len(), 1);
+        assert_eq!(entry.taproot_outputs[0].vout, 2);
+        assert_eq!(entry.taproot_outputs[0].output_pubkey, [0xC3; 32].to_vec());
+        assert_eq!(entry.taproot_outputs[0].value, 77_000);
     }
 
     #[tokio::test]

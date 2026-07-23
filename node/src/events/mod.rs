@@ -27,7 +27,8 @@ pub mod watch;
 
 pub use envelope::{
     BlockTweaks, Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody,
-    SetCursorOutcome, SpTweakEntry, ALL_CATEGORIES_DEFAULT, CATEGORY_CHAIN, CATEGORY_HEARTBEAT,
+    SetCursorOutcome, SpTaprootOutput, SpTweakEntry, ALL_CATEGORIES_DEFAULT, CATEGORY_CHAIN,
+    CATEGORY_HEARTBEAT,
     CATEGORY_MEMPOOL, CATEGORY_TWEAKS, EXPLICIT_ONLY_CATEGORIES, TWEAKS_TX_INDEX,
 };
 pub use publisher::{

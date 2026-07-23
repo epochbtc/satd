@@ -753,9 +753,15 @@ message TweakEntry {
   bytes  tweak     = 1;  // 33-byte compressed public tweak T = input_hash · A (always present)
   bytes  txid      = 2;  // omitted under tweaks_only
   uint64 max_value = 3;  // largest eligible output value in sats; omitted under tweaks_only
+  repeated TaprootOutput taproot_outputs = 4; // scan candidates; always on MempoolTweak, opt-in on BlockTweaks
+}
+message TaprootOutput {            // one of the transaction's taproot outputs — a scan candidate
+  uint32 vout          = 1;
+  bytes  output_pubkey = 2;  // 32-byte x-only key, INTERNAL byte order (do not reverse)
+  uint64 value         = 3;  // sats
 }
 message MempoolTweak {             // NodeEvent body 30 — one per SP-eligible admission (Tier 1.5)
-  TweakEntry entry = 1;            // always full: txid required for confirm-time dedup (tweaks_only n/a)
+  TweakEntry entry = 1;            // always full: txid + taproot_outputs required for confirm-free matching
 }
 ```
 
@@ -814,6 +820,15 @@ admission with the same kernel the index uses, so a mempool tweak and its later
   via `BlockTweaks` — no gap, just confirmation-latency for the missed window.
 - **Dust floor.** `tweak_dust_limit` applies: a `MempoolTweak` whose `max_value`
   is below the floor is dropped (a single-entry event has no `filtered` flag).
+- **Self-sufficient — carries the outputs.** A `MempoolTweak` entry always
+  includes the transaction's `taproot_outputs` (each `vout`, 32-byte x-only key,
+  and value). A client scanning `T` derives its candidate `P_k` and confirms the
+  match against these keys **in the event itself** — no `getrawtransaction`,
+  which for an unconfirmed tx races eviction/replacement (you could get the
+  signal but find the tx already gone). The outputs are public the moment the tx
+  hits the mempool, so this discloses nothing new, and the node already
+  enumerated them to compute `max_value`. Keys are internal byte order —
+  compare directly against a derived key with no reversal.
 - **Zero cost when unused.** The node computes a mempool tweak only while a
   `mempool_tweaks` subscriber is attached; otherwise admission does no EC work.
 

@@ -107,6 +107,16 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   The SDK exposes it as `SubscribeOptions::mempool_tweaks` and typed
   `Event::MempoolTweak`. Off by default: a node with no tweak-firehose subscriber
   does no extra work, and the mempool event path is byte-identical to before.
+- Silent payments (BIP 352): tweak events can now carry the transaction's
+  taproot outputs (`TweakEntry.taproot_outputs` — each `vout`, 32-byte x-only
+  key, value), so a client confirms a derived output key against the actual
+  on-chain output without fetching the transaction. Always populated on a
+  `MempoolTweak` (there is no block to fall back to, and a `getrawtransaction`
+  for an unconfirmed tx races eviction); opt-in per subscription for
+  `BlockTweaks` via `tweak_outputs` (the confirmed firehose stays lean by
+  default — the block is the fallback). The outputs are dropped by the on-disk
+  index (no size increase, no reindex) and re-derived at serve time. SDK:
+  `TweakEntry::taproot_outputs` and `SubscribeOptions::tweak_outputs`.
 
 ## Releases
 

@@ -122,6 +122,12 @@ impl SpBlockRow {
                 txid,
                 tweak,
                 max_taproot_value,
+                // The per-output list is deliberately NOT persisted (the row
+                // codec above stores only txid/tweak/max_value to keep the index
+                // lean). An index-decoded entry therefore carries no outputs; a
+                // `BlockTweaks` subscriber that wants them opts in and the
+                // carrier re-derives them from the block.
+                taproot_outputs: Vec::new(),
             });
         }
         Ok(Self {
@@ -182,17 +188,51 @@ mod tests {
                     txid: Txid::from_byte_array([0x22; 32]),
                     tweak: sample_tweak(),
                     max_taproot_value: Amount::from_sat(1_000),
+                    taproot_outputs: Vec::new(),
                 },
                 TweakEntry {
                     txid: Txid::from_byte_array([0x33; 32]),
                     tweak: sample_tweak(),
                     max_taproot_value: Amount::from_sat(2_100_000_000_000_000),
+                    taproot_outputs: Vec::new(),
                 },
             ],
         );
         let bytes = row.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 2 * ENTRY_LEN);
         assert_eq!(SpBlockRow::decode(&bytes).unwrap(), row);
+    }
+
+    #[test]
+    fn codec_does_not_persist_taproot_outputs() {
+        // Outputs on a freshly-computed entry (mempool path) must NOT bloat the
+        // on-disk row: encoding is the fixed 73-byte layout and a decoded entry
+        // carries an empty output list.
+        let with_outputs = TweakEntry {
+            txid: Txid::from_byte_array([0x44; 32]),
+            tweak: sample_tweak(),
+            max_taproot_value: Amount::from_sat(7_000),
+            taproot_outputs: vec![node_sp_index_taproot_output(0, [0x55; 32], 7_000)],
+        };
+        let row = SpBlockRow::new(BlockHash::from_byte_array([0x66; 32]), vec![with_outputs]);
+        let bytes = row.encode();
+        // Fixed-size entry — the output list added nothing on the wire.
+        assert_eq!(bytes.len(), HEADER_LEN + ENTRY_LEN);
+        let decoded = SpBlockRow::decode(&bytes).unwrap();
+        assert!(decoded.entries[0].taproot_outputs.is_empty());
+        assert_eq!(decoded.entries[0].max_taproot_value, Amount::from_sat(7_000));
+    }
+
+    fn node_sp_index_taproot_output(
+        vout: u32,
+        output_key: [u8; 32],
+        value: u64,
+    ) -> crate::TaprootOutput {
+        crate::TaprootOutput {
+            vout,
+            output_key,
+            value: Amount::from_sat(value),
+        }
     }
 
     #[test]

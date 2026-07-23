@@ -611,6 +611,11 @@ mod tests {
             txid,
             tweak: pk,
             max_taproot_value: bitcoin::Amount::from_sat(50_000),
+            taproot_outputs: vec![node_sp_index::TaprootOutput {
+                vout: 0,
+                output_key: [byte; 32],
+                value: bitcoin::Amount::from_sat(50_000),
+            }],
         }
     }
 
@@ -713,6 +718,11 @@ mod tests {
                     e.txid,
                     Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([1; 32]))
                 );
+                // The mempool tweak carries the tx's taproot outputs end-to-end
+                // (source → cache → publish), so a client confirms the match at
+                // admission without fetching the tx.
+                assert_eq!(e.taproot_outputs.len(), 1);
+                assert_eq!(e.taproot_outputs[0].output_key, [1; 32]);
             }
             other => panic!("expected MempoolTweak, got {other:?}"),
         }

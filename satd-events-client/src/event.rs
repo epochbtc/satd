@@ -127,6 +127,21 @@ pub struct ScriptPrefix {
     pub bits: u32,
 }
 
+/// One of a transaction's taproot outputs — a scan candidate. Carried in
+/// [`TweakEntry::taproot_outputs`] so a client can confirm a derived output key
+/// against the actual on-chain output without fetching the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaprootOutput {
+    /// Output index within the transaction.
+    pub vout: u32,
+    /// 32-byte x-only taproot output key, internal (consensus) byte order — the
+    /// raw `scriptPubKey` push, unreversed. Compare it directly against a
+    /// derived `P_k.x_only_public_key().serialize()` with no byte flip.
+    pub output_pubkey: Vec<u8>,
+    /// Output value in satoshis.
+    pub value: u64,
+}
+
 /// One transaction's public silent-payment tweak, carried in a
 /// [`Event::BlockTweaks`] for Tier 1 client-side scanning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +158,12 @@ pub struct TweakEntry {
     /// on what a payment here could be worth, for client-side dust triage. `0`
     /// under `tweaks_only`.
     pub max_value: u64,
+    /// The transaction's taproot outputs (the scan candidates). Always populated
+    /// on a [`Event::MempoolTweak`] — the whole point of Tier 1.5, since there
+    /// is no block to fetch to recover them. On a [`Event::BlockTweaks`] entry it
+    /// is present only when the subscription set `tweak_outputs`; empty
+    /// otherwise (the confirmed block is the fallback).
+    pub taproot_outputs: Vec<TaprootOutput>,
 }
 
 /// A spent prevout that matched a prefix bucket (the spend side of a
@@ -761,6 +782,11 @@ impl From<pb::NodeEvent> for Event {
                         tweak: e.tweak,
                         txid: e.txid,
                         max_value: e.max_value,
+                        taproot_outputs: e
+                            .taproot_outputs
+                            .into_iter()
+                            .map(taproot_output_from_proto)
+                            .collect(),
                     })
                     .collect(),
                 filtered: b.filtered,
@@ -772,6 +798,11 @@ impl From<pb::NodeEvent> for Event {
                         tweak: e.tweak,
                         txid: e.txid,
                         max_value: e.max_value,
+                        taproot_outputs: e
+                            .taproot_outputs
+                            .into_iter()
+                            .map(taproot_output_from_proto)
+                            .collect(),
                     })
                     // A well-formed MempoolTweak always carries its entry; an
                     // absent one (malformed wire) degrades to an empty entry
@@ -780,6 +811,7 @@ impl From<pb::NodeEvent> for Event {
                         tweak: Vec::new(),
                         txid: Vec::new(),
                         max_value: 0,
+                        taproot_outputs: Vec::new(),
                     }),
             },
             Body::SilentPaymentMatched(s) => Event::SilentPaymentMatched {
@@ -804,6 +836,16 @@ impl From<pb::NodeEvent> for Event {
             #[allow(unreachable_patterns)]
             _ => Event::Unknown,
         }
+    }
+}
+
+/// Map a proto [`pb::TaprootOutput`] to the client [`TaprootOutput`]. Bytes are
+/// carried through unchanged (x-only key, internal byte order).
+fn taproot_output_from_proto(o: pb::TaprootOutput) -> TaprootOutput {
+    TaprootOutput {
+        vout: o.vout,
+        output_pubkey: o.output_pubkey,
+        value: o.value,
     }
 }
 
