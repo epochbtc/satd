@@ -377,12 +377,24 @@ pub struct SpTaprootOutput {
 }
 
 impl SpTaprootOutput {
-    fn from_index(o: &node_sp_index::TaprootOutput) -> Self {
+    /// Build from the kernel's [`node_sp_index::TaprootOutput`].
+    pub fn from_index(o: &node_sp_index::TaprootOutput) -> Self {
         Self {
             vout: o.vout,
             output_key: o.output_key,
             value: o.value.to_sat(),
         }
+    }
+
+    /// Enumerate a transaction's taproot outputs as scan candidates — the
+    /// block-derived form the streaming carrier uses to enrich a `tweak_outputs`
+    /// `BlockTweaks` entry (the lean on-chain index does not persist them). Keeps
+    /// the `node_sp_index` dependency on the `node` side of the carrier boundary.
+    pub fn from_tx(tx: &bitcoin::Transaction) -> Vec<Self> {
+        node_sp_index::taproot_outputs(tx)
+            .iter()
+            .map(Self::from_index)
+            .collect()
     }
 }
 

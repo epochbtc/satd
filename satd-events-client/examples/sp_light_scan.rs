@@ -25,10 +25,10 @@
 //! **mempool admission** as well as at confirmation — mempool-latency detection
 //! with the scan key still on the device. A `MempoolTweak` **always** carries
 //! `taproot_outputs` (there is no block to fall back to, and fetching an
-//! unconfirmed tx races eviction), so the mempool match is always confirmed
-//! in-band; the confirmed `BlockTweaks` entries stay lean here (set
-//! `tweak_outputs` to carry the outputs there too). A mempool hit and its later
-//! confirmed hit share a txid, so a real scanner dedups on `entry.txid`.
+//! unconfirmed tx races eviction); it also sets `tweak_outputs`, so the confirmed
+//! `BlockTweaks` entries carry them too — both paths confirm the match in-band.
+//! A mempool hit and its later confirmed hit share a txid, so a real scanner
+//! dedups on `entry.txid`.
 //!
 //! Requires the default `bitcoin` feature.
 //!
@@ -64,15 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
     // Request ONLY the tweaks category (bit 8, explicit — not in the default),
-    // and opt into mempool-time tweaks so payments surface at admission too. A
-    // `MempoolTweak` carries the transaction's taproot outputs, so its match is
-    // confirmed in-band below; the lean `BlockTweaks` entries do not (set
-    // `tweak_outputs` to include them there too), so the block path falls back to
-    // printing the candidate key for the wallet to look up against the block.
+    // opt into mempool-time tweaks so payments surface at admission too, and set
+    // `tweak_outputs` so confirmed `BlockTweaks` entries carry the transaction's
+    // taproot outputs as well. With that, both streams confirm a match in-band —
+    // no block/tx fetch. (A `MempoolTweak` carries its outputs regardless; drop
+    // `tweak_outputs` and the block path falls back to the candidate key below.)
     let mut events = client
         .subscribe(SubscribeOptions {
             categories: Categories::TWEAKS,
             mempool_tweaks: true,
+            tweak_outputs: true,
             ..Default::default()
         })
         .await?;

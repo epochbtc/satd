@@ -71,6 +71,16 @@ pub struct SubscribeOptions {
     /// replayable, so a missed admission is caught at confirmation via
     /// [`Event::BlockTweaks`](crate::Event::BlockTweaks).
     pub mempool_tweaks: bool,
+    /// Include the transaction's taproot outputs on each
+    /// [`Event::BlockTweaks`](crate::Event::BlockTweaks) entry
+    /// ([`TweakEntry::taproot_outputs`](crate::TweakEntry::taproot_outputs)), so
+    /// a match is confirmed against the on-chain output without fetching the
+    /// block. `false` (default) keeps the confirmed firehose lean. A modifier on
+    /// the [`TWEAKS`](Categories::TWEAKS) category — the server rejects it if that
+    /// bit is not set, or if the node has no block source. A
+    /// [`MempoolTweak`](crate::Event::MempoolTweak) carries its outputs
+    /// regardless of this flag.
+    pub tweak_outputs: bool,
 }
 
 impl SubscribeOptions {
@@ -88,6 +98,7 @@ impl SubscribeOptions {
             // byte-identical to one built before these knobs existed.
             tweaks_only: self.tweaks_only.then_some(true),
             mempool_tweaks: self.mempool_tweaks.then_some(true),
+            tweak_outputs: self.tweak_outputs.then_some(true),
             ..Default::default()
         }
     }
@@ -992,6 +1003,28 @@ mod tests {
 
     fn next(rx: &mut mpsc::Receiver<pb::SubscribeControl>) -> Msg {
         rx.try_recv().expect("a control message was sent").msg.expect("msg set")
+    }
+
+    #[test]
+    fn subscribe_options_map_tweak_knobs_only_when_set() {
+        // A default subscription sends no tweak knobs (byte-identical to one
+        // built before they existed); each flag maps to Some(true) when set.
+        let default = SubscribeOptions { categories: Categories::TWEAKS, ..Default::default() }
+            .into_request();
+        assert_eq!(default.mempool_tweaks, None);
+        assert_eq!(default.tweak_outputs, None);
+
+        let full = SubscribeOptions {
+            categories: Categories::TWEAKS,
+            mempool_tweaks: true,
+            tweak_outputs: true,
+            tweaks_only: true,
+            ..Default::default()
+        }
+        .into_request();
+        assert_eq!(full.mempool_tweaks, Some(true));
+        assert_eq!(full.tweak_outputs, Some(true));
+        assert_eq!(full.tweaks_only, Some(true));
     }
 
     #[tokio::test]
