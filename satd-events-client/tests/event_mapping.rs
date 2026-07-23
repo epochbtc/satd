@@ -323,3 +323,19 @@ fn block_tweaks_maps_entries() {
         other => panic!("expected BlockTweaks, got {other:?}"),
     }
 }
+
+#[test]
+fn mempool_tweak_maps_to_typed_event() {
+    // Tier 1.5: a mempool tweak carries a single, always-full entry.
+    let ev = node_event(pb::node_event::Body::MempoolTweak(pb::MempoolTweak {
+        entry: Some(pb::TweakEntry { tweak: vec![0x03; 33], txid: vec![0x77; 32], max_value: 33_000 }),
+    }));
+    match Event::from(ev) {
+        Event::MempoolTweak { entry } => {
+            assert_eq!(entry.tweak, vec![0x03; 33]);
+            assert_eq!(entry.txid, vec![0x77; 32], "txid always present on a mempool tweak");
+            assert_eq!(entry.max_value, 33_000);
+        }
+        other => panic!("expected MempoolTweak, got {other:?}"),
+    }
+}

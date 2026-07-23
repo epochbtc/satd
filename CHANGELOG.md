@@ -98,6 +98,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   runnable examples — `sp_light_scan.rs` (client-side scan off the tweaks
   firehose, scan key never sent) and `sp_wallet.rs` (scan-key watch, deriving
   each match's spending key offline from `tweak` + `k`).
+- Silent payments (BIP 352): mempool-time tweak firehose ("Tier 1.5"). The node
+  computes the public tweak `T = input_hash·A` at mempool admission and emits it
+  as a `MempoolTweak` on the gRPC streaming firehose, so a zero-custody (Tier 1)
+  client detects payments to it at mempool latency without uploading a scan key.
+  Opt-in per subscription (`mempool_tweaks`, requires the `TWEAKS` category bit);
+  best-effort and ephemeral — no cursor/replay, no retraction on RBF or eviction.
+  The SDK exposes it as `SubscribeOptions::mempool_tweaks` and typed
+  `Event::MempoolTweak`. Off by default: a node with no tweak-firehose subscriber
+  does no extra work, and the mempool event path is byte-identical to before.
 
 ## Releases
 

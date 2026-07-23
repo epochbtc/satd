@@ -62,6 +62,15 @@ pub struct SubscribeOptions {
     /// tweak (no `txid`/`max_value`), minimizing bytes for a pure client-side
     /// scan. Only meaningful with the [`TWEAKS`](Categories::TWEAKS) category.
     pub tweaks_only: bool,
+    /// Mempool-time tweaks ("Tier 1.5"): when `true`, the server additionally
+    /// streams an [`Event::MempoolTweak`](crate::Event::MempoolTweak) at each
+    /// SP-eligible transaction's admission, for mempool-latency detection without
+    /// uploading a scan key. A modifier on the [`TWEAKS`](Categories::TWEAKS)
+    /// category — the server rejects it if that bit is not set. `false` (default)
+    /// = block tweaks only. Ephemeral and best-effort: mempool tweaks are not
+    /// replayable, so a missed admission is caught at confirmation via
+    /// [`Event::BlockTweaks`](crate::Event::BlockTweaks).
+    pub mempool_tweaks: bool,
 }
 
 impl SubscribeOptions {
@@ -78,6 +87,7 @@ impl SubscribeOptions {
             // Send the flag only when set, so a default subscription is
             // byte-identical to one built before these knobs existed.
             tweaks_only: self.tweaks_only.then_some(true),
+            mempool_tweaks: self.mempool_tweaks.then_some(true),
             ..Default::default()
         }
     }

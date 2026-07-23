@@ -22,6 +22,11 @@
 //! The `tweaks` category requires the node's tweak index (`silentpaymentindex=1`)
 //! and is not part of the default category set — request it explicitly.
 //!
+//! This example also sets `mempool_tweaks` (Tier 1.5), so it scans each payment
+//! at **mempool admission** as well as at confirmation — mempool-latency
+//! detection with the scan key still on the device. A mempool hit and its later
+//! confirmed hit share a txid, so a real scanner dedups on `entry.txid`.
+//!
 //! Requires the default `bitcoin` feature.
 //!
 //! ```sh
@@ -29,7 +34,9 @@
 //! ```
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
-use satd_events_client::{display_hex, Categories, Event, StreamClient, SubscribeOptions};
+use satd_events_client::{
+    display_hex, Categories, Event, StreamClient, SubscribeOptions, TweakEntry,
+};
 
 /// How many outputs per transaction to probe (`k = 0..N`). A real scanner keeps
 /// going until a `k` misses; a couple is plenty to illustrate.
@@ -53,39 +60,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spend_pubkey = PublicKey::from_secret_key(&secp, &b_spend);
 
     let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
-    // Request ONLY the tweaks category (bit 8, explicit — not in the default).
+    // Request ONLY the tweaks category (bit 8, explicit — not in the default),
+    // and opt into mempool-time tweaks so payments surface at admission too.
     let mut events = client
         .subscribe(SubscribeOptions {
             categories: Categories::TWEAKS,
+            mempool_tweaks: true,
             ..Default::default()
         })
         .await?;
 
     while let Some(event) = events.message().await? {
-        if let Event::BlockTweaks { height, entries, .. } = event {
-            for entry in &entries {
-                for k in 0..PROBE_K {
-                    let candidates =
-                        derive_candidates(&secp, &b_scan, &spend_pubkey, &b_spend, &entry.tweak, k, LABELS)?;
-                    for c in candidates {
-                        let lbl = match c.label {
-                            Some(m) => format!(" label={m}"),
-                            None => String::new(),
-                        };
-                        // The scriptPubKey a wallet would look for on-chain is the
-                        // P2TR wrapping `output_key`; the spend key is a *candidate*
-                        // until that output is confirmed present.
-                        println!(
-                            "block {height} tx {} tweak {}.. k={k}{lbl}: candidate output key {} \
-                             (candidate spend key {})",
-                            display_hex(&entry.txid),
-                            &hex(&entry.tweak)[..12],
-                            hex(&c.output_key),
-                            hex(&c.spend_key),
-                        );
-                    }
+        match event {
+            // Confirmed: one entry per SP-eligible tx in the connected block.
+            Event::BlockTweaks { height, entries, .. } => {
+                for entry in &entries {
+                    scan_entry(&secp, &b_scan, &spend_pubkey, &b_spend, entry, &format!("block {height}"))?;
                 }
             }
+            // Mempool (Tier 1.5): one accepted-but-unconfirmed tx. Same scan;
+            // dedup against the later BlockTweaks hit on `entry.txid`.
+            Event::MempoolTweak { entry } => {
+                scan_entry(&secp, &b_scan, &spend_pubkey, &b_spend, &entry, "mempool")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Run the client-side scan over one tweak entry, printing each candidate. Shared
+/// by the confirmed (`BlockTweaks`) and mempool (`MempoolTweak`) paths — the
+/// cryptography is identical; only `where_` (the log prefix) differs.
+fn scan_entry(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    b_scan: &SecretKey,
+    spend_pubkey: &PublicKey,
+    b_spend: &SecretKey,
+    entry: &TweakEntry,
+    where_: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for k in 0..PROBE_K {
+        let candidates =
+            derive_candidates(secp, b_scan, spend_pubkey, b_spend, &entry.tweak, k, LABELS)?;
+        for c in candidates {
+            let lbl = match c.label {
+                Some(m) => format!(" label={m}"),
+                None => String::new(),
+            };
+            // The scriptPubKey a wallet would look for on-chain is the P2TR
+            // wrapping `output_key`; the spend key is a *candidate* until that
+            // output is confirmed present.
+            println!(
+                "{where_} tx {} tweak {}.. k={k}{lbl}: candidate output key {} \
+                 (candidate spend key {})",
+                display_hex(&entry.txid),
+                &hex(&entry.tweak)[..12],
+                hex(&c.output_key),
+                hex(&c.spend_key),
+            );
         }
     }
     Ok(())

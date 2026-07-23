@@ -486,6 +486,20 @@ pub enum Event {
         /// "filtered out", not "none present").
         filtered: bool,
     },
+    /// One accepted-but-unconfirmed transaction's silent-payment tweak — the
+    /// Tier 1.5 (mempool-time, zero-custody) firehose payload. Arrives only for a
+    /// subscription that set the [`TWEAKS`](crate::Categories::TWEAKS) category
+    /// bit **and** [`SubscribeOptions::mempool_tweaks`](crate::SubscribeOptions::mempool_tweaks).
+    /// Scan it exactly like a [`BlockTweaks`](Event::BlockTweaks) entry — compute
+    /// `T · b_scan` and derive the candidate output key(s) — for mempool-latency
+    /// detection. Ephemeral and best-effort: not replayable, no retraction on
+    /// RBF/eviction; dedup by `entry.txid` (always present) against the confirmed
+    /// `BlockTweaks`. See [`examples/sp_light_scan.rs`].
+    MempoolTweak {
+        /// The admitted transaction's tweak. Always full (`txid` present) —
+        /// `tweaks_only` does not apply to mempool tweaks.
+        entry: TweakEntry,
+    },
     /// A BIP 352 silent payment paid a registered scan key — the Tier 2
     /// (scan-key watch, convenience) match, delivered on the `Watch` stream to a
     /// connection that registered the target via
@@ -750,6 +764,23 @@ impl From<pb::NodeEvent> for Event {
                     })
                     .collect(),
                 filtered: b.filtered,
+            },
+            Body::MempoolTweak(m) => Event::MempoolTweak {
+                entry: m
+                    .entry
+                    .map(|e| TweakEntry {
+                        tweak: e.tweak,
+                        txid: e.txid,
+                        max_value: e.max_value,
+                    })
+                    // A well-formed MempoolTweak always carries its entry; an
+                    // absent one (malformed wire) degrades to an empty entry
+                    // rather than dropping the event.
+                    .unwrap_or(TweakEntry {
+                        tweak: Vec::new(),
+                        txid: Vec::new(),
+                        max_value: 0,
+                    }),
             },
             Body::SilentPaymentMatched(s) => Event::SilentPaymentMatched {
                 scan_pubkey: s.scan_pubkey,
