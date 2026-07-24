@@ -1,3 +1,4 @@
+mod alert;
 mod config;
 mod fast_start;
 mod notify;
@@ -685,6 +686,12 @@ async fn main() {
     // of claiming success. Handed to `ReloadHandles` further down.
     let mut reorg_webhook_handle: Option<reload::SharedWebhook> = None;
 
+    // Shared per-hook delivery counters, rendered on `/metrics`. Created here
+    // because both the legacy reorg hook (below) and the alertfile dispatcher
+    // (further down) register into it; a node with neither configured leaves it
+    // empty, and an empty registry renders nothing.
+    let webhook_metrics = Arc::new(node::metrics::WebhookMetrics::new());
+
     // Open reorg log + webhook dispatcher. Failure is non-fatal — the node
     // still runs, just without persistent reorg history (and, since reorgs are
     // then not recorded, without webhook delivery either).
@@ -704,7 +711,18 @@ async fn main() {
                 Arc::new(parking_lot::RwLock::new(reload::webhook_target_from(&config)));
             let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
             reorg_log.set_webhook_sender(tx);
-            tokio::spawn(reorg_webhook_dispatcher(shared.clone(), rx));
+            // On the API runtime, not the consensus core: this task does
+            // outbound HTTP to an endpoint satd does not control, and the
+            // previous placement (a plain `tokio::spawn` here) put that on the
+            // same runtime as block connection.
+            {
+                let _api_guard = api_handle.enter();
+                tokio::spawn(alert::legacy_reorg_dispatcher(
+                    shared.clone(),
+                    rx,
+                    webhook_metrics.hook(alert::LEGACY_REORG_HOOK_ID),
+                ));
+            }
             chain_state.attach_reorg_log(reorg_log);
             reorg_webhook_handle = Some(shared);
         }
@@ -2164,6 +2182,43 @@ async fn main() {
         }
     };
 
+    // Outbound alert webhooks (`alertfile=`). The dispatcher is a plain event-bus
+    // consumer: it starts only when a file is configured, so a node without one
+    // spawns no tasks and its `/metrics` page is unchanged.
+    //
+    // A bad alertfile is fatal AT STARTUP (the operator explicitly configured
+    // alerting; coming up "successfully" with none is the failure they would
+    // notice last), but only a warning on SIGHUP, where the last-good set keeps
+    // running.
+    let alert_reloader = config.alertfile.clone().map(|path| {
+        std::sync::Arc::new(alert::AlertReloader::new(
+            path,
+            api_handle.clone(),
+            event_publisher.clone(),
+            chain_state.store_ref().clone() as std::sync::Arc<dyn node::storage::Store>,
+            // Block source for a hook's startup catch-up replay: read-only
+            // active-chain access, the same handle the streaming carriers use.
+            Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
+            webhook_metrics.clone(),
+            shutdown_rx.clone(),
+        ))
+    });
+    if let Some(reloader) = &alert_reloader {
+        match reloader.apply() {
+            Ok(hooks) => tracing::info!(
+                target: "alert",
+                hooks,
+                path = %reloader.path().display(),
+                "alertfile loaded",
+            ),
+            Err(e) => {
+                tracing::error!(target: "alert", error = %e, "alertfile is unusable");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Start MCP server if enabled
     if config.mcp {
         let mcp_ctx = std::sync::Arc::new(satd_mcp::McpContext {
@@ -2178,6 +2233,7 @@ async fn main() {
             addr_enabled: config.addressindex,
             addr_subs: Some(address_index_concrete.subscription_registry()),
             health: health_state.clone(),
+            webhooks: Some(webhook_metrics.clone()),
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.
@@ -2288,6 +2344,7 @@ async fn main() {
             addr_subs: Some(address_index_concrete.subscription_registry()),
             addr_enabled: config.addressindex,
             health: health_state.clone(),
+            webhooks: Some(webhook_metrics.clone()),
         };
         let rx = shutdown_rx.clone();
         api_handle.spawn(async move {
@@ -3088,6 +3145,7 @@ async fn main() {
         rpc_auth: auth.clone(),
         token_store: token_store.clone(),
         alert_thresholds: alert_thresholds.clone(),
+        alert_reloader: alert_reloader.clone(),
     };
     loop {
         tokio::select! {
@@ -3425,92 +3483,6 @@ fn reload_tls_certificates() {
         }
     }
     tracing::info!(reloaded, failed, "TLS certificate reload complete");
-}
-
-/// Forwards reorg records to the configured HTTP webhook. Best effort —
-/// failures are logged and dropped. Never blocks the consensus path:
-/// the only backpressure is the channel itself, which `ReorgLog::record`
-/// `try_send`s into (full queue = silent drop, counted).
-///
-/// The target (URL + optional signing secret) is read from `webhook` per
-/// record, so a SIGHUP reload that changes or removes it takes effect on the
-/// next reorg without restarting this task. When the target is `None` the
-/// record is drained and dropped (no webhook configured).
-async fn reorg_webhook_dispatcher(
-    webhook: reload::SharedWebhook,
-    mut rx: tokio::sync::mpsc::Receiver<node::chain::reorg_log::ReorgRecord>,
-) {
-    use reqwest::header::{HeaderMap, HeaderValue};
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to build reorg webhook HTTP client");
-            return;
-        }
-    };
-    tracing::info!("Reorg webhook dispatcher started");
-    while let Some(record) = rx.recv().await {
-        // Snapshot the live target. `None` => no webhook configured right now;
-        // drop the record. The guard is released before any `.await`.
-        let target = match webhook.read().clone() {
-            Some(t) => t,
-            None => continue,
-        };
-        let url = target.url;
-        let secret = target.secret;
-
-        let body = match serde_json::to_vec(&record) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to serialize reorg record for webhook");
-                continue;
-            }
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        if let Some(ref key) = secret {
-            let sig = hmac_sha256_hex(key.as_bytes(), &body);
-            if let Ok(h) = HeaderValue::from_str(&format!("sha256={}", sig)) {
-                headers.insert("X-Satd-Signature", h);
-            }
-        }
-
-        // Simple retry loop: 3 attempts with jittered backoff. A failing
-        // webhook must not back up consensus, so we stop after 3 and move
-        // on to the next record.
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match client
-                .post(&url)
-                .headers(headers.clone())
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => break,
-                Ok(r) => {
-                    tracing::warn!(status = %r.status(), attempt, "Reorg webhook returned non-2xx");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, attempt, "Reorg webhook request failed");
-                }
-            }
-            if attempt >= 3 {
-                break;
-            }
-            let backoff_ms = 200u64 * (1 << (attempt - 1));
-            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-        }
-    }
-    tracing::info!("Reorg webhook dispatcher stopped");
 }
 
 /// Address-index backfill supervisor. Owns serialization (one runner
@@ -3912,10 +3884,3 @@ async fn persist_sp_failed_with_cleanup(
     }
 }
 
-fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
-    let mut hmac: HmacEngine<sha256::Hash> = HmacEngine::new(key);
-    hmac.input(msg);
-    let out = Hmac::<sha256::Hash>::from_engine(hmac);
-    hex::encode(out.to_byte_array())
-}

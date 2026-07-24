@@ -47,6 +47,7 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         addr_subs: ctx.addr_subs.clone(),
         addr_enabled: ctx.addr_enabled,
         health: ctx.health.clone(),
+        webhooks: ctx.webhooks.clone(),
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
@@ -82,6 +83,7 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         // Readiness reads only chain heights; the health gauges are not
         // consulted, so there is nothing to thread through here.
         health: None,
+        webhooks: None,
     };
     let (ready, reason) = match metrics_ctx.is_ready() {
         Ok(()) => (true, None),

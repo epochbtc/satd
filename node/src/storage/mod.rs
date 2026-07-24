@@ -845,4 +845,24 @@ pub trait Store: Send + Sync {
             "write_sp_backfill_last_error not supported on this backend".into(),
         ))
     }
+
+    /// Read a webhook hook's durable resume cursor from metadata, by its
+    /// `alertwebhook.cursor.<id>` key. `None` when the hook has never acked a
+    /// cursor-bearing delivery (a fresh hook starts at the live head).
+    ///
+    /// Deliberately narrow rather than a generic metadata get/put: the alert
+    /// dispatcher is the only writer, and a general "write any key into the
+    /// chainstate metadata CF" accessor is an invitation to collide with the
+    /// index markers that share it.
+    fn read_alert_cursor(&self, _key: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Persist a webhook hook's resume cursor. Default: error, so a non-Rocks
+    /// backend fails loud rather than silently losing at-least-once delivery.
+    fn write_alert_cursor(&self, _key: &[u8], _value: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "write_alert_cursor not supported on this backend".into(),
+        ))
+    }
 }

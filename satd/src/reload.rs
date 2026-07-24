@@ -181,6 +181,10 @@ pub struct ReloadHandles {
     /// are rotatable live (the cookie is preserved). Shared with every RPC
     /// listener surface, so a reload covers all of them at once.
     pub rpc_auth: Arc<RpcAuth>,
+    /// Alertfile dispatcher, present only when `alertfile=` is set. Re-read on
+    /// every SIGHUP independently of the rest of the config, so editing a hook
+    /// in place takes effect — the `TokenStore` precedent.
+    pub alert_reloader: Option<Arc<crate::alert::AlertReloader>>,
     /// Health-detector raise thresholds. Always present (the detector task is
     /// always configured, even when every threshold is 0), so a threshold
     /// change always has somewhere to land.
@@ -416,8 +420,13 @@ const LOAD_ONLY_KEYS: &[&str] = &[
 ///
 /// `policyfile`: the transaction-filtering ruleset — re-read, recompiled, swapped,
 /// and re-placed live (path change, in-place content edit, and removal all live).
+///
+/// `alertfile`: the outbound webhook set — re-read, re-validated, and the
+/// dispatcher generation replaced. A parse/permission error keeps the last-good
+/// dispatcher running (silently losing alerting after a typo is the worse
+/// failure); the *path* itself is restart-only.
 #[allow(dead_code)]
-const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile"];
+const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile", "alertfile"];
 
 /// Build the field-disposition table. Constructed at call time (once per
 /// reload) so the non-capturing `diff`/`apply` closures coerce to `fn`
@@ -986,6 +995,25 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
                 error = %e,
                 path = %store.path().display(),
                 "auth token file reload failed — keeping the last-good token table"
+            ),
+        }
+    }
+
+    // Outbound alert webhooks, same precedent: re-read the file's *contents*
+    // on every SIGHUP, even when the path is unchanged. A failure keeps the
+    // last-good dispatcher — an operator whose edit did not apply reads it in
+    // the log, whereas an operator whose alerting silently stopped finds out
+    // the next time something breaks.
+    if let Some(reloader) = &handles.alert_reloader {
+        match reloader.apply() {
+            Ok(hooks) => tracing::info!(
+                hooks,
+                path = %reloader.path().display(),
+                "alertfile reloaded"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "alertfile reload failed — keeping the last-good webhook set"
             ),
         }
     }
