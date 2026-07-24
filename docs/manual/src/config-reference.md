@@ -408,6 +408,7 @@ the taxonomy and the details each event carries.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
+| `alertfile` | none | path restart, contents hot | satd | TOML file describing outbound alert webhooks. Must be mode `0600` — it holds signing secrets. The *path* is read once at startup; the file's *contents* are re-read on every SIGHUP, so a hook can be added, edited, or removed live. A parse error keeps the last-good hook set. See [Observability → Alert webhooks](observability.md#alert-webhooks). |
 | `alerttipstallseconds` | `3600` | hot | satd | Raise `tip_stall` after this many seconds with no connected block. Suppressed during initial block download, and cleared the moment a block connects — or, if you raise this value past the current tip age, on the next detector poll. |
 | `alertdiskfreemb` | `10240` | hot | satd | Raise `disk_low` below this many MiB free on the blocks directory (or the data directory when `blocksdir` is not split out). Clears at 1.5× the floor, or as soon as you lower the floor below the current reading. |
 | `alertmempoolfullpct` | `90` | hot | satd | Raise `mempool_congested` at this percentage of `maxmempool`. Clears below 75 % of the raise line, or as soon as you raise the threshold above the current occupancy. Values above 100 are clamped. |

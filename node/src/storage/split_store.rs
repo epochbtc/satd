@@ -89,6 +89,17 @@ impl Store for SplitStore {
         self.block_store.get_cumulative_tx_count(hash)
     }
 
+    // Webhook resume cursors live with the block index in the shared store, for
+    // the same reason cumulative tx counts do: they must survive the
+    // snapshot→background handoff, which replaces the coins store.
+    fn read_alert_cursor(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.block_store.read_alert_cursor(key)
+    }
+
+    fn write_alert_cursor(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.block_store.write_alert_cursor(key, value)
+    }
+
     fn chain_tx_backfill_complete(&self) -> bool {
         self.block_store.chain_tx_backfill_complete()
     }

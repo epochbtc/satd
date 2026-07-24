@@ -1,0 +1,32 @@
+[package]
+name = "satd-alert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# Operator-alerting core: alertfile parsing/validation, the webhook delivery
+# contract (headers + HMAC signature), and the retry policy. Deliberately
+# depends on NO async runtime or HTTP client — `reqwest` and the dispatcher task
+# live in the `satd` binary, so everything here is a pure function or a plain
+# data type and is unit-testable without a socket. Mirrors `satd-auth`.
+#
+# The one heavyweight dependency is `node`, and it is deliberate: the health-
+# event taxonomy (kinds, severities, category bits) has exactly one definition,
+# and an alertfile's `kinds`/`categories`/`min_severity` are validated against
+# it rather than against a copy that could drift.
+[dependencies]
+node = { path = "../node" }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Parse-only, like satd-auth: the `display` default feature pulls an
+# unpublished toml_writer and nothing here round-trips the file.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+tempfile = "3"

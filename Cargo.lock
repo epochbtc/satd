@@ -4081,6 +4081,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "reqwest",
+ "satd-alert",
  "satd-auth",
  "satd-events",
  "satd-events-client",
@@ -4098,6 +4099,21 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "satd-alert"
+version = "0.4.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "node",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]
