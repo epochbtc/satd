@@ -1266,6 +1266,16 @@ impl Store for RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .delete_cf(&cf, key)
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;

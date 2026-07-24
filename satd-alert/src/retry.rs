@@ -69,7 +69,11 @@ pub fn classify_response(status: Option<u16>) -> Disposition {
         Some(408) | Some(429) => Disposition::Retry,
         Some(s) if (500..600).contains(&s) => Disposition::Retry,
         // Every other 4xx is the receiver saying this request is wrong, and it
-        // will be just as wrong next time.
+        // will be just as wrong next time. 3xx lands here too: the delivery
+        // client does not follow redirects (a followed redirect would carry the
+        // signed body to a host the alertfile never named), so a redirecting
+        // endpoint is a misconfiguration to fix in the alertfile, not something
+        // to retry into.
         Some(_) => Disposition::Drop,
     }
 }
@@ -104,6 +108,15 @@ mod tests {
         // A misconfigured receiver must not pin the head of the queue and
         // convert every later event into an overflow drop.
         for s in [400, 401, 403, 404, 410, 422] {
+            assert_eq!(classify_response(Some(s)), Disposition::Drop, "{s}");
+        }
+    }
+
+    #[test]
+    fn redirects_are_dropped_because_they_are_never_followed() {
+        // The delivery client sets `Policy::none()`, so a 3xx arrives here
+        // rather than being chased to a host the alertfile never named.
+        for s in [301, 302, 303, 307, 308] {
             assert_eq!(classify_response(Some(s)), Disposition::Drop, "{s}");
         }
     }

@@ -100,6 +100,10 @@ impl Store for SplitStore {
         self.block_store.write_alert_cursor(key, value)
     }
 
+    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.block_store.delete_alert_cursor(key)
+    }
+
     fn chain_tx_backfill_complete(&self) -> bool {
         self.block_store.chain_tx_backfill_complete()
     }

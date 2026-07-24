@@ -42,6 +42,17 @@ pub trait BlockCursorSource: Send + Sync {
     /// Current active-chain tip height.
     fn current_tip_height(&self) -> u32;
 
+    /// Whether the node is still in initial block download.
+    ///
+    /// Not used by replay itself — it is here because the webhook dispatcher
+    /// needs to suppress its firehose during IBD and already holds this handle;
+    /// threading a second chain reference through the dispatcher's five
+    /// constructor layers to answer one boolean is worse. Defaults to `false`
+    /// so test doubles and any other implementor are unaffected.
+    fn in_initial_block_download(&self) -> bool {
+        false
+    }
+
     /// Active-chain block hashes for the heights in `[from, to]` (inclusive),
     /// height-ascending. Resolved by walking the active chain back from the tip
     /// **once** (O(tip − from), not O(span²)) so it is reorg-safe: it follows
@@ -58,6 +69,10 @@ impl BlockCursorSource for crate::chain::state::ChainState {
         // Inherent method on ChainState; no clash since the trait method
         // has a distinct name.
         self.tip_height()
+    }
+
+    fn in_initial_block_download(&self) -> bool {
+        self.is_initial_block_download()
     }
 
     fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {

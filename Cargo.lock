@@ -4089,6 +4089,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tikv-jemallocator",
  "tls-config",

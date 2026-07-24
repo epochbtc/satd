@@ -865,4 +865,17 @@ pub trait Store: Send + Sync {
             "write_alert_cursor not supported on this backend".into(),
         ))
     }
+
+    /// Forget a hook's resume cursor.
+    ///
+    /// Called when a hook disappears from the alertfile. Without it the key
+    /// outlives the hook forever, and hook ids are reused (`pager`, `alerts`,
+    /// `ops`) — so pointing a *new* endpoint at an old id would greet it with
+    /// the entire replay window of history belonging to its predecessor, with
+    /// no way to reset short of a reindex.
+    fn delete_alert_cursor(&self, _key: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError::Database(
+            "delete_alert_cursor not supported on this backend".into(),
+        ))
+    }
 }
