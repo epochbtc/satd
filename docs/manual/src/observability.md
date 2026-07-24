@@ -60,10 +60,10 @@ one through three surfaces at once, so they can never disagree:
 | Condition | Severity | Raises when | Clears when |
 |---|---|---|---|
 | `ibd_complete` | info | initial block download finishes | one-shot |
-| `tip_stall` | critical | no block connected for `alerttipstallseconds`, outside IBD | the next block connects |
-| `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor |
-| `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line |
-| `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s | at or above the floor for 60 s |
+| `tip_stall` | critical | no block connected for `alerttipstallseconds`, outside IBD | the next block connects, or the threshold no longer considers the tip stalled |
+| `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor, or the floor is lowered below the current reading |
+| `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line, or the threshold is raised above the current occupancy |
+| `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
 | `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks | one-shot |
 
 Every standing condition raises **once** on entry and clears **once** on
@@ -76,10 +76,29 @@ they are one-shot and never clear.
 Thresholds are configured with the `alert*` keys in the
 [Configuration Reference](config-reference.md#health-alerts); all of them are
 hot-reloadable, and setting one to `0` disables that detector. Each event
-carries a `details` map with the numbers behind it (free bytes and the path,
+carries a `details` map with the numbers behind it (free bytes and the floor,
 seconds since the last block and the tip height, the reorg's true depth and
 fork height, the mempool's current `mempoolminfee`), so an alert is actionable
-without a follow-up query.
+without a follow-up query. The watched *path* is deliberately not in the event —
+it goes to every `status` subscriber and into push-notification bodies, and an
+absolute datadir path usually names the account it runs under. The node logs it
+instead.
+
+**Retuning a threshold always clears its own alert.** The gap between each raise
+and clear line stops a value hovering at the threshold from flapping, but it
+would otherwise trap the operator who raises a threshold *because* the alert is
+firing: the unchanged reading lands between the new raise line and the new clear
+line, where neither fires. So a standing condition also clears when the
+threshold moves such that it would no longer raise. Without this,
+`mempool_congested` in particular was inescapable — `alertmempoolfullpct` clamps
+at 100 and the clear line is 75 % of the raise line, so past 75 % occupancy no
+setting could clear it.
+
+`alertpeerfloor` defaults to `3` on mainnet and testnet4, and to `0`
+(disabled) on regtest and signet, where running with no peers at all is normal
+rather than a fault. On the networks where it is active it does not raise until
+90 s after startup or the node's first peer, whichever comes first, so a node
+that is still dialing out does not page anyone on the way up.
 
 **Durability.** Health events are not replayable: they carry no resume cursor,
 and a `from_cursor` reconnect never yields one. Instead the detectors

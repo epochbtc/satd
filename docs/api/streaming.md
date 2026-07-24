@@ -958,6 +958,22 @@ re-raise the ones still standing, which is what makes health alerting
 at-least-once across a restart. A condition that both raised and fully cleared
 while a consumer was away is stale by definition and is not reconstructed.
 
+**`details` keys by kind.** Values are strings. Most are decimal numbers, but
+not all — parse per key rather than assuming the whole map is numeric.
+
+| Kind | Keys |
+|---|---|
+| `ibd_complete` | `height` |
+| `tip_stall` | raise: `seconds_since_block`, `threshold_seconds`, `tip_height`. Cleared by a block: `height`. Cleared by the poll: `seconds_since_block`, `threshold_seconds` |
+| `disk_low` | `free_bytes`, `threshold_bytes`; `clear_threshold_bytes` when cleared by recovered space |
+| `mempool_congested` | `bytes_used`, `bytes_cap`, `threshold_pct`, `mempoolminfee_sat_per_kvb` (raise only) |
+| `peer_floor` | `peers`, `peers_outbound`, `peers_inbound`, `threshold` (raise only) |
+| `deep_reorg` | `depth`, `from_height`, `to_height`, `fork_height` |
+
+Any kind may additionally carry `reason` — a non-numeric token, currently only
+`detector_disabled`, on a `cleared` event emitted because the operator turned
+the detector off rather than because the condition recovered.
+
 **Additive by construction.** `details` is a string map and `StatusKind` is an
 open enum: new kinds and new detail keys ship without a schema bump (§4). A
 consumer must tolerate an unrecognized `kind` — `message` and `severity` remain

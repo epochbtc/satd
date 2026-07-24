@@ -408,10 +408,10 @@ the taxonomy and the details each event carries.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `alerttipstallseconds` | `3600` | hot | satd | Raise `tip_stall` after this many seconds with no connected block. Suppressed during initial block download, and cleared the moment a block connects. |
-| `alertdiskfreemb` | `10240` | hot | satd | Raise `disk_low` below this many MiB free on the blocks directory (or the data directory when `blocksdir` is not split out). Clears at 1.5× the floor. |
-| `alertmempoolfullpct` | `90` | hot | satd | Raise `mempool_congested` at this percentage of `maxmempool`. Clears below 75 % of the raise line. Values above 100 are clamped. |
-| `alertpeerfloor` | `3` | hot | satd | Raise `peer_floor` below this many connected peers (inbound + outbound). The count must hold for 60 s in either direction, so ordinary peer churn does not page you. |
+| `alerttipstallseconds` | `3600` | hot | satd | Raise `tip_stall` after this many seconds with no connected block. Suppressed during initial block download, and cleared the moment a block connects — or, if you raise this value past the current tip age, on the next detector poll. |
+| `alertdiskfreemb` | `10240` | hot | satd | Raise `disk_low` below this many MiB free on the blocks directory (or the data directory when `blocksdir` is not split out). Clears at 1.5× the floor, or as soon as you lower the floor below the current reading. |
+| `alertmempoolfullpct` | `90` | hot | satd | Raise `mempool_congested` at this percentage of `maxmempool`. Clears below 75 % of the raise line, or as soon as you raise the threshold above the current occupancy. Values above 100 are clamped. |
+| `alertpeerfloor` | `3` (`0` on regtest/signet) | hot | satd | Raise `peer_floor` below this many connected peers (inbound + outbound). The count must hold for 60 s in either direction, so ordinary peer churn does not page you, and it does not raise until 90 s after startup or the first peer, whichever is sooner. Defaults to disabled on regtest and signet, where a node with no peers is normal. |
 | `alertreorgdepth` | `3` | hot | satd | Emit the one-shot `deep_reorg` event for a reorg that rolls back at least this many blocks. |
 
 > **Note.** The `*notify` shell hooks (`blocknotify`, `alertnotify`,
