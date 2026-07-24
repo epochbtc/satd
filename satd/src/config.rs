@@ -1008,6 +1008,21 @@ pub struct Config {
     /// node warning, with `%s` replaced by the warning text. `None` = no
     /// dispatcher. Read once at startup (restart to change), like Core.
     pub alert_notify: Option<String>,
+    /// Health detector: raise `tip_stall` after this many seconds with no
+    /// connected block, outside IBD. `0` disables the detector. SIGHUP-live.
+    pub alert_tip_stall_seconds: u64,
+    /// Health detector: raise `disk_low` below this many MiB free on the
+    /// watched data/blocks directory. `0` disables. SIGHUP-live.
+    pub alert_disk_free_mb: u64,
+    /// Health detector: raise `mempool_congested` at this percentage of the
+    /// mempool byte cap. `0` disables. SIGHUP-live.
+    pub alert_mempool_full_pct: u64,
+    /// Health detector: raise `peer_floor` below this many connected peers.
+    /// `0` disables. SIGHUP-live.
+    pub alert_peer_floor: u64,
+    /// Health detector: emit `deep_reorg` for a reorg at least this many
+    /// blocks deep. `0` disables. SIGHUP-live.
+    pub alert_reorg_depth: u64,
     /// Bitcoin Core `-startupnotify=<cmd>`: a shell command run once after
     /// the node finishes starting up (no `%s` substitution). `None` = no
     /// hook. The supported alternative is a systemd `ExecStartPost=`.
@@ -3247,6 +3262,26 @@ impl Config {
                 .or_else(|| file_get("reorgwebhooksecret")),
             block_notify: cli.blocknotify.clone().or_else(|| file_get("blocknotify")),
             alert_notify: cli.alertnotify.clone().or_else(|| file_get("alertnotify")),
+            alert_tip_stall_seconds: cli
+                .alert_tip_stall_seconds
+                .or_else(|| file_get("alerttipstallseconds").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::health::defaults::TIP_STALL_SECS),
+            alert_disk_free_mb: cli
+                .alert_disk_free_mb
+                .or_else(|| file_get("alertdiskfreemb").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::health::defaults::DISK_FREE_MB),
+            alert_mempool_full_pct: cli
+                .alert_mempool_full_pct
+                .or_else(|| file_get("alertmempoolfullpct").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::health::defaults::MEMPOOL_FULL_PCT),
+            alert_peer_floor: cli
+                .alert_peer_floor
+                .or_else(|| file_get("alertpeerfloor").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::health::defaults::PEER_FLOOR),
+            alert_reorg_depth: cli
+                .alert_reorg_depth
+                .or_else(|| file_get("alertreorgdepth").and_then(|v| v.parse().ok()))
+                .unwrap_or(node::health::defaults::REORG_DEPTH),
             startup_notify: cli.startupnotify.clone().or_else(|| file_get("startupnotify")),
             shutdown_notify: cli
                 .shutdownnotify
@@ -5113,6 +5148,41 @@ pub struct CliArgs {
     pub reorg_webhook_secret: Option<String>,
 
     #[arg(
+        long = "alerttipstallseconds",
+        value_name = "SECS",
+        help = "Raise the tip_stall health alert after this many seconds with no connected block, outside IBD (default 3600; 0 disables)"
+    )]
+    pub alert_tip_stall_seconds: Option<u64>,
+
+    #[arg(
+        long = "alertdiskfreemb",
+        value_name = "MIB",
+        help = "Raise the disk_low health alert below this many MiB free on the data/blocks directory (default 10240; 0 disables)"
+    )]
+    pub alert_disk_free_mb: Option<u64>,
+
+    #[arg(
+        long = "alertmempoolfullpct",
+        value_name = "PCT",
+        help = "Raise the mempool_congested health alert at this percentage of the mempool byte cap (default 90; 0 disables)"
+    )]
+    pub alert_mempool_full_pct: Option<u64>,
+
+    #[arg(
+        long = "alertpeerfloor",
+        value_name = "N",
+        help = "Raise the peer_floor health alert below this many connected peers (default 3; 0 disables)"
+    )]
+    pub alert_peer_floor: Option<u64>,
+
+    #[arg(
+        long = "alertreorgdepth",
+        value_name = "BLOCKS",
+        help = "Emit the deep_reorg health alert for a reorg at least this many blocks deep (default 3; 0 disables)"
+    )]
+    pub alert_reorg_depth: Option<u64>,
+
+    #[arg(
         long = "fast-start",
         value_name = "URL",
         help = "AssumeUTXO: download a UTXO snapshot from URL and load it at startup (https:// or a local file path). The snapshot is verified against satd's hardcoded anchor hash; a bad file is rejected. Incompatible with -prune."
@@ -6135,6 +6205,12 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "shutdownnotify",
     "reorgwebhook",
     "reorgwebhooksecret",
+    // Health-alert detector thresholds (A3)
+    "alerttipstallseconds",
+    "alertdiskfreemb",
+    "alertmempoolfullpct",
+    "alertpeerfloor",
+    "alertreorgdepth",
     // MCP
     "mcp",
     "mcpport",
@@ -6770,6 +6846,71 @@ rpcport=8332
     }
 
     #[test]
+    fn health_alert_threshold_defaults_and_parsing() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("satd-alert-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Defaults come from the single source of truth in `node::health`, so
+        // the config layer and the detector can never disagree about them.
+        let cli =
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+                .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.alert_tip_stall_seconds, 3_600);
+        assert_eq!(cfg.alert_disk_free_mb, 10_240);
+        assert_eq!(cfg.alert_mempool_full_pct, 90);
+        assert_eq!(cfg.alert_peer_floor, 3);
+        assert_eq!(cfg.alert_reorg_depth, 3);
+
+        // Explicit CLI values parse through, including 0 (= detector off),
+        // which must not be swallowed by the `unwrap_or(default)`.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--alerttipstallseconds",
+            "7200",
+            "--alertdiskfreemb",
+            "0",
+            "--alertmempoolfullpct",
+            "75",
+            "--alertpeerfloor",
+            "0",
+            "--alertreorgdepth",
+            "6",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.alert_tip_stall_seconds, 7_200);
+        assert_eq!(cfg.alert_disk_free_mb, 0, "0 must disable, not fall back");
+        assert_eq!(cfg.alert_mempool_full_pct, 75);
+        assert_eq!(cfg.alert_peer_floor, 0, "0 must disable, not fall back");
+        assert_eq!(cfg.alert_reorg_depth, 6);
+    }
+
+    #[test]
+    fn health_alert_keys_are_known_and_parse_from_the_config_file() {
+        for key in [
+            "alerttipstallseconds",
+            "alertdiskfreemb",
+            "alertmempoolfullpct",
+            "alertpeerfloor",
+            "alertreorgdepth",
+        ] {
+            assert!(is_known_config_key(key), "{key} should be a known key");
+        }
+        let cf = ConfigFile::parse("alerttipstallseconds=120\nalertpeerfloor=1\n")
+            .expect("alert threshold keys should parse from bitcoin.conf");
+        assert_eq!(
+            cf.global.get("alerttipstallseconds").unwrap().last().unwrap(),
+            "120"
+        );
+        assert_eq!(cf.global.get("alertpeerfloor").unwrap().last().unwrap(), "1");
+    }
+
+    #[test]
     fn policy_engine_config_defaults_and_parsing() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("satd-policy-cfg-{}", std::process::id()));
@@ -7255,6 +7396,11 @@ rpcport=8332
             shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            alert_tip_stall_seconds: None,
+            alert_disk_free_mb: None,
+            alert_mempool_full_pct: None,
+            alert_peer_floor: None,
+            alert_reorg_depth: None,
             fast_start: None,
             fast_start_sha256: None,
             events_node_id: None,
@@ -7534,6 +7680,11 @@ rpcport=8332
             shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            alert_tip_stall_seconds: None,
+            alert_disk_free_mb: None,
+            alert_mempool_full_pct: None,
+            alert_peer_floor: None,
+            alert_reorg_depth: None,
             fast_start: None,
             fast_start_sha256: None,
             events_node_id: None,

@@ -46,6 +46,7 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         // address-index state, not a hardcoded "disabled" / zero.
         addr_subs: ctx.addr_subs.clone(),
         addr_enabled: ctx.addr_enabled,
+        health: ctx.health.clone(),
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
@@ -78,6 +79,9 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         version: env!("CARGO_PKG_VERSION"),
         addr_subs: None,
         addr_enabled: false,
+        // Readiness reads only chain heights; the health gauges are not
+        // consulted, so there is nothing to thread through here.
+        health: None,
     };
     let (ready, reason) = match metrics_ctx.is_ready() {
         Ok(()) => (true, None),

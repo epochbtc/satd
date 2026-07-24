@@ -126,6 +126,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   not replayable (no cursor — detectors re-raise standing conditions after a
   restart). Wire schema only in this change; the detectors that emit them land
   next.
+- Alerting: node-health detectors. satd now watches six conditions about itself
+  — stalled tip, low disk, congested mempool, peer starvation, IBD completion,
+  deep reorg — and reports each through three surfaces at once: a `status`
+  streaming event, an entry in `getwarnings` (which fires the Core-compatible
+  `alertnotify` hook), and a `satd_alert_active{kind}` gauge. Standing
+  conditions raise once and clear once, with hysteresis so a value sitting on
+  the threshold does not flap. Five new hot-reloadable thresholds
+  (`alerttipstallseconds=3600`, `alertdiskfreemb=10240`,
+  `alertmempoolfullpct=90`, `alertpeerfloor=3`, `alertreorgdepth=3`); `0`
+  disables a detector. Two new gauges close longstanding observability gaps
+  independently of alerting: `satd_tip_last_connect_age_seconds` and
+  `satd_disk_free_bytes`.
 
 ## Releases
 

@@ -2102,6 +2102,68 @@ async fn main() {
         "RPC server listening"
     );
 
+    // Node-health detectors (A3). Always on: the conditions they watch are the
+    // ones an operator gets paged about, the poll is a handful of atomic reads
+    // plus one statvfs every 15s, and nothing leaves the node unless a `status`
+    // subscriber or a webhook asks. Individual detectors are disabled by
+    // setting their threshold to 0.
+    //
+    // Spawned on the API runtime, never the consensus core: a stall detector
+    // whose poll can be delayed by block connection is the one thing it must
+    // not be. The thresholds live behind an Arc so SIGHUP can retune them
+    // without a restart.
+    let alert_thresholds = std::sync::Arc::new(node::health::AlertThresholds::new(
+        config.alert_tip_stall_seconds,
+        config.alert_disk_free_mb,
+        config.alert_mempool_full_pct,
+        config.alert_peer_floor,
+        config.alert_reorg_depth,
+    ));
+    let health_state = match chain_state.subscribe_chain_events() {
+        Some(chain_rx) => {
+            let _api_guard = api_handle.enter();
+            let state = node::health::spawn_health_detectors(
+                node::health::HealthInputs {
+                    chain_state: chain_state.clone(),
+                    mempool: mempool.clone(),
+                    peer_manager: peer_manager.clone(),
+                    publisher: event_publisher.clone(),
+                    warnings: chain_state.warnings().clone(),
+                    thresholds: alert_thresholds.clone(),
+                    // Watch whatever directory actually grows. With a split
+                    // `-blocksdir` that is the blocks volume, which is the one
+                    // that fills; the chainstate volume rarely does.
+                    disk_watch_path: config
+                        .blocksdir
+                        .clone()
+                        .unwrap_or_else(|| net_datadir.clone()),
+                },
+                chain_rx,
+                shutdown_rx.clone(),
+            );
+            tracing::info!(
+                target: "health",
+                tip_stall_seconds = config.alert_tip_stall_seconds,
+                disk_free_mb = config.alert_disk_free_mb,
+                mempool_full_pct = config.alert_mempool_full_pct,
+                peer_floor = config.alert_peer_floor,
+                reorg_depth = config.alert_reorg_depth,
+                "health detectors started",
+            );
+            Some(state)
+        }
+        None => {
+            // No chain-event broadcast means no block-connect signal, so
+            // `tip_stall` could never clear and `deep_reorg` could never fire.
+            // Running half the detectors would be worse than running none.
+            tracing::warn!(
+                target: "health",
+                "chain-event broadcast unavailable; health detectors not started"
+            );
+            None
+        }
+    };
+
     // Start MCP server if enabled
     if config.mcp {
         let mcp_ctx = std::sync::Arc::new(satd_mcp::McpContext {
@@ -2115,6 +2177,7 @@ async fn main() {
             mempool_history: mempool_history.clone(),
             addr_enabled: config.addressindex,
             addr_subs: Some(address_index_concrete.subscription_registry()),
+            health: health_state.clone(),
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.
@@ -2224,6 +2287,7 @@ async fn main() {
             version: env!("CARGO_PKG_VERSION"),
             addr_subs: Some(address_index_concrete.subscription_registry()),
             addr_enabled: config.addressindex,
+            health: health_state.clone(),
         };
         let rx = shutdown_rx.clone();
         api_handle.spawn(async move {
@@ -3023,6 +3087,7 @@ async fn main() {
         webhook: reorg_webhook_handle,
         rpc_auth: auth.clone(),
         token_store: token_store.clone(),
+        alert_thresholds: alert_thresholds.clone(),
     };
     loop {
         tokio::select! {
