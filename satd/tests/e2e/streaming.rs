@@ -1898,6 +1898,53 @@ async fn ws_status_tip_stall_raises_then_clears_on_next_block() {
     );
 }
 
+/// A firing `tip_stall` clears when the operator raises the threshold above the
+/// current tip age — without waiting for a block.
+///
+/// The fast clear is event-driven, but a node that is genuinely not receiving
+/// blocks has no event to clear on. Retuning the threshold live is the
+/// documented way to quiet such an alert, so the poll path has to honour the new
+/// level in both directions; otherwise the warning, the gauge, and the stream
+/// state stay raised until a block that may be a long way off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_tip_stall_clears_when_the_threshold_is_raised() {
+    // `alerttipstallseconds` stays off the command line so SIGHUP can move it:
+    // startup CLI args remain authoritative across reloads. Its default (1h)
+    // does not fire inside the test.
+    let sn = start_streaming_async(vec![
+        "--alertdiskfreemb=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+        "--alertreorgdepth=0",
+    ])
+    .await;
+    mine_n(&sn, 1).await;
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    set_alert_threshold(&sn, "alerttipstallseconds", "1").await;
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "raised");
+
+    // Raise the threshold past the current age. No block is mined: the clear
+    // must come from the poll noticing the new level.
+    set_alert_threshold(&sn, "alerttipstallseconds", "86400").await;
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "cleared");
+    assert_eq!(ev["body"]["details"]["threshold_seconds"], "86400", "event: {ev}");
+    assert!(
+        !warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        "clearing the status must retract the warning",
+    );
+}
+
 /// `disk_low` raises when free space drops under the configured floor — and
 /// the floor is retunable live, without a restart.
 ///
@@ -1911,8 +1958,13 @@ async fn ws_status_tip_stall_raises_then_clears_on_next_block() {
 async fn ws_status_disk_low_raises_after_a_live_threshold_change() {
     // `alertdiskfreemb` is deliberately NOT passed on the command line: SIGHUP
     // re-reads only the config file, with the startup CLI args still
-    // authoritative, so a CLI-pinned value could never be retuned. Its default
-    // (10 GiB) does not fire on any machine that can build satd.
+    // authoritative, so a CLI-pinned value could never be retuned.
+    //
+    // PRECONDITION: the host needs **more than 10 GiB free** on /tmp. This test
+    // drives a raise by moving the threshold, so it needs `disk_low` to start
+    // clear — and the default floor is 10 GiB. On a fuller disk the alert is
+    // already raised at startup, `raise_if_new` is a no-op, and this fails as a
+    // bare 45-second websocket timeout with nothing pointing at the cause.
     let sn = start_streaming_async(vec![
         "--alerttipstallseconds=0",
         "--alertmempoolfullpct=0",
@@ -1937,7 +1989,15 @@ async fn ws_status_disk_low_raises_after_a_live_threshold_change() {
     assert_eq!(ev["body"]["severity"], "critical", "event: {ev}");
     // The actionable numbers ride in `details`, not only in the message.
     assert!(ev["body"]["details"]["free_bytes"].is_string(), "event: {ev}");
-    assert!(ev["body"]["details"]["path"].is_string(), "event: {ev}");
+    assert!(ev["body"]["details"]["threshold_bytes"].is_string(), "event: {ev}");
+    // The watched path is deliberately NOT on the wire: this event reaches
+    // every `status` subscriber and any push-notification body, and an absolute
+    // datadir path usually names the account satd runs under. It goes to the
+    // node's log instead.
+    assert!(
+        ev["body"]["details"]["path"].is_null(),
+        "the datadir path must not be exposed on the wire: {ev}"
+    );
     assert!(warning_ids(&sn).await.contains(&"alert.disk_low".to_string()));
 }
 
@@ -1998,8 +2058,13 @@ async fn ws_status_deep_reorg_reports_true_depth() {
 async fn ws_status_absent_from_the_default_category_mask() {
     // `alertdiskfreemb` is deliberately NOT passed on the command line: SIGHUP
     // re-reads only the config file, with the startup CLI args still
-    // authoritative, so a CLI-pinned value could never be retuned. Its default
-    // (10 GiB) does not fire on any machine that can build satd.
+    // authoritative, so a CLI-pinned value could never be retuned.
+    //
+    // PRECONDITION: the host needs **more than 10 GiB free** on /tmp. This test
+    // drives a raise by moving the threshold, so it needs `disk_low` to start
+    // clear — and the default floor is 10 GiB. On a fuller disk the alert is
+    // already raised at startup, `raise_if_new` is a no-op, and this fails as a
+    // bare 45-second websocket timeout with nothing pointing at the cause.
     let sn = start_streaming_async(vec![
         "--alerttipstallseconds=0",
         "--alertmempoolfullpct=0",

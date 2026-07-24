@@ -370,8 +370,26 @@ fn metric(
     labels: &[(&str, &str)],
     value: u64,
 ) {
+    metric_header(out, name, help, kind);
+    metric_sample(out, name, labels, value);
+}
+
+/// Emit the `# HELP` / `# TYPE` pair for a metric family, once.
+///
+/// The text format permits **one** such pair per family name. [`metric`] writes
+/// a header with every sample, which is correct only for a single-series
+/// family; calling it in a loop emits repeated headers, and a strict parser
+/// (`promtool check metrics`, and the `expfmt` text parser several collectors
+/// and relays use) hard-errors on the second `# HELP` and discards the *entire
+/// page* — taking every unrelated satd metric down with it. For a multi-series
+/// family call this once, then [`metric_sample`] per series.
+fn metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// Emit one sample of an already-headered metric family.
+fn metric_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
     if labels.is_empty() {
         let _ = writeln!(out, "{name} {value}");
     } else {
@@ -421,15 +439,19 @@ fn render_health_metrics(out: &mut String, health: Option<&crate::health::Health
             free,
         );
     }
+    metric_header(
+        out,
+        "satd_alert_active",
+        "1 while a node-health condition is raised, 0 while it is clear.",
+        "gauge",
+    );
     for kind in crate::events::StatusKind::ALL {
         if kind.is_edge() {
             continue;
         }
-        metric(
+        metric_sample(
             out,
             "satd_alert_active",
-            "1 while a node-health condition is raised, 0 while it is clear.",
-            "gauge",
             &[("kind", kind.as_str())],
             u64::from(health.is_active(kind)),
         );
@@ -781,6 +803,44 @@ mod tests {
         let mut out = String::new();
         render_health_metrics(&mut out, None);
         assert!(out.is_empty(), "no detector ⇒ no health metrics:\n{out}");
+    }
+
+    /// Assert a rendered page is valid Prometheus text format on the one rule
+    /// that is easy to break and fatal when broken: at most one `# HELP` and
+    /// one `# TYPE` per family name.
+    ///
+    /// Strict parsers (`promtool check metrics`, `expfmt.TextParser`) reject
+    /// the whole page on a duplicate, so one careless family takes every other
+    /// satd metric down with it. Prometheus's own scrape parser is lenient,
+    /// which is exactly why this is worth a test rather than a scrape check.
+    fn assert_one_header_per_family(out: &str) {
+        use std::collections::HashMap;
+        let mut helps: HashMap<&str, usize> = HashMap::new();
+        let mut types: HashMap<&str, usize> = HashMap::new();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                *helps.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                *types.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            }
+        }
+        for (name, n) in helps {
+            assert_eq!(n, 1, "family {name} has {n} `# HELP` lines:\n{out}");
+        }
+        for (name, n) in types {
+            assert_eq!(n, 1, "family {name} has {n} `# TYPE` lines:\n{out}");
+        }
+    }
+
+    #[test]
+    fn health_metrics_are_valid_exposition_format() {
+        // `satd_alert_active` is one family with a series per kind, so the
+        // header must be emitted once and the samples must follow it.
+        let health = crate::health::HealthState::new();
+        health.set_disk_free_for_test(Some(1 << 30));
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert_one_header_per_family(&out);
     }
 
     #[test]

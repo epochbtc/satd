@@ -94,12 +94,46 @@ impl NodeWarnings {
 
     /// Record a warning. If `id` is already active, increment count
     /// and refresh `last_seen`, `severity`, `message`, `context`.
+    ///
+    /// `-alertnotify` fires only the first time an id becomes active. For a
+    /// standing condition that is what you want; for a repeating *edge*
+    /// observation use [`record_recurring`](Self::record_recurring).
     pub fn record(
         &self,
         id: &str,
         severity: Severity,
         message: impl Into<String>,
         context: serde_json::Value,
+    ) {
+        self.record_inner(id, severity, message, context, false);
+    }
+
+    /// Record a warning that fires `-alertnotify` on **every** occurrence, not
+    /// just the first.
+    ///
+    /// For edge observations, where each occurrence is a distinct event rather
+    /// than a restatement of a standing condition. `deep_reorg` records a
+    /// warning that never clears, so under the plain first-time-only rule only
+    /// the first reorg of a process would reach the hook — every later and
+    /// possibly much deeper one would be silent there while the streaming and
+    /// webhook surfaces reported it.
+    pub fn record_recurring(
+        &self,
+        id: &str,
+        severity: Severity,
+        message: impl Into<String>,
+        context: serde_json::Value,
+    ) {
+        self.record_inner(id, severity, message, context, true);
+    }
+
+    fn record_inner(
+        &self,
+        id: &str,
+        severity: Severity,
+        message: impl Into<String>,
+        context: serde_json::Value,
+        notify_repeats: bool,
     ) {
         let now = unix_secs();
         let message: String = message.into();
@@ -130,7 +164,10 @@ impl NodeWarnings {
         // each `DoWarning`; deduping by id avoids flooding the hook with
         // identical repeats). The send is non-blocking and best-effort: a
         // dropped receiver (hook task gone) just no-ops.
-        if is_new {
+        //
+        // `notify_repeats` opts an id out of that dedup — see
+        // `record_recurring`.
+        if is_new || notify_repeats {
             let guard = self.alert_tx.lock();
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(format!("[{}] {}: {}", severity.as_str(), id, message));

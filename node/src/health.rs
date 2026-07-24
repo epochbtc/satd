@@ -79,6 +79,14 @@ pub mod hysteresis {
     /// disconnects, the manager dials a replacement within seconds); alerting
     /// on the instantaneous count would be noise.
     pub const PEER_HOLD: Duration = Duration::from_secs(60);
+
+    /// Grace from detector start until the node's first peer, during which
+    /// `peer_floor` does not raise. Outbound connections are dialed
+    /// concurrently with the rest of startup and the poll's first tick fires
+    /// immediately, so without a grace every node alerts once on the way up.
+    /// The grace ends at the first peer, so it does not blunt the alert for a
+    /// node that connects and *later* loses its peers.
+    pub const PEER_STARTUP_GRACE: Duration = Duration::from_secs(90);
 }
 
 /// Operator-tunable raise thresholds, shared with the SIGHUP reload path.
@@ -109,8 +117,26 @@ pub mod defaults {
     pub const DISK_FREE_MB: u64 = 10_240;
     /// Percent of the mempool byte cap.
     pub const MEMPOOL_FULL_PCT: u64 = 90;
-    /// Connected peers.
+    /// Connected peers, on a network where a node is expected to have some.
     pub const PEER_FLOOR: u64 = 3;
+
+    /// The `peer_floor` default for `network`.
+    ///
+    /// Disabled on regtest and signet. A regtest node is routinely run entirely
+    /// alone, and a signet node is often a single private instance — on both,
+    /// "fewer than 3 peers" is the normal operating state, not a fault, so the
+    /// default would raise a critical warning that can never clear. That
+    /// warning drives `getwarnings`, `-alertnotify`, and the TUI's blocking
+    /// modal, which is a poor greeting for every developer's first run.
+    ///
+    /// Mainnet and testnet4 keep the real floor: there, a peer-starved node
+    /// genuinely is broken.
+    pub fn peer_floor_for(network: bitcoin::Network) -> u64 {
+        match network {
+            bitcoin::Network::Regtest | bitcoin::Network::Signet => 0,
+            _ => PEER_FLOOR,
+        }
+    }
     /// Blocks rolled back.
     pub const REORG_DEPTH: u64 = 3;
 }
@@ -204,6 +230,19 @@ pub struct HealthState {
     /// "not yet sampled / unavailable", which the renderer skips rather than
     /// reporting a misleading zero.
     disk_free_bytes: AtomicU64,
+    /// The threshold value in force when each condition was raised, indexed as
+    /// `active`. Read by [`clear_if_threshold_relaxed`] to tell "the reading
+    /// recovered" apart from "the operator moved the line".
+    raised_at_threshold: [AtomicU64; StatusKind::ALL.len()],
+    /// Latched once the node has been observed out of initial block download.
+    /// See the IBD guard in [`check_tip_stall`]: `is_initial_block_download()`
+    /// can flip back to `true` on a long-stalled node, which would otherwise
+    /// permanently freeze that detector.
+    left_ibd: AtomicBool,
+    /// Latched once the node has had at least one peer. Gates the
+    /// `peer_floor` hold clock so a node that has not finished dialing out yet
+    /// does not alert on a startup transient.
+    saw_first_peer: AtomicBool,
 }
 
 /// Sentinel for "no disk reading yet" — distinct from a genuine zero-free-space
@@ -260,6 +299,14 @@ impl HealthState {
 
     fn set_active(&self, kind: StatusKind, on: bool) {
         self.slot(kind).store(on, Ordering::Relaxed);
+    }
+
+    fn threshold_slot(&self, kind: StatusKind) -> &AtomicU64 {
+        let idx = StatusKind::ALL
+            .iter()
+            .position(|k| *k == kind)
+            .expect("every StatusKind is in StatusKind::ALL");
+        &self.raised_at_threshold[idx]
     }
 }
 
@@ -357,6 +404,9 @@ async fn run_detectors(
     // direction before it is acted on.
     let mut peers_below_since: Option<Instant> = None;
     let mut peers_ok_since: Option<Instant> = None;
+    // Anchors the `peer_floor` startup grace. Distinct from `last_connect`,
+    // which is reset by every block.
+    let detector_start = Instant::now();
 
     loop {
         tokio::select! {
@@ -409,15 +459,44 @@ async fn run_detectors(
                         };
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // The disconnect run we were counting may be incomplete,
-                        // so the depth would be wrong. Abandon this reorg rather
-                        // than report a number we cannot stand behind; the tip
-                        // clock is re-derived on the next connect regardless.
+                        // The disconnect run we were counting is incomplete, so
+                        // the counted depth would be an undercount.
+                        //
+                        // Abandoning it outright is not acceptable here: the
+                        // chain-event ring holds 64 entries and a reorg emits
+                        // one marker plus one event per disconnected *and*
+                        // reconnected block, so lag becomes likely at roughly
+                        // the depth where this alert starts to matter. That
+                        // would make `deep_reorg` least reliable for the largest
+                        // reorgs — the ones it exists to report.
+                        //
+                        // The depth is not actually lost: the reorg log holds
+                        // the committed record with the true fork height. Fall
+                        // back to it and report from ground truth.
                         tracing::debug!(
                             target: "health",
                             dropped = n,
-                            "chain-event lag; abandoning in-flight reorg depth count",
+                            "chain-event lag during reorg depth count; \
+                             falling back to the reorg log",
                         );
+                        if let ReorgTracking::Counting { .. } = reorg
+                            && let Some(log) = chain_state.reorg_log()
+                            // Newest last. A window rather than "the latest
+                            // record" so a stale entry from an earlier reorg
+                            // cannot be misreported as this one; the reorg we
+                            // were counting is seconds old, and the log is
+                            // written inside `perform_reorg` before any chain
+                            // event is emitted, so it is already there.
+                            && let Some(rec) = log.history(300).into_iter().next_back()
+                        {
+                            // `from_height` is the abandoned tip: fork + depth.
+                            finish_reorg(
+                                &warnings, &publisher, &thresholds,
+                                rec.fork_height.saturating_add(rec.depth),
+                                rec.depth,
+                                chain_state.tip_height(),
+                            );
+                        }
                         reorg = ReorgTracking::Idle;
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -442,7 +521,7 @@ async fn run_detectors(
                 check_mempool(&state, &warnings, &publisher, &thresholds, &mempool);
                 check_peers(
                     &state, &warnings, &publisher, &thresholds, &peer_manager,
-                    &mut peers_below_since, &mut peers_ok_since,
+                    &mut peers_below_since, &mut peers_ok_since, &detector_start,
                 );
             }
         }
@@ -468,7 +547,15 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
                 };
                 let context = serde_json::to_value(&event.details)
                     .unwrap_or(serde_json::Value::Null);
-                warnings.record(&id, severity, event.message.clone(), context);
+                // An edge observation is a distinct event every time it
+                // happens, and its warning never clears — so it must opt out of
+                // the first-time-only `-alertnotify` dedup, or only the first
+                // deep reorg of a process would ever page anyone.
+                if event.state == StatusState::Edge {
+                    warnings.record_recurring(&id, severity, event.message.clone(), context);
+                } else {
+                    warnings.record(&id, severity, event.message.clone(), context);
+                }
             }
         }
     }
@@ -489,6 +576,7 @@ fn raise_if_new(
     warnings: &NodeWarnings,
     publisher: &EventPublisher,
     kind: StatusKind,
+    threshold: u64,
     message: String,
     details: impl FnOnce(StatusEvent) -> StatusEvent,
 ) {
@@ -496,7 +584,51 @@ fn raise_if_new(
         return;
     }
     state.set_active(kind, true);
+    // Remember the line this was raised against, so a later poll can tell a
+    // recovered reading from a retuned threshold. See
+    // `clear_if_threshold_relaxed`.
+    state.threshold_slot(kind).store(threshold, Ordering::Relaxed);
     emit(warnings, publisher, details(StatusEvent::raised(kind, message)));
+}
+
+/// Clear a standing condition whose **threshold moved** rather than whose
+/// reading recovered.
+///
+/// Every level-triggered detector clears on a hysteresis-widened predicate: disk
+/// clears at 1.5× the floor, mempool at 0.75× the raise line. That gap is there
+/// to stop a value hovering at the line from flapping, and it does its job — but
+/// it must not also trap the operator who retunes the threshold *because* the
+/// alert is firing. Raising the threshold moves both the raise line and the
+/// clear line, so the current reading can land in the new dead band where
+/// neither branch runs, and the alert stays raised against a threshold it no
+/// longer violates.
+///
+/// For `mempool_congested` that trap is inescapable rather than merely awkward:
+/// the percentage clamps at 100, so the highest reachable clear line is 75% of
+/// the cap. Once occupancy is at or above that, no value of
+/// `alertmempoolfullpct` can clear a raised alert — only disabling the detector
+/// outright.
+///
+/// So: if the raise predicate no longer holds under the *current* threshold, and
+/// that threshold differs from the one the condition was raised against, clear.
+/// A reading that recovers on its own still goes through the hysteresis path;
+/// this only fires when the operator actually moved the line.
+fn clear_if_threshold_relaxed(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    kind: StatusKind,
+    threshold: u64,
+    message: String,
+    details: impl FnOnce(StatusEvent) -> StatusEvent,
+) {
+    if !state.is_active(kind) {
+        return;
+    }
+    if state.threshold_slot(kind).load(Ordering::Relaxed) == threshold {
+        return;
+    }
+    clear_if_active(state, warnings, publisher, kind, message, details);
 }
 
 /// Clear a standing condition if it is currently raised.
@@ -551,8 +683,23 @@ fn check_tip_stall(
     // (header sync, a slow peer, a big block batch). The condition this alert
     // exists for — "a caught-up node stopped following the chain" — is
     // meaningless until IBD is done.
-    if chain_state.is_initial_block_download() {
+    //
+    // The check is latched. `is_initial_block_download()` is not a one-way
+    // door: it is a function of wall-clock time against the tip header's
+    // timestamp (tip older than ~24h ⇒ "still syncing"), so a node whose tip
+    // stops advancing crosses *back* into it a day later. Without the latch a
+    // partitioned node would raise `tip_stall` at the 1h mark and then, at the
+    // 24h mark, freeze: every later poll would return here before reaching
+    // either the raise or the clear branch, so a SIGHUP retune of
+    // `alerttipstallseconds` would apply to the atomic and do nothing visible.
+    // Once a node has been caught up, it is never "in IBD" again for this
+    // detector's purposes.
+    if state.left_ibd.load(Ordering::Relaxed) {
+        // Already caught up once; the guard no longer applies.
+    } else if chain_state.is_initial_block_download() {
         return;
+    } else {
+        state.left_ibd.store(true, Ordering::Relaxed);
     }
     if age_secs >= threshold {
         raise_if_new(
@@ -560,6 +707,7 @@ fn check_tip_stall(
             warnings,
             publisher,
             StatusKind::TipStall,
+            threshold,
             format!("no block connected for {age_secs}s (threshold {threshold}s)"),
             |e| {
                 e.with_detail("seconds_since_block", age_secs)
@@ -567,9 +715,26 @@ fn check_tip_stall(
                     .with_detail("tip_height", chain_state.tip_height())
             },
         );
+    } else {
+        // The fast clear is event-driven (on `BlockConnected`), because the
+        // point of the alert is that it lifts the instant the chain moves. This
+        // is the slow one: it exists for the case where the *threshold* moved
+        // instead of the tip. An operator who raises `alerttipstallseconds` via
+        // SIGHUP to quiet a firing alert would otherwise stay raised until some
+        // future block connects — and on a chain that only looks stalled under
+        // the old threshold, that block may be a long way off.
+        clear_if_active(
+            state,
+            warnings,
+            publisher,
+            StatusKind::TipStall,
+            format!("tip age {age_secs}s is within the threshold ({threshold}s)"),
+            |e| {
+                e.with_detail("seconds_since_block", age_secs)
+                    .with_detail("threshold_seconds", threshold)
+            },
+        );
     }
-    // The clear side is event-driven (on `BlockConnected`), not polled: the
-    // whole point is that the alert lifts the instant the chain moves.
 }
 
 fn check_disk(
@@ -580,6 +745,16 @@ fn check_disk(
     path: &std::path::Path,
 ) {
     let floor = thresholds.disk_free_bytes();
+    // The disabled-clear is checked before the filesystem read, not after. If
+    // the watched volume becomes uninterrogable while `disk_low` is raised (the
+    // blocks volume is unmounted, `-blocksdir` points somewhere that
+    // disappeared), an early return below would leave the alert raised with no
+    // way to clear it — not even by setting `alertdiskfreemb=0`, which is the
+    // documented escape hatch for every other detector.
+    if floor == 0 {
+        clear_because_disabled(state, warnings, publisher, StatusKind::DiskLow);
+        return;
+    }
     let Some(free) = crate::diskspace::free_disk_bytes(path) else {
         // Unreadable filesystem: report "unknown" rather than a zero that would
         // read as "completely full".
@@ -587,29 +762,35 @@ fn check_disk(
         return;
     };
     state.disk_free_bytes.store(free, Ordering::Relaxed);
-    if floor == 0 {
-        clear_because_disabled(state, warnings, publisher, StatusKind::DiskLow);
-        return;
-    }
     let clear_at = floor
         .saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM)
         / hysteresis::DISK_CLEAR_RATIO_DEN;
     if free < floor {
+        // The path is deliberately NOT a wire detail. It goes to every `status`
+        // subscriber, every webhook receiver, and onward into APNs/FCM push
+        // bodies — an absolute datadir path typically containing the operator's
+        // username. The node's own log records which volume this is.
+        tracing::warn!(
+            target: "health",
+            path = %path.display(),
+            free_bytes = free,
+            threshold_bytes = floor,
+            "free space below the configured floor"
+        );
         raise_if_new(
             state,
             warnings,
             publisher,
             StatusKind::DiskLow,
+            floor,
             format!(
-                "free space {} MiB below floor {} MiB on {}",
+                "free space {} MiB below floor {} MiB",
                 free / (1024 * 1024),
-                floor / (1024 * 1024),
-                path.display()
+                floor / (1024 * 1024)
             ),
             |e| {
                 e.with_detail("free_bytes", free)
                     .with_detail("threshold_bytes", floor)
-                    .with_detail("path", path.display())
             },
         );
     } else if free >= clear_at {
@@ -624,6 +805,23 @@ fn check_disk(
                     .with_detail("clear_threshold_bytes", clear_at)
             },
         );
+    } else {
+        clear_if_threshold_relaxed(
+            state,
+            warnings,
+            publisher,
+            StatusKind::DiskLow,
+            floor,
+            format!(
+                "free space {} MiB is within the floor ({} MiB)",
+                free / (1024 * 1024),
+                floor / (1024 * 1024)
+            ),
+            |e| {
+                e.with_detail("free_bytes", free)
+                    .with_detail("threshold_bytes", floor)
+            },
+        );
     }
 }
 
@@ -634,26 +832,54 @@ fn check_mempool(
     thresholds: &AlertThresholds,
     mempool: &Mempool,
 ) {
+    check_mempool_values(
+        state,
+        warnings,
+        publisher,
+        thresholds,
+        mempool.max_size_bytes() as u64,
+        mempool.acting_bytes() as u64,
+        mempool.min_fee_rate(),
+    );
+}
+
+/// The mempool detector's decision logic, over plain readings.
+///
+/// Split from [`check_mempool`] so the thresholds/hysteresis behavior is
+/// testable without filling a real mempool to a target occupancy — the tests
+/// exercise this exact code rather than a reimplementation of it.
+fn check_mempool_values(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    thresholds: &AlertThresholds,
+    cap: u64,
+    used: u64,
+    min_fee: u64,
+) {
     let pct = thresholds.mempool_full_pct();
     if pct == 0 {
         clear_because_disabled(state, warnings, publisher, StatusKind::MempoolCongested);
         return;
     }
-    let cap = mempool.max_size_bytes() as u64;
     if cap == 0 {
+        // `maxmempool=0` is accepted and is SIGHUP-live. A bare return would
+        // strand a raised alert with no path back: there is no occupancy ratio
+        // against a zero cap, so neither the raise nor the clear branch can
+        // ever run again.
+        clear_because_disabled(state, warnings, publisher, StatusKind::MempoolCongested);
         return;
     }
-    let used = mempool.acting_bytes() as u64;
     let raise_at = cap.saturating_mul(pct) / 100;
     let clear_at = raise_at.saturating_mul(hysteresis::MEMPOOL_CLEAR_RATIO_NUM)
         / hysteresis::MEMPOOL_CLEAR_RATIO_DEN;
     if used >= raise_at {
-        let min_fee = mempool.min_fee_rate();
         raise_if_new(
             state,
             warnings,
             publisher,
             StatusKind::MempoolCongested,
+            pct,
             format!("mempool at {}% of its {} MiB cap", used * 100 / cap, cap / (1024 * 1024)),
             |e| {
                 e.with_detail("bytes_used", used)
@@ -676,6 +902,24 @@ fn check_mempool(
                     .with_detail("bytes_cap", cap)
             },
         );
+    } else {
+        clear_if_threshold_relaxed(
+            state,
+            warnings,
+            publisher,
+            StatusKind::MempoolCongested,
+            pct,
+            format!(
+                "mempool at {}% is within the threshold ({}%)",
+                used * 100 / cap,
+                pct
+            ),
+            |e| {
+                e.with_detail("bytes_used", used)
+                    .with_detail("bytes_cap", cap)
+                    .with_detail("threshold_pct", pct)
+            },
+        );
     }
 }
 
@@ -688,6 +932,7 @@ fn check_peers(
     peer_manager: &PeerManager,
     below_since: &mut Option<Instant>,
     ok_since: &mut Option<Instant>,
+    started: &Instant,
 ) {
     let floor = thresholds.peer_floor();
     if floor == 0 {
@@ -701,15 +946,28 @@ fn check_peers(
     let inbound = total.saturating_sub(outbound);
     let now = Instant::now();
 
+    if total > 0 {
+        state.saw_first_peer.store(true, Ordering::Relaxed);
+    }
+
     if total < floor {
         *ok_since = None;
         let since = *below_since.get_or_insert(now);
-        if now.duration_since(since) >= hysteresis::PEER_HOLD {
+        // Startup grace. `tokio::time::interval` fires its first tick
+        // immediately, so without this the hold clock starts at t≈0 and a node
+        // that simply has not finished dialing out yet alerts at t≈PEER_HOLD.
+        // The grace runs from detector start until the node's first peer, after
+        // which the ordinary hold is the only gate — a node that loses its peers
+        // later is not in a startup transient and should alert promptly.
+        let in_startup_grace = !state.saw_first_peer.load(Ordering::Relaxed)
+            && now.duration_since(*started) < hysteresis::PEER_STARTUP_GRACE;
+        if !in_startup_grace && now.duration_since(since) >= hysteresis::PEER_HOLD {
             raise_if_new(
                 state,
                 warnings,
                 publisher,
                 StatusKind::PeerFloor,
+                floor,
                 format!("only {total} peers connected (floor {floor})"),
                 |e| {
                     e.with_detail("peers", total)
@@ -817,6 +1075,19 @@ mod tests {
     }
 
     #[test]
+    fn peer_floor_default_is_disabled_on_the_solo_networks() {
+        use bitcoin::Network;
+        // A regtest node normally has no peers at all, and a signet node is
+        // often a single private instance. Defaulting the floor to 3 there
+        // raises a critical warning 90s into every run that can never clear.
+        assert_eq!(defaults::peer_floor_for(Network::Regtest), 0);
+        assert_eq!(defaults::peer_floor_for(Network::Signet), 0);
+        // Where a peer-starved node really is broken, the floor stands.
+        assert_eq!(defaults::peer_floor_for(Network::Bitcoin), defaults::PEER_FLOOR);
+        assert_eq!(defaults::peer_floor_for(Network::Testnet4), defaults::PEER_FLOOR);
+    }
+
+    #[test]
     fn raise_is_edge_triggered_not_repeated_per_poll() {
         let state = HealthState::new();
         let warnings = NodeWarnings::new();
@@ -829,6 +1100,7 @@ mod tests {
                 &warnings,
                 &pubr,
                 StatusKind::DiskLow,
+                1,
                 "low".into(),
                 |e| e,
             );
@@ -931,6 +1203,70 @@ mod tests {
     }
 
     #[test]
+    fn raising_the_disk_floor_clears_a_standing_alert() {
+        // The operator decides the current free space is acceptable after all
+        // and raises the floor to quiet the pager. The reading has not moved,
+        // so it lands inside the *new* hysteresis band — between the new raise
+        // line and the new clear line — where neither branch runs. Without the
+        // threshold-relaxation clear the alert stays raised against a floor it
+        // no longer violates, and on a filling disk free space only goes down,
+        // so it would never clear on its own.
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+
+        // 10 MiB floor, 5 MiB free ⇒ raised.
+        let thresholds = AlertThresholds::new(0, 10, 0, 0, 0);
+        sample_disk(&state, &warnings, &pubr, &thresholds, 5 * 1024 * 1024);
+        assert_eq!(drained(&mut rx), vec![(StatusKind::DiskLow, StatusState::Raised)]);
+
+        // Retune the floor down to 4 MiB. 5 MiB free is above the new floor but
+        // below the new 6 MiB clear line: the dead band.
+        thresholds.set_disk_free_mb(4);
+        sample_disk(&state, &warnings, &pubr, &thresholds, 5 * 1024 * 1024);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::DiskLow, StatusState::Cleared)],
+            "a retuned threshold must be able to clear its own alert"
+        );
+        assert!(!state.is_active(StatusKind::DiskLow));
+    }
+
+    #[test]
+    fn raising_the_mempool_threshold_clears_a_standing_alert() {
+        // The unescapable case. `alertmempoolfullpct` clamps at 100, and the
+        // clear line is 0.75× the raise line, so the highest reachable clear
+        // line is 75% of the cap. Once occupancy is at or above that, *no*
+        // value of the setting can clear a raised alert — the operator's only
+        // escape would be disabling the detector outright.
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        const CAP: u64 = 300 * 1024 * 1024;
+        let used = CAP * 93 / 100;
+
+        // 90% threshold against 93% occupancy ⇒ raised.
+        let thresholds = AlertThresholds::new(0, 0, 90, 0, 0);
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, CAP, used, 1000);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Raised)]
+        );
+
+        // Raise it to 95 to quiet the alert: 93 < 95 so no raise, and
+        // 93 >= 0.75*95 so no hysteresis clear. Dead band.
+        thresholds.set_mempool_full_pct(95);
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, CAP, used, 1000);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Cleared)],
+            "no value of alertmempoolfullpct could otherwise clear this"
+        );
+    }
+
+    #[test]
     fn disk_hysteresis_gap_prevents_flapping() {
         let state = HealthState::new();
         let warnings = NodeWarnings::new();
@@ -965,13 +1301,20 @@ mod tests {
         let clear_at =
             floor.saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM) / hysteresis::DISK_CLEAR_RATIO_DEN;
         if free < floor {
-            raise_if_new(state, warnings, publisher, StatusKind::DiskLow, "low".into(), |e| {
+            raise_if_new(state, warnings, publisher, StatusKind::DiskLow, floor, "low".into(), |e| {
                 e.with_detail("free_bytes", free)
             });
         } else if free >= clear_at {
             clear_if_active(state, warnings, publisher, StatusKind::DiskLow, "ok".into(), |e| {
                 e.with_detail("free_bytes", free)
             });
+        } else {
+            // Mirror the real detector: a reading inside the hysteresis band
+            // still clears if the operator moved the threshold.
+            clear_if_threshold_relaxed(
+                state, warnings, publisher, StatusKind::DiskLow, floor, "relaxed".into(),
+                |e| e.with_detail("free_bytes", free),
+            );
         }
     }
 

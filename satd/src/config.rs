@@ -3277,7 +3277,7 @@ impl Config {
             alert_peer_floor: cli
                 .alert_peer_floor
                 .or_else(|| file_get("alertpeerfloor").and_then(|v| v.parse().ok()))
-                .unwrap_or(node::health::defaults::PEER_FLOOR),
+                .unwrap_or(node::health::defaults::peer_floor_for(network)),
             alert_reorg_depth: cli
                 .alert_reorg_depth
                 .or_else(|| file_get("alertreorgdepth").and_then(|v| v.parse().ok()))
@@ -6860,8 +6860,17 @@ rpcport=8332
         assert_eq!(cfg.alert_tip_stall_seconds, 3_600);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
-        assert_eq!(cfg.alert_peer_floor, 3);
         assert_eq!(cfg.alert_reorg_depth, 3);
+        // `peer_floor` is the one network-dependent default: a regtest node
+        // normally runs with no peers at all, so the floor would raise a
+        // critical warning that can never clear.
+        assert_eq!(cfg.alert_peer_floor, 0, "regtest defaults the peer floor off");
+
+        // ...but it is still armed where a peer-starved node really is broken.
+        let cli =
+            CliArgs::try_parse_from(["satd", "--datadir", dir.to_str().unwrap()]).unwrap();
+        let cfg_mainnet = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.
