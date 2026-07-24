@@ -106,6 +106,98 @@ pub enum EvictReason {
     Unknown(i32),
 }
 
+/// Which node-health condition an [`Event::Status`] describes.
+///
+/// Open by design: a newer node may report a kind this client build predates,
+/// which surfaces as [`Unknown`](StatusKind::Unknown) rather than an error. The
+/// event's `severity` and `message` stay meaningful in that case, so a generic
+/// "log it and page on critical" handler keeps working across upgrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    /// Initial block download finished (one-shot).
+    IbdComplete,
+    /// No block connected inside the configured window, outside IBD.
+    TipStall,
+    /// Free space on the watched directory fell below the configured floor.
+    DiskLow,
+    /// Mempool occupancy crossed the configured share of its byte cap.
+    MempoolCongested,
+    /// Connected peers stayed below the configured floor.
+    PeerFloor,
+    /// A reorg at least the configured depth landed (one-shot).
+    DeepReorg,
+    /// A condition this client build does not recognize.
+    Unknown(i32),
+}
+
+impl StatusKind {
+    fn from_proto(v: i32) -> Self {
+        match pb::StatusKind::try_from(v) {
+            Ok(pb::StatusKind::IbdComplete) => StatusKind::IbdComplete,
+            Ok(pb::StatusKind::TipStall) => StatusKind::TipStall,
+            Ok(pb::StatusKind::DiskLow) => StatusKind::DiskLow,
+            Ok(pb::StatusKind::MempoolCongested) => StatusKind::MempoolCongested,
+            Ok(pb::StatusKind::PeerFloor) => StatusKind::PeerFloor,
+            Ok(pb::StatusKind::DeepReorg) => StatusKind::DeepReorg,
+            _ => StatusKind::Unknown(v),
+        }
+    }
+}
+
+/// Level-triggered lifecycle of a health condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusState {
+    /// The condition was entered; it stands until a matching `Cleared`.
+    Raised,
+    /// The condition recovered.
+    Cleared,
+    /// A one-shot observation; no `Cleared` will follow.
+    Edge,
+    /// A state this client build does not recognize.
+    Unknown(i32),
+}
+
+impl StatusState {
+    fn from_proto(v: i32) -> Self {
+        match pb::StatusState::try_from(v) {
+            Ok(pb::StatusState::Raised) => StatusState::Raised,
+            Ok(pb::StatusState::Cleared) => StatusState::Cleared,
+            Ok(pb::StatusState::Edge) => StatusState::Edge,
+            _ => StatusState::Unknown(v),
+        }
+    }
+}
+
+/// How loud a health condition is.
+///
+/// `Ord` follows severity, so a client filters with a comparison
+/// (`severity >= StatusSeverity::Warning`). An unrecognized value sorts above
+/// `Critical` deliberately: a condition this build cannot name is not one to
+/// quietly filter out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StatusSeverity {
+    /// Worth knowing, not worth waking anyone (IBD completing).
+    Info,
+    /// Degraded but functioning (peer starvation, a congested mempool).
+    Warning,
+    /// The node is not doing its job, or is about to stop (a stalled tip, a
+    /// filling disk, a deep reorg).
+    Critical,
+    /// A severity this client build does not recognize.
+    Unknown(i32),
+}
+
+impl StatusSeverity {
+    fn from_proto(v: i32) -> Self {
+        match pb::StatusSeverity::try_from(v) {
+            Ok(pb::StatusSeverity::Info) => StatusSeverity::Info,
+            Ok(pb::StatusSeverity::Warning) => StatusSeverity::Warning,
+            Ok(pb::StatusSeverity::Critical) => StatusSeverity::Critical,
+            _ => StatusSeverity::Unknown(v),
+        }
+    }
+}
+
 impl From<pb::EvictReason> for EvictReason {
     fn from(r: pb::EvictReason) -> Self {
         match r {
@@ -280,6 +372,41 @@ pub enum Event {
     Heartbeat {
         /// Publisher uptime in nanoseconds.
         uptime_ns: u64,
+    },
+    /// A node-health condition the daemon detected about **itself** — a stalled
+    /// tip, a filling disk, peer starvation. Arrives only for a subscription
+    /// that set the [`STATUS`](crate::Categories::STATUS) category bit, which
+    /// is deliberately not part of the `0` ("all") default.
+    ///
+    /// Standing conditions are level-triggered: exactly one
+    /// [`StatusState::Raised`] on entry and one [`StatusState::Cleared`] on
+    /// recovery, with hysteresis so a value hovering at the threshold does not
+    /// flap. Observations with no recovered state (IBD finishing, a deep reorg
+    /// landing) are [`StatusState::Edge`].
+    ///
+    /// **Not replayable.** A status event carries no cursor, so a `from_cursor`
+    /// resume never yields one; the node re-raises standing conditions after a
+    /// restart instead. A client that connects *after* a condition was raised
+    /// will not see it until the condition changes — query `getwarnings` over
+    /// JSON-RPC for current state on connect.
+    ///
+    /// Match on [`kind`](StatusKind) and read [`details`](Event::Status) for the
+    /// numbers; treat [`StatusKind::Unknown`] as informational rather than an
+    /// error, since new conditions are added additively. See
+    /// [`examples/health_watch.rs`].
+    Status {
+        /// Which condition this describes.
+        kind: StatusKind,
+        /// Whether it was entered, recovered, or is a one-shot observation.
+        state: StatusState,
+        /// How loud it is. Ordered, so a severity floor is a comparison.
+        severity: StatusSeverity,
+        /// Human-readable one-liner. Log it or page on it; do not parse it.
+        message: String,
+        /// Kind-specific structured fields as decimal strings (free bytes and
+        /// the watched path, seconds since the last block, a reorg's depth and
+        /// fork height, …). Tolerate unknown keys and absent optional ones.
+        details: std::collections::BTreeMap<String, String>,
     },
     /// A watched outpoint was spent.
     OutpointSpent {
@@ -662,6 +789,13 @@ impl From<pb::NodeEvent> for Event {
             Body::Mempool(m) => mempool_event(m),
             Body::Chain(c) => chain_event(c),
             Body::Heartbeat(h) => Event::Heartbeat { uptime_ns: h.uptime_ns },
+            Body::Status(s) => Event::Status {
+                kind: StatusKind::from_proto(s.kind),
+                state: StatusState::from_proto(s.state),
+                severity: StatusSeverity::from_proto(s.severity),
+                message: s.message,
+                details: s.details.into_iter().collect(),
+            },
             Body::OutpointSpent(o) => Event::OutpointSpent {
                 outpoint: Outpoint { txid: o.outpoint_txid, vout: o.outpoint_vout },
                 spending_txid: o.spending_txid,

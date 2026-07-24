@@ -40,6 +40,13 @@ impl Categories {
     /// Requires the node's tweak index (`silentpaymentindex=1`); a `tweaks`
     /// subscription against a node with it disabled is refused in-band.
     pub const TWEAKS: u32 = 8;
+    /// Node-health conditions the daemon detects about itself
+    /// ([`Event::Status`](crate::Event::Status)). Like
+    /// [`TWEAKS`](Self::TWEAKS) this is **not** part of the [`ALL`](Self::ALL)
+    /// (`0`) default — a client written against an older node never starts
+    /// receiving a body it has no parser for. Unlike `TWEAKS` there is no index
+    /// prerequisite: any node serves it.
+    pub const STATUS: u32 = 16;
 }
 
 /// Options for a [`StreamClient::subscribe`] firehose.
