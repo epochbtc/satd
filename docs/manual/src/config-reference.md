@@ -394,6 +394,26 @@ Core ZMQ wire-format compatible.)
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |
 | `reorgwebhooksecret` | none | hot | satd | HMAC-SHA256 secret signing webhook bodies via `X-Satd-Signature`. |
 
+## Health alerts
+
+Thresholds for the node-health detectors. Each raises a `status` event on the
+[Streaming Consumption API](streaming.md) and an entry in `getwarnings` (which
+also fires `alertnotify`) when its condition is entered, and retracts both when
+it recovers. Every one is hot-reloadable — retuning an alert should not need a
+restart, since you are usually retuning it *because* it is firing.
+
+Set a threshold to `0` to disable that detector. See
+[Observability → Node-health alerts](observability.md#node-health-alerts) for
+the taxonomy and the details each event carries.
+
+| Key | Default | Reload | Compat | Description |
+|---|---|---|---|---|
+| `alerttipstallseconds` | `3600` | hot | satd | Raise `tip_stall` after this many seconds with no connected block. Suppressed during initial block download, and cleared the moment a block connects. |
+| `alertdiskfreemb` | `10240` | hot | satd | Raise `disk_low` below this many MiB free on the blocks directory (or the data directory when `blocksdir` is not split out). Clears at 1.5× the floor. |
+| `alertmempoolfullpct` | `90` | hot | satd | Raise `mempool_congested` at this percentage of `maxmempool`. Clears below 75 % of the raise line. Values above 100 are clamped. |
+| `alertpeerfloor` | `3` | hot | satd | Raise `peer_floor` below this many connected peers (inbound + outbound). The count must hold for 60 s in either direction, so ordinary peer churn does not page you. |
+| `alertreorgdepth` | `3` | hot | satd | Emit the one-shot `deep_reorg` event for a reorg that rolls back at least this many blocks. |
+
 > **Note.** The `*notify` shell hooks (`blocknotify`, `alertnotify`,
 > `startupnotify`, `shutdownnotify`) exist for drop-in Bitcoin Core
 > compatibility and quick scripts. They are best-effort shell execs with no

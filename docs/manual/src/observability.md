@@ -45,6 +45,57 @@ labels) and does not consume an RPC worker on every scrape.
 > one-time handshake bytes are not included, so absolute socket totals read
 > marginally lower than the kernel's.
 
+## Node-health alerts
+
+Metrics tell you what the node is doing; health alerts tell you when it has
+stopped doing it. satd watches six conditions about *itself* and reports each
+one through three surfaces at once, so they can never disagree:
+
+*   a `status` event on the [Streaming Consumption API](streaming.md) (category
+    bit 16 — see §7.8 of the wire spec),
+*   an entry in `getwarnings` (and therefore in `getblockchaininfo.warnings`
+    and the TUI), which also fires the Core-compatible `alertnotify` hook,
+*   a `satd_alert_active{kind="..."}` gauge on `/metrics`.
+
+| Condition | Severity | Raises when | Clears when |
+|---|---|---|---|
+| `ibd_complete` | info | initial block download finishes | one-shot |
+| `tip_stall` | critical | no block connected for `alerttipstallseconds`, outside IBD | the next block connects |
+| `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor |
+| `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line |
+| `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s | at or above the floor for 60 s |
+| `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks | one-shot |
+
+Every standing condition raises **once** on entry and clears **once** on
+recovery — you get a pair of events, not a stream of repeats — and the gap
+between the raise and clear lines (a ratio, a hold time, or both) means a value
+sitting on the threshold does not flap your pager. `ibd_complete` and
+`deep_reorg` describe things that happened rather than states that persist, so
+they are one-shot and never clear.
+
+Thresholds are configured with the `alert*` keys in the
+[Configuration Reference](config-reference.md#health-alerts); all of them are
+hot-reloadable, and setting one to `0` disables that detector. Each event
+carries a `details` map with the numbers behind it (free bytes and the path,
+seconds since the last block and the tip height, the reorg's true depth and
+fork height, the mempool's current `mempoolminfee`), so an alert is actionable
+without a follow-up query.
+
+**Durability.** Health events are not replayable: they carry no resume cursor,
+and a `from_cursor` reconnect never yields one. Instead the detectors
+re-evaluate from scratch on startup and re-raise anything still standing, so a
+consumer that was disconnected across a restart still learns about a live
+problem. A condition that both raised and cleared while nothing was listening is
+stale by definition and is not reconstructed. For the same reason, a subscriber
+that attaches *after* a condition raised will not see it until the condition
+changes — check `getwarnings` for current state on connect.
+
+Two of the gauges are useful independently of alerting:
+`satd_tip_last_connect_age_seconds` (seconds since the last connected block)
+and `satd_disk_free_bytes` (free space on the watched directory). The latter is
+omitted rather than reported as zero when the filesystem cannot be
+interrogated.
+
 ## Structured JSON Logging
 
 `satd` logs to stdout. Use `--log-format=json` to switch from the text format

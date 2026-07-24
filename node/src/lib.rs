@@ -1,6 +1,8 @@
 pub mod adaptive_cache;
 pub mod chain;
+pub mod diskspace;
 pub mod events;
+pub mod health;
 pub mod ibd_eta;
 pub mod index;
 pub mod memstat;
