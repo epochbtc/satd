@@ -201,6 +201,11 @@ impl MockReceiver {
         Self::start(Behavior::RejectHeights(heights)).await
     }
 
+    /// Every accepted delivery, in arrival order.
+    async fn all(&self) -> Vec<Received> {
+        self.inner.lock().await.received.clone()
+    }
+
     /// Heights of every accepted `block_connected` delivery, in arrival order.
     async fn accepted_heights(&self) -> Vec<u64> {
         self.inner
@@ -890,6 +895,11 @@ async fn a_missed_span_is_announced_as_a_gap_and_never_replayed() {
 /// `script_matched` when a transaction pays that script — the whole watch path:
 /// alertfile parse, registry registration, per-hook routing, and the shared
 /// envelope-shaped JSON the WebSocket carrier also emits.
+///
+/// Also asserts what makes those matches *usable*: every delivery carries a
+/// distinct `X-Satd-Delivery`. The contract tells receivers to deduplicate on
+/// that header, so two deposits sharing an id — or a match colliding with a
+/// chain event — is silent data loss at a correct receiver.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_watch_set_delivers_a_script_match() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -937,8 +947,25 @@ scripts = ["{scripthash}"]
             .unwrap();
     }
 
-    // Pay the watched script.
-    let (txid, _) = crate::streaming::broadcast_spend(&sn, &wallet, dest_seed, 1_000).await;
+    // Pay the watched script *twice in one transaction*. Two outputs rather
+    // than one because that produces two matches between the same pair of
+    // event-bus publishes — the case where per-event identity is easiest to get
+    // wrong, and the one the delivery-id assertions below exist for.
+    let txid = {
+        let rpc = sn.node.rpc_handle();
+        let w = wallet.clone();
+        let dests = vec![dest_spk.clone(), dest_spk.clone()];
+        let (raw, txid) = tokio::task::spawn_blocking(move || {
+            crate::common::build_signed_p2wpkh_spend_outputs(&rpc, &w, &dests, 1_000, 0xffff_ffff)
+        })
+        .await
+        .unwrap();
+        let rpc2 = sn.node.rpc_handle();
+        tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+            .await
+            .unwrap();
+        txid
+    };
 
     // Mempool match first (unconfirmed), then the confirmed re-emit.
     let got = receiver
@@ -962,6 +989,25 @@ scripts = ["{scripthash}"]
         })
         .await;
     assert_eq!(confirmed.json()["body"]["txid"], internal_txid(&txid));
+
+    // Idempotency keys. This hook has now received two watch matches (the
+    // mempool sighting and the confirmed re-emit) plus the chain events for the
+    // blocks that were mined, all down one connection.
+    let all = receiver.all().await;
+    let ids: Vec<&str> = all.iter().map(|r| r.header("x-satd-delivery")).collect();
+    let matches: Vec<&str> = all
+        .iter()
+        .filter(|r| r.json()["body"]["category"] == "script_matched")
+        .map(|r| r.header("x-satd-delivery"))
+        .collect();
+    // Two outputs × two phases (mempool sighting, confirmed re-emit).
+    assert!(matches.len() >= 4, "expected four matches, got {matches:?}");
+    let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "every delivery needs its own idempotency key; got {ids:?}",
+    );
 }
 
 /// A hook that watches nothing must not receive another hook's matches: the

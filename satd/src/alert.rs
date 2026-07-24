@@ -43,6 +43,22 @@ use tokio::sync::{mpsc, watch};
 /// is documented as reserved).
 pub const LEGACY_REORG_HOOK_ID: &str = "reorg-legacy";
 
+/// Monotonic counter naming watch-match deliveries.
+///
+/// Watch matches arrive on a per-subscriber channel rather than the shared
+/// event bus, so there is no `EdgeStamp.seq` to identify them with. They need an
+/// id of their own because the contract makes `X-Satd-Delivery` the receiver's
+/// idempotency key — the reference push relay dedupes on it, and so will anyone
+/// following the spec. Reading the bus counter instead would give every match
+/// between two bus publishes the *same* id, and that id would also collide with
+/// the bus event that last advanced it: distinct deposit alerts, silently
+/// deduplicated away by a correct receiver.
+///
+/// Process-wide rather than per-dispatcher-generation: a SIGHUP reload keeps
+/// the same `instance_id`, so a per-generation counter would restart at 1 and
+/// re-mint ids a receiver has already seen.
+static WATCH_DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-attempt HTTP timeout. Matches the shipped reorg webhook.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -312,6 +328,11 @@ async fn fan_in(
                     let json = node::events::watch_match_json(&m, &[], false);
                     let Ok(bytes) = serde_json::to_vec(&json) else { continue };
                     let body = Arc::new(bytes);
+                    // One id per match, shared by every hook that wants it —
+                    // the same rule the bus path follows, so "one event, one
+                    // idempotency key" holds on both. Minted lazily so a match
+                    // no hook subscribes to costs nothing.
+                    let mut delivery_id: Option<String> = None;
                     for hook in &hooks {
                         // Route by what the hook actually watches. The registry
                         // knows only the union, so a match for hook A must not
@@ -319,14 +340,19 @@ async fn fan_in(
                         if !hook_watches_match(&hook.hook, &m) {
                             continue;
                         }
-                        let seq = publisher.published();
-                        enqueue(hook, &publisher, Delivery::Event {
-                            body: body.clone(),
-                            delivery_id: satd_alert::delivery_id(
+                        let id = delivery_id.get_or_insert_with(|| {
+                            let seq = WATCH_DELIVERY_SEQ
+                                .fetch_add(1, Ordering::Relaxed)
+                                .wrapping_add(1);
+                            satd_alert::watch_delivery_id(
                                 &hex::encode(publisher.edge().node_id),
                                 publisher.instance_id(),
                                 seq,
-                            ),
+                            )
+                        });
+                        enqueue(hook, &publisher, Delivery::Event {
+                            body: body.clone(),
+                            delivery_id: id.clone(),
                             // Watch matches are per-subscriber and carry no
                             // durable cursor of their own; the hook's resume
                             // position advances on the confirmed chain events

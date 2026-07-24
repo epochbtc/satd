@@ -959,6 +959,22 @@ pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
     fee_sat: u64,
     sequence: u32,
 ) -> (String, String) {
+    build_signed_p2wpkh_spend_outputs(node, wallet, &[dest_script], fee_sat, sequence)
+}
+
+/// Like [`build_signed_p2wpkh_spend_seq`] but paying `dests` in that many
+/// separate outputs, splitting the value evenly.
+///
+/// Exists for tests that need one transaction to produce several watch matches:
+/// those matches are then emitted between the same pair of event-bus publishes,
+/// which is where per-event identity is easiest to get wrong.
+pub fn build_signed_p2wpkh_spend_outputs<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    dests: &[bitcoin::ScriptBuf],
+    fee_sat: u64,
+    sequence: u32,
+) -> (String, String) {
     use bitcoin::hashes::Hash as _;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
@@ -985,10 +1001,13 @@ pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
             sequence: Sequence(sequence),
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_value_sat - fee_sat),
-            script_pubkey: dest_script,
-        }],
+        output: dests
+            .iter()
+            .map(|d| TxOut {
+                value: Amount::from_sat((cb_value_sat - fee_sat) / dests.len() as u64),
+                script_pubkey: d.clone(),
+            })
+            .collect(),
     };
 
     let secp = Secp256k1::new();

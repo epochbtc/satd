@@ -166,8 +166,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   rendered by the same code so the two surfaces cannot diverge. The set is
   re-registered from the file on startup and on every SIGHUP. Scan keys are
   zeroized in memory and never appear in logs, reload summaries, or error
-  messages. Watch matches are live-only for now: a match that occurred while
-  the daemon was down is not re-delivered (a hook's chain events still are).
+  messages. A watch-set is forward-only from registration — adding an entry
+  does not replay history for it — and a restart or `-reindex` is not a gap,
+  since the set is re-registered before P2P starts.
 
 ## Releases
 

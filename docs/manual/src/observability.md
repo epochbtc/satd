@@ -212,6 +212,11 @@ how the delivery arose — a bare counter for a live event, `w` for a watch matc
 and `r` for a synthesized notice such as `lagged`. Deduplicate on the whole
 header; it is unique per event and stable across the retries of one delivery.
 
+The `<seq>` component is `w`-prefixed on a watch match (`…-w41`) and bare on a
+firehose event (`…-41`). Watch matches do not ride the shared event bus and are
+numbered separately, so the prefix is what keeps the two spaces from colliding.
+Treat the whole header as an opaque string — do not parse it.
+
 ### Watching addresses, coins, and transactions
 
 A hook can also carry a **watch-set** — the same primitives the streaming API's
@@ -255,11 +260,25 @@ already holds signing secrets at mode 0600. The key is zeroized in memory and
 never rendered by any log line, reload summary, or error message. Silent-payment
 entries require `silentpaymentindex=1`.
 
-> **Not yet: historical catch-up for watch matches.** A hook's *chain* events
-> are replayed from its stored cursor after a restart (below), but watch
-> **matches** are not — a match that occurred while the daemon was down is not
-> re-delivered. Reconcile with `getaddresshistory` / a `RescanBlocks` over the
-> streaming API if you need that window covered. Live matching is unaffected.
+**Watch-sets are forward-only from the moment they are registered.** Adding an
+entry does not replay history for it: you are told about payments from now on,
+not about the ones you already reconciled. That is the intended semantic for an
+alerting surface — a backfill would fire a burst of notifications for every
+historical transaction touching the entry. If you do want history for a script,
+that is what `getaddresshistory` and the streaming API's `RescanBlocks` are for.
+
+Restarting the node is not a gap: the watch-set is re-registered before P2P
+starts, so blocks that arrive during catch-up are matched normally. Rebuilding
+with `-reindex` is not a gap either, in the other direction — the replay happens
+before the dispatcher exists, so reindexing does not re-fire years of alerts.
+
+The one case that does lose a match is a crash in the window between a block
+connecting and the receiver acknowledging: the block's *chain* event comes back
+from the hook's stored cursor, but the match does not, because the block is
+already connected and will not be scanned again. Normally that window is
+milliseconds; it widens if the receiver is down and the hook's queue has backed
+up. Reconcile with `getaddresshistory` after an unclean shutdown if a missed
+match would matter.
 
 ### Delivery behavior
 

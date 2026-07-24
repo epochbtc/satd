@@ -153,6 +153,18 @@ pub fn sign_v2(
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+/// Build the idempotency key for a watch match.
+///
+/// Watch matches do not ride the shared event bus — they arrive on a
+/// per-subscriber channel and have no `EdgeStamp.seq` to name them. They get
+/// their own counter, and the `w` prefix keeps the two id spaces disjoint:
+/// without it, a watch match numbered 7 and the bus event numbered 7 would
+/// produce the same string, and a receiver deduplicating on this header (which
+/// the contract tells it to do) would silently drop one of them.
+pub fn watch_delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> String {
+    format!("{node_id_hex}-{instance_id}-w{seq}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,11 +271,10 @@ mod tests {
     }
 
     /// The id spaces must not overlap. They are minted from independent
-    /// counters — the bus `seq` and a synth counter — so without the prefix a
-    /// synthesized notice at counter 500 and a bus event at `seq` 500 would
-    /// collide, and a conforming receiver would silently discard the second.
-    /// (The watch space, `w<...>`, is added with the watch-hook feature and is
-    /// covered alongside it.)
+    /// counters — the bus `seq`, a watch counter, and a synth counter — so
+    /// without the prefixes a synthesized notice at counter 500 and a bus event
+    /// at `seq` 500 would collide, and a conforming receiver would silently
+    /// discard the second.
     ///
     /// Swept across the counter range rather than sampled at one value: a
     /// collision that only appears at a boundary is exactly the kind a single
@@ -272,7 +283,11 @@ mod tests {
     fn the_delivery_id_spaces_are_disjoint() {
         let node = "ab".repeat(16);
         for n in [0u64, 1, 9, 10, 500, u32::MAX as u64, u64::MAX] {
-            let ids = [delivery_id(&node, 7, n), replay_delivery_id(&node, 7, n)];
+            let ids = [
+                delivery_id(&node, 7, n),
+                watch_delivery_id(&node, 7, n),
+                replay_delivery_id(&node, 7, n),
+            ];
             for (i, a) in ids.iter().enumerate() {
                 for b in ids.iter().skip(i + 1) {
                     assert_ne!(a, b, "delivery id spaces collide at counter {n}");
@@ -290,5 +305,11 @@ mod tests {
         assert_ne!(delivery_id(&node, 7, 1), delivery_id(&other, 7, 1));
         assert_ne!(delivery_id(&node, 7, 1), delivery_id(&node, 8, 1));
         assert_ne!(delivery_id(&node, 7, 1), delivery_id(&node, 7, 2));
+    }
+
+    #[test]
+    fn watch_ids_are_distinguishable_from_each_other() {
+        let node = "ab".repeat(16);
+        assert_ne!(watch_delivery_id(&node, 7, 1), watch_delivery_id(&node, 7, 2));
     }
 }
