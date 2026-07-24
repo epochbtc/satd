@@ -18,6 +18,7 @@ repository.workspace = true
 # it rather than against a copy that could drift.
 [dependencies]
 node = { path = "../node" }
+bitcoin = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }

@@ -157,6 +157,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
   their original payload, now delivered by the same dispatcher — which also
   moves that outbound HTTP off the consensus runtime.
+- Alerting: webhook watch-sets. An `alertfile` hook can carry a
+  `[webhook.watch]` table of scripthashes, outpoints, and txids — plus
+  `[[webhook.watch.silent_payments]]` scan credentials for the operator's own
+  wallet (watch-only; requires `silentpaymentindex=1`) — and receives the same
+  `script_matched` / `outpoint_spent` / `txid_matched` /
+  `silent_payment_matched` events the streaming API's `Watch` stream delivers,
+  rendered by the same code so the two surfaces cannot diverge. The set is
+  re-registered from the file on startup and on every SIGHUP. Scan keys are
+  zeroized in memory and never appear in logs, reload summaries, or error
+  messages. Watch matches are live-only for now: a match that occurred while
+  the daemon was down is not re-delivered (a hook's chain events still are).
 
 ## Releases
 

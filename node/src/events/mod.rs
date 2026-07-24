@@ -26,6 +26,7 @@ pub mod schema;
 pub mod sink;
 pub mod status;
 pub mod watch;
+pub mod watch_json;
 
 pub use envelope::{
     BlockTweaks, Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody,
@@ -34,6 +35,7 @@ pub use envelope::{
     CATEGORY_MEMPOOL, CATEGORY_STATUS, CATEGORY_TWEAKS, EXPLICIT_ONLY_CATEGORIES, TWEAKS_TX_INDEX,
 };
 pub use status::{StatusEvent, StatusKind, StatusSeverity, StatusState};
+pub use watch_json::watch_match_json;
 pub use publisher::{
     EventPublisher, MempoolTweakSource, MempoolTweakSubscriberGuard, TweakSubscriberGuard,
     ENVELOPE_BROADCAST_CAPACITY,

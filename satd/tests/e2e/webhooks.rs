@@ -245,6 +245,11 @@ impl MockReceiver {
         }
     }
 
+    /// Whether any accepted delivery matches `pred`.
+    async fn saw_any(&self, pred: impl Fn(&Received) -> bool) -> bool {
+        self.inner.lock().await.received.iter().any(pred)
+    }
+
     async fn attempts(&self) -> usize {
         self.inner.lock().await.seen
     }
@@ -383,6 +388,14 @@ fn write_two_hook_alertfile(
     )
     .expect("write alertfile");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Convert an RPC display txid to the internal (consensus) byte order the
+/// streaming/webhook surface renders.
+fn internal_txid(display: &str) -> String {
+    let mut b = hex::decode(display).expect("hex txid");
+    b.reverse();
+    hex::encode(b)
 }
 
 /// Start a node whose `alertfile=` points at a one-hook file delivering
@@ -871,4 +884,154 @@ async fn a_missed_span_is_announced_as_a_gap_and_never_replayed() {
     receiver
         .wait_for(60, |r| r.json()["body"]["height"] == 6)
         .await;
+}
+
+/// A hook with a `[webhook.watch]` script entry receives a signed
+/// `script_matched` when a transaction pays that script — the whole watch path:
+/// alertfile parse, registry registration, per-hook routing, and the shared
+/// envelope-shaped JSON the WebSocket carrier also emits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_watch_set_delivers_a_script_match() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let receiver = MockReceiver::ok().await;
+
+    // The destination is known before the node starts, so its scripthash can go
+    // into the alertfile — which must exist at startup (the path is
+    // restart-only).
+    let dest_seed = 0x5au8;
+    let dest_spk = crate::common::DeterministicWallet::from_secret([dest_seed; 32])
+        .address
+        .script_pubkey();
+    let scripthash = crate::common::scripthash_hex(&dest_spk);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("alertfile.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"version = 1
+[[webhook]]
+id = "deposits"
+url = "{}"
+secret = "{SECRET}"
+categories = ["chain"]
+[webhook.watch]
+scripts = ["{scripthash}"]
+"#,
+            receiver.url()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let sn =
+        crate::streaming::start_streaming_owned(vec![format!("--alertfile={}", path.display())])
+            .await;
+    let wallet = crate::common::DeterministicWallet::from_secret([0x11u8; 32]);
+    {
+        let rpc = sn.node.rpc_handle();
+        let addr = wallet.address.to_string();
+        tokio::task::spawn_blocking(move || rpc.mine(101, &addr))
+            .await
+            .unwrap();
+    }
+
+    // Pay the watched script.
+    let (txid, _) = crate::streaming::broadcast_spend(&sn, &wallet, dest_seed, 1_000).await;
+
+    // Mempool match first (unconfirmed), then the confirmed re-emit.
+    let got = receiver
+        .wait_for(45, |r| r.json()["body"]["category"] == "script_matched")
+        .await;
+    assert!(got.signature_valid(SECRET), "watch matches are signed too");
+    assert_eq!(got.header("x-satd-hook"), "deposits");
+    let body = got.json();
+    assert_eq!(body["body"]["scripthash"], scripthash, "body: {body}");
+    // Hashes on this surface are internal (consensus) byte order, unreversed —
+    // the streaming API's convention, not the JSON-RPC display order the
+    // `sendrawtransaction` reply uses.
+    assert_eq!(body["body"]["txid"], internal_txid(&txid), "body: {body}");
+    assert_eq!(body["body"]["is_output"], true);
+
+    crate::streaming::mine_n(&sn, 1).await;
+    let confirmed = receiver
+        .wait_for(45, |r| {
+            r.json()["body"]["category"] == "script_matched"
+                && r.json()["body"]["confirmed"] == true
+        })
+        .await;
+    assert_eq!(confirmed.json()["body"]["txid"], internal_txid(&txid));
+}
+
+/// A hook that watches nothing must not receive another hook's matches: the
+/// registry holds one union subscriber, so routing back to the owning hook is
+/// the dispatcher's job and a bug there would leak one operator's deposit
+/// activity into an unrelated endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_watch_matches_are_routed_only_to_the_owning_hook() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let watcher = MockReceiver::ok().await;
+    let bystander = MockReceiver::ok().await;
+
+    let dest_seed = 0x5bu8;
+    let dest_spk = crate::common::DeterministicWallet::from_secret([dest_seed; 32])
+        .address
+        .script_pubkey();
+    let scripthash = crate::common::scripthash_hex(&dest_spk);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("alertfile.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"version = 1
+[[webhook]]
+id = "watcher"
+url = "{}"
+secret = "{SECRET}"
+categories = ["chain"]
+[webhook.watch]
+scripts = ["{scripthash}"]
+
+[[webhook]]
+id = "bystander"
+url = "{}"
+secret = "{SECRET}"
+categories = ["chain"]
+"#,
+            watcher.url(),
+            bystander.url()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let sn =
+        crate::streaming::start_streaming_owned(vec![format!("--alertfile={}", path.display())])
+            .await;
+    let wallet = crate::common::DeterministicWallet::from_secret([0x11u8; 32]);
+    {
+        let rpc = sn.node.rpc_handle();
+        let addr = wallet.address.to_string();
+        tokio::task::spawn_blocking(move || rpc.mine(101, &addr))
+            .await
+            .unwrap();
+    }
+    crate::streaming::broadcast_spend(&sn, &wallet, dest_seed, 1_000).await;
+    crate::streaming::mine_n(&sn, 1).await;
+
+    // The watcher gets the match...
+    watcher
+        .wait_for(45, |r| r.json()["body"]["category"] == "script_matched")
+        .await;
+    // ...and the bystander gets the block it subscribed to, but no match.
+    bystander
+        .wait_for(45, |r| r.json()["body"]["category"] == "chain")
+        .await;
+    assert!(
+        !bystander.saw_any(|r| r.json()["body"]["category"] == "script_matched").await,
+        "a hook with no watch-set must never receive another hook's matches",
+    );
 }

@@ -274,14 +274,14 @@ async fn ws_set_categories_chain_only() {
 /// Default seed for the funding wallet.
 const WALLET_SEED: u8 = 0x11;
 
-async fn matured_node() -> (StreamingNode, DeterministicWallet) {
+pub(crate) async fn matured_node() -> (StreamingNode, DeterministicWallet) {
     matured_node_args(vec![]).await
 }
 
 /// Like [`matured_node`] but forwards extra CLI args to the spawned `satd`
 /// (e.g. `--stream-prevout-meta=full`). Mines 101 blocks to the wallet so the
 /// block-1 coinbase (50 BTC) is mature and spendable.
-async fn matured_node_args(args: Vec<&'static str>) -> (StreamingNode, DeterministicWallet) {
+pub(crate) async fn matured_node_args(args: Vec<&'static str>) -> (StreamingNode, DeterministicWallet) {
     let sn = start_streaming_async(args).await;
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
@@ -309,7 +309,7 @@ pub(crate) async fn mine_n(sn: &StreamingNode, n: u32) {
 
 /// Build + broadcast the canonical block-1-coinbase spend (RBF-signalling off).
 /// Returns `(spend_display_txid, dest_spk)`.
-async fn broadcast_spend(
+pub(crate) async fn broadcast_spend(
     sn: &StreamingNode,
     wallet: &DeterministicWallet,
     dest_seed: u8,

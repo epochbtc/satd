@@ -4106,6 +4106,7 @@ dependencies = [
 name = "satd-alert"
 version = "0.4.0"
 dependencies = [
+ "bitcoin",
  "hex",
  "hmac",
  "node",

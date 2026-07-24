@@ -257,15 +257,24 @@ fn start_hook(
 /// The bus receiver is created by the caller, not here. When it is created
 /// relative to retiring the previous generation is the whole handover protocol;
 /// see `AlertReloader::apply`.
+#[allow(clippy::too_many_arguments)]
 async fn fan_in(
     hooks: Vec<HookChannel>,
     mut rx: tokio::sync::broadcast::Receiver<NodeEvent>,
     publisher: Arc<EventPublisher>,
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
+    watch_registry: Arc<node::events::WatchRegistry>,
     state: Arc<DispatcherState>,
     mut stop: Stop,
 ) {
+    // Register the union of every hook's watch-set as ONE registry subscriber.
+    // Matches arrive on a per-subscriber channel (they never ride the shared
+    // bus), and each is routed back to the hooks that asked for it. The handle
+    // is held for the generation's lifetime — dropping it deregisters, which is
+    // exactly what a reload wants.
+    let (watch_handle, mut watch_rx) = register_watch_sets(&watch_registry, &hooks);
+
     // Announce whatever each hook missed while the daemon was down. Nothing is
     // replayed — there is no snapshot-to-live seam to dedupe, because there is
     // no snapshot.
@@ -298,6 +307,39 @@ async fn fan_in(
                     flush_gap(hook, &publisher);
                 }
             }
+            m = watch_rx.recv() => match m {
+                Some(m) => {
+                    let json = node::events::watch_match_json(&m, &[], false);
+                    let Ok(bytes) = serde_json::to_vec(&json) else { continue };
+                    let body = Arc::new(bytes);
+                    for hook in &hooks {
+                        // Route by what the hook actually watches. The registry
+                        // knows only the union, so a match for hook A must not
+                        // be delivered to hook B that never asked for it.
+                        if !hook_watches_match(&hook.hook, &m) {
+                            continue;
+                        }
+                        let seq = publisher.published();
+                        enqueue(hook, &publisher, Delivery::Event {
+                            body: body.clone(),
+                            delivery_id: satd_alert::delivery_id(
+                                &hex::encode(publisher.edge().node_id),
+                                publisher.instance_id(),
+                                seq,
+                            ),
+                            // Watch matches are per-subscriber and carry no
+                            // durable cursor of their own; the hook's resume
+                            // position advances on the confirmed chain events
+                            // it also receives.
+                            cursor: None,
+                            gap_weight: 0,
+                        }, None);
+                    }
+                }
+                None => {
+                    tracing::warn!(target: "alert", "watch match channel closed");
+                }
+            },
             recv = rx.recv() => match recv {
                 Ok(env) => {
                     // Suppress the block firehose during initial block
@@ -407,7 +449,81 @@ async fn fan_in(
             },
         }
     }
+    drop(watch_handle);
     tracing::info!(target: "alert", "alert webhook dispatcher stopped");
+}
+
+/// Register every hook's watch-set into one registry subscriber and return the
+/// handle plus the match channel.
+///
+/// One subscriber rather than one per hook: the matcher's cost is per watched
+/// entry per transaction, and registering the same script twice would double it
+/// for no benefit. Routing back to individual hooks is a cheap set membership
+/// test on the delivery side.
+fn register_watch_sets(
+    registry: &Arc<node::events::WatchRegistry>,
+    hooks: &[HookChannel],
+) -> (
+    node::events::WatchHandle,
+    tokio::sync::mpsc::Receiver<node::events::WatchMatch>,
+) {
+    let (handle, rx) = registry.register(node::events::WATCH_CHANNEL_CAPACITY);
+    let mut scripts = 0usize;
+    let mut outpoints = 0usize;
+    let mut txids = 0usize;
+    let mut sp = 0usize;
+    for hook in hooks {
+        let w = &hook.hook.watch;
+        if !w.scripthashes.is_empty() {
+            scripts += handle.add_scripthashes(&w.scripthashes);
+        }
+        if !w.outpoints.is_empty() {
+            outpoints += handle.add_outpoints(&w.outpoints);
+        }
+        if !w.txids.is_empty() {
+            // No auto-close: a webhook watch is a standing operator
+            // configuration, not a one-shot wait for a payment to confirm.
+            txids += handle.add_txids(&w.txids, 0);
+        }
+        if !w.silent_payments.is_empty() {
+            sp += handle.add_silent_payments(&w.silent_payments);
+        }
+    }
+    if scripts + outpoints + txids + sp > 0 {
+        tracing::info!(
+            target: "alert",
+            scripts,
+            outpoints,
+            txids,
+            silent_payments = sp,
+            "registered webhook watch-sets",
+        );
+    }
+    (handle, rx)
+}
+
+/// Whether this hook's own watch-set produced `m`.
+fn hook_watches_match(hook: &Hook, m: &node::events::WatchMatch) -> bool {
+    use node::events::WatchMatch as W;
+    let w = &hook.watch;
+    match m {
+        W::OutpointSpent { outpoint, .. } => w.outpoints.contains(outpoint),
+        W::ScriptMatched { scripthash, .. } => w.scripthashes.iter().any(|s| s == scripthash),
+        W::TxidMatched { txid, .. }
+        | W::TxidReplaced { txid, .. }
+        | W::TxidEvicted { txid, .. }
+        | W::TxidUnconfirmed { txid, .. }
+        | W::TxidDepthReached { txid, .. }
+        | W::TxidFinalized { txid, .. } => w.txids.contains(txid),
+        W::SilentPaymentMatched { scan_pubkey, .. } => w
+            .silent_payments
+            .iter()
+            .any(|t| t.scan_pubkey() == *scan_pubkey),
+        // Prefix watches are not configurable from an alertfile (they exist to
+        // give a remote client plausible deniability, which is meaningless for
+        // an operator watching their own node), so no hook can own one.
+        W::PrefixMatched { .. } => false,
+    }
 }
 
 /// Queue an event for one hook, converting an overflow into a recorded gap.
@@ -892,6 +1008,12 @@ pub struct AlertReloader {
     publisher: Arc<EventPublisher>,
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
+    /// Watch registry the dispatcher registers each generation's union
+    /// watch-set into.
+    watch_registry: Arc<node::events::WatchRegistry>,
+    /// Whether `silentpaymentindex=1`. Silent-payment watch entries are refused
+    /// without it (see `apply`).
+    sp_index_enabled: bool,
     metrics: Arc<WebhookMetrics>,
     global_stop: watch::Receiver<bool>,
     /// Everything a handover has to hand over.
@@ -923,6 +1045,8 @@ impl AlertReloader {
         publisher: Arc<EventPublisher>,
         store: Arc<dyn Store>,
         block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
+        watch_registry: Arc<node::events::WatchRegistry>,
+        sp_index_enabled: bool,
         metrics: Arc<WebhookMetrics>,
         global_stop: watch::Receiver<bool>,
     ) -> Self {
@@ -932,6 +1056,8 @@ impl AlertReloader {
             publisher,
             store,
             block_source,
+            watch_registry,
+            sp_index_enabled,
             metrics,
             global_stop,
             running: parking_lot::Mutex::new(Running::default()),
@@ -951,6 +1077,28 @@ impl AlertReloader {
     /// right severity (fatal at startup, warn-and-continue on reload).
     pub fn apply(&self) -> Result<usize, satd_alert::AlertFileError> {
         let file = AlertFile::load(&self.path)?;
+
+        // Silent-payment watch entries are refused without the tweak index.
+        // Live matching would work either way (the matcher recomputes from the
+        // block), but the index is what lets a hook's confirmed SP matches be
+        // caught up after a restart — and an alerting rule whose durability
+        // silently depends on an unrelated flag is worse than one that refuses
+        // to start.
+        if !self.sp_index_enabled
+            && let Some(hook) = file
+                .hooks
+                .iter()
+                .find(|h| !h.watch.silent_payments.is_empty())
+        {
+            return Err(satd_alert::AlertFileError::Invalid {
+                path: self.path.clone(),
+                message: format!(
+                    "webhook `{}` watches silent payments, which requires silentpaymentindex=1",
+                    hook.id
+                ),
+            });
+        }
+
         let ids: Vec<String> = file.hooks.iter().map(|h| h.id.clone()).collect();
 
         // A SIGHUP that did not change the alertfile is a no-op.
@@ -1078,6 +1226,7 @@ impl AlertReloader {
                     self.publisher.clone(),
                     self.store.clone(),
                     self.block_source.clone(),
+                    self.watch_registry.clone(),
                     Arc::clone(&DISPATCHER_STATE),
                     Stop {
                         global: self.global_stop.clone(),
@@ -1411,6 +1560,99 @@ heartbeat_interval_secs = 3600
         }
     }
 
+    fn test_pubkey(byte: u8) -> bitcoin::secp256k1::PublicKey {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap(),
+        )
+    }
+
+    fn sp_hook_toml(id: &str) -> String {
+        let spend = test_pubkey(0x43);
+        format!(
+            r#"version = 1
+[[webhook]]
+id = "{id}"
+url = "https://x.example/h"
+secret = "s"
+categories = ["chain"]
+[[webhook.watch.silent_payments]]
+scan_key = "{}"
+spend_pubkey = "{}"
+"#,
+            hex::encode([0x42u8; 32]),
+            hex::encode(spend.serialize()),
+        )
+    }
+
+    #[test]
+    fn watch_matches_route_only_to_the_hook_that_asked() {
+        // One registry subscriber holds the union of every hook's watch-set, so
+        // routing back to the owning hook is this module's job — a bug here
+        // leaks one operator's deposit activity into an unrelated endpoint.
+        let watcher = hook_from(
+            r#"
+version = 1
+[[webhook]]
+id = "watcher"
+url = "https://x.example/h"
+secret = "s"
+categories = ["chain"]
+[webhook.watch]
+scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
+"#,
+        );
+        let bystander = hook_from(STATUS_HOOK);
+        let m = node::events::WatchMatch::ScriptMatched {
+            scripthash: [0x11; 32],
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([9u8; 32])),
+            is_output: true,
+            index: 0,
+            confirmed: false,
+            height: None,
+            amount: None,
+            raw_tx: None,
+        };
+        assert!(hook_watches_match(&watcher, &m));
+        assert!(!hook_watches_match(&bystander, &m));
+
+        // A different script is not this hook's match either.
+        let other = node::events::WatchMatch::ScriptMatched {
+            scripthash: [0x22; 32],
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([9u8; 32])),
+            is_output: true,
+            index: 0,
+            confirmed: false,
+            height: None,
+            amount: None,
+            raw_tx: None,
+        };
+        assert!(!hook_watches_match(&watcher, &other));
+    }
+
+    #[test]
+    fn silent_payment_matches_route_by_scan_identity() {
+        let hook = hook_from(&sp_hook_toml("wallet"));
+        let mine = hook.watch.silent_payments[0].scan_pubkey();
+        let m = |scan_pubkey: [u8; 33]| node::events::WatchMatch::SilentPaymentMatched {
+            scan_pubkey,
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([9u8; 32])),
+            vout: 0,
+            output_pubkey: test_pubkey(0x45).x_only_public_key().0,
+            amount: 1_000,
+            tweak: test_pubkey(0x44),
+            k: 0,
+            label: None,
+            confirmed: true,
+            height: Some(10),
+            raw_tx: None,
+        };
+        assert!(hook_watches_match(&hook, &m(mine)));
+        // A match for someone else's scan key must not be delivered here.
+        assert!(!hook_watches_match(&hook, &m([0x00; 33])));
+    }
+
     #[test]
     fn a_hook_without_the_heartbeat_interval_gets_no_heartbeats() {
         let hook = hook_from(STATUS_HOOK);
@@ -1452,6 +1694,8 @@ heartbeat_interval_secs = 3600
             publisher.clone(),
             Arc::new(node::storage::db::InMemoryStore::new()),
             None,
+            Arc::new(node::events::WatchRegistry::new()),
+            false,
             Arc::new(WebhookMetrics::new()),
             global_stop,
         );

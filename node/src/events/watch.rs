@@ -158,6 +158,23 @@ impl SpWatchTarget {
     }
 }
 
+/// Identity comparison over the **public** fields only.
+///
+/// `scan_pubkey` is `b_scan·G`, so equal scan pubkeys imply equal scan secrets:
+/// comparing it covers the secret without ever comparing secret bytes (which
+/// would also be a non-constant-time compare). `spend_pubkey` and `labels` are
+/// part of the identity too — two targets sharing a scan key but differing in
+/// either derive different outputs, so treating them as equal would be wrong.
+impl PartialEq for SpWatchTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.scan_pubkey == other.scan_pubkey
+            && self.spend_pubkey == other.spend_pubkey
+            && self.labels == other.labels
+    }
+}
+
+impl Eq for SpWatchTarget {}
+
 impl std::fmt::Debug for SpWatchTarget {
     /// Redacts `b_scan`; prints only the non-secret identity and label count,
     /// mirroring the token-redaction precedent (`satd-events-client` builder).

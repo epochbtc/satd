@@ -2199,6 +2199,8 @@ async fn main() {
             // Block source for a hook's startup catch-up replay: read-only
             // active-chain access, the same handle the streaming carriers use.
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
+            watch_registry.clone(),
+            config.silentpaymentindex,
             webhook_metrics.clone(),
             shutdown_rx.clone(),
         ))

@@ -212,6 +212,55 @@ how the delivery arose — a bare counter for a live event, `w` for a watch matc
 and `r` for a synthesized notice such as `lagged`. Deduplicate on the whole
 header; it is unique per event and stable across the retries of one delivery.
 
+### Watching addresses, coins, and transactions
+
+A hook can also carry a **watch-set** — the same primitives the streaming API's
+`Watch` stream offers, configured in the file instead of over a connection:
+
+```toml
+[[webhook]]
+id = "deposits"
+url = "https://relay.internal:8443/hook"
+secret = "..."
+categories = ["chain"]
+
+[webhook.watch]
+scripts   = ["<32-byte scripthash hex>", "..."]   # sha256(scriptPubKey)
+outpoints = ["<txid>:<vout>"]
+txids     = ["<txid>"]
+
+[[webhook.watch.silent_payments]]                 # your own wallet
+scan_key     = "<32-byte hex>"                    # watch-only; no spend authority
+spend_pubkey = "<33-byte compressed hex>"
+labels       = [0]                                # optional BIP 352 labels
+```
+
+Matches arrive as `script_matched`, `outpoint_spent`, `txid_matched`,
+`silent_payment_matched`, and the txid lifecycle events — the same
+envelope-shaped JSON the WebSocket carrier emits, rendered by the same code.
+You get the mempool sighting first (`confirmed: false`) and the confirmed
+re-emit when it lands.
+
+Hashes are in **internal (consensus) byte order**, unreversed — the streaming
+API's convention, not the reversed display order JSON-RPC uses. A scripthash is
+`sha256(scriptPubKey)`, exactly the value a `ScriptMatched` event reports.
+
+**Silent payments.** A scan key in an alertfile is a deliberate exception to the
+rule that satd never persists one. The streaming API holds a client's scan key
+in memory for a single connection and never writes it, because there the client
+and the node operator are different parties. A webhook consumer *is* the
+operator, alerting on their own wallet on their own node: the key is watch-only
+(it identifies incoming payments and confers no spend authority), and the file
+already holds signing secrets at mode 0600. The key is zeroized in memory and
+never rendered by any log line, reload summary, or error message. Silent-payment
+entries require `silentpaymentindex=1`.
+
+> **Not yet: historical catch-up for watch matches.** A hook's *chain* events
+> are replayed from its stored cursor after a restart (below), but watch
+> **matches** are not — a match that occurred while the daemon was down is not
+> re-delivered. Reconcile with `getaddresshistory` / a `RescanBlocks` over the
+> streaming API if you need that window covered. Live matching is unaffected.
+
 ### Delivery behavior
 
 - **Serial and in-order per hook** — one request in flight at a time, so events

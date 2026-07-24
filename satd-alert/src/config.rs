@@ -28,7 +28,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use node::events::{StatusKind, StatusSeverity};
+use node::events::{SpWatchTarget, StatusKind, StatusSeverity};
 
 /// Per-hook outbound queue depth. Delivery is serial per hook, so this is how
 /// far a hook may fall behind before events are dropped and the gap is reported
@@ -117,6 +117,65 @@ impl HookFilter {
     }
 }
 
+/// A hook's watch-set: the addresses, coins, transactions, and silent-payment
+/// credentials this hook wants match events for.
+///
+/// Watch matches are per-subscriber state on the node (they never ride the
+/// shared bus), so the alertfile is the durable source of truth: the dispatcher
+/// re-registers this set at startup and on every reload. That is the same
+/// "rebuild the watch-set from durable truth" shape the SDK's `ResilientWatch`
+/// uses on reconnect, with the config file playing the loader.
+#[derive(Default, PartialEq, Eq)]
+pub struct WatchSet {
+    /// 32-byte scripthashes (the streaming API's script identity).
+    pub scripthashes: Vec<[u8; 32]>,
+    pub outpoints: Vec<bitcoin::OutPoint>,
+    pub txids: Vec<bitcoin::Txid>,
+    /// BIP 352 scan credentials for the operator's own wallet.
+    pub silent_payments: Vec<SpWatchTarget>,
+}
+
+impl WatchSet {
+    pub fn is_empty(&self) -> bool {
+        self.scripthashes.is_empty()
+            && self.outpoints.is_empty()
+            && self.txids.is_empty()
+            && self.silent_payments.is_empty()
+    }
+
+    /// Total watched entries, for logging and quota-shaped reasoning.
+    pub fn len(&self) -> usize {
+        self.scripthashes.len()
+            + self.outpoints.len()
+            + self.txids.len()
+            + self.silent_payments.len()
+    }
+}
+
+/// Redacted by construction: a scan secret must never reach a log line, a
+/// reload summary, or a panic message. Counts only.
+impl std::fmt::Debug for WatchSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchSet")
+            .field("scripthashes", &self.scripthashes.len())
+            .field("outpoints", &self.outpoints.len())
+            .field("txids", &self.txids.len())
+            .field("silent_payments", &self.silent_payments.len())
+            .finish()
+    }
+}
+
+impl Clone for WatchSet {
+    fn clone(&self) -> Self {
+        Self {
+            scripthashes: self.scripthashes.clone(),
+            outpoints: self.outpoints.clone(),
+            txids: self.txids.clone(),
+            silent_payments: self.silent_payments.clone(),
+        }
+    }
+}
+
 /// One configured webhook.
 ///
 /// `Debug` is hand-written: a derived one renders `secret` in full, and a
@@ -139,6 +198,8 @@ pub struct Hook {
     /// address. Off by default: webhook bodies carry chain data rather than
     /// secrets, but signed-then-cleartext is still a footgun.
     pub allow_insecure_http: bool,
+    /// Optional watch-set. Empty ⇒ this hook receives only firehose categories.
+    pub watch: WatchSet,
 }
 
 impl std::fmt::Debug for Hook {
@@ -264,6 +325,7 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         "min_severity",
         "heartbeat_interval_secs",
         "allow_insecure_http",
+        "watch",
     ];
     for key in t.iter().map(|(k, _)| k) {
         if !KNOWN.contains(&key) {
@@ -336,6 +398,16 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         ));
     }
 
+    let watch = match t.get("watch") {
+        None => WatchSet::default(),
+        Some(v) => {
+            let table = v.as_table().ok_or_else(|| {
+                AlertFileError::invalid(path, format!("webhook `{id}`: `watch` must be a table"))
+            })?;
+            parse_watch_set(path, &id, table)?
+        }
+    };
+
     Ok(Hook {
         id,
         url,
@@ -347,7 +419,170 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         },
         heartbeat_interval_secs,
         allow_insecure_http,
+        watch,
     })
+}
+
+fn parse_watch_set(
+    path: &Path,
+    id: &str,
+    t: &toml_edit::Table,
+) -> Result<WatchSet, AlertFileError> {
+    const KNOWN: &[&str] = &["scripts", "outpoints", "txids", "silent_payments"];
+    for key in t.iter().map(|(k, _)| k) {
+        if !KNOWN.contains(&key) {
+            return Err(AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: unknown key `{key}` in [webhook.watch] (known: {})", KNOWN.join(", ")),
+            ));
+        }
+    }
+    let mut set = WatchSet::default();
+
+    for item in str_array(path, id, t, "scripts")? {
+        // Scripts are watched by their 32-byte scripthash — the same identity
+        // the streaming API uses, so an operator can reuse a value they already
+        // have from a `ScriptMatched` event.
+        let bytes = hex::decode(&item).map_err(|_| {
+            AlertFileError::invalid(path, format!("webhook `{id}`: `scripts` entry `{item}` is not hex"))
+        })?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `scripts` entry `{item}` must be a 32-byte scripthash"),
+            )
+        })?;
+        set.scripthashes.push(arr);
+    }
+
+    for item in str_array(path, id, t, "outpoints")? {
+        let (txid, vout) = item.rsplit_once(':').ok_or_else(|| {
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `outpoints` entry `{item}` must be `<txid>:<vout>`"),
+            )
+        })?;
+        let txid: bitcoin::Txid = txid.parse().map_err(|_| {
+            AlertFileError::invalid(path, format!("webhook `{id}`: bad txid in outpoint `{item}`"))
+        })?;
+        let vout: u32 = vout.parse().map_err(|_| {
+            AlertFileError::invalid(path, format!("webhook `{id}`: bad vout in outpoint `{item}`"))
+        })?;
+        set.outpoints.push(bitcoin::OutPoint { txid, vout });
+    }
+
+    for item in str_array(path, id, t, "txids")? {
+        set.txids.push(item.parse().map_err(|_| {
+            AlertFileError::invalid(path, format!("webhook `{id}`: `txids` entry `{item}` is not a txid"))
+        })?);
+    }
+
+    if let Some(v) = t.get("silent_payments") {
+        let entries = v.as_array_of_tables().ok_or_else(|| {
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `silent_payments` must be an array of tables (`[[webhook.watch.silent_payments]]`)"),
+            )
+        })?;
+        for entry in entries {
+            set.silent_payments.push(parse_sp_target(path, id, entry)?);
+        }
+    }
+
+    Ok(set)
+}
+
+/// Parse one `[[webhook.watch.silent_payments]]` entry.
+///
+/// The scan key is a **watch-only** credential: it identifies payments to the
+/// operator's own wallet and confers no spend authority. It is accepted here —
+/// unlike over the streaming API, where a client's key is held in memory for
+/// one connection and never written — because a webhook consumer is the node's
+/// own operator alerting on their own wallet, and the alertfile is already a
+/// 0600 secret-bearing file. It is zeroized on drop and never rendered by any
+/// `Debug` impl on the way through.
+fn parse_sp_target(
+    path: &Path,
+    id: &str,
+    t: &toml_edit::Table,
+) -> Result<SpWatchTarget, AlertFileError> {
+    const KNOWN: &[&str] = &["scan_key", "spend_pubkey", "labels"];
+    for key in t.iter().map(|(k, _)| k) {
+        if !KNOWN.contains(&key) {
+            return Err(AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: unknown key `{key}` in [[webhook.watch.silent_payments]]"),
+            ));
+        }
+    }
+    let scan_hex = req_str(path, t, "scan_key")?;
+    let spend_hex = req_str(path, t, "spend_pubkey")?;
+    let labels: Vec<u32> = match t.get("labels") {
+        None => Vec::new(),
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                AlertFileError::invalid(path, format!("webhook `{id}`: `labels` must be an array"))
+            })?;
+            arr.iter()
+                .map(|i| {
+                    i.as_integer()
+                        .filter(|n| *n >= 0 && *n <= u32::MAX as i64)
+                        .map(|n| n as u32)
+                        .ok_or_else(|| {
+                            AlertFileError::invalid(
+                                path,
+                                format!("webhook `{id}`: `labels` entries must be non-negative integers"),
+                            )
+                        })
+                })
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let scan: [u8; 32] = hex::decode(&scan_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            // Deliberately does not echo the value: it is a secret, and a config
+            // error message is exactly the kind of thing that ends up in a
+            // bug report.
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `scan_key` must be 32 bytes of hex"),
+            )
+        })?;
+    let spend = hex::decode(&spend_hex).map_err(|_| {
+        AlertFileError::invalid(path, format!("webhook `{id}`: `spend_pubkey` is not hex"))
+    })?;
+    SpWatchTarget::new(scan, &spend, labels).map_err(|e| {
+        AlertFileError::invalid(
+            path,
+            format!("webhook `{id}`: invalid silent-payment target: {e}"),
+        )
+    })
+}
+
+fn str_array(
+    path: &Path,
+    id: &str,
+    t: &toml_edit::Table,
+    key: &str,
+) -> Result<Vec<String>, AlertFileError> {
+    let Some(v) = t.get(key) else {
+        return Ok(Vec::new());
+    };
+    let arr = v.as_array().ok_or_else(|| {
+        AlertFileError::invalid(path, format!("webhook `{id}`: `{key}` must be an array"))
+    })?;
+    arr.iter()
+        .map(|i| {
+            i.as_str().map(str::to_string).ok_or_else(|| {
+                AlertFileError::invalid(
+                    path,
+                    format!("webhook `{id}`: `{key}` entries must be strings"),
+                )
+            })
+        })
+        .collect()
 }
 
 fn parse_categories(
@@ -909,6 +1144,130 @@ categories = ["chain"]
         // "configured but no hooks" is a legitimate intermediate state during
         // an edit; it must not fail the daemon.
         assert!(parse("version = 1\n").unwrap().hooks.is_empty());
+    }
+
+    const WATCH_HOOK: &str = r#"
+version = 1
+[[webhook]]
+id = "deposits"
+url = "https://x.example/h"
+secret = "s"
+categories = ["chain"]
+[webhook.watch]
+scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
+outpoints = ["0000000000000000000000000000000000000000000000000000000000000001:3"]
+txids = ["0000000000000000000000000000000000000000000000000000000000000002"]
+"#;
+
+    #[test]
+    fn parses_a_watch_set() {
+        let f = parse(WATCH_HOOK).unwrap();
+        let w = &f.hooks[0].watch;
+        assert_eq!(w.scripthashes, vec![[0x11u8; 32]]);
+        assert_eq!(w.outpoints.len(), 1);
+        assert_eq!(w.outpoints[0].vout, 3);
+        assert_eq!(w.txids.len(), 1);
+        assert!(w.silent_payments.is_empty());
+        assert_eq!(w.len(), 3);
+    }
+
+    #[test]
+    fn a_hook_without_a_watch_table_has_an_empty_set() {
+        assert!(parse(MINIMAL).unwrap().hooks[0].watch.is_empty());
+    }
+
+    #[test]
+    fn malformed_watch_entries_are_rejected() {
+        // A scripthash that is not 32 bytes, a bad outpoint, an unknown key —
+        // all must fail loudly rather than register a watch that matches
+        // nothing.
+        for bad in [
+            ("scripts = [\"1111\"]", "short scripthash"),
+            ("scripts = [\"zz\"]", "non-hex scripthash"),
+            ("outpoints = [\"deadbeef\"]", "outpoint without :vout"),
+            ("outpoints = [\"0000000000000000000000000000000000000000000000000000000000000001:x\"]", "non-numeric vout"),
+            ("txids = [\"nope\"]", "bad txid"),
+            ("prefixes = [\"aa\"]", "unknown watch key"),
+        ] {
+            let text = format!(
+                "version = 1\n[[webhook]]\nid=\"a\"\nurl=\"https://x/h\"\nsecret=\"s\"\ncategories=[\"chain\"]\n[webhook.watch]\n{}\n",
+                bad.0
+            );
+            assert!(parse(&text).is_err(), "{} should be rejected", bad.1);
+        }
+    }
+
+    /// A valid BIP 352 scan credential pair, built the way an operator's wallet
+    /// would export one.
+    fn sp_alertfile(scan_hex: &str, spend_hex: &str, labels: &str) -> String {
+        format!(
+            r#"version = 1
+[[webhook]]
+id = "wallet"
+url = "https://x.example/h"
+secret = "s"
+categories = ["chain"]
+[[webhook.watch.silent_payments]]
+scan_key = "{scan_hex}"
+spend_pubkey = "{spend_hex}"
+{labels}
+"#
+        )
+    }
+
+    fn sp_keys() -> (String, String) {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let scan = [0x42u8; 32];
+        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x43; 32]).unwrap());
+        (hex::encode(scan), hex::encode(spend.serialize()))
+    }
+
+    #[test]
+    fn parses_a_silent_payment_target() {
+        let (scan, spend) = sp_keys();
+        let f = parse(&sp_alertfile(&scan, &spend, "labels = [0, 7]")).unwrap();
+        let w = &f.hooks[0].watch;
+        assert_eq!(w.silent_payments.len(), 1);
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn a_scan_key_never_appears_in_debug_output() {
+        // The alertfile is 0600, but a Debug render leaks into logs, reload
+        // summaries, and panic messages, which are not.
+        let (scan, spend) = sp_keys();
+        let f = parse(&sp_alertfile(&scan, &spend, "")).unwrap();
+        let rendered = format!("{:?}", f.hooks[0]);
+        assert!(
+            !rendered.contains(&scan),
+            "the scan secret must not be renderable: {rendered}"
+        );
+        assert!(
+            rendered.contains("silent_payments: 1"),
+            "counts are fine to show: {rendered}"
+        );
+    }
+
+    #[test]
+    fn malformed_silent_payment_targets_are_rejected() {
+        let (scan, spend) = sp_keys();
+        // Wrong-length scan key, non-hex, bad spend pubkey, unknown key.
+        assert!(parse(&sp_alertfile("aabb", &spend, "")).is_err());
+        assert!(parse(&sp_alertfile("zz", &spend, "")).is_err());
+        assert!(parse(&sp_alertfile(&scan, "00", "")).is_err());
+        assert!(parse(&sp_alertfile(&scan, &spend, "nope = 1")).is_err());
+        // Negative labels are not BIP 352 label integers.
+        assert!(parse(&sp_alertfile(&scan, &spend, "labels = [-1]")).is_err());
+    }
+
+    #[test]
+    fn a_scan_key_error_does_not_echo_the_secret() {
+        // Config errors get pasted into bug reports.
+        let (_, spend) = sp_keys();
+        let bad = "ab".repeat(20); // wrong length, but still secret-shaped
+        let err = parse(&sp_alertfile(&bad, &spend, "")).unwrap_err().to_string();
+        assert!(!err.contains(&bad), "error echoed the key material: {err}");
     }
 
     #[cfg(unix)]
