@@ -3019,6 +3019,7 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         // dropped before conversion); this maps the survivor to its full proto
         // form. `tweaks_only` never applies — the txid is always present.
         NodeEventBody::MempoolTweak(entry) => Body::MempoolTweak(mempool_tweak_to_proto(entry)),
+        NodeEventBody::Status(ev) => Body::Status(status_event_to_proto(ev)),
         NodeEventBody::Heartbeat { uptime_ns } => Body::Heartbeat(pb::Heartbeat {
             uptime_ns: *uptime_ns,
         }),
@@ -3032,6 +3033,39 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         NodeEventBody::SetCursorResult(outcome) => {
             Body::SetCursorResult(set_cursor_result_to_proto(outcome))
         }
+    }
+}
+
+fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
+    use node::events::{StatusKind as K, StatusSeverity as Sev, StatusState as St};
+    let kind = match ev.kind {
+        K::IbdComplete => pb::StatusKind::IbdComplete,
+        K::TipStall => pb::StatusKind::TipStall,
+        K::DiskLow => pb::StatusKind::DiskLow,
+        K::MempoolCongested => pb::StatusKind::MempoolCongested,
+        K::PeerFloor => pb::StatusKind::PeerFloor,
+        K::DeepReorg => pb::StatusKind::DeepReorg,
+    };
+    let state = match ev.state {
+        St::Raised => pb::StatusState::Raised,
+        St::Cleared => pb::StatusState::Cleared,
+        St::Edge => pb::StatusState::Edge,
+    };
+    let severity = match ev.severity {
+        Sev::Info => pb::StatusSeverity::Info,
+        Sev::Warning => pb::StatusSeverity::Warning,
+        Sev::Critical => pb::StatusSeverity::Critical,
+    };
+    pb::StatusEvent {
+        kind: kind as i32,
+        state: state as i32,
+        severity: severity as i32,
+        message: ev.message.clone(),
+        // `details` is a `BTreeMap` on the Rust side (deterministic order for
+        // the HMAC-signed webhook body); proto maps are unordered, so the
+        // ordering guarantee simply does not carry here — no consumer of the
+        // proto surface depends on it.
+        details: ev.details.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
 }
 
@@ -3218,6 +3252,62 @@ mod tests {
             pb.entries[1].taproot_outputs.is_empty(),
             "un-enriched entry carries no outputs"
         );
+    }
+
+    #[test]
+    fn status_event_maps_to_proto_enums_and_details() {
+        use node::events::{StatusEvent, StatusKind, StatusSeverity, StatusState};
+
+        let ev = StatusEvent::raised(StatusKind::TipStall, "no block for 3612s")
+            .with_detail("seconds_since_block", 3612u64)
+            .with_detail("threshold_seconds", 3600u64);
+        let pb = status_event_to_proto(&ev);
+
+        assert_eq!(pb.kind, pb::StatusKind::TipStall as i32);
+        assert_eq!(pb.state, pb::StatusState::Raised as i32);
+        assert_eq!(pb.severity, pb::StatusSeverity::Critical as i32);
+        assert_eq!(pb.message, "no block for 3612s");
+        assert_eq!(pb.details.get("seconds_since_block").map(String::as_str), Some("3612"));
+        assert_eq!(pb.details.get("threshold_seconds").map(String::as_str), Some("3600"));
+
+        // Every kind and state has a distinct, non-UNSPECIFIED mapping — a
+        // zero-valued enum on the wire would be indistinguishable from a field
+        // the server never set.
+        let mut seen = std::collections::HashSet::new();
+        for kind in StatusKind::ALL {
+            let ev = if kind.is_edge() {
+                StatusEvent::edge(kind, "x")
+            } else {
+                StatusEvent::raised(kind, "x")
+            };
+            let mapped = status_event_to_proto(&ev).kind;
+            assert_ne!(mapped, pb::StatusKind::Unspecified as i32, "{kind:?}");
+            assert!(seen.insert(mapped), "duplicate proto mapping for {kind:?}");
+        }
+        for (state, want) in [
+            (StatusState::Raised, pb::StatusState::Raised),
+            (StatusState::Cleared, pb::StatusState::Cleared),
+            (StatusState::Edge, pb::StatusState::Edge),
+        ] {
+            let ev = StatusEvent {
+                kind: StatusKind::DiskLow,
+                state,
+                severity: StatusSeverity::Info,
+                message: String::new(),
+                details: Default::default(),
+            };
+            assert_eq!(status_event_to_proto(&ev).state, want as i32);
+        }
+    }
+
+    #[test]
+    fn status_envelope_rides_the_status_body_field() {
+        use node::events::{StatusEvent, StatusKind};
+        let body = NodeEventBody::Status(StatusEvent::edge(StatusKind::IbdComplete, "synced"));
+        assert!(matches!(
+            body_to_proto(&body),
+            pb::node_event::Body::Status(_)
+        ));
     }
 
     #[test]
@@ -4284,6 +4374,7 @@ mod tests {
                 pb::node_event::Body::BlockTweaks(_) => "block_tweaks",
                 pb::node_event::Body::SilentPaymentMatched(_) => "silent_payment_matched",
                 pb::node_event::Body::MempoolTweak(_) => "mempool_tweak",
+                pb::node_event::Body::Status(_) => "status",
             })
             .collect();
         assert!(

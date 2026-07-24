@@ -295,6 +295,11 @@ fn mask_from(categories: Option<u32>) -> u32 {
     //     any gRPC client attaches, so without this strip the WS live filter
     //     would forward them (its replay already returns empty). Tier 1 tweak
     //     consumption is gRPC-only.
+    //
+    // The other explicit-only category, `status` (bit 16), IS served here: it is
+    // low-volume JSON with no index prerequisite, so a WS/SSE client that asks
+    // for it by bit gets it (and, being explicit-only, a `0`-subscriber still
+    // does not).
     match categories {
         None | Some(0) => node::events::ALL_CATEGORIES_DEFAULT,
         Some(c) => c & !node::events::CATEGORY_TWEAKS,
@@ -1544,6 +1549,20 @@ mod tests {
         // Non-tweak categories are still present in the default.
         assert_ne!(mask_from(None) & node::events::CATEGORY_CHAIN, 0);
         assert_ne!(mask_from(None) & node::events::CATEGORY_MEMPOOL, 0);
+    }
+
+    #[test]
+    fn status_is_served_on_ws_but_only_when_asked_for() {
+        // Unlike tweaks, the status category is NOT stripped from a WS mask:
+        // health events are low-volume JSON this surface can serve. It is still
+        // explicit-only, so the `0`/absent default excludes it.
+        assert_ne!(
+            mask_from(Some(node::events::CATEGORY_STATUS)) & node::events::CATEGORY_STATUS,
+            0,
+            "an explicit status request must survive the WS mask",
+        );
+        assert_eq!(mask_from(None) & node::events::CATEGORY_STATUS, 0);
+        assert_eq!(mask_from(Some(0)) & node::events::CATEGORY_STATUS, 0);
     }
 
     #[test]

@@ -469,10 +469,12 @@ message MempoolTweak {
 // Filter knobs for a subscription. All optional; an unset field means
 // "no filter" (the server applies its own defaults).
 message SubscribeRequest {
-  // Bitfield: mempool=1, chain=2, heartbeat=4, tweaks=8 (BIP 352, §3.5).
-  // Zero means "all" — EXCEPT `tweaks`, which is explicit-request only and is
-  // NOT included in the "all" expansion, so a pre-existing categories=0
-  // subscriber does not begin receiving tweak volume after a node upgrade. The
+  // Bitfield: mempool=1, chain=2, heartbeat=4, tweaks=8 (BIP 352, §3.5),
+  // status=16 (node health, §8).
+  // Zero means "all" — EXCEPT `tweaks` and `status`, which are
+  // explicit-request only and are NOT included in the "all" expansion, so a
+  // pre-existing categories=0 subscriber does not begin receiving tweak volume
+  // or a new event type after a node upgrade. The
   // `tweaks` bit requires silentpaymentindex=1; a request that sets it against
   // a node without the index is rejected in-band. Unknown bits are silently
   // ignored — the server treats the request as "any of the known categories I
@@ -641,6 +643,75 @@ message Reorg {
 // Periodic synthetic event for end-to-end latency probes.
 message Heartbeat {
   uint64 uptime_ns = 1;
+}
+
+// A node-health condition the daemon detected about itself (`status`
+// category, bit 16). Explicit-request only — NOT part of the categories=0
+// "all" expansion, so a pre-existing subscriber never begins receiving a new
+// event type after a node upgrade.
+//
+// Standing conditions are level-triggered: exactly one RAISED when the
+// condition is entered and exactly one CLEARED when it recovers (with
+// hysteresis so a value hovering at the threshold does not flap). One-shot
+// observations that have no "recovered" state are EDGE. Detectors
+// re-evaluate on startup and re-raise conditions that are still standing, so
+// a consumer that was disconnected across a restart still learns about them
+// (at-least-once by re-evaluation rather than by replay — a status event
+// carries no durable cursor and is never replayed).
+message StatusEvent {
+  StatusKind     kind     = 1;
+  StatusState    state    = 2;
+  StatusSeverity severity = 3;
+  // Human-readable one-liner. Stable-ish: safe to log or forward to a pager,
+  // NOT to parse — machine consumers switch on `kind` and read `details`.
+  string message = 4;
+  // Kind-specific structured fields (heights, byte counts, peer counts,
+  // thresholds). A string map so every future taxonomy addition stays
+  // additive on both the proto and JSON surfaces.
+  //
+  // Most values are decimal numbers rendered as strings, but NOT all of them:
+  // some kinds carry non-numeric values (e.g. a reason token). Parse per key,
+  // not by assuming the whole map is numeric.
+  //
+  // Keys present for a given kind are documented in docs/api/streaming.md
+  // §7.8; a consumer must tolerate unknown keys and missing optional ones.
+  map<string, string> details = 5;
+}
+
+// Which health condition a StatusEvent describes. Additive: a client MUST
+// tolerate an unrecognized kind (forward-compat during a rolling upgrade) —
+// `message` and `severity` remain meaningful.
+enum StatusKind {
+  STATUS_KIND_UNSPECIFIED = 0;
+  // Initial block download finished (edge, at most once per process).
+  STATUS_KIND_IBD_COMPLETE = 1;
+  // No block connected for longer than the configured window, while not in
+  // IBD. Clears when the next block connects.
+  STATUS_KIND_TIP_STALL = 2;
+  // Free space on the data (or blocks) directory fell below the configured
+  // floor. Clears with hysteresis above it.
+  STATUS_KIND_DISK_LOW = 3;
+  // Mempool occupancy crossed the configured percentage of its byte cap.
+  STATUS_KIND_MEMPOOL_CONGESTED = 4;
+  // Connected-peer count sat below the configured floor for the hold time.
+  STATUS_KIND_PEER_FLOOR = 5;
+  // A reorg at least `alertreorgdepth` blocks deep was applied (edge).
+  STATUS_KIND_DEEP_REORG = 6;
+}
+
+// Level-triggered lifecycle of a condition.
+enum StatusState {
+  STATUS_STATE_UNSPECIFIED = 0;
+  STATUS_STATE_RAISED = 1;  // condition entered (standing until CLEARED)
+  STATUS_STATE_CLEARED = 2; // condition recovered
+  STATUS_STATE_EDGE = 3;    // one-shot observation; no CLEARED will follow
+}
+
+enum StatusSeverity {
+  STATUS_SEVERITY_UNSPECIFIED = 0;
+  STATUS_SEVERITY_INFO = 1;
+  STATUS_SEVERITY_WARNING = 2;
+  STATUS_SEVERITY_CRITICAL = 3;
 }
 
 // In-band notice that the server dropped events for this subscriber because
@@ -829,5 +900,6 @@ message NodeEvent {
     BlockTweaks block_tweaks = 28; // BIP 352 per-block tweak data (Subscribe `tweaks` category, §3.5)
     SilentPaymentMatched silent_payment_matched = 29; // BIP 352 scan-key watch match (Watch stream, §4)
     MempoolTweak mempool_tweak = 30; // BIP 352 mempool-time tweak (Subscribe `tweaks` + mempool_tweaks, §3.5)
+    StatusEvent status = 31; // node-health condition (Subscribe `status` category, bit 16)
   }
 }

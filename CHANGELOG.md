@@ -117,6 +117,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   default — the block is the fallback). The outputs are dropped by the on-disk
   index (no size increase, no reindex) and re-derived at serve time. SDK:
   `TweakEntry::taproot_outputs` and `SubscribeOptions::tweak_outputs`.
+- Alerting: node-health events on the streaming API. A new `status` category
+  (bit 16 — explicit-request only, so a `categories=0` subscriber is unaffected)
+  carries `StatusEvent` bodies describing the node itself (`ibd_complete`,
+  `tip_stall`, `disk_low`, `mempool_congested`, `peer_floor`, `deep_reorg`),
+  level-triggered with paired `raised`/`cleared` states and an additive
+  `details` string map. Served on gRPC, WS/SSE, and the ZMQ `nodeevent` topic;
+  not replayable (no cursor — detectors re-raise standing conditions after a
+  restart). Wire schema only in this change; the detectors that emit them land
+  next.
 
 ## Releases
 
