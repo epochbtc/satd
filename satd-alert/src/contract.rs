@@ -34,7 +34,20 @@ pub const ATTEMPT_HEADER: &str = "X-Satd-Attempt";
 /// signature scheme — the *body* schema is versioned independently by the
 /// event envelope's `schema_version`.
 pub const WEBHOOK_VERSION_HEADER: &str = "X-Satd-Webhook-Version";
-pub const WEBHOOK_VERSION: &str = "1";
+/// Contract version for alertfile hooks: signature covers the delivery
+/// metadata, not just the body, and `X-Satd-Timestamp` is present.
+pub const WEBHOOK_VERSION: &str = "2";
+/// Contract version the legacy `-reorgwebhook` alias keeps emitting.
+///
+/// That surface shipped before this crate existed: body-only signature, no
+/// delivery id, `ReorgRecord` rather than the event envelope. Deployed
+/// receivers verify it as-is, so it is frozen — the version header is how a
+/// receiver tells the two apart.
+pub const LEGACY_WEBHOOK_VERSION: &str = "1";
+
+/// Unix seconds at which a delivery was signed. Covered by the v2 signature;
+/// a receiver rejects a delivery outside [`MAX_TIMESTAMP_SKEW_SECS`].
+pub const TIMESTAMP_HEADER: &str = "X-Satd-Timestamp";
 
 /// Sign a raw body with a hook secret, rendering the `X-Satd-Signature` value.
 ///
@@ -58,6 +71,87 @@ pub fn delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> String {
     format!("{node_id_hex}-{instance_id}-{seq}")
 }
 
+/// Build the idempotency key for a **synthesized** envelope — a catch-up replay
+/// event or a gap notice.
+///
+/// These do not come off the live bus. They are stamped by the replay builder,
+/// which has no sequence to assign and writes `seq: 0` into every one of them;
+/// live bus events start at 1. So `seq` is not merely a weak discriminator
+/// here — it is one constant shared by every replayed event and every lag
+/// notice for the life of the process.
+///
+/// That matters more than it looks. Catch-up exists precisely so a hook that
+/// was down does not miss what happened, and the contract tells receivers to
+/// deduplicate on this header. Minting these from `seq` would mean a node down
+/// for 100 blocks replays 100 events that a conforming receiver collapses into
+/// one — the durability feature delivering 1% of what it advertises, silently.
+/// The same collision would swallow every gap notice after the first, breaking
+/// "a gap is never silent" from the second gap onward.
+///
+/// The `r` prefix keeps this space disjoint from the bus (`<seq>`) and watch
+/// (`w<seq>`) spaces.
+pub fn replay_delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> String {
+    format!("{node_id_hex}-{instance_id}-r{seq}")
+}
+
+/// Maximum age a receiver should accept for a v2 delivery, in seconds.
+///
+/// Normative for receivers, advisory here: satd stamps `X-Satd-Timestamp` and
+/// signs it, but only the receiver can enforce freshness. Wide enough to
+/// tolerate ordinary clock skew and a retry backoff (which caps at 300 s), tight
+/// enough that a captured delivery is not a permanent replay token.
+pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 600;
+
+/// Build the canonical string a v2 signature covers.
+///
+/// ```text
+/// "2" LF <timestamp> LF <delivery-id> LF <hook-id> LF <body>
+/// ```
+///
+/// Unambiguous without escaping because every field before the body is
+/// constrained to a character set that excludes LF: the version is a literal,
+/// the timestamp is decimal digits, the delivery id is hex plus `-` and an
+/// optional `w`/`r` tag, and the hook id is restricted to `[A-Za-z0-9_-]` at
+/// parse time. The body is last, so its content cannot be confused with a
+/// preceding field however it is shaped.
+pub fn v2_signing_string(timestamp: u64, delivery_id: &str, hook_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut buf =
+        Vec::with_capacity(body.len() + delivery_id.len() + hook_id.len() + 32);
+    buf.extend_from_slice(b"2\n");
+    buf.extend_from_slice(timestamp.to_string().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(delivery_id.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(hook_id.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Sign a v2 delivery: HMAC-SHA256 over [`v2_signing_string`].
+///
+/// v1 (see [`sign_body`]) covers the body and nothing else, which leaves the
+/// delivery id — the value the contract instructs receivers to deduplicate
+/// on — unauthenticated *and* predictable, since `seq` is dense and every
+/// component of the id is visible in any single captured delivery. Anyone
+/// holding one valid `(body, signature)` pair could therefore replay it under
+/// forged future ids, filling a receiver's dedup cache so that the genuine
+/// alerts bearing those ids are discarded on arrival — while satd counts them
+/// delivered and advances its cursor. Signing the id closes that, and signing a
+/// timestamp bounds replay of the capture itself.
+pub fn sign_v2(
+    secret: &str,
+    timestamp: u64,
+    delivery_id: &str,
+    hook_id: &str,
+    body: &[u8],
+) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(&v2_signing_string(timestamp, delivery_id, hook_id, body));
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +161,56 @@ mod tests {
     // independent receiver implementation can verify its HMAC without running
     // a node. Changing any expected value here is a breaking protocol change
     // and must come with a `WEBHOOK_VERSION` bump.
+    /// v2 golden vectors. Computed independently (Python `hmac`) against the
+    /// canonical string, not captured from this implementation's own output —
+    /// a vector derived from the code under test only proves the code agrees
+    /// with itself. Reproduced verbatim in `docs/api/webhooks.md` and in the
+    /// reference relay's tests.
+    #[test]
+    fn v2_signature_golden_vectors() {
+        let node = "ab".repeat(16);
+        let did = delivery_id(&node, 7, 42);
+        assert_eq!(did, "abababababababababababababababab-7-42");
+        assert_eq!(
+            sign_v2("hunter2", 1_753_400_000, &did, "pager", br#"{"hello":"world"}"#),
+            "sha256=0dcd7bcc563327beab8a0ec4464a261288b43825415ae4c1ebdc91e79c83e031",
+        );
+        assert_eq!(
+            sign_v2("hunter2", 1_753_400_000, &did, "pager", b""),
+            "sha256=abb61065799427bc98456c493fe12ac9adec92fd10bebbc1bd00720becb69b6c",
+        );
+    }
+
+    #[test]
+    fn v2_signature_covers_every_metadata_field() {
+        let node = "ab".repeat(16);
+        let did = delivery_id(&node, 7, 42);
+        let base = sign_v2("s", 1_000, &did, "pager", b"body");
+        // Each of these is a field v1 left unauthenticated. Changing any one
+        // must change the signature, or the field is not really covered.
+        assert_ne!(base, sign_v2("s", 1_001, &did, "pager", b"body"), "timestamp");
+        assert_ne!(
+            base,
+            sign_v2("s", 1_000, &delivery_id(&node, 7, 43), "pager", b"body"),
+            "delivery id — the dedup key an attacker would forge"
+        );
+        assert_ne!(base, sign_v2("s", 1_000, &did, "other", b"body"), "hook id");
+        assert_ne!(base, sign_v2("s", 1_000, &did, "pager", b"body2"), "body");
+        assert_ne!(base, sign_v2("t", 1_000, &did, "pager", b"body"), "secret");
+    }
+
+    #[test]
+    fn v2_canonical_string_is_unambiguous() {
+        // The delimiter is LF and no field before the body may contain one, so
+        // no reshuffling of field contents can produce the same signing string.
+        // Concatenation without a delimiter would let ("ab","c") collide with
+        // ("a","bc"); this asserts it does not.
+        assert_ne!(
+            v2_signing_string(1, "ab", "c", b"x"),
+            v2_signing_string(1, "a", "bc", b"x"),
+        );
+    }
+
     #[test]
     fn signature_golden_vectors() {
         for (secret, body, expected) in [

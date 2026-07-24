@@ -490,53 +490,59 @@ fn render_webhook_metrics(out: &mut String, metrics: Option<&WebhookMetrics>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    for (id, c) in metrics.snapshot() {
-        let labels = [("hook", id.as_str())];
-        metric(
-            out,
+    // Family headers once, then one labelled sample per hook. Emitting a
+    // header per hook (as a per-sample `metric` call in this loop does) is
+    // well-formed with a single webhook configured and invalid with two — the
+    // kind of bug that passes every test written against one hook and breaks
+    // an operator's whole scrape page the day they add a second.
+    let snapshot = metrics.snapshot();
+    for (name, help, kind) in [
+        (
             "satd_alertwebhook_delivered_total",
             "Webhook events acknowledged (2xx) by the receiver.",
             "counter",
-            &labels,
-            c.delivered.load(Ordering::Relaxed),
-        );
-        metric(
-            out,
+        ),
+        (
             "satd_alertwebhook_failed_attempts_total",
             "Webhook delivery attempts that failed (retried or dropped).",
             "counter",
-            &labels,
-            c.failed_attempts.load(Ordering::Relaxed),
-        );
-        metric(
-            out,
+        ),
+        (
             "satd_alertwebhook_dropped_total",
             "Webhook events never delivered (queue overflow, broadcast lag, or a permanent 4xx).",
             "counter",
-            &labels,
-            c.dropped.load(Ordering::Relaxed),
-        );
-        metric(
-            out,
+        ),
+        (
             "satd_alertwebhook_queue_depth",
             "Events currently queued for this webhook.",
             "gauge",
-            &labels,
-            c.queue_depth.load(Ordering::Relaxed),
-        );
+        ),
         // Age rather than a timestamp: an alerting rule wants "no successful
         // delivery in N minutes", which is awkward to express against an
         // absolute epoch value. 0 before the first success, which reads as
         // "fresh" — so pair it with `delivered_total > 0` in a rule.
-        let last = c.last_success_unix.load(Ordering::Relaxed);
-        metric(
-            out,
+        (
             "satd_alertwebhook_last_success_age_seconds",
             "Seconds since this webhook's last acknowledged delivery (0 if none yet).",
             "gauge",
-            &labels,
-            if last == 0 { 0 } else { now.saturating_sub(last) },
-        );
+        ),
+    ] {
+        metric_header(out, name, help, kind);
+        for (id, c) in &snapshot {
+            let labels = [("hook", id.as_str())];
+            let last = c.last_success_unix.load(Ordering::Relaxed);
+            let value = match name {
+                "satd_alertwebhook_delivered_total" => c.delivered.load(Ordering::Relaxed),
+                "satd_alertwebhook_failed_attempts_total" => {
+                    c.failed_attempts.load(Ordering::Relaxed)
+                }
+                "satd_alertwebhook_dropped_total" => c.dropped.load(Ordering::Relaxed),
+                "satd_alertwebhook_queue_depth" => c.queue_depth.load(Ordering::Relaxed),
+                _ if last == 0 => 0,
+                _ => now.saturating_sub(last),
+            };
+            metric_sample(out, name, &labels, value);
+        }
     }
 }
 
@@ -930,6 +936,29 @@ mod tests {
         assert_eq!(scope_label(true, false), "relay");
         assert_eq!(scope_label(false, true), "template");
         assert_eq!(scope_label(false, false), "none");
+    }
+
+    #[test]
+    fn webhook_metrics_are_valid_exposition_format_with_several_hooks() {
+        // Two hooks, because one hook cannot expose this: a header-per-sample
+        // renderer is well-formed with a single series and invalid with two.
+        // A strict parser rejects the entire page on the duplicate `# HELP`,
+        // so an operator adding a second webhook would lose every metric satd
+        // exports, not just these.
+        let m = WebhookMetrics::default();
+        let _ = m.hook("pager");
+        let _ = m.hook("deadman");
+        let _ = m.hook("relay");
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert_one_header_per_family(&out);
+        // And every hook is still represented.
+        for id in ["pager", "deadman", "relay"] {
+            assert!(
+                out.contains(&format!("satd_alertwebhook_delivered_total{{hook=\"{id}\"}}")),
+                "missing series for {id}:\n{out}"
+            );
+        }
     }
 
     #[test]

@@ -1292,6 +1292,10 @@ impl Store for CoinCache {
         self.inner.write_alert_cursor(key, value)
     }
 
+    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.inner.delete_alert_cursor(key)
+    }
+
     fn lookup_spend(
         &self,
         outpoint: &OutPoint,

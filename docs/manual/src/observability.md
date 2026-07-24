@@ -185,7 +185,15 @@ acknowledge.
 - **Retried with backoff** on 5xx, 408, 429, timeouts, and connection failures:
   1 s doubling to a 5-minute ceiling, indefinitely. Any *other* 4xx is treated
   as permanent, counted, and skipped — a receiver answering 404 forever must
-  not pin the queue and turn every later event into a drop.
+  not pin the queue and turn every later event into a drop. A skipped event
+  still advances the hook's resume position, so a hard-rejecting endpoint does
+  not turn every restart into a replay of the same refused span.
+- **Redirects are not followed.** A 3xx is a permanent drop. The URL in the
+  alertfile is where the signed body goes; following a redirect would move it —
+  signature, hook identity and all — to a host you never named, and the useful
+  targets for that are exactly the ones you cannot see: a cloud metadata
+  endpoint, an RFC1918 admin port, the node's own RPC. If your receiver moves,
+  update the alertfile.
 - **Bounded queue.** A hook that falls far enough behind drops events, and the
   next delivery is preceded by a `lagged` body carrying how many were lost and
   the cursor to resume from. A gap is never silent.

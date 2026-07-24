@@ -85,7 +85,7 @@ impl CategoryMask {
 
 /// A hook's event filter: categories, then (for status events) kinds and a
 /// severity floor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookFilter {
     pub categories: CategoryMask,
     /// `None` = every kind in the subscribed categories. Only meaningful for
@@ -118,7 +118,11 @@ impl HookFilter {
 }
 
 /// One configured webhook.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written: a derived one renders `secret` in full, and a
+/// single `tracing::debug!(?hook)` added later would put a signing key in the
+/// log. The crate already takes this posture for watch-set scan keys.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Hook {
     pub id: String,
     pub url: String,
@@ -137,6 +141,19 @@ pub struct Hook {
     pub allow_insecure_http: bool,
 }
 
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hook")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("secret", &"<redacted>")
+            .field("filter", &self.filter)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
 impl Hook {
     /// The `CF_METADATA` key holding this hook's durable resume cursor.
     pub fn cursor_key(&self) -> Vec<u8> {
@@ -145,7 +162,7 @@ impl Hook {
 }
 
 /// A parsed, validated alertfile.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlertFile {
     pub hooks: Vec<Hook>,
 }
@@ -459,15 +476,27 @@ fn validate_url(
 /// plaintext is normal (a relay on the same host, a receiver inside a private
 /// network) and demanding TLS would just push operators to set the override.
 fn is_local_target(rest: &str) -> bool {
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or_else(|| rest.split('/').next().unwrap_or(""))
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+    // Authority is everything before the path, query, or fragment.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip userinfo — everything through the *last* `@`.
+    //
+    // Without this, `http://127.0.0.1:8332@evil.example/hook` reads as host
+    // `127.0.0.1`, is judged loopback, and is accepted with no
+    // `allow_insecure_http` acknowledgement — while the request actually goes
+    // in cleartext to `evil.example` with `127.0.0.1:8332` as userinfo. The
+    // operator is not the adversary here; the gate exists to make them
+    // consciously accept cleartext to a public host, and this skipped it.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // An IPv6 literal is bracketed, and its address contains colons — so the
+    // port must be split on the bracket, not on the last colon.
+    let host = if let Some(after) = host_port.strip_prefix('[') {
+        match after.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        host_port.split_once(':').map_or(host_port, |(h, _)| h)
+    };
     if host == "localhost" || host == "::1" {
         return true;
     }
@@ -694,6 +723,31 @@ categories = ["chain"]
     }
 
     #[test]
+    fn userinfo_cannot_impersonate_a_local_host() {
+        // The authority's host is what comes after the last `@`. Reading the
+        // userinfo as the host would let a config pasted from a third-party
+        // setup guide send signed cleartext to a public endpoint while
+        // *looking* like a loopback target, silently skipping the acknowledgement
+        // the plaintext gate exists to force.
+        for sneaky in [
+            "http://127.0.0.1:8332@evil.example/hook",
+            "http://localhost@evil.example/hook",
+            "http://10.0.0.1@evil.example:8080/hook",
+            "http://user:127.0.0.1@evil.example/hook",
+        ] {
+            let text = MINIMAL.replace("https://alerts.example/satd", sneaky);
+            assert!(
+                parse(&text).is_err(),
+                "{sneaky} resolves to a public host and must need the opt-in"
+            );
+        }
+
+        // A genuine loopback target with userinfo is still local.
+        let text = MINIMAL.replace("https://alerts.example/satd", "http://user:pw@127.0.0.1:9000/h");
+        assert!(parse(&text).is_ok(), "userinfo on a real loopback host is fine");
+    }
+
+    #[test]
     fn non_http_schemes_are_rejected() {
         for url in ["ftp://x/h", "file:///etc/passwd", "x.example/h", ""] {
             let text = MINIMAL.replace("https://alerts.example/satd", url);
@@ -723,6 +777,35 @@ categories = ["chain"]
             "categories = [\"status\", \"heartbeat\"]\nheartbeat_interval_secs = 0",
         );
         assert!(parse(&zero).is_err());
+    }
+
+    #[test]
+    fn debug_never_renders_the_signing_secret() {
+        // A derived `Debug` prints `secret` in full, so one
+        // `tracing::debug!(?hook)` added later would write a signing key to the
+        // log — and to anywhere the log is shipped. Assert on the secret's
+        // *value*, not on the presence of "redacted", so the test cannot pass
+        // by rendering both.
+        let f = parse(
+            "version = 1\n\
+             [[webhook]]\n\
+             id = \"pager\"\n\
+             url = \"https://example.invalid/h\"\n\
+             secret = \"correct-horse-battery-staple\"\n\
+             categories = [\"status\"]\n",
+        )
+        .unwrap();
+        let hook_dbg = format!("{:?}", f.hooks[0]);
+        assert!(
+            !hook_dbg.contains("correct-horse-battery-staple"),
+            "Hook Debug leaked the secret: {hook_dbg}"
+        );
+        // The whole file renders through the same impl.
+        let file_dbg = format!("{f:?}");
+        assert!(
+            !file_dbg.contains("correct-horse-battery-staple"),
+            "AlertFile Debug leaked the secret: {file_dbg}"
+        );
     }
 
     #[test]

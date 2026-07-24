@@ -146,8 +146,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   metadata rides in headers (`X-Satd-Signature`, `X-Satd-Delivery`,
   `X-Satd-Hook`, `X-Satd-Attempt`). Delivery is serial and in-order per hook,
   retried with exponential backoff on transient failures and skipped on a
-  permanent 4xx, with a bounded queue whose overflow is reported in-band as a
-  `lagged` event rather than silently. Confirmed chain events are at-least-once
+  permanent 4xx (which still advances the resume position), with a bounded
+  queue whose overflow is reported in-band as a `lagged` event rather than
+  silently. Redirects are never followed — a 3xx is a permanent drop, so a
+  signed body cannot be steered to a host the alertfile never named. Confirmed chain events are at-least-once
   across a restart via a durable per-hook cursor. Hooks reload on SIGHUP
   (keep-last-good on error); per-hook counters are exported as
   `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with

@@ -51,6 +51,13 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// "resync below this height yourself" boundary.
 const MAX_CATCHUP_BLOCKS: u32 = node::events::MAX_REPLAY_BLOCKS;
 
+/// Numbers synthesized deliveries — catch-up replay events and gap notices.
+///
+/// Process-wide rather than per-generation, for the same reason the watch
+/// counter is: a SIGHUP reload keeps the same `instance_id`, so a per-generation
+/// counter would restart at zero and re-mint ids the receiver has already seen.
+static SYNTH_DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Composite stop signal: the process-wide shutdown, plus a per-generation
 /// channel the SIGHUP reload flips to retire the previous dispatcher.
 ///
@@ -167,8 +174,18 @@ async fn fan_in(
     // replay is being built is buffered rather than lost in the seam.
     let mut rx = publisher.subscribe();
 
+    // Per-hook snapshot→live boundary dedup, exactly as the gRPC and WS
+    // carriers keep. A block connecting between `subscribe()` and the tip
+    // snapshot taken inside `catch_up` is *both* buffered on the broadcast and
+    // inside the replayed span, so without this it is delivered twice — and
+    // because the replayed copy is re-synthesized with its own delivery id, the
+    // two carry different idempotency keys and a conforming receiver cannot
+    // collapse them. A duplicate deposit alert is exactly the failure the
+    // idempotency contract exists to prevent.
+    let mut dedup: Vec<std::collections::HashMap<u32, bitcoin::BlockHash>> =
+        Vec::with_capacity(hooks.len());
     for hook in &hooks {
-        catch_up(hook, &publisher, store.as_ref(), block_source.as_deref()).await;
+        dedup.push(catch_up(hook, &publisher, store.as_ref(), block_source.as_deref()).await);
     }
 
     // Per-hook heartbeat downsampling state (D11): last forwarded instant.
@@ -185,6 +202,41 @@ async fn fan_in(
             _ = stop.wait() => break,
             recv = rx.recv() => match recv {
                 Ok(env) => {
+                    // Suppress the firehose during initial block download.
+                    //
+                    // The dispatcher is started long before P2P, so without
+                    // this a brand-new node with an alertfile POSTs its entire
+                    // sync — one `block_connected` per historical block, plus a
+                    // watch-match per historical transaction touching a watched
+                    // script, for as long as IBD takes. That is the opposite of
+                    // what the manual promises, and the failure mode is a
+                    // multi-day firehose at the receiver rather than anything
+                    // that looks like a bug locally.
+                    //
+                    // Status events are exempt: "this node is unhealthy" is
+                    // exactly as true during IBD, and the detectors already
+                    // suppress the conditions that are meaningless while
+                    // syncing.
+                    let syncing = block_source
+                        .as_deref()
+                        .is_some_and(|s| s.in_initial_block_download());
+                    if syncing && !matches!(env.body, NodeEventBody::Status(_)) {
+                        continue;
+                    }
+                    // Decide who wants this *before* rendering it. Serializing
+                    // first meant a `BlockTweaks` envelope — hundreds of KB of
+                    // per-block silent-payment rows — was rendered in full and
+                    // then discarded, since tweaks are refused at parse and can
+                    // never be in any hook's mask.
+                    let wanted: Vec<usize> = hooks
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, hook)| accepts(&hook.hook, &env, &mut last_heartbeat[*i]))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if wanted.is_empty() {
+                        continue;
+                    }
                     // Render once for every hook: the body a receiver verifies
                     // must be the bytes a WS subscriber would have seen, and
                     // rendering per hook risks two receivers disagreeing.
@@ -198,8 +250,19 @@ async fn fan_in(
                         publisher.instance_id(),
                         env.stamp.seq,
                     );
-                    for (i, hook) in hooks.iter().enumerate() {
-                        if !accepts(&hook.hook, &env, &mut last_heartbeat[i]) {
+                    for i in wanted {
+                        let hook = &hooks[i];
+                        // A live block identical to one already replayed for
+                        // this hook. A reorg replacement at the same height has
+                        // a different hash and is forwarded, which is why the
+                        // check is on the hash and not the height alone.
+                        if !dedup[i].is_empty()
+                            && let NodeEventBody::Chain(
+                                node::chain::events::ChainEvent::BlockConnected { height, hash },
+                            ) = &env.body
+                            && dedup[i].get(height) == Some(hash)
+                        {
+                            dedup[i].remove(height);
                             continue;
                         }
                         enqueue(hook, &publisher, Delivery::Event {
@@ -245,7 +308,21 @@ fn enqueue(hook: &HookChannel, publisher: &EventPublisher, item: Delivery, curso
             hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
             hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // The delivery task is gone: it failed to build its HTTP client, or
+            // it panicked. Silently ignoring this makes the hook look perfectly
+            // healthy on `/metrics` — `dropped_total` flat, `queue_depth` flat,
+            // no `Lagged` ever synthesized — while it delivers nothing at all,
+            // forever. Count it like any other loss so the existing
+            // "no successful delivery in N minutes" rule fires.
+            hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
+            hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "alert",
+                hook = %hook.id,
+                "hook delivery task is gone; event dropped",
+            );
+        }
     }
 }
 
@@ -264,10 +341,15 @@ fn flush_gap(hook: &HookChannel, publisher: &EventPublisher) {
     };
     let item = Delivery::Event {
         body: Arc::new(bytes),
-        delivery_id: satd_alert::delivery_id(
+        // Synthesized envelope: `stamp.seq` is 0 for every one of these, so it
+        // gets an id from the replay space instead. Without this every gap
+        // notice in the process would carry the same idempotency key and a
+        // conforming receiver would discard all but the first — "a gap is never
+        // silent" would hold exactly once.
+        delivery_id: satd_alert::replay_delivery_id(
             &hex::encode(env.stamp.node_id),
             publisher.instance_id(),
-            env.stamp.seq,
+            SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
         ),
         cursor: None,
     };
@@ -332,22 +414,22 @@ async fn catch_up(
     publisher: &EventPublisher,
     store: &dyn Store,
     block_source: Option<&dyn node::events::BlockCursorSource>,
-) {
+) -> std::collections::HashMap<u32, bitcoin::BlockHash> {
     if !hook
         .hook
         .filter
         .categories
         .contains(node::events::CATEGORY_CHAIN)
     {
-        return;
+        return Default::default();
     }
     let Some(src) = block_source else {
-        return;
+        return Default::default();
     };
     let Some(cursor) = read_cursor(store, &hook.hook) else {
         // A hook that has never delivered starts at the live head rather than
         // replaying history nobody asked for.
-        return;
+        return Default::default();
     };
 
     let replay = node::events::build_cursor_replay(
@@ -359,7 +441,11 @@ async fn catch_up(
         None,
     );
     if replay.clamped {
-        let dropped = u64::from(replay.earliest_replayed.saturating_sub(cursor.height));
+        // Replay begins at `cursor.height + 1`, so the number of blocks skipped
+        // is the distance to the first one actually replayed, not to the cursor
+        // itself — the latter counts the already-delivered block at the cursor.
+        let dropped =
+            u64::from(replay.earliest_replayed.saturating_sub(cursor.height.saturating_add(1)));
         hook.gap.dropped.fetch_add(dropped, Ordering::Relaxed);
         hook.counters.dropped.fetch_add(dropped, Ordering::Relaxed);
         hook.gap.resume_height.store(cursor.height, Ordering::Relaxed);
@@ -372,6 +458,7 @@ async fn catch_up(
         );
     }
     let count = replay.events.len();
+    let before = hook.counters.dropped.load(Ordering::Relaxed);
     for env in replay.events {
         let Ok(bytes) = serde_json::to_vec(&env) else {
             continue;
@@ -382,10 +469,15 @@ async fn catch_up(
             publisher,
             Delivery::Event {
                 body: Arc::new(bytes),
-                delivery_id: satd_alert::delivery_id(
+                // Every replayed envelope is stamped `seq: 0`, so minting from
+                // it would give a node that was down for 100 blocks 100
+                // deliveries sharing one idempotency key — a conforming
+                // receiver keeps the first and discards the other 99, which is
+                // the whole point of catch-up defeated silently.
+                delivery_id: satd_alert::replay_delivery_id(
                     &hex::encode(env.stamp.node_id),
                     publisher.instance_id(),
-                    env.stamp.seq,
+                    SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
                 ),
                 cursor,
             },
@@ -393,14 +485,36 @@ async fn catch_up(
         );
     }
     if count > 0 {
+        // Report what was *queued*, not what was built. The 10k-block replay
+        // clamp warns loudly, but the hook queue holds 1024 — and for any
+        // realistic outage the queue is the binding limit, since 1024 blocks is
+        // about a week and 10k is about ten. Overflow inside this loop is
+        // counted but was otherwise unlogged, so the success line reported the
+        // pre-truncation figure and read as if everything had been recovered.
+        let overflowed = hook
+            .counters
+            .dropped
+            .load(Ordering::Relaxed)
+            .saturating_sub(before);
+        if overflowed > 0 {
+            tracing::warn!(
+                target: "alert",
+                hook = %hook.id,
+                built = count,
+                dropped = overflowed,
+                "webhook catch-up exceeded the hook queue; the excess is lost \
+                 and reported to the receiver as a gap",
+            );
+        }
         tracing::info!(
             target: "alert",
             hook = %hook.id,
-            events = count,
+            events = count as u64 - overflowed,
             from = cursor.height,
             "webhook catch-up queued events missed while the daemon was down",
         );
     }
+    replay.confirmed_dedup
 }
 
 fn read_cursor(store: &dyn Store, hook: &Hook) -> Option<Cursor> {
@@ -432,6 +546,65 @@ fn decode_cursor(raw: &[u8]) -> Option<Cursor> {
     })
 }
 
+/// The HTTP client every webhook delivery goes through.
+///
+/// Redirects are **not** followed. The alertfile URL is validated once, at load
+/// (scheme, and a warning for a non-loopback plaintext target), and a followed
+/// redirect would silently move the request — body, `X-Satd-Signature`, and the
+/// hook's identity — to a host that never passed that check. The interesting
+/// destinations are exactly the ones an operator cannot see: a cloud metadata
+/// endpoint, an RFC1918 admin port, the node's own RPC. HTTPS does not help;
+/// a 302 to `http://169.254.169.254/` is a perfectly valid response.
+///
+/// A receiver that wants to move must publish a stable final URL and have the
+/// operator update the alertfile. A 3xx classifies as a permanent drop, so the
+/// misconfiguration shows up in the logs rather than as silent non-delivery.
+fn webhook_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Persist a hook's resume position, at most once per block height.
+///
+/// The cursor is a resume hint, not a ledger: one RocksDB write per delivered
+/// event would be pure write amplification for a value only read at startup.
+fn persist_cursor(
+    hook: &Hook,
+    store: &dyn Store,
+    cursor: Option<Cursor>,
+    persisted_height: &mut Option<u32>,
+) {
+    let Some(c) = cursor else { return };
+    if *persisted_height == Some(c.height) {
+        return;
+    }
+    // Never move a hook's durable cursor backwards.
+    //
+    // `persisted_height` is this task's own view and starts empty for a fresh
+    // generation, so it cannot see what a *retired* generation is still doing.
+    // A reload spawns the new generation before signalling the old one to stop,
+    // and an in-flight POST is not inside the stop `select!` — so a delivery
+    // retired mid-request can land up to `REQUEST_TIMEOUT` later and write a
+    // cursor the new generation has already advanced past. Rewinding it means
+    // the next restart replays a span the receiver already acked.
+    if let Some(existing) = store
+        .read_alert_cursor(&hook.cursor_key())
+        .and_then(|raw| decode_cursor(&raw))
+        && existing.height > c.height
+    {
+        *persisted_height = Some(existing.height);
+        return;
+    }
+    match store.write_alert_cursor(&hook.cursor_key(), &encode_cursor(&c)) {
+        Ok(()) => *persisted_height = Some(c.height),
+        Err(e) => {
+            tracing::warn!(target: "alert", hook = %hook.id, error = %e, "failed to persist webhook cursor")
+        }
+    }
+}
+
 /// One hook's delivery loop: serial, in-order, retrying with backoff.
 async fn deliver_loop(
     hook: Hook,
@@ -440,7 +613,7 @@ async fn deliver_loop(
     store: Arc<dyn Store>,
     mut stop: Stop,
 ) {
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    let client = match webhook_client() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(target: "alert", hook = %hook.id, error = %e, "failed to build webhook HTTP client; this hook will not deliver");
@@ -470,7 +643,17 @@ async fn deliver_loop(
             .queue_depth
             .store(rx.len() as u64, Ordering::Relaxed);
 
-        let signature = satd_alert::sign_body(&hook.secret, &body);
+        // Signed once, outside the retry loop, and reused for every attempt:
+        // the signature must be stable across retries of one event (the
+        // attempt counter rides in a header, deliberately not in the body or
+        // the signed material), and the timestamp records when satd *signed*
+        // this delivery, not when it last retried it. A receiver enforcing a
+        // freshness window therefore sees a delivery age out if it is still
+        // being retried after the window, which is the intended behavior: a
+        // 20-minute-old "disk is filling" alert is not worth acting on.
+        let signed_at = unix_secs();
+        let signature =
+            satd_alert::sign_v2(&hook.secret, signed_at, &delivery_id, &hook.id, &body);
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
@@ -478,6 +661,7 @@ async fn deliver_loop(
                 .post(&hook.url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(satd_alert::SIGNATURE_HEADER, &signature)
+                .header(satd_alert::TIMESTAMP_HEADER, signed_at.to_string())
                 .header(satd_alert::DELIVERY_HEADER, &delivery_id)
                 .header(satd_alert::HOOK_HEADER, &hook.id)
                 .header(satd_alert::ATTEMPT_HEADER, attempt.to_string())
@@ -495,15 +679,7 @@ async fn deliver_loop(
                     counters
                         .last_success_unix
                         .store(unix_secs(), Ordering::Relaxed);
-                    if let Some(c) = cursor
-                        && persisted_height != Some(c.height)
-                    {
-                        if let Err(e) = store.write_alert_cursor(&hook.cursor_key(), &encode_cursor(&c)) {
-                            tracing::warn!(target: "alert", hook = %hook.id, error = %e, "failed to persist webhook cursor");
-                        } else {
-                            persisted_height = Some(c.height);
-                        }
-                    }
+                    persist_cursor(&hook, store.as_ref(), cursor, &mut persisted_height);
                     break;
                 }
                 satd_alert::Disposition::Drop => {
@@ -516,6 +692,16 @@ async fn deliver_loop(
                         delivery = %delivery_id,
                         "webhook receiver rejected the delivery permanently; skipping this event",
                     );
+                    // Advance the cursor anyway. A permanent rejection is the
+                    // receiver's decision about this event, and it will decide
+                    // the same way next time — leaving the cursor parked would
+                    // make every restart rebuild and re-queue the same span
+                    // against an endpoint that has already refused it, forever.
+                    // The event is lost either way; the difference is whether
+                    // the hook makes progress past it. The drop is counted
+                    // (`satd_alertwebhook_dropped_total`) and logged, so the loss is
+                    // visible rather than silent.
+                    persist_cursor(&hook, store.as_ref(), cursor, &mut persisted_height);
                     break;
                 }
                 satd_alert::Disposition::Retry => {
@@ -566,6 +752,9 @@ pub struct AlertReloader {
     global_stop: watch::Receiver<bool>,
     /// Stop signal for the generation currently running, if any.
     current: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+    /// The last successfully-applied alertfile, so a SIGHUP that did not change
+    /// it can be a no-op instead of destroying in-flight deliveries.
+    last_applied: parking_lot::Mutex<Option<AlertFile>>,
 }
 
 impl AlertReloader {
@@ -588,6 +777,7 @@ impl AlertReloader {
             metrics,
             global_stop,
             current: parking_lot::Mutex::new(None),
+            last_applied: parking_lot::Mutex::new(None),
         }
     }
 
@@ -604,6 +794,30 @@ impl AlertReloader {
     pub fn apply(&self) -> Result<usize, satd_alert::AlertFileError> {
         let file = AlertFile::load(&self.path)?;
         let ids: Vec<String> = file.hooks.iter().map(|h| h.id.clone()).collect();
+
+        // A SIGHUP that did not change the alertfile must not disturb the
+        // dispatcher. `reload_from_sighup` calls this on *every* SIGHUP,
+        // whatever key the operator actually edited, and retiring a generation
+        // destroys its queued deliveries. For chain events that is recoverable
+        // — the cursor did not advance, so the next generation's catch-up
+        // re-queues them — but a status event has no replay by design, and the
+        // detectors are edge-triggered against a `HealthState` that outlives
+        // the reload. So a `disk_low` sitting in retry backoff when the
+        // operator SIGHUPs to change `maxconnections` would be dropped, never
+        // replayed, and never re-raised: the page simply never arrives.
+        //
+        // Comparing the parsed file rather than the file bytes means
+        // reformatting or a comment edit is also a no-op.
+        {
+            let last = self.last_applied.lock();
+            if last.as_ref() == Some(&file) {
+                tracing::debug!(
+                    target: "alert",
+                    "alertfile unchanged; keeping the running dispatcher generation",
+                );
+                return Ok(file.hooks.len());
+            }
+        }
 
         // Retire the previous generation only once the new file has parsed, so
         // a bad edit never leaves the node with no dispatcher at all.
@@ -630,7 +844,44 @@ impl AlertReloader {
         }
         // Stop exporting counters for hooks that are no longer configured,
         // rather than freezing their series at the last value forever.
-        self.metrics.retain(&ids);
+        //
+        // The legacy reorg alias is preserved explicitly: it registers its
+        // counters outside the alertfile, so retaining only alertfile ids would
+        // evict them the first time `apply` runs — and it runs at startup —
+        // leaving the still-running legacy dispatcher incrementing a snapshot
+        // nothing renders. Reorg-webhook delivery would become permanently
+        // unobservable, and only on nodes that configure both.
+        let mut keep = ids;
+        keep.push(LEGACY_REORG_HOOK_ID.to_string());
+        self.metrics.retain(&keep);
+
+        // Drop the durable cursor of any hook this reload removed. Hook ids are
+        // short and reused — `pager`, `alerts`, `ops` — so leaving the key
+        // behind means a later hook that happens to reuse the id inherits a
+        // stale resume position and greets a brand-new endpoint with the whole
+        // replay window of its predecessor's history.
+        if let Some(prev) = self.last_applied.lock().as_ref() {
+            for gone in prev
+                .hooks
+                .iter()
+                .filter(|h| !keep.iter().any(|k| k == &h.id))
+            {
+                match self.store.delete_alert_cursor(&gone.cursor_key()) {
+                    Ok(()) => tracing::info!(
+                        target: "alert",
+                        hook = %gone.id,
+                        "hook removed from the alertfile; dropped its resume cursor",
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "alert",
+                        hook = %gone.id,
+                        error = %e,
+                        "failed to drop the removed hook's resume cursor",
+                    ),
+                }
+            }
+        }
+        *self.last_applied.lock() = Some(file);
         Ok(hook_count)
     }
 }
@@ -648,7 +899,7 @@ pub async fn legacy_reorg_dispatcher(
     mut rx: mpsc::Receiver<node::chain::reorg_log::ReorgRecord>,
     counters: Arc<HookCounters>,
 ) {
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    let client = match webhook_client() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: "alert", error = %e, "failed to build reorg webhook HTTP client");
@@ -675,7 +926,14 @@ pub async fn legacy_reorg_dispatcher(
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(satd_alert::ATTEMPT_HEADER, attempt.to_string())
                 .header(satd_alert::HOOK_HEADER, LEGACY_REORG_HOOK_ID)
-                .header(satd_alert::WEBHOOK_VERSION_HEADER, satd_alert::WEBHOOK_VERSION);
+                // v1, frozen: this surface shipped with a body-only signature,
+                // no delivery id, and a `ReorgRecord` body. Deployed receivers
+                // verify exactly that, so it does not move to the v2 contract;
+                // the version header is how a receiver tells them apart.
+                .header(
+                    satd_alert::WEBHOOK_VERSION_HEADER,
+                    satd_alert::LEGACY_WEBHOOK_VERSION,
+                );
             if let Some(secret) = &target.secret {
                 req = req.header(satd_alert::SIGNATURE_HEADER, satd_alert::sign_body(secret, &body));
             }
@@ -696,10 +954,20 @@ pub async fn legacy_reorg_dispatcher(
                         Ok(r) => tracing::warn!(target: "alert", status = %r.status(), attempt, "reorg webhook returned non-2xx"),
                         Err(e) => tracing::warn!(target: "alert", error = %e, attempt, "reorg webhook request failed"),
                     }
-                    // Bounded retries, unchanged from the shipped behavior: the
-                    // legacy hook has no queue to fall behind on, so a failing
-                    // endpoint is given three tries and the record is dropped.
-                    if d == satd_alert::Disposition::Drop || attempt >= 3 {
+                    // Bounded retries, matching the shipped behavior: the legacy
+                    // hook has no queue to fall behind on, so a failing endpoint
+                    // is given three tries and the record is dropped.
+                    //
+                    // Deliberately NOT keyed on `Disposition` the way alertfile
+                    // hooks are. The shipped dispatcher retried *any* non-2xx
+                    // three times, so classifying 4xx as a one-shot drop here
+                    // would quietly change behavior on a flag operators already
+                    // depend on. (The redirect change is not reverted: the
+                    // shipped client followed 30x, and that is an SSRF vector
+                    // for a signed request, so 3xx now fails — documented as a
+                    // breaking change in the release notes.)
+                    let _ = d;
+                    if attempt >= 3 {
                         counters.dropped.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
