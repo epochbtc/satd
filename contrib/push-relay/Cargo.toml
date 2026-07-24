@@ -1,0 +1,35 @@
+[package]
+name = "satd-push-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Reference relay: satd alert webhooks -> APNs / FCM push notifications"
+
+# Deliberately NOT a member of the satd workspace (see the `exclude` entry in
+# the root Cargo.toml). Push providers drag in JWT, OAuth, and their transitive
+# crypto stacks; none of that belongs in a Bitcoin node's dependency tree or its
+# cargo-deny surface. This project is built and tested by its own CI job.
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# `http2` is NOT implied by `json` or `rustls-tls`, and `default-features =
+# false` drops it. Apple's provider API is HTTP/2-only, so without it every APNs
+# push fails at the transport layer — with the flagship use case (an iOS
+# lock-screen alert) silently dead and only a generic error in the log.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2.6"
+jsonwebtoken = "9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
