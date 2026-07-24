@@ -32,13 +32,23 @@ X-Satd-Webhook-Version: 1
 
 | Header | Meaning |
 |---|---|
-| `X-Satd-Signature` | `sha256=` followed by the lowercase hex HMAC-SHA256 of the **raw request body**, keyed by the hook's configured `secret`. See §3. |
+| `X-Satd-Signature` | `sha256=` followed by the lowercase hex HMAC-SHA256 of the **canonical signing string** (§3), keyed by the hook's configured `secret`. |
+| `X-Satd-Timestamp` | Unix seconds at which satd signed this delivery. Covered by the signature; a receiver **must** reject a delivery whose timestamp is outside its freshness window. See §3. |
 | `X-Satd-Delivery` | Idempotency key. Stable across retries of one event; unique across daemon restarts. See §4. |
 | `X-Satd-Hook` | The `id` of the hook this delivery belongs to, as written in the alertfile. |
 | `X-Satd-Attempt` | 1-based attempt counter for *this* event. `1` on first delivery; `>1` means an earlier attempt failed. |
 | `X-Satd-Webhook-Version` | This contract's version. Bumped only for a breaking change to the header set or signature scheme — **not** for changes to the body schema, which is versioned independently by `schema_version` inside the body. |
 
-Exactly one event per request. Batching is not part of version 1.
+Exactly one event per request. Batching is not part of version 2.
+
+> **The legacy `reorgwebhook=` alias is out of scope for this document.** It
+> predates the alertfile, and it is frozen so that already-deployed receivers
+> keep working: it reports `X-Satd-Webhook-Version: 1`, signs the **body alone**
+> (and only when `reorgwebhooksecret` is set), sends a `ReorgRecord` rather than
+> an event envelope, carries no `X-Satd-Delivery` and no `X-Satd-Timestamp`, and
+> retries three times with a 200 ms base rather than the schedule in §5.2. Check
+> the version header before applying anything below. Everything in this document
+> describes version 2 — alertfile hooks.
 
 ## 2. Body
 
@@ -54,12 +64,21 @@ same event**. There is one schema, specified in
     "edge_seen_at_ns": 123, "edge_wall_ns": 1700000000000000000, "seq": 42
   },
   "cursor": { "height": 812345, "tx_index": 0, "mempool_seq": "17", "instance_id": "88…" },
-  "body": { "category": "status", "kind": "tip_stall", "state": "raised", … }
+  "body": { "category": "chain", "kind": "block_connected", "height": 812345, … }
 }
 ```
 
-`cursor` is absent on events that do not advance a durable position (status
-events, heartbeats, mempool transitions, watch matches).
+`cursor` is absent on events that do not advance a durable position: status
+events, heartbeats, and mempool transitions. (The example above is a `chain`
+event precisely because those *do* carry one — a status body never does.)
+
+**Watch matches have a different envelope shape.** A `script_matched`,
+`outpoint_spent`, `txid_*`, or `silent_payment_matched` body is
+`{schema_version, cursor, body}` — there is **no `stamp`** — and its `cursor` is
+always *present*, though it is `null` while the match is unconfirmed and an
+object once confirmed. That cursor also omits `instance_id`. If you write one
+deserializer for both shapes, make `stamp` optional and treat `cursor` as
+nullable rather than absent.
 
 Delivery metadata is **never** in the body. That is deliberate: if the attempt
 counter or hook id were inside the JSON, the bytes would differ between retries
@@ -80,43 +99,107 @@ Bodies you may receive, by the hook's configured `categories`:
 A receiver **must** tolerate an unrecognized `body.category` or `kind`: new ones
 are added additively and do not bump `schema_version`.
 
-Hashes (`txid`, `block_hash`, `scripthash`, `output_key`, `tweak`) are hex in
-**internal (consensus) byte order, unreversed** — the streaming API's
-convention, *not* the reversed display order JSON-RPC uses. A `scripthash` is
-`sha256(scriptPubKey)`.
+**A watch-set is not filtered by `categories`.** They are independent
+subscriptions on one hook: `categories` selects from the node's firehose (what
+the node and the chain are doing), while the watch-set selects your own
+addresses, coins, and transactions. A hook with `categories = ["chain"]` and a
+watch-set receives block events and *both phases* of its own matches — the
+mempool sighting (`confirmed: false`) and the confirmed re-emit — while
+receiving no mempool transitions for anything else. Adding `"mempool"` to see
+unconfirmed matches is therefore unnecessary and expensive: you already have
+them, and what you would add is every transaction on the network.
+
+### Hash byte order — read this before writing a lookup
+
+Byte order is **not uniform across bodies**, because the two families are
+serialized by different code. Getting it wrong is silent: you compute a
+valid-looking 32-byte hex string that simply never matches anything.
+
+| Body family | `txid` / `block_hash` byte order |
+|---|---|
+| **Watch matches** (`script_matched`, `outpoint_spent`, `txid_*`, `silent_payment_matched`) | **Internal (consensus) order, unreversed** |
+| **`chain` bodies** (`block_connected`, `block_disconnected`, `reorg`) | **Reversed — RPC display order**, the same string `getblockhash` returns |
+| **`mempool` bodies** (`enter`, `leave_*`) | **Reversed — RPC display order** |
+
+So a `txid` from a `mempool.enter` body can be handed straight to
+`getrawtransaction`, while a `txid` from a `script_matched` body must be
+byte-reversed first (or compared against other internal-order values).
+
+`scripthash`, `output_key`, and `tweak` appear only on watch matches and are
+always internal order, unreversed. A `scripthash` is `sha256(scriptPubKey)`.
 
 ## 3. Signature
 
 ```
-X-Satd-Signature: sha256=<hex(HMAC-SHA256(secret, raw_body))>
+X-Satd-Signature: sha256=<hex(HMAC-SHA256(secret, signing_string))>
 ```
 
-- Computed over the **exact request body bytes**, before any parsing.
+The signature covers the delivery **metadata as well as the body**:
+
+```
+signing_string = "2" LF <X-Satd-Timestamp> LF <X-Satd-Delivery> LF <X-Satd-Hook> LF <raw_body>
+```
+
+where `LF` is a single `0x0A` and `raw_body` is the exact request body bytes.
+No escaping is needed: every field before the body is restricted to a character
+set that excludes LF (the version is a literal, the timestamp is decimal digits,
+the delivery id is hex plus `-` and an optional `w`/`r` tag, and hook ids are
+`[A-Za-z0-9_-]`), and the body is last.
+
 - The key is the hook's `secret` from the alertfile, as UTF-8 bytes.
 - Every delivery is signed; a hook without a secret cannot be configured.
+
+**Why the metadata is signed.** §4 tells you to deduplicate on
+`X-Satd-Delivery`. If that header were outside the signature it would also be
+*forgeable*, and its values are predictable from any single delivery you have
+seen. An attacker holding one valid `(body, signature)` pair could then replay
+it under the delivery ids of alerts you have not received yet, so that when the
+real "disk is filling" alert arrives your receiver discards it as a duplicate —
+while satd counts it delivered. Signing the id closes that; signing the
+timestamp bounds how long a captured delivery stays replayable.
 
 A receiver **must**:
 
 1. Read the raw body without parsing or re-serializing it. A JSON round-trip
    changes whitespace and key order and will not verify.
-2. Recompute the HMAC and compare in **constant time**.
-3. Reject the request if the header is absent or does not match — before doing
-   anything else with the content.
+2. Reconstruct the signing string from the headers and the raw body, recompute
+   the HMAC, and compare in **constant time**.
+3. Reject the request if the signature header is absent or does not match —
+   before doing anything else with the content.
+4. Reject the request if `X-Satd-Timestamp` is missing, unparseable, or further
+   from your clock than your freshness window. **600 seconds** is the
+   recommended window: wide enough for ordinary clock skew and for satd's retry
+   backoff (which caps at 300 s), tight enough that a captured delivery is not a
+   permanent bearer token.
 
-The scheme is unchanged from satd's original `reorgwebhook`, so receivers
-written against that keep working.
+Note that the timestamp is stamped once per *event*, not once per attempt — it
+does not move across retries, so a delivery still being retried after your
+window will age out. That is intended: a 20-minute-stale alert is not worth
+acting on.
+
+Worked vectors and reference receiver code are in §6.
 
 ## 4. Idempotency
 
 ```
-X-Satd-Delivery: <node_id>-<instance_id>-<seq>
+X-Satd-Delivery: <node_id>-<instance_id>-<seq>       # live firehose event
+X-Satd-Delivery: <node_id>-<instance_id>-w<seq>      # watch match
+X-Satd-Delivery: <node_id>-<instance_id>-r<seq>      # replayed event or gap notice
 ```
 
 - `node_id` — the node's stable 32-hex-character identity.
 - `instance_id` — a per-process nonce, regenerated on every restart.
-- `seq` — the event's monotonic sequence within that process.
+- `seq` — a monotonic sequence within that process.
 
-Deduplicate on the whole string. It is **stable across retries** (the components
+There are three disjoint sequence spaces, distinguished by the prefix, because
+only live bus events have a bus sequence to name them. Watch matches (`w`)
+arrive on a per-subscriber channel; catch-up replay events and `lagged` notices
+(`r`) are synthesized rather than published, and every synthesized envelope
+carries the same internal stamp — so without a separate space, an entire
+restart replay would collapse to one idempotency key at your end.
+
+Treat the whole value as an opaque string; do not parse its parts. Deduplicate
+on it. It is **stable across retries** (the components
 are fixed when the event is published) and **unique across restarts** (the
 instance nonce changes), so a retry and a genuinely repeated condition are
 distinguishable — which a bare `seq` could not do, since `seq` restarts at zero.
@@ -137,6 +220,7 @@ Any `2xx` acknowledges. The response body is ignored.
 | `2xx` | Delivered. |
 | `5xx`, `408`, `429` | Retried. |
 | No response (timeout, connection failure, TLS error) | Retried. |
+| `3xx` | **Not** retried and **not followed**: counted, logged, and skipped. |
 | Any other `4xx` | **Not** retried: counted, logged, and skipped. |
 
 Retries are 1 s doubling to a 300 s ceiling, jittered, and continue
@@ -146,7 +230,16 @@ them, and a retry is never overtaken by the event behind it.
 
 Non-retryable `4xx` is a deliberate asymmetry: a receiver answering `404`
 forever would otherwise pin the head of the queue and convert every later event
-into an overflow drop. Losing one delivery beats losing all of them.
+into an overflow drop. Losing one delivery beats losing all of them. A skipped
+event still advances the hook's resume position, so a hard-rejecting endpoint
+does not turn every restart into a replay of the same refused span.
+
+**Redirects are never followed.** satd sends to the URL in the alertfile and
+nowhere else. Following a `3xx` would move the signed body, and the hook's
+identity with it, to a host the operator never named — and the useful targets
+for that are the ones they cannot see from outside: a cloud metadata endpoint,
+an RFC1918 admin port, the node's own RPC. Publish a stable final URL; if it
+changes, the operator updates the alertfile.
 
 Per-attempt timeout: 10 s.
 
@@ -162,55 +255,108 @@ behind, events are dropped — and the next successful delivery is **preceded by
   "resume_cursor":{"height":812345,"tx_index":0,"mempool_seq":"0","instance_id":"88…"}}}
 ```
 
-A gap is never silent. To recover the missed span, reconnect a streaming client
-with `from_cursor = resume_cursor` (see
+A gap caused by satd dropping events is never silent. Two qualifications:
+
+- An event **you** refused with a non-retryable status is not a gap in this
+  sense and produces no `lagged` body — see §5.4.
+- `resume_cursor` recovers `chain` and `mempool` history only. Watch matches are
+  forward-only and are not replayed by a cursor resume, so if the dropped span
+  contained matches, reconcile those separately (`getaddresshistory`). A `lagged`
+  notice does not tell you whether any of the dropped events were matches.
+
+To recover the missed span, reconnect a streaming client with
+`from_cursor = resume_cursor` (see
 [streaming.md §6](streaming.md#6-cursors--replay)).
 
 ### 5.4 Durability across a node restart
 
 | Event class | Guarantee |
 |---|---|
-| `chain` (confirmed) | **At-least-once.** The hook's resume position is persisted, and on startup it replays what it missed — bounded by the same 10 000-block window the streaming API uses. Beyond that you get a `lagged` notice and must resync the older span yourself. |
+| `chain` (confirmed) | **At-least-once, except for events you reject.** The hook's resume position is persisted, and on startup it replays what it missed — bounded by the same 10 000-block window the streaming API uses, and further by the 1024-deep hook queue. Beyond either bound you get a `lagged` notice and must resync the older span yourself. An event you answer with a non-retryable status (§5.2) is skipped permanently and the cursor advances past it; that skip is counted in `satd_alertwebhook_dropped_total` and logged by the node, but — unlike a queue overflow — it does **not** produce a `lagged` body, because you were told about it at the time by being asked. |
 | `status` | **At-least-once by re-evaluation.** Standing conditions are re-detected and re-raised after a restart. A condition that raised *and* cleared while the node was down is stale by definition and is not reconstructed. |
 | `mempool`, unconfirmed watch matches | **Best-effort.** Mempool state is ephemeral; anything that matters is re-emitted when it confirms. |
-| watch matches | **Live-only.** A match that occurred while the daemon was down is not re-delivered. |
+| confirmed watch matches | **Forward-only from registration.** Adding a watch entry does not replay history for it, and a restart is not a gap: the watch-set is re-registered before P2P starts, so blocks arriving during catch-up are matched normally. The one loss window is a crash between a block connecting and this delivery being acknowledged — the block's `chain` event returns from the cursor, but the match does not, because the block is already connected and is not rescanned. Reconcile with `getaddresshistory` after an unclean shutdown if that matters. |
 | `heartbeat` | Sampled at the hook's `heartbeat_interval_secs`; no durability by construction. |
+
+**Reorgs re-emit confirmed watch matches.** There is no retraction event for a
+script, outpoint, or silent-payment match: if a transaction confirms at height
+H, the chain reorgs, and it reconfirms at H′, you receive a second
+`confirmed: true` match for the same transaction with a **new** delivery id —
+idempotency will not collapse them for you. If you credit on `confirmed: true`,
+either wait for enough depth or key your ledger on `(txid, vout)` rather than on
+delivery. Note this bites hardest on a hook configured with a watch-set but
+*without* `categories = ["chain"]`, which is a supported shape: such a hook
+receives no `reorg` or `block_disconnected` event and so has no way to learn the
+rollback happened at all.
 
 ## 6. Test vectors
 
-Signature vectors, asserted by satd's `satd-alert` unit tests. An independent
-receiver can verify its HMAC implementation against these without a node:
+Signature vectors, asserted by satd's `satd-alert` unit tests and independently
+recomputed (they are not captured from satd's own output). An independent
+receiver can verify its HMAC implementation against these without a node.
 
-| secret | body | `X-Satd-Signature` |
-|---|---|---|
-| `hunter2` | `{"hello":"world"}` | `sha256=12f1ef94c239895aafefa2a6804ec6136d8c23fff17c08064cfc75b33e3fbaf5` |
-| *(empty)* | *(empty)* | `sha256=b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad` |
+```
+secret       = "hunter2"
+timestamp    = 1753400000
+delivery id  = "abababababababababababababababab-7-42"
+hook id      = "pager"
 
-Note the second vector is the well-known HMAC-SHA256 of an empty message under
-an empty key — useful as a smoke test that your HMAC wiring is correct at all.
+body = {"hello":"world"}
+  → sha256=0dcd7bcc563327beab8a0ec4464a261288b43825415ae4c1ebdc91e79c83e031
+
+body = (empty)
+  → sha256=abb61065799427bc98456c493fe12ac9adec92fd10bebbc1bd00720becb69b6c
+```
+
+Reproduce from a shell:
+
+```sh
+printf '2\n1753400000\nabababababababababababababababab-7-42\npager\n{"hello":"world"}' \
+  | openssl dgst -sha256 -hmac "hunter2"
+```
 
 Reference verification:
 
 ```python
-import hmac, hashlib
-def verify(secret: str, raw_body: bytes, header: str) -> bool:
-    expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)   # constant time
+import hmac, hashlib, time
+
+def verify(headers, raw_body: bytes, secret: str, window: int = 600) -> bool:
+    ts = headers["X-Satd-Timestamp"]
+    if abs(time.time() - int(ts)) > window:      # bound replay of a capture
+        return False
+    msg = (b"2\n" + ts.encode()
+           + b"\n" + headers["X-Satd-Delivery"].encode()
+           + b"\n" + headers["X-Satd-Hook"].encode()
+           + b"\n" + raw_body)
+    want = "sha256=" + hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want, headers["X-Satd-Signature"])   # constant time
 ```
 
 ```rust
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-fn verify(secret: &str, raw_body: &[u8], header: &str) -> bool {
+fn verify(secret: &str, ts: &str, delivery: &str, hook: &str, raw_body: &[u8], header: &str) -> bool {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"2\n");
+    msg.extend_from_slice(ts.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(delivery.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(hook.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(raw_body);
+
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(raw_body);
+    mac.update(&msg);
     let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-    // `Mac::verify_slice` is the constant-time comparison in this crate.
     expected.len() == header.len()
         && subtle::ConstantTimeEq::ct_eq(expected.as_bytes(), header.as_bytes()).into()
 }
 ```
+
+The caller must still check the timestamp window; the Rust snippet above covers
+only the HMAC half.
 
 ## 7. Transport
 
@@ -220,8 +366,12 @@ private network. For a public host it requires an explicit
 `allow_insecure_http = true` on the hook: bodies carry chain data rather than
 secrets, but signed-then-cleartext is still a footgun.
 
-satd verifies server certificates using the platform trust store via rustls. No
-client certificate is presented in version 1.
+satd verifies server certificates with rustls against the **bundled Mozilla root
+set** (webpki-roots), *not* the operating system trust store. A receiver whose
+certificate chains to a private or corporate CA installed system-wide will
+therefore fail verification and be retried forever. Terminate such a receiver
+behind a publicly-trusted certificate, or put a local reverse proxy in front of
+it and point the hook at loopback. No client certificate is presented.
 
 ## 8. Non-goals
 
