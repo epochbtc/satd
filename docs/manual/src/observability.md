@@ -177,6 +177,33 @@ read a group- or world-accessible one. Its **contents** are re-read on every
 set and logs why, because alerting that silently stopped after a typo is the
 worse failure.
 
+`categories` is required — a hook without it would receive nothing, which is
+never what anyone meant to configure. It selects from the node's firehose:
+
+| Category | Delivers | Rate |
+|---|---|---|
+| `status` | node-health transitions (the six conditions above) | a handful per week on a healthy node |
+| `chain` | every block connect, disconnect, and reorg | one per block |
+| `mempool` | every transaction entering or leaving the mempool — **all** of them, not just yours | thousands per minute on mainnet |
+| `heartbeat` | liveness pings, downsampled to `heartbeat_interval_secs` | whatever interval you set |
+
+`kinds` and `min_severity` narrow `status` and apply to nothing else; both are
+checked after the category, so `kinds` without `"status"` in `categories`
+matches nothing. The streaming API's `tweaks` category is **rejected** here
+rather than ignored — it is per-block bulk data and an HTTP receiver is the
+wrong consumer for it.
+
+`mempool` is almost never the right choice for a webhook: it is the whole
+network's traffic, not yours. To be told about *your* transactions, use the
+streaming API's `Watch` stream, which matches on scripts, outpoints, txids and
+silent-payment scan keys. A webhook hook cannot filter that way and is not
+meant to — see [Streaming](streaming.md).
+
+The normative wire contract — every header, the signature scheme with test
+vectors, and the exact retry semantics — is
+[`docs/api/webhooks.md`](https://github.com/epochbtc/satd/blob/master/docs/api/webhooks.md).
+What follows is the working summary.
+
 ### What arrives
 
 ```http
@@ -262,8 +289,11 @@ the only duplicate you can receive is a retry of something you already saw.
 - **Bounded queue.** A hook that falls far enough behind drops events. They are
   counted in `satd_alertwebhook_dropped_total` and logged; nothing is held for
   later and nothing is inserted into the stream to tell the receiver.
-- **Nothing reaches consensus.** Deliveries run on the isolated API runtime;
-  a stalled endpoint cannot affect block connection.
+- **Nothing reaches consensus.** Deliveries run on the isolated API runtime and
+  the event fan-in never blocks, so a stalled endpoint cannot affect block
+  connection. Measured on a regtest node connecting 20 blocks: 11.23 ms with no
+  webhook configured, 11.24 ms with every event going to a receiver that
+  accepts the connection and never answers.
 - **Best-effort, and that is the whole contract.** Nothing is persisted. A
   webhook fires when something happens and is retried while your endpoint is
   briefly unreachable; that is all it promises. A node that was down did not

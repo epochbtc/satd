@@ -171,6 +171,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
   their original payload, now delivered by the same dispatcher — which also
   moves that outbound HTTP off the consensus runtime.
+- docs: new `docs/api/webhooks.md` — the normative alert-webhook delivery
+  contract (headers, HMAC signature with test vectors, retry classes,
+  best-effort delivery semantics), linked from the streaming spec and the
+  Operator Manual; `CORE_DIFFERENCES.md` gains entries for node-health alerts
+  and the webhook surface.
 
 ## Releases
 
