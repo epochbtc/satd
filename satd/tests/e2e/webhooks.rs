@@ -201,11 +201,6 @@ impl MockReceiver {
         Self::start(Behavior::RejectHeights(heights)).await
     }
 
-    /// Every accepted delivery, in arrival order.
-    async fn all(&self) -> Vec<Received> {
-        self.inner.lock().await.received.clone()
-    }
-
     /// Heights of every accepted `block_connected` delivery, in arrival order.
     async fn accepted_heights(&self) -> Vec<u64> {
         self.inner
@@ -900,6 +895,12 @@ async fn a_missed_span_is_announced_as_a_gap_and_never_replayed() {
 /// distinct `X-Satd-Delivery`. The contract tells receivers to deduplicate on
 /// that header, so two deposits sharing an id — or a match colliding with a
 /// chain event — is silent data loss at a correct receiver.
+///
+/// The hook's `categories` is `["chain"]`, with no `"mempool"`, and it still
+/// receives the unconfirmed sighting: a watch-set is a separate channel from
+/// the firehose and is not category-gated. That is documented behavior, so this
+/// test is its guard — a deposit watcher wants the pending credit without
+/// subscribing to every transaction on the network.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_watch_set_delivers_a_script_match() {
     use std::os::unix::fs::PermissionsExt as _;

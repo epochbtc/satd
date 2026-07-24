@@ -40,6 +40,14 @@ pub const HOOK_QUEUE_CAPACITY: usize = 1024;
 /// The only alertfile schema version this build understands.
 pub const ALERTFILE_VERSION: u64 = 1;
 
+/// Silent-payment scan keys one hook may watch.
+///
+/// Mirrors the streaming API's per-connection cap. Unlike scripts, outpoints,
+/// and txids — which are inverted-index lookups — silent-payment matching has
+/// no index and costs one ECDH per target per eligible transaction, so this is
+/// a work bound rather than a memory bound.
+pub const MAX_SP_TARGETS_PER_HOOK: usize = 16;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AlertFileError {
     #[error("alertfile {path}: {source}")]
@@ -209,6 +217,10 @@ impl std::fmt::Debug for Hook {
             .field("url", &self.url)
             .field("secret", &"<redacted>")
             .field("filter", &self.filter)
+            // `WatchSet` has its own redacting `Debug` (counts only, never a
+            // scan secret), so including it here is safe and keeps the render
+            // useful.
+            .field("watch", &self.watch)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .finish()
@@ -309,6 +321,36 @@ impl AlertFile {
                     path,
                     format!("duplicate webhook id `{}`", h.id),
                 ));
+            }
+        }
+        // A silent-payment scan key may be claimed by at most one hook.
+        //
+        // The watch registry keys silent-payment targets by `scan_pubkey`
+        // alone, so a second hook registering the same key *replaces* the
+        // first — and the replacement's labels and spend pubkey win. Routing
+        // then compares only `scan_pubkey` too, so both hooks receive whatever
+        // the survivor derives. Two things go wrong and neither is visible at
+        // runtime: the hook whose target lost silently stops receiving the
+        // labels it asked for (change outputs, say), and if the two declared
+        // different spend pubkeys, one hook's endpoint receives payment details
+        // — txid, vout, amount, tweak — for a wallet it does not own.
+        //
+        // Rejecting at parse is the honest fix: the configuration is ambiguous,
+        // and an operator who wants one wallet watched by two endpoints can say
+        // so explicitly with two entries under one hook.
+        let mut seen_scan_keys = BTreeSet::new();
+        for h in &hooks {
+            for t in &h.watch.silent_payments {
+                if !seen_scan_keys.insert(t.scan_pubkey()) {
+                    return Err(AlertFileError::invalid(
+                        path,
+                        format!(
+                            "webhook `{}` reuses a silent-payment scan key already claimed by \
+                             another hook; a scan key may belong to only one hook",
+                            h.id
+                        ),
+                    ));
+                }
             }
         }
         Ok(Self { hooks })
@@ -486,6 +528,29 @@ fn parse_watch_set(
         })?;
         for entry in entries {
             set.silent_payments.push(parse_sp_target(path, id, entry)?);
+        }
+        // Bound the per-hook scan-key count, matching the cap the streaming
+        // surface enforces per connection.
+        //
+        // Scripts, outpoints, and txids are inverted-index lookups and scale
+        // fine. Silent payments do not: there is no index to invert, so every
+        // SP-eligible transaction is scanned against *every* registered target,
+        // one ECDH each. An operator pasting a few thousand scan keys into the
+        // alertfile would put thousands of EC operations on the matcher for
+        // every taproot-bearing transaction in every block — which does not
+        // stall consensus (the matcher is on the API runtime) but does make it
+        // lag the chain, hit the capped resync path, and start dropping
+        // matches.
+        if set.silent_payments.len() > MAX_SP_TARGETS_PER_HOOK {
+            return Err(AlertFileError::invalid(
+                path,
+                format!(
+                    "webhook `{id}`: {} silent-payment targets exceeds the limit of \
+                     {MAX_SP_TARGETS_PER_HOOK} per hook (each one costs an ECDH against every \
+                     eligible transaction)",
+                    set.silent_payments.len()
+                ),
+            ));
         }
     }
 
@@ -1221,6 +1286,70 @@ spend_pubkey = "{spend_hex}"
         let scan = [0x42u8; 32];
         let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x43; 32]).unwrap());
         (hex::encode(scan), hex::encode(spend.serialize()))
+    }
+
+    #[test]
+    fn a_scan_key_may_belong_to_only_one_hook() {
+        // The registry keys silent-payment targets by scan pubkey alone, so a
+        // second hook claiming the same key replaces the first — its labels and
+        // spend pubkey win — while routing (also scan-pubkey-only) hands the
+        // survivor's matches to *both* hooks. The first hook silently stops
+        // getting the labels it asked for, and with different spend pubkeys one
+        // hook's endpoint would receive payment details for a wallet it does not
+        // own. The configuration is ambiguous, so refuse it.
+        let (scan, spend) = sp_keys();
+        let two_hooks = format!(
+            r#"version = 1
+[[webhook]]
+id = "deposits"
+url = "https://a.example/h"
+secret = "s"
+categories = ["chain"]
+[[webhook.watch.silent_payments]]
+scan_key = "{scan}"
+spend_pubkey = "{spend}"
+labels = [0, 3]
+
+[[webhook]]
+id = "ops-audit"
+url = "https://b.example/h"
+secret = "s"
+categories = ["chain"]
+[[webhook.watch.silent_payments]]
+scan_key = "{scan}"
+spend_pubkey = "{spend}"
+"#
+        );
+        let err = parse(&two_hooks).expect_err("a shared scan key must be refused");
+        assert!(err.to_string().contains("scan key"), "{err}");
+    }
+
+    #[test]
+    fn silent_payment_targets_are_capped_per_hook() {
+        // No inverted index exists for silent payments, so each target costs an
+        // ECDH against every eligible transaction. Unbounded here would let an
+        // alertfile put thousands of EC operations on the matcher per block —
+        // the streaming surface caps this per connection for the same reason.
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let mut entries = String::new();
+        for i in 0..(MAX_SP_TARGETS_PER_HOOK + 1) {
+            let mut scan = [0x11u8; 32];
+            scan[0] = i as u8 + 1;
+            let spend =
+                PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x43; 32]).unwrap());
+            entries.push_str(&format!(
+                "[[webhook.watch.silent_payments]]\nscan_key = \"{}\"\nspend_pubkey = \"{}\"\n",
+                hex::encode(scan),
+                hex::encode(spend.serialize()),
+            ));
+        }
+        let text = format!(
+            "version = 1\n[[webhook]]\nid = \"w\"\nurl = \"https://x.example/h\"\n\
+             secret = \"s\"\ncategories = [\"chain\"]\n{entries}"
+        );
+        let err = parse(&text).expect_err("over the cap must be refused");
+        assert!(err.to_string().contains("exceeds the limit"), "{err}");
     }
 
     #[test]

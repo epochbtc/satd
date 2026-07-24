@@ -154,6 +154,26 @@ read a group- or world-accessible one. Its **contents** are re-read on every
 set and logs why, because alerting that silently stopped after a typo is the
 worse failure.
 
+`categories` is required — a hook without it would receive nothing, which is
+never what anyone meant to configure. It selects from the node's firehose:
+
+| Category | Delivers | Rate |
+|---|---|---|
+| `status` | node-health transitions (the six conditions above) | a handful per week on a healthy node |
+| `chain` | every block connect, disconnect, and reorg | one per block |
+| `mempool` | every transaction entering or leaving the mempool — **all** of them, not just yours | thousands per minute on mainnet |
+| `heartbeat` | liveness pings, downsampled to `heartbeat_interval_secs` | whatever interval you set |
+
+`kinds` and `min_severity` narrow `status` and apply to nothing else; both are
+checked after the category, so `kinds` without `"status"` in `categories`
+matches nothing. The streaming API's `tweaks` category is **rejected** here
+rather than ignored — it is per-block bulk data and an HTTP receiver is the
+wrong consumer for it.
+
+`mempool` is almost never the right choice for a webhook. If you want to know
+about *your* transactions before they confirm, use a watch-set (below), which
+delivers the unconfirmed sighting without subscribing you to the network's.
+
 ### What arrives
 
 ```http
@@ -245,6 +265,21 @@ Matches arrive as `script_matched`, `outpoint_spent`, `txid_matched`,
 envelope-shaped JSON the WebSocket carrier emits, rendered by the same code.
 You get the mempool sighting first (`confirmed: false`) and the confirmed
 re-emit when it lands.
+
+**A watch-set is not filtered by `categories`.** The two are independent
+channels down one connection: `categories` subscribes you to the firehose —
+what the node is doing — while the watch-set subscribes you to your own
+addresses. The hook above has `categories = ["chain"]` and therefore receives
+block connects and disconnects; it would receive its deposit matches just the
+same with `categories = ["status"]`, and it does **not** receive mempool
+transitions for unrelated transactions despite getting the unconfirmed half of
+its own matches. Both phases of a match always arrive, because a deposit
+watcher wants the pending credit whether or not it wants the mempool firehose.
+
+The practical consequence: do not add `"mempool"` to a hook in order to see
+unconfirmed matches — you already see them, and what you would actually get is
+every transaction on the network. Watch-set traffic is proportional to your
+own activity; firehose traffic is proportional to the network's.
 
 Hashes are in **internal (consensus) byte order**, unreversed — the streaming
 API's convention, not the reversed display order JSON-RPC uses. A scripthash is

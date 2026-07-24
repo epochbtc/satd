@@ -363,7 +363,15 @@ async fn fan_in(
                     }
                 }
                 None => {
+                    // Break, matching the bus arm. A closed mpsc returns `None`
+                    // immediately and forever, so falling through would spin
+                    // this loop at 100% CPU with a warn per iteration.
+                    // Unreachable today — `watch_handle` is held for the whole
+                    // loop and is the only thing that drops the sender — but
+                    // the asymmetry with the bus arm is a trap for whoever adds
+                    // registry-side subscriber pruning later.
                     tracing::warn!(target: "alert", "watch match channel closed");
+                    break;
                 }
             },
             recv = rx.recv() => match recv {
