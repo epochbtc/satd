@@ -11,6 +11,11 @@
 # Triage: a divergence is a real consensus difference between satd and Core —
 # investigate before dismissing. Infra flakes (image pull 5xx, runner OOM):
 # rerun. Never weaken the accept/reject assertion in response to a flake.
+#
+# A failure notifies via a GitHub issue in two of three cases — a divergence
+# (`fuzz-divergence`) and a broken job (`fuzz-broken`, covering both a failing
+# fuzz step and a 3+ run red streak). A lone pre-fuzz infra flake stays quiet.
+# See the "Triage failure and notify" step for the full classification.
 
 name: Bitcoin Core block-acceptance fuzz
 
@@ -90,6 +95,7 @@ jobs:
           for i in 1 2 3; do docker pull lncm/bitcoind:v27.0 && break || sleep $((i * 2)); done
 
       - name: Run block-differential fuzz
+        id: fuzz
         env:
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1800' }}
           FUZZ_NIGHTLY: ${{ env.FUZZ_NIGHTLY }}
@@ -104,48 +110,74 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      # File an issue ONLY for a real divergence, never for an infra flake.
-      # libFuzzer writes a reproducer (crash-/timeout-/oom-*) under
-      # fuzz/artifacts/ if and only if the target actually diverged or hung on
-      # a specific block. Infra failures (image-pull 5xx, apt, cargo install,
-      # runner OOM, docker) fail the job *before* any reproducer is produced —
-      # those get no issue; GitHub's built-in scheduled-failure email is the
-      # low-priority backstop for a persistently-red pipeline. Manual
-      # workflow_dispatch runs are skipped too: whoever dispatched is watching.
-      - name: File issue on a real divergence
+      # Failure triage. Three classes, distinguished by whether a reproducer
+      # exists and whether the fuzz step itself is what failed:
+      #
+      #   (a) DIVERGENCE / crash / hang — libFuzzer wrote a reproducer under
+      #       fuzz/artifacts/. A real consensus finding. -> `fuzz-divergence`.
+      #
+      #   (b) BROKEN JOB — the fuzz step failed but produced no reproducer,
+      #       i.e. the target or its build is broken (compile error, a stale
+      #       `ConnectParams`, a toolchain ICE). Persistent and actionable,
+      #       yet it yields no reproducer — so the previous version of this
+      #       step classified it as "infra/flake" and filed nothing. That is
+      #       exactly how this workflow stayed red for 41 consecutive runs
+      #       (2026-06-14 -> 2026-07-24) with nobody notified. -> `fuzz-broken`.
+      #
+      #   (c) INFRA — an earlier step failed (apt, `cargo install`, image-pull
+      #       5xx, runner OOM), so the fuzz step never ran. Usually transient:
+      #       rerun, no issue. But a streak of >=3 consecutive scheduled
+      #       failures is itself a signal that nobody is watching, so that
+      #       escalates to `fuzz-broken` rather than staying silent.
+      #
+      # Manual workflow_dispatch runs never notify — whoever dispatched is
+      # watching. Never weaken the accept/reject assertion for any of these.
+      - name: Triage failure and notify
         if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          # '' / 'skipped' when an earlier step failed; 'failure' when the
+          # fuzz step itself is what broke. This is the (b)-vs-(c) test.
+          FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
         run: |
           set -euo pipefail
 
+          today=$(date -u +%F)
+
+          # One open issue per label: comment on it if present, else open it.
+          # Keeps a recurring condition to a single thread instead of a new
+          # issue per night.
+          notify() {
+            label="$1"; color="$2"; label_desc="$3"; title="$4"; body="$5"; comment="$6"
+            gh label create "$label" --color "$color" --description "$label_desc" \
+              2>/dev/null || true
+            existing=$(gh issue list --label "$label" --state open \
+              --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              echo "Commenting on existing issue #$existing ($label)"
+              gh issue comment "$existing" --body "$comment"
+            else
+              echo "Opening new $label issue"
+              gh issue create --label "$label" --title "$title" --body "$body"
+            fi
+          }
+
           repros=$(find fuzz/artifacts -type f 2>/dev/null | sort || true)
-          if [ -z "$repros" ]; then
-            echo "No reproducer under fuzz/artifacts/ — this failure looks like"
-            echo "infra/flake, not a divergence. Not filing an issue."
-            exit 0
-          fi
 
-          echo "Reproducer(s) found — filing/updating a divergence issue:"
-          echo "$repros"
-          repro_list=$(echo "$repros" | sed 's/^/- `/; s/$/`/')
+          # ---- (a) real divergence -------------------------------------
+          if [ -n "$repros" ]; then
+            echo "Reproducer(s) found — filing/updating a divergence issue:"
+            echo "$repros"
+            repro_list=$(echo "$repros" | sed 's/^/- `/; s/$/`/')
 
-          # Ensure the dedup label exists (idempotent).
-          gh label create fuzz-divergence \
-            --color B60205 \
-            --description "block-differential fuzz found a satd/Core divergence" \
-            2>/dev/null || true
-
-          existing=$(gh issue list --label fuzz-divergence --state open \
-            --json number --jq '.[0].number // empty')
-
-          body=$(cat <<EOF
+            body=$(cat <<EOF
           The **block-differential fuzzer** found a \`satd\` ↔ Bitcoin Core
           accept/reject divergence (or a hang/OOM) on a specific block.
 
           - Run: $RUN_URL
-          - Commit: \`${{ github.sha }}\`
+          - Commit: \`$COMMIT_SHA\`
           - Reproducer(s) (also in the \`core-block-differential-fuzz-artifacts\` artifact):
 
           $repro_list
@@ -156,15 +188,92 @@ jobs:
           pass. Close this issue once resolved; the next divergence opens a
           fresh one.
           EOF
-          )
-
-          if [ -n "$existing" ]; then
-            echo "Commenting on existing issue #$existing"
-            gh issue comment "$existing" --body "Another divergence on $(date -u +%F): $RUN_URL"
-          else
-            echo "Opening new tracking issue"
-            gh issue create \
-              --label fuzz-divergence \
-              --title "Fuzz divergence: satd vs Bitcoin Core ($(date -u +%F))" \
-              --body "$body"
+            )
+            notify fuzz-divergence B60205 \
+              "block-differential fuzz found a satd/Core divergence" \
+              "Fuzz divergence: satd vs Bitcoin Core ($today)" \
+              "$body" \
+              "Another divergence on $today: $RUN_URL"
+            exit 0
           fi
+
+          # ---- (b) the fuzz step itself failed, no reproducer ----------
+          if [ "$FUZZ_OUTCOME" = "failure" ]; then
+            echo "Fuzz step failed with no reproducer — the job itself is broken."
+
+            body=$(cat <<EOF
+          The **block-differential fuzz job is broken**: the fuzz step failed
+          without producing a reproducer, so this is *not* a consensus
+          divergence — the target or its build is not working.
+
+          - Run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+
+          Usual causes, in rough order of likelihood:
+
+          - \`node\` no longer compiles with \`default-features = false\`
+            (\`fuzz/\` is the only in-tree consumer of a consensus-only
+            \`node\`; PR CI's \`--all-features\` clippy cannot catch this,
+            which is why the Lint job has a dedicated consensus-only step).
+          - The fuzz target drifted from a \`node\` API it constructs by hand
+            — e.g. a new \`ConnectParams\` field.
+          - The pinned nightly (\`FUZZ_NIGHTLY\`) broke, or an upstream rustc
+            ICE. Verify locally before bumping the pin.
+
+          Reproduce locally (needs Docker + a nightly toolchain):
+
+          \`\`\`
+          MAX_TOTAL_TIME=120 bash scripts/fuzz/run-block-differential.sh
+          \`\`\`
+
+          This job finds consensus divergence, so while it is broken that
+          coverage is simply absent — treat it as urgent, not cosmetic. Close
+          once it is green again.
+          EOF
+            )
+            notify fuzz-broken D93F0B \
+              "block-differential fuzz job is broken (not a divergence)" \
+              "Fuzz job broken: block-differential target fails to run ($today)" \
+              "$body" \
+              "Still broken as of $today: $RUN_URL"
+            exit 0
+          fi
+
+          # ---- (c) infra failure: escalate only on a streak ------------
+          # Exclude the current (still in-progress) run via --status completed,
+          # so two prior failures + this one == three consecutive.
+          prior_failures=$(gh run list \
+            --workflow core_block_differential_fuzz.yml \
+            --event schedule --status completed --limit 2 \
+            --json conclusion \
+            --jq '[.[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo 0)
+
+          if [ "${prior_failures:-0}" -lt 2 ]; then
+            echo "Infra failure before the fuzz step ran, and the preceding"
+            echo "scheduled runs were not both red ($prior_failures/2). Treating"
+            echo "as a transient flake: rerun the job. Not filing an issue."
+            exit 0
+          fi
+
+          echo "Infra failure, but the last 3 scheduled runs are all red —"
+          echo "escalating: a persistently red pipeline is not a flake."
+
+          body=$(cat <<EOF
+          The **block-differential fuzz job has failed 3+ consecutive scheduled
+          runs**, each time before the fuzz step could run (apt, \`cargo
+          install\`, image pull, or runner resources).
+
+          - Latest run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+
+          Any single one of these is a flake worth a rerun; three in a row is
+          an outage. Something in the job's environment needs fixing —
+          otherwise the consensus-divergence coverage this job provides stays
+          silently absent. Close once a scheduled run goes green.
+          EOF
+          )
+          notify fuzz-broken D93F0B \
+            "block-differential fuzz job is broken (not a divergence)" \
+            "Fuzz job broken: 3+ consecutive scheduled failures ($today)" \
+            "$body" \
+            "Still failing before the fuzz step as of $today: $RUN_URL"
