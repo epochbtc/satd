@@ -89,6 +89,8 @@ struct Inner {
     behavior: Behavior,
     seen: usize,
     received: Vec<Received>,
+    /// Every request, accepted or refused — what `received` deliberately is not.
+    attempted: Vec<Received>,
 }
 
 /// A scriptable HTTP receiver on loopback.
@@ -105,6 +107,7 @@ impl MockReceiver {
             behavior,
             seen: 0,
             received: Vec::new(),
+            attempted: Vec::new(),
         }));
         let task_inner = inner.clone();
         tokio::spawn(async move {
@@ -135,7 +138,10 @@ impl MockReceiver {
                         };
                         // Only a request the receiver actually accepted counts
                         // as received; a 503'd attempt is a retry, not a
-                        // delivery.
+                        // delivery. Every attempt is kept separately, so a test
+                        // can assert on what changes (and what must not) across
+                        // the retries of one event.
+                        g.attempted.push(req.clone());
                         if status == 200 {
                             g.received.push(req);
                         }
@@ -223,6 +229,11 @@ impl MockReceiver {
 
     async fn attempts(&self) -> usize {
         self.inner.lock().await.seen
+    }
+
+    /// Every request the receiver saw, accepted or not, in arrival order.
+    async fn all_attempts(&self) -> Vec<Received> {
+        self.inner.lock().await.attempted.clone()
     }
 
     /// Every accepted delivery, in arrival order.
@@ -359,6 +370,19 @@ async fn webhook_delivers_a_signed_status_event() {
     let receiver = MockReceiver::ok().await;
     let (sn, _dir) = node_with_hook(&receiver, "ops", "\"status\"", vec![]).await;
 
+    // Drive `disk_low` to a known-cleared state first, so the raise below is
+    // guaranteed to be an edge.
+    //
+    // At the 10 GiB default this test otherwise depends on the host's free
+    // space: on a machine under the floor the condition is already raised
+    // before the dispatcher attaches, the raise SIGHUP hits `raise_if_new`'s
+    // no-op, and the whole v2-signature guard dies as a bare 60 s timeout with
+    // nothing to say why. A 1 MiB floor is below any filesystem that can hold a
+    // datadir, so this clears on every host. It has to go through the conf file
+    // rather than the command line — a CLI value wins over the conf, so a CLI
+    // threshold would make every later SIGHUP retune a no-op.
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=1\n").await;
+
     // Raise `disk_low` *after* the dispatcher is attached, by moving the
     // threshold live rather than starting with it tripped: a status event is
     // not replayable, so a condition raised during startup would never reach a
@@ -432,6 +456,96 @@ async fn webhook_retries_until_the_receiver_recovers() {
     let attempt: u32 = got.header("x-satd-attempt").parse().unwrap_or(0);
     assert!(attempt >= 3, "expected the 3rd attempt to succeed, got {attempt}");
     assert!(receiver.attempts().await >= 3);
+
+    // One event is signed exactly once, and every attempt carries that same
+    // signature, timestamp, and delivery id — only `X-Satd-Attempt` varies.
+    //
+    // This is the invariant, not an implementation detail. Re-signing per
+    // attempt would refresh `X-Satd-Timestamp`, which is what makes a delivery
+    // age out of the receiver's freshness window while it is still being
+    // retried — deliberate, since a 20-minute-old alert is not worth acting on.
+    // Asserting only on the accepted attempt (as this test used to) passes just
+    // as happily with the signing moved inside the retry loop.
+    let attempts = receiver.all_attempts().await;
+    let chain: Vec<_> = attempts
+        .iter()
+        .filter(|r| r.json()["body"]["category"] == "chain")
+        .collect();
+    assert!(chain.len() >= 3, "expected 3 attempts at one event, got {}", chain.len());
+    let first = chain[0];
+    for (i, r) in chain.iter().enumerate() {
+        assert_eq!(
+            r.header("x-satd-timestamp"),
+            first.header("x-satd-timestamp"),
+            "attempt {} re-stamped the timestamp; the event must be signed once",
+            i + 1
+        );
+        assert_eq!(r.header("x-satd-signature"), first.header("x-satd-signature"));
+        assert_eq!(r.header("x-satd-delivery"), first.header("x-satd-delivery"));
+        assert_eq!(r.body, first.body);
+    }
+    // ...and the attempt counter is the one thing that does move.
+    assert_ne!(chain[0].header("x-satd-attempt"), chain[2].header("x-satd-attempt"));
+}
+
+/// A SIGHUP that did not touch the alertfile must not destroy a queued status
+/// event.
+///
+/// `reload_from_sighup` calls `AlertReloader::apply()` on *every* SIGHUP,
+/// whatever key the operator actually edited, and retiring a generation drops
+/// everything queued in it. For chain events that is survivable — the cursor
+/// did not advance, so the next generation's catch-up re-queues them. A status
+/// event has no replay by design, and the detectors are edge-triggered against
+/// a `HealthState` that outlives the reload, so a `disk_low` sitting in retry
+/// backoff when the operator SIGHUPs to change `maxconnections` would be
+/// dropped, never replayed, and never re-raised. The page simply never arrives.
+///
+/// The receiver 503s the first two attempts, so the event is provably still
+/// in the dispatcher — mid-backoff — when the unrelated SIGHUP lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrelated_sighup_does_not_destroy_a_queued_status_event() {
+    // Refuse the first four attempts. Backoff is 1s, 2s, 4s, 8s, so the event
+    // stays in the dispatcher for ~15s — a wide window for the unrelated reload
+    // below to land inside. Too few refusals and the delivery could succeed
+    // before the SIGHUP, leaving the test green without ever exercising the
+    // reload path.
+    let receiver = MockReceiver::failing_first(503, 4).await;
+    let (sn, _dir) = node_with_hook(&receiver, "pager", "\"status\"", vec![]).await;
+
+    // Known-cleared first, so the raise is an edge on any host (see
+    // `webhook_delivers_a_signed_status_event` for why this goes through the
+    // conf file rather than the command line).
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=1\n").await;
+
+    // Raise `disk_low`. The detectors re-evaluate on a 15s poll, so the raise
+    // does not follow the SIGHUP immediately — wait for the delivery to have
+    // been attempted rather than assuming a fixed delay.
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while receiver.attempts().await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the status event was never attempted; the raise did not reach the hook"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Now an unrelated reload, while that delivery is still being retried. The
+    // alertfile is untouched; only a daemon key changes. The threshold is
+    // carried over so the condition stays raised — a cleared-and-re-raised
+    // alert would produce a *new* event and mask the loss of the old one.
+    crate::streaming::sighup_with_conf(
+        &sn,
+        "alertdiskfreemb=17592186044416\nmaxconnections=42\n",
+    )
+    .await;
+
+    // The original event must still land.
+    let got = receiver
+        .wait_for(60, |r| r.json()["body"]["category"] == "status")
+        .await;
+    assert_eq!(got.json()["body"]["kind"], "disk_low");
+    assert!(got.signature_valid(SECRET));
 }
 
 /// A permanently-rejected event still advances the hook's resume cursor.
@@ -453,8 +567,14 @@ async fn webhook_permanent_rejection_advances_the_cursor() {
         .wait_for(60, |r| r.json()["body"]["height"] == 1)
         .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let before = receiver.attempts().await;
-    assert!(before >= 3, "expected all three blocks attempted, got {before}");
+    let block_attempts = |rs: Vec<Received>| -> Vec<u64> {
+        rs.iter()
+            .filter(|r| r.json()["body"]["kind"] == "block_connected")
+            .filter_map(|r| r.json()["body"]["height"].as_u64())
+            .collect()
+    };
+    let before = block_attempts(receiver.all_attempts().await);
+    assert_eq!(before, vec![1, 2, 3], "expected all three blocks attempted once");
 
     // A SIGHUP retires the generation and starts a new one, which re-runs
     // catch-up from the persisted cursor.
@@ -471,8 +591,14 @@ async fn webhook_permanent_rejection_advances_the_cursor() {
     // Counting *attempts*, not accepted deliveries: a replayed block would be
     // refused again and so would never show up as accepted. What matters is
     // whether the request was made at all.
+    //
+    // Scoped to `block_connected` rather than a raw request count, because a
+    // permanent rejection now also emits a `lagged` notice — the receiver is
+    // told which events it lost, since the cursor advancing past them means it
+    // can never fetch them later. A raw count would fold that in and read as a
+    // replayed block.
     assert_eq!(
-        receiver.attempts().await,
+        block_attempts(receiver.all_attempts().await),
         before,
         "a refused span must not be rebuilt and re-sent on reload",
     );
@@ -484,6 +610,22 @@ async fn webhook_permanent_rejection_advances_the_cursor() {
     receiver
         .wait_for(60, |r| r.json()["body"]["height"] == 4)
         .await;
+
+    // ...and the refusal was announced rather than silent. A gap notice is
+    // emitted ahead of the next event for the hook, so this is asserted after
+    // block 4 rather than immediately after the rejections.
+    //
+    // It matters here more than on any other drop path: the cursor advances
+    // past a permanently-rejected event, so unlike a queue overflow the
+    // receiver cannot go back for it. Being told is all it gets.
+    let lagged = receiver
+        .wait_for(30, |r| r.json()["body"]["category"] == "lagged")
+        .await;
+    assert!(
+        lagged.json()["body"]["dropped_count"].as_u64().unwrap_or(0) >= 2,
+        "both refused blocks should be counted; got {}",
+        lagged.body,
+    );
 }
 
 /// A redirect is never followed: the signed body does not go to a host the

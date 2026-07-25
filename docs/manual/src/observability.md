@@ -159,11 +159,12 @@ worse failure.
 ```http
 POST /your/endpoint HTTP/1.1
 Content-Type: application/json
-X-Satd-Signature: sha256=<hex HMAC-SHA256(secret, raw body)>
+X-Satd-Signature: sha256=<hex HMAC-SHA256(secret, canonical string)>
+X-Satd-Timestamp: 1753400000
 X-Satd-Delivery: <node_id>-<instance_id>-<seq>
 X-Satd-Hook: pager
 X-Satd-Attempt: 1
-X-Satd-Webhook-Version: 1
+X-Satd-Webhook-Version: 2
 
 {"schema_version":1,"stamp":{...},"body":{"category":"status", ...}}
 ```
@@ -173,10 +174,45 @@ the same event, so a receiver parses webhook bodies and streaming frames with
 one code path. Delivery metadata rides in headers and never in the body — which
 is what makes the signature stable across retries.
 
-Verify the signature over the **raw body, before parsing**. Deduplicate on
-`X-Satd-Delivery`: it is stable across retries of one event and unique across
-restarts, so a retry and a genuine repeat are distinguishable. Reply `2xx` to
-acknowledge.
+### Verifying a delivery
+
+The signature covers a **canonical string**, not the bare body — five fields
+joined by newlines, with the raw body last:
+
+```
+"2" LF <X-Satd-Timestamp> LF <X-Satd-Delivery> LF <X-Satd-Hook> LF <raw body>
+```
+
+Signing only the body would leave `X-Satd-Delivery` unauthenticated *and*
+predictable, and that header is the one this page tells you to deduplicate on.
+One captured `(body, signature)` pair could then be replayed under forged future
+delivery ids, poisoning your dedup cache so the real alerts were discarded on
+arrival while satd counted them delivered. Binding the id, the hook, and a
+timestamp into the signed material closes that.
+
+So a receiver must:
+
+1. Read `X-Satd-Timestamp` and reject anything older than **600 seconds**. This
+   is not optional — it is what stops a captured delivery being a permanent
+   replay token. A delivery still being retried after the window ages out by
+   design; a 20-minute-old "disk is filling" alert is not worth acting on.
+2. Rebuild the canonical string above from the raw body, **before parsing it**.
+3. Compare the HMAC in constant time.
+4. Deduplicate on `X-Satd-Delivery` — stable across retries of one event, and
+   unique across restarts, so a retry and a genuine repeat are distinguishable.
+5. Reply `2xx` to acknowledge.
+
+> **Upgrading from the pre-release v1 scheme.** Earlier drafts signed the raw
+> body alone and sent `X-Satd-Webhook-Version: 1`. The legacy `reorgwebhook=`
+> keys still use exactly that, unchanged, and still report version `1` — branch
+> on the version header rather than assuming one scheme.
+
+The `X-Satd-Delivery` value is opaque; do not parse it. Its suffix distinguishes
+how the delivery arose — a bare counter for a live event, `w` for a watch match,
+`r` for a synthesized notice such as `lagged`, and `b<height>` for a replayed
+block. That last one is deliberately derived from the height rather than a
+counter, so the same block replayed after a restart carries the same id and your
+dedup actually collapses it.
 
 ### Delivery behavior
 
@@ -199,12 +235,23 @@ acknowledge.
   the cursor to resume from. A gap is never silent.
 - **Nothing reaches consensus.** Deliveries run on the isolated API runtime;
   a stalled endpoint cannot affect block connection.
-- **At-least-once for confirmed chain events across a restart.** Each hook's
-  resume position is persisted, and on startup the hook replays what it missed
-  (bounded by the same 10 000-block window the streaming API uses; beyond that
-  you get a `lagged` notice instead). Health events are re-raised by
+- **At-least-once for confirmed chain events across a restart, or you are told.**
+  Each hook's resume position is persisted, and on startup the hook replays what
+  it missed (bounded by the same 10 000-block window the streaming API uses;
+  beyond that you get a `lagged` notice instead). Health events are re-raised by
   re-evaluation rather than replayed, and mempool events are best-effort — the
-  same contract the event bus itself offers.
+  same contract the event bus itself offers. Every way an event can be skipped —
+  queue overflow, a permanent rejection, suppression during a sync — increments
+  the hook's drop count and produces a `lagged` body, so the guarantee is
+  precisely "delivered, or reported missing"; it is never silent.
+- **Suppressed during initial block download.** A node syncing from scratch does
+  not POST its entire history: while it is catching up, only `status` and
+  `heartbeat` events are delivered. Health alerts stay live because "this node is
+  unhealthy" is exactly as true mid-sync, and the heartbeat keeps flowing so an
+  external dead-man's switch does not declare a syncing node dead. Everything
+  suppressed is counted and reported in the next `lagged` body. The suppression
+  is latched on leaving IBD once, so a node whose tip later goes stale keeps
+  alerting — which is the whole point of a stalled-tip alert.
 
 Plaintext `http://` is accepted for loopback and private-network targets. For a
 public host, use `https://` or set `allow_insecure_http = true` on the hook.

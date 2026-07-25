@@ -51,6 +51,9 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// "resync below this height yourself" boundary.
 const MAX_CATCHUP_BLOCKS: u32 = node::events::MAX_REPLAY_BLOCKS;
 
+/// How often a pending gap notice is flushed when no event is driving the hook.
+const GAP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Numbers synthesized deliveries — catch-up replay events and gap notices.
 ///
 /// Process-wide rather than per-generation, for the same reason the watch
@@ -111,6 +114,11 @@ struct HookChannel {
     /// Set when an event was dropped for this hook; cleared when the resulting
     /// `Lagged` notice has been queued.
     gap: Arc<GapState>,
+    /// Whether the "delivery task is gone" warning has already been logged for
+    /// this generation. Per-generation on purpose: a reload should re-report a
+    /// genuinely dead hook once, not stay quiet because a retired generation
+    /// already said so.
+    reported_closed: std::sync::atomic::AtomicBool,
 }
 
 /// Accumulated drop state for one hook.
@@ -121,6 +129,33 @@ struct GapState {
     /// anchor a receiver resumes from.
     resume_height: std::sync::atomic::AtomicU32,
 }
+
+/// Per-hook gap state, keyed by hook id, living as long as the process.
+///
+/// Deliberately not per-generation. A reload retires the generation that
+/// accumulated a drop count, and per-generation state would take the pending
+/// `Lagged` notice down with it — the receiver would never learn about a hole
+/// that satd had already recorded. `HookCounters` is process-lived for the same
+/// reason; this is the half that was missed.
+static GAP_STATE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<GapState>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn gap_state_for(id: &str) -> Arc<GapState> {
+    let mut map = GAP_STATE.lock();
+    Arc::clone(map.entry(id.to_string()).or_default())
+}
+
+/// Whether this node has ever been observed out of initial block download.
+///
+/// `is_initial_block_download()` is a function of the tip header's age, not of
+/// whether a sync is in progress: a node whose tip stops advancing crosses back
+/// into "IBD" 24 hours later. Without this latch the alert path would go dark
+/// during exactly the incident it exists to report — a stalled tip — and, worse,
+/// resume by advancing the durable cursor across everything it suppressed.
+/// Once a node has been caught up, it is never "syncing" again for the
+/// dispatcher's purposes.
+static LEFT_IBD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Spawn the dispatcher for a parsed alertfile.
 ///
@@ -143,11 +178,12 @@ fn spawn_with_metrics(
     for hook in &file.hooks {
         let (tx, rx) = mpsc::channel::<Delivery>(HOOK_QUEUE_CAPACITY);
         let counters = metrics.hook(&hook.id);
-        let gap = Arc::new(GapState::default());
+        let gap = gap_state_for(&hook.id);
         tokio::spawn(deliver_loop(
             hook.clone(),
             rx,
             counters.clone(),
+            gap.clone(),
             store.clone(),
             stop.clone(),
         ));
@@ -157,6 +193,7 @@ fn spawn_with_metrics(
             tx,
             counters,
             gap,
+            reported_closed: std::sync::atomic::AtomicBool::new(false),
         });
     }
     tokio::spawn(fan_in(hooks, publisher, store, block_source, stop));
@@ -197,9 +234,22 @@ async fn fan_in(
         "alert webhook dispatcher started",
     );
 
+    // A gap notice is otherwise only emitted ahead of the *next* event for that
+    // hook, so a hook whose traffic stops right after a drop holds it
+    // indefinitely — and traffic stopping is correlated with the drop, not
+    // independent of it. The one message that must not wait is the one saying
+    // data was lost.
+    let mut gap_flush = tokio::time::interval(GAP_FLUSH_INTERVAL);
+    gap_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = stop.wait() => break,
+            _ = gap_flush.tick() => {
+                for hook in &hooks {
+                    flush_gap(hook, &publisher);
+                }
+            }
             recv = rx.recv() => match recv {
                 Ok(env) => {
                     // Suppress the firehose during initial block download.
@@ -213,16 +263,31 @@ async fn fan_in(
                     // multi-day firehose at the receiver rather than anything
                     // that looks like a bug locally.
                     //
-                    // Status events are exempt: "this node is unhealthy" is
-                    // exactly as true during IBD, and the detectors already
-                    // suppress the conditions that are meaningless while
-                    // syncing.
-                    let syncing = block_source
-                        .as_deref()
-                        .is_some_and(|s| s.in_initial_block_download());
-                    if syncing && !matches!(env.body, NodeEventBody::Status(_)) {
-                        continue;
-                    }
+                    // Latched (see `LEFT_IBD`), because the predicate is the
+                    // tip's age rather than a sync flag. Once latched the
+                    // `block_source` call is skipped entirely, which also keeps
+                    // a per-event RocksDB block-index lookup off this task.
+                    //
+                    // Status and heartbeat events are exempt. "This node is
+                    // unhealthy" is exactly as true during IBD, and the
+                    // detectors already suppress the conditions that are
+                    // meaningless while syncing. A heartbeat is a dead-man's
+                    // switch: suppressing it during a multi-day sync makes an
+                    // external watchdog declare a healthy node dead, which
+                    // inverts the signal it exists to carry.
+                    let syncing = !LEFT_IBD.load(Ordering::Relaxed) && {
+                        let in_ibd = block_source
+                            .as_deref()
+                            .is_some_and(|s| s.in_initial_block_download());
+                        if !in_ibd {
+                            LEFT_IBD.store(true, Ordering::Relaxed);
+                        }
+                        in_ibd
+                    };
+                    let exempt = matches!(
+                        env.body,
+                        NodeEventBody::Status(_) | NodeEventBody::Heartbeat { .. }
+                    );
                     // Decide who wants this *before* rendering it. Serializing
                     // first meant a `BlockTweaks` envelope — hundreds of KB of
                     // per-block silent-payment rows — was rendered in full and
@@ -235,6 +300,22 @@ async fn fan_in(
                         .map(|(i, _)| i)
                         .collect();
                     if wanted.is_empty() {
+                        continue;
+                    }
+                    if syncing && !exempt {
+                        // Record the suppression as a gap rather than dropping
+                        // it silently. A silent skip would leave no counter
+                        // moved and no `lagged` body emitted, and the first
+                        // post-IBD delivery would then advance the durable
+                        // cursor straight across everything suppressed — making
+                        // the span unrecoverable on the next restart while the
+                        // module claims at-least-once. Counting it means the
+                        // receiver is told, and the resume anchor still points
+                        // before the hole.
+                        for i in wanted {
+                            hooks[i].gap.dropped.fetch_add(1, Ordering::Relaxed);
+                            hooks[i].counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                         continue;
                     }
                     // Render once for every hook: the body a receiver verifies
@@ -289,7 +370,17 @@ async fn fan_in(
 }
 
 /// Queue an event for one hook, converting an overflow into a recorded gap.
-fn enqueue(hook: &HookChannel, publisher: &EventPublisher, item: Delivery, cursor: Option<Cursor>) {
+///
+/// Returns whether the event was queued. Callers that need a count must use
+/// this rather than diffing `counters.dropped`: those counters are process-lived
+/// and shared across generations, so a retired generation still shedding events
+/// perturbs the delta — which, on a subtraction, underflowed.
+fn enqueue(
+    hook: &HookChannel,
+    publisher: &EventPublisher,
+    item: Delivery,
+    cursor: Option<Cursor>,
+) -> bool {
     // Emit the pending gap notice ahead of the event that follows it, so the
     // receiver learns about the hole before it sees the data after it.
     flush_gap(hook, publisher);
@@ -301,12 +392,14 @@ fn enqueue(hook: &HookChannel, publisher: &EventPublisher, item: Delivery, curso
             if let Some(c) = cursor {
                 hook.gap.resume_height.store(c.height, Ordering::Relaxed);
             }
+            true
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             // A receiver that cannot keep up degrades to "you missed N" rather
             // than back-pressuring the bus.
             hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
             hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             // The delivery task is gone: it failed to build its HTTP client, or
@@ -317,11 +410,19 @@ fn enqueue(hook: &HookChannel, publisher: &EventPublisher, item: Delivery, curso
             // "no successful delivery in N minutes" rule fires.
             hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
             hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                target: "alert",
-                hook = %hook.id,
-                "hook delivery task is gone; event dropped",
-            );
+            // Logged once per hook, not once per event. This arm is reached on
+            // every event once a delivery task is gone — including for a
+            // generation being retired by a reload, where it is expected — and
+            // an unrated line here is thousands per second on a busy mempool,
+            // filling the very disk `disk_low` is watching.
+            if !hook.reported_closed.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "alert",
+                    hook = %hook.id,
+                    "hook delivery task is gone; events for this hook are being dropped",
+                );
+            }
+            false
         }
     }
 }
@@ -431,6 +532,14 @@ async fn catch_up(
         // replaying history nobody asked for.
         return Default::default();
     };
+    // Seed the gap anchor from the durable cursor before any replay is queued.
+    // `resume_height` is otherwise only set by a successful enqueue, so a hook
+    // that lags before its first one — a fresh generation whose catch-up burst
+    // overflows immediately — would emit a `Lagged` advertising height 0, which
+    // reads as "resume from genesis" rather than "resume from where you were".
+    hook.gap
+        .resume_height
+        .store(cursor.height, Ordering::Relaxed);
 
     let replay = node::events::build_cursor_replay(
         src,
@@ -458,31 +567,58 @@ async fn catch_up(
         );
     }
     let count = replay.events.len();
-    let before = hook.counters.dropped.load(Ordering::Relaxed);
+    let mut queued = 0u64;
+    let mut overflowed = 0u64;
+    let mut queued_heights: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for env in replay.events {
+        let height = match &env.body {
+            NodeEventBody::Chain(node::chain::events::ChainEvent::BlockConnected {
+                height,
+                ..
+            }) => Some(*height),
+            _ => None,
+        };
         let Ok(bytes) = serde_json::to_vec(&env) else {
             continue;
         };
         let cursor = env.cursor;
-        enqueue(
+        // Every replayed envelope is stamped `seq: 0`, so minting from it would
+        // give a node that was down for 100 blocks 100 deliveries sharing one
+        // idempotency key — the whole point of catch-up defeated silently.
+        //
+        // A replayed block takes an id derived from its height rather than a
+        // process counter. This is the one event the design really can deliver
+        // twice (a restart, or a reload whose generations overlap), and every
+        // counter-minted id embeds a per-process random `instance_id`, so the
+        // duplicate would arrive under a fresh id and "deduplicate on
+        // X-Satd-Delivery" would be unimplementable for the only case that
+        // needs it. Non-block replays keep the counter — they carry no durable
+        // position to key on.
+        let delivery_id = match height {
+            Some(h) => satd_alert::block_delivery_id(&hex::encode(env.stamp.node_id), h),
+            None => satd_alert::replay_delivery_id(
+                &hex::encode(env.stamp.node_id),
+                publisher.instance_id(),
+                SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+            ),
+        };
+        if enqueue(
             hook,
             publisher,
             Delivery::Event {
                 body: Arc::new(bytes),
-                // Every replayed envelope is stamped `seq: 0`, so minting from
-                // it would give a node that was down for 100 blocks 100
-                // deliveries sharing one idempotency key — a conforming
-                // receiver keeps the first and discards the other 99, which is
-                // the whole point of catch-up defeated silently.
-                delivery_id: satd_alert::replay_delivery_id(
-                    &hex::encode(env.stamp.node_id),
-                    publisher.instance_id(),
-                    SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
-                ),
+                delivery_id,
                 cursor,
             },
             cursor,
-        );
+        ) {
+            queued += 1;
+            if let Some(h) = height {
+                queued_heights.insert(h);
+            }
+        } else {
+            overflowed += 1;
+        }
     }
     if count > 0 {
         // Report what was *queued*, not what was built. The 10k-block replay
@@ -491,11 +627,6 @@ async fn catch_up(
         // about a week and 10k is about ten. Overflow inside this loop is
         // counted but was otherwise unlogged, so the success line reported the
         // pre-truncation figure and read as if everything had been recovered.
-        let overflowed = hook
-            .counters
-            .dropped
-            .load(Ordering::Relaxed)
-            .saturating_sub(before);
         if overflowed > 0 {
             tracing::warn!(
                 target: "alert",
@@ -509,12 +640,20 @@ async fn catch_up(
         tracing::info!(
             target: "alert",
             hook = %hook.id,
-            events = count as u64 - overflowed,
+            events = queued,
             from = cursor.height,
             "webhook catch-up queued events missed while the daemon was down",
         );
     }
-    replay.confirmed_dedup
+    // Only suppress the live copy of a block this hook actually received. The
+    // replay builds up to 10,000 events into a queue that holds 1024, so on a
+    // long outage most of the tail overflows — and the tail is exactly the span
+    // still buffered on the broadcast, i.e. the blocks whose live copies are
+    // about to arrive. Keeping a dropped block in the dedup map suppresses that
+    // live copy too, dropping the same block twice.
+    let mut dedup = replay.confirmed_dedup;
+    dedup.retain(|height, _| queued_heights.contains(height));
+    dedup
 }
 
 fn read_cursor(store: &dyn Store, hook: &Hook) -> Option<Cursor> {
@@ -610,6 +749,7 @@ async fn deliver_loop(
     hook: Hook,
     mut rx: mpsc::Receiver<Delivery>,
     counters: Arc<HookCounters>,
+    gap: Arc<GapState>,
     store: Arc<dyn Store>,
     mut stop: Stop,
 ) {
@@ -692,6 +832,18 @@ async fn deliver_loop(
                         delivery = %delivery_id,
                         "webhook receiver rejected the delivery permanently; skipping this event",
                     );
+                    // Record it as a gap, so the receiver is told in-band.
+                    //
+                    // This is the one drop path that did not, and it is the one
+                    // most likely to fire on a routine misconfiguration: a 3xx
+                    // (an `http://` URL behind a proxy that redirects to HTTPS)
+                    // and a 401 (a rotated secret, or a delivery that aged past
+                    // the receiver's freshness window while being retried) are
+                    // both permanent by this classification. Without a `lagged`
+                    // body the receiver has no way to learn which events it
+                    // lost, and — because the cursor advances below — no way to
+                    // recover them after the misconfiguration is fixed.
+                    gap.dropped.fetch_add(1, Ordering::Relaxed);
                     // Advance the cursor anyway. A permanent rejection is the
                     // receiver's decision about this event, and it will decide
                     // the same way next time — leaving the cursor parked would
@@ -699,8 +851,9 @@ async fn deliver_loop(
                     // against an endpoint that has already refused it, forever.
                     // The event is lost either way; the difference is whether
                     // the hook makes progress past it. The drop is counted
-                    // (`satd_alertwebhook_dropped_total`) and logged, so the loss is
-                    // visible rather than silent.
+                    // (`satd_alertwebhook_dropped_total`), logged, and now
+                    // announced to the receiver, so the loss is visible on both
+                    // ends rather than silent.
                     persist_cursor(&hook, store.as_ref(), cursor, &mut persisted_height);
                     break;
                 }
@@ -860,26 +1013,45 @@ impl AlertReloader {
         // behind means a later hook that happens to reuse the id inherits a
         // stale resume position and greets a brand-new endpoint with the whole
         // replay window of its predecessor's history.
-        if let Some(prev) = self.last_applied.lock().as_ref() {
-            for gone in prev
-                .hooks
-                .iter()
-                .filter(|h| !keep.iter().any(|k| k == &h.id))
-            {
-                match self.store.delete_alert_cursor(&gone.cursor_key()) {
-                    Ok(()) => tracing::info!(
-                        target: "alert",
-                        hook = %gone.id,
-                        "hook removed from the alertfile; dropped its resume cursor",
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: "alert",
-                        hook = %gone.id,
-                        error = %e,
-                        "failed to drop the removed hook's resume cursor",
-                    ),
+        //
+        // Reconciled against what is actually stored rather than against the
+        // previous generation. A reload-time diff cannot see the ordinary case:
+        // an operator who removes a hook by editing the file and *restarting*
+        // leaves no previous generation to compare against, so the cursor
+        // survived forever. Enumerating the keyspace also cleans up whatever
+        // earlier versions left behind.
+        let live: std::collections::HashSet<Vec<u8>> = file
+            .hooks
+            .iter()
+            .map(|h| h.cursor_key())
+            .chain(std::iter::once(
+                format!("alertwebhook.cursor.{LEGACY_REORG_HOOK_ID}").into_bytes(),
+            ))
+            .collect();
+        match self.store.list_alert_cursor_keys() {
+            Ok(stored) => {
+                for key in stored.into_iter().filter(|k| !live.contains(k)) {
+                    let label = String::from_utf8_lossy(&key).to_string();
+                    match self.store.delete_alert_cursor(&key) {
+                        Ok(()) => tracing::info!(
+                            target: "alert",
+                            key = %label,
+                            "no hook owns this resume cursor; dropped it",
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "alert",
+                            key = %label,
+                            error = %e,
+                            "failed to drop an orphaned resume cursor",
+                        ),
+                    }
                 }
             }
+            Err(e) => tracing::warn!(
+                target: "alert",
+                error = %e,
+                "could not enumerate stored resume cursors; orphans were not reclaimed",
+            ),
         }
         *self.last_applied.lock() = Some(file);
         Ok(hook_count)

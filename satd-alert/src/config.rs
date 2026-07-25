@@ -477,7 +477,16 @@ fn validate_url(
 /// network) and demanding TLS would just push operators to set the override.
 fn is_local_target(rest: &str) -> bool {
     // Authority is everything before the path, query, or fragment.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    //
+    // A backslash terminates the authority too. The WHATWG URL parser — which
+    // is what `reqwest` resolves this string with — treats `\` as a path
+    // separator for special schemes, so `http://evil.example\@127.0.0.1/hook`
+    // has host `evil.example`, while splitting on `/` alone leaves an authority
+    // of `evil.example\@127.0.0.1` whose last `@` yields `127.0.0.1`. That
+    // reads as loopback, waives the `allow_insecure_http` gate, and posts the
+    // signed body in cleartext to the attacker's host — the same bypass the
+    // userinfo rule below closes, through a different separator.
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
     // Strip userinfo — everything through the *last* `@`.
     //
     // Without this, `http://127.0.0.1:8332@evil.example/hook` reads as host
@@ -745,6 +754,48 @@ categories = ["chain"]
         // A genuine loopback target with userinfo is still local.
         let text = MINIMAL.replace("https://alerts.example/satd", "http://user:pw@127.0.0.1:9000/h");
         assert!(parse(&text).is_ok(), "userinfo on a real loopback host is fine");
+    }
+
+    #[test]
+    fn a_backslash_cannot_smuggle_a_public_host_past_the_local_check() {
+        // The WHATWG URL parser (what `reqwest` resolves these with) treats `\`
+        // as a path separator for special schemes, so the host here is
+        // `evil.example` — but splitting the authority on `/` alone leaves
+        // `evil.example\@127.0.0.1`, whose last `@` yields a loopback address.
+        // Same bypass as the userinfo case, through a different separator.
+        // Written as TOML *literal* strings (single-quoted). A backslash in a
+        // basic string is an escape, so `"...\@..."` fails at the TOML layer
+        // and would make this test pass without ever reaching the URL check.
+        for sneaky in [
+            r"http://evil.example\@127.0.0.1/hook",
+            r"http://evil.example\@10.0.0.1/hook",
+            r"http://evil.example\@localhost:8080/hook",
+        ] {
+            let text = format!(
+                "version = 1\n\
+                 [[webhook]]\n\
+                 id = \"ops\"\n\
+                 url = '{sneaky}'\n\
+                 secret = \"s3cret\"\n\
+                 categories = [\"status\"]\n"
+            );
+            assert!(
+                parse(&text).is_err(),
+                "{sneaky} resolves to a public host and must need the opt-in"
+            );
+        }
+
+        // A backslash in the *path* of a genuinely local target is unaffected.
+        let text = format!(
+            "version = 1\n\
+             [[webhook]]\n\
+             id = \"ops\"\n\
+             url = '{}'\n\
+             secret = \"s3cret\"\n\
+             categories = [\"status\"]\n",
+            r"http://127.0.0.1:9000/a\b"
+        );
+        assert!(parse(&text).is_ok());
     }
 
     #[test]

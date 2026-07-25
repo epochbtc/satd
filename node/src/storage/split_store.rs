@@ -100,6 +100,10 @@ impl Store for SplitStore {
         self.block_store.write_alert_cursor(key, value)
     }
 
+    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+        self.block_store.list_alert_cursor_keys()
+    }
+
     fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
         self.block_store.delete_alert_cursor(key)
     }
