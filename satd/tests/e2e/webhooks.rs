@@ -618,14 +618,33 @@ async fn webhook_permanent_rejection_advances_the_cursor() {
     // It matters here more than on any other drop path: the cursor advances
     // past a permanently-rejected event, so unlike a queue overflow the
     // receiver cannot go back for it. Being told is all it gets.
-    let lagged = receiver
-        .wait_for(30, |r| r.json()["body"]["category"] == "lagged")
-        .await;
-    assert!(
-        lagged.json()["body"]["dropped_count"].as_u64().unwrap_or(0) >= 2,
-        "both refused blocks should be counted; got {}",
-        lagged.body,
-    );
+    // Summed across notices rather than read off the first one. The gap
+    // accounting also flushes on a timer, so whether the two refusals coalesce
+    // into a single notice of 2 or arrive as two notices of 1 depends only on
+    // which side of a tick they land on — a race this test has no reason to
+    // pin down. Only the total is meaningful.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let attempts = receiver.all_attempts().await;
+        let lagged: Vec<_> = attempts
+            .iter()
+            .filter(|r| r.json()["body"]["category"] == "lagged")
+            .collect();
+        let total: u64 = lagged
+            .iter()
+            .filter_map(|r| r.json()["body"]["dropped_count"].as_u64())
+            .sum();
+        if total >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both refused blocks should be counted; got {total} across {} notice(s): {:?}",
+            lagged.len(),
+            lagged.iter().map(|r| r.body.clone()).collect::<Vec<_>>(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A redirect is never followed: the signed body does not go to a host the
