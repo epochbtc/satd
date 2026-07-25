@@ -1276,6 +1276,30 @@ impl Store for RocksDbStore {
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+        const PREFIX: &[u8] = b"alertwebhook.cursor.";
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        let mut keys = Vec::new();
+        // The metadata CF is shared with index markers, so the iteration is
+        // prefix-bounded and stops at the first key outside the namespace
+        // rather than walking the whole CF.
+        let iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(PREFIX, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            if !key.starts_with(PREFIX) {
+                break;
+            }
+            keys.push(key.to_vec());
+        }
+        Ok(keys)
+    }
+
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;

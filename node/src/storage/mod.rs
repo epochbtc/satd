@@ -878,4 +878,17 @@ pub trait Store: Send + Sync {
             "delete_alert_cursor not supported on this backend".into(),
         ))
     }
+
+    /// Every persisted alert-cursor key, for reconciling against the configured
+    /// hooks.
+    ///
+    /// Removing a hook from the alertfile and restarting is the ordinary way
+    /// operators change this configuration, and a reload-time diff cannot see
+    /// it: at startup there is no previous generation to compare against. So
+    /// the dispatcher enumerates what is actually stored and drops whatever no
+    /// longer has a hook, which also cleans up cursors left behind by earlier
+    /// versions that had no GC at all.
+    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+        Ok(Vec::new())
+    }
 }
