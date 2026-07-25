@@ -181,6 +181,9 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         num_threads: 1,
         precomputed_txids: None,
         address_index: &Default::default(),
+        // Both indexes default to disabled: this target fuzzes consensus
+        // accept/reject, and index emission is not part of that verdict.
+        sp_index: &Default::default(),
         phase_tracker: None,
     })
     .is_ok()

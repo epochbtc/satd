@@ -5332,6 +5332,8 @@ impl PeerManager {
     }
 
     fn build_version_message(&self, receiver: SocketAddr) -> VersionMessage {
+        // Only the cfg-gated COMPACT_FILTERS bit below mutates this.
+        #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         // BIP 157 NODE_COMPACT_FILTERS (bit 6) — advertised at version
         // time when the runtime predicate is true. Re-evaluated per

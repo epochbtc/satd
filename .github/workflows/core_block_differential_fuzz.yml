@@ -34,6 +34,16 @@ concurrency:
   group: core-block-differential-fuzz-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # cargo-fuzz needs a nightly toolchain, but this job is here to find
+  # consensus divergence, not to track rustc. A floating `nightly` makes any
+  # upstream regression red the job: nightly-2026-07-24 (rustc 89c61a754) ICEs
+  # in rustc_codegen_ssa building `tokio` in release mode, which broke every
+  # run until this pin. Bump deliberately after checking the new toolchain
+  # builds `scripts/fuzz/run-block-differential.sh` locally; keep in sync with
+  # the default in that script.
+  FUZZ_NIGHTLY: nightly-2026-07-22
+
 jobs:
   block-differential:
     name: block-differential fuzz
@@ -59,7 +69,9 @@ jobs:
             clang cmake libclang-dev libssl-dev pkg-config
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY }}
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -72,6 +84,7 @@ jobs:
       - name: Run block-differential fuzz
         env:
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1800' }}
+          FUZZ_NIGHTLY: ${{ env.FUZZ_NIGHTLY }}
         run: bash scripts/fuzz/run-block-differential.sh
 
       - name: Upload divergence artifacts

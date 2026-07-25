@@ -206,6 +206,16 @@ jobs:
       - name: Run clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `--all-features` above never compiles the consensus-only build, so a
+      # cfg-gated item referenced from ungated code compiles fine here and
+      # breaks only for `node`'s `default-features = false` consumers — the
+      # block-differential fuzz target being the one in-tree case. That is
+      # exactly how `ALL_CFS` referencing the cfg-gated filter CFs went
+      # unnoticed for weeks: the nightly fuzz job is the only consumer and it
+      # is not a PR gate. Cheap to keep honest here.
+      - name: Run clippy (node, consensus-only build)
+        run: cargo clippy -p node --no-default-features --all-targets -- -D warnings
+
   # Seed the dependency cache from master so a fresh branch's FIRST CI run is
   # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
   # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a
