@@ -94,11 +94,18 @@ threshold moves such that it would no longer raise. Without this,
 at 100 and the clear line is 75 % of the raise line, so past 75 % occupancy no
 setting could clear it.
 
-`alertpeerfloor` defaults to `3` on mainnet and testnet4, and to `0`
-(disabled) on regtest and signet, where running with no peers at all is normal
-rather than a fault. On the networks where it is active it does not raise until
-90 s after startup or the node's first peer, whichever comes first, so a node
-that is still dialing out does not page anyone on the way up.
+`alertpeerfloor` defaults to `3` everywhere except regtest, where it is `0`
+(disabled) because running with no peers at all is a regtest node's normal
+operating state rather than a fault. Signet keeps the floor: it is a public
+network with real peers, and a detector defaulted off is indistinguishable from
+a healthy one — `satd_alert_active{kind="peer_floor"}` reads `0` either way. Set
+`alertpeerfloor=0` explicitly on a deliberately isolated signet node.
+
+Where the floor is active, a node that has never seen a peer gets a 90 s startup
+grace, and the ordinary hold begins when that grace expires or when the first
+peer arrives, whichever comes first. The grace defers the start of the hold
+rather than shortening it, so a node still dialing out does not page anyone on
+the way up.
 
 **Durability.** Health events are not replayable: they carry no resume cursor,
 and a `from_cursor` reconnect never yields one. Instead the detectors

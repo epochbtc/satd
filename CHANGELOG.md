@@ -138,10 +138,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   conditions raise once and clear once, with hysteresis so a value sitting on
   the threshold does not flap. Five new hot-reloadable thresholds
   (`alerttipstallseconds=3600`, `alertdiskfreemb=10240`,
-  `alertmempoolfullpct=90`, `alertpeerfloor=3`, `alertreorgdepth=3`); `0`
-  disables a detector. Two new gauges close longstanding observability gaps
+  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest —
+  `alertreorgdepth=3`); `0` disables a detector. `deep_reorg` carries
+  `depth_exact`, false when lag truncated the count and the reorg log held no
+  matching record. Two new gauges close longstanding observability gaps
   independently of alerting: `satd_tip_last_connect_age_seconds` and
-  `satd_disk_free_bytes`.
+  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`.
 
 ## Releases
 
