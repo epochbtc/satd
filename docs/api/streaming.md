@@ -968,11 +968,24 @@ not all — parse per key rather than assuming the whole map is numeric.
 | `disk_low` | `free_bytes`, `threshold_bytes`; `clear_threshold_bytes` when cleared by recovered space |
 | `mempool_congested` | `bytes_used`, `bytes_cap`, `threshold_pct`, `mempoolminfee_sat_per_kvb` (raise only) |
 | `peer_floor` | `peers`, `peers_outbound`, `peers_inbound`, `threshold` (raise only) |
-| `deep_reorg` | `depth`, `from_height`, `to_height`, `fork_height` |
+| `deep_reorg` | `depth`, `depth_exact`, `from_height`, `to_height`, `fork_height` |
 
-Any kind may additionally carry `reason` — a non-numeric token, currently only
-`detector_disabled`, on a `cleared` event emitted because the operator turned
-the detector off rather than because the condition recovered.
+`deep_reorg` carries `depth_exact`. It is `true` for a depth counted directly
+from the disconnect run or confirmed against the reorg log. It is `false` when
+chain-event lag truncated the count and no matching log record was found, in
+which case `depth` is a **lower bound** — the reorg was at least that deep. The
+event still fires, because a deep reorg reported shallow is something an
+operator can act on and silence is not, but `6` and `at least 6` warrant
+different responses.
+
+Any kind may additionally carry `reason` — a non-numeric token on a `cleared`
+event emitted because the detector can no longer evaluate the condition, rather
+than because the condition recovered:
+
+| Token | Meaning |
+|---|---|
+| `detector_disabled` | The operator set this detector's threshold to `0`. |
+| `mempool_cap_zero` | `maxmempool` is `0`, so there is no occupancy ratio to evaluate. `alertmempoolfullpct` is still armed — this is not the operator turning the detector off, and a consumer that suppresses `detector_disabled` should not suppress this. |
 
 **Additive by construction.** `details` is a string map and `StatusKind` is an
 open enum: new kinds and new detail keys ship without a schema bump (§4). A

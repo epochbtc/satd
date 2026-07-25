@@ -56,6 +56,11 @@ use crate::warnings::{NodeWarnings, Severity};
 /// `peer_floor`, and the tip-stall timer) re-evaluate.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How far back to search the reorg log when recovering a lag-interrupted depth
+/// count. Generous because the match is exact (on the abandoned tip height), so
+/// a wide window costs nothing in precision — only a longer `Vec` to scan.
+const REORG_LOG_LOOKBACK_SECS: u64 = 300;
+
 /// Fixed hysteresis constants. Deliberately not configurable: six raise
 /// thresholds is already a lot of operator surface, and these ratios only need
 /// to be "enough of a gap that a metric sitting on the line does not flap".
@@ -122,18 +127,21 @@ pub mod defaults {
 
     /// The `peer_floor` default for `network`.
     ///
-    /// Disabled on regtest and signet. A regtest node is routinely run entirely
-    /// alone, and a signet node is often a single private instance — on both,
-    /// "fewer than 3 peers" is the normal operating state, not a fault, so the
-    /// default would raise a critical warning that can never clear. That
-    /// warning drives `getwarnings`, `-alertnotify`, and the TUI's blocking
-    /// modal, which is a poor greeting for every developer's first run.
+    /// Disabled on regtest only. A regtest node is routinely run entirely
+    /// alone, so "fewer than 3 peers" is its normal operating state rather than
+    /// a fault, and the default would raise a critical warning that can never
+    /// clear — one that drives `getwarnings`, `-alertnotify`, and the TUI's
+    /// blocking modal, which is a poor greeting for every developer's first run.
     ///
-    /// Mainnet and testnet4 keep the real floor: there, a peer-starved node
-    /// genuinely is broken.
+    /// Every other network keeps the real floor, signet included. Signet is a
+    /// public network with real peers; a peer-starved signet node is broken in
+    /// exactly the way this alert exists to report, and defaulting it off would
+    /// make the detector's silence indistinguishable from health —
+    /// `satd_alert_active{kind="peer_floor"}` reads 0 either way. An operator
+    /// running a deliberately isolated signet can set `alertpeerfloor=0`.
     pub fn peer_floor_for(network: bitcoin::Network) -> u64 {
         match network {
-            bitcoin::Network::Regtest | bitcoin::Network::Signet => 0,
+            bitcoin::Network::Regtest => 0,
             _ => PEER_FLOOR,
         }
     }
@@ -366,6 +374,26 @@ enum ReorgTracking {
         /// until the next block arrived — which could be never.
         started: Instant,
     },
+    /// The disconnect run was interrupted by broadcast lag, so the count we
+    /// have is an undercount. The true depth is in the reorg log — but not yet.
+    ///
+    /// `perform_reorg` emits `ChainEvent::Reorg` and every disconnect and
+    /// reconnect *first*, and only then calls `ReorgLog::record`, which fsyncs
+    /// the JSONL append before pushing to the in-memory ring that `history()`
+    /// reads. So at the instant lag is observed the record is typically absent,
+    /// and the newest record present belongs to some *earlier* reorg. Reading
+    /// it there either drops the report silently or attributes another reorg's
+    /// depth and fork point to this one.
+    ///
+    /// Instead: hold the marker's abandoned-tip height, wait a poll, and match
+    /// the record by that height.
+    LagRecovery {
+        /// Abandoned tip from the `Reorg` marker: `fork_height + depth`.
+        from_height: u32,
+        /// What we counted before lag hit. A lower bound on the true depth.
+        counted: u32,
+        started: Instant,
+    },
 }
 
 async fn run_detectors(
@@ -479,25 +507,17 @@ async fn run_detectors(
                             "chain-event lag during reorg depth count; \
                              falling back to the reorg log",
                         );
-                        if let ReorgTracking::Counting { .. } = reorg
-                            && let Some(log) = chain_state.reorg_log()
-                            // Newest last. A window rather than "the latest
-                            // record" so a stale entry from an earlier reorg
-                            // cannot be misreported as this one; the reorg we
-                            // were counting is seconds old, and the log is
-                            // written inside `perform_reorg` before any chain
-                            // event is emitted, so it is already there.
-                            && let Some(rec) = log.history(300).into_iter().next_back()
-                        {
-                            // `from_height` is the abandoned tip: fork + depth.
-                            finish_reorg(
-                                &warnings, &publisher, &thresholds,
-                                rec.fork_height.saturating_add(rec.depth),
-                                rec.depth,
-                                chain_state.tip_height(),
-                            );
-                        }
-                        reorg = ReorgTracking::Idle;
+                        reorg = match reorg {
+                            ReorgTracking::Counting { from_height, disconnected, .. } => {
+                                ReorgTracking::LagRecovery {
+                                    from_height,
+                                    counted: disconnected,
+                                    started: Instant::now(),
+                                }
+                            }
+                            // Lag outside a reorg tells us nothing about depth.
+                            other => other,
+                        };
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -512,6 +532,47 @@ async fn run_detectors(
                         &warnings, &publisher, &thresholds,
                         from_height, disconnected, chain_state.tip_height(),
                     );
+                    reorg = ReorgTracking::Idle;
+                }
+                // Resolve a lag-interrupted count against the reorg log, now
+                // that the record has had a poll interval to be written and
+                // pushed to the ring. Match on the abandoned tip height from
+                // the marker rather than taking the newest record, so a reorg
+                // that happened earlier in the window cannot be reported as
+                // this one.
+                if let ReorgTracking::LagRecovery { from_height, counted, started } = reorg
+                    && started.elapsed() >= POLL_INTERVAL
+                {
+                    let exact = chain_state.reorg_log().and_then(|log| {
+                        log.history(REORG_LOG_LOOKBACK_SECS)
+                            .into_iter()
+                            .find(|r| r.fork_height.saturating_add(r.depth) == from_height)
+                    });
+                    match exact {
+                        Some(rec) => finish_reorg(
+                            &warnings, &publisher, &thresholds,
+                            from_height, rec.depth, chain_state.tip_height(),
+                        ),
+                        None => {
+                            // No matching record: the log is disabled, pruned,
+                            // or the write failed. Report the undercount rather
+                            // than nothing — a deep reorg that reads shallow is
+                            // recoverable by an operator, silence is not — and
+                            // mark the depth as a floor so a consumer does not
+                            // treat it as exact.
+                            tracing::warn!(
+                                target: "health",
+                                from_height,
+                                counted,
+                                "no reorg-log record matched a lag-interrupted \
+                                 depth count; reporting a lower bound",
+                            );
+                            finish_reorg_bounded(
+                                &warnings, &publisher, &thresholds,
+                                from_height, counted, chain_state.tip_height(), false,
+                            );
+                        }
+                    }
                     reorg = ReorgTracking::Idle;
                 }
                 let age = last_connect.elapsed().as_secs();
@@ -580,14 +641,23 @@ fn raise_if_new(
     message: String,
     details: impl FnOnce(StatusEvent) -> StatusEvent,
 ) {
+    // Remember the line this is being raised against, so a later poll can tell
+    // a recovered reading from a retuned threshold. See
+    // `clear_if_threshold_relaxed`.
+    //
+    // Refreshed on every evaluation where the raise predicate holds, not only
+    // on the raise edge. Storing it only on the edge leaves the slot stale
+    // across a retune that keeps the condition raised, and the next recovery
+    // into the hysteresis band then reads as "the operator moved the line":
+    // raise at 93% against a 90% threshold, retune *down* to 80% (still
+    // raised, so an edge-only store keeps 90), ease to 78% — below the new
+    // raise line, above the new clear line — and the stale 90 ≠ 80 clears an
+    // alert that both the old and new hysteresis lines say to hold.
+    state.threshold_slot(kind).store(threshold, Ordering::Relaxed);
     if state.is_active(kind) {
         return;
     }
     state.set_active(kind, true);
-    // Remember the line this was raised against, so a later poll can tell a
-    // recovered reading from a retuned threshold. See
-    // `clear_if_threshold_relaxed`.
-    state.threshold_slot(kind).store(threshold, Ordering::Relaxed);
     emit(warnings, publisher, details(StatusEvent::raised(kind, message)));
 }
 
@@ -656,13 +726,37 @@ fn clear_because_disabled(
     publisher: &EventPublisher,
     kind: StatusKind,
 ) {
-    clear_if_active(
+    clear_with_reason(
         state,
         warnings,
         publisher,
         kind,
         format!("{} detector disabled by configuration", kind.as_str()),
-        |e| e.with_detail("reason", "detector_disabled"),
+        "detector_disabled",
+    );
+}
+
+/// Clear a standing condition because the detector can no longer evaluate it,
+/// tagging the wire event with *why*.
+///
+/// `reason` is a stable token a receiver may route on, so it has to distinguish
+/// causes an operator would act on differently: "you turned this off" and "the
+/// input this detector divides by went to zero" are not the same message.
+fn clear_with_reason(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    kind: StatusKind,
+    message: String,
+    reason: &'static str,
+) {
+    clear_if_active(
+        state,
+        warnings,
+        publisher,
+        kind,
+        message,
+        |e| e.with_detail("reason", reason),
     );
 }
 
@@ -674,6 +768,41 @@ fn check_tip_stall(
     chain_state: &ChainState,
     age_secs: u64,
 ) {
+    check_tip_stall_values(
+        state,
+        warnings,
+        publisher,
+        thresholds,
+        chain_state.is_initial_block_download(),
+        chain_state.tip_height(),
+        age_secs,
+    );
+}
+
+/// The tip-stall detector's decision logic, over plain readings.
+///
+/// Split from [`check_tip_stall`] so the IBD latch is testable without a live
+/// `ChainState` — the tests exercise this exact code rather than a
+/// reimplementation of it.
+fn check_tip_stall_values(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    thresholds: &AlertThresholds,
+    in_ibd: bool,
+    tip_height: u32,
+    age_secs: u64,
+) {
+    // The latch is evaluated before the disabled check, because it is a
+    // property of the node rather than of this detector's configuration.
+    // Behind the `threshold == 0` return it would never be set on a node
+    // running with the detector off — so enabling `alerttipstallseconds` on an
+    // already-wedged node (tip >24h stale, hence "in IBD" again by the
+    // predicate below) would wedge the detector permanently, which is the exact
+    // failure the latch exists to prevent.
+    if !state.left_ibd.load(Ordering::Relaxed) && !in_ibd {
+        state.left_ibd.store(true, Ordering::Relaxed);
+    }
     let threshold = thresholds.tip_stall_secs();
     if threshold == 0 {
         clear_because_disabled(state, warnings, publisher, StatusKind::TipStall);
@@ -694,12 +823,8 @@ fn check_tip_stall(
     // `alerttipstallseconds` would apply to the atomic and do nothing visible.
     // Once a node has been caught up, it is never "in IBD" again for this
     // detector's purposes.
-    if state.left_ibd.load(Ordering::Relaxed) {
-        // Already caught up once; the guard no longer applies.
-    } else if chain_state.is_initial_block_download() {
+    if !state.left_ibd.load(Ordering::Relaxed) {
         return;
-    } else {
-        state.left_ibd.store(true, Ordering::Relaxed);
     }
     if age_secs >= threshold {
         raise_if_new(
@@ -712,7 +837,7 @@ fn check_tip_stall(
             |e| {
                 e.with_detail("seconds_since_block", age_secs)
                     .with_detail("threshold_seconds", threshold)
-                    .with_detail("tip_height", chain_state.tip_height())
+                    .with_detail("tip_height", tip_height)
             },
         );
     } else {
@@ -744,28 +869,20 @@ fn check_disk(
     thresholds: &AlertThresholds,
     path: &std::path::Path,
 ) {
-    let floor = thresholds.disk_free_bytes();
-    // The disabled-clear is checked before the filesystem read, not after. If
-    // the watched volume becomes uninterrogable while `disk_low` is raised (the
-    // blocks volume is unmounted, `-blocksdir` points somewhere that
-    // disappeared), an early return below would leave the alert raised with no
-    // way to clear it — not even by setting `alertdiskfreemb=0`, which is the
-    // documented escape hatch for every other detector.
-    if floor == 0 {
-        clear_because_disabled(state, warnings, publisher, StatusKind::DiskLow);
-        return;
-    }
-    let Some(free) = crate::diskspace::free_disk_bytes(path) else {
-        // Unreadable filesystem: report "unknown" rather than a zero that would
-        // read as "completely full".
-        state.disk_free_bytes.store(DISK_UNKNOWN, Ordering::Relaxed);
-        return;
-    };
-    state.disk_free_bytes.store(free, Ordering::Relaxed);
-    let clear_at = floor
-        .saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM)
-        / hysteresis::DISK_CLEAR_RATIO_DEN;
-    if free < floor {
+    // Sample before any early return, so `satd_disk_free_bytes` is populated
+    // whatever the detector's configuration. An operator who sets
+    // `alertdiskfreemb=0` has usually done so *because* they alert on the gauge
+    // in Prometheus instead of via satd; returning before the filesystem read
+    // would delete the series out from under their own rule, silently. An
+    // unreadable filesystem reports "unknown" rather than a zero that would
+    // read as "completely full".
+    let sample = crate::diskspace::free_disk_bytes(path);
+    state
+        .disk_free_bytes
+        .store(sample.unwrap_or(DISK_UNKNOWN), Ordering::Relaxed);
+    if let Some(free) = sample
+        && free < thresholds.disk_free_bytes()
+    {
         // The path is deliberately NOT a wire detail. It goes to every `status`
         // subscriber, every webhook receiver, and onward into APNs/FCM push
         // bodies — an absolute datadir path typically containing the operator's
@@ -774,9 +891,44 @@ fn check_disk(
             target: "health",
             path = %path.display(),
             free_bytes = free,
-            threshold_bytes = floor,
+            threshold_bytes = thresholds.disk_free_bytes(),
             "free space below the configured floor"
         );
+    }
+    check_disk_values(state, warnings, publisher, thresholds, sample);
+}
+
+/// The disk detector's decision logic, over a plain reading.
+///
+/// Split from [`check_disk`] so the threshold and hysteresis behavior is
+/// testable without driving a real filesystem to a target free-space level —
+/// the tests exercise this exact code rather than a reimplementation of it.
+/// `free` is `None` when the volume could not be interrogated.
+fn check_disk_values(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    thresholds: &AlertThresholds,
+    free: Option<u64>,
+) {
+    let floor = thresholds.disk_free_bytes();
+    // The disabled-clear is checked before the unreadable-filesystem return,
+    // not after. If the watched volume becomes uninterrogable while `disk_low`
+    // is raised (the blocks volume is unmounted, `-blocksdir` points somewhere
+    // that disappeared), an early return below would leave the alert raised
+    // with no way to clear it — not even by setting `alertdiskfreemb=0`, which
+    // is the documented escape hatch for every other detector.
+    if floor == 0 {
+        clear_because_disabled(state, warnings, publisher, StatusKind::DiskLow);
+        return;
+    }
+    let Some(free) = free else {
+        return;
+    };
+    let clear_at = floor
+        .saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM)
+        / hysteresis::DISK_CLEAR_RATIO_DEN;
+    if free < floor {
         raise_if_new(
             state,
             warnings,
@@ -867,7 +1019,20 @@ fn check_mempool_values(
         // strand a raised alert with no path back: there is no occupancy ratio
         // against a zero cap, so neither the raise nor the clear branch can
         // ever run again.
-        clear_because_disabled(state, warnings, publisher, StatusKind::MempoolCongested);
+        //
+        // This is *not* `detector_disabled`: `alertmempoolfullpct` is still
+        // armed and the operator did not turn anything off — their mempool cap
+        // went to zero, which is itself worth surfacing. A receiver that
+        // suppresses `detector_disabled` (reasonably, since it means "you asked
+        // for this") would otherwise swallow it.
+        clear_with_reason(
+            state,
+            warnings,
+            publisher,
+            StatusKind::MempoolCongested,
+            "mempool cap is zero; congestion cannot be evaluated".to_string(),
+            "mempool_cap_zero",
+        );
         return;
     }
     let raise_at = cap.saturating_mul(pct) / 100;
@@ -934,6 +1099,39 @@ fn check_peers(
     ok_since: &mut Option<Instant>,
     started: &Instant,
 ) {
+    check_peers_values(
+        state,
+        warnings,
+        publisher,
+        thresholds,
+        peer_manager.connection_count() as u64,
+        peer_manager.outbound_count() as u64,
+        below_since,
+        ok_since,
+        started,
+        Instant::now(),
+    );
+}
+
+/// The peer detector's decision logic, over plain readings and an injected
+/// clock.
+///
+/// Split from [`check_peers`] so the startup grace and hold behavior are
+/// testable without a live `PeerManager` or real elapsed time — the tests
+/// exercise this exact code rather than a reimplementation of it.
+#[allow(clippy::too_many_arguments)]
+fn check_peers_values(
+    state: &HealthState,
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    thresholds: &AlertThresholds,
+    total: u64,
+    outbound: u64,
+    below_since: &mut Option<Instant>,
+    ok_since: &mut Option<Instant>,
+    started: &Instant,
+    now: Instant,
+) {
     let floor = thresholds.peer_floor();
     if floor == 0 {
         *below_since = None;
@@ -941,13 +1139,15 @@ fn check_peers(
         clear_because_disabled(state, warnings, publisher, StatusKind::PeerFloor);
         return;
     }
-    let total = peer_manager.connection_count() as u64;
-    let outbound = peer_manager.outbound_count() as u64;
     let inbound = total.saturating_sub(outbound);
-    let now = Instant::now();
 
-    if total > 0 {
-        state.saw_first_peer.store(true, Ordering::Relaxed);
+    if total > 0 && !state.saw_first_peer.swap(true, Ordering::Relaxed) {
+        // First peer of this process. Normal operation starts here, so the hold
+        // clock starts here too — otherwise a node whose first peer arrives
+        // late in the startup grace ends the grace and finds a hold that has
+        // already elapsed, firing the alert in that very poll while it is still
+        // filling its remaining outbound slots.
+        *below_since = Some(now);
     }
 
     if total < floor {
@@ -956,12 +1156,19 @@ fn check_peers(
         // Startup grace. `tokio::time::interval` fires its first tick
         // immediately, so without this the hold clock starts at t≈0 and a node
         // that simply has not finished dialing out yet alerts at t≈PEER_HOLD.
-        // The grace runs from detector start until the node's first peer, after
-        // which the ordinary hold is the only gate — a node that loses its peers
-        // later is not in a startup transient and should alert promptly.
-        let in_startup_grace = !state.saw_first_peer.load(Ordering::Relaxed)
-            && now.duration_since(*started) < hysteresis::PEER_STARTUP_GRACE;
-        if !in_startup_grace && now.duration_since(since) >= hysteresis::PEER_HOLD {
+        //
+        // The grace defers the *start* of the hold rather than shortening it: a
+        // grace that merely suppressed the raise until t=GRACE would fire the
+        // instant it expired, since the hold would have run out alongside it.
+        // Once the node has seen a peer the grace is over for good — a node
+        // that loses its peers later is not in a startup transient and should
+        // alert after an ordinary hold.
+        let hold_from = if state.saw_first_peer.load(Ordering::Relaxed) {
+            since
+        } else {
+            since.max(*started + hysteresis::PEER_STARTUP_GRACE)
+        };
+        if now.duration_since(hold_from) >= hysteresis::PEER_HOLD {
             raise_if_new(
                 state,
                 warnings,
@@ -1005,21 +1212,50 @@ fn finish_reorg(
     disconnected: u32,
     to_height: u32,
 ) {
+    finish_reorg_bounded(
+        warnings,
+        publisher,
+        thresholds,
+        from_height,
+        disconnected,
+        to_height,
+        true,
+    );
+}
+
+/// As [`finish_reorg`], but able to report a depth that is only a lower bound.
+///
+/// `depth_exact = false` marks a count that broadcast lag truncated and the
+/// reorg log could not confirm. The event still fires — a deep reorg reported
+/// shallow is something an operator can act on, silence is not — but the wire
+/// says so, because "6 blocks" and "at least 6 blocks" warrant different
+/// responses.
+fn finish_reorg_bounded(
+    warnings: &NodeWarnings,
+    publisher: &EventPublisher,
+    thresholds: &AlertThresholds,
+    from_height: u32,
+    disconnected: u32,
+    to_height: u32,
+    depth_exact: bool,
+) {
     let threshold = thresholds.reorg_depth();
     if threshold == 0 || u64::from(disconnected) < threshold {
         return;
     }
+    let qualifier = if depth_exact { "" } else { "at least " };
     emit(
         warnings,
         publisher,
         StatusEvent::edge(
             StatusKind::DeepReorg,
             format!(
-                "reorg rolled back {disconnected} blocks (from height {from_height} \
-                 to {to_height}; threshold {threshold})"
+                "reorg rolled back {qualifier}{disconnected} blocks (from height \
+                 {from_height} to {to_height}; threshold {threshold})"
             ),
         )
         .with_detail("depth", disconnected)
+        .with_detail("depth_exact", depth_exact)
         .with_detail("from_height", from_height)
         .with_detail("to_height", to_height)
         .with_detail("fork_height", from_height.saturating_sub(disconnected))
@@ -1075,14 +1311,17 @@ mod tests {
     }
 
     #[test]
-    fn peer_floor_default_is_disabled_on_the_solo_networks() {
+    fn peer_floor_default_is_disabled_only_on_regtest() {
         use bitcoin::Network;
-        // A regtest node normally has no peers at all, and a signet node is
-        // often a single private instance. Defaulting the floor to 3 there
-        // raises a critical warning 90s into every run that can never clear.
+        // A regtest node normally has no peers at all, so defaulting the floor
+        // to 3 raises a critical warning 90s into every run that can never
+        // clear.
         assert_eq!(defaults::peer_floor_for(Network::Regtest), 0);
-        assert_eq!(defaults::peer_floor_for(Network::Signet), 0);
-        // Where a peer-starved node really is broken, the floor stands.
+        // Signet is a public network with real peers. A peer-starved signet
+        // node is broken in exactly the way this alert reports, and defaulting
+        // it off would make the detector's silence indistinguishable from
+        // health.
+        assert_eq!(defaults::peer_floor_for(Network::Signet), defaults::PEER_FLOOR);
         assert_eq!(defaults::peer_floor_for(Network::Bitcoin), defaults::PEER_FLOOR);
         assert_eq!(defaults::peer_floor_for(Network::Testnet4), defaults::PEER_FLOOR);
     }
@@ -1288,8 +1527,12 @@ mod tests {
         assert_eq!(drained(&mut rx), vec![(StatusKind::DiskLow, StatusState::Cleared)]);
     }
 
-    /// Exercise `check_disk`'s raise/clear logic against a synthetic free-space
-    /// reading, bypassing the real `statvfs`.
+    /// Drive the real disk detector at a synthetic free-space reading.
+    ///
+    /// A thin adapter over [`check_disk_values`] — deliberately not a
+    /// reimplementation of its branch structure. An earlier version of these
+    /// tests mirrored the detector's if/else here, which meant deleting the
+    /// production `clear_if_threshold_relaxed` arm left every one of them green.
     fn sample_disk(
         state: &HealthState,
         warnings: &NodeWarnings,
@@ -1297,25 +1540,232 @@ mod tests {
         thresholds: &AlertThresholds,
         free: u64,
     ) {
-        let floor = thresholds.disk_free_bytes();
-        let clear_at =
-            floor.saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM) / hysteresis::DISK_CLEAR_RATIO_DEN;
-        if free < floor {
-            raise_if_new(state, warnings, publisher, StatusKind::DiskLow, floor, "low".into(), |e| {
-                e.with_detail("free_bytes", free)
-            });
-        } else if free >= clear_at {
-            clear_if_active(state, warnings, publisher, StatusKind::DiskLow, "ok".into(), |e| {
-                e.with_detail("free_bytes", free)
-            });
-        } else {
-            // Mirror the real detector: a reading inside the hysteresis band
-            // still clears if the operator moved the threshold.
-            clear_if_threshold_relaxed(
-                state, warnings, publisher, StatusKind::DiskLow, floor, "relaxed".into(),
-                |e| e.with_detail("free_bytes", free),
+        check_disk_values(state, warnings, publisher, thresholds, Some(free));
+    }
+
+    /// The retune-down case. `clear_if_threshold_relaxed` exists to release an
+    /// alert whose *threshold* moved, but it must not release one whose
+    /// threshold moved in the direction that keeps it firing. Storing the
+    /// remembered line only on the raise edge left it stale across exactly that
+    /// retune, so the next reading inside the hysteresis band read as "the
+    /// operator moved the line" and cleared an alert both the old and the new
+    /// hysteresis say to hold.
+    #[test]
+    fn lowering_the_mempool_threshold_while_raised_does_not_defeat_hysteresis() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let cap = 1_000_000u64;
+        let thresholds = AlertThresholds::new(0, 0, 90, 0, 0);
+
+        // 93% against a 90% line raises.
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 930_000, 1);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Raised)]
+        );
+
+        // Operator retunes *down* to 80%, wanting an earlier warning. Still
+        // over the line, so it stays raised and emits nothing.
+        thresholds.set_mempool_full_pct(80);
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 930_000, 1);
+        assert!(drained(&mut rx).is_empty(), "still above the new line");
+        assert!(state.is_active(StatusKind::MempoolCongested));
+
+        // Ease to 78%: below the new raise line (80%), above the new clear line
+        // (60%) — squarely in the hysteresis band. It must hold.
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 780_000, 1);
+        assert!(
+            drained(&mut rx).is_empty(),
+            "78% is inside the hysteresis band for an 80% threshold; clearing \
+             here is the stale-slot bug"
+        );
+        assert!(state.is_active(StatusKind::MempoolCongested));
+
+        // Below the clear line it does clear, on the ordinary path.
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 550_000, 1);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Cleared)]
+        );
+    }
+
+    /// The retune-*up* case still works — this is what the relaxed clear is for.
+    #[test]
+    fn raising_the_mempool_threshold_still_clears_from_inside_the_band() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let cap = 1_000_000u64;
+        let thresholds = AlertThresholds::new(0, 0, 90, 0, 0);
+
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 930_000, 1);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Raised)]
+        );
+        // 93% now sits below a 95% raise line but above the 71.25% clear line:
+        // the dead band. Only the relaxed clear can release it.
+        thresholds.set_mempool_full_pct(95);
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, cap, 930_000, 1);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Cleared)]
+        );
+    }
+
+    /// `maxmempool=0` is not the operator switching the detector off, and a
+    /// receiver routing on `reason` must be able to tell the two apart.
+    #[test]
+    fn a_zero_mempool_cap_is_not_reported_as_detector_disabled() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 90, 0, 0);
+
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, 1_000_000, 950_000, 1);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::MempoolCongested, StatusState::Raised)]
+        );
+
+        check_mempool_values(&state, &warnings, &pubr, &thresholds, 0, 0, 1);
+        let env = rx.try_recv().expect("a zero cap must clear the standing alert");
+        let NodeEventBody::Status(s) = env.body else {
+            panic!("expected a status event")
+        };
+        assert_eq!(s.state, StatusState::Cleared);
+        assert_eq!(
+            s.details.get("reason").map(String::as_str),
+            Some("mempool_cap_zero"),
+            "`detector_disabled` means the operator turned it off; a consumer \
+             suppressing that would swallow a zeroed mempool cap"
+        );
+    }
+
+    /// The latch has to be set even while the detector is switched off, or
+    /// enabling it on a node that is already wedged — tip >24h stale, hence
+    /// "in IBD" again by the predicate — wedges the detector permanently.
+    #[test]
+    fn enabling_tip_stall_on_a_wedged_node_is_not_blocked_by_the_ibd_latch() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+
+        // Detector off, node caught up: nothing is emitted, but the latch must
+        // still record that this node has been out of IBD.
+        let off = AlertThresholds::new(0, 0, 0, 0, 0);
+        check_tip_stall_values(&state, &warnings, &pubr, &off, false, 100, 10);
+        assert!(drained(&mut rx).is_empty());
+        assert!(
+            state.left_ibd.load(Ordering::Relaxed),
+            "the latch is a property of the node, not of this detector's config"
+        );
+
+        // Node wedges. 30h of no blocks puts it back "in IBD" by the tip-time
+        // predicate. Operator enables the detector to find out why nothing is
+        // moving — it must raise.
+        let on = AlertThresholds::new(3600, 0, 0, 0, 0);
+        check_tip_stall_values(&state, &warnings, &pubr, &on, true, 100, 108_000);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::TipStall, StatusState::Raised)],
+            "a node that has been caught up is never 'in IBD' again for this \
+             detector's purposes"
+        );
+    }
+
+    /// A node that has never seen a peer gets a grace period, and then a full
+    /// hold — not a hold that ran concurrently with the grace.
+    #[test]
+    fn peer_startup_grace_is_followed_by_a_full_hold() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 3, 0);
+        let started = Instant::now();
+        let (mut below, mut ok) = (None, None);
+
+        let at = |d: Duration| started + d;
+        let poll = |now: Instant, total: u64, below: &mut _, ok: &mut _| {
+            check_peers_values(
+                &state, &warnings, &pubr, &thresholds, total, total, below, ok, &started, now,
             );
-        }
+        };
+
+        // Inside the grace, no peers: silent.
+        poll(at(Duration::ZERO), 0, &mut below, &mut ok);
+        poll(at(hysteresis::PEER_STARTUP_GRACE / 2), 0, &mut below, &mut ok);
+        assert!(drained(&mut rx).is_empty(), "still dialing out");
+
+        // The instant the grace ends, the hold must start fresh — not already
+        // be satisfied by time spent inside the grace.
+        poll(at(hysteresis::PEER_STARTUP_GRACE + Duration::from_secs(1)), 0, &mut below, &mut ok);
+        assert!(
+            drained(&mut rx).is_empty(),
+            "the grace must not merely delay the raise to t=GRACE"
+        );
+
+        // A full hold after the grace, still starved: now it raises.
+        poll(
+            at(hysteresis::PEER_STARTUP_GRACE + hysteresis::PEER_HOLD + Duration::from_secs(2)),
+            0,
+            &mut below,
+            &mut ok,
+        );
+        assert_eq!(drained(&mut rx), vec![(StatusKind::PeerFloor, StatusState::Raised)]);
+    }
+
+    /// Latching "we have seen a peer" ends the grace, but must not fire the
+    /// alert in the very poll the first peer arrives while the node is still
+    /// filling its remaining outbound slots.
+    #[test]
+    fn the_first_peer_arriving_does_not_immediately_raise() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 3, 0);
+        let started = Instant::now();
+        let (mut below, mut ok) = (None, None);
+
+        check_peers_values(
+            &state, &warnings, &pubr, &thresholds, 0, 0, &mut below, &mut ok, &started,
+            started,
+        );
+        // First peer lands late in the grace: 1 < floor of 3, and the latch
+        // drops the grace — but the hold has to start here, not at t=0.
+        let t = started + hysteresis::PEER_STARTUP_GRACE - Duration::from_secs(1);
+        check_peers_values(
+            &state, &warnings, &pubr, &thresholds, 1, 1, &mut below, &mut ok, &started, t,
+        );
+        assert!(
+            drained(&mut rx).is_empty(),
+            "the node just got its first peer; it is still filling outbound slots"
+        );
+    }
+
+    /// An operator who sets `alertdiskfreemb=0` has usually done so because
+    /// they alert on the Prometheus gauge instead. Disabling the alert must not
+    /// delete the series out from under their own rule.
+    #[test]
+    fn the_disk_gauge_is_sampled_even_when_the_alert_is_disabled() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
+        assert_eq!(thresholds.disk_free_bytes(), 0, "detector off");
+
+        check_disk(&state, &warnings, &pubr, &thresholds, std::path::Path::new("."));
+        assert!(
+            state.disk_free_bytes().is_some(),
+            "the gauge must be populated whatever the alert's configuration"
+        );
     }
 
     #[test]
