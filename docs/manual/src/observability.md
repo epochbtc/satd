@@ -295,6 +295,26 @@ already holds signing secrets at mode 0600. The key is zeroized in memory and
 never rendered by any log line, reload summary, or error message. Silent-payment
 entries require `silentpaymentindex=1`.
 
+Two limits apply to scan keys, and both are **hard errors that refuse to start
+the node** rather than warnings — a silently-ignored alerting rule leaves you
+believing you are covered when you are not:
+
+*   **A scan key may appear in only one hook.** Every hook's targets are folded
+    into one matcher keyed by scan pubkey, so two hooks claiming the same key
+    would collapse to one entry: the loser silently stops receiving the labels
+    it asked for, and if the two declared different `spend_pubkey` values, one
+    hook's endpoint would receive payment details — txid, vout, amount, tweak —
+    for a wallet it does not own. If you genuinely want one wallet reported to
+    two endpoints, say so explicitly with two entries under a single hook, or
+    fan out downstream of the receiver.
+*   **At most 16 scan keys per hook, and 256 across the whole file.** Matching
+    has no inverted index: it is one ECDH per registered key per eligible
+    transaction, and the cost is shared across every hook. The per-file total is
+    what actually bounds the work — without it, the per-hook limit would be
+    bypassed by adding hooks until the matcher lagged the chain and began
+    dropping matches. Scripts, outpoints, and txids are index lookups and are
+    not capped this way.
+
 **Watch-sets are forward-only from the moment they are registered.** Adding an
 entry does not replay history for it: you are told about payments from now on,
 not about the ones you already reconciled. That is the intended semantic for an
@@ -306,6 +326,16 @@ Restarting the node is not a gap: the watch-set is re-registered before P2P
 starts, so blocks that arrive during catch-up are matched normally. Rebuilding
 with `-reindex` is not a gap either, in the other direction — the replay happens
 before the dispatcher exists, so reindexing does not re-fire years of alerts.
+A node still in initial block download does not fire watch alerts at all, for
+the same reason: syncing from genesis with a busy address registered would
+otherwise POST one delivery per historical payment to it. What was suppressed is
+counted and reported in the next `lagged` body.
+
+A `lagged` notice covering dropped watch matches is a weaker signal than one
+covering chain events. Its `resume_cursor` is a *chain* position, so replaying
+from it re-delivers blocks, not the lost matches — the matches are gone. If a
+`lagged` arrives on a hook with a watch-set, reconcile with `getaddresshistory`
+or a `RescanBlocks` over the range rather than assuming the cursor covers it.
 
 The one case that does lose a match is a crash in the window between a block
 connecting and the receiver acknowledging: the block's *chain* event comes back

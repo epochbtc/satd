@@ -268,6 +268,24 @@ fn start_hook(
     }
 }
 
+/// Whether a watch match describes something already in a block.
+///
+/// Only these can be historical, so only these are subject to the IBD gate.
+/// The mempool-only variants — a replacement, an eviction, a tx falling back
+/// out of a block — are live by construction.
+fn match_is_confirmed(m: &node::events::WatchMatch) -> bool {
+    use node::events::WatchMatch as W;
+    match m {
+        W::OutpointSpent { confirmed, .. }
+        | W::ScriptMatched { confirmed, .. }
+        | W::TxidMatched { confirmed, .. }
+        | W::SilentPaymentMatched { confirmed, .. } => *confirmed,
+        W::PrefixMatched(pm) => pm.confirmed,
+        W::TxidDepthReached { .. } | W::TxidFinalized { .. } => true,
+        W::TxidReplaced { .. } | W::TxidEvicted { .. } | W::TxidUnconfirmed { .. } => false,
+    }
+}
+
 /// Fan-in: one broadcast receiver, filtered and enqueued per hook.
 ///
 /// The bus receiver is created by the caller, not here. When it is created
@@ -315,6 +333,12 @@ async fn fan_in(
     let mut gap_flush = tokio::time::interval(GAP_FLUSH_INTERVAL);
     gap_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Disables the watch arm if its channel ever closes, without taking the rest
+    // of the dispatcher down with it. A closed `mpsc` is instantly ready
+    // forever, so the arm has to be guarded out of the `select!` rather than
+    // merely ignored, or the loop spins at 100% CPU.
+    let mut watch_arm_closed = false;
+
     loop {
         tokio::select! {
             _ = stop.wait() => break,
@@ -323,8 +347,39 @@ async fn fan_in(
                     flush_gap(hook, &publisher);
                 }
             }
-            m = watch_rx.recv() => match m {
+            m = watch_rx.recv(), if !watch_arm_closed => match m {
                 Some(m) => {
+                    // The same IBD suppression the bus arm applies, and for
+                    // the same reason: `run_watch_matcher` scans every
+                    // connected block, so a fresh node with a watched busy
+                    // address would POST one signed delivery per historical
+                    // matching transaction for the whole sync.
+                    //
+                    // Scoped to *confirmed* matches. An unconfirmed match comes
+                    // from the mempool, which is live by definition and can
+                    // never be historical — there is no firehose to prevent.
+                    // Suppressing those was actively harmful: a watch match has
+                    // no replay behind it, so a suppressed one is destroyed
+                    // outright rather than deferred, and the predicate here is
+                    // the tip's age, which reads "syncing" on any node whose
+                    // chain has stalled or which was restored from a backup.
+                    // That turned the anti-firehose gate into a silent
+                    // destroyer of live deposit alerts.
+                    if match_is_confirmed(&m) && !state.left_ibd.load(Ordering::Relaxed) {
+                        let in_ibd = block_source
+                            .as_deref()
+                            .is_some_and(|s| s.in_initial_block_download());
+                        if in_ibd {
+                            for hook in &hooks {
+                                if hook_watches_match(&hook.hook, &m) {
+                                    hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
+                                    hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            continue;
+                        }
+                        state.left_ibd.store(true, Ordering::Relaxed);
+                    }
                     let json = node::events::watch_match_json(&m, &[], false);
                     let Ok(bytes) = serde_json::to_vec(&json) else { continue };
                     let body = Arc::new(bytes);
@@ -363,15 +418,29 @@ async fn fan_in(
                     }
                 }
                 None => {
-                    // Break, matching the bus arm. A closed mpsc returns `None`
-                    // immediately and forever, so falling through would spin
-                    // this loop at 100% CPU with a warn per iteration.
+                    // A closed mpsc returns `None` immediately and forever, so
+                    // falling through would spin this loop at 100% CPU with a
+                    // warn per iteration. But `break`ing exits `fan_in`
+                    // entirely, taking the bus arm with it: status events,
+                    // chain events, and the heartbeat would all stop on the
+                    // strength of the *watch* channel closing, with one warn
+                    // line and no metric moving to say so. Losing watch matches
+                    // is bad; losing the pager silently is worse.
+                    //
+                    // So: disable this arm and keep serving the rest.
                     // Unreachable today — `watch_handle` is held for the whole
-                    // loop and is the only thing that drops the sender — but
-                    // the asymmetry with the bus arm is a trap for whoever adds
-                    // registry-side subscriber pruning later.
-                    tracing::warn!(target: "alert", "watch match channel closed");
-                    break;
+                    // loop and is the only thing that drops the sender — but it
+                    // becomes reachable the moment registry-side subscriber
+                    // pruning lands, which is exactly when a silent total
+                    // alerting outage would be hardest to attribute.
+                    if !watch_arm_closed {
+                        watch_arm_closed = true;
+                        tracing::error!(
+                            target: "alert",
+                            "watch match channel closed; watch-set deliveries have \
+                             stopped, other categories continue",
+                        );
+                    }
                 }
             },
             recv = rx.recv() => match recv {

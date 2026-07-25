@@ -25,7 +25,7 @@
 //! hard error. An accepted-but-ignored alerting rule is worse than a refused
 //! one — the operator believes they are covered when they are not.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use node::events::{SpWatchTarget, StatusKind, StatusSeverity};
@@ -47,6 +47,18 @@ pub const ALERTFILE_VERSION: u64 = 1;
 /// no index and costs one ECDH per target per eligible transaction, so this is
 /// a work bound rather than a memory bound.
 pub const MAX_SP_TARGETS_PER_HOOK: usize = 16;
+
+/// Silent-payment scan keys the whole alertfile may watch.
+///
+/// [`MAX_SP_TARGETS_PER_HOOK`] bounds one stanza, but the cost is not per
+/// stanza: every hook's targets are folded into a single union subscriber, and
+/// matching is one ECDH per registered target per eligible transaction. Without
+/// a total, the per-hook cap is bypassed by adding hooks.
+///
+/// Sixteen hooks' worth. Generous for the intended shape (a handful of hooks
+/// watching a handful of wallets each) and far below where the matcher starts
+/// lagging the chain.
+pub const MAX_SP_TARGETS_TOTAL: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AlertFileError {
@@ -267,11 +279,10 @@ impl AlertFile {
     /// Parse and validate alertfile contents. Split from [`load`](Self::load)
     /// so the rules are testable without a file on disk.
     pub fn parse(path: &Path, text: &str) -> Result<Self, AlertFileError> {
-        let doc: toml_edit::DocumentMut =
-            text.parse().map_err(|source| AlertFileError::Toml {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let doc: toml_edit::DocumentMut = text.parse().map_err(|source| AlertFileError::Toml {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         match doc.get("version").and_then(|v| v.as_integer()) {
             Some(v) if v as u64 == ALERTFILE_VERSION => {}
@@ -338,22 +349,69 @@ impl AlertFile {
         // Rejecting at parse is the honest fix: the configuration is ambiguous,
         // and an operator who wants one wallet watched by two endpoints can say
         // so explicitly with two entries under one hook.
-        let mut seen_scan_keys = BTreeSet::new();
-        for h in &hooks {
+        let file = Self { hooks };
+        file.validate(path)?;
+        Ok(file)
+    }
+
+    /// Cross-hook invariants that no single hook can check for itself.
+    ///
+    /// Split out of [`Self::parse`] and public so the invariant is reachable
+    /// from any constructor. `AlertFile` has public fields and derives
+    /// `Default`, so a future runtime "add a webhook" surface, an SDK consumer,
+    /// or a test helper can build one directly — and the collision this guards
+    /// is a cross-tenant payment-data leak, not a cosmetic problem. A guard that
+    /// lives only inside the parser protects only today's single call path.
+    pub fn validate(&self, path: &Path) -> Result<(), AlertFileError> {
+        let hooks = &self.hooks;
+        // Keyed by the *first* claimant, not a bare set, so the error can name
+        // both hooks. An operator told only which hook lost has to grep 16
+        // targets across every other stanza to find the other one.
+        let mut seen_scan_keys: BTreeMap<[u8; 33], &str> = BTreeMap::new();
+        let mut total_sp_targets = 0usize;
+        for h in hooks {
+            total_sp_targets += h.watch.silent_payments.len();
             for t in &h.watch.silent_payments {
-                if !seen_scan_keys.insert(t.scan_pubkey()) {
-                    return Err(AlertFileError::invalid(
-                        path,
+                if let Some(first) = seen_scan_keys.insert(t.scan_pubkey(), h.id.as_str()) {
+                    // Distinguish the two shapes. Reporting a duplicate *inside*
+                    // one hook as "claimed by another hook" sends the operator
+                    // hunting a second stanza that does not exist.
+                    let detail = if first == h.id {
+                        format!(
+                            "webhook `{}` lists the same silent-payment scan key twice",
+                            h.id
+                        )
+                    } else {
                         format!(
                             "webhook `{}` reuses a silent-payment scan key already claimed by \
-                             another hook; a scan key may belong to only one hook",
+                             webhook `{first}`; a scan key may belong to only one hook",
                             h.id
-                        ),
-                    ));
+                        )
+                    };
+                    return Err(AlertFileError::invalid(path, detail));
                 }
             }
         }
-        Ok(Self { hooks })
+        // The per-hook cap bounds one stanza; this bounds the actual cost.
+        // Every hook's targets are folded into a single union subscriber, and
+        // silent-payment matching has no inverted index — it is one ECDH per
+        // registered target per eligible transaction, whether those targets came
+        // from one hook or two hundred. Without a total, 200 hooks × 16 targets
+        // is 3200 EC operations per taproot-bearing transaction: exactly the
+        // "matcher lags the chain, hits the capped resync path, starts dropping
+        // matches" outcome the per-hook cap exists to prevent, reached by
+        // walking around it.
+        if total_sp_targets > MAX_SP_TARGETS_TOTAL {
+            return Err(AlertFileError::invalid(
+                path,
+                format!(
+                    "alertfile registers {total_sp_targets} silent-payment scan targets across \
+                     all hooks; the limit is {MAX_SP_TARGETS_TOTAL} (matching is one ECDH per \
+                     target per eligible transaction, and every hook's targets share one matcher)"
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -373,16 +431,25 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         if !KNOWN.contains(&key) {
             return Err(AlertFileError::invalid(
                 path,
-                format!("unknown key `{key}` in [[webhook]] (known: {})", KNOWN.join(", ")),
+                format!(
+                    "unknown key `{key}` in [[webhook]] (known: {})",
+                    KNOWN.join(", ")
+                ),
             ));
         }
     }
 
     let id = req_str(path, t, "id")?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(AlertFileError::invalid(
             path,
-            format!("webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers, metric labels, and the cursor key)"),
+            format!(
+                "webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers, metric labels, and the cursor key)"
+            ),
         ));
     }
     let url = req_str(path, t, "url")?;
@@ -406,7 +473,10 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         None => None,
         Some(v) => {
             let s = v.as_str().ok_or_else(|| {
-                AlertFileError::invalid(path, format!("webhook `{id}`: `min_severity` must be a string"))
+                AlertFileError::invalid(
+                    path,
+                    format!("webhook `{id}`: `min_severity` must be a string"),
+                )
             })?;
             Some(StatusSeverity::from_str_exact(s).ok_or_else(|| {
                 AlertFileError::invalid(
@@ -428,9 +498,7 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
             Some(n as u64)
         }
     };
-    if heartbeat_interval_secs.is_some()
-        && !categories.contains(node::events::CATEGORY_HEARTBEAT)
-    {
+    if heartbeat_interval_secs.is_some() && !categories.contains(node::events::CATEGORY_HEARTBEAT) {
         return Err(AlertFileError::invalid(
             path,
             format!(
@@ -475,7 +543,10 @@ fn parse_watch_set(
         if !KNOWN.contains(&key) {
             return Err(AlertFileError::invalid(
                 path,
-                format!("webhook `{id}`: unknown key `{key}` in [webhook.watch] (known: {})", KNOWN.join(", ")),
+                format!(
+                    "webhook `{id}`: unknown key `{key}` in [webhook.watch] (known: {})",
+                    KNOWN.join(", ")
+                ),
             ));
         }
     }
@@ -486,7 +557,10 @@ fn parse_watch_set(
         // the streaming API uses, so an operator can reuse a value they already
         // have from a `ScriptMatched` event.
         let bytes = hex::decode(&item).map_err(|_| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: `scripts` entry `{item}` is not hex"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `scripts` entry `{item}` is not hex"),
+            )
         })?;
         let arr: [u8; 32] = bytes.try_into().map_err(|_| {
             AlertFileError::invalid(
@@ -505,17 +579,26 @@ fn parse_watch_set(
             )
         })?;
         let txid: bitcoin::Txid = txid.parse().map_err(|_| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: bad txid in outpoint `{item}`"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: bad txid in outpoint `{item}`"),
+            )
         })?;
         let vout: u32 = vout.parse().map_err(|_| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: bad vout in outpoint `{item}`"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: bad vout in outpoint `{item}`"),
+            )
         })?;
         set.outpoints.push(bitcoin::OutPoint { txid, vout });
     }
 
     for item in str_array(path, id, t, "txids")? {
         set.txids.push(item.parse().map_err(|_| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: `txids` entry `{item}` is not a txid"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `txids` entry `{item}` is not a txid"),
+            )
         })?);
     }
 
@@ -596,7 +679,9 @@ fn parse_sp_target(
                         .ok_or_else(|| {
                             AlertFileError::invalid(
                                 path,
-                                format!("webhook `{id}`: `labels` entries must be non-negative integers"),
+                                format!(
+                                    "webhook `{id}`: `labels` entries must be non-negative integers"
+                                ),
                             )
                         })
                 })
@@ -665,7 +750,10 @@ fn parse_categories(
         ));
     };
     let arr = v.as_array().ok_or_else(|| {
-        AlertFileError::invalid(path, format!("webhook `{id}`: `categories` must be an array"))
+        AlertFileError::invalid(
+            path,
+            format!("webhook `{id}`: `categories` must be an array"),
+        )
     })?;
     let mut mask = 0u32;
     for item in arr {
@@ -726,7 +814,10 @@ fn parse_kinds(
     let mut out = BTreeSet::new();
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: `kinds` entries must be strings"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `kinds` entries must be strings"),
+            )
         })?;
         // Validated against the live taxonomy, not a copy: a typo'd kind would
         // otherwise match nothing and silently disable the hook.
@@ -832,7 +923,10 @@ fn req_str(path: &Path, t: &toml_edit::Table, key: &str) -> Result<String, Alert
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| {
-            AlertFileError::invalid(path, format!("[[webhook]] is missing required string `{key}`"))
+            AlertFileError::invalid(
+                path,
+                format!("[[webhook]] is missing required string `{key}`"),
+            )
         })
 }
 
@@ -987,15 +1081,19 @@ categories = ["chain"]
 "#,
         )
         .unwrap();
-        assert!(!f.hooks[0]
-            .filter
-            .accepts_status(StatusKind::TipStall, StatusSeverity::Critical));
+        assert!(
+            !f.hooks[0]
+                .filter
+                .accepts_status(StatusKind::TipStall, StatusSeverity::Critical)
+        );
     }
 
     #[test]
     fn missing_or_wrong_version_is_rejected() {
         assert!(matches!(
-            parse("[[webhook]]\nid=\"a\"\nurl=\"https://x/h\"\nsecret=\"s\"\ncategories=[\"status\"]\n"),
+            parse(
+                "[[webhook]]\nid=\"a\"\nurl=\"https://x/h\"\nsecret=\"s\"\ncategories=[\"status\"]\n"
+            ),
             Err(AlertFileError::Invalid { .. })
         ));
         assert!(parse(&MINIMAL.replace("version = 1", "version = 2")).is_err());
@@ -1006,7 +1104,13 @@ categories = ["chain"]
         // An accepted-but-ignored alerting rule is worse than a refused one:
         // the operator believes they are covered when they are not.
         assert!(parse(&format!("{MINIMAL}\nnot_a_key = 1\n")).is_err());
-        assert!(parse(&MINIMAL.replace("categories = [\"status\"]", "categories = [\"status\"]\nkindz = [\"tip_stall\"]")).is_err());
+        assert!(
+            parse(&MINIMAL.replace(
+                "categories = [\"status\"]",
+                "categories = [\"status\"]\nkindz = [\"tip_stall\"]"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1016,7 +1120,10 @@ categories = ["chain"]
             "categories = [\"status\"]",
             "categories = [\"status\"]\nkinds = [\"tip_stal\"]",
         );
-        assert!(parse(&with_kind).is_err(), "a typo'd kind must not silently match nothing");
+        assert!(
+            parse(&with_kind).is_err(),
+            "a typo'd kind must not silently match nothing"
+        );
     }
 
     #[test]
@@ -1037,7 +1144,9 @@ categories = ["chain"]
     #[test]
     fn duplicate_ids_are_rejected() {
         // Two hooks sharing an id would share a durable cursor key.
-        let two = format!("{MINIMAL}\n[[webhook]]\nid = \"ops\"\nurl = \"https://b.example/h\"\nsecret = \"t\"\ncategories = [\"chain\"]\n");
+        let two = format!(
+            "{MINIMAL}\n[[webhook]]\nid = \"ops\"\nurl = \"https://b.example/h\"\nsecret = \"t\"\ncategories = [\"chain\"]\n"
+        );
         let err = parse(&two).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
     }
@@ -1053,7 +1162,10 @@ categories = ["chain"]
     #[test]
     fn plaintext_http_is_gated_unless_local_or_opted_in() {
         let remote = MINIMAL.replace("https://alerts.example/satd", "http://alerts.example/satd");
-        assert!(parse(&remote).is_err(), "plaintext to a public host needs the opt-in");
+        assert!(
+            parse(&remote).is_err(),
+            "plaintext to a public host needs the opt-in"
+        );
 
         // Loopback and RFC1918 are fine unannotated — a relay on the same host
         // or inside a private network is the normal deployment.
@@ -1097,8 +1209,14 @@ categories = ["chain"]
         }
 
         // A genuine loopback target with userinfo is still local.
-        let text = MINIMAL.replace("https://alerts.example/satd", "http://user:pw@127.0.0.1:9000/h");
-        assert!(parse(&text).is_ok(), "userinfo on a real loopback host is fine");
+        let text = MINIMAL.replace(
+            "https://alerts.example/satd",
+            "http://user:pw@127.0.0.1:9000/h",
+        );
+        assert!(
+            parse(&text).is_ok(),
+            "userinfo on a real loopback host is fine"
+        );
     }
 
     #[test]
@@ -1250,7 +1368,10 @@ txids = ["0000000000000000000000000000000000000000000000000000000000000002"]
             ("scripts = [\"1111\"]", "short scripthash"),
             ("scripts = [\"zz\"]", "non-hex scripthash"),
             ("outpoints = [\"deadbeef\"]", "outpoint without :vout"),
-            ("outpoints = [\"0000000000000000000000000000000000000000000000000000000000000001:x\"]", "non-numeric vout"),
+            (
+                "outpoints = [\"0000000000000000000000000000000000000000000000000000000000000001:x\"]",
+                "non-numeric vout",
+            ),
             ("txids = [\"nope\"]", "bad txid"),
             ("prefixes = [\"aa\"]", "unknown watch key"),
         ] {
@@ -1321,7 +1442,80 @@ spend_pubkey = "{spend}"
 "#
         );
         let err = parse(&two_hooks).expect_err("a shared scan key must be refused");
-        assert!(err.to_string().contains("scan key"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("scan key"), "{msg}");
+        // Both hooks are named. Told only which one lost, an operator has to
+        // grep every other stanza's targets to find the other claimant.
+        assert!(msg.contains("deposits"), "the first claimant must be named: {msg}");
+        assert!(msg.contains("ops-audit"), "the losing hook must be named: {msg}");
+        // The secret is never in the message.
+        assert!(!msg.contains(&scan), "the scan key must not reach the error: {msg}");
+    }
+
+    /// The same key twice inside *one* hook is caught by the same loop, but it
+    /// is a different mistake and must not be described as the other one —
+    /// "already claimed by another hook" sends the operator hunting a second
+    /// stanza that does not exist.
+    #[test]
+    fn a_scan_key_repeated_within_one_hook_is_reported_as_such() {
+        let (scan, spend) = sp_keys();
+        let text = format!(
+            r#"version = 1
+[[webhook]]
+id = "deposits"
+url = "https://a.example/h"
+secret = "s"
+categories = ["chain"]
+[[webhook.watch.silent_payments]]
+scan_key = "{scan}"
+spend_pubkey = "{spend}"
+
+[[webhook.watch.silent_payments]]
+scan_key = "{scan}"
+spend_pubkey = "{spend}"
+"#
+        );
+        let err = parse(&text).expect_err("a duplicated scan key must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("twice"), "{msg}");
+        assert!(
+            !msg.contains("another hook"),
+            "there is only one hook here; the message must not send the operator \
+             looking for a second: {msg}"
+        );
+    }
+
+    /// The per-hook cap bounds one stanza; the cost is per union subscriber, so
+    /// without a total it is bypassed by adding hooks.
+    #[test]
+    fn silent_payment_targets_are_capped_across_all_hooks() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let spend = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x43; 32]).unwrap());
+        let per_hook = MAX_SP_TARGETS_PER_HOOK;
+        let hooks_needed = MAX_SP_TARGETS_TOTAL / per_hook + 1;
+        let mut text = String::from("version = 1\n");
+        let mut n = 0u32;
+        for h in 0..hooks_needed {
+            text.push_str(&format!(
+                "\n[[webhook]]\nid = \"h{h}\"\nurl = \"https://x.example/h\"\n\
+                 secret = \"s\"\ncategories = [\"chain\"]\n"
+            ));
+            for _ in 0..per_hook {
+                n += 1;
+                let mut scan = [0x11u8; 32];
+                scan[0..4].copy_from_slice(&n.to_le_bytes());
+                text.push_str(&format!(
+                    "[[webhook.watch.silent_payments]]\nscan_key = \"{}\"\nspend_pubkey = \"{}\"\n",
+                    hex::encode(scan),
+                    hex::encode(spend.serialize()),
+                ));
+            }
+        }
+        // Every hook is individually within its cap.
+        assert!(per_hook <= MAX_SP_TARGETS_PER_HOOK);
+        let err = parse(&text).expect_err("the total must be bounded, not just each hook");
+        assert!(err.to_string().contains("across all hooks"), "{err}");
     }
 
     #[test]
@@ -1395,7 +1589,9 @@ spend_pubkey = "{spend}"
         // Config errors get pasted into bug reports.
         let (_, spend) = sp_keys();
         let bad = "ab".repeat(20); // wrong length, but still secret-shaped
-        let err = parse(&sp_alertfile(&bad, &spend, "")).unwrap_err().to_string();
+        let err = parse(&sp_alertfile(&bad, &spend, ""))
+            .unwrap_err()
+            .to_string();
         assert!(!err.contains(&bad), "error echoed the key material: {err}");
     }
 
@@ -1412,7 +1608,10 @@ spend_pubkey = "{spend}"
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            matches!(AlertFile::load(&path), Err(AlertFileError::Permissions { .. })),
+            matches!(
+                AlertFile::load(&path),
+                Err(AlertFileError::Permissions { .. })
+            ),
             "a world-readable file holding signing secrets must be refused",
         );
 
