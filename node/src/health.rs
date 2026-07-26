@@ -45,6 +45,7 @@ use tokio::sync::{broadcast, watch};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 
 use crate::chain::events::ChainEvent;
+use crate::chain::reorg_log::ReorgRecord;
 use crate::chain::state::ChainState;
 use crate::events::status::{StatusEvent, StatusKind, StatusSeverity};
 use crate::events::{EventPublisher, StatusState};
@@ -246,7 +247,6 @@ pub struct HealthState {
     /// See the IBD guard in [`check_tip_stall`]: `is_initial_block_download()`
     /// can flip back to `true` on a long-stalled node, which would otherwise
     /// permanently freeze that detector.
-    left_ibd: AtomicBool,
     /// Latched once the node has had at least one peer. Gates the
     /// `peer_floor` hold clock so a node that has not finished dialing out yet
     /// does not alert on a startup transient.
@@ -352,49 +352,6 @@ pub fn spawn_health_detectors(
     state
 }
 
-/// Tracks a reorg in flight so `deep_reorg` can report the true depth.
-///
-/// `ChainEvent::Reorg` carries the old and new tip heights but not the fork
-/// point, so depth is not derivable from the marker alone. It *is* derivable
-/// from the sequence the connect path emits — marker, one `BlockDisconnected`
-/// per rolled-back block, then the reconnects — so the detector counts
-/// disconnects between the marker and the next connect. That is exactly
-/// `old_height - fork_height`, the same number `ReorgRecord` records, with no
-/// extra plumbing into the consensus path.
-enum ReorgTracking {
-    Idle,
-    Counting {
-        from_height: u32,
-        disconnected: u32,
-        /// When counting started. A reorg that ends in a connect finalizes
-        /// immediately; a *truncation* reorg (`invalidateblock`, or a chain
-        /// rolled back with nothing to replace it) emits disconnects and then
-        /// simply stops, so the poll loop finalizes a count that has gone
-        /// quiet. Without this, a truncation-shaped reorg would go unreported
-        /// until the next block arrived — which could be never.
-        started: Instant,
-    },
-    /// The disconnect run was interrupted by broadcast lag, so the count we
-    /// have is an undercount. The true depth is in the reorg log — but not yet.
-    ///
-    /// `perform_reorg` emits `ChainEvent::Reorg` and every disconnect and
-    /// reconnect *first*, and only then calls `ReorgLog::record`, which fsyncs
-    /// the JSONL append before pushing to the in-memory ring that `history()`
-    /// reads. So at the instant lag is observed the record is typically absent,
-    /// and the newest record present belongs to some *earlier* reorg. Reading
-    /// it there either drops the report silently or attributes another reorg's
-    /// depth and fork point to this one.
-    ///
-    /// Instead: hold the marker's abandoned-tip height, wait a poll, and match
-    /// the record by that height.
-    LagRecovery {
-        /// Abandoned tip from the `Reorg` marker: `fork_height + depth`.
-        from_height: u32,
-        /// What we counted before lag hit. A lower bound on the true depth.
-        counted: u32,
-        started: Instant,
-    },
-}
 
 async fn run_detectors(
     inputs: HealthInputs,
@@ -427,7 +384,11 @@ async fn run_detectors(
     // that actually started in IBD — otherwise every restart of a synced node
     // would announce that it finished syncing.
     let mut ibd_pending = chain_state.is_initial_block_download();
-    let mut reorg = ReorgTracking::Idle;
+    // Which reorg-log records have already been reported. Seeded from the
+    // current clock so a restart does not re-announce reorgs that predate it:
+    // `deep_reorg` is an edge event, and D3 re-raises standing conditions
+    // across a restart, not edges.
+    let mut reorgs_seen = ReorgWatermark::seeded_now();
     // Hold-time trackers for `peer_floor`: the condition must persist in either
     // direction before it is acted on.
     let mut peers_below_since: Option<Instant> = None;
@@ -466,115 +427,33 @@ async fn run_detectors(
                                 .with_detail("height", height),
                             );
                         }
-                        if let ReorgTracking::Counting { from_height, disconnected, .. } = reorg {
-                            finish_reorg(
-                                &warnings, &publisher, &thresholds,
-                                from_height, disconnected, height,
-                            );
-                            reorg = ReorgTracking::Idle;
-                        }
                     }
-                    Ok(ChainEvent::BlockDisconnected { .. }) => {
-                        if let ReorgTracking::Counting { disconnected, .. } = &mut reorg {
-                            *disconnected += 1;
-                        }
-                    }
-                    Ok(ChainEvent::Reorg { from_height, .. }) => {
-                        reorg = ReorgTracking::Counting {
-                            from_height,
-                            disconnected: 0,
-                            started: Instant::now(),
-                        };
+                    Ok(ChainEvent::BlockDisconnected { .. })
+                    | Ok(ChainEvent::Reorg { .. }) => {
+                        // Reorg depth is read from the reorg log at poll time,
+                        // not reconstructed from these events. See
+                        // `scan_reorg_log`.
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // The disconnect run we were counting is incomplete, so
-                        // the counted depth would be an undercount.
-                        //
-                        // Abandoning it outright is not acceptable here: the
-                        // chain-event ring holds 64 entries and a reorg emits
-                        // one marker plus one event per disconnected *and*
-                        // reconnected block, so lag becomes likely at roughly
-                        // the depth where this alert starts to matter. That
-                        // would make `deep_reorg` least reliable for the largest
-                        // reorgs — the ones it exists to report.
-                        //
-                        // The depth is not actually lost: the reorg log holds
-                        // the committed record with the true fork height. Fall
-                        // back to it and report from ground truth.
+                        // Nothing here depends on a complete event run: the
+                        // tip-stall clock is re-derived from the tip on every
+                        // poll, and reorg depth comes from the durable log. Lag
+                        // is worth a line and nothing more.
                         tracing::debug!(
                             target: "health",
                             dropped = n,
-                            "chain-event lag during reorg depth count; \
-                             falling back to the reorg log",
+                            "chain-event lag in the health detector",
                         );
-                        reorg = match reorg {
-                            ReorgTracking::Counting { from_height, disconnected, .. } => {
-                                ReorgTracking::LagRecovery {
-                                    from_height,
-                                    counted: disconnected,
-                                    started: Instant::now(),
-                                }
-                            }
-                            // Lag outside a reorg tells us nothing about depth.
-                            other => other,
-                        };
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             _ = poll.tick() => {
-                // Finalize a truncation reorg that emitted its disconnects and
-                // then went quiet (no replacement chain to connect).
-                if let ReorgTracking::Counting { from_height, disconnected, started } = reorg
-                    && started.elapsed() >= POLL_INTERVAL
-                {
-                    finish_reorg(
-                        &warnings, &publisher, &thresholds,
-                        from_height, disconnected, chain_state.tip_height(),
-                    );
-                    reorg = ReorgTracking::Idle;
-                }
-                // Resolve a lag-interrupted count against the reorg log, now
-                // that the record has had a poll interval to be written and
-                // pushed to the ring. Match on the abandoned tip height from
-                // the marker rather than taking the newest record, so a reorg
-                // that happened earlier in the window cannot be reported as
-                // this one.
-                if let ReorgTracking::LagRecovery { from_height, counted, started } = reorg
-                    && started.elapsed() >= POLL_INTERVAL
-                {
-                    let exact = chain_state.reorg_log().and_then(|log| {
-                        log.history(REORG_LOG_LOOKBACK_SECS)
-                            .into_iter()
-                            .find(|r| r.fork_height.saturating_add(r.depth) == from_height)
-                    });
-                    match exact {
-                        Some(rec) => finish_reorg(
-                            &warnings, &publisher, &thresholds,
-                            from_height, rec.depth, chain_state.tip_height(),
-                        ),
-                        None => {
-                            // No matching record: the log is disabled, pruned,
-                            // or the write failed. Report the undercount rather
-                            // than nothing — a deep reorg that reads shallow is
-                            // recoverable by an operator, silence is not — and
-                            // mark the depth as a floor so a consumer does not
-                            // treat it as exact.
-                            tracing::warn!(
-                                target: "health",
-                                from_height,
-                                counted,
-                                "no reorg-log record matched a lag-interrupted \
-                                 depth count; reporting a lower bound",
-                            );
-                            finish_reorg_bounded(
-                                &warnings, &publisher, &thresholds,
-                                from_height, counted, chain_state.tip_height(), false,
-                            );
-                        }
-                    }
-                    reorg = ReorgTracking::Idle;
-                }
+                // Report any reorg the log recorded since the last poll.
+                // Depth comes from the record, never from counting events.
+                scan_reorg_log(
+                    &warnings, &publisher, &thresholds, &chain_state, &mut reorgs_seen,
+                );
                 let age = last_connect.elapsed().as_secs();
                 state.last_connect_age_secs.store(age, Ordering::Relaxed);
                 check_tip_stall(&state, &warnings, &publisher, &thresholds, &chain_state, age);
@@ -793,39 +672,33 @@ fn check_tip_stall_values(
     tip_height: u32,
     age_secs: u64,
 ) {
-    // The latch is evaluated before the disabled check, because it is a
-    // property of the node rather than of this detector's configuration.
-    // Behind the `threshold == 0` return it would never be set on a node
-    // running with the detector off — so enabling `alerttipstallseconds` on an
-    // already-wedged node (tip >24h stale, hence "in IBD" again by the
-    // predicate below) would wedge the detector permanently, which is the exact
-    // failure the latch exists to prevent.
-    if !state.left_ibd.load(Ordering::Relaxed) && !in_ibd {
-        state.left_ibd.store(true, Ordering::Relaxed);
-    }
     let threshold = thresholds.tip_stall_secs();
     if threshold == 0 {
         clear_because_disabled(state, warnings, publisher, StatusKind::TipStall);
         return;
     }
-    // During IBD the tip legitimately does not advance for long stretches
-    // (header sync, a slow peer, a big block batch). The condition this alert
-    // exists for — "a caught-up node stopped following the chain" — is
-    // meaningless until IBD is done.
+    // `in_ibd` deliberately does not suppress this alert.
     //
-    // The check is latched. `is_initial_block_download()` is not a one-way
-    // door: it is a function of wall-clock time against the tip header's
-    // timestamp (tip older than ~24h ⇒ "still syncing"), so a node whose tip
-    // stops advancing crosses *back* into it a day later. Without the latch a
-    // partitioned node would raise `tip_stall` at the 1h mark and then, at the
-    // 24h mark, freeze: every later poll would return here before reaching
-    // either the raise or the clear branch, so a SIGHUP retune of
-    // `alerttipstallseconds` would apply to the atomic and do nothing visible.
-    // Once a node has been caught up, it is never "in IBD" again for this
-    // detector's purposes.
-    if !state.left_ibd.load(Ordering::Relaxed) {
-        return;
-    }
+    // It is tempting to: during a genuine sync the tip advances in bursts and a
+    // stall alert would be noise. But `is_initial_block_download` is not a sync
+    // flag — it compares the tip header's timestamp against the wall clock, so
+    // a node that is fully caught up and then *stops* re-enters it a day later,
+    // exactly when the operator most needs to hear from it.
+    //
+    // Latching on "we once saw a non-IBD tip" does not close that hole, because
+    // the latch lives in this process and restarting is an operator's first
+    // move during a stall. A node restarted while already wedged never observes
+    // a non-IBD tip, so the latch never arms and this detector goes silent
+    // permanently — at precisely the moment it should be paging.
+    //
+    // `age_secs` already encodes the thing worth gating on. A node that is
+    // really syncing connects blocks continuously, which keeps the age far
+    // below any sane threshold and suppresses the alert on its own. A node that
+    // reads as "in IBD" but has connected nothing for the whole threshold is
+    // stalled whether it is wedged mid-sync or wedged at the tip, and both
+    // warrant the page. The message — "no block connected for Ns" — is true
+    // either way.
+    let _ = in_ibd;
     if age_secs >= threshold {
         raise_if_new(
             state,
@@ -1204,63 +1077,119 @@ fn check_peers_values(
     }
 }
 
-fn finish_reorg(
+/// Which reorg-log records the detector has already reported.
+///
+/// Keyed on `(ts, old_tip)` rather than a bare timestamp: two reorgs can land
+/// in the same second, and the abandoned tip is unique per reorg. Only the
+/// boundary second needs set membership — anything older is seen by
+/// definition.
+#[derive(Debug, Default)]
+struct ReorgWatermark {
+    ts: u64,
+    at_ts: std::collections::HashSet<String>,
+}
+
+impl ReorgWatermark {
+    fn seeded_now() -> Self {
+        Self {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            at_ts: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Mark `rec` as seen; returns whether it had not been seen before.
+    fn mark_new(&mut self, rec: &ReorgRecord) -> bool {
+        if rec.ts_unix_secs < self.ts {
+            return false;
+        }
+        if rec.ts_unix_secs > self.ts {
+            self.ts = rec.ts_unix_secs;
+            self.at_ts.clear();
+        }
+        self.at_ts.insert(rec.old_tip.clone())
+    }
+}
+
+/// Emit `deep_reorg` for every reorg the log has recorded since the last poll.
+///
+/// Depth, fork height and the reconnected chain all come from the record,
+/// which `perform_reorg` writes and fsyncs before pushing it to the ring that
+/// `history()` reads. This is what the design specifies — "depth from
+/// `ReorgRecord`" — and it is the only source that is right by construction.
+///
+/// The previous implementation reconstructed depth by counting
+/// `BlockDisconnected` events off the chain broadcast. That ring holds 64
+/// entries and a reorg of depth D emits `2D + 2` events in one await-free
+/// burst, so the count was truncated — or the `Reorg` marker itself dropped,
+/// losing the reorg entirely — at roughly the depth where this alert starts to
+/// matter. It also had to infer the new tip from the first reconnect, which is
+/// `fork_height + 1` rather than the tip.
+fn scan_reorg_log(
     warnings: &NodeWarnings,
     publisher: &EventPublisher,
     thresholds: &AlertThresholds,
-    from_height: u32,
-    disconnected: u32,
-    to_height: u32,
+    chain_state: &ChainState,
+    seen: &mut ReorgWatermark,
 ) {
-    finish_reorg_bounded(
+    let Some(log) = chain_state.reorg_log() else {
+        return;
+    };
+    report_reorgs(
         warnings,
         publisher,
         thresholds,
-        from_height,
-        disconnected,
-        to_height,
-        true,
+        log.history(REORG_LOG_LOOKBACK_SECS),
+        seen,
     );
 }
 
-/// As [`finish_reorg`], but able to report a depth that is only a lower bound.
-///
-/// `depth_exact = false` marks a count that broadcast lag truncated and the
-/// reorg log could not confirm. The event still fires — a deep reorg reported
-/// shallow is something an operator can act on, silence is not — but the wire
-/// says so, because "6 blocks" and "at least 6 blocks" warrant different
-/// responses.
-fn finish_reorg_bounded(
+/// The reporting half of [`scan_reorg_log`], split from the log lookup so it
+/// can be driven from a hand-built record list without a whole `ChainState`.
+fn report_reorgs(
     warnings: &NodeWarnings,
     publisher: &EventPublisher,
     thresholds: &AlertThresholds,
-    from_height: u32,
-    disconnected: u32,
-    to_height: u32,
-    depth_exact: bool,
+    records: Vec<ReorgRecord>,
+    seen: &mut ReorgWatermark,
 ) {
     let threshold = thresholds.reorg_depth();
-    if threshold == 0 || u64::from(disconnected) < threshold {
-        return;
+    for rec in records {
+        // Mark before the threshold test: a record the current threshold
+        // ignores is still one we have seen, and a later SIGHUP lowering the
+        // threshold must not resurrect it.
+        if !seen.mark_new(&rec) {
+            continue;
+        }
+        if threshold == 0 || u64::from(rec.depth) < threshold {
+            continue;
+        }
+        let from_height = rec.fork_height.saturating_add(rec.depth);
+        // `reconnected` is fork-parent-exclusive and includes the block whose
+        // connection triggered the reorg, so this is the new tip exactly.
+        let to_height = rec
+            .fork_height
+            .saturating_add(u32::try_from(rec.reconnected.len()).unwrap_or(u32::MAX));
+        emit(
+            warnings,
+            publisher,
+            StatusEvent::edge(
+                StatusKind::DeepReorg,
+                format!(
+                    "reorg rolled back {} blocks (from height {from_height} to \
+                     {to_height}; threshold {threshold})",
+                    rec.depth
+                ),
+            )
+            .with_detail("depth", rec.depth)
+            .with_detail("from_height", from_height)
+            .with_detail("to_height", to_height)
+            .with_detail("fork_height", rec.fork_height)
+            .with_detail("threshold", threshold),
+        );
     }
-    let qualifier = if depth_exact { "" } else { "at least " };
-    emit(
-        warnings,
-        publisher,
-        StatusEvent::edge(
-            StatusKind::DeepReorg,
-            format!(
-                "reorg rolled back {qualifier}{disconnected} blocks (from height \
-                 {from_height} to {to_height}; threshold {threshold})"
-            ),
-        )
-        .with_detail("depth", disconnected)
-        .with_detail("depth_exact", depth_exact)
-        .with_detail("from_height", from_height)
-        .with_detail("to_height", to_height)
-        .with_detail("fork_height", from_height.saturating_sub(disconnected))
-        .with_detail("threshold", threshold),
-    );
 }
 
 #[cfg(test)]
@@ -1646,41 +1575,47 @@ mod tests {
         );
     }
 
-    /// The latch has to be set even while the detector is switched off, or
-    /// enabling it on a node that is already wedged — tip >24h stale, hence
-    /// "in IBD" again by the predicate — wedges the detector permanently.
+    /// A node restarted while already wedged must still page.
+    ///
+    /// This is the case an in-process latch cannot cover. The node is synced
+    /// but its chain stopped; >24h later the tip-age predicate reads "in IBD"
+    /// again. The operator restarts — the first thing anyone does — so the
+    /// process never observes a non-IBD tip and a latch would never arm. The
+    /// detector has to raise anyway.
     #[test]
-    fn enabling_tip_stall_on_a_wedged_node_is_not_blocked_by_the_ibd_latch() {
+    fn tip_stall_raises_on_a_node_restarted_while_already_wedged() {
         let state = HealthState::new();
         let warnings = NodeWarnings::new();
         let pubr = publisher();
         let mut rx = pubr.subscribe();
 
-        // Detector off, node caught up: nothing is emitted, but the latch must
-        // still record that this node has been out of IBD.
-        let off = AlertThresholds::new(0, 0, 0, 0, 0);
-        check_tip_stall_values(&state, &warnings, &pubr, &off, false, 100, 10);
-        assert!(drained(&mut rx).is_empty());
-        assert!(
-            state.left_ibd.load(Ordering::Relaxed),
-            "the latch is a property of the node, not of this detector's config"
-        );
-
-        // Node wedges. 30h of no blocks puts it back "in IBD" by the tip-time
-        // predicate. Operator enables the detector to find out why nothing is
-        // moving — it must raise.
         let on = AlertThresholds::new(3600, 0, 0, 0, 0);
+        // in_ibd = true on the very first evaluation, and never false.
         check_tip_stall_values(&state, &warnings, &pubr, &on, true, 100, 108_000);
         assert_eq!(
             drained(&mut rx),
             vec![(StatusKind::TipStall, StatusState::Raised)],
-            "a node that has been caught up is never 'in IBD' again for this \
-             detector's purposes"
+            "a wedged node reads as 'in IBD' by tip age; that must not silence it"
         );
     }
 
-    /// A node that has never seen a peer gets a grace period, and then a full
-    /// hold — not a hold that ran concurrently with the grace.
+    /// The flip side: a node that really is syncing connects blocks, which
+    /// keeps the age low and suppresses the alert without any IBD predicate.
+    #[test]
+    fn a_syncing_node_connecting_blocks_does_not_raise_tip_stall() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+
+        let on = AlertThresholds::new(3600, 0, 0, 0, 0);
+        check_tip_stall_values(&state, &warnings, &pubr, &on, true, 100, 12);
+        assert!(
+            drained(&mut rx).is_empty(),
+            "blocks are arriving; there is no stall to report"
+        );
+    }
+
     #[test]
     fn peer_startup_grace_is_followed_by_a_full_hold() {
         let state = HealthState::new();
@@ -1768,17 +1703,41 @@ mod tests {
         );
     }
 
+    /// Build a reorg-log record with a controlled timestamp and shape.
+    ///
+    /// `reconnected` is a *count*: the number of blocks the new chain put back
+    /// above the fork, which is what fixes the new-tip height.
+    fn rec(ts: u64, fork_height: u32, depth: u32, reconnected: usize, tag: u8) -> ReorgRecord {
+        ReorgRecord {
+            ts_unix_secs: ts,
+            depth,
+            fork_height,
+            old_tip: format!("{tag:064x}"),
+            new_tip: format!("{:064x}", tag.wrapping_add(0x80)),
+            disconnected: (0..depth).map(|i| format!("d{i}")).collect(),
+            reconnected: (0..reconnected).map(|i| format!("r{i}")).collect(),
+        }
+    }
+
+    fn detail(env: &crate::events::NodeEvent, key: &str) -> String {
+        let NodeEventBody::Status(s) = &env.body else {
+            panic!("expected a status event")
+        };
+        s.details.get(key).cloned().unwrap_or_default()
+    }
+
     #[test]
     fn deep_reorg_fires_only_at_or_above_the_threshold() {
         let warnings = NodeWarnings::new();
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 3);
+        let mut seen = ReorgWatermark::default();
 
-        finish_reorg(&warnings, &pubr, &thresholds, 100, 2, 101);
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 98, 2, 3, 1)], &mut seen);
         assert!(drained(&mut rx).is_empty(), "a 2-deep reorg is below the floor");
 
-        finish_reorg(&warnings, &pubr, &thresholds, 100, 3, 102);
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 97, 3, 4, 2)], &mut seen);
         assert_eq!(drained(&mut rx), vec![(StatusKind::DeepReorg, StatusState::Edge)]);
     }
 
@@ -1788,17 +1747,109 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgWatermark::default();
 
-        finish_reorg(&warnings, &pubr, &thresholds, 900, 4, 902);
+        // fork at 896, 4 rolled back (old tip 900), 6 reconnected (new tip 902).
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 896, 4, 6, 1)], &mut seen);
         let env = rx.try_recv().unwrap();
-        let NodeEventBody::Status(s) = env.body else {
-            panic!("expected a status event")
-        };
-        assert_eq!(s.details.get("depth").map(String::as_str), Some("4"));
-        assert_eq!(s.details.get("from_height").map(String::as_str), Some("900"));
-        assert_eq!(s.details.get("to_height").map(String::as_str), Some("902"));
-        // fork = old tip height − blocks rolled back.
-        assert_eq!(s.details.get("fork_height").map(String::as_str), Some("896"));
+        assert_eq!(detail(&env, "depth"), "4");
+        assert_eq!(detail(&env, "from_height"), "900");
+        assert_eq!(detail(&env, "to_height"), "902");
+        assert_eq!(detail(&env, "fork_height"), "896");
+    }
+
+    /// The new tip is the end of the reconnected chain, not its first block.
+    ///
+    /// Reconnects are emitted oldest-first, so an implementation that reads the
+    /// new tip off the first `BlockConnected` after a disconnect run reports
+    /// `fork_height + 1` — below the *old* tip — for every reorg with a
+    /// replacement chain, which is every reorg deep enough to alert on.
+    #[test]
+    fn to_height_is_the_new_tip_not_the_first_reconnect() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgWatermark::default();
+
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 100, 3, 4, 1)], &mut seen);
+        let env = rx.try_recv().unwrap();
+        assert_eq!(detail(&env, "to_height"), "104");
+        assert_ne!(detail(&env, "to_height"), "101", "that is the first reconnect");
+    }
+
+    /// A truncation reorg — rolled back with nothing to replace it — leaves the
+    /// tip at the fork.
+    #[test]
+    fn a_truncation_reorg_reports_the_fork_as_the_new_tip() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgWatermark::default();
+
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 99, 6, 0, 1)], &mut seen);
+        let env = rx.try_recv().unwrap();
+        assert_eq!(detail(&env, "depth"), "6");
+        assert_eq!(detail(&env, "from_height"), "105");
+        assert_eq!(detail(&env, "to_height"), "99");
+    }
+
+    /// The log is rescanned on every poll and keeps records for 300 s, so
+    /// without a watermark one reorg would re-alert every 15 s for 5 minutes.
+    #[test]
+    fn a_reorg_is_reported_once_however_often_the_log_is_scanned() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgWatermark::default();
+        let records = vec![rec(1000, 96, 4, 5, 1)];
+
+        report_reorgs(&warnings, &pubr, &thresholds, records.clone(), &mut seen);
+        assert_eq!(drained(&mut rx).len(), 1);
+        for _ in 0..5 {
+            report_reorgs(&warnings, &pubr, &thresholds, records.clone(), &mut seen);
+        }
+        assert!(drained(&mut rx).is_empty(), "a rescan must not re-alert");
+    }
+
+    /// Two reorgs can land in the same second — a tip race, or back-to-back
+    /// `invalidateblock`. A watermark that stored only a timestamp would
+    /// swallow the second.
+    #[test]
+    fn two_reorgs_in_the_same_second_are_both_reported() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgWatermark::default();
+
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 96, 4, 5, 1), rec(1000, 90, 7, 8, 2)],
+            &mut seen,
+        );
+        assert_eq!(drained(&mut rx).len(), 2);
+    }
+
+    /// A record the threshold ignored is still a record we have seen. Lowering
+    /// `alertreorgdepth` by SIGHUP must not resurrect reorgs from the window.
+    #[test]
+    fn a_sub_threshold_reorg_is_not_resurrected_by_lowering_the_threshold() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let mut seen = ReorgWatermark::default();
+        let records = vec![rec(1000, 98, 2, 3, 1)];
+
+        report_reorgs(&warnings, &pubr, &AlertThresholds::new(0, 0, 0, 0, 10), records.clone(), &mut seen);
+        assert!(drained(&mut rx).is_empty());
+
+        report_reorgs(&warnings, &pubr, &AlertThresholds::new(0, 0, 0, 0, 1), records, &mut seen);
+        assert!(drained(&mut rx).is_empty(), "already seen at the old threshold");
     }
 
     #[test]
@@ -1807,7 +1858,8 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
-        finish_reorg(&warnings, &pubr, &thresholds, 100, 50, 101);
+        let mut seen = ReorgWatermark::default();
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 50, 50, 51, 1)], &mut seen);
         assert!(drained(&mut rx).is_empty());
     }
 
