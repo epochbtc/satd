@@ -27,7 +27,7 @@ pub mod retry;
 
 pub use config::{AlertFile, AlertFileError, Hook, HookFilter, HOOK_QUEUE_CAPACITY};
 pub use contract::{
-    block_delivery_id, delivery_id, replay_delivery_id, sign_body, sign_v2, v2_signing_string,
+    delivery_id, replay_delivery_id, sign_body, sign_v2, v2_signing_string,
     ATTEMPT_HEADER,
     DELIVERY_HEADER, HOOK_HEADER, LEGACY_WEBHOOK_VERSION, MAX_TIMESTAMP_SKEW_SECS,
     SIGNATURE_HEADER, TIMESTAMP_HEADER, WEBHOOK_VERSION, WEBHOOK_VERSION_HEADER,

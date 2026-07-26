@@ -94,25 +94,6 @@ pub fn replay_delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> Stri
     format!("{node_id_hex}-{instance_id}-r{seq}")
 }
 
-/// Delivery id for a replayed **confirmed block**, derived from its height.
-///
-/// Deterministic on purpose, and the only id in the scheme that is. Every other
-/// form embeds this process's random `instance_id` and a running counter, which
-/// is right for an event that happens once — but a replayed block is precisely
-/// the event this design can deliver twice: a restart replays from the durable
-/// cursor, and a reload can leave two generations briefly overlapping. Under a
-/// counter-minted id those duplicates arrive with *different* headers, which
-/// makes "deduplicate on `X-Satd-Delivery`" unimplementable for the only
-/// duplicate that actually occurs. Keyed on height, both copies carry the same
-/// id and a conforming receiver collapses them, which is the contract.
-///
-/// The instance component is fixed at `0` — a real `instance_id` is a random
-/// `u64` and would reintroduce the per-process variation this exists to remove.
-/// The `b` prefix keeps the space disjoint from the bus (`<seq>`), watch
-/// (`w<seq>`), and synthesized (`r<seq>`) spaces.
-pub fn block_delivery_id(node_id_hex: &str, height: u32) -> String {
-    format!("{node_id_hex}-0-b{height}")
-}
 
 /// Maximum age a receiver should accept for a v2 delivery, in seconds.
 ///
@@ -278,38 +259,36 @@ mod tests {
     }
 
     /// The id spaces must not overlap. They are minted from independent
-    /// counters — the bus `seq`, a synth counter, and a block height — so
-    /// without the prefixes a replayed block at height 500 and a bus event with
-    /// `seq` 500 would collide, and a conforming receiver would silently
-    /// discard the second. (The watch space, `w<seq>`, is added with the
-    /// watch-hook feature and is covered alongside it.)
+    /// counters — the bus `seq` and a synth counter — so without the prefix a
+    /// synthesized notice at counter 500 and a bus event at `seq` 500 would
+    /// collide, and a conforming receiver would silently discard the second.
+    /// (The watch space, `w<...>`, is added with the watch-hook feature and is
+    /// covered alongside it.)
+    ///
+    /// Swept across the counter range rather than sampled at one value: a
+    /// collision that only appears at a boundary is exactly the kind a single
+    /// sample misses.
     #[test]
     fn the_delivery_id_spaces_are_disjoint() {
         let node = "ab".repeat(16);
-        let n = 500u64;
-        let ids = [
-            delivery_id(&node, 7, n),
-            replay_delivery_id(&node, 7, n),
-            block_delivery_id(&node, n as u32),
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            for b in ids.iter().skip(i + 1) {
-                assert_ne!(a, b, "delivery id spaces collide at the same counter value");
+        for n in [0u64, 1, 9, 10, 500, u32::MAX as u64, u64::MAX] {
+            let ids = [delivery_id(&node, 7, n), replay_delivery_id(&node, 7, n)];
+            for (i, a) in ids.iter().enumerate() {
+                for b in ids.iter().skip(i + 1) {
+                    assert_ne!(a, b, "delivery id spaces collide at counter {n}");
+                }
             }
         }
     }
 
-    /// A replayed block's id is derived from its height alone, so the same
-    /// block delivered twice — a restart replaying from the durable cursor, or
-    /// a reload whose generations briefly overlap — carries the same
-    /// idempotency key. Every other id embeds a random per-process
-    /// `instance_id`, which would make those duplicates undedupable.
+    /// Ids are unique per event within a process, across every field that
+    /// varies: node, instance, and counter.
     #[test]
-    fn a_replayed_block_id_is_stable_across_restarts() {
+    fn a_delivery_id_varies_with_every_component() {
         let node = "ab".repeat(16);
-        assert_eq!(block_delivery_id(&node, 840_000), block_delivery_id(&node, 840_000));
-        assert_ne!(block_delivery_id(&node, 840_000), block_delivery_id(&node, 840_001));
-        // No instance component to vary: this is the whole point.
-        assert!(block_delivery_id(&node, 840_000).ends_with("-0-b840000"));
+        let other = "cd".repeat(16);
+        assert_ne!(delivery_id(&node, 7, 1), delivery_id(&other, 7, 1));
+        assert_ne!(delivery_id(&node, 7, 1), delivery_id(&node, 8, 1));
+        assert_ne!(delivery_id(&node, 7, 1), delivery_id(&node, 7, 2));
     }
 }

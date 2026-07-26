@@ -46,11 +46,6 @@ pub const LEGACY_REORG_HOOK_ID: &str = "reorg-legacy";
 /// Per-attempt HTTP timeout. Matches the shipped reorg webhook.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How far back a hook's startup catch-up may replay. Shares the streaming
-/// API's clamp so a webhook receiver and a streaming client see the same
-/// "resync below this height yourself" boundary.
-const MAX_CATCHUP_BLOCKS: u32 = node::events::MAX_REPLAY_BLOCKS;
-
 /// How often a pending gap notice is flushed when no event is driving the hook.
 const GAP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -103,6 +98,14 @@ enum Delivery {
         delivery_id: String,
         /// Cursor to persist once the receiver acks, if this event carries one.
         cursor: Option<Cursor>,
+        /// How many lost events this delivery announces, if it is a `Lagged`
+        /// notice. The count travels *with* the delivery rather than being
+        /// retired when the notice is queued: a queued notice can still be
+        /// destroyed — by a reload retiring the generation, or by a permanent
+        /// rejection — and the one message that must not be lost is the one
+        /// saying data was lost. Anything that fails to deliver hands the
+        /// weight back to `GapState`.
+        gap_weight: u64,
     },
 }
 
@@ -130,32 +133,54 @@ struct GapState {
     resume_height: std::sync::atomic::AtomicU32,
 }
 
-/// Per-hook gap state, keyed by hook id, living as long as the process.
+/// Process-lived dispatcher state that must outlive any single generation.
 ///
-/// Deliberately not per-generation. A reload retires the generation that
-/// accumulated a drop count, and per-generation state would take the pending
-/// `Lagged` notice down with it — the receiver would never learn about a hole
-/// that satd had already recorded. `HookCounters` is process-lived for the same
-/// reason; this is the half that was missed.
-static GAP_STATE: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, Arc<GapState>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-fn gap_state_for(id: &str) -> Arc<GapState> {
-    let mut map = GAP_STATE.lock();
-    Arc::clone(map.entry(id.to_string()).or_default())
+/// A reload retires the generation that accumulated a drop count, and
+/// per-generation state would take the pending `Lagged` notice down with it —
+/// the receiver would never learn about a hole satd had already recorded.
+/// `HookCounters` is process-lived for the same reason.
+///
+/// Injected rather than reached for as a `static` so a test can hand in a fresh
+/// one. With a bare static the first test to latch `left_ibd` makes every later
+/// test of the gate vacuous, non-deterministically, since they share a process.
+#[derive(Default)]
+struct DispatcherState {
+    /// Whether this node has ever been observed out of initial block download.
+    ///
+    /// `is_initial_block_download()` is the tip header's age, not a sync flag,
+    /// so a node whose tip stops advancing crosses back into "IBD" a day later.
+    /// This keeps a flapping predicate from re-suppressing a caught-up node.
+    ///
+    /// It is deliberately not load-bearing. The latch lives in this process, so
+    /// a node restarted while already wedged never observes a non-IBD tip and
+    /// never arms it — and an earlier version of this gate went permanently
+    /// silent in exactly that case. What makes that harmless now is the *scope*
+    /// of the gate: only chain events are suppressed, and chain events are by
+    /// definition not arriving on a node whose tip has stopped.
+    left_ibd: std::sync::atomic::AtomicBool,
+    gaps: parking_lot::Mutex<std::collections::HashMap<String, Arc<GapState>>>,
 }
 
-/// Whether this node has ever been observed out of initial block download.
-///
-/// `is_initial_block_download()` is a function of the tip header's age, not of
-/// whether a sync is in progress: a node whose tip stops advancing crosses back
-/// into "IBD" 24 hours later. Without this latch the alert path would go dark
-/// during exactly the incident it exists to report — a stalled tip — and, worse,
-/// resume by advancing the durable cursor across everything it suppressed.
-/// Once a node has been caught up, it is never "syncing" again for the
-/// dispatcher's purposes.
-static LEFT_IBD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+impl DispatcherState {
+    fn gap_for(&self, id: &str) -> Arc<GapState> {
+        Arc::clone(self.gaps.lock().entry(id.to_string()).or_default())
+    }
+
+    /// Drop gap state for hooks no longer named in the alertfile.
+    ///
+    /// The mirror of `metrics.retain` and the cursor GC, which already run on
+    /// reload. Hook ids are short and reused — `pager`, `ops`, `alerts` — so a
+    /// re-added id would otherwise inherit its predecessor's pending drop count
+    /// and resume anchor, and announce a hole to a brand-new endpoint that
+    /// never had one.
+    fn retain_gaps(&self, keep: &std::collections::HashSet<String>) {
+        self.gaps.lock().retain(|id, _| keep.contains(id));
+    }
+}
+
+/// The process-wide instance. Tests construct their own.
+static DISPATCHER_STATE: std::sync::LazyLock<Arc<DispatcherState>> =
+    std::sync::LazyLock::new(|| Arc::new(DispatcherState::default()));
 
 /// Spawn the dispatcher for a parsed alertfile.
 ///
@@ -169,6 +194,7 @@ fn spawn_with_metrics(
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
     metrics: Arc<WebhookMetrics>,
+    state: Arc<DispatcherState>,
     stop: Stop,
 ) {
     if file.hooks.is_empty() {
@@ -178,7 +204,7 @@ fn spawn_with_metrics(
     for hook in &file.hooks {
         let (tx, rx) = mpsc::channel::<Delivery>(HOOK_QUEUE_CAPACITY);
         let counters = metrics.hook(&hook.id);
-        let gap = gap_state_for(&hook.id);
+        let gap = state.gap_for(&hook.id);
         tokio::spawn(deliver_loop(
             hook.clone(),
             rx,
@@ -196,7 +222,7 @@ fn spawn_with_metrics(
             reported_closed: std::sync::atomic::AtomicBool::new(false),
         });
     }
-    tokio::spawn(fan_in(hooks, publisher, store, block_source, stop));
+    tokio::spawn(fan_in(hooks, publisher, store, block_source, state, stop));
 }
 
 /// Fan-in: one broadcast receiver, filtered and enqueued per hook.
@@ -205,24 +231,16 @@ async fn fan_in(
     publisher: Arc<EventPublisher>,
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
+    state: Arc<DispatcherState>,
     mut stop: Stop,
 ) {
-    // Subscribe BEFORE the catch-up replay, so an event published while the
-    // replay is being built is buffered rather than lost in the seam.
     let mut rx = publisher.subscribe();
 
-    // Per-hook snapshot→live boundary dedup, exactly as the gRPC and WS
-    // carriers keep. A block connecting between `subscribe()` and the tip
-    // snapshot taken inside `catch_up` is *both* buffered on the broadcast and
-    // inside the replayed span, so without this it is delivered twice — and
-    // because the replayed copy is re-synthesized with its own delivery id, the
-    // two carry different idempotency keys and a conforming receiver cannot
-    // collapse them. A duplicate deposit alert is exactly the failure the
-    // idempotency contract exists to prevent.
-    let mut dedup: Vec<std::collections::HashMap<u32, bitcoin::BlockHash>> =
-        Vec::with_capacity(hooks.len());
+    // Announce whatever each hook missed while the daemon was down. Nothing is
+    // replayed — there is no snapshot-to-live seam to dedupe, because there is
+    // no snapshot.
     for hook in &hooks {
-        dedup.push(catch_up(hook, &publisher, store.as_ref(), block_source.as_deref()).await);
+        announce_gap(hook, store.as_ref(), block_source.as_deref()).await;
     }
 
     // Per-hook heartbeat downsampling state (D11): last forwarded instant.
@@ -252,42 +270,47 @@ async fn fan_in(
             }
             recv = rx.recv() => match recv {
                 Ok(env) => {
-                    // Suppress the firehose during initial block download.
+                    // Suppress the block firehose during initial block
+                    // download.
                     //
-                    // The dispatcher is started long before P2P, so without
-                    // this a brand-new node with an alertfile POSTs its entire
-                    // sync — one `block_connected` per historical block, plus a
-                    // watch-match per historical transaction touching a watched
-                    // script, for as long as IBD takes. That is the opposite of
-                    // what the manual promises, and the failure mode is a
-                    // multi-day firehose at the receiver rather than anything
-                    // that looks like a bug locally.
+                    // The dispatcher starts long before P2P, so without this a
+                    // brand-new node with an alertfile POSTs its entire sync —
+                    // one `block_connected` per historical block, for as long as
+                    // IBD takes. The failure mode is a multi-day firehose at the
+                    // receiver rather than anything that looks like a bug
+                    // locally.
                     //
-                    // Latched (see `LEFT_IBD`), because the predicate is the
-                    // tip's age rather than a sync flag. Once latched the
-                    // `block_source` call is skipped entirely, which also keeps
-                    // a per-event RocksDB block-index lookup off this task.
+                    // Scoped to chain events, and that scope is what makes the
+                    // gate safe. `is_initial_block_download()` is the tip
+                    // header's age, not a sync flag, so a node that is fully
+                    // caught up and then *stops* reads as "syncing" a day later
+                    // — and a node restarted while already wedged reads that way
+                    // from its first event, with no chance to latch. An earlier
+                    // version gated everything on that predicate and so went
+                    // totally dark on a stalled node: no status, no mempool, and
+                    // watch matches destroyed outright since they have no replay
+                    // to recover them. The one thing a stalled node is *not*
+                    // producing is chain events, so suppressing only those costs
+                    // nothing in that state and still stops the firehose in the
+                    // state it was written for.
                     //
-                    // Status and heartbeat events are exempt. "This node is
-                    // unhealthy" is exactly as true during IBD, and the
-                    // detectors already suppress the conditions that are
-                    // meaningless while syncing. A heartbeat is a dead-man's
-                    // switch: suppressing it during a multi-day sync makes an
-                    // external watchdog declare a healthy node dead, which
-                    // inverts the signal it exists to carry.
-                    let syncing = !LEFT_IBD.load(Ordering::Relaxed) && {
-                        let in_ibd = block_source
-                            .as_deref()
-                            .is_some_and(|s| s.in_initial_block_download());
-                        if !in_ibd {
-                            LEFT_IBD.store(true, Ordering::Relaxed);
-                        }
-                        in_ibd
-                    };
-                    let exempt = matches!(
-                        env.body,
-                        NodeEventBody::Status(_) | NodeEventBody::Heartbeat { .. }
-                    );
+                    // Status and heartbeat therefore always pass, which they
+                    // must: "this node is unhealthy" is exactly as true during
+                    // IBD, and a heartbeat is a dead-man's switch — suppressing
+                    // it during a multi-day sync makes an external watchdog
+                    // declare a healthy node dead.
+                    let suppressible = matches!(env.body, NodeEventBody::Chain(_));
+                    let syncing = suppressible
+                        && !state.left_ibd.load(Ordering::Relaxed)
+                        && {
+                            let in_ibd = block_source
+                                .as_deref()
+                                .is_some_and(|s| s.in_initial_block_download());
+                            if !in_ibd {
+                                state.left_ibd.store(true, Ordering::Relaxed);
+                            }
+                            in_ibd
+                        };
                     // Decide who wants this *before* rendering it. Serializing
                     // first meant a `BlockTweaks` envelope — hundreds of KB of
                     // per-block silent-payment rows — was rendered in full and
@@ -302,7 +325,7 @@ async fn fan_in(
                     if wanted.is_empty() {
                         continue;
                     }
-                    if syncing && !exempt {
+                    if syncing {
                         // Record the suppression as a gap rather than dropping
                         // it silently. A silent skip would leave no counter
                         // moved and no `lagged` body emitted, and the first
@@ -333,23 +356,11 @@ async fn fan_in(
                     );
                     for i in wanted {
                         let hook = &hooks[i];
-                        // A live block identical to one already replayed for
-                        // this hook. A reorg replacement at the same height has
-                        // a different hash and is forwarded, which is why the
-                        // check is on the hash and not the height alone.
-                        if !dedup[i].is_empty()
-                            && let NodeEventBody::Chain(
-                                node::chain::events::ChainEvent::BlockConnected { height, hash },
-                            ) = &env.body
-                            && dedup[i].get(height) == Some(hash)
-                        {
-                            dedup[i].remove(height);
-                            continue;
-                        }
                         enqueue(hook, &publisher, Delivery::Event {
                             body: body.clone(),
                             delivery_id: delivery_id.clone(),
                             cursor: env.cursor,
+                            gap_weight: 0,
                         }, env.cursor);
                     }
                 }
@@ -453,6 +464,7 @@ fn flush_gap(hook: &HookChannel, publisher: &EventPublisher) {
             SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
         ),
         cursor: None,
+        gap_weight: dropped,
     };
     if hook.tx.try_send(item).is_err() {
         // Still full — put the count back so the notice is not lost.
@@ -510,150 +522,67 @@ fn accepts(hook: &Hook, env: &NodeEvent, last_heartbeat: &mut Option<std::time::
 /// A cursor older than the clamp yields a leading `Lagged` notice — the same
 /// deterministic "resync below this height yourself" signal a streaming client
 /// gets.
-async fn catch_up(
+/// Tell a hook what it missed while the daemon was down, without replaying it.
+///
+/// Webhooks are realtime (design D6): an event is delivered live or not at all.
+/// The durable cursor is a resume *marker*, not a replay log — read once here,
+/// compared against the tip, reported as a single `Lagged`, then advanced past
+/// the span so a restart does not announce it twice.
+///
+/// This used to rebuild the missed span from the block index and re-deliver it.
+/// That duplicated the streaming API, which does resumable consumption properly
+/// — real cursors, backpressure, a bounded `RescanBlocks` — and did it worse:
+/// the replay was built up to `MAX_REPLAY_BLOCKS` into a queue holding 1024, so
+/// any outage long enough to matter had its "guaranteed" catch-up converted
+/// straight back into an overflow gap. It also minted per-height delivery ids,
+/// which collided between a block and its post-reorg replacement, so a
+/// conforming receiver discarded the replacement.
+async fn announce_gap(
     hook: &HookChannel,
-    publisher: &EventPublisher,
     store: &dyn Store,
     block_source: Option<&dyn node::events::BlockCursorSource>,
-) -> std::collections::HashMap<u32, bitcoin::BlockHash> {
-    if !hook
-        .hook
-        .filter
-        .categories
-        .contains(node::events::CATEGORY_CHAIN)
-    {
-        return Default::default();
-    }
+) {
     let Some(src) = block_source else {
-        return Default::default();
+        return;
     };
+    let tip = src.current_tip_height();
     let Some(cursor) = read_cursor(store, &hook.hook) else {
-        // A hook that has never delivered starts at the live head rather than
-        // replaying history nobody asked for.
-        return Default::default();
+        // No stored marker: this hook is forward-only from now. Anchor the
+        // resume height at the live tip anyway. It is otherwise only set by a
+        // successful enqueue, so a hook that lags before its first one — or one
+        // that never carries a cursor at all, like a status-only or watch-only
+        // hook — would emit a `Lagged` advertising height 0. A receiver reading
+        // that as "resume from genesis" would resync the whole chain over
+        // having missed nothing.
+        hook.gap.resume_height.store(tip, Ordering::Relaxed);
+        return;
     };
-    // Seed the gap anchor from the durable cursor before any replay is queued.
-    // `resume_height` is otherwise only set by a successful enqueue, so a hook
-    // that lags before its first one — a fresh generation whose catch-up burst
-    // overflows immediately — would emit a `Lagged` advertising height 0, which
-    // reads as "resume from genesis" rather than "resume from where you were".
-    hook.gap
-        .resume_height
-        .store(cursor.height, Ordering::Relaxed);
-
-    let replay = node::events::build_cursor_replay(
-        src,
-        publisher,
-        cursor,
-        node::events::CATEGORY_CHAIN,
-        MAX_CATCHUP_BLOCKS,
-        None,
+    hook.gap.resume_height.store(cursor.height, Ordering::Relaxed);
+    let missed = u64::from(tip.saturating_sub(cursor.height));
+    if missed == 0 {
+        return;
+    }
+    hook.gap.dropped.fetch_add(missed, Ordering::Relaxed);
+    tracing::info!(
+        target: "alert",
+        hook = %hook.id,
+        from = cursor.height,
+        tip,
+        missed,
+        "webhook missed a span while the daemon was down; announcing it as a gap",
     );
-    if replay.clamped {
-        // Replay begins at `cursor.height + 1`, so the number of blocks skipped
-        // is the distance to the first one actually replayed, not to the cursor
-        // itself — the latter counts the already-delivered block at the cursor.
-        let dropped =
-            u64::from(replay.earliest_replayed.saturating_sub(cursor.height.saturating_add(1)));
-        hook.gap.dropped.fetch_add(dropped, Ordering::Relaxed);
-        hook.counters.dropped.fetch_add(dropped, Ordering::Relaxed);
-        hook.gap.resume_height.store(cursor.height, Ordering::Relaxed);
+    // Advance the marker past the announced span. Without this a restart before
+    // the next delivery re-announces the same gap, and on a quiet chain that
+    // repeats on every restart.
+    let advanced = Cursor { height: tip, ..cursor };
+    if let Err(e) = store.write_alert_cursor(&hook.hook.cursor_key(), &encode_cursor(&advanced)) {
         tracing::warn!(
             target: "alert",
             hook = %hook.id,
-            from = cursor.height,
-            earliest = replay.earliest_replayed,
-            "webhook catch-up clamped; receiver must resync the older span itself",
+            error = %e,
+            "failed to advance the webhook resume marker past an announced gap",
         );
     }
-    let count = replay.events.len();
-    let mut queued = 0u64;
-    let mut overflowed = 0u64;
-    let mut queued_heights: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for env in replay.events {
-        let height = match &env.body {
-            NodeEventBody::Chain(node::chain::events::ChainEvent::BlockConnected {
-                height,
-                ..
-            }) => Some(*height),
-            _ => None,
-        };
-        let Ok(bytes) = serde_json::to_vec(&env) else {
-            continue;
-        };
-        let cursor = env.cursor;
-        // Every replayed envelope is stamped `seq: 0`, so minting from it would
-        // give a node that was down for 100 blocks 100 deliveries sharing one
-        // idempotency key — the whole point of catch-up defeated silently.
-        //
-        // A replayed block takes an id derived from its height rather than a
-        // process counter. This is the one event the design really can deliver
-        // twice (a restart, or a reload whose generations overlap), and every
-        // counter-minted id embeds a per-process random `instance_id`, so the
-        // duplicate would arrive under a fresh id and "deduplicate on
-        // X-Satd-Delivery" would be unimplementable for the only case that
-        // needs it. Non-block replays keep the counter — they carry no durable
-        // position to key on.
-        let delivery_id = match height {
-            Some(h) => satd_alert::block_delivery_id(&hex::encode(env.stamp.node_id), h),
-            None => satd_alert::replay_delivery_id(
-                &hex::encode(env.stamp.node_id),
-                publisher.instance_id(),
-                SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
-            ),
-        };
-        if enqueue(
-            hook,
-            publisher,
-            Delivery::Event {
-                body: Arc::new(bytes),
-                delivery_id,
-                cursor,
-            },
-            cursor,
-        ) {
-            queued += 1;
-            if let Some(h) = height {
-                queued_heights.insert(h);
-            }
-        } else {
-            overflowed += 1;
-        }
-    }
-    if count > 0 {
-        // Report what was *queued*, not what was built. The 10k-block replay
-        // clamp warns loudly, but the hook queue holds 1024 — and for any
-        // realistic outage the queue is the binding limit, since 1024 blocks is
-        // about a week and 10k is about ten. Overflow inside this loop is
-        // counted but was otherwise unlogged, so the success line reported the
-        // pre-truncation figure and read as if everything had been recovered.
-        if overflowed > 0 {
-            tracing::warn!(
-                target: "alert",
-                hook = %hook.id,
-                built = count,
-                dropped = overflowed,
-                "webhook catch-up exceeded the hook queue; the excess is lost \
-                 and reported to the receiver as a gap",
-            );
-        }
-        tracing::info!(
-            target: "alert",
-            hook = %hook.id,
-            events = queued,
-            from = cursor.height,
-            "webhook catch-up queued events missed while the daemon was down",
-        );
-    }
-    // Only suppress the live copy of a block this hook actually received. The
-    // replay builds up to 10,000 events into a queue that holds 1024, so on a
-    // long outage most of the tail overflows — and the tail is exactly the span
-    // still buffered on the broadcast, i.e. the blocks whose live copies are
-    // about to arrive. Keeping a dropped block in the dedup map suppresses that
-    // live copy too, dropping the same block twice.
-    let mut dedup = replay.confirmed_dedup;
-    dedup.retain(|height, _| queued_heights.contains(height));
-    dedup
 }
 
 fn read_cursor(store: &dyn Store, hook: &Hook) -> Option<Cursor> {
@@ -744,6 +673,22 @@ fn persist_cursor(
     }
 }
 
+/// Hand back the gap weight of every delivery this loop will never send.
+///
+/// Retiring a generation drops its queue, and `flush_gap` has already zeroed
+/// `GapState` on the assumption the queued notice would go out. Without this,
+/// a reload silently destroys the record of a hole — and the process-lived
+/// `GapState` that exists precisely to survive a reload reads zero afterwards.
+fn drain_owed(rx: &mut mpsc::Receiver<Delivery>, gap: &GapState) {
+    let mut owed = 0u64;
+    while let Ok(Delivery::Event { gap_weight, .. }) = rx.try_recv() {
+        owed = owed.saturating_add(gap_weight);
+    }
+    if owed > 0 {
+        gap.dropped.fetch_add(owed, Ordering::Relaxed);
+    }
+}
+
 /// One hook's delivery loop: serial, in-order, retrying with backoff.
 async fn deliver_loop(
     hook: Hook,
@@ -767,16 +712,17 @@ async fn deliver_loop(
 
     loop {
         let item = tokio::select! {
-            _ = stop.wait() => return,
+            _ = stop.wait() => return drain_owed(&mut rx, &gap),
             item = rx.recv() => match item {
                 Some(i) => i,
-                None => return,
+                None => return drain_owed(&mut rx, &gap),
             },
         };
         let Delivery::Event {
             body,
             delivery_id,
             cursor,
+            gap_weight,
         } = item;
 
         counters
@@ -843,7 +789,14 @@ async fn deliver_loop(
                     // body the receiver has no way to learn which events it
                     // lost, and — because the cursor advances below — no way to
                     // recover them after the misconfiguration is fixed.
-                    gap.dropped.fetch_add(1, Ordering::Relaxed);
+                    //
+                    // `gap_weight` is what this delivery was itself announcing:
+                    // rejecting a `Lagged` that carried 500 must not shrink the
+                    // count to 1. Under a receiver that rejects every request —
+                    // a proxy 302ing the lot — a collapsing count would grind
+                    // gap accounting down to 1 on every cycle indefinitely.
+                    gap.dropped
+                        .fetch_add(gap_weight.saturating_add(1), Ordering::Relaxed);
                     // Advance the cursor anyway. A permanent rejection is the
                     // receiver's decision about this event, and it will decide
                     // the same way next time — leaving the cursor parked would
@@ -869,7 +822,15 @@ async fn deliver_loop(
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = stop.wait() => return,
+                        // Retired mid-backoff. This delivery is already out of
+                        // the queue, so `drain_owed` cannot see it — hand its
+                        // weight back explicitly before dropping it.
+                        _ = stop.wait() => {
+                            if gap_weight > 0 {
+                                gap.dropped.fetch_add(gap_weight, Ordering::Relaxed);
+                            }
+                            return drain_owed(&mut rx, &gap);
+                        }
                     }
                 }
             }
@@ -986,7 +947,15 @@ impl AlertReloader {
         let hook_count = file.hooks.len();
         {
             let _guard = self.api_handle.enter();
-            spawn_with_metrics(&file, publisher, store, block_source, metrics, stop);
+            spawn_with_metrics(
+                &file,
+                publisher,
+                store,
+                block_source,
+                metrics,
+                Arc::clone(&DISPATCHER_STATE),
+                stop,
+            );
         }
         if let Some(old) = self.current.lock().replace(gen_tx) {
             // Draining is deliberate rather than graceful: the retired
@@ -1007,6 +976,13 @@ impl AlertReloader {
         let mut keep = ids;
         keep.push(LEGACY_REORG_HOOK_ID.to_string());
         self.metrics.retain(&keep);
+
+        // Reclaim gap state for the same set. `metrics.retain` and the cursor
+        // GC below both prune on hook removal; the process-lived gap map has to
+        // prune with them, or a re-added id inherits its predecessor's pending
+        // drop count and resume anchor and announces a hole its new endpoint
+        // never had.
+        DISPATCHER_STATE.retain_gaps(&keep.iter().cloned().collect());
 
         // Drop the durable cursor of any hook this reload removed. Hook ids are
         // short and reused — `pager`, `alerts`, `ops` — so leaving the key
