@@ -139,9 +139,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   the threshold does not flap. Five new hot-reloadable thresholds
   (`alerttipstallseconds=3600`, `alertdiskfreemb=10240`,
   `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest —
-  `alertreorgdepth=3`); `0` disables a detector. `deep_reorg` carries
-  `depth_exact`, false when lag truncated the count and the reorg log held no
-  matching record. Two new gauges close longstanding observability gaps
+  `alertreorgdepth=3`); `0` disables a detector. `deep_reorg` depth, fork
+  height and new tip are read from the durable reorg log, so they are exact
+  regardless of chain-event lag. Two new gauges close longstanding observability gaps
   independently of alerting: `satd_tip_last_connect_age_seconds` and
   `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`.
 

@@ -983,15 +983,13 @@ not all — parse per key rather than assuming the whole map is numeric.
 | `disk_low` | `free_bytes`, `threshold_bytes`; `clear_threshold_bytes` when cleared by recovered space |
 | `mempool_congested` | `bytes_used`, `bytes_cap`, `threshold_pct`, `mempoolminfee_sat_per_kvb` (raise only) |
 | `peer_floor` | `peers`, `peers_outbound`, `peers_inbound`, `threshold` (raise only) |
-| `deep_reorg` | `depth`, `depth_exact`, `from_height`, `to_height`, `fork_height` |
+| `deep_reorg` | `depth`, `from_height`, `to_height`, `fork_height` |
 
-`deep_reorg` carries `depth_exact`. It is `true` for a depth counted directly
-from the disconnect run or confirmed against the reorg log. It is `false` when
-chain-event lag truncated the count and no matching log record was found, in
-which case `depth` is a **lower bound** — the reorg was at least that deep. The
-event still fires, because a deep reorg reported shallow is something an
-operator can act on and silence is not, but `6` and `at least 6` warrant
-different responses.
+`deep_reorg` figures are exact. Depth, fork height and the reconnected chain
+are read from the reorg log record that `perform_reorg` writes and fsyncs, not
+reconstructed by counting disconnect events off the event bus — so a reorg deep
+enough to overrun the bus ring is reported with the same precision as a shallow
+one. `to_height` is the new tip, not the first reconnected block.
 
 Any kind may additionally carry `reason` — a non-numeric token on a `cleared`
 event emitted because the detector can no longer evaluate the condition, rather
