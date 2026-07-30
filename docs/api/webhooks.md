@@ -189,39 +189,30 @@ Worked vectors and reference receiver code are in §6.
 X-Satd-Delivery: <node_id>-<instance_id>-<seq>       # live firehose event
 X-Satd-Delivery: <node_id>-<instance_id>-w<seq>      # watch match
 X-Satd-Delivery: <node_id>-<instance_id>-r<seq>      # synthesized: gap notice
-X-Satd-Delivery: <node_id>-0-b<height>               # replayed confirmed block
 ```
 
 - `node_id` — the node's stable 32-hex-character identity.
 - `instance_id` — a per-process nonce, regenerated on every restart.
 - `seq` — a monotonic sequence within that process.
 
-There are four disjoint sequence spaces, distinguished by the prefix, because
+There are three disjoint sequence spaces, distinguished by the prefix, because
 only live bus events have a bus sequence to name them. Watch matches (`w`)
 arrive on a per-subscriber channel; gap notices (`r`) are synthesized rather
 than published, and every synthesized envelope carries the same internal stamp —
 so without a separate space, every gap notice after the first would collapse to
 one idempotency key at your end.
 
-A **replayed confirmed block** (`b`) is the exception to everything above: its
-id is derived from the block's height, with the instance component fixed at `0`.
-That is deliberate. A replayed block is the one event this design genuinely
-delivers twice — a restart replays from the durable resume position, and a
-config reload can briefly overlap generations — and every other id embeds the
-per-process `instance_id`, so those duplicates would arrive under *different*
-ids and "deduplicate on `X-Satd-Delivery`" would be unimplementable for the only
-case that needs it. Keyed on height, both copies carry the same id and your
-dedup collapses them.
-
 Treat the whole value as an opaque string; do not parse its parts. Deduplicate
 on it. It is **stable across retries** (the components are fixed when the event
-is published) and, for everything except a replayed block, **unique across
-restarts** (the instance nonce changes) — so a retry and a genuinely repeated
-condition are distinguishable, which a bare `seq` could not do since `seq`
-restarts at zero.
+is published) and **unique across restarts** (the instance nonce changes) — so a
+retry and a genuinely repeated condition are distinguishable, which a bare `seq`
+could not do since `seq` restarts at zero.
 
-Delivery is **at-least-once**, never exactly-once. Design your receiver so a
-duplicate is harmless.
+Delivery is **at-most-once**, never exactly-once. A duplicate is possible only
+as a retry of one delivery, which carries the id unchanged, so deduplicating on
+`X-Satd-Delivery` is sufficient — you will not receive the same event under two
+different ids. The node never re-sends an event it has already delivered: what
+it does instead is *tell* you when something was missed (§5.3).
 
 ## 5. Delivery behavior
 
@@ -248,7 +239,8 @@ Non-retryable `4xx` is a deliberate asymmetry: a receiver answering `404`
 forever would otherwise pin the head of the queue and convert every later event
 into an overflow drop. Losing one delivery beats losing all of them. A skipped
 event still advances the hook's resume position, so a hard-rejecting endpoint
-does not turn every restart into a replay of the same refused span.
+makes progress rather than announcing the same refused span as a gap after
+every restart.
 
 **Redirects are never followed.** satd sends to the URL in the alertfile and
 nowhere else. Following a `3xx` would move the signed body, and the hook's
@@ -278,23 +270,27 @@ A gap caused by satd dropping events is never silent. Two qualifications:
 - An event **you** refused with a non-retryable status is still reported. It
   advances the hook's resume position (§5.4), so unlike a queue overflow you
   cannot go back for it — being told is all you get.
-- `resume_cursor` recovers `chain` and `mempool` history only. Watch matches are
-  forward-only and are not replayed by a cursor resume, so if the dropped span
-  contained matches, reconcile those separately (`getaddresshistory`). A `lagged`
-  notice does not tell you whether any of the dropped events were matches.
+- `resume_cursor` is a *chain* position. It names where to go looking; it does
+  not name what was lost. Watch matches in particular are forward-only, so if
+  the dropped span contained matches you must reconcile those separately
+  (`getaddresshistory`) — a `lagged` notice does not tell you whether any of the
+  dropped events were matches.
 
-To recover the missed span, reconnect a streaming client with
-`from_cursor = resume_cursor` (see
-[streaming.md §6](streaming.md#6-cursors--replay)).
+satd will not re-send the span. To recover it, go and fetch it: reconnect a
+streaming client with `from_cursor = resume_cursor` (see
+[streaming.md §6](streaming.md#6-cursors--replay)), or use the JSON-RPC history
+calls. This is the whole shape of the contract — the webhook tells you *that*
+you have a hole and *where* it starts, and a surface built for bulk history
+gives you the contents.
 
 ### 5.4 Durability across a node restart
 
 | Event class | Guarantee |
 |---|---|
-| `chain` (confirmed) | **At-least-once, or you are told.** The hook's resume position is persisted, and on startup it replays what it missed — bounded by the same 10 000-block window the streaming API uses, and further by the 1024-deep hook queue. Beyond either bound you get a `lagged` notice and must resync the older span yourself. An event you answer with a non-retryable status (§5.2) is skipped permanently and the cursor advances past it — and because the cursor moves, you cannot go back for it, so that skip also produces a `lagged` body rather than relying on you having noticed at the time. |
+| `chain` (confirmed) | **At-most-once, gap-announced.** The hook's resume position is persisted, but it is a marker rather than a replay cursor: on startup the hook emits one `lagged` body naming what it missed while the node was down, and then goes live. It does not re-send the span — recover it yourself from `resume_cursor` (§5.3). An event you answer with a non-retryable status (§5.2) is skipped permanently and the cursor advances past it, and that skip also produces a `lagged` body rather than relying on you having noticed at the time. |
 | `status` | **At-least-once by re-evaluation.** Standing conditions are re-detected and re-raised after a restart. A condition that raised *and* cleared while the node was down is stale by definition and is not reconstructed. |
 | `mempool`, unconfirmed watch matches | **Best-effort.** Mempool state is ephemeral; anything that matters is re-emitted when it confirms. |
-| confirmed watch matches | **Forward-only from registration.** Adding a watch entry does not replay history for it, and a restart is not a gap: the watch-set is re-registered before P2P starts, so blocks arriving during catch-up are matched normally. The one loss window is a crash between a block connecting and this delivery being acknowledged — the block's `chain` event returns from the cursor, but the match does not, because the block is already connected and is not rescanned. Reconcile with `getaddresshistory` after an unclean shutdown if that matters. |
+| confirmed watch matches | **Forward-only from registration.** Adding a watch entry does not replay history for it, and a restart is not a gap: the watch-set is re-registered before P2P starts, so blocks arriving during catch-up are matched normally. The one loss window is a crash between a block connecting and this delivery being acknowledged — the restart announces the span, but the matches are not reconstructed, because the blocks are already connected and are not rescanned. Reconcile with `getaddresshistory` after an unclean shutdown if that matters. |
 | `heartbeat` | Sampled at the hook's `heartbeat_interval_secs`; no durability by construction. |
 
 **Alerts are suppressed while the node is in initial block download**, except
@@ -304,9 +300,17 @@ entry, for as long as the sync takes. Health events keep flowing because "this
 node is unhealthy" is exactly as true mid-sync, and the heartbeat keeps flowing
 so an external dead-man's switch does not declare a syncing node dead.
 Everything suppressed is counted and reported in the next `lagged` body — this
-is not an exception to §5.3. The suppression is latched on first leaving IBD, so
-a node whose tip later goes stale keeps alerting rather than going quiet at the
-24-hour mark.
+is not an exception to §5.3.
+
+Suppression applies to *confirmed* events only. An unconfirmed watch match comes
+from the mempool, which is live by construction and can never be historical, so
+there is no firehose to prevent — and because a watch match has no replay behind
+it, suppressing a live one destroys it rather than deferring it. The IBD
+predicate is the tip header's *age*, which reads "syncing" on any node whose
+chain has stalled or which was restored from a backup, so the narrow scope is
+what keeps an anti-firehose measure from silencing a node that has a genuine
+problem. Within a process the suppression also latches on first leaving IBD, so
+a tip that later goes stale does not re-arm it at the 24-hour mark.
 
 **Watch-match bodies delivered over a webhook always carry `raw_tx: null` and
 `descriptor_matches: []`.** The opt-in raw-transaction and descriptor-attribution
