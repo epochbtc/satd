@@ -116,7 +116,12 @@ pub enum EvictReason {
 pub enum StatusKind {
     /// Initial block download finished (one-shot).
     IbdComplete,
-    /// No block connected inside the configured window, outside IBD.
+    /// No block connected inside the configured window.
+    ///
+    /// Not suppressed during initial block download: the node's IBD predicate
+    /// is the tip header's age, not a sync flag, so a node that was caught up
+    /// and then wedged re-enters it exactly when you want to hear about it. A
+    /// genuinely syncing node connects blocks and never crosses the threshold.
     TipStall,
     /// Free space on the watched directory fell below the configured floor.
     DiskLow,
@@ -403,9 +408,19 @@ pub enum Event {
         severity: StatusSeverity,
         /// Human-readable one-liner. Log it or page on it; do not parse it.
         message: String,
-        /// Kind-specific structured fields as decimal strings (free bytes and
-        /// the watched path, seconds since the last block, a reorg's depth and
-        /// fork height, …). Tolerate unknown keys and absent optional ones.
+        /// Kind-specific structured fields, as strings.
+        ///
+        /// Mostly decimal numbers (free bytes and the threshold, seconds since
+        /// the last block, a reorg's depth and fork height, …) but **not
+        /// uniformly** — a `cleared` event can carry a `reason` token such as
+        /// `detector_disabled` or `mempool_cap_zero`. Parse per key, not with
+        /// one integer parse over the map.
+        ///
+        /// The watched *path* is deliberately absent: it reaches every status
+        /// subscriber and every webhook receiver, and an absolute datadir path
+        /// usually names the account the node runs under.
+        ///
+        /// Tolerate unknown keys and absent optional ones.
         details: std::collections::BTreeMap<String, String>,
     },
     /// A watched outpoint was spent.
