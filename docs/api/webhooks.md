@@ -10,6 +10,14 @@ wire-level companion to the operator-facing
 configure hooks) and to [`streaming.md`](streaming.md) (the event schema the
 bodies use).
 
+**Scope.** Webhooks are a basic, **best-effort** way to automate off chain and
+mempool events. They deliver live and retry a while; they do not persist, do not
+resume, and do not match on your addresses. If you need guaranteed delivery,
+resumability across downtime, history, backpressure, or per-address matching,
+the [Streaming Consumption API](streaming.md) is the canonical way to integrate
+with satd and does all of it properly. Choosing webhooks for an integration that
+needs those things is choosing the wrong surface.
+
 Everything here is verifiable without a running node: §6 gives signature test
 vectors, and the same vectors are asserted by satd's own unit tests, so an
 independent implementation can be checked for agreement offline.
@@ -69,20 +77,12 @@ same event**. There is one schema, specified in
 }
 ```
 
-`cursor` is absent on events that do not advance a durable position: status
-events, heartbeats, and mempool transitions. Within the `chain` category it is
-carried by `block_connected` only — `block_disconnected` and `reorg` have no
-resume position of their own, so a receiver that persists `event.cursor`
-unconditionally on any `chain` body will stall or crash on the first reorg,
-which is the moment it most needs to be right.
-
-**Watch matches have a different envelope shape.** A `script_matched`,
-`outpoint_spent`, `txid_*`, or `silent_payment_matched` body is
-`{schema_version, cursor, body}` — there is **no `stamp`** — and its `cursor` is
-always *present*, though it is `null` while the match is unconfirmed and an
-object once confirmed. That cursor also omits `instance_id`. If you write one
-deserializer for both shapes, make `stamp` optional and treat `cursor` as
-nullable rather than absent.
+`cursor` is present on `block_connected` and absent on everything else — status
+events, heartbeats, mempool transitions, `block_disconnected` and `reorg` carry
+no position. It is carried because the envelope is shared with the streaming
+API, where it is load-bearing; **satd does not use it for webhook delivery and
+neither should you rely on it here.** Webhooks do not resume (§5.4). If you want
+to act on a position, take it to the streaming API.
 
 Delivery metadata is **never** in the body. That is deliberate: if the attempt
 counter or hook id were inside the JSON, the bytes would differ between retries
@@ -97,21 +97,20 @@ Bodies you may receive, by the hook's configured `categories`:
 | `chain` | `chain` (`block_connected`, `block_disconnected`, `reorg`) |
 | `mempool` | `mempool` (`enter`, `leave_confirmed`, `leave_evicted`, `leave_replaced`) |
 | `heartbeat` | `heartbeat` (downsampled per hook — see §5.4) |
-| any hook with a watch-set | `script_matched`, `outpoint_spent`, `txid_matched`, `txid_replaced`, `txid_evicted`, `txid_unconfirmed`, `txid_depth_reached`, `txid_finalized`, `silent_payment_matched` |
-| any hook | `lagged` — an in-band gap notice (§5.3) |
 
 A receiver **must** tolerate an unrecognized `body.category` or `kind`: new ones
 are added additively and do not bump `schema_version`.
 
-**A watch-set is not filtered by `categories`.** They are independent
-subscriptions on one hook: `categories` selects from the node's firehose (what
-the node and the chain are doing), while the watch-set selects your own
-addresses, coins, and transactions. A hook with `categories = ["chain"]` and a
-watch-set receives block events and *both phases* of its own matches — the
-mempool sighting (`confirmed: false`) and the confirmed re-emit — while
-receiving no mempool transitions for anything else. Adding `"mempool"` to see
-unconfirmed matches is therefore unnecessary and expensive: you already have
-them, and what you would add is every transaction on the network.
+**`categories` is the entire filter surface.** A hook cannot subscribe to
+specific addresses, outpoints, transactions or silent-payment scan keys. That is
+what the streaming API's `Watch` stream is for, and it does it properly —
+per-connection watch-sets, depth alarms, `RescanBlocks` for history,
+backpressure. A `[webhook.watch]` table in an alertfile is a hard parse error
+naming the streaming API, not an unknown key.
+
+In particular, do not reach for `"mempool"` to learn about *your* transactions
+before they confirm: it is every transaction on the network, thousands per
+minute on mainnet, and it is the wrong tool. Use `Watch`.
 
 ### Hash byte order — read this before writing a lookup
 
@@ -121,16 +120,13 @@ valid-looking 32-byte hex string that simply never matches anything.
 
 | Body family | `txid` / `block_hash` byte order |
 |---|---|
-| **Watch matches** (`script_matched`, `outpoint_spent`, `txid_*`, `silent_payment_matched`) | **Internal (consensus) order, unreversed** |
 | **`chain` bodies** (`block_connected`, `block_disconnected`, `reorg`) | **Reversed — RPC display order**, the same string `getblockhash` returns |
 | **`mempool` bodies** (`enter`, `leave_*`) | **Reversed — RPC display order** |
 
-So a `txid` from a `mempool.enter` body can be handed straight to
-`getrawtransaction`, while a `txid` from a `script_matched` body must be
-byte-reversed first (or compared against other internal-order values).
-
-`scripthash`, `output_pubkey`, and `tweak` appear only on watch matches and are
-always internal order, unreversed. A `scripthash` is `sha256(scriptPubKey)`.
+Every hash a webhook delivers is in RPC display order, so a `txid` from a
+`mempool.enter` body can be handed straight to `getrawtransaction`. (The
+streaming API's watch matches use internal, unreversed order — if you consume
+both surfaces, that is the seam to watch.)
 
 ## 3. Signature
 
@@ -186,21 +182,12 @@ Worked vectors and reference receiver code are in §6.
 ## 4. Idempotency
 
 ```
-X-Satd-Delivery: <node_id>-<instance_id>-<seq>       # live firehose event
-X-Satd-Delivery: <node_id>-<instance_id>-w<seq>      # watch match
-X-Satd-Delivery: <node_id>-<instance_id>-r<seq>      # synthesized: gap notice
+X-Satd-Delivery: <node_id>-<instance_id>-<seq>
 ```
 
 - `node_id` — the node's stable 32-hex-character identity.
 - `instance_id` — a per-process nonce, regenerated on every restart.
-- `seq` — a monotonic sequence within that process.
-
-There are three disjoint sequence spaces, distinguished by the prefix, because
-only live bus events have a bus sequence to name them. Watch matches (`w`)
-arrive on a per-subscriber channel; gap notices (`r`) are synthesized rather
-than published, and every synthesized envelope carries the same internal stamp —
-so without a separate space, every gap notice after the first would collapse to
-one idempotency key at your end.
+- `seq` — the event's own monotonic sequence within that process.
 
 Treat the whole value as an opaque string; do not parse its parts. Deduplicate
 on it. It is **stable across retries** (the components are fixed when the event
@@ -208,11 +195,10 @@ is published) and **unique across restarts** (the instance nonce changes) — so
 retry and a genuinely repeated condition are distinguishable, which a bare `seq`
 could not do since `seq` restarts at zero.
 
-Delivery is **at-most-once**, never exactly-once. A duplicate is possible only
-as a retry of one delivery, which carries the id unchanged, so deduplicating on
-`X-Satd-Delivery` is sufficient — you will not receive the same event under two
-different ids. The node never re-sends an event it has already delivered: what
-it does instead is *tell* you when something was missed (§5.3).
+Delivery is **at-most-once**, never exactly-once. The only duplicate you can
+receive is a retry of one delivery, which carries the id unchanged, so
+deduplicating on this header is sufficient — the same event never arrives under
+two different ids. satd never re-sends an event it has already delivered.
 
 ## 5. Delivery behavior
 
@@ -251,83 +237,49 @@ changes, the operator updates the alertfile.
 
 Per-attempt timeout: 10 s.
 
-### 5.3 Gaps
+### 5.3 What happens when a hook falls behind
 
-A hook's outbound queue is bounded (1024 events). If a receiver falls far enough
-behind, events are dropped — and the next successful delivery is **preceded by a
-`lagged` body**:
+A hook's outbound queue is bounded (1024 events). If your receiver cannot keep
+up, or the dispatcher itself lags the event bus, events are **dropped**. There is
+no in-band notice: nothing is inserted into the stream to tell you, and nothing
+is held for later.
 
-```json
-{"schema_version":1,"stamp":{…},
- "cursor":{"height":812345,"tx_index":0,"mempool_seq":"0","instance_id":"88…"},
- "body":{
-  "category":"lagged","dropped_count":37,
-  "resume_cursor":{"height":812345,"tx_index":0,"mempool_seq":"0","instance_id":"88…"}}}
-```
+What you get instead is the operator-side signal —
+`satd_alertwebhook_dropped_total{hook="..."}` moves and the node logs it. Alert
+on that counter if a gap matters to you.
 
-A gap caused by satd dropping events is never silent. Two qualifications:
-
-- An event **you** refused with a non-retryable status is still reported. It
-  advances the hook's resume position (§5.4), so unlike a queue overflow you
-  cannot go back for it — being told is all you get.
-- `resume_cursor` is a *chain* position. It names where to go looking; it does
-  not name what was lost. Watch matches in particular are forward-only, so if
-  the dropped span contained matches you must reconcile those separately
-  (`getaddresshistory`) — a `lagged` notice does not tell you whether any of the
-  dropped events were matches.
-
-satd will not re-send the span. To recover it, go and fetch it: reconnect a
-streaming client with `from_cursor = resume_cursor` (see
-[streaming.md §6](streaming.md#6-cursors--replay)), or use the JSON-RPC history
-calls. This is the whole shape of the contract — the webhook tells you *that*
-you have a hole and *where* it starts, and a surface built for bulk history
-gives you the contents.
+This is the deliberate shape of the surface. A webhook is a fire-and-forget HTTP
+callback; making it tell you reliably what it failed to tell you is a strictly
+harder problem than the one it exists to solve, and it is already solved one
+surface over. If you need to know you have every event, consume the
+[Streaming Consumption API](streaming.md) — real cursors, backpressure, and a
+bounded `RescanBlocks` for history.
 
 ### 5.4 Durability across a node restart
 
+None, by design.
+
 | Event class | Guarantee |
 |---|---|
-| `chain` (confirmed) | **At-most-once, gap-announced.** The hook's resume position is persisted, but it is a marker rather than a replay cursor: on startup the hook emits one `lagged` body naming what it missed while the node was down, and then goes live. It does not re-send the span — recover it yourself from `resume_cursor` (§5.3). An event you answer with a non-retryable status (§5.2) is skipped permanently and the cursor advances past it, and that skip also produces a `lagged` body rather than relying on you having noticed at the time. |
-| `status` | **At-least-once by re-evaluation.** Standing conditions are re-detected and re-raised after a restart. A condition that raised *and* cleared while the node was down is stale by definition and is not reconstructed. |
-| `mempool`, unconfirmed watch matches | **Best-effort.** Mempool state is ephemeral; anything that matters is re-emitted when it confirms. |
-| confirmed watch matches | **Forward-only from registration.** Adding a watch entry does not replay history for it, and a restart is not a gap: the watch-set is re-registered before P2P starts, so blocks arriving during catch-up are matched normally. The one loss window is a crash between a block connecting and this delivery being acknowledged — the restart announces the span, but the matches are not reconstructed, because the blocks are already connected and are not rescanned. Reconcile with `getaddresshistory` after an unclean shutdown if that matters. |
+| `chain` | **Best-effort.** Delivered live or not at all. A node that was down did not deliver those blocks and does not go back for them; its hooks resume at the live head. |
+| `mempool` | **Best-effort.** Mempool state is ephemeral; anything that matters is re-emitted when it confirms. |
+| `status` | **Re-raised by re-evaluation.** Standing conditions are re-detected at startup and raised again, so a live problem still reaches you across a restart. This is a property of the detectors, not of delivery. A condition that raised *and* cleared while the node was down is stale by definition and is not reconstructed. |
 | `heartbeat` | Sampled at the hook's `heartbeat_interval_secs`; no durability by construction. |
+
+Nothing is persisted per hook. Retries are the only recovery mechanism, and they
+cover the only failure this surface promises to survive: a receiver that is
+briefly unreachable.
 
 **Alerts are suppressed while the node is in initial block download**, except
 `status` and `heartbeat`. Syncing from genesis would otherwise POST one delivery
-per historical block, and one per historical transaction touching a watched
-entry, for as long as the sync takes. Health events keep flowing because "this
-node is unhealthy" is exactly as true mid-sync, and the heartbeat keeps flowing
-so an external dead-man's switch does not declare a syncing node dead.
-Everything suppressed is counted and reported in the next `lagged` body — this
-is not an exception to §5.3.
-
-Suppression applies to *confirmed* events only. An unconfirmed watch match comes
-from the mempool, which is live by construction and can never be historical, so
-there is no firehose to prevent — and because a watch match has no replay behind
-it, suppressing a live one destroys it rather than deferring it. The IBD
-predicate is the tip header's *age*, which reads "syncing" on any node whose
-chain has stalled or which was restored from a backup, so the narrow scope is
-what keeps an anti-firehose measure from silencing a node that has a genuine
-problem. Within a process the suppression also latches on first leaving IBD, so
-a tip that later goes stale does not re-arm it at the 24-hour mark.
-
-**Watch-match bodies delivered over a webhook always carry `raw_tx: null` and
-`descriptor_matches: []`.** The opt-in raw-transaction and descriptor-attribution
-features are per-subscription knobs on the streaming API and have no alertfile
-equivalent; `streaming.md` documents those fields as populated because there they
-can be. Fetch the transaction with `getrawtransaction` if you need its bytes.
-
-**Reorgs re-emit confirmed watch matches.** There is no retraction event for a
-script, outpoint, or silent-payment match: if a transaction confirms at height
-H, the chain reorgs, and it reconfirms at H′, you receive a second
-`confirmed: true` match for the same transaction with a **new** delivery id —
-idempotency will not collapse them for you. If you credit on `confirmed: true`,
-either wait for enough depth or key your ledger on `(txid, vout)` rather than on
-delivery. Note this bites hardest on a hook configured with a watch-set but
-*without* `categories = ["chain"]`, which is a supported shape: such a hook
-receives no `reorg` or `block_disconnected` event and so has no way to learn the
-rollback happened at all.
+per historical block for as long as the sync takes. Health events keep flowing
+because "this node is unhealthy" is exactly as true mid-sync, and the heartbeat
+keeps flowing so an external dead-man's switch does not declare a syncing node
+dead. What was suppressed is counted in `satd_alertwebhook_dropped_total`. The
+suppression latches on first leaving IBD, so a node whose tip later goes stale
+keeps alerting — the IBD predicate is the tip header's *age*, which reads
+"syncing" on any node that has stalled or been restored from a backup, and
+that is exactly when you most want the alert.
 
 ## 6. Test vectors
 
@@ -418,6 +370,14 @@ it and point the hook at loopback. No client certificate is presented.
 Stated so nobody waits for them:
 
 - **Exactly-once delivery.** Deduplicate on `X-Satd-Delivery`.
+- **Guaranteed delivery, or any notice of what was missed.** Drops are visible
+  to the operator as a counter, not to the receiver in-band. Use the streaming
+  API if you need to know you have everything.
+- **Resuming after downtime.** A hook that was not running resumes at the live
+  head. There is no cursor, no replay, and no catch-up.
+- **Watching addresses, coins, transactions, or silent-payment scan keys.** A
+  hook filters on `categories`, `kinds` and `min_severity` only. Per-address
+  matching is the streaming API's `Watch` stream.
 - **Batching.** One event per request.
 - **Ordering across hooks.** Ordering is per hook only.
 - **A hosted relay.** satd delivers to endpoints you run. The reference push
