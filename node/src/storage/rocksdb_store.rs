@@ -1249,57 +1249,6 @@ impl RocksDbStore {
 }
 
 impl Store for RocksDbStore {
-    /// Read a hook's `alertwebhook.cursor.<id>` blob. The key namespace is
-    /// disjoint from the index markers that share this CF.
-    fn read_alert_cursor(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle(CF_METADATA)?;
-        self.db.get_cf(&cf, key).ok().flatten()
-    }
-
-    fn write_alert_cursor(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        let cf = self
-            .db
-            .cf_handle(CF_METADATA)
-            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
-        let cf = self
-            .db
-            .cf_handle(CF_METADATA)
-            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
-        self.db
-            .delete_cf(&cf, key)
-            .map_err(|e| StoreError::Database(e.to_string()))
-    }
-
-    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
-        const PREFIX: &[u8] = b"alertwebhook.cursor.";
-        let cf = self
-            .db
-            .cf_handle(CF_METADATA)
-            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
-        let mut keys = Vec::new();
-        // The metadata CF is shared with index markers, so the iteration is
-        // prefix-bounded and stops at the first key outside the namespace
-        // rather than walking the whole CF.
-        let iter = self.db.iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(PREFIX, rocksdb::Direction::Forward),
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| StoreError::Database(e.to_string()))?;
-            if !key.starts_with(PREFIX) {
-                break;
-            }
-            keys.push(key.to_vec());
-        }
-        Ok(keys)
-    }
-
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         let cf = self.cf(CF_BLOCK_INDEX);
         let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;

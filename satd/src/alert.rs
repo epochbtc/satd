@@ -13,11 +13,13 @@
 //! structural, not a timeout budget. (The dispatcher this replaces ran its
 //! outbound HTTP on the consensus runtime.)
 //!
-//! **A gap is never silent.** Both drop paths — a full hook queue and a lagged
-//! broadcast receiver — set the hook's gap flag. Before its next delivery the
-//! hook emits a synthesized `Lagged` body carrying the number of events lost
-//! and the cursor to resume from, so a receiver that cares can go fetch the
-//! span it missed.
+//! **Best-effort, and deliberately so.** Nothing is persisted and nothing is
+//! replayed. A full hook queue or a lagged broadcast receiver drops events,
+//! moves `satd_alertwebhook_dropped_total`, and logs; a restart resumes at the
+//! live head. Anything that needs to know what it missed wants the Streaming
+//! Consumption API, which is the canonical integration surface and has real
+//! cursors, backpressure and a bounded `RescanBlocks`. Adding durability here
+//! would be a worse reimplementation of that one surface over.
 //!
 //! **Delivery is serial and ordered per hook.** One request in flight at a
 //! time, so a receiver observes events in the order the node produced them and
@@ -31,9 +33,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use node::events::{Cursor, EventPublisher, NodeEvent, NodeEventBody};
+use node::events::{EventPublisher, NodeEvent, NodeEventBody};
 use node::metrics::{HookCounters, WebhookMetrics};
-use node::storage::Store;
 use satd_alert::{AlertFile, Hook, HOOK_QUEUE_CAPACITY};
 use tokio::sync::{mpsc, watch};
 
@@ -45,16 +46,6 @@ pub const LEGACY_REORG_HOOK_ID: &str = "reorg-legacy";
 
 /// Per-attempt HTTP timeout. Matches the shipped reorg webhook.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How often a pending gap notice is flushed when no event is driving the hook.
-const GAP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Numbers synthesized deliveries — catch-up replay events and gap notices.
-///
-/// Process-wide rather than per-generation, for the same reason the watch
-/// counter is: a SIGHUP reload keeps the same `instance_id`, so a per-generation
-/// counter would restart at zero and re-mint ids the receiver has already seen.
-static SYNTH_DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Composite stop signal: the process-wide shutdown, plus a narrower channel
 /// the SIGHUP reload flips to retire one task.
@@ -106,16 +97,6 @@ enum Delivery {
     Event {
         body: Arc<Vec<u8>>,
         delivery_id: String,
-        /// Cursor to persist once the receiver acks, if this event carries one.
-        cursor: Option<Cursor>,
-        /// How many lost events this delivery announces, if it is a `Lagged`
-        /// notice. The count travels *with* the delivery rather than being
-        /// retired when the notice is queued: a queued notice can still be
-        /// destroyed — by a reload retiring the generation, or by a permanent
-        /// rejection — and the one message that must not be lost is the one
-        /// saying data was lost. Anything that fails to deliver hands the
-        /// weight back to `GapState`.
-        gap_weight: u64,
     },
 }
 
@@ -124,40 +105,18 @@ struct HookChannel {
     hook: Hook,
     tx: mpsc::Sender<Delivery>,
     counters: Arc<HookCounters>,
-    /// Set when an event was dropped for this hook; cleared when the resulting
-    /// `Lagged` notice has been queued.
-    gap: Arc<GapState>,
     /// Whether the "delivery task is gone" warning has already been logged for
     /// this generation. Per-generation on purpose: a reload should re-report a
     /// genuinely dead hook once, not stay quiet because a retired generation
     /// already said so.
     reported_closed: std::sync::atomic::AtomicBool,
-    /// Whether this hook's delivery task was started by the same `apply` that
-    /// built this channel, and so should be told what it missed while nothing
-    /// was delivering for it.
-    ///
-    /// False for a hook carried across a reload. Its queue survived, so the
-    /// span between its durable cursor and the tip is not a hole — it is a
-    /// backlog about to be delivered, and announcing it as a gap tells the
-    /// receiver to go rescan a range it is about to be sent anyway.
-    fresh: bool,
-}
-
-/// Accumulated drop state for one hook.
-#[derive(Default)]
-struct GapState {
-    dropped: std::sync::atomic::AtomicU64,
-    /// Position of the last event successfully queued before the gap — the
-    /// anchor a receiver resumes from.
-    resume_height: std::sync::atomic::AtomicU32,
 }
 
 /// Process-lived dispatcher state that must outlive any single generation.
 ///
 /// A reload retires the generation that accumulated a drop count, and
-/// per-generation state would take the pending `Lagged` notice down with it —
-/// the receiver would never learn about a hole satd had already recorded.
-/// `HookCounters` is process-lived for the same reason.
+/// `HookCounters` is process-lived so a reload does not reset an operator's
+/// counters.
 ///
 /// Injected rather than reached for as a `static` so a test can hand in a fresh
 /// one. With a bare static the first test to latch `left_ibd` makes every later
@@ -177,24 +136,6 @@ struct DispatcherState {
     /// of the gate: only chain events are suppressed, and chain events are by
     /// definition not arriving on a node whose tip has stopped.
     left_ibd: std::sync::atomic::AtomicBool,
-    gaps: parking_lot::Mutex<std::collections::HashMap<String, Arc<GapState>>>,
-}
-
-impl DispatcherState {
-    fn gap_for(&self, id: &str) -> Arc<GapState> {
-        Arc::clone(self.gaps.lock().entry(id.to_string()).or_default())
-    }
-
-    /// Drop gap state for hooks no longer named in the alertfile.
-    ///
-    /// The mirror of `metrics.retain` and the cursor GC, which already run on
-    /// reload. Hook ids are short and reused — `pager`, `ops`, `alerts` — so a
-    /// re-added id would otherwise inherit its predecessor's pending drop count
-    /// and resume anchor, and announce a hole to a brand-new endpoint that
-    /// never had one.
-    fn retain_gaps(&self, keep: &std::collections::HashSet<String>) {
-        self.gaps.lock().retain(|id, _| keep.contains(id));
-    }
 }
 
 /// The process-wide instance. Tests construct their own.
@@ -212,7 +153,6 @@ struct RunningHook {
     config: Hook,
     tx: mpsc::Sender<Delivery>,
     counters: Arc<HookCounters>,
-    gap: Arc<GapState>,
     /// Retires this hook's delivery task alone.
     stop: watch::Sender<bool>,
 }
@@ -224,20 +164,15 @@ struct RunningHook {
 fn start_hook(
     hook: &Hook,
     metrics: &WebhookMetrics,
-    state: &DispatcherState,
-    store: Arc<dyn Store>,
     global_stop: watch::Receiver<bool>,
 ) -> RunningHook {
     let (tx, rx) = mpsc::channel::<Delivery>(HOOK_QUEUE_CAPACITY);
     let (stop_tx, stop_rx) = watch::channel(false);
     let counters = metrics.hook(&hook.id);
-    let gap = state.gap_for(&hook.id);
     tokio::spawn(deliver_loop(
         hook.clone(),
         rx,
         counters.clone(),
-        gap.clone(),
-        store,
         Stop {
             global: global_stop,
             local: stop_rx,
@@ -247,7 +182,6 @@ fn start_hook(
         config: hook.clone(),
         tx,
         counters,
-        gap,
         stop: stop_tx,
     }
 }
@@ -261,18 +195,10 @@ async fn fan_in(
     hooks: Vec<HookChannel>,
     mut rx: tokio::sync::broadcast::Receiver<NodeEvent>,
     publisher: Arc<EventPublisher>,
-    store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
     state: Arc<DispatcherState>,
     mut stop: Stop,
 ) {
-    // Announce whatever each hook missed while the daemon was down. Nothing is
-    // replayed — there is no snapshot-to-live seam to dedupe, because there is
-    // no snapshot.
-    for hook in hooks.iter().filter(|h| h.fresh) {
-        announce_gap(hook, store.as_ref(), block_source.as_deref()).await;
-    }
-
     // Per-hook heartbeat downsampling state (D11): last forwarded instant.
     let mut last_heartbeat: Vec<Option<std::time::Instant>> = vec![None; hooks.len()];
 
@@ -282,22 +208,9 @@ async fn fan_in(
         "alert webhook dispatcher started",
     );
 
-    // A gap notice is otherwise only emitted ahead of the *next* event for that
-    // hook, so a hook whose traffic stops right after a drop holds it
-    // indefinitely — and traffic stopping is correlated with the drop, not
-    // independent of it. The one message that must not wait is the one saying
-    // data was lost.
-    let mut gap_flush = tokio::time::interval(GAP_FLUSH_INTERVAL);
-    gap_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
         tokio::select! {
             _ = stop.wait() => break,
-            _ = gap_flush.tick() => {
-                for hook in &hooks {
-                    flush_gap(hook, &publisher);
-                }
-            }
             recv = rx.recv() => match recv {
                 Ok(env) => {
                     // Suppress the block firehose during initial block
@@ -356,17 +269,10 @@ async fn fan_in(
                         continue;
                     }
                     if syncing {
-                        // Record the suppression as a gap rather than dropping
-                        // it silently. A silent skip would leave no counter
-                        // moved and no `lagged` body emitted, and the first
-                        // post-IBD delivery would then advance the durable
-                        // cursor straight across everything suppressed — making
-                        // the span unrecoverable on the next restart while the
-                        // module claims at-least-once. Counting it means the
-                        // receiver is told, and the resume anchor still points
-                        // before the hole.
+                        // Counted rather than skipped silently, so an operator
+                        // can see on `/metrics` that the sync suppressed
+                        // deliveries rather than the hook being broken.
                         for i in wanted {
-                            hooks[i].gap.dropped.fetch_add(1, Ordering::Relaxed);
                             hooks[i].counters.dropped.fetch_add(1, Ordering::Relaxed);
                         }
                         continue;
@@ -386,20 +292,18 @@ async fn fan_in(
                     );
                     for i in wanted {
                         let hook = &hooks[i];
-                        enqueue(hook, &publisher, Delivery::Event {
+                        enqueue(hook, Delivery::Event {
                             body: body.clone(),
                             delivery_id: delivery_id.clone(),
-                            cursor: env.cursor,
-                            gap_weight: 0,
-                        }, env.cursor);
+                        });
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // The dispatcher itself fell behind the bus. Every hook
-                    // missed the same span, so every hook is told.
+                    // The dispatcher itself fell behind the bus. Best-effort
+                    // means those events are simply gone: the counter and this
+                    // line are the whole record.
                     tracing::warn!(target: "alert", dropped = n, "alert dispatcher lagged the event bus");
                     for hook in &hooks {
-                        hook.gap.dropped.fetch_add(n, Ordering::Relaxed);
                         hook.counters.dropped.fetch_add(n, Ordering::Relaxed);
                     }
                 }
@@ -410,46 +314,34 @@ async fn fan_in(
     tracing::info!(target: "alert", "alert webhook dispatcher stopped");
 }
 
-/// Queue an event for one hook, converting an overflow into a recorded gap.
+/// Queue an event for one hook.
 ///
-/// Returns whether the event was queued. Callers that need a count must use
-/// this rather than diffing `counters.dropped`: those counters are process-lived
-/// and shared across generations, so a retired generation still shedding events
-/// perturbs the delta — which, on a subtraction, underflowed.
-fn enqueue(
-    hook: &HookChannel,
-    publisher: &EventPublisher,
-    item: Delivery,
-    cursor: Option<Cursor>,
-) -> bool {
-    // Emit the pending gap notice ahead of the event that follows it, so the
-    // receiver learns about the hole before it sees the data after it.
-    flush_gap(hook, publisher);
+/// Returns whether the event was queued. An overflow drops the event and moves
+/// `satd_alertwebhook_dropped_total`; nothing is held for later and nothing is
+/// synthesized into the stream. Webhooks are best-effort by design — a consumer
+/// that needs to know what it missed wants the streaming API, which has real
+/// cursors and backpressure.
+fn enqueue(hook: &HookChannel, item: Delivery) -> bool {
     match hook.tx.try_send(item) {
         Ok(()) => {
             hook.counters
                 .queue_depth
                 .store(queue_depth(&hook.tx) as u64, Ordering::Relaxed);
-            if let Some(c) = cursor {
-                hook.gap.resume_height.store(c.height, Ordering::Relaxed);
-            }
             true
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // A receiver that cannot keep up degrades to "you missed N" rather
-            // than back-pressuring the bus.
-            hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
+            // A receiver that cannot keep up loses events rather than
+            // back-pressuring the bus. Consensus is never the thing that waits.
             hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             // The delivery task is gone: it failed to build its HTTP client, or
             // it panicked. Silently ignoring this makes the hook look perfectly
-            // healthy on `/metrics` — `dropped_total` flat, `queue_depth` flat,
-            // no `Lagged` ever synthesized — while it delivers nothing at all,
-            // forever. Count it like any other loss so the existing
-            // "no successful delivery in N minutes" rule fires.
-            hook.gap.dropped.fetch_add(1, Ordering::Relaxed);
+            // healthy on `/metrics` — `dropped_total` flat, `queue_depth` flat
+            // — while it delivers nothing at all, forever. Count it like any
+            // other loss so the existing "no successful delivery in N minutes"
+            // rule fires.
             hook.counters.dropped.fetch_add(1, Ordering::Relaxed);
             // Logged once per hook, not once per event. This arm is reached on
             // every event once a delivery task is gone — including for a
@@ -465,40 +357,6 @@ fn enqueue(
             }
             false
         }
-    }
-}
-
-/// If events were dropped for this hook, queue a `Lagged` notice describing the
-/// gap. Best-effort: if the queue is still full the notice waits for the next
-/// opportunity, and the drop count keeps accumulating in the meantime.
-fn flush_gap(hook: &HookChannel, publisher: &EventPublisher) {
-    let dropped = hook.gap.dropped.swap(0, Ordering::Relaxed);
-    if dropped == 0 {
-        return;
-    }
-    let resume = publisher.resume_cursor(hook.gap.resume_height.load(Ordering::Relaxed), 0);
-    let env = node::events::lagged_event(publisher, dropped, resume);
-    let Ok(bytes) = serde_json::to_vec(&env) else {
-        return;
-    };
-    let item = Delivery::Event {
-        body: Arc::new(bytes),
-        // Synthesized envelope: `stamp.seq` is 0 for every one of these, so it
-        // gets an id from the replay space instead. Without this every gap
-        // notice in the process would carry the same idempotency key and a
-        // conforming receiver would discard all but the first — "a gap is never
-        // silent" would hold exactly once.
-        delivery_id: satd_alert::replay_delivery_id(
-            &hex::encode(env.stamp.node_id),
-            publisher.instance_id(),
-            SYNTH_DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
-        ),
-        cursor: None,
-        gap_weight: dropped,
-    };
-    if hook.tx.try_send(item).is_err() {
-        // Still full — put the count back so the notice is not lost.
-        hook.gap.dropped.fetch_add(dropped, Ordering::Relaxed);
     }
 }
 
@@ -529,9 +387,10 @@ fn accepts(hook: &Hook, env: &NodeEvent, last_heartbeat: &mut Option<std::time::
             }
             due
         }
-        // A lag notice is a control signal: it reaches every hook regardless of
-        // filter, exactly as it reaches every streaming subscriber.
-        NodeEventBody::Lagged { .. } => true,
+        // A `Lagged` body is built per-connection by the streaming carriers and
+        // is never published to the shared bus, so the dispatcher cannot see
+        // one. Treated as any other unsubscribed body rather than special-cased
+        // into a path that no event takes.
         other => {
             // Tweaks are refused at parse (never in a hook's mask), and the
             // remaining bodies map to their category bit.
@@ -543,105 +402,6 @@ fn accepts(hook: &Hook, env: &NodeEvent, last_heartbeat: &mut Option<std::time::
             hook.filter.categories.contains(bit)
         }
     }
-}
-
-/// Replay the confirmed events a hook missed while the daemon was down.
-///
-/// Only the chain category has durable history to replay; status is re-raised
-/// by the detectors instead, and mempool events are ephemeral by construction.
-/// A cursor older than the clamp yields a leading `Lagged` notice — the same
-/// deterministic "resync below this height yourself" signal a streaming client
-/// gets.
-/// Tell a hook what it missed while the daemon was down, without replaying it.
-///
-/// Webhooks are realtime (design D6): an event is delivered live or not at all.
-/// The durable cursor is a resume *marker*, not a replay log — read once here,
-/// compared against the tip, reported as a single `Lagged`, then advanced past
-/// the span so a restart does not announce it twice.
-///
-/// This used to rebuild the missed span from the block index and re-deliver it.
-/// That duplicated the streaming API, which does resumable consumption properly
-/// — real cursors, backpressure, a bounded `RescanBlocks` — and did it worse:
-/// the replay was built up to `MAX_REPLAY_BLOCKS` into a queue holding 1024, so
-/// any outage long enough to matter had its "guaranteed" catch-up converted
-/// straight back into an overflow gap. It also minted per-height delivery ids,
-/// which collided between a block and its post-reorg replacement, so a
-/// conforming receiver discarded the replacement.
-async fn announce_gap(
-    hook: &HookChannel,
-    store: &dyn Store,
-    block_source: Option<&dyn node::events::BlockCursorSource>,
-) {
-    let Some(src) = block_source else {
-        return;
-    };
-    let tip = src.current_tip_height();
-    let Some(cursor) = read_cursor(store, &hook.hook) else {
-        // No stored marker: this hook is forward-only from now. Anchor the
-        // resume height at the live tip anyway. It is otherwise only set by a
-        // successful enqueue, so a hook that lags before its first one — or one
-        // that never carries a cursor at all, like a status-only or watch-only
-        // hook — would emit a `Lagged` advertising height 0. A receiver reading
-        // that as "resume from genesis" would resync the whole chain over
-        // having missed nothing.
-        hook.gap.resume_height.store(tip, Ordering::Relaxed);
-        return;
-    };
-    hook.gap.resume_height.store(cursor.height, Ordering::Relaxed);
-    let missed = u64::from(tip.saturating_sub(cursor.height));
-    if missed == 0 {
-        return;
-    }
-    hook.gap.dropped.fetch_add(missed, Ordering::Relaxed);
-    tracing::info!(
-        target: "alert",
-        hook = %hook.id,
-        from = cursor.height,
-        tip,
-        missed,
-        "webhook missed a span while the daemon was down; announcing it as a gap",
-    );
-    // Advance the marker past the announced span. Without this a restart before
-    // the next delivery re-announces the same gap, and on a quiet chain that
-    // repeats on every restart.
-    let advanced = Cursor { height: tip, ..cursor };
-    if let Err(e) = store.write_alert_cursor(&hook.hook.cursor_key(), &encode_cursor(&advanced)) {
-        tracing::warn!(
-            target: "alert",
-            hook = %hook.id,
-            error = %e,
-            "failed to advance the webhook resume marker past an announced gap",
-        );
-    }
-}
-
-fn read_cursor(store: &dyn Store, hook: &Hook) -> Option<Cursor> {
-    let raw = store.read_alert_cursor(&hook.cursor_key())?;
-    decode_cursor(&raw)
-}
-
-/// Cursors are stored as a fixed 24-byte little-endian record rather than JSON:
-/// the format is written and read only here, and a fixed layout cannot acquire
-/// a parse failure mode as the `Cursor` type grows fields.
-fn encode_cursor(c: &Cursor) -> [u8; 24] {
-    let mut out = [0u8; 24];
-    out[0..4].copy_from_slice(&c.height.to_le_bytes());
-    out[4..8].copy_from_slice(&c.tx_index.to_le_bytes());
-    out[8..16].copy_from_slice(&c.mempool_seq.to_le_bytes());
-    out[16..24].copy_from_slice(&c.instance_id.to_le_bytes());
-    out
-}
-
-fn decode_cursor(raw: &[u8]) -> Option<Cursor> {
-    if raw.len() != 24 {
-        return None;
-    }
-    Some(Cursor {
-        height: u32::from_le_bytes(raw[0..4].try_into().ok()?),
-        tx_index: u32::from_le_bytes(raw[4..8].try_into().ok()?),
-        mempool_seq: u64::from_le_bytes(raw[8..16].try_into().ok()?),
-        instance_id: u64::from_le_bytes(raw[16..24].try_into().ok()?),
-    })
 }
 
 /// The HTTP client every webhook delivery goes through.
@@ -664,68 +424,11 @@ fn webhook_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Persist a hook's resume position, at most once per block height.
-///
-/// The cursor is a resume hint, not a ledger: one RocksDB write per delivered
-/// event would be pure write amplification for a value only read at startup.
-fn persist_cursor(
-    hook: &Hook,
-    store: &dyn Store,
-    cursor: Option<Cursor>,
-    persisted_height: &mut Option<u32>,
-) {
-    let Some(c) = cursor else { return };
-    if *persisted_height == Some(c.height) {
-        return;
-    }
-    // Never move a hook's durable cursor backwards.
-    //
-    // `persisted_height` is this task's own view and starts empty for a fresh
-    // generation, so it cannot see what a *retired* generation is still doing.
-    // A reload spawns the new generation before signalling the old one to stop,
-    // and an in-flight POST is not inside the stop `select!` — so a delivery
-    // retired mid-request can land up to `REQUEST_TIMEOUT` later and write a
-    // cursor the new generation has already advanced past. Rewinding it means
-    // the next restart replays a span the receiver already acked.
-    if let Some(existing) = store
-        .read_alert_cursor(&hook.cursor_key())
-        .and_then(|raw| decode_cursor(&raw))
-        && existing.height > c.height
-    {
-        *persisted_height = Some(existing.height);
-        return;
-    }
-    match store.write_alert_cursor(&hook.cursor_key(), &encode_cursor(&c)) {
-        Ok(()) => *persisted_height = Some(c.height),
-        Err(e) => {
-            tracing::warn!(target: "alert", hook = %hook.id, error = %e, "failed to persist webhook cursor")
-        }
-    }
-}
-
-/// Hand back the gap weight of every delivery this loop will never send.
-///
-/// Retiring a generation drops its queue, and `flush_gap` has already zeroed
-/// `GapState` on the assumption the queued notice would go out. Without this,
-/// a reload silently destroys the record of a hole — and the process-lived
-/// `GapState` that exists precisely to survive a reload reads zero afterwards.
-fn drain_owed(rx: &mut mpsc::Receiver<Delivery>, gap: &GapState) {
-    let mut owed = 0u64;
-    while let Ok(Delivery::Event { gap_weight, .. }) = rx.try_recv() {
-        owed = owed.saturating_add(gap_weight);
-    }
-    if owed > 0 {
-        gap.dropped.fetch_add(owed, Ordering::Relaxed);
-    }
-}
-
 /// One hook's delivery loop: serial, in-order, retrying with backoff.
 async fn deliver_loop(
     hook: Hook,
     mut rx: mpsc::Receiver<Delivery>,
     counters: Arc<HookCounters>,
-    gap: Arc<GapState>,
-    store: Arc<dyn Store>,
     mut stop: Stop,
 ) {
     let client = match webhook_client() {
@@ -735,25 +438,16 @@ async fn deliver_loop(
             return;
         }
     };
-    // Only persist a cursor when it actually moves forward a block: the cursor
-    // is a resume hint, not a ledger, and one RocksDB write per delivered event
-    // would be pure write amplification.
-    let mut persisted_height: Option<u32> = None;
 
     loop {
         let item = tokio::select! {
-            _ = stop.wait() => return drain_owed(&mut rx, &gap),
+            _ = stop.wait() => return,
             item = rx.recv() => match item {
                 Some(i) => i,
-                None => return drain_owed(&mut rx, &gap),
+                None => return,
             },
         };
-        let Delivery::Event {
-            body,
-            delivery_id,
-            cursor,
-            gap_weight,
-        } = item;
+        let Delivery::Event { body, delivery_id } = item;
 
         counters
             .queue_depth
@@ -795,7 +489,6 @@ async fn deliver_loop(
                     counters
                         .last_success_unix
                         .store(unix_secs(), Ordering::Relaxed);
-                    persist_cursor(&hook, store.as_ref(), cursor, &mut persisted_height);
                     break;
                 }
                 satd_alert::Disposition::Drop => {
@@ -808,36 +501,6 @@ async fn deliver_loop(
                         delivery = %delivery_id,
                         "webhook receiver rejected the delivery permanently; skipping this event",
                     );
-                    // Record it as a gap, so the receiver is told in-band.
-                    //
-                    // This is the one drop path that did not, and it is the one
-                    // most likely to fire on a routine misconfiguration: a 3xx
-                    // (an `http://` URL behind a proxy that redirects to HTTPS)
-                    // and a 401 (a rotated secret, or a delivery that aged past
-                    // the receiver's freshness window while being retried) are
-                    // both permanent by this classification. Without a `lagged`
-                    // body the receiver has no way to learn which events it
-                    // lost, and — because the cursor advances below — no way to
-                    // recover them after the misconfiguration is fixed.
-                    //
-                    // `gap_weight` is what this delivery was itself announcing:
-                    // rejecting a `Lagged` that carried 500 must not shrink the
-                    // count to 1. Under a receiver that rejects every request —
-                    // a proxy 302ing the lot — a collapsing count would grind
-                    // gap accounting down to 1 on every cycle indefinitely.
-                    gap.dropped
-                        .fetch_add(gap_weight.saturating_add(1), Ordering::Relaxed);
-                    // Advance the cursor anyway. A permanent rejection is the
-                    // receiver's decision about this event, and it will decide
-                    // the same way next time — leaving the cursor parked would
-                    // make every restart rebuild and re-queue the same span
-                    // against an endpoint that has already refused it, forever.
-                    // The event is lost either way; the difference is whether
-                    // the hook makes progress past it. The drop is counted
-                    // (`satd_alertwebhook_dropped_total`), logged, and now
-                    // announced to the receiver, so the loss is visible on both
-                    // ends rather than silent.
-                    persist_cursor(&hook, store.as_ref(), cursor, &mut persisted_height);
                     break;
                 }
                 satd_alert::Disposition::Retry => {
@@ -852,15 +515,7 @@ async fn deliver_loop(
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        // Retired mid-backoff. This delivery is already out of
-                        // the queue, so `drain_owed` cannot see it — hand its
-                        // weight back explicitly before dropping it.
-                        _ = stop.wait() => {
-                            if gap_weight > 0 {
-                                gap.dropped.fetch_add(gap_weight, Ordering::Relaxed);
-                            }
-                            return drain_owed(&mut rx, &gap);
-                        }
+                        _ = stop.wait() => return,
                     }
                 }
             }
@@ -890,7 +545,6 @@ pub struct AlertReloader {
     /// explicitly rather than inherited from the caller.
     api_handle: tokio::runtime::Handle,
     publisher: Arc<EventPublisher>,
-    store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
     metrics: Arc<WebhookMetrics>,
     global_stop: watch::Receiver<bool>,
@@ -921,7 +575,6 @@ impl AlertReloader {
         path: std::path::PathBuf,
         api_handle: tokio::runtime::Handle,
         publisher: Arc<EventPublisher>,
-        store: Arc<dyn Store>,
         block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
         metrics: Arc<WebhookMetrics>,
         global_stop: watch::Receiver<bool>,
@@ -930,7 +583,6 @@ impl AlertReloader {
             path,
             api_handle,
             publisher,
-            store,
             block_source,
             metrics,
             global_stop,
@@ -1030,24 +682,15 @@ impl AlertReloader {
                     }
                     None => None,
                 };
-                let fresh = kept.is_none();
                 let running_hook = kept.unwrap_or_else(|| {
-                    start_hook(
-                        hook,
-                        &self.metrics,
-                        &DISPATCHER_STATE,
-                        self.store.clone(),
-                        self.global_stop.clone(),
-                    )
+                    start_hook(hook, &self.metrics, self.global_stop.clone())
                 });
                 channels.push(HookChannel {
                     id: hook.id.clone(),
                     hook: hook.clone(),
                     tx: running_hook.tx.clone(),
                     counters: running_hook.counters.clone(),
-                    gap: running_hook.gap.clone(),
                     reported_closed: std::sync::atomic::AtomicBool::new(false),
-                    fresh,
                 });
                 next_hooks.insert(hook.id.clone(), running_hook);
             }
@@ -1076,7 +719,6 @@ impl AlertReloader {
                     channels,
                     bus_rx,
                     self.publisher.clone(),
-                    self.store.clone(),
                     self.block_source.clone(),
                     Arc::clone(&DISPATCHER_STATE),
                     Stop {
@@ -1101,58 +743,6 @@ impl AlertReloader {
         keep.push(LEGACY_REORG_HOOK_ID.to_string());
         self.metrics.retain(&keep);
 
-        // Reclaim gap state for the same set. `metrics.retain` and the cursor
-        // GC below both prune on hook removal; the process-lived gap map has to
-        // prune with them, or a re-added id inherits its predecessor's pending
-        // drop count and resume anchor and announces a hole its new endpoint
-        // never had.
-        DISPATCHER_STATE.retain_gaps(&keep.iter().cloned().collect());
-
-        // Drop the durable cursor of any hook this reload removed. Hook ids are
-        // short and reused — `pager`, `alerts`, `ops` — so leaving the key
-        // behind means a later hook that happens to reuse the id inherits a
-        // stale resume position and greets a brand-new endpoint with the whole
-        // replay window of its predecessor's history.
-        //
-        // Reconciled against what is actually stored rather than against the
-        // previous generation. A reload-time diff cannot see the ordinary case:
-        // an operator who removes a hook by editing the file and *restarting*
-        // leaves no previous generation to compare against, so the cursor
-        // survived forever. Enumerating the keyspace also cleans up whatever
-        // earlier versions left behind.
-        let live: std::collections::HashSet<Vec<u8>> = file
-            .hooks
-            .iter()
-            .map(|h| h.cursor_key())
-            .chain(std::iter::once(
-                format!("alertwebhook.cursor.{LEGACY_REORG_HOOK_ID}").into_bytes(),
-            ))
-            .collect();
-        match self.store.list_alert_cursor_keys() {
-            Ok(stored) => {
-                for key in stored.into_iter().filter(|k| !live.contains(k)) {
-                    let label = String::from_utf8_lossy(&key).to_string();
-                    match self.store.delete_alert_cursor(&key) {
-                        Ok(()) => tracing::info!(
-                            target: "alert",
-                            key = %label,
-                            "no hook owns this resume cursor; dropped it",
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "alert",
-                            key = %label,
-                            error = %e,
-                            "failed to drop an orphaned resume cursor",
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "alert",
-                error = %e,
-                "could not enumerate stored resume cursors; orphans were not reclaimed",
-            ),
-        }
         *self.last_applied.lock() = Some(file);
         Ok(hook_count)
     }
@@ -1293,26 +883,6 @@ min_severity = "warning"
 "#;
 
     #[test]
-    fn cursor_round_trips_through_its_fixed_encoding() {
-        let c = Cursor {
-            height: 812_345,
-            tx_index: 7,
-            mempool_seq: 0xDEAD_BEEF_CAFE,
-            instance_id: 0x0102_0304_0506_0708,
-        };
-        assert_eq!(decode_cursor(&encode_cursor(&c)), Some(c));
-    }
-
-    #[test]
-    fn a_truncated_or_garbage_cursor_is_ignored_not_misread() {
-        // A corrupt cursor must degrade to "start at the live head", never to a
-        // wrong height that would replay or skip history.
-        assert_eq!(decode_cursor(&[]), None);
-        assert_eq!(decode_cursor(&[0u8; 23]), None);
-        assert_eq!(decode_cursor(&[0u8; 25]), None);
-    }
-
-    #[test]
     fn status_filter_is_applied_per_hook() {
         let hook = hook_from(STATUS_HOOK);
         let mut hb = None;
@@ -1349,34 +919,6 @@ min_severity = "warning"
         );
         let mut hb = None;
         assert!(!accepts(&hook, &env, &mut hb));
-    }
-
-    #[test]
-    fn lag_notices_bypass_every_filter() {
-        // A receiver must learn it missed events even if the events it missed
-        // were in a category it does not subscribe to — otherwise its cursor
-        // silently diverges.
-        let hook = hook_from(STATUS_HOOK);
-        let env = NodeEvent::new(
-            node::events::EdgeStamp {
-                node_id: [7; 16],
-                region: None,
-                edge_seen_at_ns: 0,
-                edge_wall_ns: 0,
-                seq: 1,
-            },
-            NodeEventBody::Lagged {
-                dropped_count: 3,
-                resume_cursor: Cursor {
-                    height: 1,
-                    tx_index: 0,
-                    mempool_seq: 0,
-                    instance_id: 1,
-                },
-            },
-        );
-        let mut hb = None;
-        assert!(accepts(&hook, &env, &mut hb));
     }
 
     #[test]
@@ -1450,7 +992,6 @@ heartbeat_interval_secs = 3600
             dir.join("alertfile.toml"),
             tokio::runtime::Handle::current(),
             publisher.clone(),
-            Arc::new(node::storage::db::InMemoryStore::new()),
             None,
             Arc::new(WebhookMetrics::new()),
             global_stop,

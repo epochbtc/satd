@@ -1284,22 +1284,6 @@ impl Store for CoinCache {
         self.inner.write_sp_backfill_last_error(msg)
     }
 
-    fn read_alert_cursor(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner.read_alert_cursor(key)
-    }
-
-    fn write_alert_cursor(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.inner.write_alert_cursor(key, value)
-    }
-
-    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
-        self.inner.list_alert_cursor_keys()
-    }
-
-    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
-        self.inner.delete_alert_cursor(key)
-    }
-
     fn lookup_spend(
         &self,
         outpoint: &OutPoint,

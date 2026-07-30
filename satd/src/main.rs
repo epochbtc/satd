@@ -2195,9 +2195,8 @@ async fn main() {
             path,
             api_handle.clone(),
             event_publisher.clone(),
-            chain_state.store_ref().clone() as std::sync::Arc<dyn node::storage::Store>,
-            // Block source for a hook's startup catch-up replay: read-only
-            // active-chain access, the same handle the streaming carriers use.
+            // Read-only active-chain access, used only to answer "is this node
+            // still in initial block download" for the firehose gate.
             Some(chain_state.clone() as std::sync::Arc<dyn node::events::BlockCursorSource>),
             webhook_metrics.clone(),
             shutdown_rx.clone(),

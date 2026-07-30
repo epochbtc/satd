@@ -80,15 +80,11 @@ enum Behavior {
     /// Answer every request with `302 Location: <url>`.
     Redirect(String),
     /// Answer with `code` for any `block_connected` at one of these heights,
-    /// 200 for everything else. Unlike `RejectHeights` the status is the
-    /// caller's, so a 5xx leaves the delivery in retry and the hook's resume
-    /// marker parked — which is what an endpoint outage looks like from the
-    /// node's side.
+    /// 200 for everything else. Keyed on content rather than request ordinal so
+    /// a script does not depend on how many events a block produces; a 5xx
+    /// leaves the delivery in retry, which is what an endpoint outage looks
+    /// like from the node's side.
     FailHeights(Vec<u64>, u16),
-    /// Permanently reject (404) any `block_connected` at one of these heights,
-    /// accept everything else. Keyed on content rather than request ordinal so
-    /// the script does not depend on how many events a block produces.
-    RejectHeights(Vec<u64>),
 }
 
 struct Inner {
@@ -141,13 +137,6 @@ impl MockReceiver {
                                     _ => (200, None),
                                 }
                             }
-                            Behavior::RejectHeights(hs) => {
-                                let h = req.json()["body"]["height"].as_u64();
-                                match h {
-                                    Some(h) if hs.contains(&h) => (404, None),
-                                    _ => (200, None),
-                                }
-                            }
                         };
                         // Only a request the receiver actually accepted counts
                         // as received; a 503'd attempt is a retry, not a
@@ -194,23 +183,6 @@ impl MockReceiver {
     /// Answer every request with a 302 pointing at `to`.
     pub async fn redirecting_to(to: String) -> Self {
         Self::start(Behavior::Redirect(to)).await
-    }
-
-    /// Permanently reject `block_connected` at these heights; accept the rest.
-    pub async fn rejecting_heights(heights: Vec<u64>) -> Self {
-        Self::start(Behavior::RejectHeights(heights)).await
-    }
-
-    /// Heights of every accepted `block_connected` delivery, in arrival order.
-    async fn accepted_heights(&self) -> Vec<u64> {
-        self.inner
-            .lock()
-            .await
-            .received
-            .iter()
-            .filter(|r| r.json()["body"]["kind"] == "block_connected")
-            .filter_map(|r| r.json()["body"]["height"].as_u64())
-            .collect()
     }
 
     pub fn url(&self) -> String {
@@ -652,105 +624,6 @@ async fn editing_one_hook_does_not_destroy_another_hooks_queued_event() {
     assert!(got.signature_valid(SECRET));
 }
 
-/// A permanently-rejected event still advances the hook's resume cursor.
-///
-/// Otherwise a receiver that hard-rejects one body shape turns every reload and
-/// every restart into a rebuild of the same refused span — the events are lost
-/// either way, and the only question is whether the hook makes progress past
-/// them. Here blocks 2 and 3 are 404'd; the reload that follows re-runs catch-up
-/// from the stored cursor, and must not replay them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn webhook_permanent_rejection_advances_the_cursor() {
-    let receiver = MockReceiver::rejecting_heights(vec![2, 3]).await;
-    let (sn, _dir) = node_with_hook(&receiver, "chain", "\"chain\"", vec![]).await;
-
-    crate::streaming::mine_n(&sn, 3).await;
-    // Block 1 is accepted; 2 and 3 are refused. Wait for the last one to have
-    // been attempted, so the cursor writes have happened.
-    receiver
-        .wait_for(60, |r| r.json()["body"]["height"] == 1)
-        .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let block_attempts = |rs: Vec<Received>| -> Vec<u64> {
-        rs.iter()
-            .filter(|r| r.json()["body"]["kind"] == "block_connected")
-            .filter_map(|r| r.json()["body"]["height"].as_u64())
-            .collect()
-    };
-    let before = block_attempts(receiver.all_attempts().await);
-    assert_eq!(before, vec![1, 2, 3], "expected all three blocks attempted once");
-
-    // A SIGHUP retires the generation and starts a new one, which re-runs
-    // catch-up from the persisted cursor.
-    //
-    // The alertfile must actually change: an unchanged one is deliberately a
-    // no-op, because retiring a generation destroys its queued deliveries and a
-    // status event has no replay to recover it. Without a real edit here this
-    // test would pass without ever re-running catch-up — the exact thing it
-    // exists to check.
-    write_alertfile(&_dir, &receiver, "chain", "\"chain\"", true);
-    crate::streaming::sighup_with_conf(&sn, "").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Counting *attempts*, not accepted deliveries: a replayed block would be
-    // refused again and so would never show up as accepted. What matters is
-    // whether the request was made at all.
-    //
-    // Scoped to `block_connected` rather than a raw request count, because a
-    // permanent rejection now also emits a `lagged` notice — the receiver is
-    // told which events it lost, since the cursor advancing past them means it
-    // can never fetch them later. A raw count would fold that in and read as a
-    // replayed block.
-    assert_eq!(
-        block_attempts(receiver.all_attempts().await),
-        before,
-        "a refused span must not be rebuilt and re-sent on reload",
-    );
-    let heights = receiver.accepted_heights().await;
-    assert_eq!(heights, vec![1], "only block 1 was ever accepted; got {heights:?}");
-
-    // The hook is not wedged: the next block still arrives.
-    crate::streaming::mine_n(&sn, 1).await;
-    receiver
-        .wait_for(60, |r| r.json()["body"]["height"] == 4)
-        .await;
-
-    // ...and the refusal was announced rather than silent. A gap notice is
-    // emitted ahead of the next event for the hook, so this is asserted after
-    // block 4 rather than immediately after the rejections.
-    //
-    // It matters here more than on any other drop path: the cursor advances
-    // past a permanently-rejected event, so unlike a queue overflow the
-    // receiver cannot go back for it. Being told is all it gets.
-    // Summed across notices rather than read off the first one. The gap
-    // accounting also flushes on a timer, so whether the two refusals coalesce
-    // into a single notice of 2 or arrive as two notices of 1 depends only on
-    // which side of a tick they land on — a race this test has no reason to
-    // pin down. Only the total is meaningful.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let attempts = receiver.all_attempts().await;
-        let lagged: Vec<_> = attempts
-            .iter()
-            .filter(|r| r.json()["body"]["category"] == "lagged")
-            .collect();
-        let total: u64 = lagged
-            .iter()
-            .filter_map(|r| r.json()["body"]["dropped_count"].as_u64())
-            .sum();
-        if total >= 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "both refused blocks should be counted; got {total} across {} notice(s): {:?}",
-            lagged.len(),
-            lagged.iter().map(|r| r.body.clone()).collect::<Vec<_>>(),
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 /// A redirect is never followed: the signed body does not go to a host the
 /// alertfile never named.
 ///
@@ -799,71 +672,60 @@ async fn webhook_permanent_rejection_does_not_wedge_the_queue() {
     assert!(receiver.attempts().await >= 2);
 }
 
-/// A span missed while the hook was dead is announced, not replayed.
+/// A hook that was not running does not go back for what it missed.
 ///
-/// Webhooks are realtime (design D6): the durable cursor is a resume marker,
-/// not a replay log. On restart the dispatcher compares it against the tip and
-/// emits one `Lagged` naming what was missed; the events themselves are gone,
-/// and a receiver that needs them fetches them over the streaming API from the
-/// advertised `resume_cursor`.
+/// This is the whole durability contract, asserted from the outside. Webhooks
+/// are best-effort (design D6): there is no cursor, no replay and no gap
+/// notice. A hook that comes back resumes at the live head, and the events that
+/// happened while it was down are simply not delivered.
 ///
-/// This replaces a test of the old catch-up replay. That replay was built up to
-/// 10,000 blocks into a queue holding 1,024, so any outage long enough to
-/// matter had its "guaranteed" recovery converted straight back into an
-/// overflow gap — and its per-height delivery ids collided between a block and
-/// its post-reorg replacement, so a conforming receiver dropped the
-/// replacement.
+/// The assertion is deliberately that the node does *not* do something. Earlier
+/// revisions delivered the missed span, then announced it — each of which cost
+/// a durable keyspace, a `Store` trait extension across four backends, a GC
+/// pass and a synthesized delivery-id space, to serve a use case the streaming
+/// API already serves properly with real cursors and backpressure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_missed_span_is_announced_as_a_gap_and_never_replayed() {
-    // 503 blocks 2..=5 so they stay in retry and never advance the marker.
-    // Everything else — block 1, and the gap notice itself — is accepted.
+async fn a_hook_that_was_down_resumes_at_the_live_head() {
+    // 503 blocks 2..=5 so they stay queued and un-acked when the hook is
+    // retired. Everything else is accepted.
     let receiver = MockReceiver::failing_heights(vec![2, 3, 4, 5], 503).await;
     let (sn, dir) = node_with_hook(&receiver, "chain", "\"chain\"", vec![]).await;
 
-    // Establish a marker: one block delivered and acked.
     crate::streaming::mine_n(&sn, 1).await;
     receiver
         .wait_for(60, |r| r.json()["body"]["height"] == 1)
         .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // The outage. These four are queued and retrying; none is acked, so the
-    // marker stays at 1 while the tip moves to 5.
+    // The outage: four blocks queued and retrying, none acked.
     crate::streaming::mine_n(&sn, 4).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let missed = |r: &Received| (2..=5).contains(&r.json()["body"]["height"].as_u64().unwrap_or(0));
-    let attempts_before = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
-    assert!(attempts_before > 0, "the outage span should have been attempted at least once");
+    let before = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
+    assert!(before > 0, "the outage span should have been attempted at least once");
 
     // Retire the generation with a same-URL alertfile edit — the same code path
-    // a restart takes. The queued, still-retrying blocks go with it, which is
-    // exactly why the receiver has to be told.
+    // a restart takes. The queued blocks go with it.
     write_alertfile(&dir, &receiver, "chain", "\"chain\"", true);
     crate::streaming::sighup_with_conf(&sn, "").await;
-
-    let lagged = receiver
-        .wait_for(60, |r| r.json()["body"]["category"] == "lagged")
-        .await;
-    assert!(
-        lagged.json()["body"]["dropped_count"].as_u64().unwrap_or(0) >= 4,
-        "the whole missed span must be counted; got {}",
-        lagged.body,
-    );
-    // The anchor points at or before the last block the receiver actually got,
-    // never past the hole it is announcing.
-    assert!(
-        lagged.json()["body"]["resume_cursor"]["height"].as_u64().unwrap_or(u64::MAX) <= 1,
-        "resume anchor is past the gap it announces; got {}",
-        lagged.body,
-    );
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // ...and nothing from the missed span was re-sent.
-    let attempts_after = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
+    // Nothing from the missed span comes back...
+    let after = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
     assert_eq!(
-        attempts_after, attempts_before,
-        "the missed span was replayed; a gap notice replaces it, it does not precede it"
+        after, before,
+        "the missed span was re-sent; a best-effort hook resumes at the head and \
+         does not carry history across a reload"
+    );
+
+    // ...and no in-band notice is synthesized about it either.
+    assert!(
+        !receiver
+            .all_attempts()
+            .await
+            .iter()
+            .any(|r| r.json()["body"]["category"] == "lagged"),
+        "a lagged body was delivered; gap accounting was removed with the cursor"
     );
 
     // The hook is live: the next block still arrives.

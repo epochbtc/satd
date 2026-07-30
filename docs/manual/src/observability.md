@@ -230,10 +230,9 @@ So a receiver must:
 > keys still use exactly that, unchanged, and still report version `1` — branch
 > on the version header rather than assuming one scheme.
 
-The `X-Satd-Delivery` value is opaque; do not parse it. Its suffix distinguishes
-how the delivery arose — a bare counter for a live event, `w` for a watch match,
-and `r` for a synthesized notice such as `lagged`. Deduplicate on the whole
-header; it is unique per event and stable across the retries of one delivery.
+The `X-Satd-Delivery` value is opaque; do not parse it. Deduplicate on the whole
+header: it is unique per event and stable across the retries of one delivery, so
+the only duplicate you can receive is a retry of something you already saw.
 
 ### Delivery behavior
 
@@ -243,40 +242,39 @@ header; it is unique per event and stable across the retries of one delivery.
   1 s doubling to a 5-minute ceiling, indefinitely. Any *other* 4xx is treated
   as permanent, counted, and skipped — a receiver answering 404 forever must
   not pin the queue and turn every later event into a drop. A skipped event
-  still advances the hook's resume position, so a hard-rejecting endpoint makes
-  progress instead of announcing the same refused span as a gap after every
-  restart. The skip is counted and reported in the next `lagged` body.
+  The skip is counted in `satd_alertwebhook_dropped_total` and logged.
 - **Redirects are not followed.** A 3xx is a permanent drop. The URL in the
   alertfile is where the signed body goes; following a redirect would move it —
   signature, hook identity and all — to a host you never named, and the useful
   targets for that are exactly the ones you cannot see: a cloud metadata
   endpoint, an RFC1918 admin port, the node's own RPC. If your receiver moves,
   update the alertfile.
-- **Bounded queue.** A hook that falls far enough behind drops events, and the
-  next delivery is preceded by a `lagged` body carrying how many were lost and
-  the cursor to resume from. A gap is never silent.
+- **Bounded queue.** A hook that falls far enough behind drops events. They are
+  counted in `satd_alertwebhook_dropped_total` and logged; nothing is held for
+  later and nothing is inserted into the stream to tell the receiver.
 - **Nothing reaches consensus.** Deliveries run on the isolated API runtime;
   a stalled endpoint cannot affect block connection.
-- **At-most-once, and a gap is announced.** Webhooks deliver what is happening
-  now; they are not a log you can rewind. Each hook's resume position is
-  persisted, but it is a *marker*, not a replay cursor: on startup the hook is
-  told what it missed while the daemon was down — one `lagged` body carrying the
-  count and the height to resume from — and then goes live. It does not re-send
-  the span. Health events are re-raised by re-evaluation, and mempool events are
-  best-effort, the same contract the event bus itself offers. Every way an event
-  can be skipped — the daemon being down, queue overflow, a permanent rejection,
-  suppression during a sync — increments the hook's drop count and produces a
-  `lagged` body. So the guarantee is precisely "delivered, or reported missing",
-  never both and never silent. If you need the span itself, the `lagged` body
-  carries the position to fetch it from: use `RescanBlocks` on the streaming API
-  or the JSON-RPC history calls.
+- **Best-effort, and that is the whole contract.** Nothing is persisted. A
+  webhook fires when something happens and is retried while your endpoint is
+  briefly unreachable; that is all it promises. A node that was down did not
+  deliver those events and will not go back for them — when it comes up, its
+  hooks resume at the live head. Health alerts are the exception, and they get
+  it for free: the detectors re-evaluate at startup and re-raise anything still
+  true (see **Durability** above), so a standing problem still reaches you.
+
+  If you need guaranteed delivery, resumability across downtime, or history,
+  use the [Streaming Consumption API](streaming.md). That is the recommended
+  way to integrate with satd and it does all three properly — real cursors,
+  backpressure, and a bounded `RescanBlocks`. Webhooks are for automation you
+  are happy to miss occasionally: page me, poke a script, ping a dead-man's
+  switch.
 - **Suppressed during initial block download.** A node syncing from scratch does
   not POST its entire history: while it is catching up, only `status` and
   `heartbeat` events are delivered. Health alerts stay live because "this node is
   unhealthy" is exactly as true mid-sync, and the heartbeat keeps flowing so an
-  external dead-man's switch does not declare a syncing node dead. Everything
-  suppressed is counted and reported in the next `lagged` body. The suppression
-  is latched on leaving IBD once, so a node whose tip later goes stale keeps
+  external dead-man's switch does not declare a syncing node dead. What was
+  suppressed is counted in `satd_alertwebhook_dropped_total`. The suppression is
+  latched on leaving IBD once, so a node whose tip later goes stale keeps
   alerting — which is the whole point of a stalled-tip alert.
 
 Plaintext `http://` is accepted for loopback and private-network targets. For a

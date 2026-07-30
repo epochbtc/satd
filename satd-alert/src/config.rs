@@ -4,7 +4,7 @@
 //! version = 1
 //!
 //! [[webhook]]
-//! id = "ops"                      # unique; appears in headers and the cursor key
+//! id = "ops"                      # unique; appears in headers and metric labels
 //! url = "https://alerts.example/satd"
 //! secret = "a-long-random-string" # required — it signs the body
 //! categories = ["status"]         # status | chain | mempool | heartbeat
@@ -154,21 +154,7 @@ impl std::fmt::Debug for Hook {
     }
 }
 
-impl Hook {
-    /// The `CF_METADATA` key holding this hook's durable resume marker.
-    ///
-    /// Keyed on the id *and* a hash of the endpoint URL. On id alone,
-    /// repointing a hook at a new endpoint — which an operator does precisely
-    /// when the old one is dead and its marker is far behind — would hand the
-    /// new endpoint its predecessor's position and announce a gap it never had.
-    /// Including the URL means a repoint starts clean; the stale key is then
-    /// garbage-collected on the next reload like any other orphan.
-    pub fn cursor_key(&self) -> Vec<u8> {
-        use sha2::{Digest as _, Sha256};
-        let url_hash = hex::encode(Sha256::digest(self.url.as_bytes()));
-        format!("alertwebhook.cursor.{}-{}", self.id, &url_hash[..16]).into_bytes()
-    }
-}
+
 
 /// A parsed, validated alertfile.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -239,7 +225,7 @@ impl AlertFile {
         }
 
         // Ids name a hook in delivery headers, in metrics labels, and in the
-        // durable cursor key, so a duplicate would silently make two hooks
+        // metric label and header value, so a duplicate would conflate two hooks
         // share one resume position.
         let mut seen = BTreeSet::new();
         for h in &hooks {
@@ -278,7 +264,7 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(AlertFileError::invalid(
             path,
-            format!("webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers, metric labels, and the cursor key)"),
+            format!("webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers and metric labels)"),
         ));
     }
     let url = req_str(path, t, "url")?;
@@ -588,43 +574,6 @@ categories = ["status"]
         assert!(h.filter.kinds.is_none());
         assert!(h.filter.min_severity.is_none());
         assert_eq!(h.heartbeat_interval_secs, None);
-        let key = String::from_utf8(h.cursor_key()).unwrap();
-        assert!(key.starts_with("alertwebhook.cursor.ops-"), "got {key}");
-    }
-
-    /// Repointing a hook at a new endpoint must not hand it the old one's
-    /// resume marker.
-    ///
-    /// An operator changes a URL precisely when the old endpoint is dead and
-    /// its marker has fallen far behind. Keyed on the id alone, the new
-    /// endpoint would inherit that position and be told it had missed a span it
-    /// was never subscribed to.
-    #[test]
-    fn repointing_a_hook_changes_its_cursor_key() {
-        let a = AlertFile::parse(
-            Path::new("/tmp/a.toml"),
-            "version = 1\n\
-             [[webhook]]\n\
-             id = \"ops\"\n\
-             url = \"https://a.example/hook\"\n\
-             secret = \"0123456789abcdef0123456789abcdef\"\n\
-             categories = [\"status\"]\n",
-        )
-        .unwrap();
-        let b = AlertFile::parse(
-            Path::new("/tmp/b.toml"),
-            "version = 1\n\
-             [[webhook]]\n\
-             id = \"ops\"\n\
-             url = \"https://b.example/hook\"\n\
-             secret = \"0123456789abcdef0123456789abcdef\"\n\
-             categories = [\"status\"]\n",
-        )
-        .unwrap();
-        assert_ne!(a.hooks[0].cursor_key(), b.hooks[0].cursor_key());
-        // Same URL, same key: a reload that changes nothing must not orphan the
-        // marker and restart the hook from the live head.
-        assert_eq!(a.hooks[0].cursor_key(), a.hooks[0].cursor_key());
     }
 
     #[test]
@@ -736,7 +685,7 @@ categories = ["chain"]
 
     #[test]
     fn duplicate_ids_are_rejected() {
-        // Two hooks sharing an id would share a durable cursor key.
+        // Two hooks sharing an id would be indistinguishable to a receiver.
         let two = format!("{MINIMAL}\n[[webhook]]\nid = \"ops\"\nurl = \"https://b.example/h\"\nsecret = \"t\"\ncategories = [\"chain\"]\n");
         let err = parse(&two).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");

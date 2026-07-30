@@ -25,11 +25,6 @@ pub struct InMemoryStore {
     tx_index: parking_lot::RwLock<std::collections::HashMap<Txid, BlockHash>>,
     chain_tx: parking_lot::RwLock<std::collections::HashMap<BlockHash, u64>>,
     chain_tx_backfill_complete: parking_lot::RwLock<bool>,
-    /// Alert-webhook resume markers. Present so that cursor and GC tests run
-    /// against real behaviour: the `Store` defaults return `Ok(vec![])` from
-    /// `list_alert_cursor_keys` and `Err` from `write_alert_cursor`, which
-    /// would make every such test pass without exercising anything.
-    alert_cursors: parking_lot::RwLock<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
     addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
     addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
     outpoint_spend: parking_lot::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
@@ -73,7 +68,6 @@ impl InMemoryStore {
             // chains populate chain_tx directly, so the backfill is a no-op
             // there regardless.
             chain_tx_backfill_complete: parking_lot::RwLock::new(false),
-            alert_cursors: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             addr_funding: parking_lot::RwLock::new(Vec::new()),
             addr_spending: parking_lot::RwLock::new(Vec::new()),
             outpoint_spend: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -112,33 +106,6 @@ impl InMemoryStore {
 }
 
 impl Store for InMemoryStore {
-    fn read_alert_cursor(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.alert_cursors.read().get(key).cloned()
-    }
-
-    fn write_alert_cursor(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.alert_cursors
-            .write()
-            .insert(key.to_vec(), value.to_vec());
-        Ok(())
-    }
-
-    fn delete_alert_cursor(&self, key: &[u8]) -> Result<(), StoreError> {
-        self.alert_cursors.write().remove(key);
-        Ok(())
-    }
-
-    fn list_alert_cursor_keys(&self) -> Result<Vec<Vec<u8>>, StoreError> {
-        const PREFIX: &[u8] = b"alertwebhook.cursor.";
-        Ok(self
-            .alert_cursors
-            .read()
-            .keys()
-            .filter(|k| k.starts_with(PREFIX))
-            .cloned()
-            .collect())
-    }
-
     fn flush_durable(&self) -> Result<(), StoreError> {
         self.flush_durable_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
