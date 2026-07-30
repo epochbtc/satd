@@ -1012,7 +1012,7 @@ webhook dispatcher) is documented in the Operator Manual, not here.
 
 Health events are also deliverable over **outbound webhooks**, whose bodies are
 byte-identical to the JSON on this surface — one schema, two transports. The
-delivery contract (headers, signature, retry and gap semantics) is specified in
+delivery contract (headers, signature, retry and drop semantics) is specified in
 [`webhooks.md`](webhooks.md).
 
 ## 8. Reorg events

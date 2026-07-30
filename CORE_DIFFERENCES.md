@@ -376,10 +376,12 @@ preserved; the satd extension is opt-in per request or per flag.
 
 - **Outbound alert webhooks (`alertfile=`).** A satd extension with no Core
   counterpart: a TOML file describing any number of signed HTTP hooks, each
-  filtered by category, kind, and severity, optionally carrying a watch-set of
-  scripts / outpoints / txids / silent-payment scan keys. Bodies are identical
-  to the streaming API's JSON for the same event; delivery is serial per hook,
-  retried with backoff, and gaps are reported in-band rather than silently.
+  filtered by category, kind, and severity. Bodies are identical to the
+  streaming API's JSON for the same event; delivery is serial per hook and
+  retried with backoff, but it is best-effort: a hook that falls behind has
+  events dropped, counted in `satd_alertwebhook_dropped_total` and logged, with
+  no in-band notice to the receiver. Per-address, per-outpoint, and per-scan-key
+  matching is the streaming API's `Watch` stream, not this surface.
   The wire contract is specified in [`docs/api/webhooks.md`](docs/api/webhooks.md).
   The older `reorgwebhook=` keys remain, with their original payload, served by
   the same dispatcher.

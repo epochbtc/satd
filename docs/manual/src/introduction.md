@@ -73,4 +73,4 @@ These live at the repository root rather than in this manual:
   protocol spec; this manual documents the shipped surface.
 - [`docs/api/webhooks.md`](https://github.com/epochbtc/satd/blob/master/docs/api/webhooks.md):
   the alert-webhook delivery contract — headers, signature (with test vectors),
-  retry and gap semantics. Written for anyone building a receiver.
+  retry and drop semantics. Written for anyone building a receiver.

@@ -105,8 +105,8 @@ are added additively and do not bump `schema_version`.
 specific addresses, outpoints, transactions or silent-payment scan keys. That is
 what the streaming API's `Watch` stream is for, and it does it properly —
 per-connection watch-sets, depth alarms, `RescanBlocks` for history,
-backpressure. A `[webhook.watch]` table in an alertfile is a hard parse error
-naming the streaming API, not an unknown key.
+backpressure. A `[webhook.watch]` table in an alertfile is rejected at load as
+an unknown key — the alertfile parser accepts no key it does not implement.
 
 In particular, do not reach for `"mempool"` to learn about *your* transactions
 before they confirm: it is every transaction on the network, thousands per
@@ -143,8 +143,8 @@ signing_string = "2" LF <X-Satd-Timestamp> LF <X-Satd-Delivery> LF <X-Satd-Hook>
 where `LF` is a single `0x0A` and `raw_body` is the exact request body bytes.
 No escaping is needed: every field before the body is restricted to a character
 set that excludes LF (the version is a literal, the timestamp is decimal digits,
-the delivery id is hex plus `-` and an optional `w`/`r` tag, and hook ids are
-`[A-Za-z0-9_-]`), and the body is last.
+the delivery id is hex plus `-`, and hook ids are `[A-Za-z0-9_-]`), and the body
+is last.
 
 - The key is the hook's `secret` from the alertfile, as UTF-8 bytes.
 - Every delivery is signed; a hook without a secret cannot be configured.
@@ -195,10 +195,21 @@ is published) and **unique across restarts** (the instance nonce changes) — so
 retry and a genuinely repeated condition are distinguishable, which a bare `seq`
 could not do since `seq` restarts at zero.
 
-Delivery is **at-most-once**, never exactly-once. The only duplicate you can
-receive is a retry of one delivery, which carries the id unchanged, so
-deduplicating on this header is sufficient — the same event never arrives under
-two different ids. satd never re-sends an event it has already delivered.
+Delivery is **at-most-once**, never exactly-once, and **deduplicating on this
+header is required** — not merely advisable.
+
+Two situations produce a repeat, and both carry the id unchanged, so the same
+event never arrives under two different ids:
+
+1. A **retry** of a delivery whose response was lost. `X-Satd-Attempt`
+   increments.
+2. A **config reload** (`SIGHUP`). The dispatcher subscribes the incoming
+   generation to the event bus before retiring the outgoing one, so that no
+   event falls between them; the cost is that an event in flight across the
+   handover can be enqueued by both. Both copies carry `X-Satd-Attempt: 1`.
+   This is the deliberate trade — losing an alert is worse than repeating one —
+   and it is why a receiver must dedupe rather than lean on the attempt counter
+   alone.
 
 ## 5. Delivery behavior
 
@@ -270,12 +281,13 @@ Nothing is persisted per hook. Retries are the only recovery mechanism, and they
 cover the only failure this surface promises to survive: a receiver that is
 briefly unreachable.
 
-**Alerts are suppressed while the node is in initial block download**, except
-`status` and `heartbeat`. Syncing from genesis would otherwise POST one delivery
-per historical block for as long as the sync takes. Health events keep flowing
-because "this node is unhealthy" is exactly as true mid-sync, and the heartbeat
-keeps flowing so an external dead-man's switch does not declare a syncing node
-dead. What was suppressed is counted in `satd_alertwebhook_dropped_total`. The
+**`chain` alerts are suppressed while the node is in initial block download.**
+Syncing from genesis would otherwise POST one delivery per historical block for
+as long as the sync takes. `status`, `heartbeat` **and `mempool`** keep flowing:
+health events because "this node is unhealthy" is exactly as true mid-sync, and
+the heartbeat so an external dead-man's switch does not declare a syncing node
+dead. Size a `mempool` receiver accordingly — a multi-day sync does not quiet
+it, and mainnet mempool volume is thousands of deliveries a minute. What was suppressed is counted in `satd_alertwebhook_dropped_total`. The
 suppression latches on first leaving IBD, so a node whose tip later goes stale
 keeps alerting — the IBD predicate is the tip header's *age*, which reads
 "syncing" on any node that has stalled or been restored from a backup, and
