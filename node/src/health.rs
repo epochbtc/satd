@@ -57,10 +57,16 @@ use crate::warnings::{NodeWarnings, Severity};
 /// `peer_floor`, and the tip-stall timer) re-evaluate.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How far back to search the reorg log when recovering a lag-interrupted depth
-/// count. Generous because the match is exact (on the abandoned tip height), so
-/// a wide window costs nothing in precision — only a longer `Vec` to scan.
-const REORG_LOG_LOOKBACK_SECS: u64 = 300;
+/// How far back to search the reorg log on each poll.
+///
+/// The whole ring, deliberately. A bounded window was a second way to lose an
+/// edge permanently: `deep_reorg` is never reconstructed, so any delay of this
+/// task past the window — API-runtime saturation, a `statvfs` blocking on a
+/// hung mount, a VM pause, `SIGSTOP` — dropped every reorg older than it out of
+/// view for good. The window bought nothing, because [`ReorgSeen`] is already
+/// an exact de-duplicator; the only cost of scanning everything is cloning at
+/// most `DEFAULT_RING_CAPACITY` (256) records per poll.
+const REORG_LOG_LOOKBACK_SECS: u64 = u64::MAX;
 
 /// Fixed hysteresis constants. Deliberately not configurable: six raise
 /// thresholds is already a lot of operator surface, and these ratios only need
@@ -243,10 +249,6 @@ pub struct HealthState {
     /// `active`. Read by [`clear_if_threshold_relaxed`] to tell "the reading
     /// recovered" apart from "the operator moved the line".
     raised_at_threshold: [AtomicU64; StatusKind::ALL.len()],
-    /// Latched once the node has been observed out of initial block download.
-    /// See the IBD guard in [`check_tip_stall`]: `is_initial_block_download()`
-    /// can flip back to `true` on a long-stalled node, which would otherwise
-    /// permanently freeze that detector.
     /// Latched once the node has had at least one peer. Gates the
     /// `peer_floor` hold clock so a node that has not finished dialing out yet
     /// does not alert on a startup transient.
@@ -384,11 +386,14 @@ async fn run_detectors(
     // that actually started in IBD — otherwise every restart of a synced node
     // would announce that it finished syncing.
     let mut ibd_pending = chain_state.is_initial_block_download();
-    // Which reorg-log records have already been reported. Seeded from the
-    // current clock so a restart does not re-announce reorgs that predate it:
-    // `deep_reorg` is an edge event, and D3 re-raises standing conditions
+    // Which reorg-log records have already been reported. Seeded from what the
+    // log already holds so a restart does not re-announce reorgs that predate
+    // it: `deep_reorg` is an edge event, and D3 re-raises standing conditions
     // across a restart, not edges.
-    let mut reorgs_seen = ReorgWatermark::seeded_now();
+    let mut reorgs_seen = ReorgSeen::default();
+    if let Some(log) = chain_state.reorg_log() {
+        reorgs_seen.seed(&log.history(REORG_LOG_LOOKBACK_SECS));
+    }
     // Hold-time trackers for `peer_floor`: the condition must persist in either
     // direction before it is acted on.
     let mut peers_below_since: Option<Instant> = None;
@@ -399,11 +404,14 @@ async fn run_detectors(
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    return;
-                }
-            }
+            // Unconditional, like every other shutdown handler in the tree.
+            // `changed()` returns `Err` immediately and forever once the last
+            // sender drops, while `borrow()` still reads whatever value was
+            // last set — so gating the return on `*shutdown.borrow()` turns a
+            // dropped sender into a 100%-CPU spin on an API worker instead of a
+            // clean exit. A sender dropped without setting `true` means nobody
+            // is left to ask us to stop, which is a stop.
+            _ = shutdown.changed() => return,
             ev = chain_rx.recv() => {
                 match ev {
                     Ok(ChainEvent::BlockConnected { height, .. }) => {
@@ -435,10 +443,14 @@ async fn run_detectors(
                         // `scan_reorg_log`.
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Nothing here depends on a complete event run: the
-                        // tip-stall clock is re-derived from the tip on every
-                        // poll, and reorg depth comes from the durable log. Lag
-                        // is worth a line and nothing more.
+                        // Nothing here depends on a complete event run. The
+                        // tip-stall clock is advanced by `BlockConnected`, but
+                        // a drop only delays it: the next retained connect
+                        // still arrives and still resets it, and a node with no
+                        // further blocks is stalled — which is what the
+                        // detector is for. Reorg depth comes from the durable
+                        // log, not from these events. Lag is worth a line and
+                        // nothing more.
                         tracing::debug!(
                             target: "health",
                             dropped = n,
@@ -457,7 +469,7 @@ async fn run_detectors(
                 let age = last_connect.elapsed().as_secs();
                 state.last_connect_age_secs.store(age, Ordering::Relaxed);
                 check_tip_stall(&state, &warnings, &publisher, &thresholds, &chain_state, age);
-                check_disk(&state, &warnings, &publisher, &thresholds, &disk_watch_path);
+                check_disk(&state, &warnings, &publisher, &thresholds, &disk_watch_path).await;
                 check_mempool(&state, &warnings, &publisher, &thresholds, &mempool);
                 check_peers(
                     &state, &warnings, &publisher, &thresholds, &peer_manager,
@@ -735,7 +747,15 @@ fn check_tip_stall_values(
     }
 }
 
-fn check_disk(
+/// Sample the watched volume and evaluate `disk_low`.
+///
+/// `async` purely so the `statvfs` can go to `spawn_blocking`. `disk_watch_path`
+/// defaults to `blocksdir`, which operators routinely point at NFS or iSCSI, and
+/// `statvfs` on a hung network mount blocks uninterruptibly. Called inline it
+/// would park an API-runtime worker and — since every detector shares this one
+/// task — freeze *all* of them, `tip_stall` and `deep_reorg` included, for as
+/// long as the mount stayed wedged.
+async fn check_disk(
     state: &HealthState,
     warnings: &NodeWarnings,
     publisher: &EventPublisher,
@@ -749,12 +769,23 @@ fn check_disk(
     // would delete the series out from under their own rule, silently. An
     // unreadable filesystem reports "unknown" rather than a zero that would
     // read as "completely full".
-    let sample = crate::diskspace::free_disk_bytes(path);
+    let sample = {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::diskspace::free_disk_bytes(&path))
+            .await
+            .unwrap_or(None)
+    };
     state
         .disk_free_bytes
         .store(sample.unwrap_or(DISK_UNKNOWN), Ordering::Relaxed);
+    // Log on the raise edge only. Firing this every poll while the condition
+    // holds is 4 identical WARN lines a minute — 5,760 a day — which buries the
+    // rest of the log for exactly as long as the operator has a real problem.
+    // Checked before `check_disk_values` runs, so `is_active` still reads the
+    // previous poll's verdict.
     if let Some(free) = sample
         && free < thresholds.disk_free_bytes()
+        && !state.is_active(StatusKind::DiskLow)
     {
         // The path is deliberately NOT a wire detail. It goes to every `status`
         // subscriber, every webhook receiver, and onward into APNs/FCM push
@@ -1077,39 +1108,66 @@ fn check_peers_values(
     }
 }
 
+/// How many reported reorgs to remember. The log's own ring holds
+/// [`DEFAULT_RING_CAPACITY`](crate::chain::reorg_log::DEFAULT_RING_CAPACITY)
+/// (256) records, and a poll can only ever show us those, so twice that is
+/// comfortably more than can be re-presented.
+const REORG_SEEN_CAPACITY: usize = 512;
+
 /// Which reorg-log records the detector has already reported.
 ///
-/// Keyed on `(ts, old_tip)` rather than a bare timestamp: two reorgs can land
-/// in the same second, and the abandoned tip is unique per reorg. Only the
-/// boundary second needs set membership — anything older is seen by
-/// definition.
+/// A **set of identities**, deliberately not a high-water mark over the clock.
+///
+/// The earlier version compared `rec.ts_unix_secs` against a wall-clock value
+/// seeded at startup and dropped anything older. Both sides ride
+/// `SystemTime::now()`, so a single backwards step — NTP correcting a fast RTC
+/// after boot, a hypervisor resyncing after live migration, an operator running
+/// `date -s` — silenced *every* reorg alert until the clock caught back up to
+/// the seeded value, with no event, no warning and no `-alertnotify`. The
+/// watermark never reset and `deep_reorg` is an edge, so those alerts were not
+/// delayed; they were gone.
+///
+/// Identity is `(ts, old_tip, new_tip)`. Every component comes from the record
+/// itself, so rescanning the same record is stable, and a clock that jumps in
+/// either direction changes nothing about whether a reorg is recognized as one
+/// we have already reported. Including the timestamp keeps a flapping chain
+/// (A→B, B→A, A→B again) from collapsing its third reorg onto its first.
 #[derive(Debug, Default)]
-struct ReorgWatermark {
-    ts: u64,
-    at_ts: std::collections::HashSet<String>,
+struct ReorgSeen {
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
 }
 
-impl ReorgWatermark {
-    fn seeded_now() -> Self {
-        Self {
-            ts: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            at_ts: std::collections::HashSet::new(),
-        }
+impl ReorgSeen {
+    fn key(rec: &ReorgRecord) -> String {
+        format!("{}:{}:{}", rec.ts_unix_secs, rec.old_tip, rec.new_tip)
     }
 
     /// Mark `rec` as seen; returns whether it had not been seen before.
     fn mark_new(&mut self, rec: &ReorgRecord) -> bool {
-        if rec.ts_unix_secs < self.ts {
+        let key = Self::key(rec);
+        if !self.seen.insert(key.clone()) {
             return false;
         }
-        if rec.ts_unix_secs > self.ts {
-            self.ts = rec.ts_unix_secs;
-            self.at_ts.clear();
+        self.order.push_back(key);
+        while self.order.len() > REORG_SEEN_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
         }
-        self.at_ts.insert(rec.old_tip.clone())
+        true
+    }
+
+    /// Mark everything already in the log as seen, without reporting it.
+    ///
+    /// Called once at task start so a restart does not re-page for reorgs the
+    /// previous process already alerted on. This replaces the old "seed a
+    /// timestamp from the current clock" trick and does not depend on a clock
+    /// at all.
+    fn seed(&mut self, records: &[ReorgRecord]) {
+        for rec in records {
+            self.mark_new(rec);
+        }
     }
 }
 
@@ -1132,7 +1190,7 @@ fn scan_reorg_log(
     publisher: &EventPublisher,
     thresholds: &AlertThresholds,
     chain_state: &ChainState,
-    seen: &mut ReorgWatermark,
+    seen: &mut ReorgSeen,
 ) {
     let Some(log) = chain_state.reorg_log() else {
         return;
@@ -1153,7 +1211,7 @@ fn report_reorgs(
     publisher: &EventPublisher,
     thresholds: &AlertThresholds,
     records: Vec<ReorgRecord>,
-    seen: &mut ReorgWatermark,
+    seen: &mut ReorgSeen,
 ) {
     let threshold = thresholds.reorg_depth();
     for rec in records {
@@ -1343,8 +1401,8 @@ mod tests {
         assert!(!warnings.has_errors());
     }
 
-    #[test]
-    fn disabling_a_detector_clears_a_standing_condition() {
+    #[tokio::test]
+    async fn disabling_a_detector_clears_a_standing_condition() {
         // Otherwise turning the threshold off would strand a raised alert that
         // nothing will ever retract.
         let state = HealthState::new();
@@ -1362,7 +1420,8 @@ mod tests {
             &pubr,
             &thresholds,
             std::path::Path::new("."),
-        );
+        )
+        .await;
         assert_eq!(
             drained(&mut rx),
             vec![(StatusKind::DiskLow, StatusState::Cleared)],
@@ -1688,15 +1747,15 @@ mod tests {
     /// An operator who sets `alertdiskfreemb=0` has usually done so because
     /// they alert on the Prometheus gauge instead. Disabling the alert must not
     /// delete the series out from under their own rule.
-    #[test]
-    fn the_disk_gauge_is_sampled_even_when_the_alert_is_disabled() {
+    #[tokio::test]
+    async fn the_disk_gauge_is_sampled_even_when_the_alert_is_disabled() {
         let state = HealthState::new();
         let warnings = NodeWarnings::new();
         let pubr = publisher();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
         assert_eq!(thresholds.disk_free_bytes(), 0, "detector off");
 
-        check_disk(&state, &warnings, &pubr, &thresholds, std::path::Path::new("."));
+        check_disk(&state, &warnings, &pubr, &thresholds, std::path::Path::new(".")).await;
         assert!(
             state.disk_free_bytes().is_some(),
             "the gauge must be populated whatever the alert's configuration"
@@ -1732,7 +1791,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 3);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
 
         report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 98, 2, 3, 1)], &mut seen);
         assert!(drained(&mut rx).is_empty(), "a 2-deep reorg is below the floor");
@@ -1747,7 +1806,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
 
         // fork at 896, 4 rolled back (old tip 900), 6 reconnected (new tip 902).
         report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 896, 4, 6, 1)], &mut seen);
@@ -1770,12 +1829,86 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
 
         report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 100, 3, 4, 1)], &mut seen);
         let env = rx.try_recv().unwrap();
         assert_eq!(detail(&env, "to_height"), "104");
         assert_ne!(detail(&env, "to_height"), "101", "that is the first reconnect");
+    }
+
+    /// A reorg whose record predates the last one seen must still be reported.
+    ///
+    /// `ReorgRecord::ts_unix_secs` is `SystemTime::now()`, so a backwards clock
+    /// step — NTP correcting a fast RTC after boot, a hypervisor resync after
+    /// live migration, `date -s` — makes later reorgs carry *earlier*
+    /// timestamps. The previous implementation kept a high-water mark over that
+    /// timestamp and dropped anything below it, which silenced every reorg
+    /// alert until the clock caught back up. `deep_reorg` is an edge, so those
+    /// alerts were not delayed, they were gone.
+    ///
+    /// Control: with the old `if rec.ts_unix_secs < self.ts { return false }`
+    /// watermark, the second `report_reorgs` here emits nothing and the final
+    /// assertion fails.
+    #[test]
+    fn a_reorg_is_reported_even_when_the_clock_steps_backwards() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgSeen::default();
+
+        // A reorg at t=2000, reported normally.
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(2000, 100, 4, 2, 1)], &mut seen);
+        assert!(rx.try_recv().is_ok(), "the first reorg reports");
+
+        // The clock steps back 20 minutes; the next genuine reorg is stamped
+        // t=800. It is a different reorg (different tips) and must still page.
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(800, 200, 5, 3, 2)], &mut seen);
+        let env = rx
+            .try_recv()
+            .expect("a reorg after a backwards clock step must still be reported");
+        assert_eq!(detail(&env, "depth"), "5");
+    }
+
+    /// The same record rescanned across polls reports exactly once — the
+    /// property that lets the lookback window be the whole ring.
+    #[test]
+    fn rescanning_the_log_does_not_re_report_a_reorg() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgSeen::default();
+
+        let records = vec![rec(1000, 100, 4, 2, 1), rec(1001, 200, 5, 3, 2)];
+        for _ in 0..5 {
+            report_reorgs(&warnings, &pubr, &thresholds, records.clone(), &mut seen);
+        }
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "two distinct reorgs, five scans, two reports");
+    }
+
+    /// Seeding marks what the log already holds as reported, so a restart does
+    /// not re-page for reorgs the previous process already alerted on.
+    #[test]
+    fn seeding_suppresses_reorgs_that_predate_the_process() {
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let mut rx = pubr.subscribe();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgSeen::default();
+
+        let old = vec![rec(1000, 100, 9, 2, 1)];
+        seen.seed(&old);
+        report_reorgs(&warnings, &pubr, &thresholds, old, &mut seen);
+        assert!(rx.try_recv().is_err(), "a seeded reorg must not re-page");
+
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 300, 9, 2, 3)], &mut seen);
+        assert!(rx.try_recv().is_ok(), "but a new one still does");
     }
 
     /// A truncation reorg — rolled back with nothing to replace it — leaves the
@@ -1786,7 +1919,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
 
         report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 99, 6, 0, 1)], &mut seen);
         let env = rx.try_recv().unwrap();
@@ -1803,7 +1936,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
         let records = vec![rec(1000, 96, 4, 5, 1)];
 
         report_reorgs(&warnings, &pubr, &thresholds, records.clone(), &mut seen);
@@ -1823,7 +1956,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
 
         report_reorgs(
             &warnings,
@@ -1842,7 +1975,7 @@ mod tests {
         let warnings = NodeWarnings::new();
         let pubr = publisher();
         let mut rx = pubr.subscribe();
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
         let records = vec![rec(1000, 98, 2, 3, 1)];
 
         report_reorgs(&warnings, &pubr, &AlertThresholds::new(0, 0, 0, 0, 10), records.clone(), &mut seen);
@@ -1858,7 +1991,7 @@ mod tests {
         let pubr = publisher();
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
-        let mut seen = ReorgWatermark::default();
+        let mut seen = ReorgSeen::default();
         report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 50, 50, 51, 1)], &mut seen);
         assert!(drained(&mut rx).is_empty());
     }
