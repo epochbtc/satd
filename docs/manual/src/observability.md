@@ -326,24 +326,28 @@ Restarting the node is not a gap: the watch-set is re-registered before P2P
 starts, so blocks that arrive during catch-up are matched normally. Rebuilding
 with `-reindex` is not a gap either, in the other direction — the replay happens
 before the dispatcher exists, so reindexing does not re-fire years of alerts.
-A node still in initial block download does not fire watch alerts at all, for
-the same reason: syncing from genesis with a busy address registered would
+A node still in initial block download suppresses **confirmed** watch matches,
+for the same reason: syncing from genesis with a busy address registered would
 otherwise POST one delivery per historical payment to it. What was suppressed is
-counted and reported in the next `lagged` body.
+counted and reported in the next `lagged` body. Unconfirmed matches are never
+suppressed — they come from the mempool, which is live by definition and cannot
+be historical, and the predicate here is the tip's *age*, which reads "syncing"
+on any node whose chain has stalled or which was restored from a backup. A watch
+match has no replay behind it, so suppressing a live one destroys it outright
+rather than deferring it.
 
 A `lagged` notice covering dropped watch matches is a weaker signal than one
-covering chain events. Its `resume_cursor` is a *chain* position, so replaying
-from it re-delivers blocks, not the lost matches — the matches are gone. If a
-`lagged` arrives on a hook with a watch-set, reconcile with `getaddresshistory`
-or a `RescanBlocks` over the range rather than assuming the cursor covers it.
+covering chain events. Its `resume_cursor` is a *chain* position, so it tells
+you which blocks to go and re-examine — it does not name the lost matches, and
+nothing re-derives them for you. If a `lagged` arrives on a hook with a
+watch-set, reconcile the range with `getaddresshistory` or `RescanBlocks`.
 
-The one case that does lose a match is a crash in the window between a block
-connecting and the receiver acknowledging: the block's *chain* event comes back
-from the hook's stored cursor, but the match does not, because the block is
-already connected and will not be scanned again. Normally that window is
-milliseconds; it widens if the receiver is down and the hook's queue has backed
-up. Reconcile with `getaddresshistory` after an unclean shutdown if a missed
-match would matter.
+An unclean shutdown loses matches for the blocks in flight at the time. The
+hook's stored cursor records how far it got, so the restart tells you the span
+with a `lagged` body — but the matches themselves are not reconstructed, because
+the blocks are already connected and are not scanned again. Normally that is a
+window of milliseconds; it widens if the receiver is down and the hook's queue
+has backed up. Reconcile the announced span if a missed match would matter.
 
 ### Delivery behavior
 
