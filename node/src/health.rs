@@ -152,8 +152,48 @@ pub mod defaults {
             _ => PEER_FLOOR,
         }
     }
-    /// Blocks rolled back.
+    /// Blocks rolled back, on a chain where a reorg this deep is an incident.
     pub const REORG_DEPTH: u64 = 3;
+
+    /// Blocks rolled back, on a chain where reorgs are an ordinary property of
+    /// the network rather than an incident.
+    pub const REORG_DEPTH_TEST_NETWORK: u64 = 10;
+
+    /// The `deep_reorg` default for `network`.
+    ///
+    /// Depth 3 means completely different things on different chains, and the
+    /// alert is only worth having if crossing it means something is wrong.
+    ///
+    /// On mainnet a 3-block reorg is a genuine incident: it costs real hashrate
+    /// to produce, and it invalidates transactions that merchants have begun
+    /// treating as settled. Waking someone is the correct response.
+    ///
+    /// The test networks are not economically secured, and reorgs a few blocks
+    /// deep are a *normal operating property* of them — a consequence of thin,
+    /// volatile hashrate (and, on testnet, of the difficulty exception). Paging
+    /// on those is paging on the network working as designed, and an alert that
+    /// fires during normal operation is one operators learn to ignore, which
+    /// costs them the mainnet alert too. The floor is raised rather than
+    /// disabled: a reorg past the 6-confirmation convention has invalidated
+    /// something a wallet would have called final, and that is worth reporting
+    /// on any chain. An operator who wants the mainnet sensitivity sets
+    /// `alertreorgdepth=3` explicitly.
+    ///
+    /// Regtest is off entirely. Test harnesses reorg deliberately and
+    /// constantly — `invalidateblock` and competing-chain tests are the point —
+    /// so any threshold would fire on the suite doing its job.
+    ///
+    /// An unrecognized future network takes the test-network value: new
+    /// networks are overwhelmingly test networks, and the failure mode of
+    /// guessing that way (an alert that fires slightly less often than it
+    /// could) is the milder one.
+    pub fn reorg_depth_for(network: bitcoin::Network) -> u64 {
+        match network {
+            bitcoin::Network::Bitcoin => REORG_DEPTH,
+            bitcoin::Network::Regtest => 0,
+            _ => REORG_DEPTH_TEST_NETWORK,
+        }
+    }
 }
 
 impl Default for AlertThresholds {
@@ -1323,6 +1363,33 @@ mod tests {
         assert_eq!(defaults::peer_floor_for(Network::Signet), defaults::PEER_FLOOR);
         assert_eq!(defaults::peer_floor_for(Network::Bitcoin), defaults::PEER_FLOOR);
         assert_eq!(defaults::peer_floor_for(Network::Testnet4), defaults::PEER_FLOOR);
+    }
+
+    /// Depth 3 is an incident on mainnet and an ordinary Tuesday on a test
+    /// chain. Firing `-alertnotify` for the latter trains operators to ignore
+    /// the alert, which costs them the mainnet one too.
+    #[test]
+    fn reorg_depth_default_is_network_conditional() {
+        use bitcoin::Network;
+        // Mainnet: a 3-block reorg costs real hashrate and invalidates
+        // transactions merchants have started treating as settled.
+        assert_eq!(defaults::reorg_depth_for(Network::Bitcoin), 3);
+        // Test networks: reorgs a few blocks deep are the network working as
+        // designed. Raised, not disabled — past 6 confirmations a wallet has
+        // been told something false, and that is worth reporting anywhere.
+        for n in [Network::Signet, Network::Testnet, Network::Testnet4] {
+            assert_eq!(
+                defaults::reorg_depth_for(n),
+                defaults::REORG_DEPTH_TEST_NETWORK,
+                "{n:?} should not page on routine reorgs",
+            );
+            assert!(
+                defaults::reorg_depth_for(n) > 6,
+                "{n:?} default must sit above the confirmation convention",
+            );
+        }
+        // Regtest reorgs on purpose, constantly, as the test suite's whole job.
+        assert_eq!(defaults::reorg_depth_for(Network::Regtest), 0);
     }
 
     #[test]

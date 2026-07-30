@@ -3281,7 +3281,7 @@ impl Config {
             alert_reorg_depth: cli
                 .alert_reorg_depth
                 .or_else(|| file_get("alertreorgdepth").and_then(|v| v.parse().ok()))
-                .unwrap_or(node::health::defaults::REORG_DEPTH),
+                .unwrap_or(node::health::defaults::reorg_depth_for(network)),
             startup_notify: cli.startupnotify.clone().or_else(|| file_get("startupnotify")),
             shutdown_notify: cli
                 .shutdownnotify
@@ -6860,17 +6860,33 @@ rpcport=8332
         assert_eq!(cfg.alert_tip_stall_seconds, 3_600);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
-        assert_eq!(cfg.alert_reorg_depth, 3);
-        // `peer_floor` is the one network-dependent default: a regtest node
-        // normally runs with no peers at all, so the floor would raise a
-        // critical warning that can never clear.
+        // Two defaults are network-dependent, both because the alert would
+        // otherwise fire on the network behaving exactly as designed.
+        //
+        // A regtest node normally runs with no peers at all, and reorgs on
+        // purpose and constantly — competing-chain and `invalidateblock` tests
+        // are the point of the harness.
         assert_eq!(cfg.alert_peer_floor, 0, "regtest defaults the peer floor off");
+        assert_eq!(cfg.alert_reorg_depth, 0, "regtest reorgs deliberately");
 
-        // ...but it is still armed where a peer-starved node really is broken.
+        // ...both armed where the condition really does mean something is
+        // wrong.
         let cli =
             CliArgs::try_parse_from(["satd", "--datadir", dir.to_str().unwrap()]).unwrap();
         let cfg_mainnet = Config::from_cli(cli).unwrap();
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
+        assert_eq!(cfg_mainnet.alert_reorg_depth, 3, "3 deep is an incident on mainnet");
+
+        // Test networks reorg a few blocks deep as an ordinary consequence of
+        // thin hashrate. Paging on that trains the operator to ignore the
+        // alert, which costs them the mainnet one too — so the floor is raised
+        // rather than defaulted to mainnet's sensitivity.
+        let cli =
+            CliArgs::try_parse_from(["satd", "--signet", "--datadir", dir.to_str().unwrap()])
+                .unwrap();
+        let cfg_signet = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
+        assert_eq!(cfg_signet.alert_peer_floor, 3, "but signet is a real network with peers");
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.

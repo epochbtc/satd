@@ -73,7 +73,7 @@ record of a reorg is the reorg log (`getreorghistory`), not the warnings set.
 | `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor, or the floor is lowered below the current reading |
 | `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line, or the threshold is raised above the current occupancy |
 | `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
-| `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks | one-shot |
+| `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks (default `3` on mainnet, `10` on test networks, off on regtest) | one-shot |
 
 Every standing condition raises **once** on entry and clears **once** on
 recovery — you get a pair of events, not a stream of repeats — and the gap
@@ -103,6 +103,19 @@ threshold moves such that it would no longer raise. Without this,
 `mempool_congested` in particular was inescapable — `alertmempoolfullpct` clamps
 at 100 and the clear line is 75 % of the raise line, so past 75 % occupancy no
 setting could clear it.
+
+`alertreorgdepth` defaults to `3` on mainnet, where a reorg that deep costs real
+hashrate and invalidates transactions merchants have started treating as
+settled. Signet, testnet and testnet4 default to `10`: those chains are not
+economically secured, and reorgs a few blocks deep are an ordinary consequence
+of thin, volatile hashrate rather than an incident. Defaulting them to mainnet's
+sensitivity would run `-alertnotify` for the network working as designed, and an
+alert that fires during normal operation is one you learn to ignore — which
+costs you the mainnet alert too. It is raised rather than switched off because
+past the 6-confirmation convention a wallet has been told something false, and
+that is worth reporting on any chain. Regtest is off entirely; its test suites
+reorg deliberately. Set `alertreorgdepth=3` explicitly if you want mainnet
+sensitivity on a test network.
 
 `alertpeerfloor` defaults to `3` everywhere except regtest, where it is `0`
 (disabled) because running with no peers at all is a regtest node's normal
