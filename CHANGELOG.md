@@ -136,7 +136,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   streaming event, an entry in `getwarnings` (which fires the Core-compatible
   `alertnotify` hook), and a `satd_alert_active{kind}` gauge. Standing
   conditions raise once and clear once, with hysteresis so a value sitting on
-  the threshold does not flap. Five new hot-reloadable thresholds
+  the threshold does not flap. The one-shot events (`ibd_complete`,
+  `deep_reorg`) fire `alertnotify` and the streaming event but deliberately do
+  **not** enter `getwarnings` — nothing would ever clear them, and on chains
+  where multi-block reorgs are routine that would wedge
+  `getblockchaininfo.warnings` and the TUI modal permanently. Five new hot-reloadable thresholds
   (`alerttipstallseconds=3600`, `alertdiskfreemb=10240`,
   `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest —
   `alertreorgdepth=3`); `0` disables a detector. `deep_reorg` depth, fork

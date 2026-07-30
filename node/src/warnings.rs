@@ -96,8 +96,8 @@ impl NodeWarnings {
     /// and refresh `last_seen`, `severity`, `message`, `context`.
     ///
     /// `-alertnotify` fires only the first time an id becomes active. For a
-    /// standing condition that is what you want; for a repeating *edge*
-    /// observation use [`record_recurring`](Self::record_recurring).
+    /// standing condition that is what you want; for a one-shot event that will
+    /// never be cleared use [`notify_event`](Self::notify_event).
     pub fn record(
         &self,
         id: &str,
@@ -105,26 +105,36 @@ impl NodeWarnings {
         message: impl Into<String>,
         context: serde_json::Value,
     ) {
-        self.record_inner(id, severity, message, context, false);
+        self.record_inner(id, severity, message, context);
     }
 
-    /// Record a warning that fires `-alertnotify` on **every** occurrence, not
-    /// just the first.
+    /// Fire `-alertnotify` for a **one-shot event**, without recording a
+    /// standing warning.
     ///
-    /// For edge observations, where each occurrence is a distinct event rather
-    /// than a restatement of a standing condition. `deep_reorg` records a
-    /// warning that never clears, so under the plain first-time-only rule only
-    /// the first reorg of a process would reach the hook — every later and
-    /// possibly much deeper one would be silent there while the streaming and
-    /// webhook surfaces reported it.
-    pub fn record_recurring(
-        &self,
-        id: &str,
-        severity: Severity,
-        message: impl Into<String>,
-        context: serde_json::Value,
-    ) {
-        self.record_inner(id, severity, message, context, true);
+    /// This is the right call for something that *happened* rather than
+    /// something that *is*: a deep reorg, for instance. Such an event has no
+    /// resolved state, so nothing would ever call [`clear`](Self::clear) for
+    /// it — and an entry that never clears is exactly what this registry must
+    /// not accumulate. It would pin `getwarnings`, keep
+    /// [`has_errors`](Self::has_errors) true for the life of the process, and
+    /// hold the TUI's blocking modal open forever. On signet and testnet4,
+    /// where reorgs several blocks deep are routine, the first one would do
+    /// that permanently.
+    ///
+    /// Every occurrence fires the hook, since each is a distinct event rather
+    /// than a restatement of a standing condition. The durable record of what
+    /// happened is the subsystem's own log (`ReorgLog` for reorgs) and the
+    /// `status` event on the streaming API; this is only the shell hook.
+    pub fn notify_event(&self, id: &str, severity: Severity, message: impl Into<String>) {
+        let guard = self.alert_tx.lock();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(format!(
+                "[{}] {}: {}",
+                severity.as_str(),
+                id,
+                message.into()
+            ));
+        }
     }
 
     fn record_inner(
@@ -133,7 +143,6 @@ impl NodeWarnings {
         severity: Severity,
         message: impl Into<String>,
         context: serde_json::Value,
-        notify_repeats: bool,
     ) {
         let now = unix_secs();
         let message: String = message.into();
@@ -164,10 +173,7 @@ impl NodeWarnings {
         // each `DoWarning`; deduping by id avoids flooding the hook with
         // identical repeats). The send is non-blocking and best-effort: a
         // dropped receiver (hook task gone) just no-ops.
-        //
-        // `notify_repeats` opts an id out of that dedup — see
-        // `record_recurring`.
-        if is_new || notify_repeats {
+        if is_new {
             let guard = self.alert_tx.lock();
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(format!("[{}] {}: {}", severity.as_str(), id, message));
@@ -330,6 +336,45 @@ mod tests {
         w.record("peer.stall", Severity::Warn, "no progress", json!(null));
         let msg2 = rx.try_recv().expect("new id should fire");
         assert!(msg2.contains("peer.stall"));
+    }
+
+    /// A one-shot event pages, but must not become a standing warning.
+    ///
+    /// Nothing ever clears an event that has no resolved state, so recording
+    /// one would pin `getwarnings`, keep `has_errors()` true for the life of
+    /// the process, and hold the TUI's blocking modal open — permanently, from
+    /// the first deep reorg, on chains where those are routine.
+    #[test]
+    fn notify_event_fires_the_hook_without_recording_a_warning() {
+        let w = NodeWarnings::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg rolled back 4 blocks");
+
+        let msg = rx.try_recv().expect("a one-shot event must still page");
+        assert!(msg.contains("alert.deep_reorg"), "{msg}");
+        assert_eq!(w.count(), 0, "it must not become a standing warning");
+        assert!(!w.has_errors(), "and must not wedge has_errors()");
+        assert!(w.as_strings().is_empty(), "nor appear in getwarnings");
+    }
+
+    /// Every occurrence pages — unlike `record`, which dedupes by id. Each
+    /// reorg is a distinct event, not a restatement of one condition.
+    #[test]
+    fn every_occurrence_of_an_event_pages() {
+        let w = NodeWarnings::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        for i in 0..3 {
+            w.notify_event("alert.deep_reorg", Severity::Error, format!("reorg {i}"));
+        }
+        for i in 0..3 {
+            let msg = rx.try_recv().unwrap_or_else(|_| panic!("occurrence {i} did not page"));
+            assert!(msg.contains(&format!("reorg {i}")), "{msg}");
+        }
+        assert_eq!(w.count(), 0);
     }
 
     #[test]

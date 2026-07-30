@@ -57,6 +57,15 @@ one through three surfaces at once, so they can never disagree:
     and the TUI), which also fires the Core-compatible `alertnotify` hook,
 *   a `satd_alert_active{kind="..."}` gauge on `/metrics`.
 
+**One-shot events are the exception to the middle surface.** `ibd_complete` and
+`deep_reorg` describe something that *happened*; there is no state for anything
+to later clear. They fire `alertnotify` and emit their `status` event, but they
+do **not** create a `getwarnings` entry. An entry nothing clears would sit in
+`getblockchaininfo.warnings` for the life of the process and hold the TUI's
+warning modal open — which on signet and testnet4, where reorgs several blocks
+deep are ordinary, would happen on the first one and never stop. The durable
+record of a reorg is the reorg log (`getreorghistory`), not the warnings set.
+
 | Condition | Severity | Raises when | Clears when |
 |---|---|---|---|
 | `ibd_complete` | info | initial block download finishes | one-shot |
@@ -71,7 +80,8 @@ recovery — you get a pair of events, not a stream of repeats — and the gap
 between the raise and clear lines (a ratio, a hold time, or both) means a value
 sitting on the threshold does not flap your pager. `ibd_complete` and
 `deep_reorg` describe things that happened rather than states that persist, so
-they are one-shot and never clear.
+they are one-shot: they never clear, and for the same reason they never enter
+`getwarnings` at all.
 
 Thresholds are configured with the `alert*` keys in the
 [Configuration Reference](config-reference.md#health-alerts); all of them are

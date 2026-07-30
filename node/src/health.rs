@@ -484,9 +484,12 @@ async fn run_detectors(
 ///
 /// Only conditions worth operator attention become warnings: an `info` event
 /// (IBD finishing) is good news, not a problem, and would otherwise sit in
-/// `getwarnings` forever. A `cleared` event removes the warning; an `edge` event
-/// records one that stays until restart, which is correct for `deep_reorg` — it
-/// happened, and nothing "un-happens" it.
+/// `getwarnings` forever. A `raised` event records one, a `cleared` event
+/// removes it.
+///
+/// An `edge` event pages but records nothing — see the note at the call site.
+/// The registry is for conditions that are true *now* and that something will
+/// later clear; a deep reorg is history, and history has its own log.
 fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent) {
     let id = event.kind.warning_id();
     match event.state {
@@ -497,15 +500,24 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
                     StatusSeverity::Critical => Severity::Error,
                     _ => Severity::Warn,
                 };
-                let context = serde_json::to_value(&event.details)
-                    .unwrap_or(serde_json::Value::Null);
-                // An edge observation is a distinct event every time it
-                // happens, and its warning never clears — so it must opt out of
-                // the first-time-only `-alertnotify` dedup, or only the first
-                // deep reorg of a process would ever page anyone.
+                // An edge observation fires the shell hook but does **not**
+                // become a standing warning.
+                //
+                // `NodeWarnings` holds conditions that are currently true and
+                // that something will later clear; its own contract says
+                // history-style events keep their own logs, and that an active
+                // warning means a problem to go fix. A deep reorg has no
+                // resolved state, so nothing would ever clear it — it would pin
+                // `getwarnings`, hold `has_errors()` true for the life of the
+                // process, and keep the TUI's blocking modal up. On signet and
+                // testnet4, where reorgs several blocks deep are ordinary, the
+                // first one would do that permanently. The durable record is
+                // `ReorgLog` plus the `status` event; this is only the page.
                 if event.state == StatusState::Edge {
-                    warnings.record_recurring(&id, severity, event.message.clone(), context);
+                    warnings.notify_event(&id, severity, event.message.clone());
                 } else {
+                    let context = serde_json::to_value(&event.details)
+                        .unwrap_or(serde_json::Value::Null);
                     warnings.record(&id, severity, event.message.clone(), context);
                 }
             }
