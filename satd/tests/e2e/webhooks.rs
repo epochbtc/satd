@@ -361,6 +361,30 @@ categories = [{categories}]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// Write a two-hook alertfile. `cats_b` is the only thing callers vary between
+/// two writes, so hook `a`'s stanza stays byte-identical across a reload.
+fn write_two_hook_alertfile(
+    dir: &tempfile::TempDir,
+    a: (&MockReceiver, &str, &str),
+    b: (&MockReceiver, &str, &str),
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.path().join("alertfile.toml");
+    let stanza = |(r, id, cats): (&MockReceiver, &str, &str)| {
+        format!(
+            "\n[[webhook]]\nid = \"{id}\"\nurl = \"{}\"\nsecret = \"{SECRET}\"\n\
+             categories = [{cats}]\n",
+            r.url()
+        )
+    };
+    std::fs::write(
+        &path,
+        format!("version = 1\n{}{}", stanza(a), stanza(b)),
+    )
+    .expect("write alertfile");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 /// Start a node whose `alertfile=` points at a one-hook file delivering
 /// `categories` to `receiver`.
 ///
@@ -565,6 +589,63 @@ async fn an_unrelated_sighup_does_not_destroy_a_queued_status_event() {
 
     // The original event must still land.
     let got = receiver
+        .wait_for(60, |r| r.json()["body"]["category"] == "status")
+        .await;
+    assert_eq!(got.json()["body"]["kind"], "disk_low");
+    assert!(got.signature_valid(SECRET));
+}
+
+/// Editing one hook must not destroy a *different* hook's queued event.
+///
+/// The companion to `an_unrelated_sighup_does_not_destroy_a_queued_status_event`,
+/// and the harder half. That one is protected by the unchanged-file early
+/// return in `apply`; here the alertfile genuinely changes, so the reload runs
+/// the whole handover. A reload that rebuilt every delivery task would take
+/// `pager`'s in-flight `disk_low` down with it even though the operator only
+/// touched `ops` — and a status event has no replay, so it is lost outright and
+/// the edge-triggered detector never raises it again.
+///
+/// `pager` 503s the first four attempts, so the event is provably still in its
+/// queue, mid-backoff, when the reload lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_one_hook_does_not_destroy_another_hooks_queued_event() {
+    let pager = MockReceiver::failing_first(503, 4).await;
+    let ops = MockReceiver::ok().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_two_hook_alertfile(
+        &dir,
+        (&pager, "pager", "\"status\""),
+        (&ops, "ops", "\"status\""),
+    );
+    let path = dir.path().join("alertfile.toml");
+    let sn =
+        crate::streaming::start_streaming_owned(vec![format!("--alertfile={}", path.display())])
+            .await;
+
+    // Known-cleared, then raised, so the detector fires an edge on any host.
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=1\n").await;
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while pager.attempts().await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the status event was never attempted; the raise did not reach the hook"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Edit `ops` only. `pager`'s stanza is byte-identical, so its delivery task
+    // — and the `disk_low` still in its queue — must survive.
+    write_two_hook_alertfile(
+        &dir,
+        (&pager, "pager", "\"status\""),
+        (&ops, "ops", "\"status\", \"chain\""),
+    );
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+
+    let got = pager
         .wait_for(60, |r| r.json()["body"]["category"] == "status")
         .await;
     assert_eq!(got.json()["body"]["kind"], "disk_low");

@@ -56,33 +56,43 @@ const GAP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// counter would restart at zero and re-mint ids the receiver has already seen.
 static SYNTH_DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Composite stop signal: the process-wide shutdown, plus a per-generation
-/// channel the SIGHUP reload flips to retire the previous dispatcher.
+/// Composite stop signal: the process-wide shutdown, plus a narrower channel
+/// the SIGHUP reload flips to retire one task.
 ///
-/// Two channels rather than one because a reload must stop *this* generation's
-/// tasks without touching the global signal every other subsystem watches.
+/// Two channels rather than one because a reload must stop *some* of the
+/// dispatcher's tasks without touching the global signal every other subsystem
+/// watches. The scope of `local` differs by task on purpose: a fan-in is
+/// retired per *generation*, because every reload rebuilds the hook list it
+/// iterates; a delivery task is retired per *hook*, because a reload that
+/// leaves a hook's stanza untouched must leave its queue alone (see
+/// `AlertReloader::apply`).
 #[derive(Clone)]
 pub struct Stop {
     global: watch::Receiver<bool>,
-    generation: watch::Receiver<bool>,
+    local: watch::Receiver<bool>,
 }
 
 impl Stop {
     fn stopped(&self) -> bool {
-        *self.global.borrow() || *self.generation.borrow()
+        *self.global.borrow() || *self.local.borrow()
     }
 
     /// Resolve once either channel signals. Cancel-safe: `changed()` only
     /// marks a value seen when it completes, and the loop re-checks both
     /// borrows, so being dropped inside a `select!` loses nothing.
+    ///
+    /// A dropped sender counts as stopped. `changed()` returns `Err` forever
+    /// once the sender is gone, so ignoring it would spin this loop at 100%
+    /// CPU — and the reading is right anyway: nothing that could retire this
+    /// task still exists.
     async fn wait(&mut self) {
         loop {
             if self.stopped() {
                 return;
             }
             tokio::select! {
-                _ = self.global.changed() => {}
-                _ = self.generation.changed() => {}
+                r = self.global.changed() => if r.is_err() { return },
+                r = self.local.changed() => if r.is_err() { return },
             }
         }
     }
@@ -122,6 +132,15 @@ struct HookChannel {
     /// genuinely dead hook once, not stay quiet because a retired generation
     /// already said so.
     reported_closed: std::sync::atomic::AtomicBool,
+    /// Whether this hook's delivery task was started by the same `apply` that
+    /// built this channel, and so should be told what it missed while nothing
+    /// was delivering for it.
+    ///
+    /// False for a hook carried across a reload. Its queue survived, so the
+    /// span between its durable cursor and the tip is not a hole — it is a
+    /// backlog about to be delivered, and announcing it as a gap tells the
+    /// receiver to go rescan a range it is about to be sent anyway.
+    fresh: bool,
 }
 
 /// Accumulated drop state for one hook.
@@ -182,64 +201,75 @@ impl DispatcherState {
 static DISPATCHER_STATE: std::sync::LazyLock<Arc<DispatcherState>> =
     std::sync::LazyLock::new(|| Arc::new(DispatcherState::default()));
 
-/// Spawn the dispatcher for a parsed alertfile.
+/// A delivery task the reloader keeps alive across reloads.
 ///
-/// Must be called from within the API runtime — every task spawned here does
-/// outbound HTTP, which is exactly what must never share the consensus runtime.
-/// Returns `None` when the file configures no hooks, so a node with an empty
-/// alertfile starts no tasks at all.
-fn spawn_with_metrics(
-    file: &AlertFile,
-    publisher: Arc<EventPublisher>,
+/// Held by `AlertReloader` rather than by the fan-in, so a reload can decide
+/// per hook whether to keep the task — and its queue of pending deliveries —
+/// or retire it.
+struct RunningHook {
+    /// The stanza this task was started for. A reload reuses the task when the
+    /// new stanza compares equal, and retires it when it does not.
+    config: Hook,
+    tx: mpsc::Sender<Delivery>,
+    counters: Arc<HookCounters>,
+    gap: Arc<GapState>,
+    /// Retires this hook's delivery task alone.
+    stop: watch::Sender<bool>,
+}
+
+/// Start one hook's delivery task.
+///
+/// Must be called from within the API runtime — the task does outbound HTTP,
+/// which is exactly what must never share the consensus runtime.
+fn start_hook(
+    hook: &Hook,
+    metrics: &WebhookMetrics,
+    state: &DispatcherState,
     store: Arc<dyn Store>,
-    block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
-    metrics: Arc<WebhookMetrics>,
-    state: Arc<DispatcherState>,
-    stop: Stop,
-) {
-    if file.hooks.is_empty() {
-        return;
+    global_stop: watch::Receiver<bool>,
+) -> RunningHook {
+    let (tx, rx) = mpsc::channel::<Delivery>(HOOK_QUEUE_CAPACITY);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let counters = metrics.hook(&hook.id);
+    let gap = state.gap_for(&hook.id);
+    tokio::spawn(deliver_loop(
+        hook.clone(),
+        rx,
+        counters.clone(),
+        gap.clone(),
+        store,
+        Stop {
+            global: global_stop,
+            local: stop_rx,
+        },
+    ));
+    RunningHook {
+        config: hook.clone(),
+        tx,
+        counters,
+        gap,
+        stop: stop_tx,
     }
-    let mut hooks = Vec::new();
-    for hook in &file.hooks {
-        let (tx, rx) = mpsc::channel::<Delivery>(HOOK_QUEUE_CAPACITY);
-        let counters = metrics.hook(&hook.id);
-        let gap = state.gap_for(&hook.id);
-        tokio::spawn(deliver_loop(
-            hook.clone(),
-            rx,
-            counters.clone(),
-            gap.clone(),
-            store.clone(),
-            stop.clone(),
-        ));
-        hooks.push(HookChannel {
-            id: hook.id.clone(),
-            hook: hook.clone(),
-            tx,
-            counters,
-            gap,
-            reported_closed: std::sync::atomic::AtomicBool::new(false),
-        });
-    }
-    tokio::spawn(fan_in(hooks, publisher, store, block_source, state, stop));
 }
 
 /// Fan-in: one broadcast receiver, filtered and enqueued per hook.
+///
+/// The bus receiver is created by the caller, not here. When it is created
+/// relative to retiring the previous generation is the whole handover protocol;
+/// see `AlertReloader::apply`.
 async fn fan_in(
     hooks: Vec<HookChannel>,
+    mut rx: tokio::sync::broadcast::Receiver<NodeEvent>,
     publisher: Arc<EventPublisher>,
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
     state: Arc<DispatcherState>,
     mut stop: Stop,
 ) {
-    let mut rx = publisher.subscribe();
-
     // Announce whatever each hook missed while the daemon was down. Nothing is
     // replayed — there is no snapshot-to-live seam to dedupe, because there is
     // no snapshot.
-    for hook in &hooks {
+    for hook in hooks.iter().filter(|h| h.fresh) {
         announce_gap(hook, store.as_ref(), block_source.as_deref()).await;
     }
 
@@ -864,11 +894,25 @@ pub struct AlertReloader {
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
     metrics: Arc<WebhookMetrics>,
     global_stop: watch::Receiver<bool>,
-    /// Stop signal for the generation currently running, if any.
-    current: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+    /// Everything a handover has to hand over.
+    running: parking_lot::Mutex<Running>,
     /// The last successfully-applied alertfile, so a SIGHUP that did not change
     /// it can be a no-op instead of destroying in-flight deliveries.
     last_applied: parking_lot::Mutex<Option<AlertFile>>,
+}
+
+/// The live dispatcher, as much of it as a reload has to reason about.
+///
+/// Under one lock because the handover in `apply` is a sequence over these
+/// fields whose *order* is the correctness argument; splitting them would turn
+/// that order into an unstated convention between independent critical
+/// sections.
+#[derive(Default)]
+struct Running {
+    /// Retires the fan-in of the generation currently running.
+    fan_in_stop: Option<watch::Sender<bool>>,
+    /// Live delivery tasks by hook id, carried across reloads.
+    hooks: std::collections::HashMap<String, RunningHook>,
 }
 
 impl AlertReloader {
@@ -890,7 +934,7 @@ impl AlertReloader {
             block_source,
             metrics,
             global_stop,
-            current: parking_lot::Mutex::new(None),
+            running: parking_lot::Mutex::new(Running::default()),
             last_applied: parking_lot::Mutex::new(None),
         }
     }
@@ -909,16 +953,15 @@ impl AlertReloader {
         let file = AlertFile::load(&self.path)?;
         let ids: Vec<String> = file.hooks.iter().map(|h| h.id.clone()).collect();
 
-        // A SIGHUP that did not change the alertfile must not disturb the
-        // dispatcher. `reload_from_sighup` calls this on *every* SIGHUP,
-        // whatever key the operator actually edited, and retiring a generation
-        // destroys its queued deliveries. For chain events that is recoverable
-        // — the cursor did not advance, so the next generation's catch-up
-        // re-queues them — but a status event has no replay by design, and the
-        // detectors are edge-triggered against a `HealthState` that outlives
-        // the reload. So a `disk_low` sitting in retry backoff when the
-        // operator SIGHUPs to change `maxconnections` would be dropped, never
-        // replayed, and never re-raised: the page simply never arrives.
+        // A SIGHUP that did not change the alertfile is a no-op.
+        // `reload_from_sighup` calls this on *every* SIGHUP, whatever key the
+        // operator actually edited, so without this an unrelated
+        // `maxconnections` edit would churn the whole dispatcher.
+        //
+        // Belt and braces rather than the only defence: the handover below
+        // carries each hook's delivery task across a reload when that hook's
+        // stanza is unchanged, so even a real edit leaves the untouched hooks'
+        // queues and retry backoff intact.
         //
         // Comparing the parsed file rather than the file bytes means
         // reformatting or a comment edit is also a no-op.
@@ -933,37 +976,118 @@ impl AlertReloader {
             }
         }
 
-        // Retire the previous generation only once the new file has parsed, so
-        // a bad edit never leaves the node with no dispatcher at all.
-        let (gen_tx, gen_rx) = watch::channel(false);
-        let stop = Stop {
-            global: self.global_stop.clone(),
-            generation: gen_rx,
-        };
-        let publisher = self.publisher.clone();
-        let store = self.store.clone();
-        let block_source = self.block_source.clone();
-        let metrics = self.metrics.clone();
         let hook_count = file.hooks.len();
+
+        // ---- Handover ----------------------------------------------------
+        //
+        // Subscribe the incoming generation to the bus here, synchronously,
+        // before anything is retired — and hand the receiver to the task rather
+        // than letting it subscribe for itself.
+        //
+        // A `broadcast::Receiver` only sees what is published after it is
+        // created. Subscribing inside the spawned fan-in means the subscription
+        // does not exist until the executor first polls that task, so every
+        // event published between retiring the outgoing generation and that
+        // first poll reaches nobody. Not delayed: gone. Status events have no
+        // replay by design and the detectors that raise them are edge-triggered
+        // against a `HealthState` that outlives the reload, so a `disk_low`
+        // that lands in the window is never re-raised and the page never
+        // arrives. The window is short but it is scheduler latency, which is
+        // longest exactly when the node is loaded enough to be raising alerts.
+        //
+        // Holding both subscriptions open for a moment is the safe direction: a
+        // bus delivery id is `node-instance-<the event's own seq>`, so the two
+        // generations mint the *same* id for the same event and a receiver
+        // deduplicating on `X-Satd-Delivery`, as the contract instructs,
+        // collapses them.
+        let bus_rx = self.publisher.subscribe();
+
+        let mut running = self.running.lock();
+
+        // Reconcile the delivery tasks. A hook whose stanza is unchanged keeps
+        // the task it already has, queue and retry backoff included — a reload
+        // is an operator editing one stanza, and it must not destroy pending
+        // deliveries for every *other* hook in the file. A status event has no
+        // replay behind it, so one sitting in backoff for an untouched hook is
+        // lost outright. Only hooks actually edited or removed are retired.
+        let mut next_hooks: std::collections::HashMap<String, RunningHook> =
+            std::collections::HashMap::with_capacity(file.hooks.len());
+        let mut channels: Vec<HookChannel> = Vec::with_capacity(file.hooks.len());
         {
             let _guard = self.api_handle.enter();
-            spawn_with_metrics(
-                &file,
-                publisher,
-                store,
-                block_source,
-                metrics,
-                Arc::clone(&DISPATCHER_STATE),
-                stop,
-            );
+            for hook in &file.hooks {
+                let kept = match running.hooks.remove(&hook.id) {
+                    Some(r) if r.config == *hook => Some(r),
+                    Some(edited) => {
+                        // This one's queue is dropped on purpose: the operator
+                        // changed where or how it delivers, and flushing the
+                        // backlog to the superseded endpoint is not what they
+                        // asked for. `deliver_loop` hands the undelivered count
+                        // back to the process-lived `GapState` on its way out,
+                        // so the hole is announced rather than swallowed.
+                        let _ = edited.stop.send(true);
+                        None
+                    }
+                    None => None,
+                };
+                let fresh = kept.is_none();
+                let running_hook = kept.unwrap_or_else(|| {
+                    start_hook(
+                        hook,
+                        &self.metrics,
+                        &DISPATCHER_STATE,
+                        self.store.clone(),
+                        self.global_stop.clone(),
+                    )
+                });
+                channels.push(HookChannel {
+                    id: hook.id.clone(),
+                    hook: hook.clone(),
+                    tx: running_hook.tx.clone(),
+                    counters: running_hook.counters.clone(),
+                    gap: running_hook.gap.clone(),
+                    reported_closed: std::sync::atomic::AtomicBool::new(false),
+                    fresh,
+                });
+                next_hooks.insert(hook.id.clone(), running_hook);
+            }
+            // Whatever is left was removed from the file.
+            for (_, gone) in running.hooks.drain() {
+                let _ = gone.stop.send(true);
+            }
         }
-        if let Some(old) = self.current.lock().replace(gen_tx) {
-            // Draining is deliberate rather than graceful: the retired
-            // generation's queued events are dropped. A reload is an operator
-            // changing where alerts go, and delivering the backlog to the *old*
-            // endpoint after they redirected it is not what they asked for.
+        running.hooks = next_hooks;
+
+        // Retire the outgoing fan-in. Its queued deliveries are not lost with
+        // it: the queues belong to the delivery tasks, which this handover has
+        // already decided the fate of, one hook at a time.
+        if let Some(old) = running.fan_in_stop.take() {
             let _ = old.send(true);
         }
+
+        if channels.is_empty() {
+            // An alertfile with no hooks runs no tasks at all.
+            drop(bus_rx);
+        } else {
+            let (gen_tx, gen_rx) = watch::channel(false);
+            {
+                let _guard = self.api_handle.enter();
+                tokio::spawn(fan_in(
+                    channels,
+                    bus_rx,
+                    self.publisher.clone(),
+                    self.store.clone(),
+                    self.block_source.clone(),
+                    Arc::clone(&DISPATCHER_STATE),
+                    Stop {
+                        global: self.global_stop.clone(),
+                        local: gen_rx,
+                    },
+                ));
+            }
+            running.fan_in_stop = Some(gen_tx);
+        }
+        drop(running);
         // Stop exporting counters for hooks that are no longer configured,
         // rather than freezing their series at the last value forever.
         //
@@ -1302,5 +1426,176 @@ heartbeat_interval_secs = 3600
         );
         let mut hb = None;
         assert!(!accepts(&hook, &env, &mut hb));
+    }
+
+    // === Handover ==========================================================
+
+    /// A reloader over a one-line alertfile in `dir`, plus the publisher it
+    /// dispatches from.
+    ///
+    /// The URL is a discard port on loopback: these tests are about what the
+    /// reloader does to its own tasks, not about delivery, and nothing here
+    /// waits on a response.
+    fn handover_fixture(dir: &std::path::Path) -> (AlertReloader, Arc<EventPublisher>) {
+        let publisher = EventPublisher::new(
+            node::events::EdgeIdentity::new([9; 16], None).expect("edge identity"),
+            64,
+        );
+        let (_tx, global_stop) = watch::channel(false);
+        // `_tx` must outlive the reloader or every `Stop` reads "sender gone"
+        // and the tasks retire themselves immediately. Leak it: the fixture
+        // owns nothing else that could hold it for the test's duration.
+        std::mem::forget(_tx);
+        let reloader = AlertReloader::new(
+            dir.join("alertfile.toml"),
+            tokio::runtime::Handle::current(),
+            publisher.clone(),
+            Arc::new(node::storage::db::InMemoryStore::new()),
+            None,
+            Arc::new(WebhookMetrics::new()),
+            global_stop,
+        );
+        (reloader, publisher)
+    }
+
+    fn write_hooks(dir: &std::path::Path, stanzas: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("alertfile.toml");
+        std::fs::write(&path, format!("version = 1\n{stanzas}")).expect("write alertfile");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn stanza(id: &str, categories: &str) -> String {
+        format!(
+            "\n[[webhook]]\nid = \"{id}\"\nurl = \"http://127.0.0.1:9/{id}\"\n\
+             secret = \"{}\"\ncategories = [{categories}]\n",
+            "s".repeat(32)
+        )
+    }
+
+    /// `apply` must take the incoming generation's bus subscription itself,
+    /// not leave it to the task it spawns.
+    ///
+    /// A `broadcast::Receiver` only sees what is published after it is created.
+    /// If the fan-in subscribes for itself, the subscription does not exist
+    /// until the executor first polls it — and every event published between
+    /// retiring the outgoing generation and that first poll reaches nobody.
+    /// A status event lost there is lost for good: there is no replay, and the
+    /// detectors are edge-triggered against a `HealthState` that outlives the
+    /// reload, so the condition is never re-raised.
+    ///
+    /// This is a single-threaded runtime and nothing is awaited across the
+    /// second `apply`, so no spawned task has run: the subscriber count is
+    /// exactly what `apply` did synchronously. Deferring the subscription to
+    /// the task leaves it at 1 and fails here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reload_subscribes_the_incoming_generation_before_retiring_the_old_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hooks(dir.path(), &stanza("pager", "\"status\""));
+        let (reloader, publisher) = handover_fixture(dir.path());
+
+        reloader.apply().expect("first apply");
+        // Let generation one's fan-in reach its select loop.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            publisher.subscriber_count(),
+            1,
+            "one generation running should mean exactly one bus subscriber"
+        );
+
+        write_hooks(
+            dir.path(),
+            &format!(
+                "{}{}",
+                stanza("pager", "\"status\""),
+                stanza("ops", "\"chain\"")
+            ),
+        );
+        reloader.apply().expect("second apply");
+
+        assert_eq!(
+            publisher.subscriber_count(),
+            2,
+            "apply() must subscribe the incoming generation itself; deferring it \
+             to the spawned task leaves the bus unsubscribed for as long as the \
+             executor takes to poll, and events published in that window are gone"
+        );
+    }
+
+    /// Editing one hook must not destroy another hook's pending deliveries.
+    ///
+    /// A reload used to retire the whole generation, taking every hook's queue
+    /// and retry backoff with it. For chain events that is survivable — the
+    /// durable cursor did not advance. A status event has no replay by design,
+    /// so one sitting in backoff for a hook the operator never touched is
+    /// simply lost, and the edge-triggered detector will not raise it again.
+    ///
+    /// Identity of the `mpsc::Sender` is the observable: a carried-over hook
+    /// keeps the same channel, and therefore the same queue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reload_carries_over_the_delivery_task_of_an_untouched_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hooks(dir.path(), &stanza("pager", "\"status\""));
+        let (reloader, _publisher) = handover_fixture(dir.path());
+
+        reloader.apply().expect("first apply");
+        let before = reloader
+            .running
+            .lock()
+            .hooks
+            .get("pager")
+            .map(|h| h.tx.clone())
+            .expect("pager is running");
+
+        // Add an unrelated second hook. `pager`'s stanza is byte-identical.
+        write_hooks(
+            dir.path(),
+            &format!(
+                "{}{}",
+                stanza("pager", "\"status\""),
+                stanza("ops", "\"chain\"")
+            ),
+        );
+        reloader.apply().expect("second apply");
+
+        let after = reloader
+            .running
+            .lock()
+            .hooks
+            .get("pager")
+            .map(|h| h.tx.clone())
+            .expect("pager is still running");
+        assert!(
+            before.same_channel(&after),
+            "an untouched hook must keep its delivery task across a reload; a \
+             fresh channel means its queued deliveries were destroyed"
+        );
+        assert!(
+            !before.is_closed(),
+            "the carried-over hook's delivery task must still be running"
+        );
+    }
+
+    /// The mirror: a hook the operator *did* edit is retired, so the new
+    /// endpoint does not inherit a backlog addressed to the old one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reload_retires_the_delivery_task_of_an_edited_hook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hooks(dir.path(), &stanza("pager", "\"status\""));
+        let (reloader, _publisher) = handover_fixture(dir.path());
+
+        reloader.apply().expect("first apply");
+        let before = reloader.running.lock().hooks["pager"].tx.clone();
+
+        write_hooks(dir.path(), &stanza("pager", "\"status\", \"chain\""));
+        reloader.apply().expect("second apply");
+
+        let after = reloader.running.lock().hooks["pager"].tx.clone();
+        assert!(
+            !before.same_channel(&after),
+            "an edited hook must get a fresh delivery task"
+        );
     }
 }
