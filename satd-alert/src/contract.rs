@@ -71,36 +71,19 @@ pub fn delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> String {
     format!("{node_id_hex}-{instance_id}-{seq}")
 }
 
-/// Build the idempotency key for a **synthesized** envelope — a catch-up replay
-/// event or a gap notice.
-///
-/// These do not come off the live bus. They are stamped by the replay builder,
-/// which has no sequence to assign and writes `seq: 0` into every one of them;
-/// live bus events start at 1. So `seq` is not merely a weak discriminator
-/// here — it is one constant shared by every replayed event and every lag
-/// notice for the life of the process.
-///
-/// That matters more than it looks. Catch-up exists precisely so a hook that
-/// was down does not miss what happened, and the contract tells receivers to
-/// deduplicate on this header. Minting these from `seq` would mean a node down
-/// for 100 blocks replays 100 events that a conforming receiver collapses into
-/// one — the durability feature delivering 1% of what it advertises, silently.
-/// The same collision would swallow every gap notice after the first, breaking
-/// "a gap is never silent" from the second gap onward.
-///
-/// The `r` prefix keeps this space disjoint from the bus (`<seq>`) and watch
-/// (`w<seq>`) spaces.
-pub fn replay_delivery_id(node_id_hex: &str, instance_id: u64, seq: u64) -> String {
-    format!("{node_id_hex}-{instance_id}-r{seq}")
-}
-
-
 /// Maximum age a receiver should accept for a v2 delivery, in seconds.
 ///
-/// Normative for receivers, advisory here: satd stamps `X-Satd-Timestamp` and
-/// signs it, but only the receiver can enforce freshness. Wide enough to
-/// tolerate ordinary clock skew and a retry backoff (which caps at 300 s), tight
-/// enough that a captured delivery is not a permanent replay token.
+/// Normative for receivers, and now enforced on the sending side too: a
+/// delivery older than this is refused by a conforming receiver, so continuing
+/// to retry it is guaranteed-futile work that pins the head of a serial queue.
+/// The dispatcher abandons an event once it crosses this age.
+///
+/// Note the bound that matters is the *total* retry span, not the 300 s cap on
+/// any one backoff interval — a doubling curve reaches 600 s of cumulative age
+/// around the tenth attempt.
+///
+/// Wide enough to tolerate ordinary clock skew, tight enough that a captured
+/// delivery is not a permanent replay token.
 pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 600;
 
 /// Build the canonical string a v2 signature covers.
@@ -256,29 +239,6 @@ mod tests {
         // Same seq after a restart ⇒ different id, because the instance nonce
         // changed. Without this a receiver would dedupe away real events.
         assert_ne!(delivery_id(&node, 7, 42), delivery_id(&node, 8, 42));
-    }
-
-    /// The id spaces must not overlap. They are minted from independent
-    /// counters — the bus `seq` and a synth counter — so without the prefix a
-    /// synthesized notice at counter 500 and a bus event at `seq` 500 would
-    /// collide, and a conforming receiver would silently discard the second.
-    /// (The watch space, `w<...>`, is added with the watch-hook feature and is
-    /// covered alongside it.)
-    ///
-    /// Swept across the counter range rather than sampled at one value: a
-    /// collision that only appears at a boundary is exactly the kind a single
-    /// sample misses.
-    #[test]
-    fn the_delivery_id_spaces_are_disjoint() {
-        let node = "ab".repeat(16);
-        for n in [0u64, 1, 9, 10, 500, u32::MAX as u64, u64::MAX] {
-            let ids = [delivery_id(&node, 7, n), replay_delivery_id(&node, 7, n)];
-            for (i, a) in ids.iter().enumerate() {
-                for b in ids.iter().skip(i + 1) {
-                    assert_ne!(a, b, "delivery id spaces collide at counter {n}");
-                }
-            }
-        }
     }
 
     /// Ids are unique per event within a process, across every field that

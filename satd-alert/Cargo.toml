@@ -27,6 +27,10 @@ tracing = { workspace = true }
 # Parse-only, like satd-auth: the `display` default feature pulls an
 # unpublished toml_writer and nothing here round-trips the file.
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+# The same WHATWG parser `reqwest` resolves a hook URL with. Validating against
+# it rather than against a prefix check is what makes "the alertfile loaded" and
+# "this hook can actually deliver" the same statement.
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

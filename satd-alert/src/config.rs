@@ -13,8 +13,8 @@
 //! heartbeat_interval_secs = 60        # optional dead-man ping; default off
 //! ```
 //!
-//! Why a file rather than flat `bitcoin.conf` keys: a hook has a secret, a
-//! filter, and (from the watch-set work) a watch-set. Core's config format is
+//! Why a file rather than flat `bitcoin.conf` keys: a hook has a secret and a
+//! filter. Core's config format is
 //! flat and first-wins, so several hooks cannot be expressed in it without
 //! inventing an index syntax. The precedent is `authfile=`, which is the same
 //! shape for the same reason — down to the 0600 permission check, since both
@@ -31,11 +31,32 @@ use std::path::{Path, PathBuf};
 use node::events::{StatusKind, StatusSeverity};
 
 /// Per-hook outbound queue depth. Delivery is serial per hook, so this is how
-/// far a hook may fall behind before events are dropped and the gap is reported
-/// to the receiver as a `Lagged` notice. 1024 is the same order as the
-/// publisher's own replay ring: enough to ride out a receiver restart, small
-/// enough that a permanently dead endpoint cannot grow memory without bound.
+/// far a hook may fall behind before events are dropped. Nothing is announced
+/// to the receiver when that happens — webhooks are best-effort, and the loss
+/// is visible only on `satd_alertwebhook_dropped_total`. 1024 is the same order
+/// as the publisher's own replay ring: enough to ride out a receiver restart,
+/// small enough that a permanently dead endpoint cannot grow memory without
+/// bound.
 pub const HOOK_QUEUE_CAPACITY: usize = 1024;
+
+/// The hook id the built-in `reorgwebhook=` dispatcher registers under.
+///
+/// Reserved rather than merely documented as reserved: hook ids key the metrics
+/// registry, so an alertfile hook sharing this id would be handed the *same*
+/// `HookCounters` as the legacy dispatcher and silently sum two unrelated
+/// series. Both would also send `X-Satd-Hook: reorg-legacy` under different
+/// secrets and different contract versions, so a receiver keying its secret
+/// lookup off that header would verify with the wrong key. The crate already
+/// hard-errors on duplicate ids for this exact reason; this is the one
+/// collision the duplicate check cannot see.
+///
+/// Kept in step with `satd::alert::LEGACY_REORG_HOOK_ID` by a test there —
+/// `satd-alert` cannot depend on the binary crate.
+pub const RESERVED_LEGACY_REORG_ID: &str = "reorg-legacy";
+
+/// Cap on a hook id's length. It becomes an HTTP header value and a Prometheus
+/// label on every single delivery, so an unbounded id is paid for forever.
+pub const MAX_HOOK_ID_LEN: usize = 64;
 
 /// The only alertfile schema version this build understands.
 pub const ALERTFILE_VERSION: u64 = 1;
@@ -53,11 +74,23 @@ pub enum AlertFileError {
          secrets — run: chmod 600 {path}"
     )]
     Permissions { path: PathBuf, mode: u32 },
-    #[error("alertfile {path}: not valid TOML: {source}")]
+    /// A TOML syntax error, rendered as **message and line only**.
+    ///
+    /// `toml_edit::TomlError`'s own `Display` quotes the offending source line
+    /// back verbatim. That is a good diagnostic for a config file and a bad one
+    /// for this file: the most likely line to be mid-edit when the syntax
+    /// breaks is `secret = "..."` — an operator rotating a key drops the
+    /// closing quote — and both callers log this with `error = %e`
+    /// (`satd/src/main.rs`, `satd/src/reload.rs`), which would put the
+    /// plaintext HMAC signing key in `debug.log` and anywhere that log is
+    /// shipped. The whole point of `Hook`'s hand-written `Debug` below is to
+    /// keep that key out of logs; rendering the snippet here would defeat it
+    /// from a different direction.
+    #[error("alertfile {path}: not valid TOML at line {line}: {message}")]
     Toml {
         path: PathBuf,
-        #[source]
-        source: toml_edit::TomlError,
+        line: usize,
+        message: String,
     },
     #[error("alertfile {path}: {message}")]
     Invalid { path: PathBuf, message: String },
@@ -181,10 +214,16 @@ impl AlertFile {
     /// so the rules are testable without a file on disk.
     pub fn parse(path: &Path, text: &str) -> Result<Self, AlertFileError> {
         let doc: toml_edit::DocumentMut =
-            text.parse().map_err(|source| AlertFileError::Toml {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            text.parse()
+                .map_err(|source: toml_edit::TomlError| AlertFileError::Toml {
+                    path: path.to_path_buf(),
+                    // `span()` is a byte range into `text`; turn it into a line
+                    // number without carrying any of the text along with it.
+                    line: source.span().map_or(0, |s| {
+                        text[..s.start.min(text.len())].bytes().filter(|b| *b == b'\n').count() + 1
+                    }),
+                    message: source.message().to_string(),
+                })?;
 
         match doc.get("version").and_then(|v| v.as_integer()) {
             Some(v) if v as u64 == ALERTFILE_VERSION => {}
@@ -224,9 +263,9 @@ impl AlertFile {
             }
         }
 
-        // Ids name a hook in delivery headers, in metrics labels, and in the
-        // metric label and header value, so a duplicate would conflate two hooks
-        // share one resume position.
+        // An id is a hook's identity in delivery headers and in metric labels,
+        // so two hooks sharing one would conflate two unrelated series and make
+        // `X-Satd-Hook` ambiguous at the receiver.
         let mut seen = BTreeSet::new();
         for h in &hooks {
             if !seen.insert(h.id.clone()) {
@@ -267,6 +306,25 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
             format!("webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers and metric labels)"),
         ));
     }
+    if id == RESERVED_LEGACY_REORG_ID {
+        return Err(AlertFileError::invalid(
+            path,
+            format!(
+                "webhook id `{id}` is reserved for the built-in `reorgwebhook=` dispatcher; \
+                 pick another id"
+            ),
+        ));
+    }
+    if id.len() > MAX_HOOK_ID_LEN {
+        return Err(AlertFileError::invalid(
+            path,
+            format!(
+                "webhook id is {} characters; the limit is {MAX_HOOK_ID_LEN} (it becomes an HTTP \
+                 header value and a Prometheus label on every delivery)",
+                id.len()
+            ),
+        ));
+    }
     let url = req_str(path, t, "url")?;
     let secret = req_str(path, t, "secret")?;
     if secret.is_empty() {
@@ -276,10 +334,19 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         ));
     }
 
-    let allow_insecure_http = t
-        .get("allow_insecure_http")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Typed strictly, like every sibling field. `allow_insecure_http = "true"`
+    // is a plausible thing to write, and silently reading it as `false` would
+    // reject the very hook the operator just opted in for — with an error
+    // message about plaintext that makes no sense next to the line they added.
+    let allow_insecure_http = match t.get("allow_insecure_http") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `allow_insecure_http` must be a bool (true or false)"),
+            )
+        })?,
+    };
     validate_url(path, &id, &url, allow_insecure_http)?;
 
     let categories = parse_categories(path, &id, t)?;
@@ -440,76 +507,67 @@ fn parse_kinds(
     Ok(Some(out))
 }
 
+/// Validate a hook URL against the parser that will actually resolve it.
+///
+/// This parses rather than prefix-matching, because the two disagree on strings
+/// an operator really types. `https://alerts.example:99999/satd`,
+/// `https://[::1`, and `https://` all pass a `starts_with("https://")` test and
+/// all fail `Url::parse`. Accepting one is not a cosmetic slip: the dispatcher
+/// only discovers it at send time, where `reqwest` reports a builder error with
+/// no status, `classify_response(None)` reads that as *transient*, and the hook
+/// retries a permanently-invalid URL every five minutes forever — filling its
+/// queue and dropping every real alert behind it, on a node that logged
+/// `alertfile loaded` at startup. An accepted-but-undeliverable hook is the
+/// "accepted-but-ignored rule" this module's posture exists to prevent.
 fn validate_url(
     path: &Path,
     id: &str,
     url: &str,
     allow_insecure_http: bool,
 ) -> Result<(), AlertFileError> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err(AlertFileError::invalid(
+    let parsed = url::Url::parse(url).map_err(|e| {
+        AlertFileError::invalid(path, format!("webhook `{id}`: url is not a valid URL: {e}"))
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            if allow_insecure_http || is_local_host(parsed.host()) {
+                Ok(())
+            } else {
+                Err(AlertFileError::invalid(
+                    path,
+                    format!(
+                        "webhook `{id}`: plaintext http:// to a non-local address; use https://, \
+                         or set allow_insecure_http = true to accept it"
+                    ),
+                ))
+            }
+        }
+        other => Err(AlertFileError::invalid(
             path,
-            format!("webhook `{id}`: url must start with https:// or http://"),
-        ));
-    };
-    if allow_insecure_http || is_local_target(rest) {
-        return Ok(());
+            format!("webhook `{id}`: url scheme must be https:// or http:// (got `{other}://`)"),
+        )),
     }
-    Err(AlertFileError::invalid(
-        path,
-        format!(
-            "webhook `{id}`: plaintext http:// to a non-local address; use https://, or set \
-             allow_insecure_http = true to accept it"
-        ),
-    ))
 }
 
-/// Whether an `http://` authority is loopback or RFC1918 — the cases where
-/// plaintext is normal (a relay on the same host, a receiver inside a private
-/// network) and demanding TLS would just push operators to set the override.
-fn is_local_target(rest: &str) -> bool {
-    // Authority is everything before the path, query, or fragment.
-    //
-    // A backslash terminates the authority too. The WHATWG URL parser — which
-    // is what `reqwest` resolves this string with — treats `\` as a path
-    // separator for special schemes, so `http://evil.example\@127.0.0.1/hook`
-    // has host `evil.example`, while splitting on `/` alone leaves an authority
-    // of `evil.example\@127.0.0.1` whose last `@` yields `127.0.0.1`. That
-    // reads as loopback, waives the `allow_insecure_http` gate, and posts the
-    // signed body in cleartext to the attacker's host — the same bypass the
-    // userinfo rule below closes, through a different separator.
-    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
-    // Strip userinfo — everything through the *last* `@`.
-    //
-    // Without this, `http://127.0.0.1:8332@evil.example/hook` reads as host
-    // `127.0.0.1`, is judged loopback, and is accepted with no
-    // `allow_insecure_http` acknowledgement — while the request actually goes
-    // in cleartext to `evil.example` with `127.0.0.1:8332` as userinfo. The
-    // operator is not the adversary here; the gate exists to make them
-    // consciously accept cleartext to a public host, and this skipped it.
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // An IPv6 literal is bracketed, and its address contains colons — so the
-    // port must be split on the bracket, not on the last colon.
-    let host = if let Some(after) = host_port.strip_prefix('[') {
-        match after.split_once(']') {
-            Some((h, _)) => h,
-            None => return false,
-        }
-    } else {
-        host_port.split_once(':').map_or(host_port, |(h, _)| h)
-    };
-    if host == "localhost" || host == "::1" {
-        return true;
-    }
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+/// Whether a parsed host is loopback or RFC1918 — the cases where plaintext is
+/// normal (a relay on the same host, a receiver inside a private network) and
+/// demanding TLS would just push operators to set the override.
+///
+/// Taking the host from `Url` rather than slicing the authority out by hand is
+/// what closes the two smuggling tricks this check used to unpick manually.
+/// `http://127.0.0.1:8332@evil.example/hook` has host `evil.example`, not
+/// `127.0.0.1` — userinfo runs to the *last* `@`. And `\` terminates the
+/// authority for a special scheme, so `http://evil.example\@127.0.0.1/hook` is
+/// also `evil.example`. Both previously read as loopback, waiving the
+/// `allow_insecure_http` gate and posting the signed body in cleartext to the
+/// attacker's host. The parser gets both right by construction.
+fn is_local_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.is_unique_local(),
+        None => false,
     }
 }
 
@@ -654,8 +712,82 @@ categories = ["chain"]
     fn unknown_keys_are_rejected_not_ignored() {
         // An accepted-but-ignored alerting rule is worse than a refused one:
         // the operator believes they are covered when they are not.
-        assert!(parse(&format!("{MINIMAL}\nnot_a_key = 1\n")).is_err());
+        //
+        // Both levels, placed deliberately. Appending to MINIMAL does *not*
+        // test the top-level check: TOML puts a trailing key inside the last
+        // open table, so `{MINIMAL}\nnot_a_key = 1` lands in `[[webhook]]` and
+        // exercises `parse_hook`'s KNOWN list twice over. The top-level loop
+        // needs a key written before the first `[[webhook]]` header.
+        let top_level = MINIMAL.replace("[[webhook]]", "not_a_key = 1\n[[webhook]]");
+        let err = parse(&top_level).expect_err("a stray top-level key must be refused");
+        assert!(err.to_string().contains("not_a_key"), "{err}");
         assert!(parse(&MINIMAL.replace("categories = [\"status\"]", "categories = [\"status\"]\nkindz = [\"tip_stall\"]")).is_err());
+    }
+
+    /// A URL that satisfies the old `starts_with("https://")` check but that
+    /// `reqwest` cannot resolve. Accepting one is not cosmetic: the dispatcher
+    /// sees a builder error with no status, classifies it transient, and
+    /// retries forever without ever delivering — on a node whose startup log
+    /// says the alertfile loaded cleanly.
+    #[test]
+    fn a_well_prefixed_but_unparseable_url_is_refused_at_load() {
+        for bad in [
+            "https://",                     // no host at all
+            "https://:8080/hook",           // empty host with a port
+            "https://alerts.example:99999/hook", // port out of range
+            "https://[::1/hook",            // unterminated IPv6 literal
+            "https://<your-host>/hook",     // template placeholder, left unedited
+        ] {
+            let f = MINIMAL.replace("https://alerts.example/satd", bad);
+            assert!(
+                parse(&f).is_err(),
+                "`{bad}` parses as an alertfile but cannot ever deliver",
+            );
+        }
+    }
+
+    #[test]
+    fn the_legacy_reorg_hook_id_is_reserved() {
+        // Sharing this id hands the alertfile hook the same metrics counters as
+        // the built-in `reorgwebhook=` dispatcher, and makes `X-Satd-Hook`
+        // ambiguous between two hooks with different secrets and different
+        // contract versions.
+        let f = MINIMAL.replace(r#"id = "ops""#, r#"id = "reorg-legacy""#);
+        let err = parse(&f).expect_err("the reserved id must be refused");
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_typed_allow_insecure_http_is_refused_not_ignored() {
+        // Reading `"true"` as `false` would reject the very hook the operator
+        // just opted in for, with an error about plaintext that makes no sense
+        // beside the line they added.
+        let f = MINIMAL.replace(
+            "https://alerts.example/satd",
+            "http://alerts.example/satd",
+        ) + "allow_insecure_http = \"true\"\n";
+        let err = parse(&f).expect_err("a non-bool must be refused");
+        assert!(err.to_string().contains("must be a bool"), "{err}");
+    }
+
+    #[test]
+    fn an_over_long_hook_id_is_refused() {
+        let f = MINIMAL.replace(r#"id = "ops""#, &format!(r#"id = "{}""#, "x".repeat(65)));
+        assert!(parse(&f).is_err(), "an id becomes a header value on every delivery");
+    }
+
+    /// A syntax error must not quote the offending line back, because the line
+    /// most likely to be mid-edit when the syntax breaks is the secret.
+    #[test]
+    fn a_toml_syntax_error_never_echoes_the_secret() {
+        let broken = MINIMAL.replace(r#"secret = "s3cret""#, r#"secret = "s3cret"#);
+        let err = parse(&broken).expect_err("unterminated string must fail");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("s3cret"),
+            "the signing secret reached the error text, and both callers log it: {rendered}",
+        );
+        assert!(rendered.contains("line"), "should still locate the error: {rendered}");
     }
 
     #[test]

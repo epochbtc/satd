@@ -118,9 +118,11 @@ struct HookChannel {
 /// `HookCounters` is process-lived so a reload does not reset an operator's
 /// counters.
 ///
-/// Injected rather than reached for as a `static` so a test can hand in a fresh
-/// one. With a bare static the first test to latch `left_ibd` makes every later
-/// test of the gate vacuous, non-deterministically, since they share a process.
+/// Held in a process `static` (`DISPATCHER_STATE`). Note the consequence for
+/// testing: `left_ibd` is a latch, so the first test in a process to set it
+/// makes every later test of the IBD gate vacuous, non-deterministically. The
+/// gate is covered end-to-end rather than by unit tests for that reason; a unit
+/// test of it would need this state threaded through `AlertReloader::new`.
 #[derive(Default)]
 struct DispatcherState {
     /// Whether this node has ever been observed out of initial block download.
@@ -505,9 +507,56 @@ async fn deliver_loop(
                 }
                 satd_alert::Disposition::Retry => {
                     counters.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                    match &result {
+                    // A builder error is not transient. reqwest defers URL
+                    // parsing into the builder, so a URL that satisfies the
+                    // alertfile's checks but that the WHATWG parser rejects
+                    // fails here with no status — which `classify_response`
+                    // reads as a transient network problem. `validate_url`
+                    // parses at load precisely so this cannot happen, but if
+                    // one ever slips through, retrying it every five minutes
+                    // forever would pin the head of a serial queue and drop
+                    // every real alert behind it.
+                    if result.as_ref().err().is_some_and(reqwest::Error::is_builder) {
+                        counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            target: "alert",
+                            hook = %hook.id,
+                            "webhook url cannot be resolved; dropping this event (fix the \
+                             alertfile — retrying cannot help)",
+                        );
+                        break;
+                    }
+                    // Stop once the delivery is older than the freshness window
+                    // the contract publishes. `signed_at` is fixed for the life
+                    // of the event, so past this age a conforming receiver is
+                    // required to refuse every remaining attempt. Continuing
+                    // would be guaranteed-futile work — and if the rejection
+                    // arrives as a 503 from a gateway rather than a 4xx, the
+                    // event would never reach `Drop` and would pin the queue
+                    // permanently.
+                    if unix_secs().saturating_sub(signed_at) > satd_alert::MAX_TIMESTAMP_SKEW_SECS {
+                        counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "alert",
+                            hook = %hook.id,
+                            delivery = %delivery_id,
+                            attempt,
+                            "webhook delivery aged past the freshness window; giving up on it",
+                        );
+                        break;
+                    }
+                    match result {
                         Ok(r) => tracing::warn!(target: "alert", hook = %hook.id, status = %r.status(), attempt, "webhook delivery failed; retrying"),
-                        Err(e) => tracing::warn!(target: "alert", hook = %hook.id, error = %e, attempt, "webhook request failed; retrying"),
+                        // `without_url` because a webhook URL is frequently the
+                        // credential itself (Slack, Discord, PagerDuty) and may
+                        // carry userinfo; reqwest's `Display` appends it
+                        // verbatim to transport and timeout errors, so the
+                        // plain form writes that credential to the log on every
+                        // endpoint blip.
+                        Err(e) => {
+                            let e = e.without_url();
+                            tracing::warn!(target: "alert", hook = %hook.id, error = %e, attempt, "webhook request failed; retrying");
+                        }
                     }
                     let delay = satd_alert::retry::jitter(
                         satd_alert::retry_delay(attempt),
@@ -674,9 +723,9 @@ impl AlertReloader {
                         // This one's queue is dropped on purpose: the operator
                         // changed where or how it delivers, and flushing the
                         // backlog to the superseded endpoint is not what they
-                        // asked for. `deliver_loop` hands the undelivered count
-                        // back to the process-lived `GapState` on its way out,
-                        // so the hole is announced rather than swallowed.
+                        // asked for. Nothing is announced — webhooks are
+                        // best-effort, and the loss shows up only on
+                        // `satd_alertwebhook_dropped_total`.
                         let _ = edited.stop.send(true);
                         None
                     }
@@ -854,6 +903,17 @@ mod tests {
             .expect("valid alertfile")
             .hooks
             .remove(0)
+    }
+
+    /// The alertfile parser reserves this id so an operator hook cannot
+    /// collide with the built-in `reorgwebhook=` dispatcher. The two constants
+    /// live in different crates — `satd-alert` cannot depend on this binary —
+    /// so nothing but this assertion keeps them in step. If they drift, the
+    /// reservation silently protects the wrong string and both hooks share one
+    /// set of metrics counters again.
+    #[test]
+    fn the_reserved_hook_id_matches_the_one_the_parser_refuses() {
+        assert_eq!(LEGACY_REORG_HOOK_ID, satd_alert::RESERVED_LEGACY_REORG_ID);
     }
 
     fn status_env(kind: StatusKind, severity: StatusSeverity) -> NodeEvent {

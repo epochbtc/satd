@@ -155,7 +155,7 @@ each matching event to your endpoint.
 version = 1
 
 [[webhook]]
-id = "pager"                        # unique; appears in headers, metrics, and the cursor key
+id = "pager"                        # unique; appears in the X-Satd-Hook header and metric labels
 url = "https://alerts.example/satd"
 secret = "a-long-random-string"     # required — it signs every delivery
 categories = ["status"]             # status | chain | mempool | heartbeat
@@ -268,11 +268,13 @@ the only duplicate you can receive is a retry of something you already saw.
   backpressure, and a bounded `RescanBlocks`. Webhooks are for automation you
   are happy to miss occasionally: page me, poke a script, ping a dead-man's
   switch.
-- **Suppressed during initial block download.** A node syncing from scratch does
-  not POST its entire history: while it is catching up, only `status` and
-  `heartbeat` events are delivered. Health alerts stay live because "this node is
-  unhealthy" is exactly as true mid-sync, and the heartbeat keeps flowing so an
-  external dead-man's switch does not declare a syncing node dead. What was
+- **`chain` alerts are suppressed during initial block download.** A node
+  syncing from scratch does not POST its entire block history. `status`,
+  `heartbeat` **and `mempool`** keep flowing: health alerts stay live because
+  "this node is unhealthy" is exactly as true mid-sync, and the heartbeat keeps
+  flowing so an external dead-man's switch does not declare a syncing node dead.
+  Note the consequence for `mempool` hooks — a mainnet mempool subscription is
+  thousands of events a minute, and a multi-day sync does not quiet it. What was
   suppressed is counted in `satd_alertwebhook_dropped_total`. The suppression is
   latched on leaving IBD once, so a node whose tip later goes stale keeps
   alerting — which is the whole point of a stalled-tip alert.
@@ -281,7 +283,8 @@ Plaintext `http://` is accepted for loopback and private-network targets. For a
 public host, use `https://` or set `allow_insecure_http = true` on the hook.
 
 Per-hook counters are exported: `satd_alertwebhook_delivered_total`,
-`_failed_attempts_total`, `_dropped_total` (the dead-letter count),
+`_failed_attempts_total`, `_dropped_total` (events lost, not held —
+there is no dead-letter queue),
 `_queue_depth`, and `_last_success_age_seconds`, all labelled `hook="<id>"`.
 Nothing is exported when no hook is configured.
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 /// What to do with an attempt's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
-    /// 2xx — the receiver acked. Advance the cursor.
+    /// 2xx — the receiver acked.
     Delivered,
     /// Transient: retry this same event after a backoff.
     Retry,
