@@ -37,8 +37,15 @@ use serde::Serialize;
 pub enum StatusKind {
     /// Initial block download finished (edge, at most once per process).
     IbdComplete,
-    /// No block connected for longer than the configured window, while not in
-    /// IBD. Clears when the next block connects.
+    /// No block connected for longer than the configured window. Clears when
+    /// the next block connects.
+    ///
+    /// Deliberately *not* suppressed during initial block download:
+    /// `is_initial_block_download()` compares the tip header's timestamp
+    /// against the wall clock rather than tracking sync progress, so a node
+    /// that was caught up and then wedged re-enters it exactly when the
+    /// operator most needs paging. A node that is genuinely syncing connects
+    /// blocks continuously and never crosses the threshold on its own.
     TipStall,
     /// Free space on the data (or blocks) directory fell below the configured
     /// floor. Clears with hysteresis above it.
@@ -67,6 +74,12 @@ impl StatusKind {
     }
 
     /// Every kind, for config validation and metric pre-registration.
+    ///
+    /// Kept exhaustive by the compile-time guard below the impl block. A kind
+    /// missing from here compiles clean and fails only at runtime, invisibly:
+    /// `from_str_exact` scans `ALL`, so the alertfile would reject
+    /// `kinds = ["the_new_kind"]` as unknown even though the streaming docs
+    /// list it, and the metric would never be pre-registered.
     pub const ALL: [StatusKind; 6] = [
         StatusKind::IbdComplete,
         StatusKind::TipStall,
@@ -106,6 +119,26 @@ impl StatusKind {
         format!("alert.{}", self.as_str())
     }
 }
+
+/// Compile-time guard that [`StatusKind::ALL`] lists every variant.
+///
+/// Adding a variant makes this `match` non-exhaustive and fails the build here,
+/// pointing at the array that needs updating — rather than shipping a kind that
+/// the alertfile parser rejects and the metrics registry never sees.
+const _: () = {
+    const fn every_variant_is_in_all(k: StatusKind) -> usize {
+        match k {
+            StatusKind::IbdComplete => 0,
+            StatusKind::TipStall => 1,
+            StatusKind::DiskLow => 2,
+            StatusKind::MempoolCongested => 3,
+            StatusKind::PeerFloor => 4,
+            StatusKind::DeepReorg => 5,
+        }
+    }
+    // Also pins the array's length to the variant count.
+    assert!(StatusKind::ALL.len() == every_variant_is_in_all(StatusKind::DeepReorg) + 1);
+};
 
 /// Level-triggered lifecycle of a condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -167,10 +200,15 @@ pub struct StatusEvent {
     /// Human-readable one-liner. Safe to log or page on, **not** to parse:
     /// machine consumers switch on `kind` and read `details`.
     pub message: String,
-    /// Kind-specific structured fields as decimal strings. A `BTreeMap` (not a
-    /// `HashMap`) so the rendered JSON has a deterministic key order — the
-    /// webhook body is HMAC-signed, and golden signature vectors would be
-    /// unreproducible under map-iteration order.
+    /// Kind-specific structured fields, as strings.
+    ///
+    /// Mostly decimal numbers, but **not** universally: a `cleared` event can
+    /// carry a `reason` token (`detector_disabled`, `mempool_cap_zero`). A
+    /// consumer must not parse the map uniformly as integers.
+    ///
+    /// A `BTreeMap` (not a `HashMap`) so the rendered JSON has a deterministic
+    /// key order — the webhook body is HMAC-signed, and golden signature
+    /// vectors would be unreproducible under map-iteration order.
     pub details: BTreeMap<String, String>,
 }
 
@@ -182,37 +220,80 @@ impl StatusEvent {
             kind,
             state,
             severity: kind.severity(),
-            message: message.into(),
+            message: truncate(&message.into(), MAX_MESSAGE_LEN),
             details: BTreeMap::new(),
         }
     }
 
-    /// A condition entering. Panics in debug builds for edge kinds, which have
-    /// no standing state — use [`edge`](Self::edge) for those.
+    /// A condition entering.
+    ///
+    /// An edge kind has no standing state, so it is coerced to
+    /// [`StatusState::Edge`] rather than shipping a `raised` a consumer would
+    /// wait forever to see cleared. These constructors are total on purpose:
+    /// the kind is a runtime parameter at both call sites in `health.rs`, so a
+    /// mismatch is reachable, and a `debug_assert!` would let a release build
+    /// emit the malformed event silently — leaving `satd_alert_active{kind=…}`
+    /// stuck at 1 and a receiver waiting on a `cleared` that cannot come.
     pub fn raised(kind: StatusKind, message: impl Into<String>) -> Self {
-        debug_assert!(!kind.is_edge(), "{} is an edge kind", kind.as_str());
-        Self::build(kind, StatusState::Raised, message)
+        Self::build(kind, Self::state_for(kind, StatusState::Raised), message)
     }
 
-    /// A condition recovering.
+    /// A condition recovering. Coerced to [`StatusState::Edge`] for edge kinds,
+    /// which never clear — see [`raised`](Self::raised).
     pub fn cleared(kind: StatusKind, message: impl Into<String>) -> Self {
-        debug_assert!(!kind.is_edge(), "{} is an edge kind", kind.as_str());
-        Self::build(kind, StatusState::Cleared, message)
+        Self::build(kind, Self::state_for(kind, StatusState::Cleared), message)
+    }
+
+    /// The state an event of this kind may actually carry.
+    fn state_for(kind: StatusKind, requested: StatusState) -> StatusState {
+        if kind.is_edge() {
+            StatusState::Edge
+        } else if requested == StatusState::Edge {
+            // A standing kind cannot be an edge; `raised` is the honest
+            // reading of "this just happened" for one.
+            StatusState::Raised
+        } else {
+            requested
+        }
     }
 
     /// A one-shot observation.
     pub fn edge(kind: StatusKind, message: impl Into<String>) -> Self {
-        debug_assert!(kind.is_edge(), "{} is not an edge kind", kind.as_str());
-        Self::build(kind, StatusState::Edge, message)
+        Self::build(kind, Self::state_for(kind, StatusState::Edge), message)
     }
 
-    /// Attach a structured detail field (builder style). Values are rendered
-    /// as decimal strings by the caller so the map stays additive forever.
+    /// Attach a structured detail field (builder style). Values are stringified
+    /// by the caller so the map stays additive forever.
+    ///
+    /// Both key and value are truncated to [`MAX_DETAIL_LEN`]. Every producer
+    /// is in-tree today and emits short tokens, but this body rides a 4096-slot
+    /// broadcast to every subscriber *and* goes inside an HMAC-signed webhook
+    /// payload, so the first detector to interpolate peer-supplied text (a user
+    /// agent, a reject reason) should not be able to size either.
     #[must_use]
     pub fn with_detail(mut self, key: &str, value: impl ToString) -> Self {
-        self.details.insert(key.to_string(), value.to_string());
+        self.details
+            .insert(truncate(key, MAX_DETAIL_LEN), truncate(&value.to_string(), MAX_DETAIL_LEN));
         self
     }
+}
+
+/// Cap on any single `details` key or value.
+pub const MAX_DETAIL_LEN: usize = 256;
+
+/// Cap on the human-readable `message`.
+pub const MAX_MESSAGE_LEN: usize = 1024;
+
+/// Truncate on a UTF-8 boundary (slicing mid-codepoint would panic).
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 #[cfg(test)]

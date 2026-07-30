@@ -122,10 +122,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   carries `StatusEvent` bodies describing the node itself (`ibd_complete`,
   `tip_stall`, `disk_low`, `mempool_congested`, `peer_floor`, `deep_reorg`),
   level-triggered with paired `raised`/`cleared` states and an additive
-  `details` string map. Served on gRPC, WS/SSE, and the ZMQ `nodeevent` topic;
-  not replayable (no cursor — detectors re-raise standing conditions after a
-  restart). Wire schema only in this change; the detectors that emit them land
-  next.
+  `details` string map. Served on gRPC and WS/SSE; **not** on the ZMQ
+  `nodeevent` topic, which has no per-subscriber category mask (use `alertfile`
+  webhooks or `-alertnotify` for health over ZMQ). Not replayable (no cursor —
+  detectors re-raise standing conditions after a restart). Wire schema only in
+  this change; the detectors that emit them land next.
 
 ## Releases
 
