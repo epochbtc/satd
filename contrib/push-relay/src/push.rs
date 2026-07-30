@@ -20,6 +20,48 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A provider token and the moment it stops being usable.
+///
+/// Both providers rate-limit *minting*, so a relay that mints per delivery
+/// fails in the one situation it exists for. Apple documents at most one token
+/// per 20 minutes and answers `429 TooManyProviderTokenUpdates` beyond that; a
+/// flapping condition (`tip_stall` raising and clearing, peers oscillating at
+/// the threshold) produces raise/clear pairs minutes apart, so four alerts in
+/// an hour is enough to trip it. Google's is worse per delivery: a full
+/// RSA-signed assertion *and* a network round trip to `oauth2.googleapis.com`
+/// in the alert path.
+///
+/// Reading the key file per delivery was also a blocking `std::fs` read inside
+/// an `async fn`. Caching removes that too.
+#[derive(Clone)]
+struct CachedToken {
+    token: String,
+    /// Extra value APNs does not need and FCM does: the project id.
+    project: String,
+    expires_at: u64,
+}
+
+/// Refresh this long before a token actually expires, so a delivery never races
+/// the boundary.
+const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+
+/// APNs accepts a provider token for an hour; refresh at 50 minutes.
+const APNS_TOKEN_LIFETIME_SECS: u64 = 50 * 60;
+
+/// Process-wide token caches. One entry each; the relay talks to at most one
+/// APNs app and one FCM project.
+static APNS_TOKEN: std::sync::LazyLock<tokio::sync::Mutex<Option<CachedToken>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+static FCM_TOKEN: std::sync::LazyLock<tokio::sync::Mutex<Option<CachedToken>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+fn fresh(entry: &Option<CachedToken>) -> Option<CachedToken> {
+    entry
+        .as_ref()
+        .filter(|t| t.expires_at > now_secs().saturating_add(TOKEN_REFRESH_MARGIN_SECS))
+        .cloned()
+}
+
 // ---------------------------------------------------------------- APNs -----
 
 #[derive(Debug, Serialize)]
@@ -60,12 +102,27 @@ pub fn apns_payload(n: &Notification) -> serde_json::Value {
     })
 }
 
+/// The cached APNs provider token, minting a new one only when needed.
+async fn cached_apns_token(cfg: &ApnsConfig) -> anyhow::Result<String> {
+    let mut slot = APNS_TOKEN.lock().await;
+    if let Some(t) = fresh(&slot) {
+        return Ok(t.token);
+    }
+    let token = apns_token(cfg)?;
+    *slot = Some(CachedToken {
+        token: token.clone(),
+        project: String::new(),
+        expires_at: now_secs().saturating_add(APNS_TOKEN_LIFETIME_SECS),
+    });
+    Ok(token)
+}
+
 pub async fn send_apns(
     client: &reqwest::Client,
     cfg: &ApnsConfig,
     n: &Notification,
 ) -> anyhow::Result<()> {
-    let token = apns_token(cfg)?;
+    let token = cached_apns_token(cfg).await?;
     let payload = apns_payload(n);
     for device in &cfg.device_tokens {
         let url = format!("https://{}/3/device/{device}", cfg.host());
@@ -76,18 +133,48 @@ pub async fn send_apns(
             .header("apns-push-type", "alert")
             // Collapsing means a raise and its later clear replace each other
             // on the lock screen instead of stacking up.
-            .header("apns-collapse-id", &n.collapse_id)
+            .header("apns-collapse-id", collapse_id_for_apns(&n.collapse_id))
             .json(&payload)
             .send()
-            .await?;
-        if !resp.status().is_success() {
-            tracing::warn!(
-                status = %resp.status(),
-                "APNs rejected a push (device token stale or credentials wrong)"
-            );
+            .await;
+        // Deliberately not `?`. A transport error or timeout on one device must
+        // not abandon the rest: `?` here meant an unreachable first device
+        // silently swallowed the alert for every device behind it.
+        match resp {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                let status = r.status();
+                if status.as_u16() == 429 || status.is_server_error() {
+                    // Worth distinguishing: this is the provider throttling or
+                    // failing, not a bad device token, and the generic message
+                    // would send the operator hunting the wrong thing.
+                    tracing::warn!(%status, "APNs is throttling or unavailable; push not delivered");
+                } else {
+                    tracing::warn!(
+                        %status,
+                        "APNs rejected a push (device token stale or credentials wrong)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "APNs request failed for one device"),
         }
     }
     Ok(())
+}
+
+/// APNs caps `apns-collapse-id` at 64 bytes and rejects the whole request past
+/// it, so an over-long id would fail *every* push for that condition rather
+/// than degrading. Truncated on a char boundary.
+fn collapse_id_for_apns(id: &str) -> String {
+    const MAX: usize = 64;
+    if id.len() <= MAX {
+        return id.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    id[..end].to_string()
 }
 
 // ----------------------------------------------------------------- FCM -----
@@ -111,14 +198,19 @@ struct GoogleClaims {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Seconds the token stays valid. Google sends it; the caller caches on it.
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 /// Exchange a service-account key for an OAuth2 access token.
+///
+/// Returns the token, the project id, and the token's lifetime in seconds.
 pub async fn fcm_access_token(
     client: &reqwest::Client,
     sa_path: &Path,
     token_uri: &str,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, u64)> {
     let text = std::fs::read_to_string(sa_path)
         .map_err(|e| anyhow::anyhow!("reading service account {}: {e}", sa_path.display()))?;
     let sa: ServiceAccount = serde_json::from_str(&text)?;
@@ -148,7 +240,10 @@ pub async fn fcm_access_token(
         .error_for_status()?
         .json()
         .await?;
-    Ok((resp.access_token, sa.project_id))
+    // Google's default is 3600; fall back to something short rather than
+    // caching indefinitely if the field is ever absent.
+    let expires_in = resp.expires_in.unwrap_or(3600);
+    Ok((resp.access_token, sa.project_id, expires_in))
 }
 
 /// The FCM HTTP v1 message body for one device token.
@@ -166,30 +261,58 @@ pub fn fcm_message(device_token: &str, n: &Notification) -> serde_json::Value {
     })
 }
 
-pub async fn send_fcm(
+/// The cached FCM access token and project id.
+async fn cached_fcm_token(
     client: &reqwest::Client,
     cfg: &FcmConfig,
-    n: &Notification,
-) -> anyhow::Result<()> {
-    let (token, project) = fcm_access_token(
+) -> anyhow::Result<(String, String)> {
+    let mut slot = FCM_TOKEN.lock().await;
+    if let Some(t) = fresh(&slot) {
+        return Ok((t.token, t.project));
+    }
+    let (token, project, expires_in) = fcm_access_token(
         client,
         &cfg.service_account_file,
         "https://oauth2.googleapis.com/token",
     )
     .await?;
+    *slot = Some(CachedToken {
+        token: token.clone(),
+        project: project.clone(),
+        expires_at: now_secs().saturating_add(expires_in),
+    });
+    Ok((token, project))
+}
+
+pub async fn send_fcm(
+    client: &reqwest::Client,
+    cfg: &FcmConfig,
+    n: &Notification,
+) -> anyhow::Result<()> {
+    let (token, project) = cached_fcm_token(client, cfg).await?;
     let url = format!("https://fcm.googleapis.com/v1/projects/{project}/messages:send");
     for device in &cfg.device_tokens {
-        let resp = client
+        // As in `send_apns`: one unreachable device must not abandon the rest.
+        match client
             .post(&url)
             .bearer_auth(&token)
             .json(&fcm_message(device, n))
             .send()
-            .await?;
-        if !resp.status().is_success() {
-            tracing::warn!(
-                status = %resp.status(),
-                "FCM rejected a push (registration token stale or credentials wrong)"
-            );
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                let status = r.status();
+                if status.as_u16() == 429 || status.is_server_error() {
+                    tracing::warn!(%status, "FCM is throttling or unavailable; push not delivered");
+                } else {
+                    tracing::warn!(
+                        %status,
+                        "FCM rejected a push (registration token stale or credentials wrong)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "FCM request failed for one device"),
         }
     }
     Ok(())

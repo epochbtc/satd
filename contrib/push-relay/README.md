@@ -20,8 +20,15 @@ What *is* worth copying verbatim is the receive path in `src/main.rs`:
    parsing**. A re-serialized body does not verify (key order and whitespace are
    part of the signed bytes), and parsing unauthenticated input is the thing to
    avoid.
-2. Deduplicate on `X-Satd-Delivery`. satd delivers at-least-once and retries, so
-   the same id arrives again whenever a response is lost after you acted on it.
+2. Deduplicate on `X-Satd-Delivery`. satd retries, so the same id arrives again
+   whenever a response is lost after you acted on it — and a `SIGHUP` reload on
+   the node can deliver one event twice, both stamped `X-Satd-Attempt: 1`. Dedup
+   is required, not advisory.
+
+   Note what this relay's ordering costs you: the delivery is recorded in the
+   dedup ring *before* the push is attempted, so if the push then fails, satd's
+   retry is suppressed as a duplicate. Moving the insert after a successful push
+   is the fix, and it is not the same fix as moving the ACK (see below).
 3. **Acknowledge before pushing.** satd delivers serially per hook; holding the
    response open across two provider round-trips puts the node's queue behind
    Apple's and Google's latency.
@@ -41,8 +48,18 @@ What *is* worth copying verbatim is the receive path in `src/main.rs`:
 cargo build --release
 cp relay.example.toml /etc/satd-push-relay/relay.toml   # then edit
 chmod 600 /etc/satd-push-relay/relay.toml               # holds the signing secret
+chmod 600 /etc/satd-push-relay/AuthKey_*.p8             # and the credentials it points at
+chmod 600 /etc/satd-push-relay/service-account.json
 ./target/release/satd-push-relay /etc/satd-push-relay/relay.toml
 ```
+
+The relay enforces all three: it refuses to start on a group- or
+world-accessible `relay.toml`, APNs key, or FCM service-account file.
+
+It listens on loopback by default and does not terminate TLS. Bind it anywhere
+else and the alert bodies — node identity, tip heights, disk state, peer counts
+— cross the network in cleartext; the HMAC gives you authenticity, not
+confidentiality. Put a TLS-terminating proxy in front if it is not loopback.
 
 Point a satd hook at it (in the node's `alertfile`):
 

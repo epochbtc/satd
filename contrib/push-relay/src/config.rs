@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Top-level `relay.toml`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is implemented by hand, not derived: this struct holds the shared
+/// HMAC secret, and the first thing a forker adds to a service like this is a
+/// `tracing::debug!(?cfg, "loaded config")`. A derived `Debug` would put the
+/// secret in the journal the day someone does that.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address to listen on. Bind loopback and let satd reach it locally, or
@@ -17,14 +22,26 @@ pub struct Config {
     pub satd_secret: String,
     /// Severity floor for **status** notifications (`info` | `warning` |
     /// `critical`). Most operators want `warning`: a push notification for
-    /// "IBD finished" is noise. Reorg and gap notifications are not status
-    /// events and are not filtered by this — they are always pushed.
+    /// "IBD finished" is noise. Reorg notifications are not status events and
+    /// are not filtered by this — they are always pushed.
     #[serde(default = "default_min_severity")]
     pub min_severity: String,
     #[serde(default)]
     pub apns: Option<ApnsConfig>,
     #[serde(default)]
     pub fcm: Option<FcmConfig>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("satd_secret", &"<redacted>")
+            .field("min_severity", &self.min_severity)
+            .field("apns", &self.apns.is_some())
+            .field("fcm", &self.fcm.is_some())
+            .finish()
+    }
 }
 
 fn default_min_severity() -> String {
@@ -74,12 +91,30 @@ pub struct FcmConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let file = std::fs::File::open(path)
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         check_perms(path, &file)?;
-        let text = std::fs::read_to_string(path)
+        // Read from the *same handle* the permissions were checked on. Opening
+        // the path a second time would leave a window in which the file that
+        // was validated and the file that is used are different — and someone
+        // who can win that race chooses the `satd_secret`, after which they can
+        // forge correctly-signed alerts.
+        let mut text = String::new();
+        file.read_to_string(&mut text)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)?;
+        // `toml::de::Error`'s Display quotes the offending source line back
+        // verbatim, and the line most likely to be malformed in this file is
+        // `satd_secret = "..."`. `main` prints the anyhow chain to stderr, so
+        // the plain error would put the shared HMAC secret in the journal.
+        let cfg: Config = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "parsing {}: {} (source line withheld — it may contain the secret)",
+                path.display(),
+                e.message(),
+            )
+        })?;
         if cfg.satd_secret.is_empty() {
             anyhow::bail!("satd_secret must not be empty — it is what authenticates satd");
         }
@@ -92,8 +127,47 @@ impl Config {
                 cfg.min_severity
             );
         }
+        // The credentials themselves, not just the file naming them. A
+        // world-readable `.p8` lets any local user mint APNs provider tokens
+        // for this app; a readable service-account JSON is worse. Checking only
+        // `relay.toml` guarded the pointer and left the thing it points at
+        // open.
+        if let Some(apns) = &cfg.apns {
+            check_credential_perms("APNs key", &apns.key_file)?;
+        }
+        if let Some(fcm) = &cfg.fcm {
+            check_credential_perms("FCM service account", &fcm.service_account_file)?;
+        }
         Ok(cfg)
     }
+}
+
+/// Refuse a group- or world-accessible push credential.
+///
+/// A credential that cannot be opened is *not* an error here — that stays the
+/// push path's job to report, as it did before this check existed. This is
+/// purely additive: it refuses a readable-by-others credential, and is silent
+/// about everything else.
+#[cfg(unix)]
+fn check_credential_perms(what: &str, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(());
+    };
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "the {what} at {} is group/world accessible (mode {mode:04o}) — run: chmod 600 {}",
+            path.display(),
+            path.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_credential_perms(_what: &str, _path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Refuse a group- or world-accessible config.

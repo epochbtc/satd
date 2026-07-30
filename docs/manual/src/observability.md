@@ -354,8 +354,8 @@ categories = ["status", "chain"]
 min_severity = "warning"
 ```
 
-Status alerts, reorgs, and delivery gaps become notifications; blocks, mempool
-churn, and watch matches do not — a relay that buzzed on every block gets
+Status alerts and reorgs become notifications; blocks, mempool churn, and
+dropped deliveries do not — a relay that buzzed on every block gets
 uninstalled within a day. A condition and its later recovery share a collapse
 id, so the "recovered" notification *replaces* the alert on the lock screen
 rather than stacking beneath it.

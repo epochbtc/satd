@@ -45,6 +45,26 @@ use verify::DeliveryDedup;
 /// 5-minute ceiling, so this needs to cover minutes, not days.
 const DEDUP_WINDOW: usize = 4096;
 
+/// Largest body this relay will buffer. An alert envelope is a few hundred
+/// bytes; satd caps the `message` and every `details` value, so nothing
+/// legitimate approaches this.
+///
+/// Set explicitly rather than left to axum's implicit 2 MB default. The
+/// extractor must buffer the whole body *before* the signature can be checked,
+/// so this bound is what an unauthenticated peer can make the process allocate
+/// per connection — and being explicit also matters for the audience: a forker
+/// who swaps `Bytes` for a streaming extractor silently loses the implicit one.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Whole-request deadline, headers included. Without it, `POST /hook` followed
+/// by one header byte per minute holds a connection and its task forever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Concurrent in-flight requests. satd delivers serially per hook, so even a
+/// dozen hooks never approach this; it exists to bound what an unauthenticated
+/// peer can allocate.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
@@ -76,6 +96,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/hook", post(receive))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            MAX_CONCURRENT_REQUESTS,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
@@ -87,11 +115,37 @@ async fn main() -> anyhow::Result<()> {
         "satd push relay listening on /hook",
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM.
+///
+/// SIGTERM matters more than SIGINT here: under systemd, `systemctl restart`
+/// sends SIGTERM, and a relay that only waits on Ctrl-C is killed outright
+/// mid-request — dropping any push it had already acknowledged to satd.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install a SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The receive path. Order matters: verify, then deduplicate, then acknowledge,
