@@ -518,6 +518,16 @@ impl WatchRegistry {
         self.watch_items.load(Ordering::Acquire) > 0
     }
 
+    /// Total watched entries across every subscriber.
+    ///
+    /// Two subscribers watching the same script count twice — which is the
+    /// point: it is how a caller detects that it has registered the same
+    /// watch-set twice, e.g. a reload that re-registered before the outgoing
+    /// registration was dropped.
+    pub fn watched_items(&self) -> usize {
+        self.watch_items.load(Ordering::Acquire)
+    }
+
     /// `true` if any subscriber is watching at least one script. Lock-free;
     /// gates the input-side undo-data fetch.
     pub fn has_script_watchers(&self) -> bool {

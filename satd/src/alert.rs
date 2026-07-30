@@ -298,17 +298,10 @@ async fn fan_in(
     publisher: Arc<EventPublisher>,
     store: Arc<dyn Store>,
     block_source: Option<Arc<dyn node::events::BlockCursorSource>>,
-    watch_registry: Arc<node::events::WatchRegistry>,
+    mut watch_rx: tokio::sync::mpsc::Receiver<node::events::WatchMatch>,
     state: Arc<DispatcherState>,
     mut stop: Stop,
 ) {
-    // Register the union of every hook's watch-set as ONE registry subscriber.
-    // Matches arrive on a per-subscriber channel (they never ride the shared
-    // bus), and each is routed back to the hooks that asked for it. The handle
-    // is held for the generation's lifetime — dropping it deregisters, which is
-    // exactly what a reload wants.
-    let (watch_handle, mut watch_rx) = register_watch_sets(&watch_registry, &hooks);
-
     // Announce whatever each hook missed while the daemon was down. Nothing is
     // replayed — there is no snapshot-to-live seam to dedupe, because there is
     // no snapshot.
@@ -428,18 +421,21 @@ async fn fan_in(
                     // is bad; losing the pager silently is worse.
                     //
                     // So: disable this arm and keep serving the rest.
-                    // Unreachable today — `watch_handle` is held for the whole
-                    // loop and is the only thing that drops the sender — but it
-                    // becomes reachable the moment registry-side subscriber
-                    // pruning lands, which is exactly when a silent total
-                    // alerting outage would be hardest to attribute.
+                    //
+                    // Reachable on every reload, by construction: the reloader
+                    // owns the `WatchHandle` and drops it to deregister this
+                    // generation. That is a handover, not an outage, so the arm
+                    // is disabled quietly once we are stopping and the error is
+                    // reserved for a channel that closed on its own.
                     if !watch_arm_closed {
                         watch_arm_closed = true;
-                        tracing::error!(
-                            target: "alert",
-                            "watch match channel closed; watch-set deliveries have \
-                             stopped, other categories continue",
-                        );
+                        if !stop.stopped() {
+                            tracing::error!(
+                                target: "alert",
+                                "watch match channel closed; watch-set deliveries have \
+                                 stopped, other categories continue",
+                            );
+                        }
                     }
                 }
             },
@@ -552,7 +548,6 @@ async fn fan_in(
             },
         }
     }
-    drop(watch_handle);
     tracing::info!(target: "alert", "alert webhook dispatcher stopped");
 }
 
@@ -563,9 +558,14 @@ async fn fan_in(
 /// entry per transaction, and registering the same script twice would double it
 /// for no benefit. Routing back to individual hooks is a cheap set membership
 /// test on the delivery side.
+///
+/// The handle goes back to the caller rather than to the task that reads the
+/// channel, because dropping it is what deregisters — and a reload needs that
+/// to happen at a point it controls, not whenever the retired fan-in's task
+/// next gets scheduled. See `AlertReloader::apply`.
 fn register_watch_sets(
     registry: &Arc<node::events::WatchRegistry>,
-    hooks: &[HookChannel],
+    hooks: &[Hook],
 ) -> (
     node::events::WatchHandle,
     tokio::sync::mpsc::Receiver<node::events::WatchMatch>,
@@ -576,7 +576,7 @@ fn register_watch_sets(
     let mut txids = 0usize;
     let mut sp = 0usize;
     for hook in hooks {
-        let w = &hook.hook.watch;
+        let w = &hook.watch;
         if !w.scripthashes.is_empty() {
             scripts += handle.add_scripthashes(&w.scripthashes);
         }
@@ -1136,6 +1136,11 @@ pub struct AlertReloader {
 struct Running {
     /// Retires the fan-in of the generation currently running.
     fan_in_stop: Option<watch::Sender<bool>>,
+    /// The union watch-set registration for that generation. Dropping it
+    /// deregisters, so the reloader holds it rather than the fan-in: a reload
+    /// has to deregister at a point it controls, not whenever the retired task
+    /// happens to be scheduled.
+    watch_handle: Option<node::events::WatchHandle>,
     /// Live delivery tasks by hook id, carried across reloads.
     hooks: std::collections::HashMap<String, RunningHook>,
 }
@@ -1251,6 +1256,19 @@ impl AlertReloader {
         // generations mint the *same* id for the same event and a receiver
         // deduplicating on `X-Satd-Delivery`, as the contract instructs,
         // collapses them.
+        //
+        // The watch registration goes the *other* way — deregister first, then
+        // register — and the asymmetry is entirely about how the two delivery
+        // ids are minted. A watch delivery id comes from a process counter, not
+        // from the match, so two subscribers seeing the same match mint
+        // different ids for identical bodies. That is an undedupable duplicate,
+        // and for a deposit alert it means crediting twice. A momentary gap is
+        // the better failure there: watch matches are documented forward-only
+        // and best-effort, and unlike a status event nothing about them is
+        // edge-triggered.
+        //
+        // Hence: subscribe bus → retire old → deregister watch → register watch
+        // → spawn.
         let bus_rx = self.publisher.subscribe();
 
         let mut running = self.running.lock();
@@ -1315,11 +1333,18 @@ impl AlertReloader {
         if let Some(old) = running.fan_in_stop.take() {
             let _ = old.send(true);
         }
+        // Deregister before re-registering, so the matcher never has two
+        // subscribers for the same watch-set. Matches already queued to the
+        // outgoing channel were queued before this point and cannot also reach
+        // the incoming registration, so the retired fan-in draining a few on
+        // its way out is not a duplicate.
+        running.watch_handle = None;
 
         if channels.is_empty() {
             // An alertfile with no hooks runs no tasks at all.
             drop(bus_rx);
         } else {
+            let (watch_handle, watch_rx) = register_watch_sets(&self.watch_registry, &file.hooks);
             let (gen_tx, gen_rx) = watch::channel(false);
             {
                 let _guard = self.api_handle.enter();
@@ -1329,7 +1354,7 @@ impl AlertReloader {
                     self.publisher.clone(),
                     self.store.clone(),
                     self.block_source.clone(),
-                    self.watch_registry.clone(),
+                    watch_rx,
                     Arc::clone(&DISPATCHER_STATE),
                     Stop {
                         global: self.global_stop.clone(),
@@ -1338,6 +1363,7 @@ impl AlertReloader {
                 ));
             }
             running.fan_in_stop = Some(gen_tx);
+            running.watch_handle = Some(watch_handle);
         }
         drop(running);
         // Stop exporting counters for hooks that are no longer configured,
@@ -1781,7 +1807,13 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
     /// The URL is a discard port on loopback: these tests are about what the
     /// reloader does to its own tasks, not about delivery, and nothing here
     /// waits on a response.
-    fn handover_fixture(dir: &std::path::Path) -> (AlertReloader, Arc<EventPublisher>) {
+    fn handover_fixture(
+        dir: &std::path::Path,
+    ) -> (
+        AlertReloader,
+        Arc<EventPublisher>,
+        Arc<node::events::WatchRegistry>,
+    ) {
         let publisher = EventPublisher::new(
             node::events::EdgeIdentity::new([9; 16], None).expect("edge identity"),
             64,
@@ -1791,18 +1823,19 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
         // and the tasks retire themselves immediately. Leak it: the fixture
         // owns nothing else that could hold it for the test's duration.
         std::mem::forget(_tx);
+        let registry = Arc::new(node::events::WatchRegistry::new());
         let reloader = AlertReloader::new(
             dir.join("alertfile.toml"),
             tokio::runtime::Handle::current(),
             publisher.clone(),
             Arc::new(node::storage::db::InMemoryStore::new()),
             None,
-            Arc::new(node::events::WatchRegistry::new()),
+            registry.clone(),
             false,
             Arc::new(WebhookMetrics::new()),
             global_stop,
         );
-        (reloader, publisher)
+        (reloader, publisher, registry)
     }
 
     fn write_hooks(dir: &std::path::Path, stanzas: &str) {
@@ -1818,6 +1851,73 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
              secret = \"{}\"\ncategories = [{categories}]\n",
             "s".repeat(32)
         )
+    }
+
+    /// The same stanza with a watch-set of `n` distinct scripts attached.
+    fn watching_stanza(id: &str, categories: &str, n: u8) -> String {
+        let scripts: Vec<String> = (0..n)
+            .map(|i| format!("\"{}\"", format!("{i:02x}").repeat(32)))
+            .collect();
+        format!(
+            "{}[webhook.watch]\nscripts = [{}]\n",
+            stanza(id, categories),
+            scripts.join(", ")
+        )
+    }
+
+    /// A reload must swap the watch registration itself, and never hold two.
+    ///
+    /// The mirror image of the bus ordering below, and it goes the other way. A
+    /// watch delivery id comes from a process counter rather than from the
+    /// match, so two subscribers seeing one match mint *different* ids for
+    /// identical bodies — an undedupable duplicate, which for a deposit alert
+    /// means crediting twice. So the outgoing registration is dropped before
+    /// the incoming one is taken, and the reloader owns the handle to make that
+    /// ordering something it controls rather than something the scheduler
+    /// decides.
+    ///
+    /// The two applies register *different* numbers of scripts, which is what
+    /// makes the assertion discriminating. `watched_items` counts entries
+    /// across all subscribers, and nothing is awaited across the second
+    /// `apply`, so on this single-threaded runtime the incoming fan-in has not
+    /// run. A count of 2 means `apply` did the swap itself; 1 means it deferred
+    /// the registration to a task that has not been polled, so the swap lands
+    /// at a moment the reloader does not control.
+    ///
+    /// What this does *not* catch is the ordering within `apply` — dropping the
+    /// outgoing handle before taking the incoming one. Both are synchronous, so
+    /// by the time the assertion runs the old handle is gone either way, and
+    /// observing the overlap would mean racing a concurrent block scan against
+    /// the reload. The explicit drop is load-bearing anyway: the matcher runs
+    /// on other threads, and a match landing between the two calls would be
+    /// delivered twice under two ids no receiver can reconcile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reload_swaps_the_watch_registration_without_overlapping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hooks(dir.path(), &watching_stanza("pager", "\"status\"", 1));
+        let (reloader, _publisher, registry) = handover_fixture(dir.path());
+
+        reloader.apply().expect("first apply");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry.watched_items(),
+            1,
+            "one generation should register its watch-set once"
+        );
+
+        write_hooks(dir.path(), &watching_stanza("pager", "\"status\"", 2));
+        reloader.apply().expect("second apply");
+
+        assert_eq!(
+            registry.watched_items(),
+            2,
+            "apply() must drop the outgoing registration and take the incoming \
+             one itself: 1 means the swap was deferred to an unscheduled task, \
+             3 means both are live and matches are delivered twice under two \
+             different X-Satd-Delivery ids"
+        );
     }
 
     /// `apply` must take the incoming generation's bus subscription itself,
@@ -1839,7 +1939,7 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
     async fn a_reload_subscribes_the_incoming_generation_before_retiring_the_old_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_hooks(dir.path(), &stanza("pager", "\"status\""));
-        let (reloader, publisher) = handover_fixture(dir.path());
+        let (reloader, publisher, _registry) = handover_fixture(dir.path());
 
         reloader.apply().expect("first apply");
         // Let generation one's fan-in reach its select loop.
@@ -1885,7 +1985,7 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
     async fn a_reload_carries_over_the_delivery_task_of_an_untouched_hook() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_hooks(dir.path(), &stanza("pager", "\"status\""));
-        let (reloader, _publisher) = handover_fixture(dir.path());
+        let (reloader, _publisher, _registry) = handover_fixture(dir.path());
 
         reloader.apply().expect("first apply");
         let before = reloader
@@ -1931,7 +2031,7 @@ scripts = ["1111111111111111111111111111111111111111111111111111111111111111"]
     async fn a_reload_retires_the_delivery_task_of_an_edited_hook() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_hooks(dir.path(), &stanza("pager", "\"status\""));
-        let (reloader, _publisher) = handover_fixture(dir.path());
+        let (reloader, _publisher, _registry) = handover_fixture(dir.path());
 
         reloader.apply().expect("first apply");
         let before = reloader.running.lock().hooks["pager"].tx.clone();
