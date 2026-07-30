@@ -149,8 +149,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   permanent 4xx (which still advances the resume position), with a bounded
   queue whose overflow is reported in-band as a `lagged` event rather than
   silently. Redirects are never followed — a 3xx is a permanent drop, so a
-  signed body cannot be steered to a host the alertfile never named. Confirmed chain events are at-least-once
-  across a restart via a durable per-hook cursor. Hooks reload on SIGHUP
+  signed body cannot be steered to a host the alertfile never named. Delivery
+  is at-most-once with every gap announced: the durable per-hook cursor is a
+  resume *marker*, so a hook coming back is told what it missed with one
+  `lagged` body rather than being re-sent the span. Hooks reload on SIGHUP
   (keep-last-good on error); per-hook counters are exported as
   `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
   their original payload, now delivered by the same dispatcher — which also

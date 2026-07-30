@@ -209,10 +209,8 @@ So a receiver must:
 
 The `X-Satd-Delivery` value is opaque; do not parse it. Its suffix distinguishes
 how the delivery arose — a bare counter for a live event, `w` for a watch match,
-`r` for a synthesized notice such as `lagged`, and `b<height>` for a replayed
-block. That last one is deliberately derived from the height rather than a
-counter, so the same block replayed after a restart carries the same id and your
-dedup actually collapses it.
+and `r` for a synthesized notice such as `lagged`. Deduplicate on the whole
+header; it is unique per event and stable across the retries of one delivery.
 
 ### Delivery behavior
 
@@ -222,8 +220,9 @@ dedup actually collapses it.
   1 s doubling to a 5-minute ceiling, indefinitely. Any *other* 4xx is treated
   as permanent, counted, and skipped — a receiver answering 404 forever must
   not pin the queue and turn every later event into a drop. A skipped event
-  still advances the hook's resume position, so a hard-rejecting endpoint does
-  not turn every restart into a replay of the same refused span.
+  still advances the hook's resume position, so a hard-rejecting endpoint makes
+  progress instead of announcing the same refused span as a gap after every
+  restart. The skip is counted and reported in the next `lagged` body.
 - **Redirects are not followed.** A 3xx is a permanent drop. The URL in the
   alertfile is where the signed body goes; following a redirect would move it —
   signature, hook identity and all — to a host you never named, and the useful
@@ -235,15 +234,19 @@ dedup actually collapses it.
   the cursor to resume from. A gap is never silent.
 - **Nothing reaches consensus.** Deliveries run on the isolated API runtime;
   a stalled endpoint cannot affect block connection.
-- **At-least-once for confirmed chain events across a restart, or you are told.**
-  Each hook's resume position is persisted, and on startup the hook replays what
-  it missed (bounded by the same 10 000-block window the streaming API uses;
-  beyond that you get a `lagged` notice instead). Health events are re-raised by
-  re-evaluation rather than replayed, and mempool events are best-effort — the
-  same contract the event bus itself offers. Every way an event can be skipped —
-  queue overflow, a permanent rejection, suppression during a sync — increments
-  the hook's drop count and produces a `lagged` body, so the guarantee is
-  precisely "delivered, or reported missing"; it is never silent.
+- **At-most-once, and a gap is announced.** Webhooks deliver what is happening
+  now; they are not a log you can rewind. Each hook's resume position is
+  persisted, but it is a *marker*, not a replay cursor: on startup the hook is
+  told what it missed while the daemon was down — one `lagged` body carrying the
+  count and the height to resume from — and then goes live. It does not re-send
+  the span. Health events are re-raised by re-evaluation, and mempool events are
+  best-effort, the same contract the event bus itself offers. Every way an event
+  can be skipped — the daemon being down, queue overflow, a permanent rejection,
+  suppression during a sync — increments the hook's drop count and produces a
+  `lagged` body. So the guarantee is precisely "delivered, or reported missing",
+  never both and never silent. If you need the span itself, the `lagged` body
+  carries the position to fetch it from: use `RescanBlocks` on the streaming API
+  or the JSON-RPC history calls.
 - **Suppressed during initial block download.** A node syncing from scratch does
   not POST its entire history: while it is catching up, only `status` and
   `heartbeat` events are delivered. Health alerts stay live because "this node is
