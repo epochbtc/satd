@@ -62,11 +62,15 @@ min_severity = "warning"
 | `status`, at or above `min_severity` | `CRITICAL: disk_low` / `Recovered: tip_stall`, with the most actionable `details` field folded into the body |
 
 | `chain` / `reorg` | "Chain reorganization" with the fork's from/to heights |
-| `lagged` | "Alert delivery gap" with the dropped count |
-| anything else (blocks, mempool, watch matches) | nothing — a relay that buzzed on every block would be uninstalled within a day |
+| anything else (blocks, mempool) | nothing — a relay that buzzed on every block would be uninstalled within a day |
 
-`min_severity` is a **status** floor only; reorg and gap notifications are not
-status events and are always pushed.
+`min_severity` is a **status** floor only; reorg notifications are not status
+events and are always pushed.
+
+There is no "you missed some alerts" notification, because satd does not send
+one. Webhooks are best-effort and report drops on the node's
+`satd_alertwebhook_dropped_total` counter — alert on that from your metrics
+stack, not from the relay, which cannot know what it was never sent.
 
 Raise and clear share a collapse id (`apns-collapse-id` / `collapse_key`), so a
 condition that recovers **replaces** its own alert on the lock screen instead of

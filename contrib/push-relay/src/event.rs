@@ -38,9 +38,6 @@ pub enum Body {
         #[serde(default)]
         to_height: Option<u32>,
     },
-    Lagged {
-        dropped_count: u64,
-    },
     #[serde(other)]
     Other,
 }
@@ -121,16 +118,15 @@ pub fn to_notification(env: &Envelope, min_severity: &str) -> Option<Notificatio
             },
             collapse_id: "chain-reorg".into(),
         }),
-        Body::Lagged { dropped_count } => Some(Notification {
-            title: "Alert delivery gap".into(),
-            message: format!(
-                "{dropped_count} event(s) were dropped before reaching this relay."
-            ),
-            collapse_id: "lagged".into(),
-        }),
-        // Block connects, mempool churn, watch matches: real events, but not
-        // ones a push notification is the right medium for. A relay that
-        // buzzed on every block would be uninstalled within a day.
+        // Block connects and mempool churn: real events, but not ones a push
+        // notification is the right medium for. A relay that buzzed on every
+        // block would be uninstalled within a day.
+        //
+        // There is deliberately no "you missed some events" notification.
+        // Webhooks are best-effort and satd does not report gaps in-band —
+        // dropped deliveries show up on the node's
+        // `satd_alertwebhook_dropped_total` counter, which is where an operator
+        // should alert on them. A relay cannot know what it was not sent.
         _ => None,
     }
 }
@@ -227,8 +223,10 @@ mod tests {
         assert!(n.message.contains("812345"), "{}", n.message);
         assert!(n.message.contains("812347"), "{}", n.message);
 
-        let lagged = parse(r#"{"body":{"category":"lagged","dropped_count":37}}"#);
-        let n = to_notification(&lagged, "info").expect("a gap notifies");
-        assert!(n.message.contains("37"), "{}", n.message);
+        // satd does not send a gap notice — webhooks are best-effort and
+        // report drops on the node's counter, not in-band. An unrecognized
+        // body decodes to `Other` and produces nothing rather than failing.
+        let unknown = parse(r#"{"body":{"category":"lagged","dropped_count":37}}"#);
+        assert!(to_notification(&unknown, "info").is_none());
     }
 }

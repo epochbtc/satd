@@ -249,9 +249,8 @@ never overtaken by the event behind it.
 Non-retryable `4xx` is a deliberate asymmetry: a receiver answering `404`
 forever would otherwise pin the head of the queue and convert every later event
 into an overflow drop. Losing one delivery beats losing all of them. A skipped
-event still advances the hook's resume position, so a hard-rejecting endpoint
-makes progress rather than announcing the same refused span as a gap after
-every restart.
+event is counted in `satd_alertwebhook_dropped_total` and logged, like any
+other loss.
 
 **Redirects are never followed.** satd sends to the URL in the alertfile and
 nowhere else. Following a `3xx` would move the signed body, and the hook's
