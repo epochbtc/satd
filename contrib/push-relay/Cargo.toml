@@ -19,7 +19,7 @@ axum = "0.8"
 # them — all of it before a byte of HMAC is computed.
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["timeout"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # `http2` is NOT implied by `json` or `rustls-tls`, and `default-features =
 # false` drops it. Apple's provider API is HTTP/2-only, so without it every APNs
 # push fails at the transport layer — with the flagship use case (an iOS

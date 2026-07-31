@@ -29,6 +29,7 @@ mod event;
 mod push;
 mod verify;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -65,11 +66,21 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// peer can allocate.
 const MAX_CONCURRENT_REQUESTS: usize = 64;
 
+/// How long shutdown waits for already-acknowledged pushes to finish.
+///
+/// Must stay below systemd's `TimeoutStopSec` (90 s by default) so the unit
+/// still stops promptly; 15 s covers a provider round-trip with its own
+/// timeout applied.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
     http: reqwest::Client,
     dedup: Arc<Mutex<DeliveryDedup>>,
+    /// Pushes that have been acknowledged to satd but not yet delivered to a
+    /// provider. Shutdown drains this; see `SHUTDOWN_DRAIN`.
+    inflight: Arc<AtomicUsize>,
 }
 
 #[tokio::main]
@@ -91,9 +102,11 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         dedup: Arc::new(Mutex::new(DeliveryDedup::new(DEDUP_WINDOW))),
+        inflight: Arc::new(AtomicUsize::new(0)),
         cfg: cfg.clone(),
     };
 
+    let inflight = state.inflight.clone();
     let app = Router::new()
         .route("/hook", post(receive))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -117,7 +130,43 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // `with_graceful_shutdown` waits for in-flight *requests*, and a push is
+    // deliberately not one — it is acknowledged first and delivered on a
+    // detached task, so that the node's serial per-hook queue does not sit
+    // behind Apple's and Google's latency. Without this drain, returning from
+    // `serve` drops the runtime and aborts those tasks at their await points:
+    // `systemctl restart` during a critical push means satd already got its
+    // 200, the delivery id is in its dedup ring, no retry is coming, and the
+    // operator is never paged. That is exactly what the SIGTERM handling is
+    // supposed to prevent.
+    let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN;
+    loop {
+        let remaining = inflight.load(Ordering::Acquire);
+        if remaining == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                remaining,
+                "shutting down with pushes still in flight; satd has already \
+                 acknowledged them and will not retry"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     Ok(())
+}
+
+/// Decrements the in-flight count however the push task ends, including on an
+/// early `?`/return inside it.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Resolve on SIGINT or SIGTERM.
@@ -216,7 +265,12 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     // 3. Acknowledge before pushing. satd delivers serially per hook, so
     //    holding the response open across two provider round-trips would put
     //    the node's queue behind Apple's and Google's latency.
+    // Counted so shutdown can wait for it: the response below tells satd the
+    // push is ours, and satd records the delivery id in its dedup ring and
+    // never retries it. A push dropped after that point is a page nobody gets.
+    state.inflight.fetch_add(1, Ordering::AcqRel);
     tokio::spawn(async move {
+        let _guard = InflightGuard(state.inflight.clone());
         if let Some(apns) = &state.cfg.apns
             && let Err(e) = push::send_apns(&state.http, apns, &notification).await
         {
