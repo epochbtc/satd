@@ -3100,9 +3100,41 @@ impl ChainState {
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
     ) -> Result<(), ChainError> {
+        // Decide which chain to replay before touching anything. Selecting by
+        // chainwork over the block index, rather than walking the height→hash
+        // index, is what keeps a polluted index from splicing two branches into
+        // one chainstate — see `chain::replay_plan`.
+        //
+        // Flush first: `for_each_block_index` reads through the coin cache to
+        // the backing store, so an entry still sitting in the dirty cache would
+        // be invisible to the scan and its branch silently excluded. At startup
+        // (the only caller) the cache is empty and this is a no-op; it is here
+        // so the planner's view can never be a partial one.
+        self.store.flush()?;
+        let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
+        let plan = Arc::new(
+            crate::chain::replay_plan::plan_replay_from_block_index(&*self.store, genesis_hash)
+                .map_err(ChainError::Storage)?,
+        );
+
+        // A partially-replayed chainstate can only be resumed if it lies on the
+        // branch now selected. If it does not, the previous run followed a
+        // different chain and continuing would build a UTXO set from both.
+        let resume_height = self.tip_height();
+        if resume_height > 0 && plan.hash_at(resume_height) != Some(self.tip_hash()) {
+            tracing::error!(
+                height = resume_height,
+                chain_tip = %self.tip_hash(),
+                planned = ?plan.hash_at(resume_height),
+                "reindex: the existing chainstate is not on the most-work branch of the \
+                 block index; refusing to resume onto a different chain. Run a full \
+                 --reindex to rebuild the block index from the block files."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
+
         if let Some(p) = &progress {
-            let total = self.max_indexed_height();
-            p.set_total(total as u64);
+            p.set_total(plan.tip_height() as u64);
             p.set_stop_height(stop_at.map(|h| h as u64));
         }
 
@@ -3117,7 +3149,7 @@ impl ChainState {
         // restored on EVERY exit path (including the `?` error paths in the
         // inner replay), so BulkLoad semantics never leak into steady state.
         self.set_write_mode(crate::storage::WriteMode::BulkLoad);
-        let result = self.reindex_replay(stop_at, progress);
+        let result = self.reindex_replay(plan, stop_at, progress);
         let flush_result = self.flush_durable();
         self.set_write_mode(crate::storage::WriteMode::Normal);
         if let Err(e) = flush_result {
@@ -3140,6 +3172,7 @@ impl ChainState {
     /// mode regardless of how this returns.
     fn reindex_replay(
         &self,
+        plan: Arc<crate::chain::replay_plan::ReplayPlan>,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
     ) -> Result<(), ChainError> {
@@ -3155,6 +3188,7 @@ impl ChainState {
             self.store_ref().clone() as Arc<dyn crate::storage::Store + Send + Sync>,
             self.blocks_dir().to_path_buf(),
             self.blocks_xor_key,
+            Some(plan.clone()),
             start_height,
             workers,
             128, // lookahead blocks, matching the IBD connect loop
@@ -3168,7 +3202,7 @@ impl ChainState {
         // weights apply directly. Target the configured `-stopatheight` when
         // set — the loop below exits there, so an ETA to the full file tip
         // would be materially inflated.
-        let target_height = stop_at.unwrap_or_else(|| self.max_indexed_height());
+        let target_height = stop_at.unwrap_or_else(|| plan.tip_height());
         let mut eta_est = crate::ibd_eta::IbdEtaEstimator::new(
             start_height,
             target_height,
@@ -3191,7 +3225,7 @@ impl ChainState {
         // after a failed reindex.
         let result = (|| -> Result<(), ChainError> {
             let mut height = start_height;
-            while let Some(hash) = self.store.get_block_hash_by_height(height) {
+            while let Some(hash) = plan.hash_at(height) {
                 // Prefer the prefetched, pre-processed block; fall back to a
                 // direct read on a miss (cold start, or a worker behind the
                 // cursor). Both paths connect via `connect_block` directly,
@@ -3421,37 +3455,6 @@ impl ChainState {
         Ok(())
     }
 
-    /// Highest height present in the height→hash index. Used by reindex
-    /// progress reporting to show the on-disk file tip when it differs
-    /// from a configured `-stopatheight` target.
-    ///
-    /// Doubling probe (1, 2, 4, …) to find an absent height, then binary
-    /// search between the last-present and first-absent height. ~40
-    /// `get_block_hash_by_height` lookups at mainnet sizes — negligible
-    /// vs. the reindex itself, and avoids widening the `Store` trait.
-    fn max_indexed_height(&self) -> u32 {
-        if self.store.get_block_hash_by_height(1).is_none() {
-            return 0;
-        }
-        let mut lo: u32 = 1;
-        let mut hi: u32 = 2;
-        while self.store.get_block_hash_by_height(hi).is_some() {
-            lo = hi;
-            hi = match hi.checked_mul(2) {
-                Some(v) => v,
-                None => return u32::MAX,
-            };
-        }
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.store.get_block_hash_by_height(mid).is_some() {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
 
     /// Plan the replay of a from-genesis reindex over the block tree built by
     /// the phase-1 flat-file scan.
@@ -5387,7 +5390,7 @@ struct ReindexPlan {
 }
 
 /// Compare two big-endian U256 values. Returns -1, 0, or 1.
-fn compare_u256(a: &[u8; 32], b: &[u8; 32]) -> i32 {
+pub(crate) fn compare_u256(a: &[u8; 32], b: &[u8; 32]) -> i32 {
     for i in 0..32 {
         if a[i] > b[i] {
             return 1;
@@ -9461,15 +9464,18 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `-reindex-chainstate` picks the block to replay at each height from the
-    /// height→hash index. That index is derived state, and it has been observed
-    /// polluted with a fork block in production (#322, and the `bad-cb-height`
-    /// reindex loop that followed). When it is, the replay must fail closed
-    /// rather than splice one branch onto another and commit the result: the
-    /// same UTXO-corruption class as the flat-file reindex bug, reached through
-    /// a different picker.
+    /// `-reindex-chainstate` used to pick the block to replay at each height
+    /// from the height→hash index. That index is derived state, and it has been
+    /// observed polluted with a fork block in production (#322, and the
+    /// `bad-cb-height` reindex loop that followed). Given such an index the old
+    /// replay connected the fork block, carried on with the main chain on top of
+    /// it, and returned `Ok` over a UTXO set assembled from two branches.
+    ///
+    /// The replay now selects by chainwork over the block index, so a polluted
+    /// height index cannot misdirect it at all — it is not consulted. The
+    /// replay both completes and rewrites the bad entry.
     #[test]
-    fn reindex_chainstate_refuses_a_spliced_branch() {
+    fn reindex_chainstate_ignores_a_polluted_height_index() {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
@@ -9480,13 +9486,19 @@ pub(crate) mod tests {
             parent = cs.accept_block(&b).expect("accept main block");
             main_hashes.push(parent);
         }
+        let main_tip = *main_hashes.last().unwrap();
         // Stale sibling of block 3, stored but never on the active chain.
         let stale = build_test_block(main_hashes[1], 3, 1_701_100_003);
         let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
-        assert_eq!(cs.tip_hash(), *main_hashes.last().unwrap());
+        assert_eq!(cs.tip_hash(), main_tip);
+        let stale_coin = OutPoint {
+            txid: stale.txdata[0].compute_txid(),
+            vout: 0,
+        };
 
-        // Reindex the chainstate against a height index that names the stale
-        // block at height 3 — the shape a polluted index takes.
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        let expected_coins = cs.store.coin_count();
+
         cs.store.flush().unwrap();
         cs.store.clear_chainstate().unwrap();
         {
@@ -9494,20 +9506,67 @@ pub(crate) mod tests {
             tip.hash = genesis_hash;
             tip.height = 0;
         }
+        // The shape a polluted index takes: a fork block owning a height.
         pollute_height_hash(&cs, 3, stale_hash);
+
+        cs.reindex_chainstate(None, None)
+            .expect("chainwork selection must not be misled by the height index");
+
+        assert_eq!(cs.tip_hash(), main_tip, "replayed the wrong branch");
+        assert_eq!(cs.tip_height(), 5);
+        cs.flush_coin_cache().expect("flush replayed state");
+        assert!(
+            cs.get_coin(&stale_coin).is_none(),
+            "stale block's coinbase leaked into the replayed UTXO set"
+        );
+        assert_eq!(
+            cs.store.coin_count(),
+            expected_coins,
+            "replayed UTXO set does not match the pre-reindex set"
+        );
+        assert_eq!(
+            cs.store.get_block_hash_by_height(3),
+            Some(main_hashes[2]),
+            "the replay must rewrite the polluted height entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A partially-replayed chainstate can only be resumed if it sits on the
+    /// branch now selected. Resuming across branches would build one UTXO set
+    /// out of two chains, so it fails closed and tells the operator to run a
+    /// full `-reindex`.
+    #[test]
+    fn reindex_chainstate_refuses_to_resume_onto_a_different_branch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main_hashes = Vec::new();
+        for h in 1..=5u32 {
+            let b = build_test_block(parent, h, 1_702_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            main_hashes.push(parent);
+        }
+        let stale = build_test_block(main_hashes[1], 3, 1_702_100_003);
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        // Pretend a previous run replayed as far as the stale block.
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = stale_hash;
+            tip.height = 3;
+        }
 
         let err = cs
             .reindex_chainstate(None, None)
-            .expect_err("a spliced replay must fail, not complete");
+            .expect_err("resuming onto a different branch must fail");
         assert!(
             matches!(err, ChainError::BadPrevBlock),
             "expected a linkage failure, got {err:?}"
-        );
-        // The replay stopped at the splice rather than running to the tip over
-        // a UTXO set built from two different branches.
-        assert!(
-            cs.tip_height() < 5,
-            "replay must not reach the tip across a branch splice"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -9865,27 +9924,33 @@ pub(crate) mod tests {
         assert!(plan.side.is_empty());
     }
 
-    /// `max_indexed_height` is the helper that powers reindex progress
-    /// reporting. Validates the doubling+binary-search across a few
-    /// shapes: empty index, small, and a non-power-of-two boundary.
+    /// The replay plan is what now powers chainstate-reindex progress
+    /// reporting (it replaced a height→hash probe). Its tip height must track
+    /// the real chain across a few shapes: genesis-only, and a chain past a
+    /// power-of-two boundary.
     #[test]
-    fn max_indexed_height_finds_chain_tip() {
+    fn replay_plan_tip_height_tracks_the_chain() {
+        use crate::chain::replay_plan::plan_replay_from_block_index;
         let (cs, dir) = make_chain_state();
-
-        // Pristine: only genesis exists at height 0. The helper looks
-        // at heights ≥ 1 because reindex starts from 1, so an empty
-        // index past genesis must return 0.
-        assert_eq!(cs.max_indexed_height(), 0);
-
-        // Build 257 blocks — one past a power-of-two boundary so the
-        // doubling probe (256, 512) bounds the binary search.
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+
+        // Pristine: only genesis.
+        cs.store.flush().unwrap();
+        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash()).unwrap();
+        assert_eq!(plan.tip_height(), 0);
+        assert_eq!(plan.tip_hash(), genesis.block_hash());
+
         let mut parent = genesis.block_hash();
         for h in 1..=257u32 {
             let block = build_test_block(parent, h, 1_300_000_000 + h);
             parent = cs.accept_block(&block).unwrap();
         }
-        assert_eq!(cs.max_indexed_height(), 257);
+        cs.store.flush().unwrap();
+        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash()).unwrap();
+        assert_eq!(plan.tip_height(), 257);
+        assert_eq!(plan.tip_hash(), parent);
+        assert_eq!(plan.hash_at(0), Some(genesis.block_hash()));
+        assert_eq!(plan.hash_at(258), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

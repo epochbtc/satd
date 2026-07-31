@@ -220,13 +220,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   cumulative chainwork and connects only that branch; side-chain blocks are
   indexed (`DataStored`, addressable by hash) but never connected. Duplicate
   block records on disk are collapsed.
-- Fixed: both reindex paths now refuse to connect a block that does not extend
-  the chain being replayed, the invariant `connect_stored_block` has always
-  enforced on the IBD path. This closes the same corruption class in
-  `-reindex-chainstate`, which selects each block by height→hash — derived state
-  that has been observed polluted with a fork block — and would previously
-  splice one branch onto another and report a completed reindex over a UTXO set
-  built from both.
+- Fixed: `-reindex-chainstate` no longer replays whatever chain the height→hash
+  index names. That index is derived state and has been observed polluted with a
+  fork block, which made the replay splice one branch onto another and report a
+  completed reindex over a UTXO set built from both. The replay now selects the
+  most-work fully-connectable branch of the block index, recomputing chainwork
+  and height from the stored headers rather than trusting the index's own
+  fields, and refuses to resume a partial chainstate that sits on a different
+  branch. `invalidateblock` and header-only gaps are honored during selection.
+- Fixed: all reindex paths now refuse to connect a block that does not extend
+  the chain being replayed — the invariant `connect_stored_block` has always
+  enforced on the IBD path, now applied to both reindex replays as a
+  belt-and-braces check behind the selection fixes above.
 
 ## Releases
 

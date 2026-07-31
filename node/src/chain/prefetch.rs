@@ -11,6 +11,7 @@ use std::thread;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
+use crate::chain::replay_plan::ReplayPlan;
 use crate::storage::Store;
 use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptVerifier};
 use crate::validation::tx::check_transaction;
@@ -56,11 +57,23 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
 
 /// Compute median time past for a height using read-only store lookups.
 /// Same algorithm as `connect::get_median_time_past` and `ChainState::get_median_time_past`.
-fn compute_mtp(store: &dyn Store, height: u32) -> u32 {
+///
+/// `plan` resolves height→hash during a chainstate reindex. It must be used
+/// there rather than the store's height→hash index: the prefetcher runs ahead
+/// of the connect cursor, so for the heights it is working on the index still
+/// holds the *pre-reindex* chain. Whenever the replayed chain differs from that
+/// — the whole point of selecting by chainwork — reading the index would hand
+/// the connect thread an MTP computed over the wrong branch, and MTP gates
+/// BIP113 locktimes.
+fn compute_mtp(store: &dyn Store, plan: Option<&ReplayPlan>, height: u32) -> u32 {
     let start = height.saturating_sub(11);
     let mut timestamps: Vec<u32> = Vec::new();
     for h in start..height {
-        if let Some(hash) = store.get_block_hash_by_height(h)
+        let hash = match plan {
+            Some(p) => p.hash_at(h),
+            None => store.get_block_hash_by_height(h),
+        };
+        if let Some(hash) = hash
             && let Some(entry) = store.get_block_index(&hash)
         {
             timestamps.push(entry.header.time);
@@ -86,13 +99,21 @@ pub fn prefetch_block(
     store: &dyn Store,
     blocks_dir: &Path,
     blocks_xor_key: &[u8; 8],
+    plan: Option<&ReplayPlan>,
     height: u32,
     _assumevalid: bool,
     primary_engine: PrimaryEngine,
     network: bitcoin::Network,
 ) -> Option<PreprocessedBlock> {
-    // 1. Get block hash and entry
-    let hash = store.get_block_hash_by_height(height)?;
+    // 1. Get block hash and entry. During a chainstate reindex the chain to
+    //    replay comes from the plan, not the height→hash index (see
+    //    `chain::replay_plan`); on the IBD path there is no plan and the index
+    //    is authoritative — it is written forward as blocks connect, and
+    //    `connect_stored_block` rejects anything that does not extend the tip.
+    let hash = match plan {
+        Some(p) => p.hash_at(height)?,
+        None => store.get_block_hash_by_height(height)?,
+    };
     let entry = store.get_block_index(&hash)?;
 
     if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid) {
@@ -110,7 +131,7 @@ pub fn prefetch_block(
     let block = read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
 
     // 4. Compute MTP (read-only store lookups)
-    let mtp = compute_mtp(store, height);
+    let mtp = compute_mtp(store, plan, height);
 
     // 5. Context-free work: txids + check_transaction
     let mut txids = Vec::with_capacity(block.txdata.len());
@@ -274,6 +295,7 @@ pub fn start_prefetcher(
     store: Arc<dyn Store + Send + Sync>,
     blocks_dir: PathBuf,
     blocks_xor_key: [u8; 8],
+    plan: Option<Arc<ReplayPlan>>,
     start_height: u32,
     num_workers: usize,
     lookahead: usize,
@@ -299,6 +321,7 @@ pub fn start_prefetcher(
         let w_dir = blocks_dir.clone();
         let w_shutdown = shutdown.clone();
         let w_buffer = buffer.clone();
+        let w_plan = plan.clone();
 
         workers.push(
             thread::Builder::new()
@@ -311,6 +334,7 @@ pub fn start_prefetcher(
                                     &*w_store,
                                     &w_dir,
                                     &blocks_xor_key,
+                                    w_plan.as_deref(),
                                     height,
                                     assumevalid,
                                     primary_engine,
@@ -332,6 +356,7 @@ pub fn start_prefetcher(
     let disp_cursor = cursor.clone();
     let disp_store = store.clone();
     let disp_buffer = buffer.clone();
+    let disp_plan = plan.clone();
 
     workers.push(
         thread::Builder::new()
@@ -353,8 +378,11 @@ pub fn start_prefetcher(
 
             // Assign work up to lookahead ahead of cursor
             while next_to_assign < current_cursor + lookahead as u32 {
-                let has_data = disp_store
-                    .get_block_hash_by_height(next_to_assign)
+                let next_hash = match &disp_plan {
+                    Some(p) => p.hash_at(next_to_assign),
+                    None => disp_store.get_block_hash_by_height(next_to_assign),
+                };
+                let has_data = next_hash
                     .and_then(|hash| disp_store.get_block_index(&hash))
                     .is_some_and(|entry| {
                         matches!(
