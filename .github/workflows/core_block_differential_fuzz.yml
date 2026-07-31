@@ -34,6 +34,10 @@ permissions:
   contents: read
   # Allow the failure step to open / comment on a tracking issue.
   issues: write
+  # Read this workflow's own run history. The streak check below is the
+  # catch-all for a misclassified failure, and without this it 403s — which,
+  # defaulted to zero, looks exactly like "no streak" and files nothing.
+  actions: read
 
 concurrency:
   group: core-block-differential-fuzz-${{ github.ref }}
@@ -242,11 +246,20 @@ jobs:
           # ---- (c) infra failure: escalate only on a streak ------------
           # Exclude the current (still in-progress) run via --status completed,
           # so two prior failures + this one == three consecutive.
-          prior_failures=$(gh run list \
+          # Escalate rather than default to zero if the query itself fails.
+          # `2>/dev/null || echo 0` made a 403, a rate limit, or a stale
+          # `--workflow` filename after a rename indistinguishable from a
+          # healthy no-streak run: the step logged "not both red (0/2)" and
+          # filed nothing, silently voiding the one guarantee this branch
+          # exists to provide.
+          if ! prior_failures=$(gh run list \
             --workflow core_block_differential_fuzz.yml \
             --event schedule --status completed --limit 2 \
             --json conclusion \
-            --jq '[.[] | select(.conclusion == "failure")] | length' 2>/dev/null || echo 0)
+            --jq '[.[] | select(.conclusion == "failure")] | length'); then
+            echo "Could not read prior run conclusions; assuming a streak so this cannot pass unnoticed."
+            prior_failures=2
+          fi
 
           if [ "${prior_failures:-0}" -lt 2 ]; then
             echo "Infra failure before the fuzz step ran, and the preceding"
