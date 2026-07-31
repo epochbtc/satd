@@ -209,6 +209,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   status alerts and reorgs as APNs / FCM push notifications
   using the operator's own credentials. Reference-grade and meant to be forked;
   its HMAC tests assert the same vectors as `docs/api/webhooks.md`.
+- Fixed: `-reindex` mis-handled fork points in the block files. Block files hold
+  every block the node fully received, including ones a later reorg orphaned, so
+  any datadir that has been live through a reorg has forks on disk. The replay
+  connected *every* block reachable from genesis as if it extended the tip
+  instead of selecting the most-work branch — aborting with
+  `bad-txns-inputs-missingorspent` when the two branches double-spent, and
+  otherwise applying the losing branch's UTXO delta on top of the winning chain
+  and reporting success over a corrupt UTXO set. The replay now selects by
+  cumulative chainwork and connects only that branch; side-chain blocks are
+  indexed (`DataStored`, addressable by hash) but never connected. Duplicate
+  block records on disk are collapsed. `-reindex-chainstate` was never affected.
 
 ## Releases
 
