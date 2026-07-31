@@ -861,9 +861,19 @@ pub async fn legacy_reorg_dispatcher(
                 }
                 d => {
                     counters.failed_attempts.fetch_add(1, Ordering::Relaxed);
-                    match &result {
+                    // Consumes `result` (nothing below reads it) so the error
+                    // can be stripped of its URL before it is formatted.
+                    match result {
                         Ok(r) => tracing::warn!(target: "alert", status = %r.status(), attempt, "reorg webhook returned non-2xx"),
-                        Err(e) => tracing::warn!(target: "alert", error = %e, attempt, "reorg webhook request failed"),
+                        // `without_url` for the same reason the alertfile
+                        // dispatcher applies it: a webhook URL is frequently
+                        // the credential itself (Slack, Discord, PagerDuty)
+                        // and may carry userinfo, and reqwest's `Display`
+                        // appends it verbatim to transport and timeout errors.
+                        Err(e) => {
+                            let e = e.without_url();
+                            tracing::warn!(target: "alert", error = %e, attempt, "reorg webhook request failed")
+                        }
                     }
                     // Bounded retries, matching the shipped behavior: the legacy
                     // hook has no queue to fall behind on, so a failing endpoint
