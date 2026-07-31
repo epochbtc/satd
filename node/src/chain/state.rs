@@ -3284,6 +3284,48 @@ impl ChainState {
         result
     }
 
+    /// Fail closed unless `header` extends the block the chainstate currently
+    /// ends at.
+    ///
+    /// The one invariant every replay loop depends on: `connect_block` applies
+    /// a UTXO delta computed against the *current* set, so handing it a block
+    /// from a different branch either aborts on an already-spent input
+    /// (`bad-txns-inputs-missingorspent`) or — when the branches happen not to
+    /// conflict — silently commits a UTXO set that no longer matches
+    /// consensus. `connect_stored_block` has always enforced this on the IBD
+    /// path; the reindex paths did not, and both ways of picking the next
+    /// block to replay have gone wrong in production:
+    ///
+    ///   * `-reindex` connected every genesis-reachable block, side chains
+    ///     included, and died at mainnet 916308 (the first fork point on
+    ///     disk);
+    ///   * `-reindex-chainstate` selects by height→hash, which is derived
+    ///     state that has been observed polluted with a fork block (#322, and
+    ///     the `bad-cb-height` reindex loop that followed it).
+    ///
+    /// So the check is on the connect, not on any one selection strategy: a
+    /// future bug in either picker surfaces here, loudly, before it can touch
+    /// the UTXO set.
+    fn require_extends_tip(
+        &self,
+        header: &bitcoin::block::Header,
+        height: u32,
+    ) -> Result<(), ChainError> {
+        let tip = self.tip_hash();
+        if header.prev_blockhash != tip {
+            tracing::error!(
+                height,
+                block = %header.block_hash(),
+                parent = %header.prev_blockhash,
+                chain_tip = %tip,
+                "reindex: refusing to connect a block that does not extend the \
+                 replayed chain — it belongs to a different branch"
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
+        Ok(())
+    }
+
     /// Connect a prefetched, pre-processed block during reindex. Reuses the
     /// prefetcher's deserialized block, precomputed txids, and (in
     /// assumevalid mode) speculatively pre-verified scripts. Does NOT check
@@ -3292,6 +3334,7 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<(), ChainError> {
+        self.require_extends_tip(&pre.block.header, pre.height)?;
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
         let verifier: &dyn ScriptVerifier =
@@ -3338,6 +3381,7 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
+        self.require_extends_tip(&entry.header, height)?;
         let block = self
             .read_block_direct(&flat_pos)
             .ok_or(ChainError::FlatFile("cannot read block during reindex".into()))?;
@@ -3672,6 +3716,11 @@ impl ChainState {
                 .get_block_index(&entry.header.prev_blockhash)
                 .ok_or(ChainError::BadPrevBlock)?;
             let height = parent.height + 1;
+            // `plan_reindex_chain` builds the path by walking parent pointers,
+            // so this holds by construction — which is exactly why it is worth
+            // asserting: it is the guard that keeps a future change to the
+            // planner from silently reintroducing a side-chain connect.
+            self.require_extends_tip(&entry.header, height)?;
 
             let use_noop = self.should_skip_scripts(height);
             let noop = NoopVerifier;
@@ -9408,6 +9457,58 @@ pub(crate) mod tests {
         for (i, h) in b_hashes.iter().enumerate() {
             assert_eq!(re.store.get_block_hash_by_height(i as u32 + 3), Some(*h));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-reindex-chainstate` picks the block to replay at each height from the
+    /// height→hash index. That index is derived state, and it has been observed
+    /// polluted with a fork block in production (#322, and the `bad-cb-height`
+    /// reindex loop that followed). When it is, the replay must fail closed
+    /// rather than splice one branch onto another and commit the result: the
+    /// same UTXO-corruption class as the flat-file reindex bug, reached through
+    /// a different picker.
+    #[test]
+    fn reindex_chainstate_refuses_a_spliced_branch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main_hashes = Vec::new();
+        for h in 1..=5u32 {
+            let b = build_test_block(parent, h, 1_701_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            main_hashes.push(parent);
+        }
+        // Stale sibling of block 3, stored but never on the active chain.
+        let stale = build_test_block(main_hashes[1], 3, 1_701_100_003);
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        assert_eq!(cs.tip_hash(), *main_hashes.last().unwrap());
+
+        // Reindex the chainstate against a height index that names the stale
+        // block at height 3 — the shape a polluted index takes.
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis_hash;
+            tip.height = 0;
+        }
+        pollute_height_hash(&cs, 3, stale_hash);
+
+        let err = cs
+            .reindex_chainstate(None, None)
+            .expect_err("a spliced replay must fail, not complete");
+        assert!(
+            matches!(err, ChainError::BadPrevBlock),
+            "expected a linkage failure, got {err:?}"
+        );
+        // The replay stopped at the splice rather than running to the tip over
+        // a UTXO set built from two different branches.
+        assert!(
+            cs.tip_height() < 5,
+            "replay must not reach the tip across a branch splice"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
