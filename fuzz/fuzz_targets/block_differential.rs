@@ -35,6 +35,7 @@
 #![no_main]
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -189,22 +190,86 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
     .is_ok()
 }
 
+/// Verdicts actually compared against the oracle. Reported periodically so a
+/// run's log carries evidence of how much differential testing it did.
+static COMPARISONS: AtomicU64 = AtomicU64::new(0);
+/// Consecutive `submitblock` errors where a follow-up liveness probe ALSO
+/// failed, i.e. the oracle itself is gone rather than the input being bad.
+static ORACLE_DOWN_STREAK: AtomicU64 = AtomicU64::new(0);
+
+/// How many consecutive dead-oracle observations end the run. Small enough to
+/// fail fast, large enough to ride out a momentary hiccup.
+const MAX_ORACLE_DOWN_STREAK: u64 = 20;
+
 /// Core's verdict via `submitblock`. `Some(true)` = accept (null result),
 /// `Some(false)` = a consensus reject, `None` = a connectivity/duplicate
 /// verdict or RPC-level error → skip (not a consensus signal).
+///
+/// A skip is indistinguishable from a comparison in the exit status, so a dead
+/// oracle used to be invisible: every iteration returned `None`, the target
+/// returned early, libFuzzer ran out its full `-max_total_time` and **exited
+/// 0**. The job went green having compared nothing — precisely the outcome it
+/// exists to prevent, and one no failure-triage can catch because there is no
+/// failure. So an RPC error is now followed by a liveness probe, and a streak
+/// of dead probes ends the run loudly.
 fn core_accepts(rpc: &Client, hex: &str) -> Option<bool> {
     match rpc.call::<Option<String>>("submitblock", &[serde_json::Value::String(hex.to_string())]) {
-        Ok(None) => Some(true),
+        Ok(None) => {
+            note_comparison(rpc);
+            Some(true)
+        }
         Ok(Some(reason)) => {
+            ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
             if is_connectivity(&reason) {
                 None
             } else {
+                note_comparison(rpc);
                 Some(false)
             }
         }
-        // RPC error (e.g. the submitblock "doesn't start with a coinbase"
-        // pre-check, or a decode error) — not a comparable consensus verdict.
-        Err(_) => None,
+        // An RPC error is usually the input's fault — the `submitblock`
+        // "doesn't start with a coinbase" pre-check, a decode error — and not a
+        // comparable consensus verdict. But it is also what a vanished oracle
+        // looks like, so ask whether Core is still answering at all before
+        // treating it as an ordinary skip.
+        Err(_) => {
+            if rpc.call::<serde_json::Value>("getblockcount", &[]).is_ok() {
+                ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
+                return None;
+            }
+            let streak = ORACLE_DOWN_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= MAX_ORACLE_DOWN_STREAK {
+                eprintln!("=== BLOCK-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
+                eprintln!(
+                    "Bitcoin Core oracle unreachable for {streak} consecutive submissions \
+                     (container '{CORE_CONTAINER}' gone? OOM-killed?)."
+                );
+                eprintln!(
+                    "comparisons_before_failure={}",
+                    COMPARISONS.load(Ordering::Relaxed)
+                );
+                eprintln!(
+                    "Ending the run: continuing would burn the remaining budget comparing \
+                     satd against nothing and exit 0."
+                );
+                // Exit rather than panic: a panic inside the fuzz target makes
+                // libFuzzer write a `crash-*` reproducer, which the workflow's
+                // triage reads as a confirmed consensus divergence. This is a
+                // broken harness, not a divergence.
+                std::process::exit(2);
+            }
+            None
+        }
+    }
+}
+
+/// Count a real accept/reject comparison, and log progress periodically so the
+/// run's log shows how much differential work actually happened.
+fn note_comparison(_rpc: &Client) {
+    ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
+    let n = COMPARISONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(10_000) {
+        eprintln!("block-differential: {n} verdicts compared against Bitcoin Core");
     }
 }
 
