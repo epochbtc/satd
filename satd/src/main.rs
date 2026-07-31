@@ -423,6 +423,11 @@ async fn main() {
             .with_silentpaymentindex_enabled(config.silentpaymentindex),
     );
 
+    // Height the chainstate reached before `-reindex-chainstate` cleared it;
+    // the replay must reach it again or fail closed. `None` when not doing a
+    // chainstate reindex, or when there was no tip to begin with.
+    let mut prev_chainstate_height: Option<u32> = None;
+
     // Handle -reindex: clear everything, will rebuild from flat files
     if config.reindex {
         startup_progress.set_phase("clearing_db", "Clearing chain database for reindex...");
@@ -433,8 +438,24 @@ async fn main() {
             std::process::exit(1);
         }
     } else if config.reindex_chainstate {
-        // Handle -reindex-chainstate: clear UTXO/undo, keep block index
-        tracing::info!("Reindexing chainstate: clearing UTXO set, will rebuild from block files");
+        // Handle -reindex-chainstate: clear UTXO/undo, keep block index.
+        //
+        // Capture how far the chainstate reached BEFORE clearing it. The
+        // replay has to prove it can rebuild at least that much: it selects
+        // its chain from the block index, and a block index with a hole (a
+        // `HeaderOnly` gap, a pruned range) yields a chain that stops short —
+        // or does not leave genesis at all. Without this floor the replay
+        // silently reports success over a truncated or empty UTXO set. The
+        // tip lives in the metadata column family, which `clear_chainstate`
+        // drops, so it must be read first.
+        prev_chainstate_height = store
+            .get_tip()
+            .and_then(|h| store.get_block_index(&h))
+            .map(|e| e.height);
+        tracing::info!(
+            prev_height = ?prev_chainstate_height,
+            "Reindexing chainstate: clearing UTXO set, will rebuild from block files"
+        );
         if let Err(e) = store.clear_chainstate() {
             eprintln!("Error clearing chainstate for reindex: {}", e);
             auth.cleanup();
@@ -766,6 +787,7 @@ async fn main() {
         if let Err(e) = chain_state.reindex_chainstate(
             config.stopatheight,
             Some(startup_progress.clone()),
+            prev_chainstate_height,
         ) {
             eprintln!("Error during chainstate reindex: {}", e);
             auth.cleanup();

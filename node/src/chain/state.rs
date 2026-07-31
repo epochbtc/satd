@@ -3095,10 +3095,14 @@ impl ChainState {
     /// `progress` (if provided) receives total / current / stop_height
     /// updates so the startup RPC can render a gauge that distinguishes
     /// the file tip (total) from the configured stop target.
+    /// `required_height` is how far the chainstate reached before it was
+    /// cleared. The replay must be able to rebuild at least that much or it
+    /// fails closed — see the coverage check below.
     pub fn reindex_chainstate(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
+        required_height: Option<u32>,
     ) -> Result<(), ChainError> {
         // Decide which chain to replay before touching anything. Selecting by
         // chainwork over the block index, rather than walking the height→hash
@@ -3112,10 +3116,48 @@ impl ChainState {
         // so the planner's view can never be a partial one.
         self.store.flush()?;
         let genesis_hash = bitcoin::constants::genesis_block(self.network).block_hash();
+        // The pre-clear tip doubles as the tie-break incumbent: on an exact
+        // chainwork tie the branch the node was already on wins, matching the
+        // consensus first-seen rule that `find_best_valid_tip` implements by
+        // returning the active tip. Without it a node holding a fully-received
+        // stale sibling at its tip height would, on a coin flip, rebuild onto
+        // the orphan and have to be reorged back by its peers.
+        let incumbent = self
+            .store
+            .get_block_hash_by_height(required_height.unwrap_or(0));
         let plan = Arc::new(
-            crate::chain::replay_plan::plan_replay_from_block_index(&*self.store, genesis_hash)
-                .map_err(ChainError::Storage)?,
+            crate::chain::replay_plan::plan_replay_from_block_index(
+                &*self.store,
+                genesis_hash,
+                incumbent,
+            )
+            .map_err(ChainError::Storage)?,
         );
+
+        // Fail closed when the block index cannot produce the chain the node
+        // already had. Selection admits only `DataStored`/`Valid` blocks and
+        // requires every ancestor to qualify, so one ineligible block low in
+        // the chain truncates the plan — or empties it. A pruned node is the
+        // guaranteed case: every block below the prune horizon is `Pruned`, so
+        // nothing resolves and the plan is genesis alone. Reporting success
+        // there would leave the node serving height 0 with an empty UTXO set,
+        // while `clear_chainstate` has already stamped the tx and address
+        // indexes complete — so Electrum and Esplora would answer "no history"
+        // for every address. Before this check the replay did exactly that;
+        // the pre-plan code failed loudly instead, on the unreadable block.
+        if let Some(required) = required_height
+            && plan.tip_height() < required
+        {
+            tracing::error!(
+                required,
+                planned = plan.tip_height(),
+                "reindex: the block index has no fully-connectable chain reaching the height \
+                 the chainstate was already at. This datadir cannot be rebuilt with \
+                 --reindex-chainstate — a pruned range or a hole in the block index breaks the \
+                 ancestry. Run a full --reindex to rebuild the block index from the block files."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
 
         // A partially-replayed chainstate can only be resumed if it lies on the
         // branch now selected. If it does not, the previous run followed a
@@ -3202,7 +3244,12 @@ impl ChainState {
         // weights apply directly. Target the configured `-stopatheight` when
         // set — the loop below exits there, so an ETA to the full file tip
         // would be materially inflated.
-        let target_height = stop_at.unwrap_or_else(|| plan.tip_height());
+        // Clamp like the flat-file path: a `-stopatheight` above the plan tip
+        // would aim the progress gauge and ETA at a height the replay cannot
+        // reach, so neither ever converges.
+        let target_height = stop_at
+            .map(|h| h.min(plan.tip_height()))
+            .unwrap_or_else(|| plan.tip_height());
         let mut eta_est = crate::ibd_eta::IbdEtaEstimator::new(
             start_height,
             target_height,
@@ -3544,7 +3591,17 @@ impl ChainState {
         let mut side: Vec<(BlockHash, u32, [u8; 32])> = Vec::new();
         queue.push_back((genesis, 0, [0u8; 32]));
         while let Some((hash, height, work)) = queue.pop_front() {
-            if hash != genesis && !path_set.contains(&hash) {
+            // Side blocks are indexed WITHOUT a height→hash row, because that
+            // row names the active chain. That holds only for heights the
+            // active chain also occupies: `accept_headers` restores a
+            // "missing" height→hash row for any `DataStored` entry whose
+            // height is vacant, so a side block above the selected tip would
+            // have one written for it on the next headers message — putting a
+            // losing branch into the active-chain index after all. Selection
+            // is by work rather than depth, so a lighter-but-longer branch can
+            // reach above the tip; leave those blocks unindexed, exactly as
+            // they were before a reindex indexed side chains at all.
+            if hash != genesis && !path_set.contains(&hash) && height <= tip_height {
                 side.push((hash, height, work));
             }
             let Some(child_hashes) = children.get(&hash) else {
@@ -3572,10 +3629,15 @@ impl ChainState {
     /// Three passes:
     ///   1. Stream every record in the flat files, parsing only the 80-byte
     ///      header. Build `header_by_hash` and the `parent → children`
-    ///      multimap. Memory: one `BlockHeader` + position per block,
-    ///      ~150 bytes — about 140 MB at the current mainnet height. The
-    ///      previous implementation eagerly held every full block in
-    ///      memory (~900 GB on mainnet), which OOM-killed the node.
+    ///      multimap. At the current mainnet height (~950k blocks, which
+    ///      hashbrown rounds up to 2^21 buckets) that is ~254 MB for
+    ///      `header_by_hash` and ~166 MB for `children` including its
+    ///      per-parent `Vec` allocations; planning adds a ~30 MB path and a
+    ///      ~69 MB membership set, for a ~518 MB peak. `children` is dropped
+    ///      as soon as planning ends so the multi-day connect phase does not
+    ///      hold it alongside the coin cache. The original implementation
+    ///      eagerly held every full block in memory (~900 GB on mainnet),
+    ///      which OOM-killed the node.
     ///   2. [`Self::plan_reindex_chain`]: pick the most-work branch of that
     ///      tree and order it genesis→tip. Side-chain blocks are separated
     ///      out here and never enter the connect loop.
@@ -3627,12 +3689,35 @@ impl ChainState {
                         };
                     let hash = header.block_hash();
                     scanned += 1;
-                    // The same block can be on disk more than once — a
-                    // crash-resume that re-wrote a block, or a re-download.
-                    // Keep the first copy and drop the rest: a repeated
-                    // `children` edge would walk that block's whole subtree
-                    // again per copy (exponential in the number of duplicated
-                    // ancestors) and emit duplicate side-chain index entries.
+                    // Branch selection is driven by `bits`, so `bits` has to be
+                    // backed by work actually done. An 80-byte header always
+                    // deserializes — every field is a fixed-width integer — so
+                    // a single flipped bit in a record's `nBits` exponent
+                    // yields a well-formed header claiming an astronomical
+                    // target, which would then out-score the honest chain and,
+                    // since `connect_block` checks no PoW either, be connected
+                    // and persisted as the tip. Checking the hash against the
+                    // claimed target closes that off: a harder target the block
+                    // does not meet is rejected, and an easier one only lowers
+                    // its own score.
+                    if validation::pow::check_proof_of_work(&header).is_err() {
+                        tracing::warn!(
+                            block = %hash,
+                            "reindex: flat-file record fails proof of work; not indexing it"
+                        );
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    // The same block can be on disk more than once (a
+                    // re-download, or a crash-resume that re-wrote it). Keep
+                    // the first copy: a repeated `children` edge would walk
+                    // that block's whole subtree again per copy (exponential
+                    // in the number of duplicated ancestors) and emit
+                    // duplicate side-chain index entries. Which copy is kept
+                    // only matters if one of them is damaged, and the flat-file
+                    // scanner already refuses to yield a record whose length
+                    // header does not bound a complete payload — so both copies
+                    // are structurally intact and byte-identical. First-wins
+                    // also keeps the sibling ordering below deterministic.
                     if header_by_hash.contains_key(&hash) {
                         return std::ops::ControlFlow::Continue(());
                     }
@@ -3676,6 +3761,25 @@ impl ChainState {
                 "Phase 2: selected most-work branch; side-chain blocks will be indexed, not connected"
             );
         }
+        // Records on disk but no chain out of genesis means the flat files are
+        // unusable — a wrong network's blocks dir, a truncated first file, a
+        // missing blk00000.dat. Connecting nothing and reporting a completed
+        // reindex would leave the node serving height 0 as though that were
+        // the answer.
+        if plan.path.is_empty() && total > 0 {
+            tracing::error!(
+                scanned = total,
+                "reindex: scanned block records but none form a chain from genesis; the block \
+                 files cannot be replayed. Check that the blocks directory belongs to this \
+                 network and that blk00000.dat is present and intact."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
+
+        // `children` is dead once the plan exists; without this it stays
+        // resident (~166 MB on mainnet) for the entire multi-day connect phase,
+        // competing with the coin cache.
+        drop(children);
         let connect_target_height = plan.tip_height;
         // `-stopatheight` caps the connect target when it lands below the tip.
         let target_height = stop_at
@@ -9209,7 +9313,7 @@ pub(crate) mod tests {
             .flush_count
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        cs.reindex_chainstate(None, None).unwrap();
+        cs.reindex_chainstate(None, None, None).unwrap();
 
         let flushes_after = cs
             .store
@@ -9509,7 +9613,7 @@ pub(crate) mod tests {
         // The shape a polluted index takes: a fork block owning a height.
         pollute_height_hash(&cs, 3, stale_hash);
 
-        cs.reindex_chainstate(None, None)
+        cs.reindex_chainstate(None, None, None)
             .expect("chainwork selection must not be misled by the height index");
 
         assert_eq!(cs.tip_hash(), main_tip, "replayed the wrong branch");
@@ -9528,6 +9632,71 @@ pub(crate) mod tests {
             cs.store.get_block_hash_by_height(3),
             Some(main_hashes[2]),
             "the replay must rewrite the polluted height entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The critical fail-open found in review: selection admits only
+    /// `DataStored`/`Valid` blocks and requires every ancestor to qualify, so a
+    /// single ineligible block low in the chain empties the plan. The replay
+    /// then connected nothing and returned `Ok`.
+    ///
+    /// A pruned node is the guaranteed case — every block below the prune
+    /// horizon is `Pruned` — and the outcome was a node serving height 0 with
+    /// an empty UTXO set, while `clear_chainstate` had already stamped the tx
+    /// and address indexes complete. Before the plan existed this failed
+    /// loudly, on the unreadable pruned block.
+    #[test]
+    fn reindex_chainstate_refuses_to_replay_a_truncated_chain() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        for h in 1..=6u32 {
+            let b = build_test_block(parent, h, 1_703_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept block");
+        }
+        let real_height = cs.tip_height();
+        assert_eq!(real_height, 6);
+
+        // Drain the cache's pending block-index writes first: a later flush
+        // would otherwise replay the original `Valid` entry over the `Pruned`
+        // one written below.
+        cs.store.flush().unwrap();
+
+        // Mark block 2 unreplayable, exactly as pruning does. Everything above
+        // it now has an ineligible ancestor.
+        let pruned_hash = cs.store.get_block_hash_by_height(2).unwrap();
+        let mut entry = cs.store.get_block_index(&pruned_hash).unwrap();
+        entry.status = BlockStatus::Pruned;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((pruned_hash, entry));
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(
+            cs.store.get_block_index(&pruned_hash).unwrap().status,
+            BlockStatus::Pruned,
+            "fixture did not take effect"
+        );
+
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis_hash;
+            tip.height = 0;
+        }
+
+        let err = cs
+            .reindex_chainstate(None, None, Some(real_height))
+            .expect_err("a replay that cannot reach the previous height must fail, not report success");
+        assert!(
+            matches!(err, ChainError::BadPrevBlock),
+            "expected a coverage failure, got {err:?}"
+        );
+        assert_eq!(
+            cs.tip_height(),
+            0,
+            "the failed replay must not leave a partial chainstate advertised as complete"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -9562,12 +9731,64 @@ pub(crate) mod tests {
         }
 
         let err = cs
-            .reindex_chainstate(None, None)
+            .reindex_chainstate(None, None, None)
             .expect_err("resuming onto a different branch must fail");
         assert!(
             matches!(err, ChainError::BadPrevBlock),
             "expected a linkage failure, got {err:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Side-chain blocks are indexed without a height→hash row because that row
+    /// names the active chain. `accept_headers` restores a "missing" row for
+    /// any `DataStored` entry whose height is vacant, so a side block ABOVE the
+    /// selected tip would get one written on the next headers message —
+    /// re-creating the active-chain pollution the omission exists to prevent.
+    /// Those blocks must be left unindexed.
+    #[test]
+    fn reindex_from_flat_files_does_not_index_side_blocks_above_the_tip() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Main chain to 5, then a competing branch from block 2 that overtakes
+        // to 8 — so after the reorg the abandoned A-branch tail sits at heights
+        // 3..5, all at or below the winning tip.
+        let mut parent = genesis_hash;
+        let mut a_hashes = Vec::new();
+        for h in 1..=5u32 {
+            let b = build_test_block(parent, h, 1_704_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept A block");
+            a_hashes.push(parent);
+        }
+        let mut parent = a_hashes[1];
+        for h in 3..=8u32 {
+            let b = build_test_block(parent, h, 1_704_100_000 + h);
+            parent = cs.accept_block(&b).expect("accept B block");
+        }
+        let b_tip = parent;
+        assert_eq!(cs.tip_hash(), b_tip);
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None).expect("reindex");
+        assert_eq!(re.tip_height(), 8);
+
+        // Every indexed side block must sit at a height the active chain also
+        // occupies, so `accept_headers` can never see a vacant height for one.
+        for h in a_hashes.iter().skip(2) {
+            let e = re.store.get_block_index(h).expect("side block indexed");
+            assert!(
+                e.height <= re.tip_height(),
+                "indexed a side block above the tip at height {}",
+                e.height
+            );
+            assert!(
+                re.store.get_block_hash_by_height(e.height).is_some(),
+                "height {} is vacant, so accept_headers would claim it for the side block",
+                e.height
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9680,7 +9901,7 @@ pub(crate) mod tests {
             tip.height = 0;
         }
 
-        cs.reindex_chainstate(None, None).unwrap();
+        cs.reindex_chainstate(None, None, None).unwrap();
         cs.store.flush().unwrap();
 
         assert_eq!(cs.tip_height(), 300, "reindex must restore the tip height");
@@ -9727,7 +9948,8 @@ pub(crate) mod tests {
 
         let progress = crate::startup_progress::StartupProgress::new();
         progress.set_phase("reindex_chainstate", "Replaying UTXO set");
-        cs.reindex_chainstate(Some(400), Some(progress.clone())).unwrap();
+        cs.reindex_chainstate(Some(400), Some(progress.clone()), None)
+            .unwrap();
 
         assert_eq!(cs.tip_height(), 400, "reindex must stop at the target");
         let snap = progress.snapshot();
@@ -9884,8 +10106,12 @@ pub(crate) mod tests {
             "the heavier one-block branch must win over the deeper easy branch"
         );
         assert_eq!(plan.tip_height, 1);
+        // Only `deep1` is reported: it sits at height 1, which the selected
+        // chain also occupies. `deep2` is at height 2, above the tip, and side
+        // blocks above the tip are deliberately left unindexed — an indexed
+        // one would have a vacant height for `accept_headers` to claim.
         let side: Vec<_> = plan.side.iter().map(|s| s.0).collect();
-        assert_eq!(side, vec![deep1, deep2]);
+        assert_eq!(side, vec![deep1]);
     }
 
     /// Equal-work fork: the branch seen first in flat-file order wins, which is
@@ -9936,7 +10162,7 @@ pub(crate) mod tests {
 
         // Pristine: only genesis.
         cs.store.flush().unwrap();
-        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash()).unwrap();
+        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash(), None).unwrap();
         assert_eq!(plan.tip_height(), 0);
         assert_eq!(plan.tip_hash(), genesis.block_hash());
 
@@ -9946,7 +10172,7 @@ pub(crate) mod tests {
             parent = cs.accept_block(&block).unwrap();
         }
         cs.store.flush().unwrap();
-        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash()).unwrap();
+        let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash(), None).unwrap();
         assert_eq!(plan.tip_height(), 257);
         assert_eq!(plan.tip_hash(), parent);
         assert_eq!(plan.hash_at(0), Some(genesis.block_hash()));

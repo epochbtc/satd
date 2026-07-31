@@ -78,23 +78,42 @@ struct Node {
 /// excludes its descendants — an `invalidateblock` still holds across a
 /// chainstate reindex.
 ///
-/// Ties on chainwork are broken by block hash. `for_each_block_index` has no
-/// defined iteration order, so unlike the flat-file planner there is no
-/// meaningful "first seen" to prefer; hash order at least makes the choice
-/// deterministic across runs. This matches `find_best_valid_tip`, which faces
-/// the same problem on the live path.
+/// On an exact chainwork tie `incumbent` — the block the chainstate was already
+/// at — wins, so a reindex never switches a node onto an equal-work sibling it
+/// had already declined. That is the rule `find_best_valid_tip` implements on
+/// the live path by returning the active tip. Remaining ties fall back to the
+/// lowest block hash: `for_each_block_index` has no defined iteration order, so
+/// unlike the flat-file planner there is no meaningful "first seen" to prefer,
+/// and hash order at least makes the choice deterministic across runs.
 ///
-/// Memory is one `Node` per replayable block — about 130 MB at the current
-/// mainnet height, alongside a `Vec<BlockHash>` of the same set. Comparable to
-/// the flat-file reindex's header scan, and released before the replay starts.
+/// Memory at the current mainnet height (~950k eligible blocks, which hashbrown
+/// rounds up to 2^21 buckets): `nodes` is ~220 MB, plus ~33 MB each for `all`,
+/// the ancestry `stack`, the reversed path and the returned `hashes` — roughly
+/// **350 MB peak**. All of it is dropped before the caller enters BulkLoad and
+/// starts filling the coin cache.
 pub fn plan_replay_from_block_index(
     store: &dyn Store,
     genesis: BlockHash,
+    incumbent: Option<BlockHash>,
 ) -> Result<ReplayPlan, crate::storage::StoreError> {
     let mut nodes: HashMap<BlockHash, Node> = HashMap::new();
     let mut all: Vec<BlockHash> = Vec::new();
     store.for_each_block_index(&mut |hash, entry| {
         if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid) {
+            return;
+        }
+        // Selection is driven by `bits`, so `bits` has to be backed by work
+        // that was actually done. A corrupted header — in a damaged index, or
+        // one rebuilt from a damaged flat file — can otherwise claim an
+        // astronomical target and win every comparison. Re-deriving the hash
+        // and checking it against the claimed target makes forged work
+        // impossible: a harder claimed target the block does not meet is
+        // rejected outright, and an easier one only lowers its own score.
+        if crate::validation::pow::check_proof_of_work(&entry.header).is_err() {
+            tracing::warn!(
+                block = %hash,
+                "reindex: block index entry fails proof of work; excluding it from chain selection"
+            );
             return;
         }
         all.push(hash);
@@ -161,7 +180,17 @@ pub fn plan_replay_from_block_index(
         };
         let better = match &best {
             None => true,
-            Some((_, best_work)) => crate::chain::state::compare_u256(&work, best_work) > 0,
+            Some((best_hash, best_work)) => {
+                match crate::chain::state::compare_u256(&work, best_work) {
+                    1 => true,
+                    // Exact tie: the branch the node was already on wins, and
+                    // never loses to a later candidate. Same rule as
+                    // `find_best_valid_tip`, which returns the active tip
+                    // rather than switching on equal work.
+                    0 => Some(*hash) == incumbent && Some(*best_hash) != incumbent,
+                    _ => false,
+                }
+            }
         };
         if better {
             best = Some((*hash, work));
@@ -196,8 +225,11 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
 
-    const EASY: u32 = 0x207fffff; // regtest floor — work ≈ 2
-    const HARD: u32 = 0x1d00ffff; // mainnet genesis target — work ≈ 2^32
+    // Both targets must be cheap to mine, since every synthetic header below is
+    // ground until it satisfies its own claimed target — the planner now
+    // rejects entries whose PoW does not back their `bits`.
+    const EASY: u32 = 0x207fffff; // regtest floor
+    const HARDER: u32 = 0x201fffff; // a quarter of EASY's target => 4x the work
 
     fn h(n: u8) -> BlockHash {
         BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([n; 32]))
@@ -215,20 +247,33 @@ mod tests {
         stored_height: u32,
         stored_work: [u8; 32],
     ) {
+        let mut header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(0x20000000),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]),
+            ),
+            time: 0,
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        };
+        // Grind until the header actually meets the target it claims. The
+        // planner excludes entries whose PoW does not back their `bits`, which
+        // is what stops a corrupted header from claiming astronomical work, so
+        // the fixtures have to be honestly mined.
+        let mut nonce = 0u32;
+        loop {
+            header.nonce = nonce;
+            if crate::validation::pow::check_proof_of_work(&header).is_ok() {
+                break;
+            }
+            nonce = nonce.checked_add(1).expect("failed to mine test header");
+        }
         let mut batch = StoreBatch::default();
         batch.block_index_puts.push((
             hash,
             BlockIndexEntry {
-                header: bitcoin::block::Header {
-                    version: bitcoin::block::Version::from_consensus(0x20000000),
-                    prev_blockhash: prev,
-                    merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]),
-                    ),
-                    time: 0,
-                    bits: CompactTarget::from_consensus(bits),
-                    nonce: 0,
-                },
+                header,
                 height: stored_height,
                 status,
                 num_tx: 1,
@@ -247,8 +292,8 @@ mod tests {
     }
 
     /// Selection is by recomputed cumulative chainwork, so a single block at a
-    /// harder target beats two at an easy one. Picking by depth — or by walking
-    /// the height→hash index — would replay the wrong branch here.
+    /// harder target (4x the work) beats two at an easy one. Picking by depth —
+    /// or by walking the height→hash index — would replay the wrong branch.
     #[test]
     fn picks_most_work_not_deepest() {
         let store = InMemoryStore::new();
@@ -256,10 +301,10 @@ mod tests {
         chain(&store, &[
             (deep1, genesis, EASY, BlockStatus::Valid),
             (deep2, deep1, EASY, BlockStatus::Valid),
-            (heavy, genesis, HARD, BlockStatus::Valid),
+            (heavy, genesis, HARDER, BlockStatus::Valid),
         ]);
 
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_height(), 1);
         assert_eq!(plan.tip_hash(), heavy);
         assert_eq!(plan.hash_at(0), Some(genesis));
@@ -281,7 +326,7 @@ mod tests {
         // A one-block branch claiming enormous chainwork and an absurd height.
         put(&store, liar, genesis, EASY, BlockStatus::Valid, 9_999, [0xffu8; 32]);
 
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(
             plan.tip_hash(),
             b,
@@ -304,7 +349,7 @@ mod tests {
             (side, a, EASY, BlockStatus::Valid),
         ]);
 
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), side);
         assert_eq!(plan.tip_height(), 2);
     }
@@ -322,7 +367,7 @@ mod tests {
             (short, a, EASY, BlockStatus::Valid),
         ]);
 
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), short);
         assert_eq!(plan.tip_height(), 2);
     }
@@ -341,9 +386,83 @@ mod tests {
                 (high, a, EASY, BlockStatus::Valid),
                 (low, a, EASY, BlockStatus::Valid),
             ]);
-            let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+            let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
             assert_eq!(plan.tip_hash(), low);
         }
+    }
+
+    /// On an exact chainwork tie the incumbent — the chain the node was already
+    /// on — wins, regardless of hash order. Without this a node holding a
+    /// fully-received equal-work stale sibling at its tip would, on a coin
+    /// flip, rebuild its chainstate onto the orphan.
+    #[test]
+    fn incumbent_wins_an_exact_tie() {
+        let (genesis, a, low, high) = (h(0), h(1), h(2), h(9));
+        // `high` is the incumbent even though `low` sorts first, so hash order
+        // and incumbent order disagree and only the incumbent rule can win.
+        let store = InMemoryStore::new();
+        chain(&store, &[
+            (a, genesis, EASY, BlockStatus::Valid),
+            (low, a, EASY, BlockStatus::Valid),
+            (high, a, EASY, BlockStatus::Valid),
+        ]);
+        let plan = plan_replay_from_block_index(&store, genesis, Some(high)).unwrap();
+        assert_eq!(
+            plan.tip_hash(),
+            high,
+            "an equal-work sibling must not displace the chain the node was on"
+        );
+        // And with no incumbent the deterministic hash rule still applies.
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
+        assert_eq!(plan.tip_hash(), low);
+    }
+
+    /// A header whose `bits` claims work it did not do must not be able to buy
+    /// the selection. `bits` is the only input to the work calculation, and a
+    /// corrupt index or flat file can produce a well-formed header claiming an
+    /// astronomical target — which would otherwise out-score the honest chain
+    /// and be replayed as the active one.
+    #[test]
+    fn forged_work_without_proof_is_excluded() {
+        let store = InMemoryStore::new();
+        let (genesis, a, b, forger) = (h(0), h(1), h(2), h(3));
+        chain(&store, &[
+            (a, genesis, EASY, BlockStatus::Valid),
+            (b, a, EASY, BlockStatus::Valid),
+        ]);
+        // Claims a target ~2^32 times harder than the honest chain's, with a
+        // nonce that does not meet it — the shape a flipped exponent byte
+        // produces. `chain()` mines; this deliberately does not.
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((
+            forger,
+            BlockIndexEntry {
+                header: bitcoin::block::Header {
+                    version: bitcoin::block::Version::from_consensus(0x20000000),
+                    prev_blockhash: genesis,
+                    merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
+                        bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]),
+                    ),
+                    time: 0,
+                    bits: CompactTarget::from_consensus(0x1d00ffff),
+                    nonce: 0,
+                },
+                height: 1,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            },
+        ));
+        store.write_batch(batch).unwrap();
+
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
+        assert_eq!(
+            plan.tip_hash(),
+            b,
+            "a header claiming unearned work must not win selection"
+        );
     }
 
     /// A block whose parent is absent from the index entirely is unreachable
@@ -360,7 +479,7 @@ mod tests {
             (y, x, EASY, BlockStatus::Valid),
         ]);
 
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_hash(), a);
         assert_eq!(plan.tip_height(), 1);
     }
@@ -371,7 +490,7 @@ mod tests {
     fn genesis_only_index_plans_an_empty_replay() {
         let store = InMemoryStore::new();
         let genesis = h(0);
-        let plan = plan_replay_from_block_index(&store, genesis).unwrap();
+        let plan = plan_replay_from_block_index(&store, genesis, None).unwrap();
         assert_eq!(plan.tip_height(), 0);
         assert_eq!(plan.tip_hash(), genesis);
         assert_eq!(plan.hash_at(1), None);

@@ -228,6 +228,26 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   and height from the stored headers rather than trusting the index's own
   fields, and refuses to resume a partial chainstate that sits on a different
   branch. `invalidateblock` and header-only gaps are honored during selection.
+- Fixed: both reindex paths now validate proof of work before letting a header
+  influence branch selection. An 80-byte header always deserializes, so a single
+  flipped bit in a record's `nBits` exponent produced a well-formed header
+  claiming astronomical work — and since `connect_block` checks no PoW either,
+  it would have been selected and connected as the tip, wedging the node on a
+  branch it could never reorg away from.
+- Fixed: `-reindex-chainstate` now refuses to run when the block index cannot
+  produce a fully-connectable chain reaching the height the chainstate was
+  already at, instead of reporting success over a truncated or empty UTXO set. A
+  pruned datadir hit this every time: every block below the prune horizon is
+  ineligible, so the replay connected nothing and the node came up at height 0
+  with the tx and address indexes already stamped complete.
+- Fixed: an exact chainwork tie during a chainstate reindex now keeps the branch
+  the node was already on, rather than resolving by block hash — a node holding
+  an equal-work stale sibling at its tip could otherwise rebuild onto the orphan.
+- Fixed: side-chain blocks above the selected tip are no longer indexed by
+  `-reindex`. `accept_headers` restores a "missing" height→hash row for any
+  data-carrying entry whose height is vacant, so such an entry would have had one
+  written for it on the next headers message — putting a losing branch into the
+  active-chain index after all.
 - Fixed: all reindex paths now refuse to connect a block that does not extend
   the chain being replayed — the invariant `connect_stored_block` has always
   enforced on the IBD path, now applied to both reindex replays as a
