@@ -926,6 +926,21 @@ The `status` category is **bit 16**. Like `tweaks`, it is **not** part of the
 never begins receiving a body it has no parser for. Unlike `tweaks` it has no
 index prerequisite.
 
+**Authorization: `status` requires `rpc:read` in addition to
+`stream:subscribe`.** Every other category describes public chain data, which is
+what `stream:subscribe` exists to hand out. `StatusEvent` describes the host —
+free bytes on the node's volume, connected peers split inbound/outbound, the
+mempool byte cap with its occupancy and `mempoolminfee`, tip height, IBD state,
+reorg depth and fork heights. That is the content of `getblockchaininfo`,
+`getpeerinfo`, `getmempoolinfo` and `getwarnings`, and `satd-auth` separates the
+two capabilities precisely so an operator can issue a streaming token to a
+wallet backend or tenant *without* granting node read RPC. A token holding only
+`stream:subscribe` is refused with `PERMISSION_DENIED` (gRPC) or `403` (WS/SSE)
+when it requests bit 16, and a mid-stream `SetCategories` / `SetWatchSet` from
+such a token has the bit stripped. This applies only where `-authfile` is
+configured: with no token store the node behaves exactly as before, and the
+operator principal (cookie / `rpcuser` / `rpcauth`) holds every capability.
+
 It is served on the carriers that have a per-subscriber category mask to opt in
 with: gRPC `Subscribe`, gRPC `Watch`, WS, and SSE. It is **not** emitted on the
 ZMQ `nodeevent` topic. ZMQ has no per-subscriber mask — only an all-or-nothing

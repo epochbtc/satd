@@ -685,8 +685,12 @@ enum StatusKind {
   STATUS_KIND_UNSPECIFIED = 0;
   // Initial block download finished (edge, at most once per process).
   STATUS_KIND_IBD_COMPLETE = 1;
-  // No block connected for longer than the configured window, while not in
-  // IBD. Clears when the next block connects.
+  // No block connected for longer than the configured window. Clears when the
+  // next block connects (or when the window is widened past the current tip
+  // age). Deliberately NOT suppressed during initial block download: a node
+  // that was caught up and then wedged re-enters IBD a day later — exactly when
+  // the alert is wanted — while a node genuinely syncing connects blocks
+  // continuously and so never reaches the window.
   STATUS_KIND_TIP_STALL = 2;
   // Free space on the data (or blocks) directory fell below the configured
   // floor. Clears with hysteresis above it.

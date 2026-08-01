@@ -124,7 +124,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   level-triggered with paired `raised`/`cleared` states and an additive
   `details` string map. Served on gRPC and WS/SSE; **not** on the ZMQ
   `nodeevent` topic, which has no per-subscriber category mask (use `alertfile`
-  webhooks or `-alertnotify` for health over ZMQ). Not replayable (no cursor —
+  webhooks or `-alertnotify` for health over ZMQ). Requires **`rpc:read` as well
+  as `stream:subscribe`** where `-authfile` is in use — the bodies carry host
+  telemetry (disk, peers, mempool occupancy, tip height) that the same
+  capability gates on the RPC surface. Not replayable (no cursor —
   detectors re-raise standing conditions after a restart). Wire schema only in
   this change; the detectors that emit them land next.
 

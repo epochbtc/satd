@@ -825,6 +825,10 @@ impl NodeEventStream for NodeEventStreamSvc {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        // Read before `into_inner()`, which drops the extensions the auth
+        // interceptor stashed the principal in. `None` means the token store is
+        // not configured at all (loopback trust), the Core-compatible default.
+        let principal = request.extensions().get::<satd_auth::Principal>().cloned();
         let req = request.into_inner();
 
         // Enforce the global concurrent-subscription cap before attaching a
@@ -866,6 +870,26 @@ impl NodeEventStream for NodeEventStreamSvc {
         } else {
             req.categories
         };
+
+        // `status` (bit 16) additionally requires `rpc:read`: it reports host
+        // telemetry — free disk, peer topology, mempool occupancy and
+        // `mempoolminfee`, tip height, IBD state — that every other surface
+        // keeps behind that capability. Refused here rather than stripped,
+        // because the client asked for it explicitly (bit 16 is never in the
+        // `0` default) and a silently absent category reads as "the node is
+        // healthy". See `crate::catauth`.
+        if category_mask & node::events::CATEGORY_STATUS != 0
+            && !crate::catauth::may_receive_status(principal.as_ref())
+        {
+            debug!(
+                target: "events::grpc",
+                code = "permission_denied",
+                "rejecting Subscribe: the status category requires rpc:read",
+            );
+            return Err(Status::permission_denied(
+                "the status category requires the rpc:read capability",
+            ));
+        }
         let since_seq = req.since_seq.unwrap_or(0);
 
         // Silent-payment `tweaks` category (bit 8) is explicit-request only and
@@ -1451,8 +1475,15 @@ impl NodeEventStream for NodeEventStreamSvc {
                                         // control update cannot forward shared-broadcast
                                         // `BlockTweaks` past the Subscribe path's
                                         // index/completeness/dust-limit validation.
+                                        // `status` is stripped for a token without
+                                        // `rpc:read` for the same reason it is refused
+                                        // on Subscribe — a control message must not be
+                                        // a way around the handshake gate.
                                         category_mask.store(
-                                            mask & !node::events::CATEGORY_TWEAKS,
+                                            crate::catauth::strip_unauthorized(
+                                                principal.as_ref(),
+                                                mask & !node::events::CATEGORY_TWEAKS,
+                                            ),
                                             Ordering::Relaxed,
                                         );
                                     }
@@ -2150,8 +2181,16 @@ fn apply_control(
                 c.categories
             };
             // Strip the tweaks bit: Watch never serves the firehose (see the
-            // SetWatchSet path above).
-            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
+            // SetWatchSet path above). `status` goes the same way for a token
+            // without `rpc:read`, so a mid-stream update is not a route around
+            // the handshake gate.
+            category_mask.store(
+                crate::catauth::strip_unauthorized(
+                    principal,
+                    mask & !node::events::CATEGORY_TWEAKS,
+                ),
+                Ordering::Relaxed,
+            );
         }
         Some(Msg::SetWatchOptions(o)) => {
             // Per-stream raw-tx inlining. Store the encoder-side flag AND toggle
