@@ -112,6 +112,13 @@ pub enum EvictReason {
 /// which surfaces as [`Unknown`](StatusKind::Unknown) rather than an error. The
 /// event's `severity` and `message` stay meaningful in that case, so a generic
 /// "log it and page on critical" handler keeps working across upgrades.
+///
+/// `#[non_exhaustive]` for the reason the `Unknown` arm exists: this crate is
+/// published, the node's taxonomy grows independently of it, and a downstream
+/// `match` that listed every variant *including* `Unknown(_)` would be
+/// exhaustive — so adding a kind here would be a breaking release. Forcing a
+/// wildcard arm keeps a node-side addition additive for every consumer.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     /// Initial block download finished (one-shot).
@@ -150,6 +157,9 @@ impl StatusKind {
 }
 
 /// Level-triggered lifecycle of a health condition.
+///
+/// `#[non_exhaustive]` — see [`StatusKind`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusState {
     /// The condition was entered; it stands until a matching `Cleared`.
@@ -179,6 +189,9 @@ impl StatusState {
 /// (`severity >= StatusSeverity::Warning`). An unrecognized value sorts above
 /// `Critical` deliberately: a condition this build cannot name is not one to
 /// quietly filter out.
+///
+/// `#[non_exhaustive]` — see [`StatusKind`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StatusSeverity {
     /// Worth knowing, not worth waking anyone (IBD completing).
@@ -389,11 +402,25 @@ pub enum Event {
     /// flap. Observations with no recovered state (IBD finishing, a deep reorg
     /// landing) are [`StatusState::Edge`].
     ///
-    /// **Not replayable.** A status event carries no cursor, so a `from_cursor`
-    /// resume never yields one; the node re-raises standing conditions after a
-    /// restart instead. A client that connects *after* a condition was raised
-    /// will not see it until the condition changes — query `getwarnings` over
-    /// JSON-RPC for current state on connect.
+    /// **Not replayable, and the gap is not observable.** A status event carries
+    /// no cursor, so a `from_cursor` resume never yields one; the node re-raises
+    /// standing conditions after a restart instead. A client that connects
+    /// *after* a condition was raised will not see it until the condition
+    /// changes.
+    ///
+    /// This is not something the reconnect layer can paper over.
+    /// [`ResilientSubscription`](crate::ResilientSubscription) hides reconnects
+    /// by design, and its one synthetic notice
+    /// ([`Event::ReplayGap`]) is cursor-anchored — which status has no part in.
+    /// So a drop during which one condition raised and another cleared leaves a
+    /// client's picture silently wrong, with nothing to key recovery off.
+    ///
+    /// Treat this stream as the low-latency edge signal and **`getwarnings` over
+    /// JSON-RPC as the authority** on what is wrong right now: poll it on a slow
+    /// timer as well as consuming this, and a missed transition self-corrects at
+    /// the next poll instead of persisting for the life of the process. Seeding
+    /// once on connect is not enough, because reconnects after that are
+    /// invisible to you.
     ///
     /// Match on [`kind`](StatusKind) and read [`details`](Event::Status) for the
     /// numbers; treat [`StatusKind::Unknown`] as informational rather than an
