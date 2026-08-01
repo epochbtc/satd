@@ -1009,7 +1009,8 @@ pub struct Config {
     /// dispatcher. Read once at startup (restart to change), like Core.
     pub alert_notify: Option<String>,
     /// Health detector: raise `tip_stall` after this many seconds with no
-    /// connected block, outside IBD. `0` disables the detector. SIGHUP-live.
+    /// connected block. Deliberately not gated on IBD — see
+    /// `node::health::check_tip_stall_values`. `0` disables. SIGHUP-live.
     pub alert_tip_stall_seconds: u64,
     /// Health detector: raise `disk_low` below this many MiB free on the
     /// watched data/blocks directory. `0` disables. SIGHUP-live.
@@ -5157,7 +5158,7 @@ pub struct CliArgs {
     #[arg(
         long = "alerttipstallseconds",
         value_name = "SECS",
-        help = "Raise the tip_stall health alert after this many seconds with no connected block, outside IBD (default 3600; 0 disables)"
+        help = "Raise the tip_stall health alert after this many seconds with no connected block (default 3600, 0 on regtest; 0 disables)"
     )]
     pub alert_tip_stall_seconds: Option<u64>,
 

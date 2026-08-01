@@ -149,7 +149,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   height and new tip are read from the durable reorg log, so they are exact
   regardless of chain-event lag. Two new gauges close longstanding observability gaps
   independently of alerting: `satd_tip_last_connect_age_seconds` and
-  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`.
+  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`. The
+  free-space probe is bounded and carried across polls, so a `blocksdir` on an
+  unresponsive network mount stalls only the disk alert — never the other
+  detectors — and strands at most one blocking thread rather than one per poll.
 
 ## Releases
 

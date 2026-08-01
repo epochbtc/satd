@@ -118,7 +118,8 @@ pub struct AlertThresholds {
 
 /// Default raise thresholds, mirrored by the `alert*` config-key defaults.
 pub mod defaults {
-    /// One hour without a connected block, outside IBD. At mainnet's 10-minute
+    /// One hour without a connected block. Not gated on IBD — see
+    /// `check_tip_stall_values`, which explains why at length. At mainnet's 10-minute
     /// target roughly 0.25 % of blocks take longer than an hour by chance, so
     /// this fires spuriously about once every few days on a healthy node —
     /// deliberate: a stalled node is worth a look, and an operator who finds it
@@ -476,6 +477,8 @@ async fn run_detectors(
     // Anchors the `peer_floor` startup grace. Distinct from `last_connect`,
     // which is reset by every block.
     let detector_start = Instant::now();
+    // Outstanding `statvfs`, collected on the following poll. See `check_disk`.
+    let mut disk_probe: Option<DiskProbe> = None;
 
     loop {
         tokio::select! {
@@ -544,7 +547,11 @@ async fn run_detectors(
                 let age = last_connect.elapsed().as_secs();
                 state.last_connect_age_secs.store(age, Ordering::Relaxed);
                 check_tip_stall(&state, &warnings, &publisher, &thresholds, &chain_state, age);
-                check_disk(&state, &warnings, &publisher, &thresholds, &disk_watch_path).await;
+                check_disk(
+                    &state, &warnings, &publisher, &thresholds, &disk_watch_path,
+                    &mut disk_probe, DISK_PROBE_BUDGET,
+                )
+                .await;
                 check_mempool(&state, &warnings, &publisher, &thresholds, &mempool);
                 check_peers(
                     &state, &warnings, &publisher, &thresholds, &peer_manager,
@@ -842,12 +849,33 @@ fn check_tip_stall_values(
 /// would park an API-runtime worker and — since every detector shares this one
 /// task — freeze *all* of them, `tip_stall` and `deep_reorg` included, for as
 /// long as the mount stayed wedged.
+/// How many stalled polls between repeat warnings about an unresponsive
+/// filesystem. At the 15 s poll interval this is roughly hourly.
+const STALL_LOG_EVERY: u32 = 240;
+
+/// How long one poll will wait on an outstanding `statvfs` before giving up on
+/// it for this tick. Comfortably under the poll interval, so a filesystem that
+/// answers at all is read inline and the detector never falls behind; a
+/// filesystem that does not answer costs this much per poll and nothing more.
+const DISK_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// An outstanding `statvfs`, carried across polls so a filesystem that never
+/// answers strands exactly one blocking thread instead of one per poll.
+struct DiskProbe {
+    handle: tokio::task::JoinHandle<Option<u64>>,
+    /// Consecutive polls this probe has failed to finish in. Drives the
+    /// log-rate limiting only.
+    stalled_polls: u32,
+}
+
 async fn check_disk(
     state: &HealthState,
     warnings: &NodeWarnings,
     publisher: &EventPublisher,
     thresholds: &AlertThresholds,
     path: &std::path::Path,
+    pending: &mut Option<DiskProbe>,
+    budget: std::time::Duration,
 ) {
     // Sample before any early return, so `satd_disk_free_bytes` is populated
     // whatever the detector's configuration. An operator who sets
@@ -856,12 +884,78 @@ async fn check_disk(
     // would delete the series out from under their own rule, silently. An
     // unreadable filesystem reports "unknown" rather than a zero that would
     // read as "completely full".
-    let sample = {
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || crate::diskspace::free_disk_bytes(&path))
-            .await
-            .unwrap_or(None)
+    //
+    // The probe is collected on the *next* poll rather than awaited on this
+    // one. `statvfs` on a hard NFS mount whose server has gone away does not
+    // return, and `spawn_blocking(..).await` inherits that wait in full: it
+    // moves the syscall off the detector's thread but still parks the detector
+    // on the `JoinHandle`. Every other detector — tip stall, deep reorg,
+    // mempool, peers — then stops running, `chain_rx` stops being drained, and
+    // every gauge freezes at its last value, so an external Prometheus rule on
+    // tip age cannot fire either. A wedged mount would silently disable the
+    // whole alerting subsystem, which is the one condition alerting exists for.
+    //
+    // A timeout around the join would not fix it: `tokio::time::timeout`
+    // abandons the handle but cannot cancel a blocking task, so each poll would
+    // strand another thread and exhaust the (bounded) blocking pool within
+    // hours — trading a wedged detector for a wedged runtime. Holding the
+    // handle across polls bounds the damage at exactly one stuck thread.
+    let sample = match pending.as_mut() {
+        Some(probe) => {
+            // `&mut JoinHandle` is itself a future, so a timeout here does NOT
+            // consume the handle — which is the whole point. `timeout(_, handle)`
+            // by value would abandon it, and since a blocking task cannot be
+            // cancelled, the next poll would spawn another and the one after
+            // that another, exhausting the bounded blocking pool within hours.
+            match tokio::time::timeout(budget, &mut probe.handle).await {
+                Ok(joined) => joined.unwrap_or(None),
+                Err(_) => {
+                    probe.stalled_polls += 1;
+                    let stalls = probe.stalled_polls;
+                    // Loud once, then hourly: a hung filesystem is worth saying,
+                    // and worth repeating for whoever reads the log later, but
+                    // four identical lines a minute buries everything else.
+                    if stalls == 1 || stalls.is_multiple_of(STALL_LOG_EVERY) {
+                        tracing::warn!(
+                            target: "health",
+                            path = %path.display(),
+                            stalled_polls = stalls,
+                            budget_secs = budget.as_secs(),
+                            "disk-space probe has not returned; the filesystem is \
+                             not responding. Free-space alerting is stalled until \
+                             it does — every other health detector keeps running.",
+                        );
+                    }
+                    // Leave the gauge and the alert verdict on their last known
+                    // values. Overwriting with "unknown" would clear a
+                    // `disk_low` that is very likely still true — an
+                    // unresponsive mount is not evidence the disk drained.
+                    return;
+                }
+            }
+        }
+        // First poll of the process: nothing outstanding to collect. Start one
+        // below and read it next tick.
+        None => {
+            let path = path.to_path_buf();
+            *pending = Some(DiskProbe {
+                handle: tokio::task::spawn_blocking(move || {
+                    crate::diskspace::free_disk_bytes(&path)
+                }),
+                stalled_polls: 0,
+            });
+            // "Not measured yet" must not reach the gauge as "unmeasurable".
+            return;
+        }
     };
+    // Collected: start the next one so the following poll has something to read.
+    {
+        let path = path.to_path_buf();
+        *pending = Some(DiskProbe {
+            handle: tokio::task::spawn_blocking(move || crate::diskspace::free_disk_bytes(&path)),
+            stalled_polls: 0,
+        });
+    }
     state
         .disk_free_bytes
         .store(sample.unwrap_or(DISK_UNKNOWN), Ordering::Relaxed);
@@ -1554,14 +1648,21 @@ mod tests {
         state.set_active(StatusKind::DiskLow, true);
         warnings.record("alert.disk_low", Severity::Error, "low", serde_json::Value::Null);
 
-        check_disk(
-            &state,
-            &warnings,
-            &pubr,
-            &thresholds,
-            std::path::Path::new("."),
-        )
-        .await;
+        // Two polls: the probe is started on the first and collected on the
+        // second (see `check_disk` on why it is never awaited inline).
+        let mut probe = None;
+        for _ in 0..2 {
+            check_disk(
+                &state,
+                &warnings,
+                &pubr,
+                &thresholds,
+                std::path::Path::new("."),
+                &mut probe,
+                DISK_PROBE_BUDGET,
+            )
+            .await;
+        }
         assert_eq!(
             drained(&mut rx),
             vec![(StatusKind::DiskLow, StatusState::Cleared)],
@@ -1895,11 +1996,81 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
         assert_eq!(thresholds.disk_free_bytes(), 0, "detector off");
 
-        check_disk(&state, &warnings, &pubr, &thresholds, std::path::Path::new(".")).await;
+        let mut probe = None;
+        let call = async |probe: &mut Option<DiskProbe>| {
+            check_disk(
+                &state, &warnings, &pubr, &thresholds, std::path::Path::new("."), probe,
+                DISK_PROBE_BUDGET,
+            )
+            .await;
+        };
+        // First poll starts the probe and publishes nothing: "not measured yet"
+        // must not reach the gauge as "unmeasurable".
+        call(&mut probe).await;
+        assert!(
+            state.disk_free_bytes().is_none(),
+            "the first poll only starts the probe",
+        );
+        assert!(probe.is_some(), "and leaves it outstanding");
+        // Second poll collects it.
+        call(&mut probe).await;
         assert!(
             state.disk_free_bytes().is_some(),
             "the gauge must be populated whatever the alert's configuration"
         );
+    }
+
+    /// The finding: `statvfs` on a hard NFS mount whose server has gone away
+    /// never returns. Awaiting it inline parked the whole detector loop — tip
+    /// stall, deep reorg, mempool and peer checks all stopped, and every gauge
+    /// froze, so even an external Prometheus rule on tip age could not fire.
+    ///
+    /// A probe that never finishes must therefore (a) not block the poll, and
+    /// (b) not spawn a replacement each poll, which would strand one blocking
+    /// thread per tick and exhaust the pool within hours.
+    #[tokio::test]
+    async fn a_wedged_filesystem_does_not_stall_the_detector_or_leak_threads() {
+        let state = HealthState::new();
+        let warnings = NodeWarnings::new();
+        let pubr = publisher();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
+
+        // Stand in for the hung syscall: a blocking task that never returns.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut probe = Some(DiskProbe {
+            handle: tokio::task::spawn_blocking(move || {
+                let _ = release_rx.recv();
+                None
+            }),
+            stalled_polls: 0,
+        });
+
+        for expected in 1..=3u32 {
+            // Each call must RETURN — if this hangs, the bug is back.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                check_disk(
+                    &state,
+                    &warnings,
+                    &pubr,
+                    &thresholds,
+                    std::path::Path::new("."),
+                    &mut probe,
+                    // Tiny budget: the point is that a stuck probe is abandoned
+                    // for this tick, not how long we are willing to wait.
+                    std::time::Duration::from_millis(1),
+                ),
+            )
+            .await
+            .expect("check_disk must not block on an unresponsive filesystem");
+            assert_eq!(
+                probe.as_ref().expect("the stuck probe is retained").stalled_polls,
+                expected,
+                "the same probe is carried forward, not replaced",
+            );
+        }
+        // Let the fake syscall finish so the runtime can shut down cleanly.
+        let _ = release_tx.send(());
     }
 
     /// Build a reorg-log record with a controlled timestamp and shape.
