@@ -239,10 +239,20 @@ the only duplicate you can receive is a retry of something you already saw.
 - **Serial and in-order per hook** — one request in flight at a time, so events
   arrive in the order the node produced them.
 - **Retried with backoff** on 5xx, 408, 429, timeouts, and connection failures:
-  1 s doubling to a 5-minute ceiling, indefinitely. Any *other* 4xx is treated
-  as permanent, counted, and skipped — a receiver answering 404 forever must
-  not pin the queue and turn every later event into a drop. A skipped event
-  The skip is counted in `satd_alertwebhook_dropped_total` and logged.
+  1 s doubling to a 5-minute ceiling — but **not forever**. A delivery is
+  abandoned once it ages past the 600 s freshness window it was signed with,
+  which lands somewhere around the tenth or eleventh attempt. That is
+  deliberate: the signed timestamp is the only staleness signal a receiver
+  checks, so a delivery that could no longer pass that check is not worth
+  sending. The practical consequence is that a receiver down for longer than
+  ten minutes — a relay redeploy, a restart that takes a while — loses the
+  events raised during the outage. Alert on
+  `satd_alertwebhook_dropped_total` if that matters to you; the detectors
+  re-raise standing health conditions, so those recover on their own, but
+  chain and mempool events do not.
+  Any *other* 4xx is treated as permanent, counted, and skipped — a receiver
+  answering 404 forever must not pin the queue and turn every later event into
+  a drop. The skip is counted in `satd_alertwebhook_dropped_total` and logged.
 - **Redirects are not followed.** A 3xx is a permanent drop. The URL in the
   alertfile is where the signed body goes; following a redirect would move it —
   signature, hook identity and all — to a host you never named, and the useful
@@ -290,9 +300,18 @@ Nothing is exported when no hook is configured.
 
 > **Note.** The older `reorgwebhook=` / `reorgwebhooksecret=` keys still work
 > and are now served by this dispatcher, with their original `ReorgRecord`
-> payload unchanged — existing receivers need no edits. New deployments should
-> prefer an `alertfile` hook with `categories = ["chain"]`, which delivers the
-> standard event envelope.
+> payload and v1 body-only signature unchanged.
+>
+> **One behavior did change:** redirects are no longer followed. A receiver
+> that answers 301/302 — an `http`→`https` proxy hop, a trailing-slash
+> redirect, a load balancer that relocates — used to be chased and now
+> classifies as a permanent drop. If your reorg endpoint relies on a redirect,
+> point `reorgwebhook=` at the final URL; otherwise every reorg record is
+> silently discarded. Everything else about the payload and signature is
+> byte-identical, so a receiver on a stable URL needs no edits.
+>
+> New deployments should prefer an `alertfile` hook with
+> `categories = ["chain"]`, which delivers the standard event envelope.
 
 ## Structured JSON Logging
 

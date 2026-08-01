@@ -97,6 +97,20 @@ enum Delivery {
     Event {
         body: Arc<Vec<u8>>,
         delivery_id: String,
+        /// When the dispatcher took this event off the bus — NOT when the
+        /// delivery task got round to it.
+        ///
+        /// This is what `X-Satd-Timestamp` carries, and the spec makes it the
+        /// only staleness signal a receiver checks. Stamping it at dequeue
+        /// instead meant the freshness window bounded the *retry span* rather
+        /// than the event's actual age: delivery is serial per hook and a
+        /// hard-down endpoint burns the full retry budget on each event in
+        /// turn, so a `tip_stall` raised at T+0 could be popped at T+2h,
+        /// signed with `now`, sail through the receiver's 600 s check, and
+        /// page on-call for a condition that raised and cleared two hours
+        /// earlier. Stamped here, that delivery is correctly rejected as
+        /// stale.
+        queued_at: u64,
     },
 }
 
@@ -287,6 +301,10 @@ async fn fan_in(
                         continue;
                     };
                     let body = Arc::new(bytes);
+                    // One clock read for every hook this event fans out to, so
+                    // the same event is never stale for one receiver and fresh
+                    // for another.
+                    let queued_at = unix_secs();
                     let delivery_id = satd_alert::delivery_id(
                         &hex::encode(env.stamp.node_id),
                         publisher.instance_id(),
@@ -297,6 +315,7 @@ async fn fan_in(
                         enqueue(hook, Delivery::Event {
                             body: body.clone(),
                             delivery_id: delivery_id.clone(),
+                            queued_at,
                         });
                     }
                 }
@@ -449,7 +468,7 @@ async fn deliver_loop(
                 None => return,
             },
         };
-        let Delivery::Event { body, delivery_id } = item;
+        let Delivery::Event { body, delivery_id, queued_at } = item;
 
         counters
             .queue_depth
@@ -458,12 +477,15 @@ async fn deliver_loop(
         // Signed once, outside the retry loop, and reused for every attempt:
         // the signature must be stable across retries of one event (the
         // attempt counter rides in a header, deliberately not in the body or
-        // the signed material), and the timestamp records when satd *signed*
-        // this delivery, not when it last retried it. A receiver enforcing a
-        // freshness window therefore sees a delivery age out if it is still
-        // being retried after the window, which is the intended behavior: a
-        // 20-minute-old "disk is filling" alert is not worth acting on.
-        let signed_at = unix_secs();
+        // the signed material).
+        //
+        // The timestamp is the moment the event left the bus, not the moment
+        // this task reached it — see `Delivery::Event::queued_at`. So the
+        // freshness window bounds the age of the *alert*, which is what a
+        // receiver actually wants to reason about, rather than the length of
+        // one retry chain. A 20-minute-old "disk is filling" alert is not
+        // worth acting on however long it spent queued versus retrying.
+        let signed_at = queued_at;
         let signature =
             satd_alert::sign_v2(&hook.secret, signed_at, &delivery_id, &hook.id, &body);
         let mut attempt: u32 = 0;
@@ -666,14 +688,32 @@ impl AlertReloader {
         //
         // Comparing the parsed file rather than the file bytes means
         // reformatting or a comment edit is also a no-op.
+        //
+        // The one exception is a hook whose delivery task is no longer running.
+        // "Unchanged" is the common case for a SIGHUP — the operator is
+        // reloading precisely *because* something is wrong — so short-circuiting
+        // on it unconditionally would make the restart below unreachable on the
+        // only path an operator would take to trigger it, leaving "edit the
+        // stanza to force a mismatch" as the sole recovery.
         {
             let last = self.last_applied.lock();
-            if last.as_ref() == Some(&file) {
+            let dead = {
+                let running = self.running.lock();
+                running.hooks.values().any(|h| h.tx.is_closed())
+            };
+            if last.as_ref() == Some(&file) && !dead {
                 tracing::debug!(
                     target: "alert",
                     "alertfile unchanged; keeping the running dispatcher generation",
                 );
                 return Ok(file.hooks.len());
+            }
+            if dead {
+                tracing::warn!(
+                    target: "alert",
+                    "at least one webhook delivery task is no longer running; \
+                     rebuilding the dispatcher generation to restart it",
+                );
             }
         }
 
@@ -718,7 +758,26 @@ impl AlertReloader {
             let _guard = self.api_handle.enter();
             for hook in &file.hooks {
                 let kept = match running.hooks.remove(&hook.id) {
-                    Some(r) if r.config == *hook => Some(r),
+                    // An unchanged stanza keeps its task AND its queued
+                    // backlog — but only if that task is still alive. A
+                    // delivery loop that returned early (its `webhook_client()`
+                    // failed to build at startup, say) leaves a closed channel
+                    // behind, and re-adopting it on every SIGHUP made the hook
+                    // permanently dark: the config compares equal forever, so
+                    // nothing ever restarted it, and the operator's only
+                    // recoveries were a full restart or editing the stanza to
+                    // force a mismatch. A closed sender means the task is gone,
+                    // so fall through and start a fresh one.
+                    Some(r) if r.config == *hook && !r.tx.is_closed() => Some(r),
+                    Some(dead) if dead.config == *hook => {
+                        tracing::warn!(
+                            target: "alert",
+                            hook = %hook.id,
+                            "webhook delivery task is no longer running; restarting it",
+                        );
+                        let _ = dead.stop.send(true);
+                        None
+                    }
                     Some(edited) => {
                         // This one's queue is dropped on purpose: the operator
                         // changed where or how it delivers, and flushing the
@@ -1186,6 +1245,58 @@ heartbeat_interval_secs = 3600
         assert!(
             !before.is_closed(),
             "the carried-over hook's delivery task must still be running"
+        );
+    }
+
+    /// A hook whose delivery task has died must be restarted by the next
+    /// reload, not re-adopted forever.
+    ///
+    /// The keep-the-task rule compared only the stanza, so a task that exited
+    /// early — `webhook_client()` failing to build at startup is the realistic
+    /// way — left a closed channel that every subsequent SIGHUP happily
+    /// re-adopted, because an unchanged stanza compares equal every time. The
+    /// hook was dark for the life of the process and the only recoveries were a
+    /// restart or editing the stanza to force a mismatch. Reloading is exactly
+    /// what an operator does to fix things, so it must actually fix this.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reload_restarts_a_hook_whose_delivery_task_has_died() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hooks(dir.path(), &stanza("pager", "\"status\""));
+        let (reloader, _publisher) = handover_fixture(dir.path());
+
+        reloader.apply().expect("first apply");
+        let before = reloader.running.lock().hooks["pager"].tx.clone();
+
+        // Kill this hook's delivery task the way an early return would, and let
+        // it observe the stop so the receiver drops and the channel closes.
+        reloader.running.lock().hooks["pager"]
+            .stop
+            .send(true)
+            .expect("stop the delivery task");
+        for _ in 0..100 {
+            if before.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(before.is_closed(), "fixture must actually kill the task");
+
+        // Same file, same stanza — the exact case that used to re-adopt it.
+        reloader.apply().expect("second apply");
+        let after = reloader
+            .running
+            .lock()
+            .hooks
+            .get("pager")
+            .map(|h| h.tx.clone())
+            .expect("pager is still registered");
+        assert!(
+            !after.is_closed(),
+            "a reload must restart a dead delivery task, not re-adopt it",
+        );
+        assert!(
+            !before.same_channel(&after),
+            "and that means a fresh channel, not the corpse",
         );
     }
 

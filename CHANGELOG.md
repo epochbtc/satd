@@ -159,9 +159,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   metadata rides in headers (`X-Satd-Signature`, `X-Satd-Delivery`,
   `X-Satd-Hook`, `X-Satd-Attempt`). Delivery is serial and in-order per hook,
   retried with exponential backoff on transient failures and skipped on a
-  permanent 4xx (which still advances the resume position), with a bounded
-  queue whose overflow is reported in-band as a `lagged` event rather than
-  silently. Redirects are never followed — a 3xx is a permanent drop, so a
+  permanent 4xx. The per-hook queue is bounded and overflow **drops silently**
+  — there is no in-band gap notice; the record is
+  `satd_alertwebhook_dropped_total` and a log line. Redirects are never followed — a 3xx is a permanent drop, so a
   signed body cannot be steered to a host the alertfile never named. Delivery is
   **best-effort**: nothing is persisted, a hook that was down resumes at the
   live head, and drops are counted in `satd_alertwebhook_dropped_total`. The
