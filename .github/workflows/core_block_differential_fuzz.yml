@@ -106,7 +106,11 @@ jobs:
         run: bash scripts/fuzz/run-block-differential.sh
 
       - name: Upload divergence artifacts
-        if: failure()
+        # `cancelled()` as well as `failure()`: GitHub *cancels* rather than
+        # fails a job that hits `timeout-minutes`, and the fuzz step is the one
+        # that would be running when it does. Without this, a hang past the
+        # deadline discards the reproducer that proves it.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: core-block-differential-fuzz-artifacts
@@ -134,17 +138,34 @@ jobs:
       #       failures is itself a signal that nobody is watching, so that
       #       escalates to `fuzz-broken` rather than staying silent.
       #
+      # CANCELLATION is handled too, because GitHub *cancels* rather than fails
+      # a job that exceeds `timeout-minutes`, and `failure()` is false for a
+      # cancelled job. This job has no dependency cache, so a cold run builds
+      # cargo-fuzz, then node+rocksdb+bitcoinconsensus for gen_corpus, then the
+      # whole tree again under ASan, before fuzzing for 30 minutes — the 60
+      # minute ceiling is not far away. `cancel-in-progress` can cancel it too
+      # (a workflow_dispatch on master supersedes the running nightly). A
+      # cancelled run's conclusion is not `failure` either, so the (c) streak
+      # counter never counted it: the job could time out every single night and
+      # notify nothing, forever. A cancellation that reached the fuzz step is
+      # reported as (b) if it left a reproducer (a genuine hang) and otherwise
+      # as a timeout; one that did not reach it is left alone, since that is a
+      # deliberate supersede.
+      #
       # Manual workflow_dispatch runs never notify — whoever dispatched is
       # watching. Never weaken the accept/reject assertion for any of these.
       - name: Triage failure and notify
-        if: failure() && github.event_name == 'schedule'
+        if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
           # '' / 'skipped' when an earlier step failed; 'failure' when the
-          # fuzz step itself is what broke. This is the (b)-vs-(c) test.
+          # fuzz step itself is what broke; 'cancelled' when the job hit
+          # `timeout-minutes` or was superseded mid-fuzz. This is the (b)-vs-(c)
+          # test.
           FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
+          JOB_CANCELLED: ${{ cancelled() }}
         run: |
           set -euo pipefail
 
@@ -240,6 +261,57 @@ jobs:
               "Fuzz job broken: block-differential target fails to run ($today)" \
               "$body" \
               "Still broken as of $today: $RUN_URL"
+            exit 0
+          fi
+
+          # ---- (b') cancelled mid-fuzz: a timeout, reported as broken ---
+          # A job that exceeds `timeout-minutes` is CANCELLED, not failed, so
+          # `$FUZZ_OUTCOME` is `cancelled` and neither branch above fires. It
+          # also never reaches the (c) streak counter, whose `gh run list`
+          # filter matches `conclusion == "failure"`. Left alone, the job could
+          # time out every night forever and notify nothing.
+          #
+          # Only a cancellation that reached the fuzz step is reported. One that
+          # did not is a deliberate supersede (`cancel-in-progress` when someone
+          # dispatches a manual run over the nightly), and paging for that would
+          # be noise.
+          if [ "$FUZZ_OUTCOME" = "cancelled" ] || \
+             { [ "$JOB_CANCELLED" = "true" ] && [ "$FUZZ_OUTCOME" = "failure" ]; }; then
+            echo "Job was cancelled with the fuzz step running — treating as a timeout."
+
+            body=$(cat <<EOF
+          The **block-differential fuzz job was cancelled while fuzzing**,
+          which in practice means it hit its \`timeout-minutes\` ceiling. This
+          is not a consensus divergence and not a transient infra blip: the run
+          produced no verdict at all, and it will keep producing none.
+
+          - Run: $RUN_URL
+          - Commit: \`$COMMIT_SHA\`
+
+          The job has no dependency cache, so every run cold-builds
+          \`cargo-fuzz\`, then \`node\` + rocksdb + bitcoinconsensus for
+          \`gen_corpus\`, then the whole tree again under ASan, and only then
+          fuzzes for \`MAX_TOTAL_TIME\` (default 1800s). The 60-minute ceiling
+          leaves little headroom, so this trips when the runner is slow or a
+          dependency graph grows.
+
+          Options, roughly in order of preference:
+
+          - Cache the build (\`Swatinem/rust-cache\`, keyed separately from the
+            PR-CI legs since this uses a nightly toolchain).
+          - Lower \`MAX_TOTAL_TIME\` so build time and fuzz time fit.
+          - Raise \`timeout-minutes\`.
+
+          Note that a cancelled run is invisible to this workflow's own
+          consecutive-failure counter, which matches on \`failure\` — so
+          nothing else will report this.
+          EOF
+            )
+            notify fuzz-broken D93F0B \
+              "block-differential fuzz job is broken (not a divergence)" \
+              "Fuzz job broken: block-differential run timed out ($today)" \
+              "$body" \
+              "Timed out again on $today: $RUN_URL"
             exit 0
           fi
 
