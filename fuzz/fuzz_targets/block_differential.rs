@@ -118,34 +118,49 @@ fn spawn_base() -> Base {
             &format!("-rpcpassword={CORE_PASS}"),
             "-rpcallowip=127.0.0.1",
         ])
-        .output()
-        .expect("docker run bitcoind (is Docker installed?)");
-    assert!(
-        run.status.success(),
-        "docker run for Bitcoin Core failed: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        .output();
+    let run = match run {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => harness_failure(&format!(
+            "docker run for Bitcoin Core failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => harness_failure(&format!("could not exec docker (is Docker installed?): {e}")),
+    };
+    let _ = run;
 
     let rpc = Client::new(
         &format!("http://127.0.0.1:{CORE_RPC_PORT}"),
         Auth::UserPass(CORE_USER.to_string(), CORE_PASS.to_string()),
-    )
-    .expect("Core RPC client");
+    );
+    let rpc = match rpc {
+        Ok(c) => c,
+        Err(e) => harness_failure(&format!("could not build the Core RPC client: {e}")),
+    };
 
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if rpc.get_blockchain_info().is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "Bitcoin Core RPC never came up");
+        if Instant::now() >= deadline {
+            harness_failure(
+                "Bitcoin Core RPC never came up within 90s (loaded runner? container died?)",
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 
     let genesis = genesis_hash();
-    let best = rpc
-        .call::<String>("getbestblockhash", &[])
-        .expect("Core getbestblockhash");
-    assert_eq!(best, genesis.to_string(), "Core not at regtest genesis");
+    let best = match rpc.call::<String>("getbestblockhash", &[]) {
+        Ok(b) => b,
+        Err(e) => harness_failure(&format!("Core getbestblockhash failed: {e}")),
+    };
+    if best != genesis.to_string() {
+        harness_failure(&format!(
+            "Core is not at regtest genesis (best={best}, expected={genesis})"
+        ));
+    }
 
     Base {
         rpc,
@@ -239,28 +254,44 @@ fn core_accepts(rpc: &Client, hex: &str) -> Option<bool> {
             }
             let streak = ORACLE_DOWN_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
             if streak >= MAX_ORACLE_DOWN_STREAK {
-                eprintln!("=== BLOCK-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
-                eprintln!(
+                // Continuing would burn the remaining budget comparing satd
+                // against nothing and then exit 0.
+                harness_failure(&format!(
                     "Bitcoin Core oracle unreachable for {streak} consecutive submissions \
                      (container '{CORE_CONTAINER}' gone? OOM-killed?)."
-                );
-                eprintln!(
-                    "comparisons_before_failure={}",
-                    COMPARISONS.load(Ordering::Relaxed)
-                );
-                eprintln!(
-                    "Ending the run: continuing would burn the remaining budget comparing \
-                     satd against nothing and exit 0."
-                );
-                // Exit rather than panic: a panic inside the fuzz target makes
-                // libFuzzer write a `crash-*` reproducer, which the workflow's
-                // triage reads as a confirmed consensus divergence. This is a
-                // broken harness, not a divergence.
-                std::process::exit(2);
+                ));
             }
             None
         }
     }
+}
+
+/// Abort the run as a **harness** failure, never as a finding.
+///
+/// Every startup step below reaches the oracle over Docker and the network, and
+/// each can fail for reasons that have nothing to do with consensus: no Docker
+/// on the runner, a registry hiccup, an OOM-killed container, a bitcoind that
+/// takes longer than the deadline to open its RPC port on a loaded shared
+/// runner. Those used to be `expect`/`assert!`, i.e. panics — and a panic
+/// *inside a fuzz target* makes libFuzzer write a `crash-*` reproducer. The
+/// triage step keys on the presence of a reproducer, so a slow-starting
+/// bitcoind filed an issue titled "Fuzz divergence: satd vs Bitcoin Core"
+/// whose body asserts "This is a confirmed finding, not a flake."
+///
+/// Exiting with a distinct status leaves no artifact, so triage classifies it
+/// as the broken-harness case it is.
+fn harness_failure(what: &str) -> ! {
+    eprintln!("=== BLOCK-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
+    eprintln!("{what}");
+    eprintln!(
+        "comparisons_before_failure={}",
+        COMPARISONS.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "This is a harness/infrastructure failure, NOT a consensus divergence: \
+         no reproducer is written."
+    );
+    std::process::exit(2);
 }
 
 /// Count a real accept/reject comparison, and log progress periodically so the
