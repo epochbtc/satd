@@ -206,6 +206,32 @@ jobs:
       - name: Run clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `--all-features` above never compiles the consensus-only build, so a
+      # cfg-gated item referenced from ungated code compiles fine here and
+      # breaks only for `node`'s `default-features = false` consumers — the
+      # block-differential fuzz target being the one in-tree case. That is
+      # exactly how `ALL_CFS` referencing the cfg-gated filter CFs went
+      # unnoticed for weeks: the nightly fuzz job is the only consumer and it
+      # is not a PR gate. Cheap to keep honest here.
+      - name: Run clippy (node, consensus-only build)
+        run: cargo clippy -p node --no-default-features --all-targets -- -D warnings
+
+      # `fuzz/` is a separate workspace (the root `Cargo.toml` excludes it), so
+      # none of the steps above compile it and no other PR job touches it. The
+      # fuzz targets are hand-written against `node`'s internal API, which
+      # drifts: `ConnectParams` has grown a field twice — `address_index`, then
+      # `sp_index` — and each time the block-differential target stopped
+      # compiling. Nothing noticed until the nightly job had been red for
+      # weeks, because a build failure there produces no reproducer and so
+      # files no issue.
+      #
+      # A type-check is enough to catch that; building the instrumented binary
+      # needs a nightly toolchain and cargo-fuzz, which is what the nightly job
+      # is for. Stable is fine here — `#[no_main]`/`fuzz_target!` type-check
+      # without the sanitizer.
+      - name: Type-check the fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
   # Seed the dependency cache from master so a fresh branch's FIRST CI run is
   # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
   # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a

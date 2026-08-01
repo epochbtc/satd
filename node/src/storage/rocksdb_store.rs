@@ -77,7 +77,14 @@ const ALL_CFS: &[&str] = &[
     CF_ADDR_FUNDING_V2,
     CF_ADDR_SPENDING_V2,
     CF_OUTPOINT_SPEND,
+    // Gated exactly like the descriptors `open()` creates for them: on a
+    // consensus-only build (`--no-default-features`) this store can never
+    // create or write these CFs, so listing them would break the
+    // "descriptor created => listed here" correspondence in both
+    // directions.
+    #[cfg(feature = "block-filter-index")]
     CF_FILTER,
+    #[cfg(feature = "block-filter-index")]
     CF_FILTER_HEADER,
     CF_ADDR_BACKFILL_TEMP,
     CF_SP_TWEAKS,
@@ -2070,6 +2077,8 @@ impl Store for RocksDbStore {
     }
 
     fn clear_all(&self) -> Result<(), StoreError> {
+        // Only the cfg-gated filter-CF pushes below mutate this.
+        #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut all_cfs: Vec<&str> = vec![
             CF_BLOCK_INDEX,
             CF_COINS,
