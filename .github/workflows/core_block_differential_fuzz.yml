@@ -165,7 +165,12 @@ jobs:
           # `timeout-minutes` or was superseded mid-fuzz. This is the (b)-vs-(c)
           # test.
           FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
-          JOB_CANCELLED: ${{ cancelled() }}
+          # `job.status`, not `cancelled()`: the status functions are legal only
+          # in an `if:`, and using one in an `env:` makes the whole file invalid
+          # — GitHub then refuses to start the workflow at all, which is a
+          # louder failure than the one this step exists to report. `job.status`
+          # carries the same information and is available here.
+          JOB_CANCELLED: ${{ job.status == 'cancelled' }}
         run: |
           set -euo pipefail
 

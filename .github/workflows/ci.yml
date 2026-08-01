@@ -232,6 +232,31 @@ jobs:
       - name: Type-check the fuzz targets
         run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
 
+      # A workflow whose only triggers are `schedule` and `workflow_dispatch` is
+      # never instantiated by a pull request, so nothing on a PR validates it.
+      # An invalid expression there — `${{ cancelled() }}` in an `env:`, which
+      # the status functions do not permit — is therefore invisible until it
+      # reaches master, where GitHub rejects the file and refuses to start the
+      # workflow at all. That is silent by construction: a workflow that cannot
+      # start emits no failing job, and the nightly fuzz job simply stops
+      # running.
+      #
+      # actionlint parses every file under .github/workflows and checks context
+      # availability, so it catches that class before merge. shellcheck and
+      # pyflakes are disabled deliberately: this gate is for "does GitHub accept
+      # this file", not for style in embedded scripts, and leaving them on makes
+      # the gate depend on what happens to be installed on the runner.
+      - name: Lint the workflow files
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar xz -C /tmp actionlint
+          # `actions-rs/*` is archived and flagged repo-wide; that is a known
+          # migration (tracked separately), not something to block PRs on today.
+          /tmp/actionlint -shellcheck= -pyflakes= -ignore 'the runner of "actions-rs/.+" action is too old'
+        env:
+          ACTIONLINT_VERSION: '1.7.7'
+
   # Seed the dependency cache from master so a fresh branch's FIRST CI run is
   # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
   # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a
