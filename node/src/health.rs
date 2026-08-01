@@ -132,7 +132,8 @@ pub mod defaults {
     /// Connected peers, on a network where a node is expected to have some.
     pub const PEER_FLOOR: u64 = 3;
 
-    /// The `peer_floor` default for `network`.
+    /// The `peer_floor` default for `network`, capped by `connect_peers` — the
+    /// number of `-connect=` addresses the operator configured.
     ///
     /// Disabled on regtest only. A regtest node is routinely run entirely
     /// alone, so "fewer than 3 peers" is its normal operating state rather than
@@ -146,9 +147,19 @@ pub mod defaults {
     /// make the detector's silence indistinguishable from health —
     /// `satd_alert_active{kind="peer_floor"}` reads 0 either way. An operator
     /// running a deliberately isolated signet can set `alertpeerfloor=0`.
-    pub fn peer_floor_for(network: bitcoin::Network) -> u64 {
+    ///
+    /// `-connect=` is the same trap as regtest wearing different clothes. It
+    /// pins the node to exactly the addresses given and suppresses both DNS
+    /// seeding and the fixed seeds, so a node with one or two of them can never
+    /// reach a floor of 3 — no code path is left that would add a peer. The
+    /// floor is a property of the configuration, not only of the network, so it
+    /// follows the count the operator declared. Capping rather than disabling
+    /// keeps the alert working for what it is actually good for here: a
+    /// `-connect=` node that had all its configured peers and then lost one.
+    pub fn peer_floor_for(network: bitcoin::Network, connect_peers: usize) -> u64 {
         match network {
             bitcoin::Network::Regtest => 0,
+            _ if connect_peers > 0 => PEER_FLOOR.min(connect_peers as u64),
             _ => PEER_FLOOR,
         }
     }
@@ -1355,14 +1366,25 @@ mod tests {
         // A regtest node normally has no peers at all, so defaulting the floor
         // to 3 raises a critical warning 90s into every run that can never
         // clear.
-        assert_eq!(defaults::peer_floor_for(Network::Regtest), 0);
+        assert_eq!(defaults::peer_floor_for(Network::Regtest, 0), 0);
         // Signet is a public network with real peers. A peer-starved signet
         // node is broken in exactly the way this alert reports, and defaulting
         // it off would make the detector's silence indistinguishable from
         // health.
-        assert_eq!(defaults::peer_floor_for(Network::Signet), defaults::PEER_FLOOR);
-        assert_eq!(defaults::peer_floor_for(Network::Bitcoin), defaults::PEER_FLOOR);
-        assert_eq!(defaults::peer_floor_for(Network::Testnet4), defaults::PEER_FLOOR);
+        assert_eq!(defaults::peer_floor_for(Network::Signet, 0), defaults::PEER_FLOOR);
+        assert_eq!(defaults::peer_floor_for(Network::Bitcoin, 0), defaults::PEER_FLOOR);
+        assert_eq!(defaults::peer_floor_for(Network::Testnet4, 0), defaults::PEER_FLOOR);
+
+        // `-connect=` is the same trap as regtest: it suppresses DNS and fixed
+        // seeds, so the node can never hold more peers than were named and a
+        // stock floor of 3 would stand in `getblockchaininfo.warnings` forever.
+        assert_eq!(defaults::peer_floor_for(Network::Bitcoin, 1), 1);
+        assert_eq!(defaults::peer_floor_for(Network::Signet, 2), 2);
+        // Capped, not mirrored — past the stock floor the ordinary threshold
+        // governs, so a node wired to eight peers is not held to needing eight.
+        assert_eq!(defaults::peer_floor_for(Network::Bitcoin, 8), defaults::PEER_FLOOR);
+        // Regtest stays off; the network already answered this.
+        assert_eq!(defaults::peer_floor_for(Network::Regtest, 1), 0);
     }
 
     /// Depth 3 is an incident on mainnet and an ordinary Tuesday on a test

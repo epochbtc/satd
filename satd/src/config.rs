@@ -2038,6 +2038,16 @@ impl Config {
             connect = file_get_all("connect");
         }
 
+        // Computed here rather than inline in the struct below, because the
+        // default reads `connect`, which the struct literal has already moved
+        // by the time it reaches the `alert_peer_floor` field.
+        let alert_peer_floor = cli
+            .alert_peer_floor
+            .or_else(|| file_get("alertpeerfloor").and_then(|v| v.parse().ok()))
+            .unwrap_or_else(|| {
+                node::health::defaults::peer_floor_for(network, connect.len())
+            });
+
         let assumevalid = cli.assumevalid.or_else(|| file_get("assumevalid"));
 
         let assumevalidage = cli
@@ -3274,10 +3284,7 @@ impl Config {
                 .alert_mempool_full_pct
                 .or_else(|| file_get("alertmempoolfullpct").and_then(|v| v.parse().ok()))
                 .unwrap_or(node::health::defaults::MEMPOOL_FULL_PCT),
-            alert_peer_floor: cli
-                .alert_peer_floor
-                .or_else(|| file_get("alertpeerfloor").and_then(|v| v.parse().ok()))
-                .unwrap_or(node::health::defaults::peer_floor_for(network)),
+            alert_peer_floor,
             alert_reorg_depth: cli
                 .alert_reorg_depth
                 .or_else(|| file_get("alertreorgdepth").and_then(|v| v.parse().ok()))
@@ -6913,6 +6920,77 @@ rpcport=8332
         assert_eq!(cfg.alert_mempool_full_pct, 75);
         assert_eq!(cfg.alert_peer_floor, 0, "0 must disable, not fall back");
         assert_eq!(cfg.alert_reorg_depth, 6);
+    }
+
+    /// `-connect=` pins the node to exactly the peers named and turns off both
+    /// DNS seeding and the fixed seeds, so the stock floor of 3 would raise a
+    /// warning that nothing on the node could ever clear — and it would land in
+    /// `getblockchaininfo.warnings`, which wallet software renders to end users.
+    /// The declared peer count is the floor.
+    #[test]
+    fn the_peer_floor_default_follows_the_connect_list() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("satd-alert-connect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let with = |args: &[&str]| {
+            let mut argv = vec!["satd", "--datadir", dir.to_str().unwrap()];
+            argv.extend_from_slice(args);
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap()
+        };
+
+        // One trusted upstream: a floor of 1 is the most this node can ever
+        // satisfy, and it still alerts if that peer goes away.
+        assert_eq!(with(&["--connect", "10.0.0.5:8333"]).alert_peer_floor, 1);
+        assert_eq!(
+            with(&["--connect", "10.0.0.5:8333", "--connect", "10.0.0.6:8333"]).alert_peer_floor,
+            2,
+        );
+
+        // Capped, not merely mirrored: past the stock floor the ordinary
+        // threshold governs, so a node wired to eight peers is not held to
+        // needing all eight.
+        let many: Vec<&str> = vec![
+            "--connect", "10.0.0.1:8333", "--connect", "10.0.0.2:8333", "--connect",
+            "10.0.0.3:8333", "--connect", "10.0.0.4:8333",
+        ];
+        assert_eq!(with(&many).alert_peer_floor, 3, "the cap is the stock floor");
+
+        // An explicit value still wins over the derived default, in both
+        // directions.
+        assert_eq!(
+            with(&["--connect", "10.0.0.5:8333", "--alertpeerfloor", "0"]).alert_peer_floor,
+            0,
+            "explicit 0 disables even with -connect set",
+        );
+        assert_eq!(
+            with(&["--connect", "10.0.0.5:8333", "--alertpeerfloor", "5"]).alert_peer_floor,
+            5,
+        );
+
+        // Regtest stays off regardless: -connect there is routine, and the
+        // network default already answered this question.
+        assert_eq!(
+            with(&["--regtest", "--connect", "10.0.0.5:8333"]).alert_peer_floor,
+            0,
+        );
+
+        // The config file is the same path — this is where a -connect node's
+        // settings actually live.
+        let conf = dir.join("connect-floor.conf");
+        std::fs::write(&conf, "connect=10.0.0.5:8333\nconnect=10.0.0.6:8333\n").unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                dir.to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.connect.len(), 2, "the fixture must actually take effect");
+        assert_eq!(cfg.alert_peer_floor, 2, "connect= from bitcoin.conf counts too");
     }
 
     #[test]

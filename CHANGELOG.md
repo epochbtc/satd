@@ -142,7 +142,8 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   where multi-block reorgs are routine that would wedge
   `getblockchaininfo.warnings` and the TUI modal permanently. Five new hot-reloadable thresholds
   (`alerttipstallseconds=3600`, `alertdiskfreemb=10240`,
-  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest —
+  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest, and capped by
+  the number of `-connect=` peers when that is set —
   `alertreorgdepth=3` — `10` on test networks, `0` on regtest); `0` disables a
   detector. `deep_reorg` depth, fork
   height and new tip are read from the durable reorg log, so they are exact
