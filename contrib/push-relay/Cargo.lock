@@ -1029,6 +1029,8 @@ dependencies = [
  "axum",
  "hex",
  "hmac",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "reqwest",
  "serde",

@@ -57,9 +57,28 @@ const DEDUP_WINDOW: usize = 4096;
 /// who swaps `Bytes` for a streaming extractor silently loses the implicit one.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Whole-request deadline, headers included. Without it, `POST /hook` followed
-/// by one header byte per minute holds a connection and its task forever.
+/// Deadline on the request once axum is handling it — i.e. from the moment the
+/// head has been parsed. Bounds a slow or stalled *body*, and the handler.
+///
+/// It does NOT cover the header phase: `tower_http`'s layer wraps the axum
+/// service, and hyper only invokes that service after it has parsed the request
+/// head. See [`HEADER_READ_TIMEOUT`], which is the half that does.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Deadline for a connection to finish sending its request headers.
+///
+/// This is the slowloris bound, and it has to live at the hyper layer rather
+/// than in a tower layer. A peer that opens a connection and dribbles one
+/// header byte per minute never completes the head, so hyper never calls the
+/// service — meaning neither `REQUEST_TIMEOUT` nor
+/// [`MAX_CONCURRENT_REQUESTS`] (also a service-level layer) ever applies. N such
+/// connections consume N tasks and N file descriptors indefinitely, and the
+/// process runs out of both. Then satd's real deliveries are refused and alerts
+/// stop arriving — silently, since the node acknowledges nothing it could not
+/// send.
+///
+/// Body-phase slowloris was already covered; this is the phase that was not.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Concurrent in-flight requests. satd delivers serially per hook, so even a
 /// dozen hooks never approach this; it exists to bound what an unauthenticated
@@ -127,9 +146,12 @@ async fn main() -> anyhow::Result<()> {
         min_severity = %cfg.min_severity,
         "satd push relay listening on /hook",
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Hand-rolled accept loop rather than `axum::serve`, for one reason:
+    // `axum::serve` exposes no way to set hyper's header-read timeout, and that
+    // is the only place the header phase can be bounded (see
+    // `HEADER_READ_TIMEOUT`). Everything else — graceful shutdown, per-connection
+    // tasks — is what `axum::serve` would have done.
+    serve_with_header_timeout(listener, app, HEADER_READ_TIMEOUT, shutdown_signal()).await?;
 
     // `with_graceful_shutdown` waits for in-flight *requests*, and a push is
     // deliberately not one — it is acknowledged first and delivered on a
@@ -156,6 +178,69 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    Ok(())
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, with a bound on how long
+/// a connection may take to send its request headers.
+///
+/// Equivalent to `axum::serve(listener, app).with_graceful_shutdown(shutdown)`
+/// except for `http1().header_read_timeout(..)`, which `axum::serve` does not
+/// expose and which is the only defence against a header-phase slowloris.
+async fn serve_with_header_timeout(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_timeout: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .header_read_timeout(header_timeout)
+        // Apple and Google speak to us over HTTP/1.1 here; satd does too. Keep
+        // h2 available anyway so the relay is usable behind a proxy that
+        // upgrades, and bound its header phase the same way.
+        .timer(hyper_util::rt::TokioTimer::new());
+    let builder = std::sync::Arc::new(builder);
+
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                // A per-connection accept error (fd exhaustion, a peer that
+                // vanished mid-handshake) must not take the listener down.
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    continue;
+                }
+            },
+            _ = shutdown.as_mut() => break,
+        };
+
+        let svc = app.clone();
+        let builder = builder.clone();
+        let watcher = graceful.watcher();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req| {
+                use tower::ServiceExt as _;
+                svc.clone().oneshot(req)
+            });
+            let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), svc);
+            if let Err(e) = watcher.watch(conn).await {
+                tracing::debug!(%peer, error = %e, "connection closed with an error");
+            }
+        });
+    }
+
+    // Same bound the push drain uses: do not let a stuck connection hold
+    // shutdown open past what systemd will wait for.
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, graceful.shutdown()).await;
     Ok(())
 }
 
@@ -283,4 +368,95 @@ async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         }
     });
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A peer that opens a connection and never finishes its request headers
+    /// must be dropped.
+    ///
+    /// This is the case neither `REQUEST_TIMEOUT` nor `MAX_CONCURRENT_REQUESTS`
+    /// can reach: both are tower layers wrapping the axum service, and hyper
+    /// only invokes that service once the head is parsed. So a dribbled header
+    /// holds a task and a file descriptor while passing through no layer at
+    /// all, and enough of them exhaust both — at which point satd's real
+    /// deliveries are refused and alerts stop, with the node none the wiser
+    /// because it acknowledged nothing it could not send.
+    #[tokio::test]
+    async fn a_connection_that_never_finishes_its_headers_is_dropped() {
+        let app = Router::new().route("/hook", post(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(serve_with_header_timeout(
+            listener,
+            app,
+            std::time::Duration::from_millis(200),
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // A request line and one header, deliberately never terminated by the
+        // blank line that ends the head.
+        sock.write_all(b"POST /hook HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+
+        // The server must hang up on its own. Read until EOF; if the deadline
+        // is not enforced this blocks and the outer timeout fails the test.
+        let mut buf = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sock.read_to_end(&mut buf),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the server kept a half-sent request open past the header deadline",
+        );
+
+        let _ = stop_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
+
+    /// The mirror: a complete request is served normally, so the deadline is
+    /// not just closing everything.
+    #[tokio::test]
+    async fn a_complete_request_is_served() {
+        let app = Router::new().route("/hook", post(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(serve_with_header_timeout(
+            listener,
+            app,
+            std::time::Duration::from_millis(200),
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"POST /hook HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 15];
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut buf))
+            .await
+            .expect("a complete request must be answered")
+            .expect("read the status line");
+        assert!(
+            String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200"),
+            "got: {}",
+            String::from_utf8_lossy(&buf),
+        );
+
+        let _ = stop_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
 }

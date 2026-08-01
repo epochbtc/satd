@@ -17,7 +17,12 @@ axum = "0.8"
 # own, so without these a single unauthenticated peer can hold connections open
 # indefinitely (slowloris) or park the per-connection body buffer on each of
 # them — all of it before a byte of HMAC is computed.
-tower = { version = "0.5", features = ["limit"] }
+tower = { version = "0.5", features = ["limit", "util"] }
+# Direct hyper access: `axum::serve` exposes no header-read timeout, which is
+# the only place a header-phase slowloris can be bounded (a tower layer sees a
+# request only after hyper has parsed its head).
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # `http2` is NOT implied by `json` or `rustls-tls`, and `default-features =

@@ -41,6 +41,20 @@ What *is* worth copying verbatim is the receive path in `src/main.rs`:
    node), but if you need better, do not simply move the ACK after the push —
    that trades the loss for head-of-line blocking on the whole hook. Persist an
    outbox before acknowledging and retry from it.
+4. **Bound the header phase at the hyper layer, not in a tower layer.** This is
+   the one piece of hardening that cannot be a `Layer`, and the easy mistake is
+   to assume `tower_http`'s `TimeoutLayer` covers it. It does not: hyper invokes
+   the service only after it has parsed the request head, so a peer that opens a
+   connection and dribbles one header byte per minute never reaches the timeout
+   layer, the body limit, or the concurrency limit. It just holds a task and a
+   file descriptor. Enough of them exhaust both, satd's real deliveries start
+   being refused, and the alerts you built this for stop arriving — quietly,
+   because the node never got a response it could retry.
+
+   `axum::serve` exposes no knob for this, which is why `serve_with_header_timeout`
+   runs the accept loop by hand over `hyper_util`'s builder and sets
+   `http1().header_read_timeout(..)`. Everything else it does is what
+   `axum::serve` would have.
 
 ## Run it
 
