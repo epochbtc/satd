@@ -227,10 +227,24 @@ Any `2xx` acknowledges. The response body is ignored.
 | `3xx` | **Not** retried and **not followed**: counted, logged, and skipped. |
 | Any other `4xx` | **Not** retried: counted, logged, and skipped. |
 
-Retries are 1 s doubling to a 300 s ceiling, jittered, and continue
-indefinitely. Delivery is **serial and in-order per hook** — one request in
-flight at a time — so a receiver observes events in the order the node produced
-them, and a retry is never overtaken by the event behind it.
+Retries are 1 s doubling to a 300 s ceiling, jittered, and are **abandoned once
+the delivery ages past the freshness window it was signed with**
+(`MAX_TIMESTAMP_SKEW_SECS`, 600 s) — in practice around the tenth or eleventh
+attempt. Retrying past that point is pointless: §4 requires the receiver to
+reject anything outside the window, so a delivery that can no longer pass that
+check cannot be accepted however many times it is sent.
+
+The operational consequence is worth stating plainly: **a receiver unreachable
+for more than ~10 minutes loses the events raised during the outage.** A relay
+redeploy or a slow restart is long enough. Standing health conditions recover on
+their own, because the detectors re-evaluate and re-raise them (§6), but chain
+and mempool events do not — they are gone. Alert on
+`satd_alertwebhook_dropped_total` if that matters, and use the Streaming
+Consumption API if you need a guarantee rather than best effort.
+
+Delivery is **serial and in-order per hook** — one request in flight at a time —
+so a receiver observes events in the order the node produced them, and a retry is
+never overtaken by the event behind it.
 
 Non-retryable `4xx` is a deliberate asymmetry: a receiver answering `404`
 forever would otherwise pin the head of the queue and convert every later event
@@ -373,9 +387,11 @@ secrets, but signed-then-cleartext is still a footgun.
 satd verifies server certificates with rustls against the **bundled Mozilla root
 set** (webpki-roots), *not* the operating system trust store. A receiver whose
 certificate chains to a private or corporate CA installed system-wide will
-therefore fail verification and be retried forever. Terminate such a receiver
-behind a publicly-trusted certificate, or put a local reverse proxy in front of
-it and point the hook at loopback. No client certificate is presented.
+therefore fail verification, and every delivery to it will be retried until it
+ages out of the freshness window and is dropped — so the hook is effectively
+dark, not merely delayed. Terminate such a receiver behind a publicly-trusted
+certificate, or put a local reverse proxy in front of it and point the hook at
+loopback. No client certificate is presented.
 
 ## 8. Non-goals
 
