@@ -124,6 +124,30 @@ pub mod defaults {
     /// deliberate: a stalled node is worth a look, and an operator who finds it
     /// noisy raises the value (the manual documents the trade).
     pub const TIP_STALL_SECS: u64 = 3_600;
+
+    /// The `tip_stall` default for `network`.
+    ///
+    /// Disabled on regtest, for the same reason as the peer floor and the reorg
+    /// depth: regtest blocks exist only when someone calls
+    /// `generatetoaddress`, so an idle chain is its resting state and not a
+    /// stall. `last_connect` is seeded at detector start and advanced only by
+    /// `BlockConnected`, so a developer's node left running for an hour while
+    /// they write code — or a harness that mines a fixture and then sits —
+    /// raises a *critical* alert. That pins `getwarnings`, holds `has_errors()`
+    /// true, and puts up the TUI's blocking modal, on a chain that is behaving
+    /// exactly as designed.
+    ///
+    /// Every other network keeps the hour. The spurious-raise rate on mainnet
+    /// is a deliberate trade documented on [`TIP_STALL_SECS`], and a test
+    /// network that goes an hour without a block is worth reporting even though
+    /// its hashrate is thin — unlike a reorg a few blocks deep, a stall there is
+    /// not an ordinary property of the network.
+    pub fn tip_stall_for(network: bitcoin::Network) -> u64 {
+        match network {
+            bitcoin::Network::Regtest => 0,
+            _ => TIP_STALL_SECS,
+        }
+    }
     /// 10 GiB. Enough headroom to notice before a mainnet node wedges mid-block
     /// (the 2026-05-13 dogfood incident was a silent disk-fill).
     pub const DISK_FREE_MB: u64 = 10_240;
@@ -1358,6 +1382,21 @@ mod tests {
         assert_eq!(t.mempool_full_pct(), 90);
         assert_eq!(t.peer_floor(), 3);
         assert_eq!(t.reorg_depth(), 3);
+    }
+
+    /// Regtest blocks exist only when a test mines them, so an idle chain is
+    /// its resting state — not a stall worth a critical alert that pins
+    /// `getwarnings` and the TUI modal.
+    #[test]
+    fn tip_stall_default_is_disabled_only_on_regtest() {
+        use bitcoin::Network;
+        assert_eq!(defaults::tip_stall_for(Network::Regtest), 0);
+        // A stall is not an ordinary property of a thin-hashrate chain the way
+        // a shallow reorg is, so unlike `reorg_depth_for` the test networks are
+        // not relaxed — they are simply expected to make blocks.
+        assert_eq!(defaults::tip_stall_for(Network::Bitcoin), defaults::TIP_STALL_SECS);
+        assert_eq!(defaults::tip_stall_for(Network::Signet), defaults::TIP_STALL_SECS);
+        assert_eq!(defaults::tip_stall_for(Network::Testnet4), defaults::TIP_STALL_SECS);
     }
 
     #[test]

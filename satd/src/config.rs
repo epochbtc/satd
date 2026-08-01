@@ -3275,7 +3275,7 @@ impl Config {
             alert_tip_stall_seconds: cli
                 .alert_tip_stall_seconds
                 .or_else(|| file_get("alerttipstallseconds").and_then(|v| v.parse().ok()))
-                .unwrap_or(node::health::defaults::TIP_STALL_SECS),
+                .unwrap_or_else(|| node::health::defaults::tip_stall_for(network)),
             alert_disk_free_mb: cli
                 .alert_disk_free_mb
                 .or_else(|| file_get("alertdiskfreemb").and_then(|v| v.parse().ok()))
@@ -6864,23 +6864,25 @@ rpcport=8332
             CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert_eq!(cfg.alert_tip_stall_seconds, 3_600);
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
         assert_eq!(cfg.alert_mempool_full_pct, 90);
-        // Two defaults are network-dependent, both because the alert would
+        // Three defaults are network-dependent, all because the alert would
         // otherwise fire on the network behaving exactly as designed.
         //
-        // A regtest node normally runs with no peers at all, and reorgs on
-        // purpose and constantly — competing-chain and `invalidateblock` tests
-        // are the point of the harness.
+        // A regtest node normally runs with no peers at all, reorgs on purpose
+        // and constantly — competing-chain and `invalidateblock` tests are the
+        // point of the harness — and only has blocks when a test mines them, so
+        // an idle chain is its resting state rather than a stall.
+        assert_eq!(cfg.alert_tip_stall_seconds, 0, "regtest only has blocks on demand");
         assert_eq!(cfg.alert_peer_floor, 0, "regtest defaults the peer floor off");
         assert_eq!(cfg.alert_reorg_depth, 0, "regtest reorgs deliberately");
 
-        // ...both armed where the condition really does mean something is
+        // ...all armed where the condition really does mean something is
         // wrong.
         let cli =
             CliArgs::try_parse_from(["satd", "--datadir", dir.to_str().unwrap()]).unwrap();
         let cfg_mainnet = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg_mainnet.alert_tip_stall_seconds, 3_600, "mainnet keeps the hour");
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
         assert_eq!(cfg_mainnet.alert_reorg_depth, 3, "3 deep is an incident on mainnet");
 
@@ -6894,6 +6896,9 @@ rpcport=8332
         let cfg_signet = Config::from_cli(cli).unwrap();
         assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
         assert_eq!(cfg_signet.alert_peer_floor, 3, "but signet is a real network with peers");
+        // A stall is not an ordinary property of a thin-hashrate chain the way
+        // a shallow reorg is, so the hour holds on the test networks.
+        assert_eq!(cfg_signet.alert_tip_stall_seconds, 3_600, "and it should still make blocks");
 
         // Explicit CLI values parse through, including 0 (= detector off),
         // which must not be swallowed by the `unwrap_or(default)`.
