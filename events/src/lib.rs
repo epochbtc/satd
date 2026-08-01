@@ -43,3 +43,7 @@ pub mod descriptor;
 // per-remove release) — shared by the gRPC and WS watch surfaces.
 #[cfg(any(feature = "grpc", feature = "ws"))]
 pub(crate) mod watchset;
+
+// Category-level authorization, shared by the gRPC and WS/SSE carriers.
+#[cfg(any(feature = "grpc", feature = "ws"))]
+pub(crate) mod catauth;

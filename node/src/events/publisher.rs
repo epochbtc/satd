@@ -26,6 +26,7 @@ use crate::mempool::events::MempoolEvent;
 use super::envelope::{
     BlockTweaks, Cursor, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody, SpTweakEntry,
 };
+use super::status::StatusEvent;
 
 /// Read handle for the mempool's admission-cached silent-payment tweaks, keyed
 /// by txid. Implemented by [`crate::mempool::pool::Mempool`]; the mempool bridge
@@ -228,6 +229,22 @@ impl EventPublisher {
         }
     }
 
+    /// Publish a node-health [`StatusEvent`] onto the envelope bus.
+    ///
+    /// The only publicly-callable emitter on the publisher: health conditions
+    /// are detected by a task outside this module (unlike mempool/chain events,
+    /// which are bridged from the internal broadcasts). Best-effort like every
+    /// other publish — with no subscribers the envelope is dropped, which is the
+    /// steady state on a node whose operator configured neither a `status`
+    /// subscriber nor a webhook.
+    ///
+    /// Status envelopes carry no durable cursor and are kept out of the replay
+    /// ring; see [`status`](super::status) for why re-evaluation, not replay, is
+    /// what makes them at-least-once across a restart.
+    pub fn publish_status(&self, event: StatusEvent) {
+        self.publish(NodeEventBody::Status(event));
+    }
+
     /// Number of envelopes published since startup. Useful for tests.
     pub fn published(&self) -> u64 {
         self.seq.load(Ordering::Relaxed)
@@ -285,9 +302,15 @@ impl EventPublisher {
         // exists to retain. `MempoolTweak` is excluded too: it is ephemeral and
         // best-effort (no durable cursor), so it is never replayed — a client
         // that missed an admission catches the payment at confirmation.
+        // `Status` is excluded for the same reason: health events are not
+        // replayable at all (detectors re-raise standing conditions after a
+        // restart instead), so retaining them would only evict the mempool
+        // transitions the ring exists for.
         if !matches!(
             env.body,
-            NodeEventBody::BlockTweaks(_) | NodeEventBody::MempoolTweak(_)
+            NodeEventBody::BlockTweaks(_)
+                | NodeEventBody::MempoolTweak(_)
+                | NodeEventBody::Status(_)
         ) {
             let mut ring = self
                 .replay_ring
@@ -588,6 +611,39 @@ mod tests {
             fee_rate_sat_per_kvb: 400,
             time: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn status_events_stay_out_of_the_replay_ring() {
+        use crate::events::status::{StatusEvent, StatusKind};
+
+        // Ring big enough for the Enter plus every status event that follows —
+        // so if status events were retained they would still fit, and the only
+        // thing this can detect is the exclusion itself. Then a second pass with
+        // a ring of 1 proves they cannot evict a retained mempool transition.
+        for cap in [8usize, 1] {
+            let publisher = EventPublisher::new(edge(), cap);
+            publisher.publish(NodeEventBody::Mempool(enter_event(1)));
+            for _ in 0..4 {
+                publisher.publish_status(StatusEvent::raised(StatusKind::DiskLow, "low"));
+            }
+            assert_eq!(
+                publisher.replay_mempool_since(0).len(),
+                1,
+                "the Enter must survive a burst of status events (ring cap {cap})",
+            );
+        }
+    }
+
+    #[test]
+    fn published_status_carries_no_cursor() {
+        use crate::events::status::{StatusEvent, StatusKind};
+        let publisher = EventPublisher::new(edge(), 8);
+        let mut rx = publisher.subscribe();
+        publisher.publish_status(StatusEvent::edge(StatusKind::IbdComplete, "synced"));
+        let env = rx.try_recv().expect("status envelope");
+        assert!(env.cursor.is_none(), "status must not anchor a resume position");
+        assert!(matches!(env.body, NodeEventBody::Status(_)));
     }
 
     fn block_event(byte: u8, height: u32) -> ChainEvent {

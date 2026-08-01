@@ -126,6 +126,7 @@ message NodeEvent {
     BlockTweaks    block_tweaks        = 28;  // BIP 352 per-block tweak data (§7.7)
     SilentPaymentMatched silent_payment_matched = 29;  // BIP 352 scan-key watch match (§7.7)
     MempoolTweak   mempool_tweak       = 30;  // BIP 352 mempool-time tweak, Tier 1.5 (§7.7)
+    StatusEvent    status              = 31;  // node-health condition (§7.8)
   }
 }
 ```
@@ -912,6 +913,75 @@ every reconnect — the D3 custody model) register `SilentPaymentTarget`s and
 deliver `Event::SilentPaymentMatched`; `examples/sp_wallet.rs` re-derives each
 match's spending key offline from `tweak` + `k`. The scan-key helpers need the
 crate's default `bitcoin` feature (to derive the removal identity `b_scan·G`).
+
+### 7.8 Node-health status events
+
+Every other body on this surface describes the *chain* or the *mempool*. A
+`StatusEvent` describes the **node itself** — a stalled tip, a filling disk, a
+peer-starved daemon — so an operator can drive alerting off the same stream they
+already consume, instead of polling `getblockchaininfo` on a timer.
+
+The `status` category is **bit 16**. Like `tweaks`, it is **not** part of the
+`categories = 0` ("all") default: a subscriber written against an older node
+never begins receiving a body it has no parser for. Unlike `tweaks` it has no
+index prerequisite.
+
+**Authorization: `status` requires `rpc:read` in addition to
+`stream:subscribe`.** Every other category describes public chain data, which is
+what `stream:subscribe` exists to hand out. `StatusEvent` describes the host —
+free bytes on the node's volume, connected peers split inbound/outbound, the
+mempool byte cap with its occupancy and `mempoolminfee`, tip height, IBD state,
+reorg depth and fork heights. That is the content of `getblockchaininfo`,
+`getpeerinfo`, `getmempoolinfo` and `getwarnings`, and `satd-auth` separates the
+two capabilities precisely so an operator can issue a streaming token to a
+wallet backend or tenant *without* granting node read RPC. A token holding only
+`stream:subscribe` is refused with `PERMISSION_DENIED` (gRPC) or `403` (WS/SSE)
+when it requests bit 16, and a mid-stream `SetCategories` / `SetWatchSet` from
+such a token has the bit stripped. This applies only where `-authfile` is
+configured: with no token store the node behaves exactly as before, and the
+operator principal (cookie / `rpcuser` / `rpcauth`) holds every capability.
+
+It is served on the carriers that have a per-subscriber category mask to opt in
+with: gRPC `Subscribe`, gRPC `Watch`, WS, and SSE. It is **not** emitted on the
+ZMQ `nodeevent` topic. ZMQ has no per-subscriber mask — only an all-or-nothing
+topic toggle — so honoring "explicit-only" there is impossible: emitting status
+would hand a new body type to every already-deployed `nodeevent` consumer on
+upgrade, and their only escape would be `eventszmqnodeevent=0`, which silences
+every other envelope too. Operators consuming health over ZMQ should use the
+`alertfile` webhook dispatcher or `-alertnotify` instead.
+
+```proto
+message StatusEvent {
+  StatusKind     kind     = 1;  // ibd_complete | tip_stall | disk_low |
+                                // mempool_congested | peer_floor | deep_reorg
+  StatusState    state    = 2;  // raised | cleared | edge
+  StatusSeverity severity = 3;  // info | warning | critical
+  string message = 4;                // human-readable; log it, do not parse it
+  map<string, string> details = 5;   // kind-specific fields (see below)
+}
+```
+
+**Level-triggered.** A standing condition emits exactly one `raised` on entry and
+exactly one `cleared` on recovery, with hysteresis between the two thresholds so
+a value hovering at the line does not flap. Observations with no recovered state
+(IBD finishing, a deep reorg landing) are `edge` and never produce a `cleared`.
+
+**Not replayable.** A status event carries no `cursor` and is excluded from the
+replay ring, so a `from_cursor` resume never yields one. Durability comes from
+re-evaluation instead: the detectors re-examine every condition at startup and
+re-raise the ones still standing, which is what makes health alerting
+at-least-once across a restart. A condition that both raised and fully cleared
+while a consumer was away is stale by definition and is not reconstructed.
+
+**Additive by construction.** `details` is a string map and `StatusKind` is an
+open enum: new kinds and new detail keys ship without a schema bump (§4). A
+consumer must tolerate an unrecognized `kind` — `message` and `severity` remain
+meaningful — and must not require any particular `details` key to be present.
+
+The same detections also drive the node's warnings registry, so `getwarnings`,
+the Core-compatible `-alertnotify` hook, and this stream can never disagree about
+node state. Operator-facing configuration (detector thresholds, the `alertfile`
+webhook dispatcher) is documented in the Operator Manual, not here.
 
 ## 8. Reorg events
 
