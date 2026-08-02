@@ -3432,6 +3432,47 @@ impl ChainState {
         Ok(())
     }
 
+    /// The bytes read at `flat_pos` must be the block the plan selected.
+    ///
+    /// `flat_pos` comes from the block index, and a damaged block index is the
+    /// thing `-reindex-chainstate` is run to repair — so the position can point
+    /// at a different, perfectly well-formed record. Nothing downstream would
+    /// notice. `connect_block` derives everything from the block it is handed
+    /// and writes *that* block's hash, height row and UTXO delta, while the
+    /// caller sets the in-memory tip to the *plan's* hash. The next
+    /// `require_extends_tip` compares against that in-memory tip and passes, so
+    /// the replay runs to completion with the persisted chainstate and the
+    /// in-memory tip naming different blocks.
+    ///
+    /// `require_extends_tip` does not subsume this. On the prefetched path it
+    /// sees the real block's header, so the wrong record must at least be a
+    /// child of the current tip — but a stale sibling of the planned block is
+    /// exactly that, and it is the shape corruption actually takes here. On the
+    /// direct path it sees the *index's* header for the planned hash, which
+    /// extends the chain by construction, so it constrains nothing at all.
+    fn require_planned_block(
+        &self,
+        height: u32,
+        planned: BlockHash,
+        block: &Block,
+        flat_pos: FlatFilePos,
+    ) -> Result<(), ChainError> {
+        let found = block.block_hash();
+        if found != planned {
+            tracing::error!(
+                height,
+                expected = %planned,
+                found = %found,
+                file_number = flat_pos.file_number,
+                data_pos = flat_pos.data_pos,
+                "reindex: the block index points at the wrong record; the index is corrupt. \
+                 Run a full --reindex to rebuild it from the block files."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
+        Ok(())
+    }
+
     /// Connect a prefetched, pre-processed block during reindex. Reuses the
     /// prefetcher's deserialized block, precomputed txids, and (in
     /// assumevalid mode) speculatively pre-verified scripts. Does NOT check
@@ -3440,6 +3481,12 @@ impl ChainState {
         &self,
         pre: crate::chain::prefetch::PreprocessedBlock,
     ) -> Result<(), ChainError> {
+        // The prefetch worker labels the block with the hash the plan asked
+        // for, not one derived from the bytes it read (see
+        // `prefetch::preprocess_block`), so this is the only place the two can
+        // be reconciled — and this is the path that carries the replay. The
+        // direct read below is just the prefetch-miss fallback.
+        self.require_planned_block(pre.height, pre.hash, &pre.block, pre.flat_pos)?;
         self.require_extends_tip(&pre.block.header, pre.height)?;
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
@@ -3498,29 +3545,7 @@ impl ChainState {
             );
             ChainError::FlatFile("cannot read block during reindex".into())
         })?;
-        // The bytes at `flat_pos` must be the block the plan selected.
-        //
-        // `flat_pos` comes from the block index, and a damaged block index is
-        // the thing `-reindex-chainstate` is run to repair — so the position
-        // can point at a different, perfectly well-formed record. Nothing
-        // downstream would notice: `connect_block` derives everything from the
-        // block it is handed and writes its hash, height row and UTXO delta,
-        // while the caller sets the in-memory tip to the *plan's* hash. The
-        // next `require_extends_tip` compares against that in-memory tip and
-        // passes, so the replay runs to completion with the persisted tip and
-        // the in-memory tip naming different blocks.
-        if block.block_hash() != hash {
-            tracing::error!(
-                height,
-                expected = %hash,
-                found = %block.block_hash(),
-                file_number = flat_pos.file_number,
-                data_pos = flat_pos.data_pos,
-                "reindex: the block index points at the wrong record; the index is corrupt. \
-                 Run a full --reindex to rebuild it from the block files."
-            );
-            return Err(ChainError::BadPrevBlock);
-        }
+        self.require_planned_block(height, hash, &block, flat_pos)?;
         let parent = self
             .store
             .get_block_index(&entry.header.prev_blockhash)
@@ -9796,6 +9821,98 @@ pub(crate) mod tests {
             cs.store.get_block_hash_by_height(real_height),
             Some(real_tip),
             "the replay must rewrite the polluted height entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block index whose `flat_pos` points at the wrong record must fail the
+    /// replay, on the path that actually carries it.
+    ///
+    /// The prefetch worker labels each block with the hash the *plan* asked for
+    /// while reading the bytes from the *index's* `flat_pos`, and never
+    /// reconciles the two. So a corrupt position yielded a `PreprocessedBlock`
+    /// claiming to be the planned block while holding a different one:
+    /// `connect_block` wrote that block's hash, height row and UTXO delta, and
+    /// the caller then set the in-memory tip to the plan's hash. Every later
+    /// `require_extends_tip` compares against the in-memory tip and passes, so
+    /// the replay ran to completion and reported success with the persisted
+    /// chainstate and the in-memory tip naming different blocks.
+    ///
+    /// `require_extends_tip` is not enough here: it sees the real block's
+    /// header on this path, so the wrong record must be a child of the current
+    /// tip — which a stale sibling of the planned block is, and that is the
+    /// shape the corruption takes.
+    ///
+    /// This calls the connect directly rather than driving a full reindex: the
+    /// prefetcher is a race between background workers and the connect cursor,
+    /// so a whole-replay fixture cannot guarantee the hit lands on this path
+    /// instead of the direct-read fallback.
+    #[test]
+    fn reindex_prefetched_connect_rejects_a_block_index_pointing_at_the_wrong_record() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // The planned block, and an equal-work sibling of it that is also on
+        // disk — the wrong-but-well-formed record a corrupt position lands on.
+        let planned = build_test_block(genesis_hash, 1, 1_705_000_001);
+        let planned_hash = cs.accept_block(&planned).expect("accept planned block");
+        let wrong = build_test_block(genesis_hash, 1, 1_705_000_999);
+        let wrong_hash = cs.accept_block(&wrong).expect("store sibling");
+        assert_ne!(planned_hash, wrong_hash, "fixture must produce two records");
+        assert_eq!(
+            wrong.header.prev_blockhash, genesis_hash,
+            "the wrong record must still extend the tip, or require_extends_tip \
+             would reject it and prove nothing"
+        );
+
+        cs.flush_coin_cache().expect("flush before clearing");
+        cs.store.flush().unwrap();
+        let entry = cs.store.get_block_index(&planned_hash).expect("planned entry");
+        let parent = cs.store.get_block_index(&genesis_hash).expect("genesis entry");
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis_hash;
+            tip.height = 0;
+        }
+
+        let flat_pos = FlatFilePos {
+            file_number: entry.file_number,
+            data_pos: entry.data_pos,
+        };
+        let pre = crate::chain::prefetch::PreprocessedBlock {
+            height: 1,
+            hash: planned_hash, // from the plan
+            txids: wrong.txdata.iter().map(|tx| tx.compute_txid()).collect(),
+            block: wrong.clone(), // from the corrupt flat_pos
+            entry,
+            parent,
+            flat_pos,
+            mtp: cs.get_median_time_past(1),
+            script_verified_txs: std::collections::HashSet::new(),
+        };
+
+        let err = cs
+            .reindex_connect_prefetched(pre)
+            .expect_err("a record that is not the planned block must not connect");
+        assert!(
+            matches!(err, ChainError::BadPrevBlock),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            cs.tip_hash(),
+            genesis_hash,
+            "the tip must not advance past a block the replay refused"
+        );
+        cs.flush_coin_cache().expect("flush after the refusal");
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: wrong.txdata[0].compute_txid(),
+                vout: 0,
+            })
+            .is_none(),
+            "the wrong record's coinbase reached the UTXO set"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
