@@ -283,6 +283,32 @@ impl FirehoseQuery {
     }
 }
 
+/// Refuse a handshake that asks for `status` without `rpc:read`.
+///
+/// Refused rather than quietly stripped: bit 16 is never in the `0` default, so
+/// asking for it is always deliberate, and a category that silently never
+/// arrives reads to a health dashboard as "nothing is wrong". See
+/// [`crate::catauth`] for why `rpc:read` is the capability that owns this data.
+#[allow(clippy::result_large_err)]
+fn require_status_capability(
+    mask: u32,
+    principal: Option<&satd_auth::Principal>,
+) -> Result<(), Response> {
+    if mask & node::events::CATEGORY_STATUS != 0 && !crate::catauth::may_receive_status(principal) {
+        debug!(
+            target: "events::ws",
+            status = 403,
+            "rejecting streamws connection: the status category requires rpc:read",
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the status category requires the rpc:read capability",
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 fn mask_from(categories: Option<u32>) -> u32 {
     // The WS/SSE firehose does not serve the tweaks category this release, so
     // the tweaks bit is stripped from EVERY mask, default or explicit:
@@ -295,6 +321,11 @@ fn mask_from(categories: Option<u32>) -> u32 {
     //     any gRPC client attaches, so without this strip the WS live filter
     //     would forward them (its replay already returns empty). Tier 1 tweak
     //     consumption is gRPC-only.
+    //
+    // The other explicit-only category, `status` (bit 16), IS served here: it is
+    // low-volume JSON with no index prerequisite, so a WS/SSE client that asks
+    // for it by bit gets it (and, being explicit-only, a `0`-subscriber still
+    // does not).
     match categories {
         None | Some(0) => node::events::ALL_CATEGORIES_DEFAULT,
         Some(c) => c & !node::events::CATEGORY_TWEAKS,
@@ -393,9 +424,10 @@ async fn sse_firehose(
     headers: HeaderMap,
     Query(q): Query<FirehoseQuery>,
 ) -> Response {
-    if let Err(resp) = authorize(&state, &headers) {
-        return resp;
-    }
+    let principal = match authorize(&state, &headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     // Admission control: hold a connection permit for the stream's lifetime.
     let Ok(permit) = state.conn_sem.clone().try_acquire_owned() else {
         return (
@@ -405,6 +437,9 @@ async fn sse_firehose(
             .into_response();
     };
     let mask = mask_from(q.categories);
+    if let Err(resp) = require_status_capability(mask, principal.as_ref()) {
+        return resp;
+    }
     // Subscribe to the live broadcast FIRST so nothing is missed between the
     // replay snapshot and the live tail (the snapshot→live handoff ordering).
     let rx = state.publisher.subscribe();
@@ -496,6 +531,9 @@ async fn ws_upgrade(
             .into_response();
     };
     let initial_mask = mask_from(q.categories);
+    if let Err(resp) = require_status_capability(initial_mask, principal.as_ref()) {
+        return resp;
+    }
     let cursor = q.cursor();
     // Bound a single inbound frame/message — control frames are tiny.
     let max_bytes = state.max_message_bytes;
@@ -1029,7 +1067,16 @@ fn apply_ws_control(
                     // category); strip the bit so a control update cannot opt this
                     // stream into shared-broadcast `BlockTweaks` and bypass the
                     // Subscribe path's index/completeness/dust-limit validation.
-                    category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
+                    // `status` goes the same way for a token without `rpc:read`,
+                    // so a control message is not a route around the handshake
+                    // gate that already refused it.
+                    category_mask.store(
+                        crate::catauth::strip_unauthorized(
+                            principal,
+                            mask & !node::events::CATEGORY_TWEAKS,
+                        ),
+                        Ordering::Relaxed,
+                    );
                 }
                 outcome
             }
@@ -1068,8 +1115,16 @@ fn apply_ws_control(
                 categories
             };
             // Strip the tweaks bit: WS/SSE never serves the firehose (see the
-            // SetWatchSet path above).
-            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
+            // SetWatchSet path above). `status` goes the same way for a token
+            // without `rpc:read` — the handshake already refused it, and a
+            // control message must not be a second door.
+            category_mask.store(
+                crate::catauth::strip_unauthorized(
+                    principal,
+                    mask & !node::events::CATEGORY_TWEAKS,
+                ),
+                Ordering::Relaxed,
+            );
         }
         WsControl::SetWatchOptions { include_raw_tx: want } => {
             // Store the encoder-side flag AND toggle the registry gate counter so
@@ -1547,6 +1602,20 @@ mod tests {
     }
 
     #[test]
+    fn status_is_served_on_ws_but_only_when_asked_for() {
+        // Unlike tweaks, the status category is NOT stripped from a WS mask:
+        // health events are low-volume JSON this surface can serve. It is still
+        // explicit-only, so the `0`/absent default excludes it.
+        assert_ne!(
+            mask_from(Some(node::events::CATEGORY_STATUS)) & node::events::CATEGORY_STATUS,
+            0,
+            "an explicit status request must survive the WS mask",
+        );
+        assert_eq!(mask_from(None) & node::events::CATEGORY_STATUS, 0);
+        assert_eq!(mask_from(Some(0)) & node::events::CATEGORY_STATUS, 0);
+    }
+
+    #[test]
     fn parses_scripthash_hex() {
         let hexstr = "ff".repeat(32);
         assert_eq!(parse_ws_scripthash(&hexstr), Some([0xff; 32]));
@@ -1635,6 +1704,75 @@ mod tests {
         // cap = 0 ⇒ unlimited: adds are never shed.
         apply_ws_control(&add(3), &handle, None, &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
         assert_eq!(ws.len(), 3, "cap 0 disables the per-connection limit");
+    }
+
+    /// The handshake gate. `status` carries host telemetry that `rpc:read`
+    /// owns everywhere else, so a `stream:subscribe`-only token — the exact
+    /// token an operator issues *to withhold* `getblockchaininfo` — is refused
+    /// rather than served, and rather than silently given an empty category.
+    #[test]
+    fn the_status_category_needs_rpc_read_at_the_handshake() {
+        use satd_auth::{Capability, CapabilitySet, Principal};
+        let stream_only = Principal::loopback(CapabilitySet::EMPTY.with(Capability::StreamSubscribe));
+        let with_read = Principal::loopback(
+            CapabilitySet::EMPTY
+                .with(Capability::StreamSubscribe)
+                .with(Capability::RpcRead),
+        );
+        let status = node::events::CATEGORY_STATUS;
+
+        assert!(require_status_capability(status, Some(&stream_only)).is_err());
+        assert!(require_status_capability(status, Some(&with_read)).is_ok());
+        // Mixed masks are refused too — the bit is what matters, not whether it
+        // was asked for alone.
+        assert!(
+            require_status_capability(status | node::events::CATEGORY_CHAIN, Some(&stream_only))
+                .is_err(),
+        );
+        // Everything else is untouched for the same token.
+        assert!(require_status_capability(node::events::CATEGORY_CHAIN, Some(&stream_only)).is_ok());
+        // The default mask does not contain status, so an ordinary subscriber
+        // is unaffected — this gate must not break `categories=0`.
+        assert!(
+            require_status_capability(mask_from(None), Some(&stream_only)).is_ok(),
+            "the default mask must stay reachable without rpc:read",
+        );
+        // Auth disabled entirely (Core-compatible default): unchanged.
+        assert!(require_status_capability(status, None).is_ok());
+    }
+
+    /// …and the mid-stream control path is not a second door around it.
+    #[test]
+    fn set_categories_cannot_add_status_without_rpc_read() {
+        use satd_auth::{Capability, CapabilitySet, Principal};
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, _rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let p = Principal::loopback(CapabilitySet::EMPTY.with(Capability::StreamSubscribe));
+        let mask = AtomicU32::new(node::events::CATEGORY_CHAIN);
+        let mut ws = WatchSet::default();
+
+        let ctrl = format!(
+            r#"{{"type":"set_categories","categories":{}}}"#,
+            node::events::CATEGORY_STATUS | node::events::CATEGORY_CHAIN,
+        );
+        apply_ws_control(&ctrl, &handle, Some(&p), &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
+        let got = mask.load(Ordering::Relaxed);
+        assert_eq!(got & node::events::CATEGORY_STATUS, 0, "status must not be added");
+        assert_ne!(got & node::events::CATEGORY_CHAIN, 0, "the rest of the update applies");
+
+        // With rpc:read the same message is honored, so the gate is the
+        // capability and not the code path.
+        let p2 = Principal::loopback(
+            CapabilitySet::EMPTY
+                .with(Capability::StreamSubscribe)
+                .with(Capability::RpcRead),
+        );
+        apply_ws_control(&ctrl, &handle, Some(&p2), &mask, &AtomicBool::new(false), &mut ws, 0, (8, 32));
+        assert_ne!(
+            mask.load(Ordering::Relaxed) & node::events::CATEGORY_STATUS,
+            0,
+            "rpc:read receives status",
+        );
     }
 
     #[test]

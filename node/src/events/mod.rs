@@ -16,6 +16,7 @@
 //!   the internal broadcasts into envelopes, drives a 1 Hz heartbeat,
 //!   and supervises sink tasks.
 //! - [`sink`] — `EventSink` trait, runtime helpers.
+//! - [`status`] — `StatusEvent` node-health conditions (`status` category).
 //! - [`schema`] — schema-version constant and evolution rules.
 
 pub mod envelope;
@@ -23,14 +24,16 @@ pub mod publisher;
 pub mod replay;
 pub mod schema;
 pub mod sink;
+pub mod status;
 pub mod watch;
 
 pub use envelope::{
     BlockTweaks, Cursor, CursorRejectReason, EdgeIdentity, EdgeStamp, NodeEvent, NodeEventBody,
     SetCursorOutcome, SpTaprootOutput, SpTweakEntry, ALL_CATEGORIES_DEFAULT, CATEGORY_CHAIN,
     CATEGORY_HEARTBEAT,
-    CATEGORY_MEMPOOL, CATEGORY_TWEAKS, EXPLICIT_ONLY_CATEGORIES, TWEAKS_TX_INDEX,
+    CATEGORY_MEMPOOL, CATEGORY_STATUS, CATEGORY_TWEAKS, EXPLICIT_ONLY_CATEGORIES, TWEAKS_TX_INDEX,
 };
+pub use status::{StatusEvent, StatusKind, StatusSeverity, StatusState};
 pub use publisher::{
     EventPublisher, MempoolTweakSource, MempoolTweakSubscriberGuard, TweakSubscriberGuard,
     ENVELOPE_BROADCAST_CAPACITY,

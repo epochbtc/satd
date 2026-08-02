@@ -14,6 +14,8 @@ use serde::{Serialize, Serializer};
 use crate::chain::events::ChainEvent;
 use crate::mempool::events::MempoolEvent;
 
+use super::status::StatusEvent;
+
 use super::schema::SCHEMA_VERSION;
 
 /// Filename inside `<datadir>` that holds the auto-generated UUIDv4 if
@@ -340,11 +342,16 @@ pub const CATEGORY_HEARTBEAT: u32 = 4;
 /// **not** part of the `categories = 0` default, so a pre-existing subscriber
 /// never begins receiving tweak volume after a node upgrade.
 pub const CATEGORY_TWEAKS: u32 = 8;
+/// Node-health conditions the daemon detects about itself ([`StatusEvent`]).
+/// Explicit-request only — **not** part of the `categories = 0` default, so a
+/// pre-existing subscriber never begins receiving a new event type it has no
+/// parser for after a node upgrade.
+pub const CATEGORY_STATUS: u32 = 16;
 
 /// Categories excluded from the `categories = 0` ("all") default: opt-in,
 /// high-volume, or custody-adjacent streams a legacy subscriber must not begin
-/// receiving after a node upgrade. Currently just [`CATEGORY_TWEAKS`].
-pub const EXPLICIT_ONLY_CATEGORIES: u32 = CATEGORY_TWEAKS;
+/// receiving after a node upgrade.
+pub const EXPLICIT_ONLY_CATEGORIES: u32 = CATEGORY_TWEAKS | CATEGORY_STATUS;
 
 /// The mask a `categories = 0` request expands to: every bit (forward-compat
 /// for rolling upgrades — a client may request a category a mixed-version
@@ -477,6 +484,13 @@ pub enum NodeEventBody {
     /// is excluded from the replay ring, so a `from_cursor` resume never yields
     /// one (missed admissions surface at confirmation via [`BlockTweaks`]).
     MempoolTweak(SpTweakEntry),
+    /// A node-health condition the daemon detected about itself (stalled tip,
+    /// low disk, peer starvation …); category bit [`CATEGORY_STATUS`].
+    /// Explicit-request only, like tweaks. Carries no durable cursor and is
+    /// excluded from the replay ring — durability comes from detectors
+    /// re-evaluating and re-raising standing conditions after a restart
+    /// (see [`status`](super::status)).
+    Status(StatusEvent),
     Heartbeat {
         /// Nanoseconds since the [`super::EventPublisher`] was
         /// constructed. Lets downstream consumers measure end-to-end
@@ -684,6 +698,7 @@ impl NodeEvent {
             NodeEventBody::Chain(_) => CATEGORY_CHAIN,
             NodeEventBody::BlockTweaks(_) => CATEGORY_TWEAKS,
             NodeEventBody::MempoolTweak(_) => CATEGORY_TWEAKS,
+            NodeEventBody::Status(_) => CATEGORY_STATUS,
             NodeEventBody::Heartbeat { .. } => CATEGORY_HEARTBEAT,
             // A lag notice is a control signal, not a content category: it
             // must reach every subscriber regardless of the category mask, so
@@ -868,6 +883,50 @@ mod tests {
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_MEMPOOL, 0);
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_CHAIN, 0);
         assert_ne!(ALL_CATEGORIES_DEFAULT & CATEGORY_HEARTBEAT, 0);
+    }
+
+    fn status_env() -> NodeEvent {
+        NodeEvent::new(
+            stamp(),
+            NodeEventBody::Status(
+                crate::events::status::StatusEvent::raised(
+                    crate::events::status::StatusKind::DiskLow,
+                    "free space below floor",
+                )
+                .with_detail("free_bytes", 1_234u64),
+            ),
+        )
+    }
+
+    #[test]
+    fn status_category_is_explicit_only() {
+        // Health events carry bit 16 and, like tweaks, are excluded from the
+        // `categories = 0` default: a subscriber written against an older node
+        // must never start receiving an event body it has no parser for.
+        assert_eq!(CATEGORY_STATUS, 16);
+        assert_eq!(status_env().category_bit(), CATEGORY_STATUS);
+        assert_eq!(
+            ALL_CATEGORIES_DEFAULT & CATEGORY_STATUS,
+            0,
+            "status must NOT be in the all-categories default",
+        );
+        assert_ne!(EXPLICIT_ONLY_CATEGORIES & CATEGORY_STATUS, 0);
+    }
+
+    #[test]
+    fn status_carries_no_durable_cursor() {
+        // Status events are not replayable: durability is by re-evaluation on
+        // restart, so they must never anchor a resume position.
+        assert!(status_env().body.derive_cursor(1, 42).is_none());
+    }
+
+    #[test]
+    fn status_serializes_flat_under_the_category_tag() {
+        let json = serde_json::to_string(&status_env().body).unwrap();
+        assert_eq!(
+            json,
+            r#"{"category":"status","kind":"disk_low","state":"raised","severity":"critical","message":"free space below floor","details":{"free_bytes":"1234"}}"#
+        );
     }
 
     fn tweak_entry_fixture() -> node_sp_index::TweakEntry {

@@ -377,7 +377,10 @@ impl WatchSetMirror {
 
         // Category filter (not a watch *item*, so it does not move the counts).
         // `None` and `Some(0)` both mean "all categories" — the wire spells "all"
-        // as `SetCategories { categories: 0 }` (both carriers map 0 → u32::MAX).
+        // as `SetCategories { categories: 0 }` (both carriers map 0 to the
+        // default mask — every category except the explicit-only ones, `tweaks`
+        // and `status`, so an older client never starts receiving a body it has
+        // no parser for).
         // Compare the *effective* masks, not the raw `Option`: a reload that
         // relaxes the filter (`Some(n)` → truth has no filter) must emit an
         // explicit `SetCategories { 0 }` reset, or the mirror would adopt "no

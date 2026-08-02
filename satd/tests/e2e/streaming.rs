@@ -44,10 +44,21 @@ fn mine_addr(seed: u8) -> String {
 /// readiness with `reqwest::blocking`, whose internal runtime panics if dropped
 /// on a tokio worker thread — so the (blocking) startup runs on a blocking
 /// task.
-async fn start_streaming_async(args: Vec<&'static str>) -> StreamingNode {
+pub(crate) async fn start_streaming_async(args: Vec<&'static str>) -> StreamingNode {
     tokio::task::spawn_blocking(move || StreamingNode::start(&args))
         .await
         .unwrap()
+}
+
+/// Like [`start_streaming_async`] but for arguments computed at runtime (a
+/// temp path, an allocated port), which cannot be `&'static str` literals.
+pub(crate) async fn start_streaming_owned(args: Vec<String>) -> StreamingNode {
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        StreamingNode::start(&refs)
+    })
+    .await
+    .unwrap()
 }
 
 /// `getserverstatus` reports the runtime-bound gRPC + streamws listener
@@ -288,7 +299,7 @@ async fn coinbase1(sn: &StreamingNode) -> String {
         .unwrap()
 }
 
-async fn mine_n(sn: &StreamingNode, n: u32) {
+pub(crate) async fn mine_n(sn: &StreamingNode, n: u32) {
     let rpc = sn.node.rpc_handle();
     let addr = mine_addr(0x99);
     tokio::task::spawn_blocking(move || rpc.mine(n, &addr))
@@ -1773,3 +1784,351 @@ async fn grpc_watch_txid_unconfirmed_on_invalidateblock() {
 // driven by real P2P block propagation rather than `invalidateblock`) would be
 // additive — the event paths themselves are identical and already exercised
 // here — so it is intentionally left as future coverage, not a gap.
+
+// ===========================================================================
+// Node-health status events (A3)
+// ===========================================================================
+//
+// The detectors' raise/clear state machines, hysteresis, and warning mapping
+// are unit-tested in `node::health`. What can only be checked end-to-end is
+// that a real condition on a real daemon reaches a real subscriber over a
+// socket, carries the right shape, and is simultaneously visible through
+// `getwarnings` — the three surfaces the design requires never to disagree.
+//
+// `peer_floor` is deliberately not covered here: it holds for 60s in either
+// direction by design, which is longer than an E2E test should sit.
+
+/// Retune one health threshold on a running node and wait for the reload to
+/// land. The config file is the only input SIGHUP re-reads (CLI args stay
+/// authoritative), so the value is written there — which means it must not have
+/// been passed on the command line as anything other than its startup default.
+async fn set_alert_threshold(sn: &StreamingNode, key: &str, value: &str) {
+    sighup_with_conf(sn, &format!("{key}={value}\n")).await;
+}
+
+/// Replace the node's `bitcoin.conf` `[regtest]` section and SIGHUP, waiting
+/// for the reload to land. Only the config *file* is re-read on SIGHUP (startup
+/// CLI args stay authoritative), so a key set on the command line cannot be
+/// changed this way.
+pub(crate) async fn sighup_with_conf(sn: &StreamingNode, body: &str) {
+    let conf = sn.node.datadir.join("bitcoin.conf");
+    std::fs::write(&conf, format!("[regtest]\n{body}")).expect("write bitcoin.conf");
+    let pid = sn.node.process.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(pid)
+            .status()
+            .expect("spawn kill -HUP")
+    })
+    .await
+    .unwrap();
+    assert!(status.success(), "kill -HUP returned {status:?}");
+    // The reload runs between signal-loop iterations, and the detector picks the
+    // new value up on its next poll.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// A status event's envelope shape, for the assertions below.
+fn assert_status_shape(ev: &serde_json::Value, kind: &str, state: &str) {
+    assert_eq!(ev["body"]["category"], "status", "event: {ev}");
+    assert_eq!(ev["body"]["kind"], kind, "event: {ev}");
+    assert_eq!(ev["body"]["state"], state, "event: {ev}");
+    assert!(
+        ev["body"]["details"].is_object(),
+        "details must always be an object (possibly empty): {ev}"
+    );
+    assert!(
+        ev["cursor"].is_null(),
+        "status events are not replayable and must carry no cursor: {ev}"
+    );
+}
+
+/// Fetch the active warning ids from `getwarnings`.
+async fn warning_ids(sn: &StreamingNode) -> Vec<String> {
+    let rpc = sn.node.rpc_handle();
+    let resp = tokio::task::spawn_blocking(move || rpc.call("getwarnings", vec![]))
+        .await
+        .unwrap()
+        .unwrap();
+    resp["result"]["warnings"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w["id"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `tip_stall` raises when no block connects inside the window and clears the
+/// moment one does — and the same transition is visible in `getwarnings`.
+///
+/// The threshold is 1s; the detector polls every 15s, so the raise lands on the
+/// first poll after startup and the whole test fits in one poll interval plus
+/// slack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_tip_stall_raises_then_clears_on_next_block() {
+    let sn = start_streaming_async(vec![
+        "--alerttipstallseconds=1",
+        // Silence the other detectors so the only status traffic is ours.
+        "--alertdiskfreemb=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+        "--alertreorgdepth=0",
+    ])
+    .await;
+
+    // Regtest's genesis tip is 24h+ old, which the IBD heuristic reads as
+    // "still syncing" — and `tip_stall` is suppressed during IBD. Mine one
+    // block so the tip timestamp is current and the node is out of IBD.
+    mine_n(&sn, 1).await;
+
+    // Bit 16 = status. Explicitly requested, since it is not in the default.
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+
+    let ev = ws
+        .next_json_matching(30, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "raised");
+    assert_eq!(ev["body"]["severity"], "critical", "event: {ev}");
+    assert!(
+        ev["body"]["details"]["threshold_seconds"] == "1",
+        "details carry the configured threshold: {ev}"
+    );
+
+    // The same condition is visible to an operator polling RPC.
+    assert!(
+        warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        "a raised status must also be an active warning",
+    );
+
+    // Mining clears it immediately — the clear side is event-driven, not polled.
+    mine_n(&sn, 1).await;
+    let ev = ws
+        .next_json_matching(15, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "cleared");
+    assert!(
+        !warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        "clearing the status must retract the warning",
+    );
+}
+
+/// A firing `tip_stall` clears when the operator raises the threshold above the
+/// current tip age — without waiting for a block.
+///
+/// The fast clear is event-driven, but a node that is genuinely not receiving
+/// blocks has no event to clear on. Retuning the threshold live is the
+/// documented way to quiet such an alert, so the poll path has to honour the new
+/// level in both directions; otherwise the warning, the gauge, and the stream
+/// state stay raised until a block that may be a long way off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_tip_stall_clears_when_the_threshold_is_raised() {
+    // `alerttipstallseconds` stays off the command line so SIGHUP can move it:
+    // startup CLI args remain authoritative across reloads. Its default (1h)
+    // does not fire inside the test.
+    let sn = start_streaming_async(vec![
+        "--alertdiskfreemb=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+        "--alertreorgdepth=0",
+    ])
+    .await;
+    mine_n(&sn, 1).await;
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    set_alert_threshold(&sn, "alerttipstallseconds", "1").await;
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "raised");
+
+    // Raise the threshold past the current age. No block is mined: the clear
+    // must come from the poll noticing the new level.
+    set_alert_threshold(&sn, "alerttipstallseconds", "86400").await;
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "tip_stall", "cleared");
+    assert_eq!(ev["body"]["details"]["threshold_seconds"], "86400", "event: {ev}");
+    assert!(
+        !warning_ids(&sn).await.contains(&"alert.tip_stall".to_string()),
+        "clearing the status must retract the warning",
+    );
+}
+
+/// `disk_low` raises when free space drops under the configured floor — and
+/// the floor is retunable live, without a restart.
+///
+/// The node starts with the detector off and it is switched on by SIGHUP, for
+/// two reasons: it makes the condition become true *after* the subscriber has
+/// attached (status events are not replayable, so a condition raised during
+/// startup is invisible to a client that connects later — snapshot-on-subscribe
+/// is deliberately deferred), and it exercises the live-reload path that exists
+/// precisely so an operator can retune a firing alert without downtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_disk_low_raises_after_a_live_threshold_change() {
+    // `alertdiskfreemb` is deliberately NOT passed on the command line: SIGHUP
+    // re-reads only the config file, with the startup CLI args still
+    // authoritative, so a CLI-pinned value could never be retuned.
+    //
+    // PRECONDITION: the host needs **more than 10 GiB free** on /tmp. This test
+    // drives a raise by moving the threshold, so it needs `disk_low` to start
+    // clear — and the default floor is 10 GiB. On a fuller disk the alert is
+    // already raised at startup, `raise_if_new` is a no-op, and this fails as a
+    // bare 45-second websocket timeout with nothing pointing at the cause.
+    let sn = start_streaming_async(vec![
+        "--alerttipstallseconds=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+        "--alertreorgdepth=0",
+    ])
+    .await;
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // An unreachable floor (2^44 MiB) guarantees the condition on any real
+    // filesystem. Applied live — no restart.
+    set_alert_threshold(&sn, "alertdiskfreemb", "17592186044416").await;
+
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "disk_low", "raised");
+    assert_eq!(ev["body"]["severity"], "critical", "event: {ev}");
+    // The actionable numbers ride in `details`, not only in the message.
+    assert!(ev["body"]["details"]["free_bytes"].is_string(), "event: {ev}");
+    assert!(ev["body"]["details"]["threshold_bytes"].is_string(), "event: {ev}");
+    // The watched path is deliberately NOT on the wire: this event reaches
+    // every `status` subscriber and any push-notification body, and an absolute
+    // datadir path usually names the account satd runs under. It goes to the
+    // node's log instead.
+    assert!(
+        ev["body"]["details"]["path"].is_null(),
+        "the datadir path must not be exposed on the wire: {ev}"
+    );
+    assert!(warning_ids(&sn).await.contains(&"alert.disk_low".to_string()));
+}
+
+/// A reorg at or beyond `alertreorgdepth` emits a one-shot `deep_reorg` edge
+/// carrying the true depth — which the marker alone does not provide, so this
+/// also covers the disconnect-counting derivation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_deep_reorg_reports_true_depth() {
+    let sn = start_streaming_async(vec![
+        "--alertreorgdepth=2",
+        "--alerttipstallseconds=0",
+        "--alertdiskfreemb=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+    ])
+    .await;
+
+    let rpc = sn.node.rpc_handle();
+    let addr = mine_addr(0x73);
+    let hashes = tokio::task::spawn_blocking(move || rpc.mine(3, &addr))
+        .await
+        .unwrap();
+    assert_eq!(hashes.len(), 3);
+    let height2 = hashes[1].clone();
+
+    let mut ws = WsClient::connect(sn.ws_port()).await;
+    ws.send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Invalidating height 2 rolls back heights 3 and 2 — a 2-deep truncation.
+    let rpc2 = sn.node.rpc_handle();
+    let resp = tokio::task::spawn_blocking(move || {
+        rpc2.call("invalidateblock", vec![serde_json::json!(height2)])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+
+    // A truncation reorg has no replacement chain to connect, so the detector
+    // finalizes the depth count on its next poll (≤ one poll interval).
+    let ev = ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "deep_reorg", "edge");
+    assert_eq!(ev["body"]["severity"], "critical", "event: {ev}");
+    assert_eq!(ev["body"]["details"]["depth"], "2", "event: {ev}");
+    assert_eq!(ev["body"]["details"]["from_height"], "3", "event: {ev}");
+    assert_eq!(ev["body"]["details"]["fork_height"], "1", "event: {ev}");
+}
+
+/// The `status` category is explicit-request only: a default (`categories=0`)
+/// subscriber must never receive a status event, even while one is firing.
+/// This is the upgrade-safety property — a client written against an older
+/// node must not start receiving a body it has no parser for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_status_absent_from_the_default_category_mask() {
+    // `alertdiskfreemb` is deliberately NOT passed on the command line: SIGHUP
+    // re-reads only the config file, with the startup CLI args still
+    // authoritative, so a CLI-pinned value could never be retuned.
+    //
+    // PRECONDITION: the host needs **more than 10 GiB free** on /tmp. This test
+    // drives a raise by moving the threshold, so it needs `disk_low` to start
+    // clear — and the default floor is 10 GiB. On a fuller disk the alert is
+    // already raised at startup, `raise_if_new` is a no-op, and this fails as a
+    // bare 45-second websocket timeout with nothing pointing at the cause.
+    let sn = start_streaming_async(vec![
+        "--alerttipstallseconds=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+        "--alertreorgdepth=0",
+    ])
+    .await;
+
+    // One subscriber on the default mask, one explicitly asking for status.
+    let mut default_ws = WsClient::connect(sn.ws_port()).await;
+    let mut status_ws = WsClient::connect(sn.ws_port()).await;
+    status_ws
+        .send_control(serde_json::json!({"type": "set_categories", "categories": 16}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    set_alert_threshold(&sn, "alertdiskfreemb", "17592186044416").await;
+
+    // The explicit subscriber gets it, proving the condition really fired
+    // while both subscribers were attached.
+    let ev = status_ws
+        .next_json_matching(45, |v| v["body"]["category"] == "status")
+        .await;
+    assert_status_shape(&ev, "disk_low", "raised");
+
+    // Mine so the default subscriber definitely has traffic to read — if it
+    // were going to see a status event, it would be interleaved with these.
+    mine_n(&sn, 2).await;
+    // Drain the default subscriber for a fixed window rather than stopping at
+    // the first gap: `next_json_opt` yields `None` for a keepalive ping as well
+    // as for a timeout, so a break-on-`None` loop would end before reading
+    // anything real.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = default_ws.next_json_opt(1).await {
+            assert_ne!(
+                v["body"]["category"], "status",
+                "a categories=0 subscriber must never receive status events: {v}"
+            );
+            seen.push(v["body"]["category"].as_str().unwrap_or("?").to_string());
+        }
+    }
+    assert!(
+        seen.iter().any(|c| c == "chain"),
+        "the default subscriber should still see chain events; saw: {seen:?}"
+    );
+}

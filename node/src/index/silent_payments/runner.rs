@@ -476,7 +476,7 @@ impl BackfillRunner {
 pub fn preflight_disk(chain: &ChainState) -> Result<(), BackfillError> {
     use crate::index::silent_payments::backfill::PREFLIGHT_REQUIRED_FREE_BYTES;
     let datadir = chain.blocks_dir();
-    let have = match free_disk_bytes(datadir) {
+    let have = match crate::diskspace::free_disk_bytes(datadir) {
         Some(b) => b,
         None => {
             tracing::warn!(
@@ -502,22 +502,3 @@ fn debug_delay_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(target_os = "linux")]
-fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: zero-init s; libc::statvfs is the canonical free-space syscall.
-    unsafe {
-        let mut s: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(cpath.as_ptr(), &mut s) != 0 {
-            return None;
-        }
-        Some(s.f_bavail.saturating_mul(s.f_frsize))
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn free_disk_bytes(_path: &std::path::Path) -> Option<u64> {
-    None
-}

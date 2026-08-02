@@ -2,7 +2,10 @@
 //! easy to get subtly wrong: `has_amount` → `Option`, the evict-reason enum,
 //! prefix nesting, and the empty-body / unrecognized-arm fallback.
 
-use satd_events_client::{proto as pb, CursorRejectReason, DescriptorMatch, Event, EvictReason};
+use satd_events_client::{
+    proto as pb, CursorRejectReason, DescriptorMatch, Event, EvictReason, StatusKind,
+    StatusSeverity, StatusState,
+};
 
 fn node_event(body: pb::node_event::Body) -> pb::NodeEvent {
     pb::NodeEvent { schema_version: 1, stamp: None, cursor: None, body: Some(body) }
@@ -366,5 +369,138 @@ fn mempool_tweak_maps_to_typed_event() {
             assert_eq!(entry.taproot_outputs[0].value, 33_000);
         }
         other => panic!("expected MempoolTweak, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unset vs unrecognized.
+//
+// Every open enum on this API has to tell two different facts apart: a field
+// the producer never set (proto3's zero value) and a value this build does not
+// recognize. These decode at the real `Event::from` boundary rather than
+// through the private per-type helpers, because the boundary is where the
+// wiring can be wrong even when the helper is right.
+// ---------------------------------------------------------------------------
+
+fn status_event(kind: i32, state: i32, severity: i32) -> pb::NodeEvent {
+    node_event(pb::node_event::Body::Status(pb::StatusEvent {
+        kind,
+        state,
+        severity,
+        message: "probe".into(),
+        details: Default::default(),
+    }))
+}
+
+#[test]
+fn status_decodes_a_fully_specified_event() {
+    let ev = status_event(
+        pb::StatusKind::DiskLow as i32,
+        pb::StatusState::Raised as i32,
+        pb::StatusSeverity::Critical as i32,
+    );
+    match Event::from(ev) {
+        Event::Status { kind, state, severity, .. } => {
+            assert_eq!(kind, StatusKind::DiskLow);
+            assert_eq!(state, StatusState::Raised);
+            assert_eq!(severity, StatusSeverity::Critical);
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unset_severity_survives_the_wire_boundary_as_unspecified() {
+    // The regression the ordering fix exists for, exercised end to end: a
+    // producer that omits `severity` must not out-page `Critical`.
+    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, 0);
+    match Event::from(ev) {
+        Event::Status { severity, .. } => {
+            assert_eq!(severity, StatusSeverity::Unspecified);
+            assert!(severity < StatusSeverity::Warning, "an unset severity must not page");
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrecognized_severity_survives_the_wire_boundary_above_critical() {
+    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, 99);
+    match Event::from(ev) {
+        Event::Status { severity, .. } => {
+            assert_eq!(severity, StatusSeverity::Unknown(99));
+            assert!(severity > StatusSeverity::Critical);
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_negative_severity_is_unrecognized_not_unset() {
+    // A "rank by proto value" reimplementation gets this backwards and sorts a
+    // negative below everything, including `Unspecified`.
+    let ev = status_event(pb::StatusKind::DiskLow as i32, pb::StatusState::Raised as i32, -1);
+    match Event::from(ev) {
+        Event::Status { severity, .. } => {
+            assert_eq!(severity, StatusSeverity::Unknown(-1));
+            assert!(severity > StatusSeverity::Critical, "negative is unrecognized, not quiet");
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unset_kind_and_state_are_unspecified_not_unknown() {
+    let ev = status_event(0, 0, pb::StatusSeverity::Info as i32);
+    match Event::from(ev) {
+        Event::Status { kind, state, .. } => {
+            assert_eq!(kind, StatusKind::Unspecified);
+            assert_eq!(state, StatusState::Unspecified);
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrecognized_kind_and_state_are_unknown_not_unspecified() {
+    let ev = status_event(99, 98, pb::StatusSeverity::Info as i32);
+    match Event::from(ev) {
+        Event::Status { kind, state, .. } => {
+            assert_eq!(kind, StatusKind::Unknown(99));
+            assert_eq!(state, StatusState::Unknown(98));
+        }
+        other => panic!("expected status, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrecognized_evict_reason_is_unknown_not_unspecified() {
+    // prost's generated `reason()` accessor is `try_from(..).unwrap_or_default()`,
+    // which turns any unrecognized value into the zero variant — so going
+    // through it reported a reason added by a newer node as "unspecified" and
+    // left `EvictReason::Unknown` unconstructible.
+    let ev = node_event(pb::node_event::Body::Mempool(pb::MempoolEvent {
+        body: Some(pb::mempool_event::Body::LeaveEvicted(pb::MempoolLeaveEvicted {
+            txid: vec![1; 32],
+            reason: 99,
+        })),
+    }));
+    match Event::from(ev) {
+        Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::Unknown(99)),
+        other => panic!("expected evicted, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unset_evict_reason_is_still_unspecified() {
+    let ev = node_event(pb::node_event::Body::Mempool(pb::MempoolEvent {
+        body: Some(pb::mempool_event::Body::LeaveEvicted(pb::MempoolLeaveEvicted {
+            txid: vec![1; 32],
+            reason: 0,
+        })),
+    }));
+    match Event::from(ev) {
+        Event::MempoolLeaveEvicted { reason, .. } => assert_eq!(reason, EvictReason::Unspecified),
+        other => panic!("expected evicted, got {other:?}"),
     }
 }

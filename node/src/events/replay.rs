@@ -42,6 +42,17 @@ pub trait BlockCursorSource: Send + Sync {
     /// Current active-chain tip height.
     fn current_tip_height(&self) -> u32;
 
+    /// Whether the node is still in initial block download.
+    ///
+    /// Not used by replay itself — it is here because the webhook dispatcher
+    /// needs to suppress its firehose during IBD and already holds this handle;
+    /// threading a second chain reference through the dispatcher's five
+    /// constructor layers to answer one boolean is worse. Defaults to `false`
+    /// so test doubles and any other implementor are unaffected.
+    fn in_initial_block_download(&self) -> bool {
+        false
+    }
+
     /// Active-chain block hashes for the heights in `[from, to]` (inclusive),
     /// height-ascending. Resolved by walking the active chain back from the tip
     /// **once** (O(tip − from), not O(span²)) so it is reorg-safe: it follows
@@ -58,6 +69,10 @@ impl BlockCursorSource for crate::chain::state::ChainState {
         // Inherent method on ChainState; no clash since the trait method
         // has a distinct name.
         self.tip_height()
+    }
+
+    fn in_initial_block_download(&self) -> bool {
+        self.is_initial_block_download()
     }
 
     fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, BlockHash)> {
@@ -261,7 +276,8 @@ pub struct CursorReplay {
 ///
 /// `tweak_source` is the silent-payment index read handle, consulted only when
 /// the `tweaks` bit is set. A **tweaks-only** subscription (`category_mask ==
-/// tweaks`) against a complete index is exempt from the `max_blocks` clamp —
+/// tweaks`, ignoring the non-replayable `status` bit) against a complete index
+/// is exempt from the `max_blocks` clamp —
 /// each `sp_tweaks` row embeds the hash of the block it describes (§3.2), so a
 /// phone can cold-sync from taproot activation in one subscription without a
 /// height→hash lookup. A **mixed** subscription keeps the clamp for every
@@ -287,7 +303,14 @@ pub fn build_cursor_replay(
     // index replays unclamped from the requested cursor. A partial index is
     // never treated as authoritative (the carrier rejects a replay request in
     // that state before calling us), so we still gate on `is_complete()`.
-    let tweaks_only_sub = category_mask == CATEGORY_TWEAKS;
+    // `status` is masked out before the test: it contributes nothing replayable
+    // (never synthesized here, and excluded from the replay ring), so a client
+    // that asks for "my tweaks, and tell me if the node is sick" is still a
+    // tweaks-only subscription for replay purposes. Testing the raw mask for
+    // equality would silently drop the exemption and clamp a cold-syncing
+    // wallet to the last `max_blocks` — a truncation the Subscribe path has no
+    // way to signal in-band.
+    let tweaks_only_sub = category_mask & !super::CATEGORY_STATUS == CATEGORY_TWEAKS;
     let deep_exempt = tweaks_only_sub && sp.map(|s| s.is_complete()).unwrap_or(false);
 
     let requested_start = from.height.saturating_add(1);
@@ -757,6 +780,30 @@ mod tests {
         );
         // Nothing is eagerly materialized on the deep path — no memory blowup.
         assert!(r.events.is_empty(), "deep tweaks are streamed lazily, not buffered");
+    }
+
+    #[test]
+    fn adding_the_status_bit_does_not_forfeit_the_deep_replay_exemption() {
+        // "Give me my tweaks, and tell me if the node is sick" — tweaks|status
+        // (8|16). `status` carries nothing replayable, so this is still a
+        // tweaks-only subscription as far as replay is concerned and must stay
+        // exempt. Testing the raw mask for equality would clamp a cold-syncing
+        // BIP-352 wallet to the most recent `max_blocks` and, because the
+        // Subscribe path never surfaces `clamped` in-band, the wallet would
+        // silently miss every earlier block.
+        let src = FlatChain { tip: 50 };
+        let pubr = publisher();
+        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let r = build_cursor_replay(
+            &src,
+            &pubr,
+            cursor(0),
+            CATEGORY_TWEAKS | crate::events::CATEGORY_STATUS,
+            10,
+            Some(&sp),
+        );
+        assert!(!r.clamped, "the status bit must not forfeit the exemption");
+        assert_eq!(r.deep_tweak_range, Some((1, 50)), "full span, unclamped");
     }
 
     #[test]

@@ -118,6 +118,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Release tags are needed to tell whether the local proto is the same
+          # code as the published crate of that version; the default shallow,
+          # tagless fetch would make that check unanswerable and skip the
+          # dry-run every time.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -127,10 +133,83 @@ jobs:
       - name: cargo publish --dry-run (satd-events-proto)
         run: cargo publish -p satd-events-proto --dry-run
 
-      # satd-events-proto published to crates.io at 0.4.0 (2026-07-07), so
-      # satd-events-client's version dependency now resolves from the
-      # registry index — this is a hard gate like the proto step above.
+      # The client's gate is split in two, because half of it is uncheckable
+      # between schema changes.
+      #
+      # `cargo publish --dry-run` simulates what crates.io would build, so it
+      # drops the `path` on `satd-events-proto` and resolves the `version`
+      # requirement from the *registry*. It then compiles the working tree's
+      # client against the *published* proto. Every addition to the schema that
+      # the client uses therefore fails this step — not flakily, but by
+      # construction — until the matching proto is published. That is the
+      # normal state of this repo between releases: the job was red on master
+      # and on every release-matrix PR for the whole 0.5.0 cycle, which trains
+      # everyone to ignore a red X on the one job whose failures would matter.
+      #
+      # `contrib/release/publish-sdk-crates.sh` already documents the same
+      # limitation for the real publish; this encodes it.
+      #
+      # So: packaging correctness is checked unconditionally (below), and the
+      # full build-against-the-registry check runs only when it *can* pass.
+      # It re-arms by itself the moment proto is published — no workflow edit —
+      # and it always runs at release time, since the publish script does proto
+      # first, then client.
+      - name: cargo package (satd-events-client)
+        run: cargo package -p satd-events-client --no-verify
+
+      # Two conditions must hold for the dry-run below to mean anything, and
+      # version equality alone is NOT one of them.
+      #
+      #   1. The required proto version exists on crates.io — otherwise there is
+      #      nothing for cargo to resolve against.
+      #   2. The local proto is the SAME CODE that was published under that
+      #      version. The workspace version stays at the last release for the
+      #      whole development cycle, so `satd-events-proto = "=0.4.0"` keeps
+      #      resolving to a published 0.4.0 whose schema is months behind the
+      #      working tree. The version number matches while the code does not,
+      #      which is exactly the state that produced a permanently red job.
+      #
+      # git answers (2) precisely: diff the crate against the release tag.
+      - name: Can the client dry-run resolve a matching proto?
+        id: proto
+        run: |
+          set -euo pipefail
+          req=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="satd-events-client")
+                     | .dependencies[] | select(.name=="satd-events-proto") | .req')
+          # `=x.y.z` is the only form this manifest uses; anything looser makes
+          # "which published crate is this?" ill-defined, so refuse to guess.
+          case "$req" in
+            "="*) want="${req#=}" ;;
+            *) echo "::error::expected an exact (=x.y.z) satd-events-proto requirement, got '$req'"; exit 1 ;;
+          esac
+          # Sparse index layout for a name of 4+ chars: /ab/cd/name
+          have=$(curl -fsSL https://index.crates.io/sa/td/satd-events-proto \
+            | jq -r 'select(.yanked | not) | .vers' | paste -sd' ')
+          echo "required=$want  published=$have"
+
+          skip() {
+            echo "publishable=false" >> "$GITHUB_OUTPUT"
+            local tail="Packaging was still verified above. This step re-arms by itself, with no workflow edit, once a release publishes a matching satd-events-proto."
+            echo "::notice title=client publish dry-run skipped::$1 $tail"
+            exit 0
+          }
+
+          printf '%s\n' $have | grep -qxF "$want" \
+            || skip "satd-events-proto $want is not on crates.io (published: $have)."
+
+          git rev-parse -q --verify "refs/tags/v$want" >/dev/null \
+            || skip "no v$want tag in this checkout, so the published proto cannot be compared against the working tree."
+
+          if git diff --quiet "v$want" HEAD -- satd-events-proto/; then
+            echo "publishable=true" >> "$GITHUB_OUTPUT"
+          else
+            changed=$(git diff --stat "v$want" HEAD -- satd-events-proto/ | tail -1 | sed 's/^ *//')
+            skip "the local satd-events-proto has diverged from published $want ($changed), so cargo would build the client against a stale schema."
+          fi
+
       - name: cargo publish --dry-run (satd-events-client)
+        if: steps.proto.outputs.publishable == 'true'
         run: cargo publish -p satd-events-client --all-features --dry-run
 
   # CycloneDX 1.5 SBOM for the two shipped binaries (satd, sat-cli).
