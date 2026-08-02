@@ -11,6 +11,16 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- SDK (`satd-events-client`): an **unset** protobuf field and a value this build
+  does not **recognize** are now different variants on every open enum
+  (`StatusSeverity`, `StatusKind`, `StatusState`, `EvictReason`) — proto3's zero
+  value decodes to `Unspecified`, anything unrecognized to `Unknown(i32)`.
+  Behaviour change for `EvictReason`, which shipped in 0.4.0 routing *every*
+  unrecognized value into `Unspecified` and leaving its `Unknown` variant
+  unconstructible: an eviction reason added by a newer node was reported as
+  "unspecified". `docs/api/streaming.md` now states the severity ranking
+  normatively (`Unspecified` < `Info` < `Warning` < `Critical` < unrecognized).
+
 - Silent payments (BIP 352): new workspace-internal `node-sp-index` crate — the
   shared BIP 352 kernel (input extraction, public tweak `T = input_hash · A`,
   scan loop) plus the `sp_tweaks` row/key codec, backfill cursor, read trait,
@@ -117,6 +127,88 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   default — the block is the fallback). The outputs are dropped by the on-disk
   index (no size increase, no reindex) and re-derived at serve time. SDK:
   `TweakEntry::taproot_outputs` and `SubscribeOptions::tweak_outputs`.
+- Alerting: node-health events on the streaming API. A new `status` category
+  (bit 16 — explicit-request only, so a `categories=0` subscriber is unaffected)
+  carries `StatusEvent` bodies describing the node itself (`ibd_complete`,
+  `tip_stall`, `disk_low`, `mempool_congested`, `peer_floor`, `deep_reorg`),
+  level-triggered with paired `raised`/`cleared` states and an additive
+  `details` string map. Served on gRPC and WS/SSE; **not** on the ZMQ
+  `nodeevent` topic, which has no per-subscriber category mask (use `alertfile`
+  webhooks or `-alertnotify` for health over ZMQ). Requires **`rpc:read` as well
+  as `stream:subscribe`** where `-authfile` is in use — the bodies carry host
+  telemetry (disk, peers, mempool occupancy, tip height) that the same
+  capability gates on the RPC surface. Not replayable (no cursor —
+  detectors re-raise standing conditions after a restart). Wire schema only in
+  this change; the detectors that emit them land next.
+- Alerting: node-health detectors. satd now watches six conditions about itself
+  — stalled tip, low disk, congested mempool, peer starvation, IBD completion,
+  deep reorg — and reports each through three surfaces at once: a `status`
+  streaming event, an entry in `getwarnings` (which fires the Core-compatible
+  `alertnotify` hook), and a `satd_alert_active{kind}` gauge. Standing
+  conditions raise once and clear once, with hysteresis so a value sitting on
+  the threshold does not flap. The one-shot events (`ibd_complete`,
+  `deep_reorg`) fire `alertnotify` and the streaming event but deliberately do
+  **not** enter `getwarnings` — nothing would ever clear them, and on chains
+  where multi-block reorgs are routine that would wedge
+  `getblockchaininfo.warnings` and the TUI modal permanently. Five new hot-reloadable thresholds
+  (`alerttipstallseconds=3600` — `0` on regtest, `alertdiskfreemb=10240`,
+  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest, and capped by
+  the number of `-connect=` peers when that is set —
+  `alertreorgdepth=3` — `10` on test networks, `0` on regtest); `0` disables a
+  detector. `deep_reorg` depth, fork
+  height and new tip are read from the durable reorg log, so they are exact
+  regardless of chain-event lag. Two new gauges close longstanding observability gaps
+  independently of alerting: `satd_tip_last_connect_age_seconds` and
+  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`. The
+  free-space probe is bounded and carried across polls, so a `blocksdir` on an
+  unresponsive network mount stalls only the disk alert — never the other
+  detectors — and strands at most one blocking thread rather than one per poll.
+- Alerting: outbound webhooks. `alertfile=<path>` configures any number of
+  signed HTTP hooks, each filtered by category/kind/severity. Bodies are
+  byte-identical to the streaming API's JSON for the same event; delivery
+  metadata rides in headers (`X-Satd-Signature`, `X-Satd-Timestamp`,
+  `X-Satd-Delivery`, `X-Satd-Hook`, `X-Satd-Attempt`). The signature covers the
+  timestamp, delivery id, and hook id as well as the body, so the idempotency
+  key a receiver deduplicates on cannot be forged and a captured delivery is not
+  a permanent replay token. Delivery is serial and in-order per hook,
+  retried with exponential backoff on transient failures and skipped on a
+  permanent 4xx. The per-hook queue is bounded and overflow **drops silently**
+  — there is no in-band gap notice; the record is
+  `satd_alertwebhook_dropped_total` and a log line. Redirects are never followed — a 3xx is a permanent drop, so a
+  signed body cannot be steered to a host the alertfile never named. Delivery is
+  **best-effort**: nothing is persisted, a hook that was down resumes at the
+  live head, and drops are counted in `satd_alertwebhook_dropped_total`. The
+  Streaming Consumption API remains the surface for guaranteed, resumable
+  consumption. Hooks reload on SIGHUP
+  (keep-last-good on error); per-hook counters are exported as
+  `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
+  their original payload, headers, and retry schedule, now delivered by the same
+  dispatcher — which also moves that outbound HTTP off the consensus runtime.
+  They keep reporting `X-Satd-Webhook-Version: 1`; alertfile hooks report `2`.
+  **Behavior change on `reorgwebhook=`:** redirects are no longer followed, so a
+  receiver answering `3xx` (an `http`→`https` proxy hop, a trailing-slash
+  redirect) must be repointed at its final URL — following one moves a signed
+  body to a host the operator never named.
+- docs: new `docs/api/webhooks.md` — the normative alert-webhook delivery
+  contract (headers, HMAC signature with test vectors, retry classes,
+  best-effort delivery semantics), linked from the streaming spec and the
+  Operator Manual; `CORE_DIFFERENCES.md` gains entries for node-health alerts
+  and the webhook surface.
+- Alerting: Rust SDK (`satd-events-client`) support for node-health events. New
+  `Categories::STATUS` bit and typed `Event::Status { kind, state, severity,
+  message, details }` with open `StatusKind` / `StatusState` / `StatusSeverity`
+  enums — an unrecognized value from a newer node surfaces as `Unknown(i32)`
+  rather than an error, and `StatusSeverity` is ordered by severity rank
+  (`Unspecified` < `Info` < `Warning` < `Critical` < `Unknown`) so a client
+  filters with a comparison. All three are `#[non_exhaustive]`, so a condition added
+  node-side stays additive for downstream consumers. New runnable
+  `examples/health_watch.rs`.
+- Alerting: reference push relay in `contrib/push-relay/` — a standalone service
+  (excluded from the workspace, path-gated CI, not release-gated) that verifies
+  satd's webhook signatures, deduplicates on `X-Satd-Delivery`, and forwards
+  status alerts and reorgs as APNs / FCM push notifications
+  using the operator's own credentials. Reference-grade and meant to be forked;
+  its HMAC tests assert the same vectors as `docs/api/webhooks.md`.
 
 ## Releases
 

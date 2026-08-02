@@ -359,6 +359,13 @@ impl ChainState {
         filter_index: crate::index::filter::FilterIndexConfig,
         sp_index: crate::index::silent_payments::SpIndexConfig,
     ) -> Result<Self, ChainError> {
+        // The `filter_index` field it feeds is cfg-gated, but the parameter is
+        // not: every caller passes a config regardless of build, so the
+        // signature stays stable across feature combinations. Consume it
+        // explicitly on a consensus-only build.
+        #[cfg(not(feature = "block-filter-index"))]
+        let _ = filter_index;
+
         let genesis = bitcoin::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
         let blocks_dir = flat_files.blocks_dir().to_path_buf();

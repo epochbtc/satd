@@ -181,6 +181,14 @@ pub struct ReloadHandles {
     /// are rotatable live (the cookie is preserved). Shared with every RPC
     /// listener surface, so a reload covers all of them at once.
     pub rpc_auth: Arc<RpcAuth>,
+    /// Alertfile dispatcher, present only when `alertfile=` is set. Re-read on
+    /// every SIGHUP independently of the rest of the config, so editing a hook
+    /// in place takes effect — the `TokenStore` precedent.
+    pub alert_reloader: Option<Arc<crate::alert::AlertReloader>>,
+    /// Health-detector raise thresholds. Always present (the detector task is
+    /// always configured, even when every threshold is 0), so a threshold
+    /// change always has somewhere to land.
+    pub alert_thresholds: Arc<node::health::AlertThresholds>,
     /// Unified-auth bearer-token store, present only when `authfile=` is set.
     /// Re-read on every SIGHUP independently of the rest of the config so that
     /// removing a `[[token]]` revokes it live; a re-read error keeps the
@@ -412,8 +420,13 @@ const LOAD_ONLY_KEYS: &[&str] = &[
 ///
 /// `policyfile`: the transaction-filtering ruleset — re-read, recompiled, swapped,
 /// and re-placed live (path change, in-place content edit, and removal all live).
+///
+/// `alertfile`: the outbound webhook set — re-read, re-validated, and the
+/// dispatcher generation replaced. A parse/permission error keeps the last-good
+/// dispatcher running (silently losing alerting after a typo is the worse
+/// failure); the *path* itself is restart-only.
 #[allow(dead_code)]
-const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile"];
+const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile", "alertfile"];
 
 /// Build the field-disposition table. Constructed at call time (once per
 /// reload) so the non-capturing `diff`/`apply` closures coerce to `fn`
@@ -865,6 +878,26 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("shutdownnotify", shutdown_notify),
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
+        // ---- Health-alert thresholds (A3) ----
+        // Retuning an alert must not need a restart: the operator is usually
+        // retuning it *because* it is firing, and taking the node down to
+        // silence a pager is the wrong trade. Each pushes into the shared
+        // atomics the detector task reads on its next poll.
+        live!("alerttipstallseconds", alert_tip_stall_seconds, |c, h| h
+            .alert_thresholds
+            .set_tip_stall_secs(c.alert_tip_stall_seconds)),
+        live!("alertdiskfreemb", alert_disk_free_mb, |c, h| h
+            .alert_thresholds
+            .set_disk_free_mb(c.alert_disk_free_mb)),
+        live!("alertmempoolfullpct", alert_mempool_full_pct, |c, h| h
+            .alert_thresholds
+            .set_mempool_full_pct(c.alert_mempool_full_pct)),
+        live!("alertpeerfloor", alert_peer_floor, |c, h| h
+            .alert_thresholds
+            .set_peer_floor(c.alert_peer_floor)),
+        live!("alertreorgdepth", alert_reorg_depth, |c, h| h
+            .alert_thresholds
+            .set_reorg_depth(c.alert_reorg_depth)),
         // ---- MCP ----
         restart!("mcp", mcp),
         restart!("mcpport", mcp_port),
@@ -962,6 +995,25 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
                 error = %e,
                 path = %store.path().display(),
                 "auth token file reload failed — keeping the last-good token table"
+            ),
+        }
+    }
+
+    // Outbound alert webhooks, same precedent: re-read the file's *contents*
+    // on every SIGHUP, even when the path is unchanged. A failure keeps the
+    // last-good dispatcher — an operator whose edit did not apply reads it in
+    // the log, whereas an operator whose alerting silently stopped finds out
+    // the next time something breaks.
+    if let Some(reloader) = &handles.alert_reloader {
+        match reloader.apply() {
+            Ok(hooks) => tracing::info!(
+                hooks,
+                path = %reloader.path().display(),
+                "alertfile reloaded"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "alertfile reload failed — keeping the last-good webhook set"
             ),
         }
     }
@@ -1076,6 +1128,13 @@ mod tests {
             "maxshutdownsecs",
             "reorgwebhook",
             "reorgwebhooksecret",
+            // Retuning an alert must not require a restart — the operator is
+            // usually retuning it because it is firing.
+            "alerttipstallseconds",
+            "alertdiskfreemb",
+            "alertmempoolfullpct",
+            "alertpeerfloor",
+            "alertreorgdepth",
         ] {
             assert!(
                 find(key).apply.is_some(),
