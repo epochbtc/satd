@@ -89,10 +89,15 @@ pub struct DescriptorMatch {
 }
 
 /// Why a transaction left the mempool by policy.
+///
+/// Like the status enums, this distinguishes an **unset** field
+/// ([`Unspecified`](Self::Unspecified), proto3's zero value) from a value this
+/// build does not recognize ([`Unknown`](Self::Unknown)) — two different facts
+/// that must not collapse into one variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EvictReason {
-    /// Unspecified / not set.
+    /// The producer did not set a reason (proto3's zero value).
     Unspecified,
     /// Evicted because the pool hit its byte budget.
     FullPool,
@@ -121,6 +126,10 @@ pub enum EvictReason {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
+    /// The producer did not set a kind (proto3's zero value). Distinct from
+    /// [`Unknown`](Self::Unknown), which is a kind that *was* set and this
+    /// build does not recognize.
+    Unspecified,
     /// Initial block download finished (one-shot).
     IbdComplete,
     /// No block connected inside the configured window.
@@ -145,6 +154,7 @@ pub enum StatusKind {
 impl StatusKind {
     fn from_proto(v: i32) -> Self {
         match pb::StatusKind::try_from(v) {
+            Ok(pb::StatusKind::Unspecified) => StatusKind::Unspecified,
             Ok(pb::StatusKind::IbdComplete) => StatusKind::IbdComplete,
             Ok(pb::StatusKind::TipStall) => StatusKind::TipStall,
             Ok(pb::StatusKind::DiskLow) => StatusKind::DiskLow,
@@ -162,6 +172,13 @@ impl StatusKind {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusState {
+    /// The producer did not set a state (proto3's zero value).
+    ///
+    /// A consumer tracking standing conditions cannot infer a lifecycle from
+    /// this — it is neither a raise nor a clear — so treat it as "unusable" and
+    /// say so, rather than silently dropping it. Dropping it is how a condition
+    /// whose *clear* arrived unset stays standing forever.
+    Unspecified,
     /// The condition was entered; it stands until a matching `Cleared`.
     Raised,
     /// The condition recovered.
@@ -175,6 +192,7 @@ pub enum StatusState {
 impl StatusState {
     fn from_proto(v: i32) -> Self {
         match pb::StatusState::try_from(v) {
+            Ok(pb::StatusState::Unspecified) => StatusState::Unspecified,
             Ok(pb::StatusState::Raised) => StatusState::Raised,
             Ok(pb::StatusState::Cleared) => StatusState::Cleared,
             Ok(pb::StatusState::Edge) => StatusState::Edge,
@@ -185,15 +203,43 @@ impl StatusState {
 
 /// How loud a health condition is.
 ///
-/// `Ord` follows severity, so a client filters with a comparison
-/// (`severity >= StatusSeverity::Warning`). An unrecognized value sorts above
-/// `Critical` deliberately: a condition this build cannot name is not one to
-/// quietly filter out.
+/// Ordering is by *severity rank*, not by proto value, so a client filters with
+/// a comparison (`severity >= StatusSeverity::Warning`). The rank is:
+///
+/// ```text
+/// Unspecified  <  Info  <  Warning  <  Critical  <  Unknown(_)
+/// ```
+///
+/// `Unknown(_)` sorting above `Critical` is deliberate: a severity this build
+/// cannot name is not one to quietly filter out, so an additive taxonomy change
+/// fails loud rather than silent.
+///
+/// [`Unspecified`](Self::Unspecified) is the opposite case and is why the two
+/// are separate variants. `STATUS_SEVERITY_UNSPECIFIED` is proto3's zero value,
+/// which is what an absent field decodes to — a producer that never set the
+/// field at all. That is an absence of information, not a loud condition, so it
+/// ranks lowest. Folding it into `Unknown` (as this type once did) made an
+/// unset severity outrank `Critical` and page on the documented filter.
+///
+/// **satd itself never emits a zero severity** — the node's own enum has three
+/// variants and the encoder writes one of them explicitly — so this is defence
+/// against a third-party producer, an in-path relay that re-encodes the event,
+/// or a future schema, not a bug you can have hit against a stock node.
+///
+/// If you do see `Unspecified` and need a level, `kind` is the recovery: in v1
+/// severity is a fixed function of the condition, so the kind's documented
+/// severity is the one the originating node would have sent.
 ///
 /// `#[non_exhaustive]` — see [`StatusKind`].
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusSeverity {
+    /// The producer did not set a severity (proto3's zero value).
+    ///
+    /// Ranks below `Info`: the event is still delivered and still carries a
+    /// `kind` and `message`, but a severity floor cannot promote a level that
+    /// was never stated.
+    Unspecified,
     /// Worth knowing, not worth waking anyone (IBD completing).
     Info,
     /// Degraded but functioning (peer starvation, a congested mempool).
@@ -201,18 +247,48 @@ pub enum StatusSeverity {
     /// The node is not doing its job, or is about to stop (a stalled tip, a
     /// filling disk, a deep reorg).
     Critical,
-    /// A severity this client build does not recognize.
+    /// A severity this client build does not recognize. Ranks above `Critical`.
     Unknown(i32),
 }
 
 impl StatusSeverity {
     fn from_proto(v: i32) -> Self {
         match pb::StatusSeverity::try_from(v) {
+            Ok(pb::StatusSeverity::Unspecified) => StatusSeverity::Unspecified,
             Ok(pb::StatusSeverity::Info) => StatusSeverity::Info,
             Ok(pb::StatusSeverity::Warning) => StatusSeverity::Warning,
             Ok(pb::StatusSeverity::Critical) => StatusSeverity::Critical,
             _ => StatusSeverity::Unknown(v),
         }
+    }
+
+    /// Sort key: the severity rank, then the raw value.
+    ///
+    /// The second element only ever distinguishes two `Unknown`s, and it is
+    /// required rather than cosmetic: `Ord` must agree with `Eq`, and the
+    /// derived `Eq` says `Unknown(5) != Unknown(9)`. Ranking both as simply
+    /// "above Critical" and stopping there would report them equal, which
+    /// breaks the total order and, with it, `BTreeMap`/`sort` on this type.
+    fn rank(self) -> (u8, i32) {
+        match self {
+            StatusSeverity::Unspecified => (0, 0),
+            StatusSeverity::Info => (1, 0),
+            StatusSeverity::Warning => (2, 0),
+            StatusSeverity::Critical => (3, 0),
+            StatusSeverity::Unknown(v) => (4, v),
+        }
+    }
+}
+
+impl Ord for StatusSeverity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for StatusSeverity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -224,6 +300,24 @@ impl From<pb::EvictReason> for EvictReason {
             pb::EvictReason::Expiry => EvictReason::Expiry,
             pb::EvictReason::BlockConflict => EvictReason::BlockConflict,
             pb::EvictReason::Policy => EvictReason::Policy,
+        }
+    }
+}
+
+impl EvictReason {
+    /// Decode from the raw wire value.
+    ///
+    /// This exists because prost's generated `reason()` accessor is
+    /// `try_from(..).unwrap_or_default()`, which turns *any* unrecognized value
+    /// into the zero variant. Going through it made `EvictReason::Unknown`
+    /// unconstructible and reported a reason added by a newer node as
+    /// "unspecified" — indistinguishable from a producer that omitted the
+    /// field. Decode from the `i32` instead, as every other open enum here
+    /// does.
+    fn from_proto(v: i32) -> Self {
+        match pb::EvictReason::try_from(v) {
+            Ok(r) => r.into(),
+            Err(_) => EvictReason::Unknown(v),
         }
     }
 }
@@ -1055,7 +1149,9 @@ fn mempool_event(m: pb::MempoolEvent) -> Event {
             height: e.height,
         },
         Some(Body::LeaveEvicted(e)) => {
-            let reason = e.reason().into();
+            // NOT `e.reason()` — that accessor collapses an unrecognized value
+            // into the zero variant. See `EvictReason::from_proto`.
+            let reason = EvictReason::from_proto(e.reason);
             Event::MempoolLeaveEvicted { txid: e.txid, reason }
         }
         Some(Body::LeaveReplaced(e)) => Event::MempoolLeaveReplaced {
@@ -1080,5 +1176,152 @@ fn chain_event(c: pb::ChainEvent) -> Event {
             new_tip: r.new_tip,
         },
         None => Event::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_severity_decodes_to_unspecified_not_unknown() {
+        // proto3's zero value. Before this was its own variant it decoded to
+        // `Unknown(0)`, which ranked above `Critical`.
+        assert_eq!(StatusSeverity::from_proto(0), StatusSeverity::Unspecified);
+    }
+
+    #[test]
+    fn an_unset_severity_ranks_below_info() {
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Info);
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Critical);
+        // The regression this exists for: the documented filter must not page
+        // on a severity the producer never set.
+        assert!(StatusSeverity::from_proto(0) < StatusSeverity::Warning);
+    }
+
+    #[test]
+    fn known_severities_order_by_loudness() {
+        assert!(StatusSeverity::Info < StatusSeverity::Warning);
+        assert!(StatusSeverity::Warning < StatusSeverity::Critical);
+        for (v, want) in [
+            (1, StatusSeverity::Info),
+            (2, StatusSeverity::Warning),
+            (3, StatusSeverity::Critical),
+        ] {
+            assert_eq!(StatusSeverity::from_proto(v), want);
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_severity_still_outranks_critical() {
+        // Deliberate and unchanged: a level this build cannot name is not one
+        // to quietly filter out. A future `notice` at proto 4 would land here
+        // and page — the accepted cost of failing loud on an open taxonomy.
+        let future = StatusSeverity::from_proto(4);
+        assert_eq!(future, StatusSeverity::Unknown(4));
+        assert!(future > StatusSeverity::Critical);
+        assert!(future >= StatusSeverity::Warning);
+    }
+
+    #[test]
+    fn ord_agrees_with_eq_for_distinct_unknowns() {
+        // `Ord` must report `Equal` exactly when `Eq` does. Ranking every
+        // `Unknown` as simply "above Critical" would call these equal while
+        // `Eq` calls them different, breaking the total order.
+        let a = StatusSeverity::Unknown(5);
+        let b = StatusSeverity::Unknown(9);
+        assert_ne!(a, b);
+        assert_ne!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert!(a < b);
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn sorting_puts_the_loudest_last_and_the_unset_first() {
+        let mut all = vec![
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(7),
+            StatusSeverity::Unspecified,
+            StatusSeverity::Warning,
+            StatusSeverity::Info,
+        ];
+        all.sort();
+        assert_eq!(all, vec![
+            StatusSeverity::Unspecified,
+            StatusSeverity::Info,
+            StatusSeverity::Warning,
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(7),
+        ]);
+    }
+
+    #[test]
+    fn the_documented_filter_idiom_selects_what_it_should() {
+        let page = |s: StatusSeverity| s >= StatusSeverity::Warning;
+        assert!(!page(StatusSeverity::Unspecified));
+        assert!(!page(StatusSeverity::Info));
+        assert!(page(StatusSeverity::Warning));
+        assert!(page(StatusSeverity::Critical));
+        assert!(page(StatusSeverity::Unknown(4)));
+    }
+
+    #[test]
+    fn unspecified_and_unknown_zero_are_different_values() {
+        // Both mean "proto 0", but only `from_proto` produces `Unspecified`.
+        // `Unknown(0)` is still constructible by hand (`#[non_exhaustive]`
+        // blocks exhaustive matching, not construction) and deliberately keeps
+        // the loud rank — the asymmetry is documented rather than papered over,
+        // because nothing in the decode path can produce it.
+        assert_ne!(StatusSeverity::Unspecified, StatusSeverity::Unknown(0));
+        assert!(StatusSeverity::Unknown(0) > StatusSeverity::Critical);
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Info);
+    }
+
+    #[test]
+    fn the_order_is_total_across_mixed_sign_unknowns() {
+        // `rank()`'s second element exists to keep this a total order; a
+        // rank-only key would report every `Unknown` equal and break sorting.
+        let mut all = vec![
+            StatusSeverity::Unknown(i32::MAX),
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(i32::MIN),
+            StatusSeverity::Unspecified,
+            StatusSeverity::Unknown(0),
+            StatusSeverity::Info,
+        ];
+        all.sort();
+        assert_eq!(all, vec![
+            StatusSeverity::Unspecified,
+            StatusSeverity::Info,
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(i32::MIN),
+            StatusSeverity::Unknown(0),
+            StatusSeverity::Unknown(i32::MAX),
+        ]);
+        // Every unknown, including the extremes, still outranks Critical.
+        for v in [i32::MIN, -1, 0, 1, i32::MAX] {
+            assert!(StatusSeverity::Unknown(v) > StatusSeverity::Critical, "Unknown({v})");
+        }
+        // Transitivity spot-check across the variant boundary.
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Warning);
+        assert!(StatusSeverity::Warning < StatusSeverity::Unknown(i32::MIN));
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Unknown(i32::MIN));
+    }
+
+    #[test]
+    fn a_negative_severity_is_unrecognized_not_unset() {
+        assert_eq!(StatusSeverity::from_proto(-1), StatusSeverity::Unknown(-1));
+        assert!(StatusSeverity::from_proto(-1) > StatusSeverity::Critical);
+    }
+
+    #[test]
+    fn the_sibling_enums_split_unset_from_unrecognized_too() {
+        assert_eq!(StatusKind::from_proto(0), StatusKind::Unspecified);
+        assert_eq!(StatusKind::from_proto(99), StatusKind::Unknown(99));
+        assert_eq!(StatusState::from_proto(0), StatusState::Unspecified);
+        assert_eq!(StatusState::from_proto(99), StatusState::Unknown(99));
+        assert_eq!(EvictReason::from_proto(0), EvictReason::Unspecified);
+        assert_eq!(EvictReason::from_proto(99), EvictReason::Unknown(99));
+        assert_eq!(EvictReason::from_proto(1), EvictReason::FullPool);
     }
 }

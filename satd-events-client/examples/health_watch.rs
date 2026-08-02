@@ -146,6 +146,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // A one-shot observation: it happened, there is nothing to clear.
             StatusState::Edge => {}
+            // The producer did not set a state. This is the dangerous one to
+            // swallow: if the event that arrived unset was a *clear*, dropping
+            // it silently leaves the condition standing in `observed` for the
+            // life of the process, long after it recovered. We cannot infer
+            // which it was, so say so loudly and let the operator reconcile
+            // against `getwarnings` rather than trusting the set below.
+            StatusState::Unspecified => {
+                eprintln!(
+                    "  !! {name} arrived with no state — cannot tell raise from clear; \
+                     the standing set below may now be wrong"
+                );
+            }
             // The enum is non-exhaustive, so a state this build predates lands
             // here. Do not guess at its lifecycle — report it and move on.
             _ => {}
@@ -154,6 +166,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Route by severity rather than by kind, so a condition this build does
         // not recognize still reaches the right place.
         let route = match severity {
+            // The producer never set a severity. Log it — the kind and message
+            // are still meaningful — but do not page: an absent field is not a
+            // critical condition, and treating it as one pages on every partial
+            // or buggy producer.
+            StatusSeverity::Unspecified => "info",
             StatusSeverity::Info => "info",
             StatusSeverity::Warning => "warn",
             StatusSeverity::Critical => "PAGE",
@@ -184,6 +201,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn kind_name(kind: StatusKind) -> String {
     match kind {
+        // Distinct from `Unknown`: the field was never set, rather than set to
+        // something this build predates. Worth telling apart when you are
+        // deciding whether to upgrade the client or go fix the producer.
+        StatusKind::Unspecified => "unspecified".into(),
         StatusKind::IbdComplete => "ibd_complete".into(),
         StatusKind::TipStall => "tip_stall".into(),
         StatusKind::DiskLow => "disk_low".into(),
