@@ -153,6 +153,24 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   free-space probe is bounded and carried across polls, so a `blocksdir` on an
   unresponsive network mount stalls only the disk alert — never the other
   detectors — and strands at most one blocking thread rather than one per poll.
+- Alerting: outbound webhooks. `alertfile=<path>` configures any number of
+  signed HTTP hooks, each filtered by category/kind/severity. Bodies are
+  byte-identical to the streaming API's JSON for the same event; delivery
+  metadata rides in headers (`X-Satd-Signature`, `X-Satd-Delivery`,
+  `X-Satd-Hook`, `X-Satd-Attempt`). Delivery is serial and in-order per hook,
+  retried with exponential backoff on transient failures and skipped on a
+  permanent 4xx. The per-hook queue is bounded and overflow **drops silently**
+  — there is no in-band gap notice; the record is
+  `satd_alertwebhook_dropped_total` and a log line. Redirects are never followed — a 3xx is a permanent drop, so a
+  signed body cannot be steered to a host the alertfile never named. Delivery is
+  **best-effort**: nothing is persisted, a hook that was down resumes at the
+  live head, and drops are counted in `satd_alertwebhook_dropped_total`. The
+  Streaming Consumption API remains the surface for guaranteed, resumable
+  consumption. Hooks reload on SIGHUP
+  (keep-last-good on error); per-hook counters are exported as
+  `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
+  their original payload, now delivered by the same dispatcher — which also
+  moves that outbound HTTP off the consensus runtime.
 
 ## Releases
 

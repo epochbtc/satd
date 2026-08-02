@@ -204,6 +204,16 @@ impl EventPublisher {
         self.out.subscribe()
     }
 
+    /// How many receivers are currently subscribed to the envelope stream.
+    ///
+    /// A published event reaches exactly these; anything published while this
+    /// is zero is not buffered anywhere and cannot be recovered. That makes it
+    /// the observable a handover has to keep above zero — see
+    /// `satd::alert::AlertReloader::apply`.
+    pub fn subscriber_count(&self) -> usize {
+        self.out.receiver_count()
+    }
+
     /// Edge identity stamped on every envelope.
     pub fn edge(&self) -> &EdgeIdentity {
         &self.edge

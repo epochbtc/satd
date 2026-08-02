@@ -1008,6 +1008,10 @@ pub struct Config {
     /// node warning, with `%s` replaced by the warning text. `None` = no
     /// dispatcher. Read once at startup (restart to change), like Core.
     pub alert_notify: Option<String>,
+    /// Path to the TOML alertfile describing outbound webhooks. `None` = no
+    /// dispatcher. The path is restart-only; the file's *contents* are re-read
+    /// on every SIGHUP (the `authfile` model).
+    pub alertfile: Option<PathBuf>,
     /// Health detector: raise `tip_stall` after this many seconds with no
     /// connected block. Deliberately not gated on IBD — see
     /// `node::health::check_tip_stall_values`. `0` disables. SIGHUP-live.
@@ -3273,6 +3277,10 @@ impl Config {
                 .or_else(|| file_get("reorgwebhooksecret")),
             block_notify: cli.blocknotify.clone().or_else(|| file_get("blocknotify")),
             alert_notify: cli.alertnotify.clone().or_else(|| file_get("alertnotify")),
+            alertfile: cli
+                .alertfile
+                .clone()
+                .or_else(|| file_get("alertfile").map(PathBuf::from)),
             alert_tip_stall_seconds: cli
                 .alert_tip_stall_seconds
                 .or_else(|| file_get("alerttipstallseconds").and_then(|v| v.parse().ok()))
@@ -5156,6 +5164,13 @@ pub struct CliArgs {
     pub reorg_webhook_secret: Option<String>,
 
     #[arg(
+        long = "alertfile",
+        value_name = "PATH",
+        help = "TOML file describing outbound alert webhooks (see the Operator Manual). Must be mode 0600 — it holds signing secrets."
+    )]
+    pub alertfile: Option<PathBuf>,
+
+    #[arg(
         long = "alerttipstallseconds",
         value_name = "SECS",
         help = "Raise the tip_stall health alert after this many seconds with no connected block (default 3600, 0 on regtest; 0 disables)"
@@ -6213,7 +6228,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "shutdownnotify",
     "reorgwebhook",
     "reorgwebhooksecret",
-    // Health-alert detector thresholds (A3)
+    // Health alerts + webhook dispatcher (A3)
+    "alertfile",
     "alerttipstallseconds",
     "alertdiskfreemb",
     "alertmempoolfullpct",
@@ -7505,6 +7521,7 @@ rpcport=8332
             shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            alertfile: None,
             alert_tip_stall_seconds: None,
             alert_disk_free_mb: None,
             alert_mempool_full_pct: None,
@@ -7789,6 +7806,7 @@ rpcport=8332
             shutdownnotify: None,
             reorg_webhook: None,
             reorg_webhook_secret: None,
+            alertfile: None,
             alert_tip_stall_seconds: None,
             alert_disk_free_mb: None,
             alert_mempool_full_pct: None,

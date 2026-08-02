@@ -52,6 +52,7 @@ node-index = { path = "../node-index" }
 node-filter-index = { path = "../node-filter-index" }
 esplora-handlers = { path = "../esplora-handlers" }
 satd-auth = { path = "../satd-auth" }
+satd-alert = { path = "../satd-alert" }
 electrum-proto = { path = "../electrum-proto" }
 tls-config = { path = "../tls-config" }
 satd-events = { path = "../events", features = ["grpc", "zmq", "ws"] }
@@ -81,6 +82,10 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 rcgen = { workspace = true }
+# Constant-time signature comparison in the webhook e2e helper: that helper is
+# the most likely thing a third party copies when writing a receiver, and the
+# spec requires a constant-time compare.
+subtle = { workspace = true }
 # Streaming E2E harness (tests/e2e/streaming.rs, folded into the `e2e` test
 # target): a real gRPC client (tonic,
 # pinned to the workspace version so it matches the `satd_events::proto`

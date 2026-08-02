@@ -44,10 +44,21 @@ fn mine_addr(seed: u8) -> String {
 /// readiness with `reqwest::blocking`, whose internal runtime panics if dropped
 /// on a tokio worker thread — so the (blocking) startup runs on a blocking
 /// task.
-async fn start_streaming_async(args: Vec<&'static str>) -> StreamingNode {
+pub(crate) async fn start_streaming_async(args: Vec<&'static str>) -> StreamingNode {
     tokio::task::spawn_blocking(move || StreamingNode::start(&args))
         .await
         .unwrap()
+}
+
+/// Like [`start_streaming_async`] but for arguments computed at runtime (a
+/// temp path, an allocated port), which cannot be `&'static str` literals.
+pub(crate) async fn start_streaming_owned(args: Vec<String>) -> StreamingNode {
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        StreamingNode::start(&refs)
+    })
+    .await
+    .unwrap()
 }
 
 /// `getserverstatus` reports the runtime-bound gRPC + streamws listener
@@ -288,7 +299,7 @@ async fn coinbase1(sn: &StreamingNode) -> String {
         .unwrap()
 }
 
-async fn mine_n(sn: &StreamingNode, n: u32) {
+pub(crate) async fn mine_n(sn: &StreamingNode, n: u32) {
     let rpc = sn.node.rpc_handle();
     let addr = mine_addr(0x99);
     tokio::task::spawn_blocking(move || rpc.mine(n, &addr))
@@ -1792,8 +1803,16 @@ async fn grpc_watch_txid_unconfirmed_on_invalidateblock() {
 /// authoritative), so the value is written there — which means it must not have
 /// been passed on the command line as anything other than its startup default.
 async fn set_alert_threshold(sn: &StreamingNode, key: &str, value: &str) {
+    sighup_with_conf(sn, &format!("{key}={value}\n")).await;
+}
+
+/// Replace the node's `bitcoin.conf` `[regtest]` section and SIGHUP, waiting
+/// for the reload to land. Only the config *file* is re-read on SIGHUP (startup
+/// CLI args stay authoritative), so a key set on the command line cannot be
+/// changed this way.
+pub(crate) async fn sighup_with_conf(sn: &StreamingNode, body: &str) {
     let conf = sn.node.datadir.join("bitcoin.conf");
-    std::fs::write(&conf, format!("[regtest]\n{key}={value}\n")).expect("write bitcoin.conf");
+    std::fs::write(&conf, format!("[regtest]\n{body}")).expect("write bitcoin.conf");
     let pid = sn.node.process.id().to_string();
     let status = tokio::task::spawn_blocking(move || {
         std::process::Command::new("kill")

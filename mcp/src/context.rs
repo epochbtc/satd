@@ -28,4 +28,6 @@ pub struct McpContext {
     /// Health-detector readings, so `get_metrics_snapshot` renders the same
     /// health gauges as the HTTP scrape. `None` in tests that bypass main.rs.
     pub health: Option<Arc<node::health::HealthState>>,
+    /// Webhook delivery counters, for the same reason. `None` in tests.
+    pub webhooks: Option<Arc<node::metrics::WebhookMetrics>>,
 }

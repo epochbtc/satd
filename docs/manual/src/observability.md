@@ -145,6 +145,174 @@ and `satd_disk_free_bytes` (free space on the watched directory). The latter is
 omitted rather than reported as zero when the filesystem cannot be
 interrogated.
 
+## Alert webhooks
+
+The three surfaces above all require something to be *watching* the node. A
+webhook pushes instead: point `alertfile=<path>` at a TOML file and satd POSTs
+each matching event to your endpoint.
+
+```toml
+version = 1
+
+[[webhook]]
+id = "pager"                        # unique; appears in the X-Satd-Hook header and metric labels
+url = "https://alerts.example/satd"
+secret = "a-long-random-string"     # required — it signs every delivery
+categories = ["status"]             # status | chain | mempool | heartbeat
+kinds = ["tip_stall", "disk_low"]   # optional, status only
+min_severity = "warning"            # optional, status only
+
+[[webhook]]
+id = "deadman"
+url = "https://hc-ping.example/abc123"
+secret = "another-long-random-string"
+categories = ["heartbeat"]
+heartbeat_interval_secs = 300       # one ping per 5 min, not the bus's 1 Hz
+```
+
+The file must be mode `0600` — it holds signing secrets, and satd refuses to
+read a group- or world-accessible one. Its **contents** are re-read on every
+`SIGHUP`, so hooks can be added, edited, or removed without a restart; the
+**path** is fixed at startup. A parse error on reload keeps the last-good hook
+set and logs why, because alerting that silently stopped after a typo is the
+worse failure.
+
+### What arrives
+
+```http
+POST /your/endpoint HTTP/1.1
+Content-Type: application/json
+X-Satd-Signature: sha256=<hex HMAC-SHA256(secret, canonical string)>
+X-Satd-Timestamp: 1753400000
+X-Satd-Delivery: <node_id>-<instance_id>-<seq>
+X-Satd-Hook: pager
+X-Satd-Attempt: 1
+X-Satd-Webhook-Version: 2
+
+{"schema_version":1,"stamp":{...},"body":{"category":"status", ...}}
+```
+
+The body is **byte-identical** to the JSON a WebSocket subscriber receives for
+the same event, so a receiver parses webhook bodies and streaming frames with
+one code path. Delivery metadata rides in headers and never in the body — which
+is what makes the signature stable across retries.
+
+### Verifying a delivery
+
+The signature covers a **canonical string**, not the bare body — five fields
+joined by newlines, with the raw body last:
+
+```
+"2" LF <X-Satd-Timestamp> LF <X-Satd-Delivery> LF <X-Satd-Hook> LF <raw body>
+```
+
+Signing only the body would leave `X-Satd-Delivery` unauthenticated *and*
+predictable, and that header is the one this page tells you to deduplicate on.
+One captured `(body, signature)` pair could then be replayed under forged future
+delivery ids, poisoning your dedup cache so the real alerts were discarded on
+arrival while satd counted them delivered. Binding the id, the hook, and a
+timestamp into the signed material closes that.
+
+So a receiver must:
+
+1. Read `X-Satd-Timestamp` and reject anything older than **600 seconds**. This
+   is not optional — it is what stops a captured delivery being a permanent
+   replay token. A delivery still being retried after the window ages out by
+   design; a 20-minute-old "disk is filling" alert is not worth acting on.
+2. Rebuild the canonical string above from the raw body, **before parsing it**.
+3. Compare the HMAC in constant time.
+4. Deduplicate on `X-Satd-Delivery` — stable across retries of one event, and
+   unique across restarts, so a retry and a genuine repeat are distinguishable.
+5. Reply `2xx` to acknowledge.
+
+> **Upgrading from the pre-release v1 scheme.** Earlier drafts signed the raw
+> body alone and sent `X-Satd-Webhook-Version: 1`. The legacy `reorgwebhook=`
+> keys still use exactly that, unchanged, and still report version `1` — branch
+> on the version header rather than assuming one scheme.
+
+The `X-Satd-Delivery` value is opaque; do not parse it. Deduplicate on the whole
+header: it is unique per event and stable across the retries of one delivery, so
+the only duplicate you can receive is a retry of something you already saw.
+
+### Delivery behavior
+
+- **Serial and in-order per hook** — one request in flight at a time, so events
+  arrive in the order the node produced them.
+- **Retried with backoff** on 5xx, 408, 429, timeouts, and connection failures:
+  1 s doubling to a 5-minute ceiling — but **not forever**. A delivery is
+  abandoned once it ages past the 600 s freshness window it was signed with,
+  which lands somewhere around the tenth or eleventh attempt. That is
+  deliberate: the signed timestamp is the only staleness signal a receiver
+  checks, so a delivery that could no longer pass that check is not worth
+  sending. The practical consequence is that a receiver down for longer than
+  ten minutes — a relay redeploy, a restart that takes a while — loses the
+  events raised during the outage. Alert on
+  `satd_alertwebhook_dropped_total` if that matters to you; the detectors
+  re-raise standing health conditions, so those recover on their own, but
+  chain and mempool events do not.
+  Any *other* 4xx is treated as permanent, counted, and skipped — a receiver
+  answering 404 forever must not pin the queue and turn every later event into
+  a drop. The skip is counted in `satd_alertwebhook_dropped_total` and logged.
+- **Redirects are not followed.** A 3xx is a permanent drop. The URL in the
+  alertfile is where the signed body goes; following a redirect would move it —
+  signature, hook identity and all — to a host you never named, and the useful
+  targets for that are exactly the ones you cannot see: a cloud metadata
+  endpoint, an RFC1918 admin port, the node's own RPC. If your receiver moves,
+  update the alertfile.
+- **Bounded queue.** A hook that falls far enough behind drops events. They are
+  counted in `satd_alertwebhook_dropped_total` and logged; nothing is held for
+  later and nothing is inserted into the stream to tell the receiver.
+- **Nothing reaches consensus.** Deliveries run on the isolated API runtime;
+  a stalled endpoint cannot affect block connection.
+- **Best-effort, and that is the whole contract.** Nothing is persisted. A
+  webhook fires when something happens and is retried while your endpoint is
+  briefly unreachable; that is all it promises. A node that was down did not
+  deliver those events and will not go back for them — when it comes up, its
+  hooks resume at the live head. Health alerts are the exception, and they get
+  it for free: the detectors re-evaluate at startup and re-raise anything still
+  true (see **Durability** above), so a standing problem still reaches you.
+
+  If you need guaranteed delivery, resumability across downtime, or history,
+  use the [Streaming Consumption API](streaming.md). That is the recommended
+  way to integrate with satd and it does all three properly — real cursors,
+  backpressure, and a bounded `RescanBlocks`. Webhooks are for automation you
+  are happy to miss occasionally: page me, poke a script, ping a dead-man's
+  switch.
+- **`chain` alerts are suppressed during initial block download.** A node
+  syncing from scratch does not POST its entire block history. `status`,
+  `heartbeat` **and `mempool`** keep flowing: health alerts stay live because
+  "this node is unhealthy" is exactly as true mid-sync, and the heartbeat keeps
+  flowing so an external dead-man's switch does not declare a syncing node dead.
+  Note the consequence for `mempool` hooks — a mainnet mempool subscription is
+  thousands of events a minute, and a multi-day sync does not quiet it. What was
+  suppressed is counted in `satd_alertwebhook_dropped_total`. The suppression is
+  latched on leaving IBD once, so a node whose tip later goes stale keeps
+  alerting — which is the whole point of a stalled-tip alert.
+
+Plaintext `http://` is accepted for loopback and private-network targets. For a
+public host, use `https://` or set `allow_insecure_http = true` on the hook.
+
+Per-hook counters are exported: `satd_alertwebhook_delivered_total`,
+`_failed_attempts_total`, `_dropped_total` (events lost, not held —
+there is no dead-letter queue),
+`_queue_depth`, and `_last_success_age_seconds`, all labelled `hook="<id>"`.
+Nothing is exported when no hook is configured.
+
+> **Note.** The older `reorgwebhook=` / `reorgwebhooksecret=` keys still work
+> and are now served by this dispatcher, with their original `ReorgRecord`
+> payload and v1 body-only signature unchanged.
+>
+> **One behavior did change:** redirects are no longer followed. A receiver
+> that answers 301/302 — an `http`→`https` proxy hop, a trailing-slash
+> redirect, a load balancer that relocates — used to be chased and now
+> classifies as a permanent drop. If your reorg endpoint relies on a redirect,
+> point `reorgwebhook=` at the final URL; otherwise every reorg record is
+> silently discarded. Everything else about the payload and signature is
+> byte-identical, so a receiver on a stable URL needs no edits.
+>
+> New deployments should prefer an `alertfile` hook with
+> `categories = ["chain"]`, which delivers the standard event envelope.
+
 ## Structured JSON Logging
 
 `satd` logs to stdout. Use `--log-format=json` to switch from the text format
