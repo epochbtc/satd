@@ -11,8 +11,8 @@
 use std::time::Duration;
 
 use satd_events_client::{
-    Categories, Cursor, Event, PrefixWatcher, ResilientConfig, StreamClient, StreamError,
-    SubscribeOptions,
+    Categories, Cursor, Event, PrefixWatcher, ResilientConfig, StatusKind, StatusSeverity,
+    StatusState, StreamClient, StreamError, SubscribeOptions,
 };
 
 use crate::common::{
@@ -265,6 +265,71 @@ async fn sdk_resilient_subscribe_replays_from_cursor() {
     let ev = next_resilient(&mut sub, 15).await;
     let Event::BlockConnected { height, .. } = ev else { panic!("expected block, got {ev:?}") };
     assert_eq!(height, 2, "resilient subscription replays from cursor.height + 1");
+}
+
+/// The typed `Event::Status` path end to end: a real condition detected by a
+/// real node, decoded by the SDK.
+///
+/// The threshold is moved *after* subscribing rather than set on the command
+/// line: status events are not replayable, so a condition raised during startup
+/// would never reach a client that had not finished connecting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_status_events_decode_typed() {
+    let sn = start_async(vec![]).await;
+    let mut client = connect(&sn).await;
+    let mut stream = client
+        .subscribe(SubscribeOptions { categories: Categories::STATUS, ..Default::default() })
+        .await
+        .expect("subscribe");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // An unreachable disk floor (2^44 MiB) fires `disk_low` on any filesystem.
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+
+    let ev = next_matching(&mut stream, 45, |e| matches!(e, Event::Status { .. })).await;
+    let Event::Status { kind, state, severity, message, details } = ev else { unreachable!() };
+    assert_eq!(kind, StatusKind::DiskLow);
+    assert_eq!(state, StatusState::Raised);
+    assert_eq!(severity, StatusSeverity::Critical);
+    assert!(!message.is_empty(), "a status event always carries a message");
+    // `details` is the machine-readable half; a client switches on `kind` and
+    // reads these rather than parsing the message.
+    assert!(details.contains_key("free_bytes"), "details: {details:?}");
+    assert!(details.contains_key("threshold_bytes"), "details: {details:?}");
+    // Severity is ordered, so a client filters with a comparison.
+    assert!(severity >= StatusSeverity::Warning);
+    // Status events are not replayable and must not advance a resume position.
+    assert!(stream.cursor().is_none(), "status must not anchor a cursor");
+}
+
+/// A `CHAIN`-only subscription must not receive status events: the category is
+/// explicit-request only, which is what keeps an older client safe across a
+/// node upgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_status_absent_without_the_category_bit() {
+    let sn = start_async(vec![]).await;
+    let mut client = connect(&sn).await;
+    let mut stream = client
+        .subscribe(SubscribeOptions { categories: Categories::CHAIN, ..Default::default() })
+        .await
+        .expect("subscribe");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+    mine_n(&sn, 2).await;
+
+    // Read a bounded number of events; a status body among them would be a bug.
+    for _ in 0..4 {
+        let Ok(Ok(Some(ev))) =
+            tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+        else {
+            break;
+        };
+        assert!(
+            !matches!(ev, Event::Status { .. }),
+            "a CHAIN-only subscription must never receive status events",
+        );
+    }
 }
 
 /// Next event from a `ResilientSubscription`, panicking on timeout / error.

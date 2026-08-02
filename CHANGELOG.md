@@ -184,6 +184,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   best-effort delivery semantics), linked from the streaming spec and the
   Operator Manual; `CORE_DIFFERENCES.md` gains entries for node-health alerts
   and the webhook surface.
+- Alerting: Rust SDK (`satd-events-client`) support for node-health events. New
+  `Categories::STATUS` bit and typed `Event::Status { kind, state, severity,
+  message, details }` with open `StatusKind` / `StatusState` / `StatusSeverity`
+  enums — an unrecognized value from a newer node surfaces as `Unknown(i32)`
+  rather than an error, and `StatusSeverity` is ordered so a client filters with
+  a comparison. All three are `#[non_exhaustive]`, so a condition added
+  node-side stays additive for downstream consumers. New runnable
+  `examples/health_watch.rs`.
 
 ## Releases
 

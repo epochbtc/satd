@@ -446,11 +446,16 @@ underlying gRPC contract is the [streaming spec](streaming.md).
 Runnable examples live in
 [`satd-events-client/examples/`](https://github.com/epochbtc/satd/tree/master/satd-events-client/examples):
 `firehose_tail`, `resilient_tail`, `resilient_watch`, `watch_outpoints`,
-`descriptor_wallet`, `lifecycle_alarms`, `prefix_privacy`, plus `tls_tail`
-and `mtls_tail` over an encrypted transport.
+`descriptor_wallet`, `lifecycle_alarms`, `prefix_privacy`, `health_watch`, plus
+`tls_tail` and `mtls_tail` over an encrypted transport.
+
+`health_watch` is the alerting shape: subscribe with `Categories::STATUS`,
+track raise/clear pairs to hold "what is wrong right now", and route by
+severity so a condition your build predates still reaches the right place.
 
 ```sh
 cargo run -p satd-events-client --example resilient_tail -- http://127.0.0.1:50051 /tmp/satd.cursor
 cargo run -p satd-events-client --example resilient_watch -- http://127.0.0.1:50051 /tmp/satd-watch.cursor
 cargo run -p satd-events-client --example tls_tail -- https://node.example:50051 ./node-ca.pem
+cargo run -p satd-events-client --example health_watch -- http://127.0.0.1:50051
 ```
