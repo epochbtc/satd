@@ -2,6 +2,14 @@
 # Build output of the standalone BDK canary crate (scripts/canary/bdk-canary).
 # Its Cargo.lock IS committed (reproducible downstream pin); its target/ is not.
 /scripts/canary/bdk-canary/target
+
+# Same for the reference push relay (contrib/push-relay): a standalone crate
+# excluded from the workspace, so the root /target rule does not cover it. The
+# rule lives this early in the stack, ahead of the crate it protects, because
+# 831 MiB of its build output was once committed by a stray `git add -A` four
+# PRs before the crate itself existed — and .gitignore does not untrack what is
+# already tracked.
+/contrib/push-relay/target
 *.swp
 .idea/
 .vscode/

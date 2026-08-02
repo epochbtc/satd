@@ -130,6 +130,29 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   capability gates on the RPC surface. Not replayable (no cursor —
   detectors re-raise standing conditions after a restart). Wire schema only in
   this change; the detectors that emit them land next.
+- Alerting: node-health detectors. satd now watches six conditions about itself
+  — stalled tip, low disk, congested mempool, peer starvation, IBD completion,
+  deep reorg — and reports each through three surfaces at once: a `status`
+  streaming event, an entry in `getwarnings` (which fires the Core-compatible
+  `alertnotify` hook), and a `satd_alert_active{kind}` gauge. Standing
+  conditions raise once and clear once, with hysteresis so a value sitting on
+  the threshold does not flap. The one-shot events (`ibd_complete`,
+  `deep_reorg`) fire `alertnotify` and the streaming event but deliberately do
+  **not** enter `getwarnings` — nothing would ever clear them, and on chains
+  where multi-block reorgs are routine that would wedge
+  `getblockchaininfo.warnings` and the TUI modal permanently. Five new hot-reloadable thresholds
+  (`alerttipstallseconds=3600` — `0` on regtest, `alertdiskfreemb=10240`,
+  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest, and capped by
+  the number of `-connect=` peers when that is set —
+  `alertreorgdepth=3` — `10` on test networks, `0` on regtest); `0` disables a
+  detector. `deep_reorg` depth, fork
+  height and new tip are read from the durable reorg log, so they are exact
+  regardless of chain-event lag. Two new gauges close longstanding observability gaps
+  independently of alerting: `satd_tip_last_connect_age_seconds` and
+  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`. The
+  free-space probe is bounded and carried across polls, so a `blocksdir` on an
+  unresponsive network mount stalls only the disk alert — never the other
+  detectors — and strands at most one blocking thread rather than one per poll.
 
 ## Releases
 

@@ -25,4 +25,7 @@ pub struct McpContext {
     /// Subscription registry handle for the active-subscribers gauge.
     /// `None` in tests that bypass main.rs.
     pub addr_subs: Option<Arc<node::index::address::SubscriptionRegistry>>,
+    /// Health-detector readings, so `get_metrics_snapshot` renders the same
+    /// health gauges as the HTTP scrape. `None` in tests that bypass main.rs.
+    pub health: Option<Arc<node::health::HealthState>>,
 }

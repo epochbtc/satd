@@ -48,6 +48,12 @@ pub struct MetricsContext {
     /// so operators can confirm at a glance which DB-backed indexes
     /// are live.
     pub addr_enabled: bool,
+    /// Live readings from the health detectors. `None` in test backends and
+    /// anywhere the detector task was not spawned, in which case the health
+    /// gauges are omitted entirely rather than reported as zeros (a zero
+    /// `satd_disk_free_bytes` is exactly the alarm an operator must not be
+    /// shown falsely).
+    pub health: Option<Arc<crate::health::HealthState>>,
 }
 
 impl MetricsContext {
@@ -328,6 +334,9 @@ impl MetricsContext {
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
 
+        // Node-health gauges, rendered only when the detector task is running.
+        render_health_metrics(&mut out, self.health.as_deref());
+
         // Transaction-filtering policy metrics (design §10, PR 7c). Extracted to
         // a free function so the I8-invisibility invariant (a node with no
         // non-empty ruleset renders a byte-identical page) is unit-testable
@@ -361,8 +370,26 @@ fn metric(
     labels: &[(&str, &str)],
     value: u64,
 ) {
+    metric_header(out, name, help, kind);
+    metric_sample(out, name, labels, value);
+}
+
+/// Emit the `# HELP` / `# TYPE` pair for a metric family, once.
+///
+/// The text format permits **one** such pair per family name. [`metric`] writes
+/// a header with every sample, which is correct only for a single-series
+/// family; calling it in a loop emits repeated headers, and a strict parser
+/// (`promtool check metrics`, and the `expfmt` text parser several collectors
+/// and relays use) hard-errors on the second `# HELP` and discards the *entire
+/// page* — taking every unrelated satd metric down with it. For a multi-series
+/// family call this once, then [`metric_sample`] per series.
+fn metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// Emit one sample of an already-headered metric family.
+fn metric_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
     if labels.is_empty() {
         let _ = writeln!(out, "{name} {value}");
     } else {
@@ -374,6 +401,60 @@ fn metric(
             let _ = write!(label_str, "{k}=\"{}\"", escape_label(v));
         }
         let _ = writeln!(out, "{name}{{{label_str}}} {value}");
+    }
+}
+
+/// Append the node-health gauges (§A3): tip age, free disk, and one 0/1 series
+/// per standing alert condition.
+///
+/// `satd_alert_active` is pre-registered for *every* kind, including ones that
+/// are not currently raised, so an alerting rule can be written against a series
+/// that exists from the first scrape — a gauge that only appears once the
+/// condition fires is exactly the gauge you cannot alert on. Edge kinds
+/// (`ibd_complete`, `deep_reorg`) have no standing state and are omitted: a
+/// permanently-zero series would invite a rule that can never fire.
+///
+/// Renders nothing at all when no detector task is running (`None`), rather
+/// than emitting zeros that would read as real readings.
+fn render_health_metrics(out: &mut String, health: Option<&crate::health::HealthState>) {
+    let Some(health) = health else {
+        return;
+    };
+    metric(
+        out,
+        "satd_tip_last_connect_age_seconds",
+        "Seconds since the last block was connected to the active chain (since process start if none has been).",
+        "gauge",
+        &[],
+        health.last_connect_age_secs(),
+    );
+    // Omitted rather than zeroed when the filesystem cannot be interrogated.
+    if let Some(free) = health.disk_free_bytes() {
+        metric(
+            out,
+            "satd_disk_free_bytes",
+            "Free space available to satd on the watched data/blocks directory.",
+            "gauge",
+            &[],
+            free,
+        );
+    }
+    metric_header(
+        out,
+        "satd_alert_active",
+        "1 while a node-health condition is raised, 0 while it is clear.",
+        "gauge",
+    );
+    for kind in crate::events::StatusKind::ALL {
+        if kind.is_edge() {
+            continue;
+        }
+        metric_sample(
+            out,
+            "satd_alert_active",
+            &[("kind", kind.as_str())],
+            u64::from(health.is_active(kind)),
+        );
     }
 }
 
@@ -713,6 +794,101 @@ mod tests {
         assert_eq!(scope_label(true, false), "relay");
         assert_eq!(scope_label(false, true), "template");
         assert_eq!(scope_label(false, false), "none");
+    }
+
+    #[test]
+    fn health_metrics_absent_without_a_detector_task() {
+        // Rendering zeros here would show a `satd_disk_free_bytes 0` — the
+        // exact alarm an operator must not be given falsely.
+        let mut out = String::new();
+        render_health_metrics(&mut out, None);
+        assert!(out.is_empty(), "no detector ⇒ no health metrics:\n{out}");
+    }
+
+    /// Assert a rendered page is valid Prometheus text format on the one rule
+    /// that is easy to break and fatal when broken: at most one `# HELP` and
+    /// one `# TYPE` per family name.
+    ///
+    /// Strict parsers (`promtool check metrics`, `expfmt.TextParser`) reject
+    /// the whole page on a duplicate, so one careless family takes every other
+    /// satd metric down with it. Prometheus's own scrape parser is lenient,
+    /// which is exactly why this is worth a test rather than a scrape check.
+    fn assert_one_header_per_family(out: &str) {
+        use std::collections::HashMap;
+        let mut helps: HashMap<&str, usize> = HashMap::new();
+        let mut types: HashMap<&str, usize> = HashMap::new();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                *helps.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                *types.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            }
+        }
+        for (name, n) in helps {
+            assert_eq!(n, 1, "family {name} has {n} `# HELP` lines:\n{out}");
+        }
+        for (name, n) in types {
+            assert_eq!(n, 1, "family {name} has {n} `# TYPE` lines:\n{out}");
+        }
+    }
+
+    #[test]
+    fn health_metrics_are_valid_exposition_format() {
+        // `satd_alert_active` is one family with a series per kind, so the
+        // header must be emitted once and the samples must follow it.
+        let health = crate::health::HealthState::new();
+        health.set_disk_free_for_test(Some(1 << 30));
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert_one_header_per_family(&out);
+    }
+
+    #[test]
+    fn health_metrics_preregister_every_standing_kind() {
+        use crate::events::StatusKind;
+        let health = crate::health::HealthState::new();
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+
+        // The tip-age gauge always renders.
+        assert!(out.contains("satd_tip_last_connect_age_seconds 0"), "{out}");
+        // Disk is omitted until sampled, rather than reported as zero free.
+        assert!(
+            !out.contains("satd_disk_free_bytes"),
+            "an unsampled disk reading must be omitted, not zeroed:\n{out}"
+        );
+        // Every standing condition has a series from the first scrape, so an
+        // alerting rule can reference one before it ever fires.
+        for kind in StatusKind::ALL {
+            let want = format!("satd_alert_active{{kind=\"{}\"}} 0", kind.as_str());
+            if kind.is_edge() {
+                assert!(
+                    !out.contains(&format!("kind=\"{}\"", kind.as_str())),
+                    "edge kind {kind:?} has no standing state to report:\n{out}"
+                );
+            } else {
+                assert!(out.contains(&want), "missing series {want}:\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn health_metrics_reflect_a_raised_condition() {
+        use crate::events::StatusKind;
+        let health = crate::health::HealthState::new();
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert!(out.contains("satd_alert_active{kind=\"disk_low\"} 0"));
+
+        // Simulate the detector raising `disk_low` with a real reading.
+        health.set_active_for_test(StatusKind::DiskLow, true);
+        health.set_disk_free_for_test(Some(4096));
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert!(out.contains("satd_alert_active{kind=\"disk_low\"} 1"), "{out}");
+        assert!(out.contains("satd_disk_free_bytes 4096"), "{out}");
+        // Unrelated conditions stay at 0.
+        assert!(out.contains("satd_alert_active{kind=\"tip_stall\"} 0"), "{out}");
     }
 
     #[test]

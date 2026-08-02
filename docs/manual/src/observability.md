@@ -45,6 +45,106 @@ labels) and does not consume an RPC worker on every scrape.
 > one-time handshake bytes are not included, so absolute socket totals read
 > marginally lower than the kernel's.
 
+## Node-health alerts
+
+Metrics tell you what the node is doing; health alerts tell you when it has
+stopped doing it. satd watches six conditions about *itself* and reports each
+one through three surfaces at once, so they can never disagree:
+
+*   a `status` event on the [Streaming Consumption API](streaming.md) (category
+    bit 16 — see §7.8 of the wire spec),
+*   an entry in `getwarnings` (and therefore in `getblockchaininfo.warnings`
+    and the TUI), which also fires the Core-compatible `alertnotify` hook,
+*   a `satd_alert_active{kind="..."}` gauge on `/metrics`.
+
+**One-shot events are the exception to the middle surface.** `ibd_complete` and
+`deep_reorg` describe something that *happened*; there is no state for anything
+to later clear. They fire `alertnotify` and emit their `status` event, but they
+do **not** create a `getwarnings` entry. An entry nothing clears would sit in
+`getblockchaininfo.warnings` for the life of the process and hold the TUI's
+warning modal open — which on signet and testnet4, where reorgs several blocks
+deep are ordinary, would happen on the first one and never stop. The durable
+record of a reorg is the reorg log (`getreorghistory`), not the warnings set.
+
+| Condition | Severity | Raises when | Clears when |
+|---|---|---|---|
+| `ibd_complete` | info | initial block download finishes | one-shot |
+| `tip_stall` | critical | no block connected for `alerttipstallseconds`, outside IBD | the next block connects, or the threshold no longer considers the tip stalled |
+| `disk_low` | critical | free space below `alertdiskfreemb` | free space reaches 1.5× the floor, or the floor is lowered below the current reading |
+| `mempool_congested` | warning | mempool at `alertmempoolfullpct` of its cap | occupancy drops below 75 % of the raise line, or the threshold is raised above the current occupancy |
+| `peer_floor` | warning | fewer than `alertpeerfloor` peers for 60 s (after a 90 s startup grace) | at or above the floor for 60 s |
+| `deep_reorg` | critical | a reorg rolled back ≥ `alertreorgdepth` blocks (default `3` on mainnet, `10` on test networks, off on regtest) | one-shot |
+
+Every standing condition raises **once** on entry and clears **once** on
+recovery — you get a pair of events, not a stream of repeats — and the gap
+between the raise and clear lines (a ratio, a hold time, or both) means a value
+sitting on the threshold does not flap your pager. `ibd_complete` and
+`deep_reorg` describe things that happened rather than states that persist, so
+they are one-shot: they never clear, and for the same reason they never enter
+`getwarnings` at all.
+
+Thresholds are configured with the `alert*` keys in the
+[Configuration Reference](config-reference.md#health-alerts); all of them are
+hot-reloadable, and setting one to `0` disables that detector. Each event
+carries a `details` map with the numbers behind it (free bytes and the floor,
+seconds since the last block and the tip height, the reorg's true depth and
+fork height, the mempool's current `mempoolminfee`), so an alert is actionable
+without a follow-up query. The watched *path* is deliberately not in the event —
+it goes to every `status` subscriber and into push-notification bodies, and an
+absolute datadir path usually names the account it runs under. The node logs it
+instead.
+
+**Retuning a threshold always clears its own alert.** The gap between each raise
+and clear line stops a value hovering at the threshold from flapping, but it
+would otherwise trap the operator who raises a threshold *because* the alert is
+firing: the unchanged reading lands between the new raise line and the new clear
+line, where neither fires. So a standing condition also clears when the
+threshold moves such that it would no longer raise. Without this,
+`mempool_congested` in particular was inescapable — `alertmempoolfullpct` clamps
+at 100 and the clear line is 75 % of the raise line, so past 75 % occupancy no
+setting could clear it.
+
+`alertreorgdepth` defaults to `3` on mainnet, where a reorg that deep costs real
+hashrate and invalidates transactions merchants have started treating as
+settled. Signet, testnet and testnet4 default to `10`: those chains are not
+economically secured, and reorgs a few blocks deep are an ordinary consequence
+of thin, volatile hashrate rather than an incident. Defaulting them to mainnet's
+sensitivity would run `-alertnotify` for the network working as designed, and an
+alert that fires during normal operation is one you learn to ignore — which
+costs you the mainnet alert too. It is raised rather than switched off because
+past the 6-confirmation convention a wallet has been told something false, and
+that is worth reporting on any chain. Regtest is off entirely; its test suites
+reorg deliberately. Set `alertreorgdepth=3` explicitly if you want mainnet
+sensitivity on a test network.
+
+`alertpeerfloor` defaults to `3` everywhere except regtest, where it is `0`
+(disabled) because running with no peers at all is a regtest node's normal
+operating state rather than a fault. Signet keeps the floor: it is a public
+network with real peers, and a detector defaulted off is indistinguishable from
+a healthy one — `satd_alert_active{kind="peer_floor"}` reads `0` either way. Set
+`alertpeerfloor=0` explicitly on a deliberately isolated signet node.
+
+Where the floor is active, a node that has never seen a peer gets a 90 s startup
+grace, and the ordinary hold begins when that grace expires or when the first
+peer arrives, whichever comes first. The grace defers the start of the hold
+rather than shortening it, so a node still dialing out does not page anyone on
+the way up.
+
+**Durability.** Health events are not replayable: they carry no resume cursor,
+and a `from_cursor` reconnect never yields one. Instead the detectors
+re-evaluate from scratch on startup and re-raise anything still standing, so a
+consumer that was disconnected across a restart still learns about a live
+problem. A condition that both raised and cleared while nothing was listening is
+stale by definition and is not reconstructed. For the same reason, a subscriber
+that attaches *after* a condition raised will not see it until the condition
+changes — check `getwarnings` for current state on connect.
+
+Two of the gauges are useful independently of alerting:
+`satd_tip_last_connect_age_seconds` (seconds since the last connected block)
+and `satd_disk_free_bytes` (free space on the watched directory). The latter is
+omitted rather than reported as zero when the filesystem cannot be
+interrogated.
+
 ## Structured JSON Logging
 
 `satd` logs to stdout. Use `--log-format=json` to switch from the text format

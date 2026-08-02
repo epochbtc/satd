@@ -181,6 +181,10 @@ pub struct ReloadHandles {
     /// are rotatable live (the cookie is preserved). Shared with every RPC
     /// listener surface, so a reload covers all of them at once.
     pub rpc_auth: Arc<RpcAuth>,
+    /// Health-detector raise thresholds. Always present (the detector task is
+    /// always configured, even when every threshold is 0), so a threshold
+    /// change always has somewhere to land.
+    pub alert_thresholds: Arc<node::health::AlertThresholds>,
     /// Unified-auth bearer-token store, present only when `authfile=` is set.
     /// Re-read on every SIGHUP independently of the rest of the config so that
     /// removing a `[[token]]` revokes it live; a re-read error keeps the
@@ -865,6 +869,26 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("shutdownnotify", shutdown_notify),
         live!("reorgwebhook", reorg_webhook, apply_webhook),
         live_secret!("reorgwebhooksecret", reorg_webhook_secret, apply_webhook),
+        // ---- Health-alert thresholds (A3) ----
+        // Retuning an alert must not need a restart: the operator is usually
+        // retuning it *because* it is firing, and taking the node down to
+        // silence a pager is the wrong trade. Each pushes into the shared
+        // atomics the detector task reads on its next poll.
+        live!("alerttipstallseconds", alert_tip_stall_seconds, |c, h| h
+            .alert_thresholds
+            .set_tip_stall_secs(c.alert_tip_stall_seconds)),
+        live!("alertdiskfreemb", alert_disk_free_mb, |c, h| h
+            .alert_thresholds
+            .set_disk_free_mb(c.alert_disk_free_mb)),
+        live!("alertmempoolfullpct", alert_mempool_full_pct, |c, h| h
+            .alert_thresholds
+            .set_mempool_full_pct(c.alert_mempool_full_pct)),
+        live!("alertpeerfloor", alert_peer_floor, |c, h| h
+            .alert_thresholds
+            .set_peer_floor(c.alert_peer_floor)),
+        live!("alertreorgdepth", alert_reorg_depth, |c, h| h
+            .alert_thresholds
+            .set_reorg_depth(c.alert_reorg_depth)),
         // ---- MCP ----
         restart!("mcp", mcp),
         restart!("mcpport", mcp_port),
@@ -1076,6 +1100,13 @@ mod tests {
             "maxshutdownsecs",
             "reorgwebhook",
             "reorgwebhooksecret",
+            // Retuning an alert must not require a restart — the operator is
+            // usually retuning it because it is firing.
+            "alerttipstallseconds",
+            "alertdiskfreemb",
+            "alertmempoolfullpct",
+            "alertpeerfloor",
+            "alertreorgdepth",
         ] {
             assert!(
                 find(key).apply.is_some(),
