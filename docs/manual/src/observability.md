@@ -328,6 +328,43 @@ there is no dead-letter queue),
 `_queue_depth`, and `_last_success_age_seconds`, all labelled `hook="<id>"`.
 Nothing is exported when no hook is configured.
 
+### Push notifications
+
+`contrib/push-relay/` is a reference service that receives these webhooks and
+forwards the ones worth waking someone for as APNs / FCM push notifications,
+using **your** Apple and Google credentials. It runs as a separate process,
+outside satd's workspace, deliberately: a Bitcoin node should not hold a
+push-provider credential, nor the JWT/OAuth dependency stack that comes with
+one.
+
+```sh
+cd contrib/push-relay
+cargo build --release
+cp relay.example.toml /etc/satd-push-relay/relay.toml   # then edit
+./target/release/satd-push-relay /etc/satd-push-relay/relay.toml
+```
+
+```toml
+# in satd's alertfile
+[[webhook]]
+id = "push"
+url = "http://127.0.0.1:9099/hook"
+secret = "the same value as satd_secret in relay.toml"
+categories = ["status", "chain"]
+min_severity = "warning"
+```
+
+Status alerts and reorgs become notifications; blocks, mempool churn, and
+dropped deliveries do not — a relay that buzzed on every block gets
+uninstalled within a day. A condition and its later recovery share a collapse
+id, so the "recovered" notification *replaces* the alert on the lock screen
+rather than stacking beneath it.
+
+It is reference-grade and meant to be forked: device registration, per-user
+routing, and your own retry policy are yours to add. See its
+[README](https://github.com/epochbtc/satd/tree/master/contrib/push-relay) for
+what is worth copying verbatim (the receive path) and what is not.
+
 > **Note.** The older `reorgwebhook=` / `reorgwebhooksecret=` keys still work
 > and are now served by this dispatcher, with their original `ReorgRecord`
 > payload and v1 body-only signature unchanged.
