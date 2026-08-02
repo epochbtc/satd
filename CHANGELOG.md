@@ -11,6 +11,16 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- SDK (`satd-events-client`): an **unset** protobuf field and a value this build
+  does not **recognize** are now different variants on every open enum
+  (`StatusSeverity`, `StatusKind`, `StatusState`, `EvictReason`) — proto3's zero
+  value decodes to `Unspecified`, anything unrecognized to `Unknown(i32)`.
+  Behaviour change for `EvictReason`, which shipped in 0.4.0 routing *every*
+  unrecognized value into `Unspecified` and leaving its `Unknown` variant
+  unconstructible: an eviction reason added by a newer node was reported as
+  "unspecified". `docs/api/streaming.md` now states the severity ranking
+  normatively (`Unspecified` < `Info` < `Warning` < `Critical` < unrecognized).
+
 - Silent payments (BIP 352): new workspace-internal `node-sp-index` crate — the
   shared BIP 352 kernel (input extraction, public tweak `T = input_hash · A`,
   scan loop) plus the `sp_tweaks` row/key codec, backfill cursor, read trait,

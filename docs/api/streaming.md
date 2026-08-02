@@ -954,8 +954,11 @@ every other envelope too. Operators consuming health over ZMQ should use the
 message StatusEvent {
   StatusKind     kind     = 1;  // ibd_complete | tip_stall | disk_low |
                                 // mempool_congested | peer_floor | deep_reorg
+                                // (0 = unspecified; never emitted by satd)
   StatusState    state    = 2;  // raised | cleared | edge
+                                // (0 = unspecified; never emitted by satd)
   StatusSeverity severity = 3;  // info | warning | critical
+                                // (0 = unspecified; ranks lowest — see below)
   string message = 4;                // human-readable; log it, do not parse it
   map<string, string> details = 5;   // kind-specific fields (see below)
 }
@@ -1004,6 +1007,34 @@ than because the condition recovered:
 open enum: new kinds and new detail keys ship without a schema bump (§4). A
 consumer must tolerate an unrecognized `kind` — `message` and `severity` remain
 meaningful — and must not require any particular `details` key to be present.
+
+**Severity ordering, and the zero value.** `severity` is meant to be filtered by
+a threshold ("page at warning and above"), so the ranking is normative:
+
+```text
+UNSPECIFIED  <  INFO  <  WARNING  <  CRITICAL  <  any unrecognized value
+```
+
+An unrecognized severity ranks **above** `CRITICAL` deliberately: a level the
+consumer cannot name is not one to filter out silently, so an additive change to
+the taxonomy fails loud rather than dropping alerts. Implementations MUST NOT
+rank by numeric proto value, which would order a future level by its tag rather
+than its meaning.
+
+`STATUS_SEVERITY_UNSPECIFIED` (0) is the exception and ranks **lowest**. It is
+proto3's zero value, so it is what an absent field decodes to — an absence of
+information, not a loud condition. A consumer that ranks it with the
+unrecognized values pages on every producer that forgets to set the field.
+
+**satd never emits `0`** for `kind`, `state`, or `severity`: the node's internal
+enums are closed and the encoder writes an explicit value for each. The zero
+value is therefore a contract for third-party producers, re-encoding relays, and
+future schema versions — a consumer must handle it, but it will not arrive from
+a stock node. For the same reason a consumer should distinguish "unset" from
+"unrecognized" rather than folding both into one case: they call for different
+responses (fix the producer vs. upgrade the client). Note that `severity` is a
+fixed function of `kind` in v1, so a consumer that receives `UNSPECIFIED`
+severity can recover the intended level from the kind.
 
 The same detections also drive the node's warnings registry, so `getwarnings`,
 the Core-compatible `-alertnotify` hook, and this stream can never disagree about
