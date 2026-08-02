@@ -65,7 +65,7 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
 /// — the whole point of selecting by chainwork — reading the index would hand
 /// the connect thread an MTP computed over the wrong branch, and MTP gates
 /// BIP113 locktimes.
-fn compute_mtp(store: &dyn Store, plan: Option<&ReplayPlan>, height: u32) -> u32 {
+pub(crate) fn compute_mtp(store: &dyn Store, plan: Option<&ReplayPlan>, height: u32) -> u32 {
     let start = height.saturating_sub(11);
     let mut timestamps: Vec<u32> = Vec::new();
     for h in start..height {

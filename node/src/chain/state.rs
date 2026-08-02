@@ -3306,7 +3306,7 @@ impl ChainState {
                 // entries are still `Valid` from the original sync.
                 match prefetch.take_block(height) {
                     Some(pre) if pre.hash == hash => self.reindex_connect_prefetched(pre)?,
-                    _ => self.reindex_connect_direct(height, hash)?,
+                    _ => self.reindex_connect_direct(&plan, height, hash)?,
                 }
                 prefetch.advance_cursor(height + 1);
                 self.bump_connect_heartbeat();
@@ -3450,11 +3450,18 @@ impl ChainState {
     /// exactly that, and it is the shape corruption actually takes here. On the
     /// direct path it sees the *index's* header for the planned hash, which
     /// extends the chain by construction, so it constrains nothing at all.
+    /// `indexed` is the header stored under `planned` in the block index. It
+    /// must equal the header of the block actually on disk. `get_block_index`
+    /// keys on the hash, but nothing constrains the stored header to be the one
+    /// that hashes to that key — so an index damaged in the header bytes can
+    /// name a parent the block does not have, and both replay paths take the
+    /// parent (and therefore the cumulative chainwork) from that link.
     fn require_planned_block(
         &self,
         height: u32,
         planned: BlockHash,
         block: &Block,
+        indexed: &bitcoin::block::Header,
         flat_pos: FlatFilePos,
     ) -> Result<(), ChainError> {
         let found = block.block_hash();
@@ -3467,6 +3474,18 @@ impl ChainState {
                 data_pos = flat_pos.data_pos,
                 "reindex: the block index points at the wrong record; the index is corrupt. \
                  Run a full --reindex to rebuild it from the block files."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
+        if *indexed != block.header {
+            tracing::error!(
+                height,
+                block = %planned,
+                indexed_parent = %indexed.prev_blockhash,
+                actual_parent = %block.header.prev_blockhash,
+                "reindex: the block index holds a header that is not the one in the block \
+                 file; the index is corrupt. Run a full --reindex to rebuild it from the \
+                 block files."
             );
             return Err(ChainError::BadPrevBlock);
         }
@@ -3486,7 +3505,16 @@ impl ChainState {
         // `prefetch::preprocess_block`), so this is the only place the two can
         // be reconciled — and this is the path that carries the replay. The
         // direct read below is just the prefetch-miss fallback.
-        self.require_planned_block(pre.height, pre.hash, &pre.block, pre.flat_pos)?;
+        // `pre.parent` was resolved by the worker from `pre.entry.header`, so
+        // the header-agreement half of this check is what makes that parent —
+        // and the chainwork taken from it — trustworthy.
+        self.require_planned_block(
+            pre.height,
+            pre.hash,
+            &pre.block,
+            &pre.entry.header,
+            pre.flat_pos,
+        )?;
         self.require_extends_tip(&pre.block.header, pre.height)?;
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
@@ -3525,7 +3553,15 @@ impl ChainState {
     /// Connect a block during reindex by reading it directly from the flat
     /// files (prefetch miss). Same connect path as
     /// [`Self::reindex_connect_prefetched`], minus the prefetched extras.
-    fn reindex_connect_direct(&self, height: u32, hash: BlockHash) -> Result<(), ChainError> {
+    ///
+    /// Takes the plan because MTP must be resolved through it, not through the
+    /// height→hash index — see the `mtp` binding below.
+    fn reindex_connect_direct(
+        &self,
+        plan: &crate::chain::replay_plan::ReplayPlan,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<(), ChainError> {
         let entry = self
             .store
             .get_block_index(&hash)
@@ -3534,7 +3570,6 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        self.require_extends_tip(&entry.header, height)?;
         let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
             tracing::error!(
                 height,
@@ -3545,10 +3580,22 @@ impl ChainState {
             );
             ChainError::FlatFile("cannot read block during reindex".into())
         })?;
-        self.require_planned_block(height, hash, &block, flat_pos)?;
+        // Validate the record BEFORE anything reads a header, then work from
+        // `block.header` alone. The indexed header was the sole input to the
+        // extends-tip guard and the parent lookup, and it is not trustworthy
+        // here: `get_block_index` keys on the hash but nothing constrains the
+        // stored header to be the one that hashes to that key, so an index
+        // damaged in the header bytes — the thing `-reindex-chainstate`
+        // repairs — could assert a parent link the block itself does not have.
+        // The guard would then pass on a forged `prev_blockhash` while
+        // `connect_block` received a differently-parented block, and the
+        // cumulative chainwork would be measured from whatever entry that
+        // forged link named.
+        self.require_planned_block(height, hash, &block, &entry.header, flat_pos)?;
+        self.require_extends_tip(&block.header, height)?;
         let parent = self
             .store
-            .get_block_index(&entry.header.prev_blockhash)
+            .get_block_index(&block.header.prev_blockhash)
             .ok_or(ChainError::BadPrevBlock)?;
 
         let use_noop = self.should_skip_scripts(height);
@@ -3556,7 +3603,18 @@ impl ChainState {
         let verifier: &dyn ScriptVerifier =
             if use_noop { &noop } else { &*self.script_verifier };
 
-        let mtp = self.get_median_time_past(height);
+        // Resolve MTP through the plan, exactly as the prefetch path does.
+        //
+        // `get_median_time_past` walks the height→hash index, which is the
+        // derived state this whole replay exists to distrust — and it is read
+        // here at heights *below* the connect cursor, where a resumed replay
+        // has not rewritten it. Rows written by the original sync survive
+        // there, so a #322-shaped polluted row (a fork block owning a height)
+        // contributes a timestamp from the wrong branch. MTP gates BIP113
+        // locktimes, so that is a consensus input, and having the two replay
+        // paths derive it from different sources made it depend on whether the
+        // prefetcher happened to hit — which at replay startup it never does.
+        let mtp = crate::chain::prefetch::compute_mtp(&*self.store, Some(plan), height);
         let batch = connect::connect_block(&connect::ConnectParams {
             store: &*self.store,
             block: &block,
@@ -7561,6 +7619,60 @@ pub(crate) mod tests {
         panic!("Failed to mine spending test block within 2,000,000 nonce iterations");
     }
 
+    /// Like `build_test_block_spending`, but the grafted transaction is
+    /// *non-final*: a time-based `lock_time` paired with a non-MAX sequence.
+    ///
+    /// This makes the MTP a caller computed observable. `connect_block` runs
+    /// the BIP113 locktime comparison at the top of its per-transaction loop,
+    /// before it resolves any input, so the block's fate distinguishes the two:
+    /// an MTP below `lock_time` gives `LocktimeNotFinal`, and an MTP at or
+    /// above it lets the transaction through to input resolution, which then
+    /// fails on the deliberately missing outpoint. Two different errors, from
+    /// nothing but the MTP.
+    pub(crate) fn build_test_block_timelocked(
+        parent_hash: BlockHash,
+        height: u32,
+        time: u32,
+        spend: bitcoin::OutPoint,
+        lock_time: u32,
+    ) -> Block {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::pow::CompactTarget;
+        use bitcoin::{Sequence, hashes::Hash};
+
+        let mut block = build_test_block_spending(parent_hash, height, time, spend);
+        let tx = block.txdata.last_mut().expect("grafted spend tx");
+        tx.lock_time = LockTime::from_consensus(lock_time);
+        // Any sequence below MAX opts the transaction into locktime enforcement.
+        tx.input[0].sequence = Sequence::from_consensus(0xffff_fffe);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let target = crate::storage::blockindex::target_from_compact(bits);
+        for nonce in 0u32..2_000_000 {
+            block.header.nonce = nonce;
+            let hash_bytes = *block.block_hash().as_raw_hash().as_byte_array();
+            let mut hash_be = [0u8; 32];
+            for i in 0..32 {
+                hash_be[i] = hash_bytes[31 - i];
+            }
+            let mut ok = true;
+            for i in 0..32 {
+                if hash_be[i] < target[i] {
+                    break;
+                }
+                if hash_be[i] > target[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return block;
+            }
+        }
+        panic!("Failed to mine time-locked test block within 2,000,000 nonce iterations");
+    }
+
     /// Regression for issue #262: a reorg whose triggering block fails to
     /// connect must leave the original active chain — and its still-FRESH
     /// (un-flushed) coins — fully intact and durable. The old replay-based
@@ -9913,6 +10025,199 @@ pub(crate) mod tests {
             })
             .is_none(),
             "the wrong record's coinbase reached the UTXO set"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MTP the replay validates against must come from the plan, not from
+    /// the height→hash index.
+    ///
+    /// `get_median_time_past` resolves each of the eleven preceding heights
+    /// through the height→hash index — the derived state this replay exists to
+    /// distrust — and the prefetch path had already been given a plan-driven
+    /// MTP precisely because of that. Only the direct read still used it, so
+    /// the consensus input depended on whether the prefetcher happened to hit,
+    /// which at replay startup it never does.
+    ///
+    /// The rows it reads sit *below* the connect cursor, and a resumed replay
+    /// never rewrites them: they are whatever the original sync left, which is
+    /// exactly where the #322 pollution (a fork block owning a height) was
+    /// observed. MTP gates BIP113 locktimes, so a timestamp from the wrong
+    /// branch is a validity decision made against a chain the node is not
+    /// replaying.
+    ///
+    /// Observable through a non-final, time-locked transaction: the polluted
+    /// MTP falls below its locktime and the block is rejected as non-final,
+    /// while the real branch's MTP clears it and the block goes on to fail at
+    /// input resolution instead. The missing-input error IS the pass.
+    #[test]
+    fn reindex_direct_connect_takes_mtp_from_the_plan_not_the_height_index() {
+        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
+        use bitcoin::consensus::serialize;
+
+        const BASE: u32 = 1_705_000_000;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut hashes = vec![genesis_hash];
+        for h in 1..=12u32 {
+            let b = build_test_block(parent, h, BASE + 100 * h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            hashes.push(parent);
+        }
+
+        // A stale sibling of height 10, timestamped low enough to drag the
+        // median down when it usurps that height's row. It must still be
+        // above its own ancestors' MTP or it would not have been storable.
+        let stale = build_test_block(hashes[9], 10, BASE + 650);
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        assert_eq!(cs.tip_hash(), hashes[12], "the sibling must not win the tip");
+
+        // Block 13 goes on disk and into the index WITHOUT being connected —
+        // the state a reindex actually finds. It cannot be accepted normally:
+        // its transaction spends an outpoint that does not exist, which is the
+        // second half of the observable.
+        let bogus = OutPoint {
+            txid: stale.txdata[0].compute_txid(),
+            vout: 7,
+        };
+        let lock_time = BASE + 680;
+        let b13 = build_test_block_timelocked(hashes[12], 13, BASE + 1300, bogus, lock_time);
+        let h13 = b13.block_hash();
+        let pos = cs
+            .flat_files
+            .lock()
+            .write_block(&serialize(&b13), network_magic(Network::Regtest))
+            .expect("write block 13");
+        let parent_entry = cs.store.get_block_index(&hashes[12]).expect("parent entry");
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((
+            h13,
+            BlockIndexEntry {
+                header: b13.header,
+                height: 13,
+                status: BlockStatus::DataStored,
+                num_tx: b13.txdata.len() as u32,
+                file_number: pos.file_number,
+                data_pos: pos.data_pos,
+                chainwork: add_u256(&parent_entry.chainwork, &work_for_bits(b13.header.bits)),
+            },
+        ));
+        cs.store.write_batch(batch).expect("index block 13");
+        cs.store.invalidate_block_index_cache(&h13);
+        cs.store.flush().expect("flush the index write");
+
+        let plan = crate::chain::replay_plan::plan_replay_from_block_index(
+            &*cs.store,
+            genesis_hash,
+            Some(hashes[12]),
+        )
+        .expect("plan the replay");
+        assert_eq!(plan.hash_at(13), Some(h13), "plan must reach block 13");
+
+        // The #322 shape, at a height inside block 13's MTP window.
+        pollute_height_hash(&cs, 10, stale_hash);
+        // A fresh process reindexing at startup has an empty MTP cache, so the
+        // store lookups are what run. Warm entries here would mask that.
+        cs.mtp_cache.lock().clear();
+
+        let planned_mtp = crate::chain::prefetch::compute_mtp(&*cs.store, Some(&plan), 13);
+        let indexed_mtp = cs.get_median_time_past(13);
+        assert_eq!(planned_mtp, BASE + 700, "MTP of the branch being replayed");
+        assert_eq!(indexed_mtp, BASE + 650, "MTP the polluted rows produce");
+        assert!(
+            indexed_mtp < lock_time && planned_mtp >= lock_time,
+            "fixture must straddle the locktime: {indexed_mtp} < {lock_time} <= {planned_mtp}"
+        );
+
+        let err = cs
+            .reindex_connect_direct(&plan, 13, h13)
+            .expect_err("block 13 spends a nonexistent outpoint");
+        assert!(
+            matches!(
+                err,
+                ChainError::Connect(connect::ConnectError::MissingOrSpentInput)
+            ),
+            "expected the locktime check to pass on the replayed branch's MTP and the \
+             connect to fail on the missing input; got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The indexed header must match the header in the block file.
+    ///
+    /// `get_block_index` keys on the block hash, but nothing constrains the
+    /// header stored under that key to be the one that hashes to it — and an
+    /// index damaged in the header bytes is squarely what `-reindex-chainstate`
+    /// is run to repair. Both replay paths took the parent link, and therefore
+    /// the cumulative chainwork handed to `connect_block`, from that stored
+    /// header, and the direct path additionally checked the extends-tip guard
+    /// against it rather than against the block it was about to connect.
+    ///
+    /// Forged here in `bits`, the field that decides the branch's work in
+    /// selection: an entry claiming more work than the block file supports
+    /// steers the plan onto a chain the files do not back. Verifying the
+    /// record's hash does not catch this — the block on disk IS the planned
+    /// block; only the index's copy of its header is a lie.
+    #[test]
+    fn reindex_direct_connect_rejects_an_indexed_header_the_block_file_contradicts() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let b1 = build_test_block(genesis_hash, 1, 1_706_000_001);
+        let h1 = cs.accept_block(&b1).expect("accept block 1");
+        let b2 = build_test_block(h1, 2, 1_706_000_002);
+        let h2 = cs.accept_block(&b2).expect("accept block 2");
+
+        cs.flush_coin_cache().expect("flush before clearing");
+        cs.store.flush().unwrap();
+
+        // Forge the stored header's difficulty. The parent link is left intact,
+        // so the extends-tip guard passes and the record at `flat_pos` is still
+        // the planned block: this check is the only thing standing in the way.
+        let mut forged = cs.store.get_block_index(&h2).expect("entry for block 2");
+        forged.header.bits = bitcoin::pow::CompactTarget::from_consensus(0x207ffffe);
+        assert_ne!(forged.header, b2.header, "fixture must forge something");
+        assert_eq!(
+            forged.header.prev_blockhash, b2.header.prev_blockhash,
+            "the forgery must leave the parent link alone"
+        );
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((h2, forged));
+        cs.store.write_batch(batch).expect("write forged entry");
+        cs.store.invalidate_block_index_cache(&h2);
+
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = h1;
+            tip.height = 1;
+        }
+
+        let plan =
+            crate::chain::replay_plan::plan_replay_from_block_index(&*cs.store, genesis_hash, None)
+                .expect("plan the replay");
+        assert_eq!(plan.hash_at(2), Some(h2), "plan must reach block 2");
+
+        let err = cs
+            .reindex_connect_direct(&plan, 2, h2)
+            .expect_err("a header the block file contradicts must not connect");
+        assert!(
+            matches!(err, ChainError::BadPrevBlock),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(cs.tip_hash(), h1, "the tip must not advance past the refusal");
+        cs.flush_coin_cache().expect("flush after the refusal");
+        assert!(
+            cs.get_coin(&OutPoint {
+                txid: b2.txdata[0].compute_txid(),
+                vout: 0,
+            })
+            .is_none(),
+            "the block connected despite a forged indexed header"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
