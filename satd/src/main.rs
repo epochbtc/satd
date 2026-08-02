@@ -423,10 +423,13 @@ async fn main() {
             .with_silentpaymentindex_enabled(config.silentpaymentindex),
     );
 
-    // Height the chainstate reached before `-reindex-chainstate` cleared it;
-    // the replay must reach it again or fail closed. `None` when not doing a
-    // chainstate reindex, or when there was no tip to begin with.
-    let mut prev_chainstate_height: Option<u32> = None;
+    // The tip the chainstate was on before `-reindex-chainstate` cleared it:
+    // hash and height. The replay must reach that height again or fail closed,
+    // and the hash is the tie-break incumbent — it must be the authoritative
+    // one from the metadata CF, never re-derived from the height→hash index,
+    // which is the derived state this whole replay path exists to distrust.
+    // `None` when not doing a chainstate reindex, or when there was no tip.
+    let mut prev_chainstate_tip: Option<(bitcoin::BlockHash, u32)> = None;
 
     // Handle -reindex: clear everything, will rebuild from flat files
     if config.reindex {
@@ -440,20 +443,63 @@ async fn main() {
     } else if config.reindex_chainstate {
         // Handle -reindex-chainstate: clear UTXO/undo, keep block index.
         //
-        // Capture how far the chainstate reached BEFORE clearing it. The
-        // replay has to prove it can rebuild at least that much: it selects
-        // its chain from the block index, and a block index with a hole (a
-        // `HeaderOnly` gap, a pruned range) yields a chain that stops short —
-        // or does not leave genesis at all. Without this floor the replay
-        // silently reports success over a truncated or empty UTXO set. The
-        // tip lives in the metadata column family, which `clear_chainstate`
-        // drops, so it must be read first.
-        prev_chainstate_height = store
+        // Capture the tip BEFORE clearing: it lives in the metadata column
+        // family, which `clear_chainstate` drops.
+        prev_chainstate_tip = store
             .get_tip()
-            .and_then(|h| store.get_block_index(&h))
-            .map(|e| e.height);
+            .and_then(|h| store.get_block_index(&h).map(|e| (h, e.height)));
+
+        // Then prove the replay can actually rebuild it — BEFORE clearing.
+        //
+        // The replay selects its chain from the block index, and an index with
+        // a hole (a `HeaderOnly` gap, a pruned range) yields a chain that stops
+        // short, or never leaves genesis. Reporting success there leaves the
+        // node serving a truncated or empty UTXO set while `clear_chainstate`
+        // has already stamped the tx, address and filter indexes complete — so
+        // Electrum and Esplora answer "no history" for every address.
+        //
+        // Checking here rather than after the clear is what makes the guard
+        // idempotent. Deriving the floor from a tip that this same run then
+        // destroys means the check can only ever fire once: the retry — an
+        // operator re-running, or `Restart=always` in the systemd unit bringing
+        // it straight back — reads the genesis tip that the failed run left
+        // behind, computes a floor of 0, and sails through. The guard would be
+        // absent exactly when it is needed a second time. Nothing is cleared
+        // until the replay is known to be possible, so a retry re-runs this
+        // check against the same inputs and reaches the same answer.
+        //
+        // Costs one extra block-index scan (seconds) on a job measured in
+        // minutes to hours.
+        if let Some((prev_hash, prev_height)) = prev_chainstate_tip {
+            let genesis = bitcoin::constants::genesis_block(config.network).block_hash();
+            match node::chain::replay_plan::plan_replay_from_block_index(
+                &*store,
+                genesis,
+                Some(prev_hash),
+            ) {
+                Ok(plan) if plan.tip_height() < prev_height => {
+                    eprintln!(
+                        "Error: -reindex-chainstate cannot rebuild this datadir. The block \
+                         index has no fully-connectable chain reaching height {prev_height} \
+                         (best is {}); a pruned range or a hole in the index breaks the \
+                         ancestry. The chainstate has NOT been cleared. Run a full --reindex \
+                         to rebuild the block index from the block files.",
+                        plan.tip_height()
+                    );
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Error planning chainstate reindex: {}", e);
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            }
+        }
+
         tracing::info!(
-            prev_height = ?prev_chainstate_height,
+            prev_height = ?prev_chainstate_tip.map(|(_, h)| h),
             "Reindexing chainstate: clearing UTXO set, will rebuild from block files"
         );
         if let Err(e) = store.clear_chainstate() {
@@ -787,7 +833,7 @@ async fn main() {
         if let Err(e) = chain_state.reindex_chainstate(
             config.stopatheight,
             Some(startup_progress.clone()),
-            prev_chainstate_height,
+            prev_chainstate_tip,
         ) {
             eprintln!("Error during chainstate reindex: {}", e);
             auth.cleanup();

@@ -3095,14 +3095,21 @@ impl ChainState {
     /// `progress` (if provided) receives total / current / stop_height
     /// updates so the startup RPC can render a gauge that distinguishes
     /// the file tip (total) from the configured stop target.
-    /// `required_height` is how far the chainstate reached before it was
-    /// cleared. The replay must be able to rebuild at least that much or it
-    /// fails closed — see the coverage check below.
+    /// `prev_tip` is the tip the chainstate was on before it was cleared —
+    /// hash and height, read from the metadata column family by the caller
+    /// before clearing. The height is a floor the replay must reach or it
+    /// fails closed; the hash is the tie-break incumbent. Both must come from
+    /// authoritative state: see the note on `incumbent` below for what
+    /// happened when the hash was re-derived from the height→hash index.
+    ///
+    /// `satd` additionally runs the same coverage check *before* clearing, so
+    /// a datadir that cannot be rebuilt is rejected with the chainstate still
+    /// intact. The check here is defence in depth and covers other callers.
     pub fn reindex_chainstate(
         &self,
         stop_at: Option<u32>,
         progress: Option<Arc<crate::startup_progress::StartupProgress>>,
-        required_height: Option<u32>,
+        prev_tip: Option<(BlockHash, u32)>,
     ) -> Result<(), ChainError> {
         // Decide which chain to replay before touching anything. Selecting by
         // chainwork over the block index, rather than walking the height→hash
@@ -3122,9 +3129,19 @@ impl ChainState {
         // returning the active tip. Without it a node holding a fully-received
         // stale sibling at its tip height would, on a coin flip, rebuild onto
         // the orphan and have to be reorged back by its peers.
-        let incumbent = self
-            .store
-            .get_block_hash_by_height(required_height.unwrap_or(0));
+        //
+        // The hash is passed in from the metadata CF, NOT looked up by height.
+        // An earlier version did `get_block_hash_by_height(required_height)`,
+        // which reintroduced a dependency on the height→hash index at the one
+        // height where pollution was actually observed (#322) — and the
+        // incumbent is decisive on a tie, so a polluted row handed the win to
+        // the stale sibling and rebuilt the whole chainstate onto the orphan.
+        // Every other input to selection is recomputed from headers precisely
+        // so a damaged index cannot steer the replay; this one must be too.
+        let (incumbent, required_height) = match prev_tip {
+            Some((hash, height)) => (Some(hash), Some(height)),
+            None => (None, None),
+        };
         let plan = Arc::new(
             crate::chain::replay_plan::plan_replay_from_block_index(
                 &*self.store,
@@ -3132,6 +3149,14 @@ impl ChainState {
                 incumbent,
             )
             .map_err(ChainError::Storage)?,
+        );
+        // Say which chain was selected — see the equivalent line on the
+        // flat-file path for why this is not optional.
+        tracing::info!(
+            tip = %plan.tip_hash(),
+            tip_height = plan.tip_height(),
+            incumbent = ?incumbent.map(|h| h.to_string()),
+            "Chainstate reindex: selected the most-work branch to replay"
         );
 
         // Fail closed when the block index cannot produce the chain the node
@@ -3463,9 +3488,39 @@ impl ChainState {
             data_pos: entry.data_pos,
         };
         self.require_extends_tip(&entry.header, height)?;
-        let block = self
-            .read_block_direct(&flat_pos)
-            .ok_or(ChainError::FlatFile("cannot read block during reindex".into()))?;
+        let block = self.read_block_direct(&flat_pos).ok_or_else(|| {
+            tracing::error!(
+                height,
+                block = %hash,
+                file_number = flat_pos.file_number,
+                data_pos = flat_pos.data_pos,
+                "reindex: cannot read block from the flat files"
+            );
+            ChainError::FlatFile("cannot read block during reindex".into())
+        })?;
+        // The bytes at `flat_pos` must be the block the plan selected.
+        //
+        // `flat_pos` comes from the block index, and a damaged block index is
+        // the thing `-reindex-chainstate` is run to repair — so the position
+        // can point at a different, perfectly well-formed record. Nothing
+        // downstream would notice: `connect_block` derives everything from the
+        // block it is handed and writes its hash, height row and UTXO delta,
+        // while the caller sets the in-memory tip to the *plan's* hash. The
+        // next `require_extends_tip` compares against that in-memory tip and
+        // passes, so the replay runs to completion with the persisted tip and
+        // the in-memory tip naming different blocks.
+        if block.block_hash() != hash {
+            tracing::error!(
+                height,
+                expected = %hash,
+                found = %block.block_hash(),
+                file_number = flat_pos.file_number,
+                data_pos = flat_pos.data_pos,
+                "reindex: the block index points at the wrong record; the index is corrupt. \
+                 Run a full --reindex to rebuild it from the block files."
+            );
+            return Err(ChainError::BadPrevBlock);
+        }
         let parent = self
             .store
             .get_block_index(&entry.header.prev_blockhash)
@@ -3536,11 +3591,27 @@ impl ChainState {
         // Pass 1: breadth-first from genesis, carrying each block's height and
         // its chainwork relative to genesis (the genesis term is a constant
         // offset shared by every candidate, so omitting it cannot change the
-        // comparison). BFS visits in height order and, within a height, in
-        // flat-file scan order, so `>` — strictly greater work — keeps the
-        // first-seen block of an equal-work tie. That is the reindex analogue
-        // of the consensus first-seen rule: an equal-work side chain never
-        // displaces the branch already chosen.
+        // comparison). `>` — strictly greater work — means an equal-work
+        // candidate never displaces the one already chosen.
+        //
+        // Be precise about which candidate that is, because the obvious
+        // reading is wrong. BFS dequeues in *height* order, so on an exact
+        // work tie the winner is the branch whose tip is **shallower**, and
+        // flat-file scan order only decides ties *within* the same height.
+        // For same-height siblings — the only shape that occurs in practice,
+        // since equal work at different depths needs a mixed-difficulty fork —
+        // that is first-seen, matching the consensus rule `find_best_valid_tip`
+        // implements. For the exotic case (branch A: 10 easy blocks written
+        // first; branch B: 3 hard blocks of exactly equal cumulative work) it
+        // picks B, which is NOT first-seen.
+        //
+        // Left as-is deliberately: exact work equality across differing depths
+        // requires a contrived difficulty mix, both branches are valid, and the
+        // node reorgs to whichever its peers extend. Documented rather than
+        // claimed away — the sibling planner
+        // (`replay_plan::plan_replay_from_block_index`) uses an explicit
+        // incumbent-then-lowest-hash rule instead, so the two can disagree on
+        // such a tie.
         let mut best: (BlockHash, u32, [u8; 32]) = (genesis, 0, [0u8; 32]);
         let mut queue: VecDeque<(BlockHash, u32, [u8; 32])> = VecDeque::new();
         queue.push_back((genesis, 0, [0u8; 32]));
@@ -3755,12 +3826,25 @@ impl ChainState {
         // target from the block tree instead: the most-work branch's tip is the
         // block Phase 3 will actually connect to.
         let plan = Self::plan_reindex_chain(&children, &header_by_hash, genesis_hash);
-        if !plan.side.is_empty() {
-            tracing::info!(
-                side_chain_blocks = plan.side.len(),
-                "Phase 2: selected most-work branch; side-chain blocks will be indexed, not connected"
-            );
-        }
+        // Always state which chain was selected, even when there is no fork.
+        //
+        // The failure this replay path exists to fix was "it replayed the wrong
+        // chain", and diagnosing it took a three-day run followed by a custom
+        // scan of 5661 flat files — because nothing in the log ever said which
+        // branch had been chosen. One line here is the difference between
+        // confirming the selection from a log and reproducing the whole job.
+        tracing::info!(
+            tip = %plan
+                .path
+                .last()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "genesis".into()),
+            tip_height = plan.tip_height,
+            connecting = plan.path.len(),
+            side_chain_blocks = plan.side.len(),
+            scanned = total,
+            "Phase 2: selected the most-work branch to replay"
+        );
         // Records on disk but no chain out of genesis means the flat files are
         // unusable — a wrong network's blocks dir, a truncated first file, a
         // missing blk00000.dat. Connecting nothing and reporting a completed
@@ -3943,10 +4027,23 @@ impl ChainState {
     /// Deliberately narrow:
     ///   * Proof of work is re-checked. Everything else on the branch is
     ///     unvalidated — these entries exist so the block stays addressable by
-    ///     hash and so a later reorg can consider the branch, and the reorg
-    ///     path validates before connecting. Re-checking PoW is what stops a
-    ///     doctored flat file from injecting an index entry claiming
-    ///     more chainwork than it did the work for.
+    ///     hash and so a later reorg can consider the branch. Re-checking PoW
+    ///     is what stops a doctored flat file from injecting an index entry
+    ///     claiming more chainwork than it did the work for, which is the only
+    ///     property that matters for selection: work cannot be forged, so such
+    ///     a branch cannot *win*.
+    ///
+    ///     Note what this does NOT buy. An earlier version of this comment
+    ///     said the reorg path validates before connecting; it does not.
+    ///     `reorg_to` connects through `connect::connect_block`, which runs
+    ///     neither `check_proof_of_work` nor `check_difficulty` — every
+    ///     difficulty-schedule, timestamp and checkpoint rule lives in
+    ///     `accept_header`/`accept_block`, which the reindex bypasses. So a
+    ///     side entry with wrong `bits` for its retarget window can be indexed
+    ///     and, if later extended, connected, where the live path would have
+    ///     rejected it. The main-chain reindex path has the same gap and
+    ///     always has, so this is not a regression — but it is not covered by
+    ///     the reorg path either.
     ///   * No `height_hash` entry is ever written. The height→hash index names
     ///     the *active* chain; letting a losing branch write there is the
     ///     bad-cb-height pollution that wedged a dogfood node (#322).
@@ -9637,6 +9734,73 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A polluted height→hash row at the TIP height must not steer the
+    /// tie-break.
+    ///
+    /// Deep review found the planner re-deriving its tie-break incumbent with
+    /// `get_block_hash_by_height(required_height)` — the exact derived state
+    /// this module exists to distrust, read at the exact height where #322
+    /// pollution was observed. The incumbent *wins* an exact chainwork tie, so
+    /// a polluted row handed the win to an equal-work stale sibling and rebuilt
+    /// the whole chainstate onto the orphan: the inverse of the fix's purpose.
+    /// The sibling test above pollutes a mid-chain height, where the loser is
+    /// excluded on work and the incumbent never gets a say; only a tie at the
+    /// tip exercises this.
+    ///
+    /// The incumbent is now the authoritative tip hash, passed in from the
+    /// metadata CF before it is cleared.
+    #[test]
+    fn reindex_chainstate_tie_break_ignores_a_polluted_height_index() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main_hashes = Vec::new();
+        for h in 1..=4u32 {
+            let b = build_test_block(parent, h, 1_704_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            main_hashes.push(parent);
+        }
+        let real_tip = *main_hashes.last().unwrap();
+        let real_height = cs.tip_height();
+        assert_eq!(real_height, 4);
+
+        // An equal-work sibling OF THE TIP: same parent, same bits, so the two
+        // branches tie exactly on cumulative chainwork and the incumbent rule
+        // is what decides.
+        let sibling = build_test_block(main_hashes[2], 4, 1_704_000_999);
+        let sibling_hash = cs.accept_block(&sibling).expect("store tip sibling");
+        assert_ne!(sibling_hash, real_tip, "fixture must produce a distinct sibling");
+        assert_eq!(cs.tip_hash(), real_tip, "equal work must not reorg the tip");
+
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis_hash;
+            tip.height = 0;
+        }
+        // The #322 shape, at the height where it decides a tie.
+        pollute_height_hash(&cs, real_height, sibling_hash);
+
+        cs.reindex_chainstate(None, None, Some((real_tip, real_height)))
+            .expect("replay must succeed");
+
+        assert_eq!(
+            cs.tip_hash(),
+            real_tip,
+            "the tie-break must follow the authoritative tip, not the polluted row"
+        );
+        assert_eq!(
+            cs.store.get_block_hash_by_height(real_height),
+            Some(real_tip),
+            "the replay must rewrite the polluted height entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The critical fail-open found in review: selection admits only
     /// `DataStored`/`Valid` blocks and requires every ancestor to qualify, so a
     /// single ineligible block low in the chain empties the plan. The replay
@@ -9657,6 +9821,7 @@ pub(crate) mod tests {
             let b = build_test_block(parent, h, 1_703_000_000 + h);
             parent = cs.accept_block(&b).expect("accept block");
         }
+        let real_tip = cs.tip_hash();
         let real_height = cs.tip_height();
         assert_eq!(real_height, 6);
 
@@ -9687,7 +9852,7 @@ pub(crate) mod tests {
         }
 
         let err = cs
-            .reindex_chainstate(None, None, Some(real_height))
+            .reindex_chainstate(None, None, Some((real_tip, real_height)))
             .expect_err("a replay that cannot reach the previous height must fail, not report success");
         assert!(
             matches!(err, ChainError::BadPrevBlock),
@@ -10114,9 +10279,13 @@ pub(crate) mod tests {
         assert_eq!(side, vec![deep1]);
     }
 
-    /// Equal-work fork: the branch seen first in flat-file order wins, which is
-    /// the reindex analogue of the consensus first-seen rule. The loser is
-    /// reported as side chain rather than silently dropped.
+    /// Equal-work fork at the SAME height: the branch seen first in flat-file
+    /// order wins, which is the reindex analogue of the consensus first-seen
+    /// rule. The loser is reported as side chain rather than silently dropped.
+    ///
+    /// Scoped to same-height siblings on purpose — see `plan_reindex_chain`:
+    /// across differing depths BFS order makes the shallower tip win, not the
+    /// first-seen one.
     #[test]
     fn plan_reindex_chain_equal_work_keeps_first_seen() {
         const EASY: u32 = 0x207fffff;
