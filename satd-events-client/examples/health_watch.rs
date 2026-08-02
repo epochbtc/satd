@@ -154,6 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Route by severity rather than by kind, so a condition this build does
         // not recognize still reaches the right place.
         let route = match severity {
+            // The producer never set a severity. Log it — the kind and message
+            // are still meaningful — but do not page: an absent field is not a
+            // critical condition, and treating it as one pages on every partial
+            // or buggy producer.
+            StatusSeverity::Unspecified => "info",
             StatusSeverity::Info => "info",
             StatusSeverity::Warning => "warn",
             StatusSeverity::Critical => "PAGE",

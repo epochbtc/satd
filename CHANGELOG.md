@@ -188,8 +188,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   `Categories::STATUS` bit and typed `Event::Status { kind, state, severity,
   message, details }` with open `StatusKind` / `StatusState` / `StatusSeverity`
   enums — an unrecognized value from a newer node surfaces as `Unknown(i32)`
-  rather than an error, and `StatusSeverity` is ordered so a client filters with
-  a comparison. All three are `#[non_exhaustive]`, so a condition added
+  rather than an error, and `StatusSeverity` is ordered by severity rank
+  (`Unspecified` < `Info` < `Warning` < `Critical` < `Unknown`) so a client
+  filters with a comparison. All three are `#[non_exhaustive]`, so a condition added
   node-side stays additive for downstream consumers. New runnable
   `examples/health_watch.rs`.
 - Alerting: reference push relay in `contrib/push-relay/` — a standalone service

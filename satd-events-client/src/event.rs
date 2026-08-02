@@ -185,15 +185,34 @@ impl StatusState {
 
 /// How loud a health condition is.
 ///
-/// `Ord` follows severity, so a client filters with a comparison
-/// (`severity >= StatusSeverity::Warning`). An unrecognized value sorts above
-/// `Critical` deliberately: a condition this build cannot name is not one to
-/// quietly filter out.
+/// Ordering is by *severity rank*, not by proto value, so a client filters with
+/// a comparison (`severity >= StatusSeverity::Warning`). The rank is:
+///
+/// ```text
+/// Unspecified  <  Info  <  Warning  <  Critical  <  Unknown(_)
+/// ```
+///
+/// `Unknown(_)` sorting above `Critical` is deliberate: a severity this build
+/// cannot name is not one to quietly filter out, so an additive taxonomy change
+/// fails loud rather than silent.
+///
+/// [`Unspecified`](Self::Unspecified) is the opposite case and is why the two
+/// are separate variants. `STATUS_SEVERITY_UNSPECIFIED` is proto3's zero value,
+/// which is what an absent field decodes to — a producer that never set the
+/// field at all. That is an absence of information, not a loud condition, so it
+/// ranks lowest. Folding it into `Unknown` (as this type once did) made every
+/// unset severity outrank `Critical` and page on the documented filter.
 ///
 /// `#[non_exhaustive]` — see [`StatusKind`].
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusSeverity {
+    /// The producer did not set a severity (proto3's zero value).
+    ///
+    /// Ranks below `Info`: the event is still delivered and still carries a
+    /// `kind` and `message`, but a severity floor cannot promote a level that
+    /// was never stated.
+    Unspecified,
     /// Worth knowing, not worth waking anyone (IBD completing).
     Info,
     /// Degraded but functioning (peer starvation, a congested mempool).
@@ -201,18 +220,48 @@ pub enum StatusSeverity {
     /// The node is not doing its job, or is about to stop (a stalled tip, a
     /// filling disk, a deep reorg).
     Critical,
-    /// A severity this client build does not recognize.
+    /// A severity this client build does not recognize. Ranks above `Critical`.
     Unknown(i32),
 }
 
 impl StatusSeverity {
     fn from_proto(v: i32) -> Self {
         match pb::StatusSeverity::try_from(v) {
+            Ok(pb::StatusSeverity::Unspecified) => StatusSeverity::Unspecified,
             Ok(pb::StatusSeverity::Info) => StatusSeverity::Info,
             Ok(pb::StatusSeverity::Warning) => StatusSeverity::Warning,
             Ok(pb::StatusSeverity::Critical) => StatusSeverity::Critical,
             _ => StatusSeverity::Unknown(v),
         }
+    }
+
+    /// Sort key: the severity rank, then the raw value.
+    ///
+    /// The second element only ever distinguishes two `Unknown`s, and it is
+    /// required rather than cosmetic: `Ord` must agree with `Eq`, and the
+    /// derived `Eq` says `Unknown(5) != Unknown(9)`. Ranking both as simply
+    /// "above Critical" and stopping there would report them equal, which
+    /// breaks the total order and, with it, `BTreeMap`/`sort` on this type.
+    fn rank(self) -> (u8, i32) {
+        match self {
+            StatusSeverity::Unspecified => (0, 0),
+            StatusSeverity::Info => (1, 0),
+            StatusSeverity::Warning => (2, 0),
+            StatusSeverity::Critical => (3, 0),
+            StatusSeverity::Unknown(v) => (4, v),
+        }
+    }
+}
+
+impl Ord for StatusSeverity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for StatusSeverity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -1080,5 +1129,92 @@ fn chain_event(c: pb::ChainEvent) -> Event {
             new_tip: r.new_tip,
         },
         None => Event::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_severity_decodes_to_unspecified_not_unknown() {
+        // proto3's zero value. Before this was its own variant it decoded to
+        // `Unknown(0)`, which ranked above `Critical`.
+        assert_eq!(StatusSeverity::from_proto(0), StatusSeverity::Unspecified);
+    }
+
+    #[test]
+    fn an_unset_severity_ranks_below_info() {
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Info);
+        assert!(StatusSeverity::Unspecified < StatusSeverity::Critical);
+        // The regression this exists for: the documented filter must not page
+        // on a severity the producer never set.
+        assert!(StatusSeverity::from_proto(0) < StatusSeverity::Warning);
+    }
+
+    #[test]
+    fn known_severities_order_by_loudness() {
+        assert!(StatusSeverity::Info < StatusSeverity::Warning);
+        assert!(StatusSeverity::Warning < StatusSeverity::Critical);
+        for (v, want) in [
+            (1, StatusSeverity::Info),
+            (2, StatusSeverity::Warning),
+            (3, StatusSeverity::Critical),
+        ] {
+            assert_eq!(StatusSeverity::from_proto(v), want);
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_severity_still_outranks_critical() {
+        // Deliberate and unchanged: a level this build cannot name is not one
+        // to quietly filter out. A future `notice` at proto 4 would land here
+        // and page — the accepted cost of failing loud on an open taxonomy.
+        let future = StatusSeverity::from_proto(4);
+        assert_eq!(future, StatusSeverity::Unknown(4));
+        assert!(future > StatusSeverity::Critical);
+        assert!(future >= StatusSeverity::Warning);
+    }
+
+    #[test]
+    fn ord_agrees_with_eq_for_distinct_unknowns() {
+        // `Ord` must report `Equal` exactly when `Eq` does. Ranking every
+        // `Unknown` as simply "above Critical" would call these equal while
+        // `Eq` calls them different, breaking the total order.
+        let a = StatusSeverity::Unknown(5);
+        let b = StatusSeverity::Unknown(9);
+        assert_ne!(a, b);
+        assert_ne!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert!(a < b);
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn sorting_puts_the_loudest_last_and_the_unset_first() {
+        let mut all = vec![
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(7),
+            StatusSeverity::Unspecified,
+            StatusSeverity::Warning,
+            StatusSeverity::Info,
+        ];
+        all.sort();
+        assert_eq!(all, vec![
+            StatusSeverity::Unspecified,
+            StatusSeverity::Info,
+            StatusSeverity::Warning,
+            StatusSeverity::Critical,
+            StatusSeverity::Unknown(7),
+        ]);
+    }
+
+    #[test]
+    fn the_documented_filter_idiom_selects_what_it_should() {
+        let page = |s: StatusSeverity| s >= StatusSeverity::Warning;
+        assert!(!page(StatusSeverity::Unspecified));
+        assert!(!page(StatusSeverity::Info));
+        assert!(page(StatusSeverity::Warning));
+        assert!(page(StatusSeverity::Critical));
+        assert!(page(StatusSeverity::Unknown(4)));
     }
 }
