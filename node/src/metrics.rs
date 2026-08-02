@@ -48,6 +48,15 @@ pub struct MetricsContext {
     /// so operators can confirm at a glance which DB-backed indexes
     /// are live.
     pub addr_enabled: bool,
+    /// Live readings from the health detectors. `None` in test backends and
+    /// anywhere the detector task was not spawned, in which case the health
+    /// gauges are omitted entirely rather than reported as zeros (a zero
+    /// `satd_disk_free_bytes` is exactly the alarm an operator must not be
+    /// shown falsely).
+    pub health: Option<Arc<crate::health::HealthState>>,
+    /// Per-hook webhook delivery counters. `None` (or empty) when no alertfile
+    /// is configured, in which case the block renders nothing at all.
+    pub webhooks: Option<Arc<WebhookMetrics>>,
 }
 
 impl MetricsContext {
@@ -328,6 +337,12 @@ impl MetricsContext {
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
 
+        // Node-health gauges, rendered only when the detector task is running.
+        render_health_metrics(&mut out, self.health.as_deref());
+
+        // Webhook delivery counters, rendered only when a hook is configured.
+        render_webhook_metrics(&mut out, self.webhooks.as_deref());
+
         // Transaction-filtering policy metrics (design §10, PR 7c). Extracted to
         // a free function so the I8-invisibility invariant (a node with no
         // non-empty ruleset renders a byte-identical page) is unit-testable
@@ -361,8 +376,26 @@ fn metric(
     labels: &[(&str, &str)],
     value: u64,
 ) {
+    metric_header(out, name, help, kind);
+    metric_sample(out, name, labels, value);
+}
+
+/// Emit the `# HELP` / `# TYPE` pair for a metric family, once.
+///
+/// The text format permits **one** such pair per family name. [`metric`] writes
+/// a header with every sample, which is correct only for a single-series
+/// family; calling it in a loop emits repeated headers, and a strict parser
+/// (`promtool check metrics`, and the `expfmt` text parser several collectors
+/// and relays use) hard-errors on the second `# HELP` and discards the *entire
+/// page* — taking every unrelated satd metric down with it. For a multi-series
+/// family call this once, then [`metric_sample`] per series.
+fn metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// Emit one sample of an already-headered metric family.
+fn metric_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
     if labels.is_empty() {
         let _ = writeln!(out, "{name} {value}");
     } else {
@@ -374,6 +407,196 @@ fn metric(
             let _ = write!(label_str, "{k}=\"{}\"", escape_label(v));
         }
         let _ = writeln!(out, "{name}{{{label_str}}} {value}");
+    }
+}
+
+/// Per-hook webhook delivery counters, written by the alert dispatcher in the
+/// `satd` binary and rendered here.
+///
+/// Lives in `node` rather than beside the dispatcher because `satd-alert`
+/// depends on `node` (for the health taxonomy), so the reverse dependency
+/// needed to render them from here would be a cycle.
+#[derive(Debug, Default)]
+pub struct HookCounters {
+    pub delivered: std::sync::atomic::AtomicU64,
+    /// Failed *attempts*, not failed events: a single event retried five times
+    /// before succeeding contributes five. This is the signal that an endpoint
+    /// is flaky even while it is ultimately keeping up.
+    pub failed_attempts: std::sync::atomic::AtomicU64,
+    /// Events never delivered: queue overflow, broadcast lag, or a permanent
+    /// 4xx. The dead-letter count.
+    pub dropped: std::sync::atomic::AtomicU64,
+    pub queue_depth: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the last 2xx, or 0 if there has never been one.
+    pub last_success_unix: std::sync::atomic::AtomicU64,
+}
+
+/// Registry of per-hook counters, keyed by hook id.
+///
+/// A `BTreeMap` so `/metrics` renders hooks in a stable order (Prometheus does
+/// not care, but a diffable scrape is worth the ordering), behind an `RwLock`
+/// because a SIGHUP reload can add or remove hooks while the endpoint is being
+/// scraped.
+#[derive(Debug, Default)]
+pub struct WebhookMetrics {
+    hooks: parking_lot::RwLock<std::collections::BTreeMap<String, Arc<HookCounters>>>,
+}
+
+impl WebhookMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get or create a hook's counters. Called on hook registration and on
+    /// every delivery, so it must not allocate on the hot path — the common
+    /// case is a read-lock hit.
+    pub fn hook(&self, id: &str) -> Arc<HookCounters> {
+        if let Some(c) = self.hooks.read().get(id) {
+            return c.clone();
+        }
+        let mut w = self.hooks.write();
+        w.entry(id.to_string()).or_default().clone()
+    }
+
+    /// Forget hooks that are no longer configured, so a removed hook's series
+    /// stops being exported instead of freezing at its last value forever.
+    pub fn retain(&self, ids: &[String]) {
+        self.hooks.write().retain(|k, _| ids.iter().any(|i| i == k));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hooks.read().is_empty()
+    }
+
+    fn snapshot(&self) -> Vec<(String, Arc<HookCounters>)> {
+        self.hooks
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+/// Append the webhook dispatcher's per-hook counters — but only when at least
+/// one hook is configured, so a node with no alertfile renders a page
+/// byte-identical to a build without the dispatcher (the same invisibility
+/// property the policy metrics hold).
+fn render_webhook_metrics(out: &mut String, metrics: Option<&WebhookMetrics>) {
+    use std::sync::atomic::Ordering;
+    let Some(metrics) = metrics.filter(|m| !m.is_empty()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Family headers once, then one labelled sample per hook. Emitting a
+    // header per hook (as a per-sample `metric` call in this loop does) is
+    // well-formed with a single webhook configured and invalid with two — the
+    // kind of bug that passes every test written against one hook and breaks
+    // an operator's whole scrape page the day they add a second.
+    let snapshot = metrics.snapshot();
+    for (name, help, kind) in [
+        (
+            "satd_alertwebhook_delivered_total",
+            "Webhook events acknowledged (2xx) by the receiver.",
+            "counter",
+        ),
+        (
+            "satd_alertwebhook_failed_attempts_total",
+            "Webhook delivery attempts that failed (retried or dropped).",
+            "counter",
+        ),
+        (
+            "satd_alertwebhook_dropped_total",
+            "Webhook events never delivered (queue overflow, broadcast lag, or a permanent 4xx).",
+            "counter",
+        ),
+        (
+            "satd_alertwebhook_queue_depth",
+            "Events currently queued for this webhook.",
+            "gauge",
+        ),
+        // Age rather than a timestamp: an alerting rule wants "no successful
+        // delivery in N minutes", which is awkward to express against an
+        // absolute epoch value. 0 before the first success, which reads as
+        // "fresh" — so pair it with `delivered_total > 0` in a rule.
+        (
+            "satd_alertwebhook_last_success_age_seconds",
+            "Seconds since this webhook's last acknowledged delivery (0 if none yet).",
+            "gauge",
+        ),
+    ] {
+        metric_header(out, name, help, kind);
+        for (id, c) in &snapshot {
+            let labels = [("hook", id.as_str())];
+            let last = c.last_success_unix.load(Ordering::Relaxed);
+            let value = match name {
+                "satd_alertwebhook_delivered_total" => c.delivered.load(Ordering::Relaxed),
+                "satd_alertwebhook_failed_attempts_total" => {
+                    c.failed_attempts.load(Ordering::Relaxed)
+                }
+                "satd_alertwebhook_dropped_total" => c.dropped.load(Ordering::Relaxed),
+                "satd_alertwebhook_queue_depth" => c.queue_depth.load(Ordering::Relaxed),
+                _ if last == 0 => 0,
+                _ => now.saturating_sub(last),
+            };
+            metric_sample(out, name, &labels, value);
+        }
+    }
+}
+
+/// Append the node-health gauges (§A3): tip age, free disk, and one 0/1 series
+/// per standing alert condition.
+///
+/// `satd_alert_active` is pre-registered for *every* kind, including ones that
+/// are not currently raised, so an alerting rule can be written against a series
+/// that exists from the first scrape — a gauge that only appears once the
+/// condition fires is exactly the gauge you cannot alert on. Edge kinds
+/// (`ibd_complete`, `deep_reorg`) have no standing state and are omitted: a
+/// permanently-zero series would invite a rule that can never fire.
+///
+/// Renders nothing at all when no detector task is running (`None`), rather
+/// than emitting zeros that would read as real readings.
+fn render_health_metrics(out: &mut String, health: Option<&crate::health::HealthState>) {
+    let Some(health) = health else {
+        return;
+    };
+    metric(
+        out,
+        "satd_tip_last_connect_age_seconds",
+        "Seconds since the last block was connected to the active chain (since process start if none has been).",
+        "gauge",
+        &[],
+        health.last_connect_age_secs(),
+    );
+    // Omitted rather than zeroed when the filesystem cannot be interrogated.
+    if let Some(free) = health.disk_free_bytes() {
+        metric(
+            out,
+            "satd_disk_free_bytes",
+            "Free space available to satd on the watched data/blocks directory.",
+            "gauge",
+            &[],
+            free,
+        );
+    }
+    metric_header(
+        out,
+        "satd_alert_active",
+        "1 while a node-health condition is raised, 0 while it is clear.",
+        "gauge",
+    );
+    for kind in crate::events::StatusKind::ALL {
+        if kind.is_edge() {
+            continue;
+        }
+        metric_sample(
+            out,
+            "satd_alert_active",
+            &[("kind", kind.as_str())],
+            u64::from(health.is_active(kind)),
+        );
     }
 }
 
@@ -713,6 +936,194 @@ mod tests {
         assert_eq!(scope_label(true, false), "relay");
         assert_eq!(scope_label(false, true), "template");
         assert_eq!(scope_label(false, false), "none");
+    }
+
+    #[test]
+    fn webhook_metrics_are_valid_exposition_format_with_several_hooks() {
+        // Two hooks, because one hook cannot expose this: a header-per-sample
+        // renderer is well-formed with a single series and invalid with two.
+        // A strict parser rejects the entire page on the duplicate `# HELP`,
+        // so an operator adding a second webhook would lose every metric satd
+        // exports, not just these.
+        let m = WebhookMetrics::default();
+        let _ = m.hook("pager");
+        let _ = m.hook("deadman");
+        let _ = m.hook("relay");
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert_one_header_per_family(&out);
+        // And every hook is still represented.
+        for id in ["pager", "deadman", "relay"] {
+            assert!(
+                out.contains(&format!("satd_alertwebhook_delivered_total{{hook=\"{id}\"}}")),
+                "missing series for {id}:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_metrics_invisible_until_a_hook_is_configured() {
+        use std::sync::atomic::Ordering;
+        // No registry, and an empty registry, both render nothing: a node with
+        // no alertfile must produce a page byte-identical to one built without
+        // the dispatcher.
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, None);
+        assert!(out.is_empty(), "{out}");
+
+        let m = WebhookMetrics::new();
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert!(out.is_empty(), "an empty registry must leak nothing:\n{out}");
+
+        // A registered hook exports its counters, labelled by id.
+        let c = m.hook("ops");
+        c.delivered.store(7, Ordering::Relaxed);
+        c.dropped.store(2, Ordering::Relaxed);
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert!(out.contains(r#"satd_alertwebhook_delivered_total{hook="ops"} 7"#), "{out}");
+        assert!(out.contains(r#"satd_alertwebhook_dropped_total{hook="ops"} 2"#), "{out}");
+        assert!(out.contains(r#"satd_alertwebhook_queue_depth{hook="ops"} 0"#), "{out}");
+    }
+
+    #[test]
+    fn removed_hooks_stop_being_exported() {
+        // Otherwise a hook deleted on SIGHUP would keep exporting its last
+        // values forever, and an alerting rule on it could never recover.
+        let m = WebhookMetrics::new();
+        m.hook("old");
+        m.hook("new");
+        m.retain(&["new".to_string()]);
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert!(out.contains(r#"hook="new""#), "{out}");
+        assert!(!out.contains(r#"hook="old""#), "{out}");
+    }
+
+    #[test]
+    fn last_success_age_is_zero_before_the_first_delivery() {
+        use std::sync::atomic::Ordering;
+        // An age computed from an unset (0) timestamp would render as ~57 years
+        // and read as a catastrophic outage on a node that simply has not
+        // delivered anything yet.
+        let m = WebhookMetrics::new();
+        m.hook("ops");
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert!(
+            out.contains(r#"satd_alertwebhook_last_success_age_seconds{hook="ops"} 0"#),
+            "{out}"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        m.hook("ops")
+            .last_success_unix
+            .store(now.saturating_sub(30), Ordering::Relaxed);
+        let mut out = String::new();
+        render_webhook_metrics(&mut out, Some(&m));
+        assert!(
+            out.contains(r#"satd_alertwebhook_last_success_age_seconds{hook="ops"} 3"#),
+            "expected an age around 30s:\n{out}"
+        );
+    }
+
+    #[test]
+    fn health_metrics_absent_without_a_detector_task() {
+        // Rendering zeros here would show a `satd_disk_free_bytes 0` — the
+        // exact alarm an operator must not be given falsely.
+        let mut out = String::new();
+        render_health_metrics(&mut out, None);
+        assert!(out.is_empty(), "no detector ⇒ no health metrics:\n{out}");
+    }
+
+    /// Assert a rendered page is valid Prometheus text format on the one rule
+    /// that is easy to break and fatal when broken: at most one `# HELP` and
+    /// one `# TYPE` per family name.
+    ///
+    /// Strict parsers (`promtool check metrics`, `expfmt.TextParser`) reject
+    /// the whole page on a duplicate, so one careless family takes every other
+    /// satd metric down with it. Prometheus's own scrape parser is lenient,
+    /// which is exactly why this is worth a test rather than a scrape check.
+    fn assert_one_header_per_family(out: &str) {
+        use std::collections::HashMap;
+        let mut helps: HashMap<&str, usize> = HashMap::new();
+        let mut types: HashMap<&str, usize> = HashMap::new();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                *helps.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                *types.entry(rest.split(' ').next().unwrap_or("")).or_default() += 1;
+            }
+        }
+        for (name, n) in helps {
+            assert_eq!(n, 1, "family {name} has {n} `# HELP` lines:\n{out}");
+        }
+        for (name, n) in types {
+            assert_eq!(n, 1, "family {name} has {n} `# TYPE` lines:\n{out}");
+        }
+    }
+
+    #[test]
+    fn health_metrics_are_valid_exposition_format() {
+        // `satd_alert_active` is one family with a series per kind, so the
+        // header must be emitted once and the samples must follow it.
+        let health = crate::health::HealthState::new();
+        health.set_disk_free_for_test(Some(1 << 30));
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert_one_header_per_family(&out);
+    }
+
+    #[test]
+    fn health_metrics_preregister_every_standing_kind() {
+        use crate::events::StatusKind;
+        let health = crate::health::HealthState::new();
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+
+        // The tip-age gauge always renders.
+        assert!(out.contains("satd_tip_last_connect_age_seconds 0"), "{out}");
+        // Disk is omitted until sampled, rather than reported as zero free.
+        assert!(
+            !out.contains("satd_disk_free_bytes"),
+            "an unsampled disk reading must be omitted, not zeroed:\n{out}"
+        );
+        // Every standing condition has a series from the first scrape, so an
+        // alerting rule can reference one before it ever fires.
+        for kind in StatusKind::ALL {
+            let want = format!("satd_alert_active{{kind=\"{}\"}} 0", kind.as_str());
+            if kind.is_edge() {
+                assert!(
+                    !out.contains(&format!("kind=\"{}\"", kind.as_str())),
+                    "edge kind {kind:?} has no standing state to report:\n{out}"
+                );
+            } else {
+                assert!(out.contains(&want), "missing series {want}:\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn health_metrics_reflect_a_raised_condition() {
+        use crate::events::StatusKind;
+        let health = crate::health::HealthState::new();
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert!(out.contains("satd_alert_active{kind=\"disk_low\"} 0"));
+
+        // Simulate the detector raising `disk_low` with a real reading.
+        health.set_active_for_test(StatusKind::DiskLow, true);
+        health.set_disk_free_for_test(Some(4096));
+        let mut out = String::new();
+        render_health_metrics(&mut out, Some(&health));
+        assert!(out.contains("satd_alert_active{kind=\"disk_low\"} 1"), "{out}");
+        assert!(out.contains("satd_disk_free_bytes 4096"), "{out}");
+        // Unrelated conditions stay at 0.
+        assert!(out.contains("satd_alert_active{kind=\"tip_stall\"} 0"), "{out}");
     }
 
     #[test]

@@ -209,8 +209,29 @@ async fn publish(
     topics: &ZmqTopicConfig,
     counters: &TopicCounters,
 ) -> Result<(), zeromq::ZmqError> {
-    // Catch-all envelope topic (always emitted unless disabled).
-    if ZmqTopicConfig::enabled(topics.nodeevent) {
+    // Catch-all envelope topic (always emitted unless disabled), minus the
+    // `status` category.
+    //
+    // `status` is explicit-only: a subscriber must name the bit to receive it,
+    // so it never reaches a client that did not ask. gRPC/WS/SSE can honor that
+    // because each subscriber carries a category mask; the ZMQ fanout has no
+    // per-subscriber mask, only an all-or-nothing topic toggle. Emitting status
+    // here would hand a new body type to every already-deployed `nodeevent`
+    // consumer the moment they upgrade — health detectors are on by default, so
+    // `peer_floor` alone would start frames arriving — and their only remedy
+    // would be `eventszmqnodeevent=0`, which kills every other envelope too.
+    //
+    // This is not the same situation as the tweak categories, despite both
+    // being explicit-only: `BlockTweaks`/`MempoolTweak` reach the shared
+    // broadcast only while a gRPC tweaks subscriber is attached, so a ZMQ-only
+    // deployment never sees them either way. Status has no such gate.
+    //
+    // Status is served on the three mask-bearing transports, on webhooks, and
+    // through `-alertnotify`. If a ZMQ-only consumer ever needs it, the additive
+    // fix is an opt-in `eventszmqstatus` topic, not widening this one.
+    let explicit_only_on_unmasked_transport =
+        env.category_bit() == node::events::CATEGORY_STATUS;
+    if ZmqTopicConfig::enabled(topics.nodeevent) && !explicit_only_on_unmasked_transport {
         match serde_json::to_vec(env) {
             Ok(payload) => {
                 let seq = counters.next(&counters.nodeevent);
@@ -304,6 +325,13 @@ async fn publish(
             // (gRPC `Subscribe`); it has no Bitcoin Core-compat ZMQ topic. The
             // full envelope is still available on `nodeevent` for consumers who
             // subscribe to the tweaks category there.
+        }
+        NodeEventBody::Status(_) => {
+            // Node-health conditions are a satd-native category with no Bitcoin
+            // Core-compat ZMQ topic (Core surfaces the equivalent through
+            // `-alertnotify`, which satd also drives from the same detectors).
+            // Nor does it ride the catch-all `nodeevent` topic — see the
+            // explicit-only note at the top of `publish`.
         }
         NodeEventBody::MempoolTweak(_) => {
             // Mempool-time tweak (Tier 1.5): like BlockTweaks, no Core-compat ZMQ
@@ -638,6 +666,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodeevent_topic_omits_the_explicit_only_status_category() {
+        // `status` is explicit-only, and ZMQ has no per-subscriber category
+        // mask to opt in with. An already-deployed `nodeevent` consumer must
+        // therefore not start receiving a new body type just because it
+        // upgraded to a build whose health detectors are on by default.
+        //
+        // Publish a status event first, then a mempool event. If status were
+        // emitted the first frame would be the status one; asserting the first
+        // frame is the mempool event proves status was skipped rather than
+        // merely delayed.
+        let publisher = EventPublisher::new(edge(), 64);
+        let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
+        let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
+
+        let (endpoint, _) = ephemeral_endpoint().await;
+        spin_up_sink(
+            endpoint.clone(),
+            ZmqTopicConfig::default(),
+            publisher.clone(),
+            shutdown_rx.clone(),
+        )
+        .await;
+
+        let mut sub = SubSocket::new();
+        sub.connect(&endpoint).await.expect("sub connect");
+        sub.subscribe(topics::NODEEVENT).await.expect("subscribe");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        publisher.publish_status(node::events::StatusEvent::raised(
+            node::events::StatusKind::PeerFloor,
+            "0 peers connected",
+        ));
+        mp_tx.send(enter_event(0x55)).unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+            .await
+            .expect("nodeevent timeout")
+            .expect("recv");
+        let frames: Vec<_> = msg.into_vec().into_iter().map(|b| b.to_vec()).collect();
+        let parsed: serde_json::Value = serde_json::from_slice(&frames[1]).unwrap();
+        assert_eq!(
+            parsed["body"]["category"], "mempool",
+            "status must not reach the unmasked ZMQ fanout"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
     async fn nodeevent_topic_carries_full_envelope() {
         let publisher = EventPublisher::new(edge(), 64);
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);

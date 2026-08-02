@@ -23,6 +23,10 @@ mod streaming;
 // against a live `satd`.
 #[path = "e2e/sdk.rs"]
 mod sdk;
+// Alert webhook dispatcher E2E: a real satd delivering signed POSTs to a
+// scriptable loopback receiver.
+#[path = "e2e/webhooks.rs"]
+mod webhooks;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,

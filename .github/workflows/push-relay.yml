@@ -1,0 +1,64 @@
+# Build + test the reference push relay (`contrib/push-relay/`).
+#
+# Path-gated and separate from the main CI workflow on purpose: the relay is a
+# standalone project outside the satd workspace, with its own dependency tree
+# (JWT, OAuth, HTTP server). It must not gate node changes, and node changes
+# must not rebuild it. It is also NOT release-gated — the relay ships as source
+# for operators to fork, not as a binary satd distributes.
+name: Push relay
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'contrib/push-relay/**'
+      - '.github/workflows/push-relay.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'contrib/push-relay/**'
+      - '.github/workflows/push-relay.yml'
+
+concurrency:
+  group: push-relay-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "Build + test"
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: contrib/push-relay
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contrib/push-relay/target
+          key: push-relay-${{ runner.os }}-${{ hashFiles('contrib/push-relay/Cargo.toml') }}
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build release
+        run: cargo build --locked --release

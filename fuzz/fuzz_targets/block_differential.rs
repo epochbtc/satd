@@ -35,6 +35,7 @@
 #![no_main]
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -117,34 +118,49 @@ fn spawn_base() -> Base {
             &format!("-rpcpassword={CORE_PASS}"),
             "-rpcallowip=127.0.0.1",
         ])
-        .output()
-        .expect("docker run bitcoind (is Docker installed?)");
-    assert!(
-        run.status.success(),
-        "docker run for Bitcoin Core failed: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        .output();
+    let run = match run {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => harness_failure(&format!(
+            "docker run for Bitcoin Core failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => harness_failure(&format!("could not exec docker (is Docker installed?): {e}")),
+    };
+    let _ = run;
 
     let rpc = Client::new(
         &format!("http://127.0.0.1:{CORE_RPC_PORT}"),
         Auth::UserPass(CORE_USER.to_string(), CORE_PASS.to_string()),
-    )
-    .expect("Core RPC client");
+    );
+    let rpc = match rpc {
+        Ok(c) => c,
+        Err(e) => harness_failure(&format!("could not build the Core RPC client: {e}")),
+    };
 
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if rpc.get_blockchain_info().is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "Bitcoin Core RPC never came up");
+        if Instant::now() >= deadline {
+            harness_failure(
+                "Bitcoin Core RPC never came up within 90s (loaded runner? container died?)",
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 
     let genesis = genesis_hash();
-    let best = rpc
-        .call::<String>("getbestblockhash", &[])
-        .expect("Core getbestblockhash");
-    assert_eq!(best, genesis.to_string(), "Core not at regtest genesis");
+    let best = match rpc.call::<String>("getbestblockhash", &[]) {
+        Ok(b) => b,
+        Err(e) => harness_failure(&format!("Core getbestblockhash failed: {e}")),
+    };
+    if best != genesis.to_string() {
+        harness_failure(&format!(
+            "Core is not at regtest genesis (best={best}, expected={genesis})"
+        ));
+    }
 
     Base {
         rpc,
@@ -181,27 +197,110 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         num_threads: 1,
         precomputed_txids: None,
         address_index: &Default::default(),
+        // Both indexes default to disabled: this target fuzzes consensus
+        // accept/reject, and index emission is not part of that verdict.
+        sp_index: &Default::default(),
         phase_tracker: None,
     })
     .is_ok()
 }
 
+/// Verdicts actually compared against the oracle. Reported periodically so a
+/// run's log carries evidence of how much differential testing it did.
+static COMPARISONS: AtomicU64 = AtomicU64::new(0);
+/// Consecutive `submitblock` errors where a follow-up liveness probe ALSO
+/// failed, i.e. the oracle itself is gone rather than the input being bad.
+static ORACLE_DOWN_STREAK: AtomicU64 = AtomicU64::new(0);
+
+/// How many consecutive dead-oracle observations end the run. Small enough to
+/// fail fast, large enough to ride out a momentary hiccup.
+const MAX_ORACLE_DOWN_STREAK: u64 = 20;
+
 /// Core's verdict via `submitblock`. `Some(true)` = accept (null result),
 /// `Some(false)` = a consensus reject, `None` = a connectivity/duplicate
 /// verdict or RPC-level error → skip (not a consensus signal).
+///
+/// A skip is indistinguishable from a comparison in the exit status, so a dead
+/// oracle used to be invisible: every iteration returned `None`, the target
+/// returned early, libFuzzer ran out its full `-max_total_time` and **exited
+/// 0**. The job went green having compared nothing — precisely the outcome it
+/// exists to prevent, and one no failure-triage can catch because there is no
+/// failure. So an RPC error is now followed by a liveness probe, and a streak
+/// of dead probes ends the run loudly.
 fn core_accepts(rpc: &Client, hex: &str) -> Option<bool> {
     match rpc.call::<Option<String>>("submitblock", &[serde_json::Value::String(hex.to_string())]) {
-        Ok(None) => Some(true),
+        Ok(None) => {
+            note_comparison(rpc);
+            Some(true)
+        }
         Ok(Some(reason)) => {
+            ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
             if is_connectivity(&reason) {
                 None
             } else {
+                note_comparison(rpc);
                 Some(false)
             }
         }
-        // RPC error (e.g. the submitblock "doesn't start with a coinbase"
-        // pre-check, or a decode error) — not a comparable consensus verdict.
-        Err(_) => None,
+        // An RPC error is usually the input's fault — the `submitblock`
+        // "doesn't start with a coinbase" pre-check, a decode error — and not a
+        // comparable consensus verdict. But it is also what a vanished oracle
+        // looks like, so ask whether Core is still answering at all before
+        // treating it as an ordinary skip.
+        Err(_) => {
+            if rpc.call::<serde_json::Value>("getblockcount", &[]).is_ok() {
+                ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
+                return None;
+            }
+            let streak = ORACLE_DOWN_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= MAX_ORACLE_DOWN_STREAK {
+                // Continuing would burn the remaining budget comparing satd
+                // against nothing and then exit 0.
+                harness_failure(&format!(
+                    "Bitcoin Core oracle unreachable for {streak} consecutive submissions \
+                     (container '{CORE_CONTAINER}' gone? OOM-killed?)."
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// Abort the run as a **harness** failure, never as a finding.
+///
+/// Every startup step below reaches the oracle over Docker and the network, and
+/// each can fail for reasons that have nothing to do with consensus: no Docker
+/// on the runner, a registry hiccup, an OOM-killed container, a bitcoind that
+/// takes longer than the deadline to open its RPC port on a loaded shared
+/// runner. Those used to be `expect`/`assert!`, i.e. panics — and a panic
+/// *inside a fuzz target* makes libFuzzer write a `crash-*` reproducer. The
+/// triage step keys on the presence of a reproducer, so a slow-starting
+/// bitcoind filed an issue titled "Fuzz divergence: satd vs Bitcoin Core"
+/// whose body asserts "This is a confirmed finding, not a flake."
+///
+/// Exiting with a distinct status leaves no artifact, so triage classifies it
+/// as the broken-harness case it is.
+fn harness_failure(what: &str) -> ! {
+    eprintln!("=== BLOCK-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
+    eprintln!("{what}");
+    eprintln!(
+        "comparisons_before_failure={}",
+        COMPARISONS.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "This is a harness/infrastructure failure, NOT a consensus divergence: \
+         no reproducer is written."
+    );
+    std::process::exit(2);
+}
+
+/// Count a real accept/reject comparison, and log progress periodically so the
+/// run's log shows how much differential work actually happened.
+fn note_comparison(_rpc: &Client) {
+    ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
+    let n = COMPARISONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(10_000) {
+        eprintln!("block-differential: {n} verdicts compared against Bitcoin Core");
     }
 }
 

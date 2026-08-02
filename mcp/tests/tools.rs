@@ -58,6 +58,8 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
         mempool_history: None,
         addr_enabled: false,
         addr_subs: None,
+        health: None,
+        webhooks: None,
     };
     (ctx, dir)
 }
@@ -614,6 +616,8 @@ mod mining {
             mempool_history: None,
             addr_enabled: false,
             addr_subs: None,
+            health: None,
+            webhooks: None,
         };
 
         let result = mine::generate_blocks(&ctx, 1, REGTEST_ADDR);

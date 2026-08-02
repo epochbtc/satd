@@ -825,6 +825,10 @@ impl NodeEventStream for NodeEventStreamSvc {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        // Read before `into_inner()`, which drops the extensions the auth
+        // interceptor stashed the principal in. `None` means the token store is
+        // not configured at all (loopback trust), the Core-compatible default.
+        let principal = request.extensions().get::<satd_auth::Principal>().cloned();
         let req = request.into_inner();
 
         // Enforce the global concurrent-subscription cap before attaching a
@@ -866,6 +870,26 @@ impl NodeEventStream for NodeEventStreamSvc {
         } else {
             req.categories
         };
+
+        // `status` (bit 16) additionally requires `rpc:read`: it reports host
+        // telemetry — free disk, peer topology, mempool occupancy and
+        // `mempoolminfee`, tip height, IBD state — that every other surface
+        // keeps behind that capability. Refused here rather than stripped,
+        // because the client asked for it explicitly (bit 16 is never in the
+        // `0` default) and a silently absent category reads as "the node is
+        // healthy". See `crate::catauth`.
+        if category_mask & node::events::CATEGORY_STATUS != 0
+            && !crate::catauth::may_receive_status(principal.as_ref())
+        {
+            debug!(
+                target: "events::grpc",
+                code = "permission_denied",
+                "rejecting Subscribe: the status category requires rpc:read",
+            );
+            return Err(Status::permission_denied(
+                "the status category requires the rpc:read capability",
+            ));
+        }
         let since_seq = req.since_seq.unwrap_or(0);
 
         // Silent-payment `tweaks` category (bit 8) is explicit-request only and
@@ -1451,8 +1475,15 @@ impl NodeEventStream for NodeEventStreamSvc {
                                         // control update cannot forward shared-broadcast
                                         // `BlockTweaks` past the Subscribe path's
                                         // index/completeness/dust-limit validation.
+                                        // `status` is stripped for a token without
+                                        // `rpc:read` for the same reason it is refused
+                                        // on Subscribe — a control message must not be
+                                        // a way around the handshake gate.
                                         category_mask.store(
-                                            mask & !node::events::CATEGORY_TWEAKS,
+                                            crate::catauth::strip_unauthorized(
+                                                principal.as_ref(),
+                                                mask & !node::events::CATEGORY_TWEAKS,
+                                            ),
                                             Ordering::Relaxed,
                                         );
                                     }
@@ -2150,8 +2181,16 @@ fn apply_control(
                 c.categories
             };
             // Strip the tweaks bit: Watch never serves the firehose (see the
-            // SetWatchSet path above).
-            category_mask.store(mask & !node::events::CATEGORY_TWEAKS, Ordering::Relaxed);
+            // SetWatchSet path above). `status` goes the same way for a token
+            // without `rpc:read`, so a mid-stream update is not a route around
+            // the handshake gate.
+            category_mask.store(
+                crate::catauth::strip_unauthorized(
+                    principal,
+                    mask & !node::events::CATEGORY_TWEAKS,
+                ),
+                Ordering::Relaxed,
+            );
         }
         Some(Msg::SetWatchOptions(o)) => {
             // Per-stream raw-tx inlining. Store the encoder-side flag AND toggle
@@ -3019,6 +3058,7 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         // dropped before conversion); this maps the survivor to its full proto
         // form. `tweaks_only` never applies — the txid is always present.
         NodeEventBody::MempoolTweak(entry) => Body::MempoolTweak(mempool_tweak_to_proto(entry)),
+        NodeEventBody::Status(ev) => Body::Status(status_event_to_proto(ev)),
         NodeEventBody::Heartbeat { uptime_ns } => Body::Heartbeat(pb::Heartbeat {
             uptime_ns: *uptime_ns,
         }),
@@ -3032,6 +3072,39 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         NodeEventBody::SetCursorResult(outcome) => {
             Body::SetCursorResult(set_cursor_result_to_proto(outcome))
         }
+    }
+}
+
+fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
+    use node::events::{StatusKind as K, StatusSeverity as Sev, StatusState as St};
+    let kind = match ev.kind {
+        K::IbdComplete => pb::StatusKind::IbdComplete,
+        K::TipStall => pb::StatusKind::TipStall,
+        K::DiskLow => pb::StatusKind::DiskLow,
+        K::MempoolCongested => pb::StatusKind::MempoolCongested,
+        K::PeerFloor => pb::StatusKind::PeerFloor,
+        K::DeepReorg => pb::StatusKind::DeepReorg,
+    };
+    let state = match ev.state {
+        St::Raised => pb::StatusState::Raised,
+        St::Cleared => pb::StatusState::Cleared,
+        St::Edge => pb::StatusState::Edge,
+    };
+    let severity = match ev.severity {
+        Sev::Info => pb::StatusSeverity::Info,
+        Sev::Warning => pb::StatusSeverity::Warning,
+        Sev::Critical => pb::StatusSeverity::Critical,
+    };
+    pb::StatusEvent {
+        kind: kind as i32,
+        state: state as i32,
+        severity: severity as i32,
+        message: ev.message.clone(),
+        // `details` is a `BTreeMap` on the Rust side (deterministic order for
+        // the HMAC-signed webhook body); proto maps are unordered, so the
+        // ordering guarantee simply does not carry here — no consumer of the
+        // proto surface depends on it.
+        details: ev.details.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
     }
 }
 
@@ -3218,6 +3291,62 @@ mod tests {
             pb.entries[1].taproot_outputs.is_empty(),
             "un-enriched entry carries no outputs"
         );
+    }
+
+    #[test]
+    fn status_event_maps_to_proto_enums_and_details() {
+        use node::events::{StatusEvent, StatusKind, StatusSeverity, StatusState};
+
+        let ev = StatusEvent::raised(StatusKind::TipStall, "no block for 3612s")
+            .with_detail("seconds_since_block", 3612u64)
+            .with_detail("threshold_seconds", 3600u64);
+        let pb = status_event_to_proto(&ev);
+
+        assert_eq!(pb.kind, pb::StatusKind::TipStall as i32);
+        assert_eq!(pb.state, pb::StatusState::Raised as i32);
+        assert_eq!(pb.severity, pb::StatusSeverity::Critical as i32);
+        assert_eq!(pb.message, "no block for 3612s");
+        assert_eq!(pb.details.get("seconds_since_block").map(String::as_str), Some("3612"));
+        assert_eq!(pb.details.get("threshold_seconds").map(String::as_str), Some("3600"));
+
+        // Every kind and state has a distinct, non-UNSPECIFIED mapping — a
+        // zero-valued enum on the wire would be indistinguishable from a field
+        // the server never set.
+        let mut seen = std::collections::HashSet::new();
+        for kind in StatusKind::ALL {
+            let ev = if kind.is_edge() {
+                StatusEvent::edge(kind, "x")
+            } else {
+                StatusEvent::raised(kind, "x")
+            };
+            let mapped = status_event_to_proto(&ev).kind;
+            assert_ne!(mapped, pb::StatusKind::Unspecified as i32, "{kind:?}");
+            assert!(seen.insert(mapped), "duplicate proto mapping for {kind:?}");
+        }
+        for (state, want) in [
+            (StatusState::Raised, pb::StatusState::Raised),
+            (StatusState::Cleared, pb::StatusState::Cleared),
+            (StatusState::Edge, pb::StatusState::Edge),
+        ] {
+            let ev = StatusEvent {
+                kind: StatusKind::DiskLow,
+                state,
+                severity: StatusSeverity::Info,
+                message: String::new(),
+                details: Default::default(),
+            };
+            assert_eq!(status_event_to_proto(&ev).state, want as i32);
+        }
+    }
+
+    #[test]
+    fn status_envelope_rides_the_status_body_field() {
+        use node::events::{StatusEvent, StatusKind};
+        let body = NodeEventBody::Status(StatusEvent::edge(StatusKind::IbdComplete, "synced"));
+        assert!(matches!(
+            body_to_proto(&body),
+            pb::node_event::Body::Status(_)
+        ));
     }
 
     #[test]
@@ -4284,6 +4413,7 @@ mod tests {
                 pb::node_event::Body::BlockTweaks(_) => "block_tweaks",
                 pb::node_event::Body::SilentPaymentMatched(_) => "silent_payment_matched",
                 pb::node_event::Body::MempoolTweak(_) => "mempool_tweak",
+                pb::node_event::Body::Status(_) => "status",
             })
             .collect();
         assert!(
