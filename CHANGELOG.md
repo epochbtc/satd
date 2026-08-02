@@ -156,8 +156,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 - Alerting: outbound webhooks. `alertfile=<path>` configures any number of
   signed HTTP hooks, each filtered by category/kind/severity. Bodies are
   byte-identical to the streaming API's JSON for the same event; delivery
-  metadata rides in headers (`X-Satd-Signature`, `X-Satd-Delivery`,
-  `X-Satd-Hook`, `X-Satd-Attempt`). Delivery is serial and in-order per hook,
+  metadata rides in headers (`X-Satd-Signature`, `X-Satd-Timestamp`,
+  `X-Satd-Delivery`, `X-Satd-Hook`, `X-Satd-Attempt`). The signature covers the
+  timestamp, delivery id, and hook id as well as the body, so the idempotency
+  key a receiver deduplicates on cannot be forged and a captured delivery is not
+  a permanent replay token. Delivery is serial and in-order per hook,
   retried with exponential backoff on transient failures and skipped on a
   permanent 4xx. The per-hook queue is bounded and overflow **drops silently**
   — there is no in-band gap notice; the record is
@@ -169,8 +172,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   consumption. Hooks reload on SIGHUP
   (keep-last-good on error); per-hook counters are exported as
   `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
-  their original payload, now delivered by the same dispatcher — which also
-  moves that outbound HTTP off the consensus runtime.
+  their original payload, headers, and retry schedule, now delivered by the same
+  dispatcher — which also moves that outbound HTTP off the consensus runtime.
+  They keep reporting `X-Satd-Webhook-Version: 1`; alertfile hooks report `2`.
+  **Behavior change on `reorgwebhook=`:** redirects are no longer followed, so a
+  receiver answering `3xx` (an `http`→`https` proxy hop, a trailing-slash
+  redirect) must be repointed at its final URL — following one moves a signed
+  body to a host the operator never named.
+- docs: new `docs/api/webhooks.md` — the normative alert-webhook delivery
+  contract (headers, HMAC signature with test vectors, retry classes,
+  best-effort delivery semantics), linked from the streaming spec and the
+  Operator Manual; `CORE_DIFFERENCES.md` gains entries for node-health alerts
+  and the webhook surface.
 
 ## Releases
 

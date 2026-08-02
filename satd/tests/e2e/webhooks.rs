@@ -85,6 +85,10 @@ enum Behavior {
     /// leaves the delivery in retry, which is what an endpoint outage looks
     /// like from the node's side.
     FailHeights(Vec<u64>, u16),
+    /// Accept the connection, read the request, and never answer. The worst
+    /// case for a dispatcher: not a refused connection it can fail fast on, but
+    /// an open socket that consumes the full per-attempt timeout every time.
+    BlackHole,
 }
 
 struct Inner {
@@ -137,6 +141,8 @@ impl MockReceiver {
                                     _ => (200, None),
                                 }
                             }
+                            // 0 is the sentinel for "never answer".
+                            Behavior::BlackHole => (0, None),
                         };
                         // Only a request the receiver actually accepted counts
                         // as received; a 503'd attempt is a retry, not a
@@ -149,6 +155,11 @@ impl MockReceiver {
                         }
                         (status, location)
                     };
+                    if status == 0 {
+                        // Hold the connection open forever; the client times out.
+                        std::future::pending::<()>().await;
+                        return;
+                    }
                     let reason = if status == 200 { "OK" } else { "Error" };
                     let loc = location
                         .map(|l| format!("Location: {l}\r\n"))
@@ -183,6 +194,11 @@ impl MockReceiver {
     /// Answer every request with a 302 pointing at `to`.
     pub async fn redirecting_to(to: String) -> Self {
         Self::start(Behavior::Redirect(to)).await
+    }
+
+    /// Accept connections and never respond.
+    pub async fn black_hole() -> Self {
+        Self::start(Behavior::BlackHole).await
     }
 
     pub fn url(&self) -> String {
@@ -733,4 +749,63 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     receiver
         .wait_for(60, |r| r.json()["body"]["height"] == 6)
         .await;
+}
+
+/// **Release criterion: a stalled webhook endpoint cannot affect consensus.**
+///
+/// The isolation is structural — deliveries run on the API runtime, the fan-in
+/// only ever `try_send`s into a bounded queue — so this test demonstrates the
+/// property rather than establishing it: with a receiver that accepts TCP and
+/// never answers (the worst case: every attempt burns the full 10s timeout),
+/// block connection must proceed at the same rate as with no hook at all.
+///
+/// The assertion is deliberately a wide bound rather than a tight ratio: this
+/// runs on shared CI hardware where a strict comparison of two wall-clock
+/// measurements would flake. A regression that coupled delivery to block
+/// connection would not be marginal — it would serialize every block behind a
+/// 10-second timeout, blowing past this bound by orders of magnitude.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_endpoint_does_not_slow_block_connection() {
+    const BLOCKS: u32 = 20;
+
+    // Baseline: no webhook configured at all.
+    let plain = crate::streaming::start_streaming_async(vec![]).await;
+    let t0 = std::time::Instant::now();
+    crate::streaming::mine_n(&plain, BLOCKS).await;
+    let baseline = t0.elapsed();
+
+    // Same work, with every event going to a receiver that never answers.
+    let receiver = MockReceiver::black_hole().await;
+    let (stalled, _dir) = node_with_hook(&receiver, "blackhole", "\"chain\"", vec![]).await;
+    let t0 = std::time::Instant::now();
+    crate::streaming::mine_n(&stalled, BLOCKS).await;
+    let with_stalled_hook = t0.elapsed();
+
+    println!(
+        "block-connect wall time for {BLOCKS} blocks: baseline {baseline:?}, \
+         with a stalled webhook {with_stalled_hook:?}",
+    );
+
+    // If delivery were coupled to block connection, each block would wait out
+    // the 10s per-attempt timeout — 200s for this run. A generous ceiling still
+    // catches that by two orders of magnitude.
+    let ceiling = (baseline * 4).max(Duration::from_secs(20));
+    assert!(
+        with_stalled_hook < ceiling,
+        "a stalled webhook endpoint slowed block connection: {with_stalled_hook:?} \
+         vs a {ceiling:?} ceiling (baseline {baseline:?})",
+    );
+
+    // And the node is still healthy afterwards — the tip really did advance.
+    let rpc = stalled.node.rpc_handle();
+    let height = tokio::task::spawn_blocking(move || rpc.call("getblockcount", vec![]))
+        .await
+        .unwrap()
+        .unwrap()["result"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        height >= u64::from(BLOCKS),
+        "tip should have advanced to at least {BLOCKS}, got {height}",
+    );
 }

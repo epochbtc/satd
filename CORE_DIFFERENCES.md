@@ -363,6 +363,29 @@ preserved; the satd extension is opt-in per request or per flag.
   humans, json for production. Stable field schema, trace IDs on the
   block-validation pipeline.
 
+- **Node-health alerts, and `-alertnotify` that actually fires.** Bitcoin Core
+  ships `-alertnotify` but raises almost nothing through it in practice, so
+  most operators have never seen it run. satd detects six conditions about
+  itself — stalled tip, low disk, congested mempool, peer starvation, IBD
+  completion, deep reorg — and reports each simultaneously as a `status`
+  event on the [Streaming Consumption API](docs/api/streaming.md), an entry in
+  `getwarnings` (which drives `-alertnotify`), and a `satd_alert_active{kind}`
+  gauge. Thresholds are the `alert*` config keys, all hot-reloadable; `0`
+  disables a detector. Core has no equivalent for the first and third
+  surfaces.
+
+- **Outbound alert webhooks (`alertfile=`).** A satd extension with no Core
+  counterpart: a TOML file describing any number of signed HTTP hooks, each
+  filtered by category, kind, and severity. Bodies are identical to the
+  streaming API's JSON for the same event; delivery is serial per hook and
+  retried with backoff, but it is best-effort: a hook that falls behind has
+  events dropped, counted in `satd_alertwebhook_dropped_total` and logged, with
+  no in-band notice to the receiver. Per-address, per-outpoint, and per-scan-key
+  matching is the streaming API's `Watch` stream, not this surface.
+  The wire contract is specified in [`docs/api/webhooks.md`](docs/api/webhooks.md).
+  The older `reorgwebhook=` keys remain, with their original payload, served by
+  the same dispatcher.
+
 - **`SIGHUP` reloads config (does not reopen a log file).** Bitcoin Core
   treats `SIGHUP` as "reopen `debug.log`" for logrotate. satd has no
   `debug.log` (it logs to stdout — see the **Log destination** row in

@@ -1010,6 +1010,11 @@ the Core-compatible `-alertnotify` hook, and this stream can never disagree abou
 node state. Operator-facing configuration (detector thresholds, the `alertfile`
 webhook dispatcher) is documented in the Operator Manual, not here.
 
+Health events are also deliverable over **outbound webhooks**, whose bodies are
+byte-identical to the JSON on this surface — one schema, two transports. The
+delivery contract (headers, signature, retry and drop semantics) is specified in
+[`webhooks.md`](webhooks.md).
+
 ## 8. Reorg events
 
 Reorgs are **first-class**, emitted in-process as consensus ground truth — a
