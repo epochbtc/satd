@@ -37,7 +37,12 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2.6"
-jsonwebtoken = "9"
+# v10 moved signing behind a provider feature and picks none by default: with
+# neither `rust_crypto` nor `aws_lc_rs` enabled it builds fine and then panics
+# inside `encode`, so every push dies at the first provider token. `rust_crypto`
+# is pure Rust — `aws_lc_rs` drags in a C/asm build that does not play well with
+# the static-musl targets satd ships.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

@@ -206,6 +206,23 @@ struct TokenResponse {
 /// Exchange a service-account key for an OAuth2 access token.
 ///
 /// Returns the token, the project id, and the token's lifetime in seconds.
+/// Sign the OAuth assertion Google exchanges for an access token (RS256 over
+/// the service account's key).
+///
+/// Split out of `fcm_access_token` so the signing half is reachable without an
+/// HTTP round trip — this is the relay's other provider-token path, and it uses
+/// a different algorithm family than APNs (RSA rather than P-256), so a crypto
+/// provider can cover one and not the other.
+fn google_assertion(private_key: &str, claims: &GoogleClaims) -> anyhow::Result<String> {
+    let enc = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
+        .map_err(|e| anyhow::anyhow!("service-account private_key is not a valid RSA PEM: {e}"))?;
+    Ok(jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        claims,
+        &enc,
+    )?)
+}
+
 pub async fn fcm_access_token(
     client: &reqwest::Client,
     sa_path: &Path,
@@ -222,13 +239,7 @@ pub async fn fcm_access_token(
         iat,
         exp: iat + 3600,
     };
-    let enc = jsonwebtoken::EncodingKey::from_rsa_pem(sa.private_key.as_bytes())
-        .map_err(|e| anyhow::anyhow!("service-account private_key is not a valid RSA PEM: {e}"))?;
-    let assertion = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-        &claims,
-        &enc,
-    )?;
+    let assertion = google_assertion(&sa.private_key, &claims)?;
     let resp: TokenResponse = client
         .post(token_uri)
         .form(&[
@@ -321,6 +332,65 @@ pub async fn send_fcm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// A P-256 key in PKCS#8 PEM — the shape Apple hands out as
+    /// `AuthKey_*.p8`. Generated for this test; it authenticates nothing.
+    const TEST_EC_P8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg5ROTgubMOvR8dvfX\nUtqlw8ERKM9W2l+jY28G/P2f/BGhRANCAATHxPeL3+/oXZYmM2+nvxfvKQJlfbTe\n49Fi+0RfKfhTFDQr7lcn/aryMPF93/peKVgU8ikjOjHyABGM65rvRQT2\n-----END PRIVATE KEY-----\n";
+
+    /// The provider token must actually mint.
+    ///
+    /// Every other test here covers verifying satd's own webhook signatures —
+    /// HMAC, our code. Nothing exercised `jsonwebtoken`, which is what talks to
+    /// Apple, and that gap is what let the v10 bump land green while leaving
+    /// the crate with no crypto provider compiled in: v10 moved signing behind
+    /// the `rust_crypto` / `aws_lc_rs` features, and with neither enabled every
+    /// `encode` fails at runtime. It builds, CI passes, and the first symptom
+    /// is Apple rejecting pushes.
+    #[test]
+    fn apns_token_mints_and_is_signed() {
+        let mut key = tempfile::NamedTempFile::new().expect("temp key file");
+        key.write_all(TEST_EC_P8.as_bytes()).expect("write key");
+        key.flush().expect("flush key");
+
+        let cfg = crate::config::ApnsConfig {
+            key_file: key.path().to_path_buf(),
+            key_id: "ABCDE12345".into(),
+            team_id: "TEAM123456".into(),
+            topic: "com.example.wallet".into(),
+            production: false,
+            device_tokens: vec!["00".repeat(32)],
+        };
+
+        let token = apns_token(&cfg).expect("APNs provider token must mint");
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "not a JWT: {token}");
+        // An empty signature segment would mean the signer produced nothing.
+        assert!(!parts[2].is_empty(), "token carries no signature: {token}");
+    }
+
+    /// A 2048-bit RSA key in PKCS#8 PEM — the shape a Google service-account
+    /// JSON carries in `private_key`. Generated for this test.
+    const TEST_RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDexnZt2bjtq4qt\nK5JCDwFm5A22YNe1tGg9hn5NOfvLYSNIsawJWPWymX/65IsDcPcFLtEQquO7TGRK\ndQvw+4/n/o3hZhaGwZTfGMUCQWy1pidDaLbUWnIeUxnp2p+VOJS2lu9YjzBZmjVo\nui7qTF0V+TBhsJjqTNdHe7bb1P0ryRQsol6WjK8EzwjSvNX7/xDwaJENcqWf3dg8\nhJ0aVNANa+C7AIUUsqLXKDoCD5/55rU/OdrVzBPInrtOUbaZYoegLC7f1rPuqoLq\nW/zM1hQKTDiUeyKJig+8pLqoYu3tyjwM4AtNtnMN+8MP1DRVRgLPdFJbLG1WmaBx\nYIodJFjZAgMBAAECggEAFBOAy71U9/8MF2p3gU8dE+38bStE27UY6czrjlkdEtyI\nef4gOccHFjChwtucY+1NWm24Kijd+6lsP/UhZBCMc16FrPW7lPeJse6BBQceKjA0\nyW0WTbfWISgUpalt1UKzZp5E9QJ4DuZU5tqHuaMZ7Nq3aS5cvky53+rLW8jrhRz5\nG+YeJ8FR2tN0q51F0f4yns+hjeHnWcyJKhlc01FUdeBhTltk/NvYO9CwBQqK06C9\nkTaehAcnvIxHyOKqXJ2GVIilVEzNiYUz2ld4iCB46QM2pNzkn7rB/rlBMA1eBVBl\n/Zxlh6H4dEwIAq3euXrZAjrkLKCN9g0haHHVSfdq0wKBgQD8NG8F/ZAYHt6qRAcL\nC2VsXZFYvsTEYh6CzS6gJJoBsS4sFW5b+lK5iVvjc2f/2NW6W157LGA36rAuuIP/\nZFN+xQl94XW+RXtgeuCkhs45SF1DgpDdwsiHBe7PzE9Ql3RU4K+t2K18evt3f0r2\n1OfOtA7ULL0NMvPVSXodaPstYwKBgQDiIKhbogePRHpx8DVizg/kTsczfbpL+DJS\nK2VPPP2odqdbBUoquMlJqV9OefsZyXM8F3WysQRB08eaLOFlhj+1hc2fwfjD53TI\nTmd6A29qyy/CjoWR8UqPQD4AwMD90vXXclbMHaActehTNuvOgFj2sCb3r3InixzP\n5QEC0PRjkwKBgG7uOS8vWmPhoBrQFTD8cD374eRg9HdUmQr7aNizgLHh1uc4/fOi\n5SQKkMo4hrP4EfoIGkSfPisaJShHrHd3D2qhDA28T2fDdAL5yTlUufxkIfGBympg\nNId/So1H1lMiat6yfVNADP7FsTncWYK8HsHCXQtiKj1V/f4AdZ/d/yz1AoGAcGgP\niM14uI0v2OexghYw7CsE9uGu9AjC6vnLeKI27cFd2+87ORV2afmZ+ObGHcF4WQzI\nYzV/ikF+XXOl79PWY6PJ3XqM8MVj1hazdYGzpwCuEybJ2wx5JdCngbRPu11c++ZI\no1quttbuUD9i5NoEX0ydck5yjpmmjumloQLCGaUCgYEA2yg51x94OYlQnfyLFcpE\n8Cf9Ta7gwftQwvq1rW/ws80TDWJ9GAORVMpt9+g6APqY3VlriboPXx5/zGWm4Wcj\nw+kPZPnOIBd4fJBaHbe7nMNlS+fVWkBaVq1B5V6tiFhnT5+WnOumOqB6oU6OwBZC\n7FKVudSiQSp7Iq7vUILh0RE=\n-----END PRIVATE KEY-----\n";
+
+    /// The FCM half of the same concern: RS256 goes through the `rsa` crate
+    /// rather than `p256`, so a provider could satisfy APNs and not this.
+    #[test]
+    fn google_assertion_mints_and_is_signed() {
+        let claims = GoogleClaims {
+            iss: "relay@example.iam.gserviceaccount.com".into(),
+            scope: "https://www.googleapis.com/auth/firebase.messaging".into(),
+            aud: "https://oauth2.googleapis.com/token".into(),
+            iat: 1_700_000_000,
+            exp: 1_700_003_600,
+        };
+
+        let assertion =
+            google_assertion(TEST_RSA_PEM, &claims).expect("FCM assertion must mint");
+        let parts: Vec<&str> = assertion.split('.').collect();
+        assert_eq!(parts.len(), 3, "not a JWT: {assertion}");
+        assert!(!parts[2].is_empty(), "assertion carries no signature");
+    }
 
     fn notification() -> Notification {
         Notification {
