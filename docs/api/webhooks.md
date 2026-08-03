@@ -407,6 +407,6 @@ Stated so nobody waits for them:
   matching is the streaming API's `Watch` stream.
 - **Batching.** One event per request.
 - **Ordering across hooks.** Ordering is per hook only.
-- **A hosted relay.** satd delivers to endpoints you run. The reference push
-  relay in `contrib/` is a starting point you operate yourself, with your own
-  APNs/FCM credentials.
+- **A hosted relay.** satd delivers to endpoints you run. Where an alert goes
+  after that — a pager, a chat channel, a push service — is your receiver's
+  business, not the node's.

@@ -203,12 +203,6 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   filters with a comparison. All three are `#[non_exhaustive]`, so a condition added
   node-side stays additive for downstream consumers. New runnable
   `examples/health_watch.rs`.
-- Alerting: reference push relay in `contrib/push-relay/` — a standalone service
-  (excluded from the workspace, path-gated CI, not release-gated) that verifies
-  satd's webhook signatures, deduplicates on `X-Satd-Delivery`, and forwards
-  status alerts and reorgs as APNs / FCM push notifications
-  using the operator's own credentials. Reference-grade and meant to be forked;
-  its HMAC tests assert the same vectors as `docs/api/webhooks.md`.
 - Fixed: `-reindex` mis-handled fork points in the block files. Block files hold
   every block the node fully received, including ones a later reorg orphaned, so
   any datadir that has been live through a reorg has forks on disk. The replay
