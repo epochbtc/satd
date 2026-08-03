@@ -328,42 +328,26 @@ there is no dead-letter queue),
 `_queue_depth`, and `_last_success_age_seconds`, all labelled `hook="<id>"`.
 Nothing is exported when no hook is configured.
 
-### Push notifications
+### Writing a receiver
 
-`contrib/push-relay/` is a reference service that receives these webhooks and
-forwards the ones worth waking someone for as APNs / FCM push notifications,
-using **your** Apple and Google credentials. It runs as a separate process,
-outside satd's workspace, deliberately: a Bitcoin node should not hold a
-push-provider credential, nor the JWT/OAuth dependency stack that comes with
-one.
+A receiver is an HTTP endpoint that verifies the signature and acts. What it
+does with an alert — page someone, open a ticket, forward to a push service, or
+just log it — is yours to decide; satd's job ends at the delivery.
 
-```sh
-cd contrib/push-relay
-cargo build --release
-cp relay.example.toml /etc/satd-push-relay/relay.toml   # then edit
-./target/release/satd-push-relay /etc/satd-push-relay/relay.toml
-```
+Two things are worth getting right, and both are covered with test vectors in
+the [webhook reference](https://github.com/epochbtc/satd/blob/master/docs/api/webhooks.md):
 
-```toml
-# in satd's alertfile
-[[webhook]]
-id = "push"
-url = "http://127.0.0.1:9099/hook"
-secret = "the same value as satd_secret in relay.toml"
-categories = ["status", "chain"]
-min_severity = "warning"
-```
+1. **Verify `X-Satd-Signature` over the raw body, in constant time, before
+   parsing.** Key order and whitespace are part of the signed bytes, so a
+   re-serialized body will not verify — and parsing unauthenticated input is
+   the thing to avoid.
+2. **Deduplicate on `X-Satd-Delivery`.** satd retries, so the same id arrives
+   again whenever a response is lost after you already acted on it. The id is
+   inside the signature, so a forged one cannot poison your dedup window.
 
-Status alerts and reorgs become notifications; blocks, mempool churn, and
-dropped deliveries do not — a relay that buzzed on every block gets
-uninstalled within a day. A condition and its later recovery share a collapse
-id, so the "recovered" notification *replaces* the alert on the lock screen
-rather than stacking beneath it.
-
-It is reference-grade and meant to be forked: device registration, per-user
-routing, and your own retry policy are yours to add. See its
-[README](https://github.com/epochbtc/satd/tree/master/contrib/push-relay) for
-what is worth copying verbatim (the receive path) and what is not.
+A condition and its later recovery share a `collapse_id`, so a receiver that
+surfaces alerts to a human can replace the alert with its recovery rather than
+stacking a second message beneath it.
 
 > **Note.** The older `reorgwebhook=` / `reorgwebhooksecret=` keys still work
 > and are now served by this dispatcher, with their original `ReorgRecord`
