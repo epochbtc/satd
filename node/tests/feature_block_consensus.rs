@@ -227,6 +227,7 @@ fn tx(tx: &Transaction) -> Satd {
 
 fn connect(store: &dyn Store, block: &Block, height: u32, mtp: u32) -> Satd {
     connect_block(&ConnectParams {
+        replay_plan: None,
         store,
         block,
         height,

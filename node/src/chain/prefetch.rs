@@ -11,6 +11,7 @@ use std::thread;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
+use crate::chain::replay_plan::ReplayPlan;
 use crate::storage::Store;
 use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptVerifier};
 use crate::validation::tx::check_transaction;
@@ -30,6 +31,10 @@ pub struct PreprocessedBlock {
     /// Tx indices where all inputs were speculatively resolved AND scripts
     /// were pre-verified successfully. Only populated in assumevalid mode.
     pub script_verified_txs: HashSet<usize>,
+    /// `validation::block::check_block` already ran on `block`, off the connect
+    /// thread. Consumers must run it themselves when this is false — the
+    /// conservative default for anything not produced by a prefetch worker.
+    pub context_free_checked: bool,
 }
 
 /// Read a block from a flat file without holding the FlatFileManager mutex.
@@ -54,45 +59,35 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
     bitcoin::consensus::deserialize(&data).ok()
 }
 
-/// Compute median time past for a height using read-only store lookups.
-/// Same algorithm as `connect::get_median_time_past` and `ChainState::get_median_time_past`.
-fn compute_mtp(store: &dyn Store, height: u32) -> u32 {
-    let start = height.saturating_sub(11);
-    let mut timestamps: Vec<u32> = Vec::new();
-    for h in start..height {
-        if let Some(hash) = store.get_block_hash_by_height(h)
-            && let Some(entry) = store.get_block_index(&hash)
-        {
-            timestamps.push(entry.header.time);
-        }
-    }
-    if timestamps.is_empty() {
-        return 0;
-    }
-    timestamps.sort();
-    timestamps[timestamps.len() / 2]
-}
-
 /// Prefetch and pre-process a single block at the given height.
 ///
 /// Performs the following work off the connect thread:
 /// 1. Reads the block index entry and parent entry
 /// 2. Reads the raw block from flat files (no mutex)
-/// 3. Computes MTP via read-only store lookups
-/// 4. Computes txids and runs context-free `check_transaction`
-/// 5. Speculatively resolves UTXO inputs (cache warming)
+/// 3. Runs `check_block` on the bytes it read
+/// 4. Computes MTP via read-only store lookups
+/// 5. Computes txids and runs context-free `check_transaction`
+/// 6. Speculatively resolves UTXO inputs (cache warming)
 #[allow(clippy::too_many_arguments)]
 pub fn prefetch_block(
     store: &dyn Store,
     blocks_dir: &Path,
     blocks_xor_key: &[u8; 8],
+    plan: Option<&ReplayPlan>,
     height: u32,
     _assumevalid: bool,
     primary_engine: PrimaryEngine,
     network: bitcoin::Network,
 ) -> Option<PreprocessedBlock> {
-    // 1. Get block hash and entry
-    let hash = store.get_block_hash_by_height(height)?;
+    // 1. Get block hash and entry. During a chainstate reindex the chain to
+    //    replay comes from the plan, not the height→hash index (see
+    //    `chain::replay_plan`); on the IBD path there is no plan and the index
+    //    is authoritative — it is written forward as blocks connect, and
+    //    `connect_stored_block` rejects anything that does not extend the tip.
+    let hash = match plan {
+        Some(p) => p.hash_at(height)?,
+        None => store.get_block_hash_by_height(height)?,
+    };
     let entry = store.get_block_index(&hash)?;
 
     if !matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid) {
@@ -109,10 +104,30 @@ pub fn prefetch_block(
     };
     let block = read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?;
 
-    // 4. Compute MTP (read-only store lookups)
-    let mtp = compute_mtp(store, height);
+    // 4. Context-free block validation, off the connect thread.
+    //
+    // Nothing else re-derives the block from its own bytes: the record framing
+    // in the flat files carries no checksum (`scan_one_file` checks magic and
+    // length only), and a bit flipped inside a transaction payload leaves the
+    // 80-byte header hashing correctly. Without this the corrupted block
+    // connects, its UTXO delta lands, and the reindex reports success —
+    // Bitcoin Core runs `CheckBlock` on every block during reindex for this
+    // reason. Returning `None` hands the block to the direct-read path, which
+    // repeats the check and fails the replay with the specific error.
+    if let Err(e) = crate::validation::block::check_block(&block) {
+        tracing::warn!(
+            height,
+            block = %hash,
+            error = %e,
+            "prefetch: block failed context-free validation; deferring to the direct read"
+        );
+        return None;
+    }
 
-    // 5. Context-free work: txids + check_transaction
+    // 5. Compute MTP (read-only store lookups)
+    let mtp = crate::chain::connect::median_time_past_with_plan(store, plan, height);
+
+    // 6. Context-free work: txids + check_transaction
     let mut txids = Vec::with_capacity(block.txdata.len());
     for tx in &block.txdata {
         txids.push(tx.compute_txid());
@@ -120,7 +135,7 @@ pub fn prefetch_block(
         let _ = check_transaction(tx);
     }
 
-    // 6. Speculative UTXO resolution (cache warming) + optional script pre-verification.
+    // 7. Speculative UTXO resolution (cache warming) + optional script pre-verification.
     //
     // The batch lookup always warms the CoinCache for the connect thread.
     // In assumevalid mode, the results are also used for script pre-verification.
@@ -139,7 +154,7 @@ pub fn prefetch_block(
     let outpoints: Vec<bitcoin::OutPoint> = input_keys.iter().map(|(_, _, op)| *op).collect();
     let coins = store.get_coins_batch(&outpoints); // single batch lookup — warms cache
 
-    // 7. Speculative script verification — always attempted, not just assumevalid.
+    // 8. Speculative script verification — always attempted, not just assumevalid.
     //
     // Pre-verifies scripts using the coins resolved above. The connect thread
     // will skip primary verification for txs where all inputs still exist
@@ -222,6 +237,7 @@ pub fn prefetch_block(
         mtp,
         txids,
         script_verified_txs,
+        context_free_checked: true,
     })
 }
 
@@ -274,6 +290,7 @@ pub fn start_prefetcher(
     store: Arc<dyn Store + Send + Sync>,
     blocks_dir: PathBuf,
     blocks_xor_key: [u8; 8],
+    plan: Option<Arc<ReplayPlan>>,
     start_height: u32,
     num_workers: usize,
     lookahead: usize,
@@ -299,6 +316,7 @@ pub fn start_prefetcher(
         let w_dir = blocks_dir.clone();
         let w_shutdown = shutdown.clone();
         let w_buffer = buffer.clone();
+        let w_plan = plan.clone();
 
         workers.push(
             thread::Builder::new()
@@ -311,6 +329,7 @@ pub fn start_prefetcher(
                                     &*w_store,
                                     &w_dir,
                                     &blocks_xor_key,
+                                    w_plan.as_deref(),
                                     height,
                                     assumevalid,
                                     primary_engine,
@@ -332,6 +351,7 @@ pub fn start_prefetcher(
     let disp_cursor = cursor.clone();
     let disp_store = store.clone();
     let disp_buffer = buffer.clone();
+    let disp_plan = plan.clone();
 
     workers.push(
         thread::Builder::new()
@@ -353,8 +373,11 @@ pub fn start_prefetcher(
 
             // Assign work up to lookahead ahead of cursor
             while next_to_assign < current_cursor + lookahead as u32 {
-                let has_data = disp_store
-                    .get_block_hash_by_height(next_to_assign)
+                let next_hash = match &disp_plan {
+                    Some(p) => p.hash_at(next_to_assign),
+                    None => disp_store.get_block_hash_by_height(next_to_assign),
+                };
+                let has_data = next_hash
                     .and_then(|hash| disp_store.get_block_index(&hash))
                     .is_some_and(|entry| {
                         matches!(

@@ -377,6 +377,7 @@ mod tests {
 
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -445,6 +446,7 @@ mod tests {
 
         let connect = |sp: &SpIndexConfig| {
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -514,6 +516,7 @@ mod tests {
         let block = make_coinbase_only_block(1, prev_hash);
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -566,6 +569,7 @@ mod tests {
 
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -627,6 +631,7 @@ mod tests {
 
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -775,6 +780,7 @@ mod tests {
         let block_hash = block.block_hash();
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height,
@@ -897,6 +903,7 @@ mod tests {
         let block_hash = block.block_hash();
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height,
@@ -965,6 +972,7 @@ mod tests {
 
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -1018,6 +1026,7 @@ mod tests {
         // Connect
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -1076,6 +1085,7 @@ mod tests {
         // Reconnect
         let reconnect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -1138,6 +1148,7 @@ mod tests {
 
         let connect_batch =
             connect_block(&ConnectParams {
+                replay_plan: None,
                 store: &store,
                 block: &block,
                 height: 1,
@@ -1209,6 +1220,7 @@ mod tests {
         let cfg = crate::index::address::AddressIndexConfig::default();
 
         let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -1282,6 +1294,7 @@ mod tests {
         };
 
         let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -1389,6 +1402,7 @@ mod tests {
         let block_hash = block.block_hash();
 
         let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,

@@ -209,6 +209,68 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   status alerts and reorgs as APNs / FCM push notifications
   using the operator's own credentials. Reference-grade and meant to be forked;
   its HMAC tests assert the same vectors as `docs/api/webhooks.md`.
+- Fixed: `-reindex` mis-handled fork points in the block files. Block files hold
+  every block the node fully received, including ones a later reorg orphaned, so
+  any datadir that has been live through a reorg has forks on disk. The replay
+  connected *every* block reachable from genesis as if it extended the tip
+  instead of selecting the most-work branch — aborting with
+  `bad-txns-inputs-missingorspent` when the two branches double-spent, and
+  otherwise applying the losing branch's UTXO delta on top of the winning chain
+  and reporting success over a corrupt UTXO set. The replay now selects by
+  cumulative chainwork and connects only that branch; side-chain blocks are
+  indexed (`DataStored`, addressable by hash) but never connected. Duplicate
+  block records on disk are collapsed.
+- Fixed: `-reindex-chainstate` no longer replays whatever chain the height→hash
+  index names. That index is derived state and has been observed polluted with a
+  fork block, which made the replay splice one branch onto another and report a
+  completed reindex over a UTXO set built from both. The replay now selects the
+  most-work fully-connectable branch of the block index, recomputing chainwork
+  and height from the stored headers rather than trusting the index's own
+  fields, and refuses to resume a partial chainstate that sits on a different
+  branch. `invalidateblock` and header-only gaps are honored during selection.
+- Fixed: both reindex paths now validate proof of work before letting a header
+  influence branch selection. An 80-byte header always deserializes, so a single
+  flipped bit in a record's `nBits` exponent produced a well-formed header
+  claiming astronomical work — and since `connect_block` checks no PoW either,
+  it would have been selected and connected as the tip, wedging the node on a
+  branch it could never reorg away from.
+- Fixed: `-reindex-chainstate` now refuses to run when the block index cannot
+  produce a fully-connectable chain reaching the height the chainstate was
+  already at, instead of reporting success over a truncated or empty UTXO set. A
+  pruned datadir hit this every time: every block below the prune horizon is
+  ineligible, so the replay connected nothing and the node came up at height 0
+  with the tx and address indexes already stamped complete.
+- Fixed: an exact chainwork tie during a chainstate reindex now keeps the branch
+  the node was already on, rather than resolving by block hash — a node holding
+  an equal-work stale sibling at its tip could otherwise rebuild onto the orphan.
+- Fixed: side-chain blocks above the selected tip are no longer indexed by
+  `-reindex`. `accept_headers` restores a "missing" height→hash row for any
+  data-carrying entry whose height is vacant, so such an entry would have had one
+  written for it on the next headers message — putting a losing branch into the
+  active-chain index after all.
+- Fixed: all reindex paths now refuse to connect a block that does not extend
+  the chain being replayed — the invariant `connect_stored_block` has always
+  enforced on the IBD path, now applied to both reindex replays as a
+  belt-and-braces check behind the selection fixes above.
+- Fixed: every reindex path now runs full context-free block validation
+  (`CheckBlock`, as Core does) on the bytes it read. Flat-file records carry no
+  checksum, so a bit flipped inside a transaction payload left the 80-byte
+  header hashing correctly and the corrupted block was connected, its UTXO delta
+  applied, and the reindex reported success.
+- Changed: `-reindex-chainstate` no longer resumes a partially-replayed
+  chainstate — the replay starts at genesis or refuses. The daemon already
+  cleared the UTXO set before every run, so this is unchanged in practice; it
+  makes the replay's verification inductive rather than conditional on where it
+  started. Every block it connects is checked against the block files, so
+  starting above genesis would validate blocks against index entries below it
+  that nothing reconciled, and BIP68 (which reads a spent coin's MTP at that
+  coin's creation height, anywhere in history) makes that hole unbounded.
+- Fixed: a chainstate reindex no longer takes any consensus input from the
+  height→hash index it exists to distrust. Median time past — which gates BIP113
+  locktimes and, at the spent coin's height, BIP68 time-based sequence locks — is
+  now resolved through the branch being replayed. The block index's stored header
+  must also match the header in the block file before either replay path will use
+  its parent link, chainwork or timestamp.
 
 ## Releases
 

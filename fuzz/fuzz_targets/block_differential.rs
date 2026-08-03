@@ -185,6 +185,9 @@ fn satd_accepts(b: &Block, base: &Base) -> bool {
         return false;
     }
     connect_block(&ConnectParams {
+        // Live-path semantics: no reindex plan, so height→hash resolves through
+        // the store exactly as it does for a block arriving from a peer.
+        replay_plan: None,
         store: &base.store,
         block: b,
         height: base.height + 1,

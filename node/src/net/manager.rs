@@ -3248,6 +3248,11 @@ impl PeerManager {
             store,
             chain_state.blocks_dir().to_path_buf(),
             chain_state.blocks_xor_key(),
+            // No replay plan on the IBD path: the height→hash index is
+            // authoritative there — it is written forward as blocks connect,
+            // and `connect_stored_block` refuses anything that does not extend
+            // the tip.
+            None,
             chain_state.tip_height() + 1,
             prefetch_workers,
             128, // lookahead blocks
