@@ -3187,18 +3187,42 @@ impl ChainState {
             return Err(ChainError::BadPrevBlock);
         }
 
-        // A partially-replayed chainstate can only be resumed if it lies on the
-        // branch now selected. If it does not, the previous run followed a
-        // different chain and continuing would build a UTXO set from both.
+        // The replay starts at genesis or not at all.
+        //
+        // A partial chainstate used to be resumed when it sat on the selected
+        // branch. That is what makes this replay's central safety property
+        // conditional, so it is no longer allowed.
+        //
+        // The property: every block this replay connects has its indexed header
+        // checked against the block file before anything reads it
+        // (`require_planned_block`), and everything the replay derives from an
+        // indexed header — the parent link, the chainwork, and the timestamps
+        // that MTP is the median of — is therefore backed by the block files.
+        // That argument is inductive, and it only closes if the run starts at
+        // genesis. Resume punches an unbounded hole in it: BIP68 evaluates a
+        // spent coin's MTP at the coin's *creation* height, which can be
+        // anywhere in history, so a resumed run reads timestamps out of index
+        // entries that neither it nor anything else ever reconciled. Verifying
+        // them is not bounded work — a coin spent at the tip can be older than
+        // any window — and reading the whole chain back to check costs more
+        // than replaying it.
+        //
+        // Nothing is lost. `main.rs` calls `clear_chainstate()` immediately
+        // before this on every `-reindex-chainstate` run, so the daemon has
+        // always started from genesis; a crashed replay re-run through the flag
+        // is cleared and restarted, not resumed. This makes that the rule
+        // rather than a coincidence of the caller.
         let resume_height = self.tip_height();
-        if resume_height > 0 && plan.hash_at(resume_height) != Some(self.tip_hash()) {
+        if resume_height > 0 {
             tracing::error!(
                 height = resume_height,
                 chain_tip = %self.tip_hash(),
-                planned = ?plan.hash_at(resume_height),
-                "reindex: the existing chainstate is not on the most-work branch of the \
-                 block index; refusing to resume onto a different chain. Run a full \
-                 --reindex to rebuild the block index from the block files."
+                "reindex: refusing to resume a partially-replayed chainstate. The UTXO set \
+                 must be cleared first so the replay starts at genesis — every block it \
+                 connects is verified against the block files, and resuming would validate \
+                 the blocks above the resume point against index entries below it that \
+                 nothing checked. Re-run -reindex-chainstate (which clears it), or run a \
+                 full --reindex to rebuild the block index from the block files."
             );
             return Err(ChainError::BadPrevBlock);
         }
@@ -3497,20 +3521,19 @@ impl ChainState {
     }
 
     /// Verify the index headers that the first blocks' MTP will be computed
-    /// from.
+    /// from — in practice, genesis.
     ///
     /// Every block a replay connects has its indexed header checked against the
-    /// block file before it is used (`require_planned_block`), and MTP reads
-    /// timestamps out of those same indexed headers — so for the stretch this
-    /// run connects, induction covers it: an ancestor with a forged timestamp
-    /// fails its own connect and the replay stops before anything downstream
-    /// consumes it.
+    /// block file before anything reads it (`require_planned_block`), and MTP
+    /// reads timestamps out of those same indexed headers, so induction covers
+    /// the whole run: an ancestor with a forged timestamp fails its own connect
+    /// first. The induction needs a base case, and genesis is it — the replay
+    /// starts *above* genesis, so its entry is the one header MTP consumes that
+    /// no connect ever validates. Compared against the network constant.
     ///
-    /// A resumed replay starts above a stretch it will never re-connect, and
-    /// MTP reaches eleven blocks back into it. Those entries are whatever the
-    /// original sync left — derived state a reindex is run to distrust — and a
-    /// forged timestamp there decides BIP113 locktimes for the first blocks of
-    /// the run. Cheap to close: read the ≤11 blocks once and compare.
+    /// The loop generalizes to a start above genesis, which the resume refusal
+    /// in `reindex_chainstate` currently rules out; it stays here so a future
+    /// change that relaxes that does not silently reopen the hole.
     fn verify_replay_mtp_window(
         &self,
         plan: &crate::chain::replay_plan::ReplayPlan,
@@ -10357,63 +10380,61 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resumed replay must verify the block-index headers its first MTPs are
-    /// computed from.
+    /// The base case of the replay's induction: genesis.
     ///
-    /// Every block a replay connects has its indexed header checked against the
-    /// block file, and MTP reads timestamps out of those same headers — so
-    /// induction covers the stretch this run connects. It does not cover the
-    /// eleven blocks *below* the resume point: those entries are whatever the
-    /// original sync left, and a forged timestamp there decides BIP113
-    /// locktimes for the first blocks of the run against a chain that is not on
-    /// disk.
+    /// Every block the replay connects has its indexed header checked against
+    /// the block file before anything reads it, and MTP is the median of those
+    /// indexed timestamps — so the run validates everything it consumes, given
+    /// a trustworthy starting point. Genesis is the exception: the replay
+    /// starts above it, so no connect ever validates its entry, and blocks 1
+    /// through 11 take their MTP partly from it. It is compared against the
+    /// network constant instead.
     #[test]
-    fn reindex_chainstate_verifies_the_mtp_window_it_resumes_above() {
-        const BASE: u32 = 1_708_000_000;
+    fn reindex_chainstate_refuses_a_forged_genesis_entry() {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
         let mut parent = genesis_hash;
-        let mut hashes = vec![genesis_hash];
-        for h in 1..=12u32 {
-            let b = build_test_block(parent, h, BASE + 100 * h);
+        let mut hashes = Vec::new();
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_710_000_000 + h);
             parent = cs.accept_block(&b).expect("accept block");
             hashes.push(parent);
         }
-        // Block 13 is on disk but unconnected: the replay has real work to do,
-        // so the refusal is not vacuous.
-        let b13 = build_test_block(hashes[12], 13, BASE + 1300);
-        store_block_without_connecting(&cs, &b13, 13);
+        let main_tip = parent;
 
-        // Height 5 sits inside block 13's MTP window (heights 2..12) and below
-        // the resume point, so nothing in the replay would re-derive it.
-        let mut forged = cs.store.get_block_index(&hashes[5]).expect("entry at height 5");
-        forged.header.time += 10_000;
-        // The planner PoW-checks the headers it selects from, which already
-        // rejects most corruption: any change to a header randomizes its hash,
-        // and on a real network that hash will not meet the target. Re-mine so
-        // this forgery survives selection — that is the residue this guard is
-        // for, and on a low-difficulty chain it is not exotic.
-        remine_header(&mut forged.header);
-        let mut batch = crate::storage::StoreBatch::default();
-        batch.block_index_puts.push((hashes[5], forged));
-        cs.store.write_batch(batch).expect("write forged entry");
-        cs.store.invalidate_block_index_cache(&hashes[5]);
+        cs.flush_coin_cache().expect("flush before clearing");
         cs.store.flush().unwrap();
 
-        assert_eq!(cs.tip_height(), 12, "fixture must resume from height 12");
+        // Genesis keeps its hash as the index key while its stored header says
+        // something else — the timestamp blocks 1..11 would average in.
+        let mut forged = cs
+            .store
+            .get_block_index(&genesis_hash)
+            .expect("genesis entry");
+        forged.header.time += 10_000;
+        remine_header(&mut forged.header);
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((genesis_hash, forged));
+        cs.store.write_batch(batch).expect("write forged genesis entry");
+        cs.store.invalidate_block_index_cache(&genesis_hash);
+        cs.store.flush().unwrap();
+
+        cs.store.clear_chainstate().unwrap();
+        {
+            let mut tip = cs.tip.write();
+            tip.hash = genesis_hash;
+            tip.height = 0;
+        }
+
         let err = cs
-            .reindex_chainstate(None, None, Some((hashes[12], 12)))
-            .expect_err("an unverifiable MTP window must stop the replay");
+            .reindex_chainstate(None, None, Some((main_tip, 3)))
+            .expect_err("a genesis entry that is not this network's genesis must stop the replay");
         assert!(
             matches!(err, ChainError::BadPrevBlock),
             "unexpected error: {err:?}"
         );
-        assert_eq!(
-            cs.tip_hash(),
-            hashes[12],
-            "nothing may connect on top of a window that was not verified"
-        );
+        assert_eq!(cs.tip_height(), 0, "nothing may connect on a forged base case");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10441,9 +10462,6 @@ pub(crate) mod tests {
     /// input resolution instead. The missing-input error IS the pass.
     #[test]
     fn reindex_direct_connect_takes_mtp_from_the_plan_not_the_height_index() {
-        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
-        use bitcoin::consensus::serialize;
-
         const BASE: u32 = 1_705_000_000;
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
@@ -10474,28 +10492,7 @@ pub(crate) mod tests {
         let lock_time = BASE + 680;
         let b13 = build_test_block_timelocked(hashes[12], 13, BASE + 1300, bogus, lock_time);
         let h13 = b13.block_hash();
-        let pos = cs
-            .flat_files
-            .lock()
-            .write_block(&serialize(&b13), network_magic(Network::Regtest))
-            .expect("write block 13");
-        let parent_entry = cs.store.get_block_index(&hashes[12]).expect("parent entry");
-        let mut batch = crate::storage::StoreBatch::default();
-        batch.block_index_puts.push((
-            h13,
-            BlockIndexEntry {
-                header: b13.header,
-                height: 13,
-                status: BlockStatus::DataStored,
-                num_tx: b13.txdata.len() as u32,
-                file_number: pos.file_number,
-                data_pos: pos.data_pos,
-                chainwork: add_u256(&parent_entry.chainwork, &work_for_bits(b13.header.bits)),
-            },
-        ));
-        cs.store.write_batch(batch).expect("index block 13");
-        cs.store.invalidate_block_index_cache(&h13);
-        cs.store.flush().expect("flush the index write");
+        store_block_without_connecting(&cs, &b13, 13);
 
         let plan = crate::chain::replay_plan::plan_replay_from_block_index(
             &*cs.store,
@@ -10677,40 +10674,54 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A partially-replayed chainstate can only be resumed if it sits on the
-    /// branch now selected. Resuming across branches would build one UTXO set
-    /// out of two chains, so it fails closed and tells the operator to run a
-    /// full `-reindex`.
+    /// A partially-replayed chainstate is never resumed — not even when it sits
+    /// on the branch now selected, which used to be allowed.
+    ///
+    /// The replay's safety property is inductive: each block's indexed header
+    /// is checked against the block file before anything reads it, so the
+    /// parent links, chainwork and MTP timestamps it derives from indexed
+    /// headers are all backed by the block files. Starting above genesis breaks
+    /// the induction, and BIP68 makes the hole unbounded — it evaluates a spent
+    /// coin's MTP at the coin's creation height, which can be anywhere in
+    /// history, so a resumed run reads timestamps from entries nothing
+    /// reconciled. `main.rs` clears the chainstate before every
+    /// `-reindex-chainstate`, so the daemon never resumed in the first place.
     #[test]
-    fn reindex_chainstate_refuses_to_resume_onto_a_different_branch() {
+    fn reindex_chainstate_refuses_to_resume_a_partial_chainstate() {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
         let mut parent = genesis_hash;
-        let mut main_hashes = Vec::new();
+        let mut hashes = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_702_000_000 + h);
             parent = cs.accept_block(&b).expect("accept main block");
-            main_hashes.push(parent);
+            hashes.push(parent);
         }
-        let stale = build_test_block(main_hashes[1], 3, 1_702_100_003);
-        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        let main_tip = parent;
 
+        cs.flush_coin_cache().expect("flush before clearing");
         cs.store.flush().unwrap();
         cs.store.clear_chainstate().unwrap();
-        // Pretend a previous run replayed as far as the stale block.
+        // A previous run replayed as far as height 3 — on the winning branch,
+        // the case the old guard let through.
         {
             let mut tip = cs.tip.write();
-            tip.hash = stale_hash;
+            tip.hash = hashes[2];
             tip.height = 3;
         }
 
         let err = cs
-            .reindex_chainstate(None, None, None)
-            .expect_err("resuming onto a different branch must fail");
+            .reindex_chainstate(None, None, Some((main_tip, 5)))
+            .expect_err("a partial chainstate must not be resumed, on-branch or not");
         assert!(
             matches!(err, ChainError::BadPrevBlock),
-            "expected a linkage failure, got {err:?}"
+            "expected a refusal, got {err:?}"
+        );
+        assert_eq!(
+            cs.tip_height(),
+            3,
+            "the refusal must not touch the chainstate it declined to extend"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -257,6 +257,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   checksum, so a bit flipped inside a transaction payload left the 80-byte
   header hashing correctly and the corrupted block was connected, its UTXO delta
   applied, and the reindex reported success.
+- Changed: `-reindex-chainstate` no longer resumes a partially-replayed
+  chainstate — the replay starts at genesis or refuses. The daemon already
+  cleared the UTXO set before every run, so this is unchanged in practice; it
+  makes the replay's verification inductive rather than conditional on where it
+  started. Every block it connects is checked against the block files, so
+  starting above genesis would validate blocks against index entries below it
+  that nothing reconciled, and BIP68 (which reads a spent coin's MTP at that
+  coin's creation height, anywhere in history) makes that hole unbounded.
 - Fixed: a chainstate reindex no longer takes any consensus input from the
   height→hash index it exists to distrust. Median time past — which gates BIP113
   locktimes and, at the spent coin's height, BIP68 time-based sequence locks — is
