@@ -4190,13 +4190,22 @@ impl ChainState {
     /// flat-file reindex found but did not connect.
     ///
     /// Deliberately narrow:
-    ///   * Proof of work is re-checked. Everything else on the branch is
-    ///     unvalidated — these entries exist so the block stays addressable by
-    ///     hash and so a later reorg can consider the branch. Re-checking PoW
-    ///     is what stops a doctored flat file from injecting an index entry
-    ///     claiming more chainwork than it did the work for, which is the only
-    ///     property that matters for selection: work cannot be forged, so such
-    ///     a branch cannot *win*.
+    ///   * Proof of work is re-checked. Re-checking PoW is what stops a
+    ///     doctored flat file from injecting an index entry claiming more
+    ///     chainwork than it did the work for, which is the property that
+    ///     matters for selection: work cannot be forged, so such a branch
+    ///     cannot *win*.
+    ///   * The record is reconciled with the entry about to be written, and
+    ///     run through `check_block`. This path is the only producer of
+    ///     `DataStored` entries whose bytes were never validated — on the live
+    ///     path `accept_block` checks a block before it is written to the flat
+    ///     files. It matters because nothing downstream re-derives them:
+    ///     `connect_stored_block` reads `flat_pos` and connects, without
+    ///     comparing the bytes to the entry's hash or header and without
+    ///     `check_block`. So a mispointed or corrupt record indexed here is
+    ///     applied verbatim if the branch is ever activated, while the tip
+    ///     advances to the *indexed* hash.
+    ///   * Contextual validity is still not checked — see the note below.
     ///
     ///     Note what this does NOT buy. An earlier version of this comment
     ///     said the reorg path validates before connecting; it does not.
@@ -4258,6 +4267,28 @@ impl ChainState {
                 skipped += 1;
                 continue;
             };
+            if block.block_hash() != *hash || block.header != entry.header {
+                tracing::warn!(
+                    block = %hash,
+                    height,
+                    found = %block.block_hash(),
+                    file_number = entry.pos.file_number,
+                    data_pos = entry.pos.data_pos,
+                    "reindex: side-chain record does not match the header scanned from it;                      not indexing"
+                );
+                skipped += 1;
+                continue;
+            }
+            if let Err(e) = validation::block::check_block(&block) {
+                tracing::warn!(
+                    block = %hash,
+                    height,
+                    error = %e,
+                    "reindex: side-chain block fails context-free validation; not indexing"
+                );
+                skipped += 1;
+                continue;
+            }
             batch.block_index_puts.push((
                 *hash,
                 BlockIndexEntry {
@@ -9694,6 +9725,66 @@ pub(crate) mod tests {
     /// completed reindex over a corrupt UTXO set. This is the silent half of
     /// the bug; `reindex_from_flat_files_survives_conflicting_stale_sibling`
     /// covers the loud half.
+    #[test]
+    fn reindex_from_flat_files_does_not_index_a_corrupt_side_chain_record() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main_hashes = Vec::new();
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_709_000_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            main_hashes.push(parent);
+        }
+        let main_tip = parent;
+
+        // A sibling of block 2 whose payload is corrupt: the header is intact,
+        // so the flat-file scan indexes it under the right hash and it passes
+        // the PoW re-check, but its transactions no longer match its merkle
+        // root. Written straight to the flat files — never accepted — so the
+        // scan finds only the corrupt copy, as an in-place bit flip would leave
+        // it.
+        let mut sibling = build_test_block(main_hashes[0], 2, 1_709_000_999);
+        let sibling_hash = sibling.block_hash();
+        let mut script = sibling.txdata[0].input[0].script_sig.to_bytes();
+        let last = script.len() - 1;
+        script[last] ^= 0xff;
+        sibling.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from(script);
+        assert_eq!(
+            sibling.block_hash(),
+            sibling_hash,
+            "the header must be untouched"
+        );
+        assert!(
+            validation::pow::check_proof_of_work(&sibling.header).is_ok(),
+            "the fixture must get past the PoW re-check to reach the new one"
+        );
+        cs.flat_files
+            .lock()
+            .write_block(
+                &bitcoin::consensus::serialize(&sibling),
+                network_magic(Network::Regtest),
+            )
+            .expect("write corrupt sibling record");
+
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None)
+            .expect("a bad side-chain block must not abort the reindex");
+
+        assert_eq!(re.tip_hash(), main_tip, "the main chain must still replay");
+        assert_eq!(re.tip_height(), 3);
+        assert!(
+            re.store.get_block_index(&sibling_hash).is_none(),
+            "a block whose bytes fail validation was indexed as DataStored —              `connect_stored_block` would apply them verbatim if the branch won"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reindex_from_flat_files_ignores_non_conflicting_stale_sibling() {
         let (cs, dir) = make_chain_state();
