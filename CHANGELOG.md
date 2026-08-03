@@ -252,6 +252,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   the chain being replayed — the invariant `connect_stored_block` has always
   enforced on the IBD path, now applied to both reindex replays as a
   belt-and-braces check behind the selection fixes above.
+- Fixed: every reindex path now runs full context-free block validation
+  (`CheckBlock`, as Core does) on the bytes it read. Flat-file records carry no
+  checksum, so a bit flipped inside a transaction payload left the 80-byte
+  header hashing correctly and the corrupted block was connected, its UTXO delta
+  applied, and the reindex reported success.
+- Fixed: a chainstate reindex no longer takes any consensus input from the
+  height→hash index it exists to distrust. Median time past — which gates BIP113
+  locktimes and, at the spent coin's height, BIP68 time-based sequence locks — is
+  now resolved through the branch being replayed. The block index's stored header
+  must also match the header in the block file before either replay path will use
+  its parent link, chainwork or timestamp.
 
 ## Releases
 

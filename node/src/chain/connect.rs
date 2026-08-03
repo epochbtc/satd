@@ -114,13 +114,36 @@ fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
 /// Compute median time past (MTP) for a given height using the store directly.
 /// MTP is the median of the timestamps of the previous 11 blocks.
 pub(crate) fn get_median_time_past(store: &dyn Store, height: u32) -> u32 {
+    median_time_past_with_plan(store, None, height)
+}
+
+/// MTP, with height→hash resolved through `plan` when one is given.
+///
+/// The single implementation behind every MTP the connect path uses. `plan` is
+/// `Some` only during a chainstate reindex, where the store's height→hash index
+/// must not be consulted: it is derived state that has been observed polluted
+/// with a fork block (#322), it describes the *pre-reindex* chain rather than
+/// the branch being replayed, and above the connect cursor it has not been
+/// rewritten yet. MTP gates BIP113 locktimes and BIP68 time-based sequence
+/// locks, so resolving it against the wrong branch is a consensus decision made
+/// about a chain the node is not building.
+pub(crate) fn median_time_past_with_plan(
+    store: &dyn Store,
+    plan: Option<&crate::chain::replay_plan::ReplayPlan>,
+    height: u32,
+) -> u32 {
     let start = height.saturating_sub(11);
     let mut timestamps: Vec<u32> = Vec::new();
     for h in start..height {
-        if let Some(hash) = store.get_block_hash_by_height(h)
-            && let Some(entry) = store.get_block_index(&hash) {
-                timestamps.push(entry.header.time);
-            }
+        let hash = match plan {
+            Some(p) => p.hash_at(h),
+            None => store.get_block_hash_by_height(h),
+        };
+        if let Some(hash) = hash
+            && let Some(entry) = store.get_block_index(&hash)
+        {
+            timestamps.push(entry.header.time);
+        }
     }
     if timestamps.is_empty() {
         return 0;
@@ -310,6 +333,17 @@ pub struct ConnectParams<'a> {
     /// that don't need observability (tests, disconnect/reorg replay).
     pub phase_tracker:
         Option<&'a crate::chain::connect_phase::ConnectPhaseTracker>,
+    /// The chain a chainstate reindex is replaying. `Some` only on that path.
+    ///
+    /// BIP 68 time-based sequence locks compare the block's MTP against the MTP
+    /// at the *spent coin's* height, and that second lookup resolves
+    /// height→hash. During a replay the store's height index is the wrong
+    /// answer: below a resumed replay's start it still describes whatever the
+    /// original sync left — including, at the heights where #322 pollution
+    /// landed, a fork block. A coin spent at the tip can have been created at
+    /// any height in history, so this is not bounded to a window near the
+    /// cursor the way the block's own MTP is.
+    pub replay_plan: Option<&'a crate::chain::replay_plan::ReplayPlan>,
 }
 
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
@@ -319,6 +353,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
         address_index, filter_index, sp_index, phase_tracker,
+        replay_plan,
     } = params;
     #[cfg(not(feature = "block-filter-index"))]
     let ConnectParams {
@@ -326,6 +361,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         script_verifier, median_time_past, network,
         pre_verified_txs, num_threads, precomputed_txids,
         address_index, sp_index, phase_tracker,
+        replay_plan,
     } = params;
     let store: &dyn Store = *store;
     let script_verifier: &dyn ScriptVerifier = *script_verifier;
@@ -535,7 +571,8 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                             // Time-based: value * 512 seconds relative to input's MTP
                             // BIP 68: compare MTP at current height vs MTP at coin height
                             let required_seconds = (seq & mask) as u64 * 512;
-                            let mtp_coin = get_median_time_past(store, coin.height) as u64;
+                            let mtp_coin =
+                                median_time_past_with_plan(store, *replay_plan, coin.height) as u64;
                             let mtp_block = median_time_past as u64;
                             if mtp_block.saturating_sub(mtp_coin) < required_seconds {
                                 return Err(ConnectError::SequenceLockNotMet);
@@ -895,6 +932,7 @@ mod tests {
         let verifier = NoopVerifier;
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &genesis,
             height: 0,
@@ -1001,6 +1039,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -1286,6 +1325,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 60, 2, 10, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 60,
@@ -1312,6 +1352,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 55, 2, 10, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 55,
@@ -1338,6 +1379,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 2, 0x8000_0000 | 100, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 51,
@@ -1364,6 +1406,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 1, 10, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 51,
@@ -1390,6 +1433,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, false);
         let block = make_block_spending(outpoint, 51, 2, 0xffff_ffff, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 51,
@@ -1418,6 +1462,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 60, 2, 0, 50);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 60,
@@ -1444,6 +1489,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 49, 2, 0, 50);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 49,
@@ -1470,6 +1516,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 60, 2, 0, 500_000_001);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 60,
@@ -1496,6 +1543,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 49, 2, 0xffff_ffff, 50);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 49,
@@ -1529,6 +1577,7 @@ mod tests {
         };
         let block = make_block_spending(fake_outpoint, 1, 2, 0xffff_ffff, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -1555,6 +1604,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, true);
         let block = make_block_spending(outpoint, 149, 2, 0xffff_ffff, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 149,
@@ -1581,6 +1631,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(50, true);
         let block = make_block_spending(outpoint, 150, 2, 0xffff_ffff, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 150,
@@ -1599,6 +1650,119 @@ mod tests {
             phase_tracker: None,
         });
         assert!(result.is_ok());
+    }
+
+    /// BIP 68 time-based sequence locks resolve the spent coin's MTP through
+    /// the replay plan, not the store's height→hash index.
+    ///
+    /// The block's own MTP is passed in, so a reindex controls it. The *coin's*
+    /// MTP is looked up inside `connect_block`, and it walks height→hash — the
+    /// derived state a replay must not trust. Unlike the block's MTP this is
+    /// not bounded to a window near the connect cursor: a coin spent at the tip
+    /// can have been created at any height in history, so on a resumed replay
+    /// the lookup lands wherever the original sync's rows still are.
+    ///
+    /// Both directions asserted from one fixture: the honest rows meet the lock
+    /// and the polluted row does not, so the plan is doing the deciding.
+    #[test]
+    fn test_bip68_coin_mtp_resolves_through_the_replay_plan() {
+        let coin_height = 10u32;
+        let block_height = 20u32;
+        let (store, outpoint, _) = make_test_store_with_coin(coin_height, false);
+
+        let base_time = 1_700_000_000u32;
+        let hash_for = |h: u32| {
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array({
+                let mut arr = [0u8; 32];
+                arr[0] = h as u8;
+                arr[1] = (h >> 8) as u8;
+                arr[3] = 0xAA;
+                arr
+            }))
+        };
+        let entry_at = |time: u32, height: u32| {
+            let mut hdr = bitcoin::constants::genesis_block(Network::Regtest).header;
+            hdr.time = time;
+            BlockIndexEntry {
+                header: hdr,
+                height,
+                status: BlockStatus::Valid,
+                num_tx: 1,
+                file_number: 0,
+                data_pos: 0,
+                chainwork: [0u8; 32],
+            }
+        };
+
+        // Honest chain: 500s apart.
+        let mut batch = StoreBatch::default();
+        let mut honest: Vec<BlockHash> = Vec::new();
+        for h in 0..block_height {
+            let hash = hash_for(h);
+            honest.push(hash);
+            batch
+                .block_index_puts
+                .push((hash, entry_at(base_time + h * 500, h)));
+            batch.height_hash_puts.push((h, hash));
+        }
+        // A fork block usurping height 0's row (the #322 shape), timestamped
+        // far ahead so it drags the coin's median up a slot.
+        let fork = hash_for(9_000);
+        batch
+            .block_index_puts
+            .push((fork, entry_at(base_time + 50_000, 0)));
+        batch.height_hash_puts.push((0, fork));
+        store.write_batch(batch).unwrap();
+
+        // Coin MTP over heights 0..9: honest median base+2500, polluted
+        // base+3000. Block MTP over 9..19: base+7000. The lock needs 8*512 =
+        // 4096 seconds, which the honest 4500 clears and the polluted 4000
+        // does not.
+        let seq = (1u32 << 22) | 8;
+        let mtp_block = base_time + 7000;
+        let block = make_block_spending(outpoint, block_height, 2, seq, 0);
+        let plan = crate::chain::replay_plan::ReplayPlan::from_hashes(honest);
+
+        let address_index = Default::default();
+        let sp_index = Default::default();
+        #[cfg(feature = "block-filter-index")]
+        let filter_index = Default::default();
+        let chainwork = [0u8; 32];
+        macro_rules! params {
+            ($plan:expr) => {
+                ConnectParams {
+                    replay_plan: $plan,
+                    store: &store,
+                    block: &block,
+                    height: block_height,
+                    parent_chainwork: &chainwork,
+                    flat_pos: default_pos(),
+                    script_verifier: &NoopVerifier,
+                    median_time_past: mtp_block,
+                    network: Network::Regtest,
+                    pre_verified_txs: None,
+                    num_threads: 1,
+                    precomputed_txids: None,
+                    address_index: &address_index,
+                    sp_index: &sp_index,
+                    #[cfg(feature = "block-filter-index")]
+                    filter_index: &filter_index,
+                    phase_tracker: None,
+                }
+            };
+        }
+
+        assert!(
+            matches!(
+                connect_block(&params!(None)),
+                Err(ConnectError::SequenceLockNotMet)
+            ),
+            "the polluted height row must be what the store-only lookup sees"
+        );
+        assert!(
+            connect_block(&params!(Some(&plan))).is_ok(),
+            "the plan's own chain meets the lock"
+        );
     }
 
     #[test]
@@ -1659,6 +1823,7 @@ mod tests {
         let mtp_block = base_time + 1400;
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: block_height,
@@ -1726,6 +1891,7 @@ mod tests {
         let block = make_block_spending(outpoint, block_height, 2, seq, 0);
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: block_height,
@@ -1805,6 +1971,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 101,
@@ -1905,6 +2072,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height,
@@ -1931,6 +2099,7 @@ mod tests {
         let (store, outpoint, _) = make_test_store_with_coin(10, false);
         let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 101,
@@ -2005,6 +2174,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 101,
@@ -2083,6 +2253,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 101,
@@ -2113,6 +2284,7 @@ mod tests {
         let block = make_block_spending(outpoint, 101, 2, 0xffff_ffff, 0);
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 101,
@@ -2233,6 +2405,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height,
@@ -2277,6 +2450,7 @@ mod tests {
         let mtp = 500_000_000; // below locktime
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height,
@@ -2316,6 +2490,7 @@ mod tests {
         let block = make_block_spending(outpoint, block_height, 2, seq, 0);
 
         let result = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: block_height,
@@ -2387,6 +2562,7 @@ mod tests {
         let cfg = crate::index::address::AddressIndexConfig::default();
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -2426,6 +2602,7 @@ mod tests {
         let cfg = crate::index::address::AddressIndexConfig::default();
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -2469,6 +2646,7 @@ mod tests {
         };
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -2504,6 +2682,7 @@ mod tests {
         let cfg = crate::index::address::AddressIndexConfig::default();
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &genesis,
             height: 0,
@@ -2544,6 +2723,7 @@ mod tests {
         };
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -2578,6 +2758,7 @@ mod tests {
         let fcfg = crate::index::filter::FilterIndexConfig::default();
 
         let batch = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block,
             height: 1,
@@ -2616,6 +2797,7 @@ mod tests {
         };
 
         let batch_1 = connect_block(&ConnectParams {
+            replay_plan: None,
             store: &store,
             block: &block_1,
             height: 1,

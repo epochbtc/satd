@@ -48,6 +48,13 @@ impl ReplayPlan {
         (self.hashes.len() as u32).saturating_sub(1)
     }
 
+    /// Build a plan from an explicit height→hash list, `hashes[0]` genesis.
+    /// Tests only: the production plan comes from `plan_replay_from_block_index`.
+    #[cfg(test)]
+    pub(crate) fn from_hashes(hashes: Vec<BlockHash>) -> Self {
+        Self { hashes }
+    }
+
     /// The selected tip's hash.
     pub fn tip_hash(&self) -> BlockHash {
         // Same invariant: `hashes` is never empty.

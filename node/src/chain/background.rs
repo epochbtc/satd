@@ -344,6 +344,7 @@ impl BackgroundChainState {
         let sp_index = crate::index::silent_payments::SpIndexConfig::default();
 
         let batch = connect::connect_block(&connect::ConnectParams {
+            replay_plan: None,
             store: store_ref,
             block,
             height: new_height,

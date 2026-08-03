@@ -253,6 +253,7 @@ pub fn repair_lost_connect_delta(
     // validation, scripts included: every prevout is still present.
     let flat_pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
     let mut batch = connect::connect_block(&ConnectParams {
+        replay_plan: None,
         store,
         block,
         height,
@@ -533,6 +534,7 @@ mod tests {
         let block2 = seal(block1_hash, vec![make_coinbase(2, 0)]);
         let block2_hash = block2.block_hash();
         let batch2 = connect::connect_block(&ConnectParams {
+            replay_plan: None,
             store,
             block: &block2,
             height: 2,
