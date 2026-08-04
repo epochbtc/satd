@@ -244,10 +244,9 @@ impl MockReceiver {
 
     /// Every accepted delivery, in arrival order.
     ///
-    /// Unused on this branch — the dispatcher tests assert on *attempts*, since
-    /// a refused delivery is still evidence of what was sent. The watch-hook
-    /// tests stacked above do use it, and each branch is linted on its own.
-    #[allow(dead_code)]
+    /// The dispatcher tests mostly assert on *attempts*, since a refused
+    /// delivery is still evidence of what was sent; the category-routing and
+    /// heartbeat tests want the accepted set specifically.
     async fn all(&self) -> Vec<Received> {
         self.inner.lock().await.received.clone()
     }
@@ -327,9 +326,24 @@ fn write_alertfile(
     categories: &str,
     nudge: bool,
 ) {
+    let extra = if nudge { "allow_insecure_http = true\n" } else { "" };
+    write_alertfile_keys(dir, receiver, id, categories, extra);
+}
+
+/// Write a one-hook alertfile with `extra` appended verbatim to the stanza.
+///
+/// The separate entry point exists for keys the dispatcher reads per hook
+/// (`heartbeat_interval_secs`) rather than for the `nudge` flag's purpose of
+/// forcing a materially-different file.
+fn write_alertfile_keys(
+    dir: &tempfile::TempDir,
+    receiver: &MockReceiver,
+    id: &str,
+    categories: &str,
+    extra: &str,
+) {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.path().join("alertfile.toml");
-    let hb = if nudge { "allow_insecure_http = true\n" } else { "" };
     std::fs::write(
         &path,
         format!(
@@ -339,7 +353,7 @@ id = "{id}"
 url = "{}"
 secret = "{SECRET}"
 categories = [{categories}]
-{hb}"#,
+{extra}"#,
             receiver.url()
         ),
     )
@@ -386,14 +400,42 @@ async fn node_with_hook(
     categories: &str,
     extra: Vec<String>,
 ) -> (StreamingNode, tempfile::TempDir) {
+    node_with_hook_keys(receiver, id, categories, "", extra).await
+}
+
+/// [`node_with_hook`] with `hook_keys` appended to the hook's stanza.
+async fn node_with_hook_keys(
+    receiver: &MockReceiver,
+    id: &str,
+    categories: &str,
+    hook_keys: &str,
+    extra: Vec<String>,
+) -> (StreamingNode, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_alertfile(&dir, receiver, id, categories, false);
+    write_alertfile_keys(&dir, receiver, id, categories, hook_keys);
     let path = dir.path().join("alertfile.toml");
 
     let mut args = vec![format!("--alertfile={}", path.display())];
     args.extend(extra);
     let sn = crate::streaming::start_streaming_owned(args).await;
     (sn, dir)
+}
+
+/// The detectors that fire on their own schedule, off. A test that asserts on
+/// *which* events reached a hook needs the status stream quiet apart from the
+/// one condition it drives; `disk_low` in particular raises at startup on any
+/// machine with under 10 GiB free, which would otherwise land in the middle of
+/// an unrelated assertion.
+fn quiet_detectors() -> Vec<String> {
+    [
+        "--alerttipstallseconds=0",
+        "--alertdiskfreemb=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 // ===========================================================================
@@ -807,5 +849,231 @@ async fn stalled_endpoint_does_not_slow_block_connection() {
     assert!(
         height >= u64::from(BLOCKS),
         "tip should have advanced to at least {BLOCKS}, got {height}",
+    );
+}
+
+/// **A reorg reaches an operator's webhook** — the per-block disconnects on the
+/// `chain` category and the one-shot `deep_reorg` edge on `status`, both to the
+/// same hook.
+///
+/// Reorg notification is the reason the alert dispatcher exists (it absorbed
+/// the older `reorgwebhook=`), and it is the one alert an operator cannot
+/// reconstruct after the fact from a polled RPC: by the time anything asks, the
+/// abandoned blocks are gone from the active chain. The streaming API covers
+/// the same reorg (`ws_status_deep_reorg_reports_true_depth`); this covers the
+/// path an operator who is not writing a streaming client actually uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reorg_delivers_the_disconnects_and_a_deep_reorg_edge() {
+    let receiver = MockReceiver::ok().await;
+    let mut args = vec!["--alertreorgdepth=2".to_string()];
+    args.extend(quiet_detectors());
+    let (sn, _dir) =
+        node_with_hook_keys(&receiver, "ops", "\"status\", \"chain\"", "", args).await;
+
+    // Mine three blocks to a known address so the height-2 hash is in hand to
+    // invalidate. `mine` returns the hashes in height order.
+    let rpc = sn.node.rpc_handle();
+    let addr = crate::common::DeterministicWallet::from_secret([0x73; 32])
+        .address
+        .to_string();
+    let hashes = tokio::task::spawn_blocking(move || rpc.mine(3, &addr))
+        .await
+        .unwrap();
+    assert_eq!(hashes.len(), 3, "mined three blocks");
+    let height2 = hashes[1].clone();
+
+    // Wait out the forward chain before reorging, so the disconnects below are
+    // unambiguously the reorg's rather than a slow tail of the connects.
+    receiver
+        .wait_for(60, |r| {
+            let b = r.json();
+            b["body"]["kind"] == "block_connected" && b["body"]["height"] == 3
+        })
+        .await;
+
+    // Invalidating height 2 rolls back heights 3 and 2 — a 2-deep truncation.
+    let rpc2 = sn.node.rpc_handle();
+    let resp = tokio::task::spawn_blocking(move || {
+        rpc2.call("invalidateblock", vec![serde_json::json!(height2)])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+
+    // The fork-point marker, carrying the abandoned tip and the new one.
+    let marker = receiver
+        .wait_for(60, |r| r.json()["body"]["kind"] == "reorg")
+        .await;
+    let m = marker.json();
+    assert!(marker.signature_valid(SECRET), "the reorg marker must be signed");
+    assert_eq!(m["body"]["from_height"], 3, "abandoned tip height: {m}");
+    assert_eq!(m["body"]["to_height"], 1, "new tip height: {m}");
+
+    // One disconnect per rolled-back block, both heights.
+    for height in [3, 2] {
+        let got = receiver
+            .wait_for(60, |r| {
+                let b = r.json();
+                b["body"]["kind"] == "block_disconnected" && b["body"]["height"] == height
+            })
+            .await;
+        assert!(
+            got.signature_valid(SECRET),
+            "disconnect at height {height} must be signed",
+        );
+        assert_eq!(got.json()["body"]["category"], "chain");
+    }
+
+    // And the status edge that names the incident, with the true depth. A
+    // truncation has no replacement chain to connect, so the detector finalizes
+    // the count on its next poll rather than on a connect.
+    let edge = receiver
+        .wait_for(60, |r| r.json()["body"]["kind"] == "deep_reorg")
+        .await;
+    assert!(edge.signature_valid(SECRET), "the deep_reorg edge must be signed");
+    let e = edge.json();
+    assert_eq!(e["body"]["category"], "status", "event: {e}");
+    assert_eq!(e["body"]["state"], "edge", "one-shot, not a standing warning: {e}");
+    assert_eq!(e["body"]["severity"], "critical", "event: {e}");
+    assert_eq!(e["body"]["details"]["depth"], "2", "event: {e}");
+    assert_eq!(e["body"]["details"]["from_height"], "3", "event: {e}");
+    assert_eq!(e["body"]["details"]["fork_height"], "1", "event: {e}");
+}
+
+/// A mempool hook sees a transaction enter the pool and leave it confirmed —
+/// and sees nothing else.
+///
+/// The `mempool` category had no end-to-end coverage: every other webhook test
+/// drives `status` or `chain`. The negative half matters as much as the
+/// positive one — the category mask is what stands between an operator's pager
+/// and per-transaction volume, and until now it was only ever asserted in a
+/// unit test against an in-process publisher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mempool_hook_sees_admission_and_confirmation_and_nothing_else() {
+    let receiver = MockReceiver::ok().await;
+    let (sn, _dir) =
+        node_with_hook_keys(&receiver, "pool", "\"mempool\"", "", quiet_detectors()).await;
+
+    // Mature the block-1 coinbase so it is spendable (101 blocks to the funding
+    // wallet). None of this reaches the hook: it is chain traffic.
+    let wallet = crate::common::DeterministicWallet::from_secret([0x11; 32]);
+    let rpc = sn.node.rpc_handle();
+    let addr = wallet.address.to_string();
+    tokio::task::spawn_blocking(move || rpc.mine(101, &addr))
+        .await
+        .unwrap();
+
+    let (txid, _dest) = crate::streaming::broadcast_spend(&sn, &wallet, 0x55, 10_000).await;
+
+    // Admission.
+    let got = receiver
+        .wait_for(60, |r| r.json()["body"]["kind"] == "enter")
+        .await;
+    assert!(got.signature_valid(SECRET));
+    let b = got.json();
+    assert_eq!(b["body"]["category"], "mempool", "body: {b}");
+    assert_eq!(b["body"]["txid"], txid, "body: {b}");
+    // The numbers an operator would alert on ride in the body, not just the id.
+    assert!(b["body"]["fee"].is_number(), "body: {b}");
+    assert!(b["body"]["vsize"].is_number(), "body: {b}");
+    assert!(b["body"]["fee_rate_sat_per_kvb"].is_number(), "body: {b}");
+
+    // Confirmation removes it, on the same hook.
+    crate::streaming::mine_n(&sn, 1).await;
+    let got = receiver
+        .wait_for(60, |r| r.json()["body"]["kind"] == "leave_confirmed")
+        .await;
+    let b = got.json();
+    assert_eq!(b["body"]["txid"], txid, "body: {b}");
+    assert_eq!(b["body"]["height"], 102, "body: {b}");
+    assert!(b["body"]["block_hash"].is_string(), "body: {b}");
+
+    // 102 blocks connected over the life of this test. A mempool-only hook must
+    // have been sent none of them — the mask is applied before delivery, not
+    // left to the receiver.
+    let stray: Vec<_> = receiver
+        .all()
+        .await
+        .iter()
+        .filter(|r| r.json()["body"]["category"] != "mempool")
+        .map(|r| r.body.clone())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a mempool-only hook received {} off-category deliveries: {stray:?}",
+        stray.len(),
+    );
+}
+
+/// A heartbeat hook is a dead-man's switch: the deliveries keep arriving while
+/// the node is alive, downsampled to the configured interval rather than
+/// forwarded at the bus's 1 Hz.
+///
+/// Downsampling is unit-tested against an in-process publisher; what is only
+/// visible end-to-end is that the pings actually leave the node on a schedule.
+/// A dead-man's switch that silently never fires is indistinguishable from a
+/// healthy node right up until it is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeats_reach_a_hook_downsampled_to_its_interval() {
+    const INTERVAL: u64 = 2;
+    // Long enough for several intervals, short enough not to dominate the
+    // suite's wall clock.
+    const WINDOW: u64 = 10;
+
+    let receiver = MockReceiver::ok().await;
+    let (_sn, _dir) = node_with_hook_keys(
+        &receiver,
+        "deadman",
+        "\"heartbeat\"",
+        &format!("heartbeat_interval_secs = {INTERVAL}\n"),
+        quiet_detectors(),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(WINDOW)).await;
+
+    let beats: Vec<_> = receiver
+        .all()
+        .await
+        .into_iter()
+        .filter(|r| r.json()["body"]["category"] == "heartbeat")
+        .collect();
+
+    // The switch has to keep firing — a single ping proves nothing about a
+    // *recurring* signal, and "it fired once at startup then went quiet" is
+    // exactly the failure an external watchdog cannot distinguish from a dead
+    // node.
+    assert!(
+        beats.len() >= 2,
+        "expected the dead-man's switch to keep firing over {WINDOW}s, got {}",
+        beats.len(),
+    );
+
+    // Downsampling is asserted on the *spacing* rather than the count. The
+    // filter compares whole seconds (`as_secs() >= interval`), so at a 1s
+    // setting the 1 Hz bus loses roughly every other beat to truncation and a
+    // count-based bound cannot tell 1s from 2s. Consecutive signing timestamps
+    // can: an accepted beat is signed when it is forwarded, and the filter
+    // admits one only after a full interval of real time, so the floor of the
+    // gap is never below the interval.
+    let stamps: Vec<u64> = beats
+        .iter()
+        .map(|r| r.header("x-satd-timestamp").parse().expect("numeric timestamp"))
+        .collect();
+    for pair in stamps.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= INTERVAL,
+            "heartbeats were not downsampled to the {INTERVAL}s interval: \
+             consecutive deliveries {}s apart (all: {stamps:?})",
+            pair[1] - pair[0],
+        );
+    }
+
+    let b = beats[0].json();
+    assert!(beats[0].signature_valid(SECRET), "heartbeats are signed like any other event");
+    assert!(
+        b["body"]["uptime_ns"].is_number(),
+        "the heartbeat carries uptime for pipeline-latency measurement: {b}",
     );
 }

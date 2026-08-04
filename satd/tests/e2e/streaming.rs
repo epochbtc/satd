@@ -309,7 +309,7 @@ pub(crate) async fn mine_n(sn: &StreamingNode, n: u32) {
 
 /// Build + broadcast the canonical block-1-coinbase spend (RBF-signalling off).
 /// Returns `(spend_display_txid, dest_spk)`.
-async fn broadcast_spend(
+pub(crate) async fn broadcast_spend(
     sn: &StreamingNode,
     wallet: &DeterministicWallet,
     dest_seed: u8,
