@@ -429,8 +429,7 @@ func TestSetCursorIsAckedInBand(t *testing.T) {
 	if err := h.SetCategories(ctx, satdevents.CategoryChain); err != nil {
 		t.Fatal(err)
 	}
-	n.mine(1, walletC)
-	first := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	first := mineUntilSeen(t, n, stream, walletC, 30, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockConnected)
 		return ok
 	}).(*satdevents.BlockConnected)

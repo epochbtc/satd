@@ -388,6 +388,26 @@ func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream,
 	if err != nil {
 		return nil, fromStatus(err)
 	}
+	// Wait for the server's response headers before handing the stream back.
+	//
+	// grpc-go starts a server-streaming call without waiting for the server to
+	// accept it, so without this Subscribe returns before the node has
+	// registered the subscription - and anything the caller triggers in that
+	// window (mining a block, broadcasting a transaction) is simply not on the
+	// stream. That silent race is a bad default for an event API: "subscribe,
+	// then do the thing" has to work.
+	//
+	// This also matches the Rust SDK, where awaiting the tonic response waits
+	// for headers as a matter of course. The wait is bounded by ctx, and the
+	// node flushes headers when it accepts the stream, so it costs one round
+	// trip.
+	//
+	// Deliberately NOT done for the bidirectional Watch stream: there a server
+	// is free to withhold headers until it has something to send, so waiting can
+	// block until the first event - or forever on a quiet watch-set.
+	if _, err := sc.Header(); err != nil {
+		return nil, fromStatus(err)
+	}
 	return &Stream{recv: sc.Recv}, nil
 }
 

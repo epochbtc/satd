@@ -116,6 +116,9 @@ type node struct {
 	grpcPort int
 	cookie   string
 	stderr   string
+	// env is extra KEY=VALUE entries for the satd process, preserved across a
+	// restart so a test knob (a shrunk event buffer, say) survives it.
+	env []string
 }
 
 // satdBinary locates the satd binary under test. CI points SATD_BIN at the
@@ -163,6 +166,13 @@ var nodeSeq atomic.Uint64
 // any of them.
 func startNode(t *testing.T, extraArgs ...string) *node {
 	t.Helper()
+	return startNodeEnv(t, nil, extraArgs...)
+}
+
+// startNodeEnv is startNode with extra KEY=VALUE environment entries, for the
+// node-side test knobs (SATD_EVENT_BROADCAST_CAPACITY and friends).
+func startNodeEnv(t *testing.T, env []string, extraArgs ...string) *node {
+	t.Helper()
 	bin := satdBinary(t)
 
 	// A satd that never answers RPC has almost always crashed on startup (a
@@ -171,7 +181,7 @@ func startNode(t *testing.T, extraArgs ...string) *node {
 	const attempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		n, err := tryStartNode(t, bin, extraArgs)
+		n, err := tryStartNode(t, bin, env, extraArgs)
 		if err == nil {
 			return n
 		}
@@ -182,7 +192,7 @@ func startNode(t *testing.T, extraArgs ...string) *node {
 	return nil
 }
 
-func tryStartNode(t *testing.T, bin string, extraArgs []string) (*node, error) {
+func tryStartNode(t *testing.T, bin string, env []string, extraArgs []string) (*node, error) {
 	t.Helper()
 	rpcPort := freePort(t)
 	p2pPort := freePort(t)
@@ -216,11 +226,14 @@ func tryStartNode(t *testing.T, bin string, extraArgs []string) (*node, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = stderrFile
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 
-	n := &node{t: t, cmd: cmd, datadir: datadir, rpcPort: rpcPort, stderr: stderrPath}
+	n := &node{t: t, cmd: cmd, datadir: datadir, rpcPort: rpcPort, stderr: stderrPath, env: env}
 	if err := n.waitReady(); err != nil {
 		n.kill()
 		return nil, fmt.Errorf("%w%s", err, n.stderrTail())
@@ -235,22 +248,27 @@ func tryStartNode(t *testing.T, bin string, extraArgs []string) (*node, error) {
 func (n *node) waitReady() error {
 	deadline := time.Now().Add(timeout(120))
 	cookiePath := filepath.Join(n.datadir, "regtest", ".cookie")
+	var lastErr error
 	for time.Now().Before(deadline) {
 		if n.cmd.ProcessState != nil {
 			return fmt.Errorf("satd exited before its RPC came up")
 		}
-		if n.cookie == "" {
-			raw, err := os.ReadFile(cookiePath)
-			if err != nil {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			n.cookie = strings.TrimSpace(string(raw))
+		// Re-read the cookie every poll rather than caching the first one seen.
+		// After a restart the old file is still on disk for a moment, so caching
+		// pins a credential satd has already replaced and every later call comes
+		// back Unauthorized - which reads as "the node never came up".
+		raw, err := os.ReadFile(cookiePath)
+		if err != nil {
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+		n.cookie = strings.TrimSpace(string(raw))
 		var info struct {
 			Chain string `json:"chain"`
 		}
 		if err := n.call("getblockchaininfo", nil, &info); err != nil || info.Chain == "" {
+			lastErr = err
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -259,9 +277,11 @@ func (n *node) waitReady() error {
 			n.grpcPort = port
 			return nil
 		}
+		lastErr = err
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("satd did not become ready within %s", timeout(120))
+	return fmt.Errorf("satd did not become ready within %s (last error: %v)",
+		timeout(120), lastErr)
 }
 
 // grpcBoundPort reads the runtime-bound streaming port out of getserverstatus.
@@ -448,7 +468,9 @@ func (n *node) restart() {
 		"--esplora=0",
 		"--loglevel=error",
 	}
-	stderrFile, err := os.Create(n.stderr)
+	// Append rather than truncate: the pre-restart output is often what explains
+	// a node that does not come back.
+	stderrFile, err := os.OpenFile(n.stderr, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		n.t.Fatalf("reopening the stderr log: %v", err)
 	}
@@ -456,11 +478,15 @@ func (n *node) restart() {
 
 	cmd := exec.Command(bin, args...)
 	cmd.Stderr = stderrFile
+	if len(n.env) > 0 {
+		cmd.Env = append(os.Environ(), n.env...)
+	}
 	if err := cmd.Start(); err != nil {
 		n.t.Fatalf("restarting satd: %v", err)
 	}
 	n.cmd = cmd
 	n.grpcPort = 0
+	n.cookie = ""
 	if err := n.waitReady(); err != nil {
 		n.t.Fatalf("satd did not come back up: %v%s", err, n.stderrTail())
 	}
@@ -528,6 +554,54 @@ func recvMatching(t *testing.T, s *satdevents.Stream, secs float64, pred func(sa
 	case <-time.After(timeout(secs)):
 		t.Fatalf("no matching event within %s", timeout(secs))
 		return nil
+	}
+}
+
+// mineUntilSeen mines blocks until pred matches on the stream.
+//
+// Watch control messages have no per-message ack, so SetCategories (or
+// AddScripts, or any other registration) returning means only that the frame was
+// written - the node may not have applied it yet, and a block mined inside that
+// window never reaches the stream. Retrying the trigger is the only way to close
+// that window from the client side. One reader goroutine drives the whole wait,
+// so a retry cannot race a previous attempt for the same event.
+func mineUntilSeen(t *testing.T, n *node, s *satdevents.Stream, w wallet, secs float64,
+	pred func(satdevents.Event) bool) satdevents.Event {
+	t.Helper()
+	type result struct {
+		ev  satdevents.Event
+		err error
+	}
+	out := make(chan result, 1)
+	go func() {
+		for {
+			ev, err := s.Recv()
+			if err != nil {
+				out <- result{err: err}
+				return
+			}
+			if pred(ev) {
+				out <- result{ev: ev}
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(timeout(secs))
+	for {
+		n.mine(1, w)
+		select {
+		case r := <-out:
+			if r.err != nil {
+				t.Fatalf("stream error while waiting for a matching event: %v", r.err)
+			}
+			return r.ev
+		case <-time.After(timeout(2)):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no matching event within %s, despite mining throughout", timeout(secs))
+			return nil
+		}
 	}
 }
 
