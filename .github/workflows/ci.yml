@@ -135,6 +135,26 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: cargo test --all --locked
 
+      # The Go SDK (clients/go) is an independent module in this repo. It is
+      # tested here, on satd's own PRs, rather than in a downstream repo, so a
+      # node or proto change that breaks the SDK fails the PR that made it —
+      # the same reason the third-party canary fleet is PR-gating. The SDK is
+      # not dogfooded by the maintainer, so CI is the only thing between a
+      # green badge and a rotted client.
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+
+      # Built before the E2E suite because the differential parity test
+      # (tests/e2e/parity.rs) runs INSIDE it and spawns this binary as the Go
+      # half of the comparison. Handing it over by path keeps the test from
+      # shelling out to `go build` on a runner mid-suite.
+      - name: Build the Go parity dumper
+        working-directory: clients/go
+        run: go build -o "${{ runner.temp }}/paritydump" ./cmd/paritydump
+
       - name: Run E2E suite
         # The E2E suite (`tests/e2e.rs`) drives `satd` over real sockets
         # via real clients (sat-cli, reqwest, electrum-client). It owns
@@ -155,19 +175,11 @@ jobs:
           SATD_TEST_TIMEOUT_MULT: "2"
           SATD_E2E_TIMEOUT_MULT: "3"
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
+          # Without this the parity test skips itself rather than failing, which
+          # would quietly turn the one check that proves Go/Rust parity into a
+          # no-op on the runner.
+          PARITYDUMP_BIN: ${{ runner.temp }}/paritydump
         run: cargo test --test e2e --locked --features e2e
-
-      # The Go SDK (clients/go) is an independent module in this repo. It is
-      # tested here, on satd's own PRs, rather than in a downstream repo, so a
-      # node or proto change that breaks the SDK fails the PR that made it —
-      # the same reason the third-party canary fleet is PR-gating. The SDK is
-      # not dogfooded by the maintainer, so CI is the only thing between a
-      # green badge and a rotted client.
-      - name: Set up Go toolchain
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: clients/go/go.mod
-          cache-dependency-path: clients/go/go.sum
 
       - name: Run Go SDK unit tests
         working-directory: clients/go
