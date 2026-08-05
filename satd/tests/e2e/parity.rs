@@ -508,7 +508,7 @@ mod canonical {
             ),
             // A variant an SDK cannot decode is itself parity-relevant: one side
             // decoding and the other filing it here is the missing-variant case.
-            Event::Unknown { .. } => obj("unknown", []),
+            Event::Unknown => obj("unknown", []),
             // `Event` is #[non_exhaustive]. A variant added to the SDK without a
             // rendering here would otherwise diff as silence against whatever Go
             // renders - so name it loudly instead.
@@ -723,10 +723,10 @@ async fn rust_dump(
         });
         out.push((key, serde_json::to_string(&render(&ev)).expect("render")));
 
-        if let Event::BlockConnected { height, .. } = ev {
-            if height >= until_height {
-                break;
-            }
+        if let Event::BlockConnected { height, .. } = ev
+            && height >= until_height
+        {
+            break;
         }
     }
     out.sort();
