@@ -45,7 +45,10 @@ import (
 type wallet struct {
 	wif     string
 	address string
-	spk     []byte
+	// pubkey is the compressed public key, hex - the form a fixed wpkh()
+	// descriptor takes.
+	pubkey string
+	spk    []byte
 }
 
 var (
@@ -53,6 +56,7 @@ var (
 	walletA = wallet{
 		wif:     "cN9spWsvaxA8taS7DFMxnk1yJD2gaF2PX1npuTpy3vuZFJdwavaw",
 		address: "bcrt1ql3e9pgs3mmwuwrh95fecme0s0qtn2880hlwwpw",
+		pubkey:  "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
 		spk:     mustHex("0014fc7250a211deddc70ee5a2738de5f07817351cef"),
 	}
 	// walletB (key 0x22...) is the spend destination - the address a watch-set
@@ -60,6 +64,7 @@ var (
 	walletB = wallet{
 		wif:     "cNj3zTdrLAMQtUhdFPPVJtRY7a3TdUF38ShW5MrJkVh1CVaeuEGU",
 		address: "bcrt1q2vfxp232rx0z9rzn0hay9jptagk8c86ddphpjv",
+		pubkey:  "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
 		spk:     mustHex("0014531260aa2a199e228c537dfa42c82bea2c7c1f4d"),
 	}
 	// walletC (key 0x99...) absorbs filler blocks so they never touch the
@@ -67,6 +72,7 @@ var (
 	walletC = wallet{
 		wif:     "cSjHC4wLYdiLsnaFWMaAwuGVq78u24maQT4EGe1geTB8rpGvbmqX",
 		address: "bcrt1q6tvhjq0thwhe0wl8c7kyrjjhsfzd259z3jpr9l",
+		pubkey:  "028985087b1818714f67e494a076ca0284c060fabc5d2ba66885b4ac60f801d3f5",
 		spk:     mustHex("0014d2d97901ebbbaf97bbe7c7ac41ca578244d550a2"),
 	}
 )
