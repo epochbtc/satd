@@ -281,6 +281,11 @@ type SubscribeOptions struct {
 	// SinceSeq is a forward-only dedup filter: drop events with seq <=
 	// SinceSeq. Use it after a brief reconnect within the broadcast window - not
 	// for durable replay, which is FromCursor's job.
+	//
+	// NOTE: this SDK does not surface per-event seq (the wire's EdgeStamp is
+	// dropped, matching the Rust SDK), so a value for this can only come from
+	// outside the SDK. For ordinary reconnect-without-duplicates, use
+	// [Client.ResilientSubscribe], which anchors on FromCursor instead.
 	SinceSeq *uint64
 	// TweakDustLimit drops [TweakEntry] whose MaxValue is below this floor
 	// (satoshis) and flags the block Filtered. Only meaningful with
@@ -383,6 +388,25 @@ func (s *Stream) Cursor() *Cursor {
 // [Client.ResilientSubscribe].
 //
 // Cancelling ctx terminates the stream.
+// String renders the client without its credentials.
+//
+// fmt reflects over unexported fields, so `log.Printf("%+v", client)` printed
+// the live bearer token into stdout, journald, and any log aggregator behind
+// them. The Rust SDK hand-writes Debug for exactly this reason; this is the Go
+// counterpart, and TestClientStringDoesNotLeakTheToken pins it.
+func (c *Client) String() string {
+	if c == nil {
+		return "<nil>"
+	}
+	if c.auth != "" {
+		return "satdevents.Client{auth: <redacted>}"
+	}
+	return "satdevents.Client{auth: none}"
+}
+
+// GoString makes %#v redact too, since it otherwise bypasses String.
+func (c *Client) GoString() string { return c.String() }
+
 func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream, error) {
 	sc, err := c.rpc.Subscribe(c.authed(ctx), opts.toProto())
 	if err != nil {
@@ -452,12 +476,29 @@ func transportCredentials(cfg *dialConfig) (credentials.TransportCredentials, er
 	if cfg.serverName != "" {
 		tlsCfg.ServerName = cfg.serverName
 	}
-	if len(cfg.caPEM) > 0 {
+	// caPEM != nil means the caller asked to PIN. An empty PEM must therefore
+	// fail closed: skipping the block leaves RootCAs nil, which silently falls
+	// back to the host's system roots. A zero-byte CA file - a truncated
+	// deploy, a secret projected before its content lands, an empty placeholder
+	// - would then make the client accept any publicly-trusted certificate for
+	// the endpoint's name, and the bearer token and the whole event stream go
+	// to whoever holds one.
+	if cfg.caPEM != nil {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(cfg.caPEM) {
 			return nil, newError(KindInvalidArgument, "no certificate found in the supplied CA PEM")
 		}
 		tlsCfg.RootCAs = pool
+	}
+	// Same posture for the client identity: asking for mTLS with two empty PEMs
+	// used to dial happily with no client certificate at all, deferring the
+	// failure to an opaque handshake rejection on the first RPC - or, against a
+	// server with optional client auth, succeeding as an unauthenticated peer.
+	if cfg.certPEM != nil || cfg.keyPEM != nil {
+		if len(cfg.certPEM) == 0 || len(cfg.keyPEM) == 0 {
+			return nil, newError(KindInvalidArgument,
+				"WithMTLS needs both a certificate and a private key")
+		}
 	}
 	if len(cfg.certPEM) > 0 || len(cfg.keyPEM) > 0 {
 		cert, err := tls.X509KeyPair(cfg.certPEM, cfg.keyPEM)

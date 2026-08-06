@@ -45,6 +45,17 @@ func maskPrefix(scripthash []byte, bits uint32) []byte {
 	return out
 }
 
+// maskPrefixSafe is maskPrefix for the declarative paths, where an invalid
+// (Prefix, Bits) pair is not reported until render time. A wrong-length or
+// out-of-range input is copied through untouched so the error still surfaces
+// from validatePrefix, rather than becoming a slice-bounds panic here.
+func maskPrefixSafe(prefix []byte, bits uint32) []byte {
+	if bits < 1 || bits > MaxPrefixBits || len(prefix) != int((bits+7)/8) {
+		return append([]byte(nil), prefix...)
+	}
+	return maskPrefix(prefix, bits)
+}
+
 func clampPrefixBits(bits uint32) uint32 {
 	if bits < 1 {
 		return 1

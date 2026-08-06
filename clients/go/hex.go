@@ -9,9 +9,16 @@ import (
 // hex string in the reversed display order used by block explorers and Bitcoin
 // Core JSON-RPC.
 //
-// Use it on a hash or txid field (Txid, BlockHash, ...). Do NOT apply it to a
-// public key or tweak (OutputPubkey, Tweak, ScanPubkey): those are raw bytes
-// and are not reversed for display.
+// Use it on a block hash or txid field (Txid, BlockHash, PrevTxid). Do NOT
+// apply it to a public key or tweak (OutputPubkey, Tweak, ScanPubkey), nor to
+// a scriptPubKey: those are raw bytes and are not reversed for display.
+//
+// Nor to Scripthash, despite it being a 32-byte hash. Electrum's convention IS
+// to reverse scripthashes, so reversing is the trained instinct - but this API
+// and satd's JSON-RPC both carry them unreversed, matching ScripthashOf. A
+// wallet that keys its map on DisplayHex(ev.Scripthash) and populates it from
+// ScripthashOf gets two strings that never match, and every hit is attributed
+// to nothing at all.
 //
 // This mismatch is the single most common integration bug against this API - a
 // txid compared against getrawtransaction output will silently never match if

@@ -123,7 +123,7 @@ func run(endpoint, specPath, outPath, readyPath string,
 	//
 	// The cost is explicit: this harness proves the two SDKs see the same events
 	// with the same field values, NOT that they see them in the same order.
-	var lines []sortableLine
+	var lines []string
 
 	// Readiness barrier: one deliberately invalid rescan.
 	//
@@ -178,9 +178,14 @@ func run(endpoint, specPath, outPath, readyPath string,
 		if err != nil {
 			return err
 		}
-		lines = append(lines, sortableLine{key: cursorKey(stream.Cursor()), line: string(encoded)})
+		lines = append(lines, string(encoded))
 		count++
 
+		// The sentinel block is mined to an UNWATCHED address (see the
+		// scenario in parity.rs), so it produces no watch match that could be
+		// queued behind it on the matcher channel. That is what lets both
+		// dumpers stop on the same event set rather than truncating wherever
+		// each connection's interleaving happened to fall.
 		if bc, ok := ev.(*satdevents.BlockConnected); ok &&
 			untilHeight != 0 && bc.Height >= untilHeight {
 			return flush(w, lines)
@@ -191,33 +196,23 @@ func run(endpoint, specPath, outPath, readyPath string,
 	}
 }
 
-// sortableLine is a rendered event plus the cursor it arrived under.
-type sortableLine struct {
-	key  [3]uint64
-	line string
-}
-
-// cursorKey is the node's total order over confirmed events. A nil cursor sorts
-// first, which is where the pre-cursor events genuinely belong.
-func cursorKey(c *satdevents.Cursor) [3]uint64 {
-	if c == nil {
-		return [3]uint64{}
-	}
-	return [3]uint64{uint64(c.Height), uint64(c.TxIndex), c.MempoolSeq}
-}
-
-func flush(w *bufio.Writer, lines []sortableLine) error {
-	sort.SliceStable(lines, func(i, j int) bool {
-		if lines[i].key != lines[j].key {
-			return lines[i].key[0] < lines[j].key[0] ||
-				(lines[i].key[0] == lines[j].key[0] &&
-					(lines[i].key[1] < lines[j].key[1] ||
-						(lines[i].key[1] == lines[j].key[1] && lines[i].key[2] < lines[j].key[2])))
-		}
-		return lines[i].line < lines[j].line
-	})
+// flush writes the dump sorted by RENDERED CONTENT.
+//
+// Sorting by cursor looked more principled and was wrong: only confirmed events
+// carry a cursor, so every mempool-side event inherited whichever block cursor
+// happened to arrive before it ON THAT CONNECTION. The two SDKs drain the node's
+// live and watch-matcher channels independently, so identical events landed in
+// different sort buckets and the diff reported an ordering race as an SDK
+// mismatch.
+//
+// Content order is a total order both sides compute identically from the data
+// alone. It compares the two dumps as MULTISETS - any missing, extra, or
+// differing event still fails - and drops only the ordering check, which this
+// harness already disclaims.
+func flush(w *bufio.Writer, lines []string) error {
+	sort.Strings(lines)
 	for _, l := range lines {
-		if _, err := w.WriteString(l.line + "\n"); err != nil {
+		if _, err := w.WriteString(l + "\n"); err != nil {
 			return err
 		}
 	}

@@ -510,6 +510,14 @@ type Lagged struct {
 // unrecoverable via this stream, so full-resync the skipped range from another
 // source (for example the getblock JSON-RPC). Emitted once per resume,
 // immediately before the first replayed block.
+//
+// DETECTION LIMIT: it is inferred from the height of the first replayed
+// [BlockConnected], so it can only fire on a subscription that requested
+// [CategoryChain]. A clampable subscription that filtered chain events out -
+// CategoryTweaks|CategoryMempool, say - is still clamped by the server but gets
+// NO gap notice here, and the skipped range passes unremarked. If you filter out
+// chain events and rely on durable replay, compare [ResilientSubscription.ResumeCursor]
+// against your own record of where you were caught up to.
 type ReplayGap struct {
 	// ResumeHeight is the height the resume cursor expected next
 	// (cursor.Height + 1).

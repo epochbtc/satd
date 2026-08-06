@@ -438,10 +438,55 @@ func TestLagPolicyAutoResumeReanchorsSilently(t *testing.T) {
 	if req.GetFromCursor().GetHeight() != 42 {
 		t.Errorf("re-anchored at %v, want the notice's resume cursor (42)", req.GetFromCursor())
 	}
-	// A lag recovery point is persisted IMMEDIATELY, not deferred: it is the
-	// server's own anchor, and a crash must resume from the same place.
-	if c := store.last(); c == nil || c.Height != 42 {
-		t.Errorf("the lag anchor was not persisted immediately, store holds %v", c)
+	// The lag re-anchor moves the in-memory resume point, and the STORE follows
+	// commit-on-poll like everything else. It must never be written from the
+	// pump: the node's resume_cursor is the last position it delivered - the
+	// event the caller is still holding - so persisting it there let a crash
+	// mid-processing skip that event for good.
+	// (The re-anchor itself is already proven by the FromCursor check above.)
+	if c := store.last(); c != nil && c.Height == 42 {
+		t.Error("the pump persisted the lag anchor directly, so an unacked event can be skipped")
+	}
+}
+
+// TestLagAutoResumeDoesNotOutrunTheCaller is the regression proof for that:
+// the caller takes an event, the pump sees a lag notice anchored AT that event,
+// and the store must still not hold it until the caller polls again.
+func TestLagAutoResumeDoesNotOutrunTheCaller(t *testing.T) {
+	client, _ := startScripted(t,
+		sendAll(blockEvent(10), laggedEvent(500, &eventspb.Cursor{Height: 10})),
+		sendAll(blockEvent(11)),
+	)
+	store := &recordingStore{}
+	sub := client.ResilientSubscribe(context.Background(), SubscribeOptions{},
+		ResilientConfig{
+			CursorStore: store,
+			Backoff:     Backoff{Initial: time.Millisecond, Max: 5 * time.Millisecond, Multiplier: 2},
+		})
+	defer func() { _ = sub.Close() }()
+
+	// Block 10 is now in the caller's hands and NOT acked. The pump goes on to
+	// read the lag notice, whose resume cursor is block 10's own position.
+	if got := nextBlock(t, sub).Height; got != 10 {
+		t.Fatalf("height = %d", got)
+	}
+	// Give the pump time to process the lag notice and reconnect.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r := sub.ResumeCursor(); r != nil && r.Height == 10 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if c := store.last(); c != nil && c.Height >= 10 {
+		t.Fatalf("store holds %v while block 10 is still unacked: a crash here loses it", c)
+	}
+	// Polling again is the ack, and only now may the store advance.
+	if got := nextBlock(t, sub).Height; got != 11 {
+		t.Fatalf("height = %d", got)
+	}
+	if c := store.last(); c == nil || c.Height != 10 {
+		t.Errorf("after the ack the store holds %v, want block 10", c)
 	}
 }
 
@@ -722,4 +767,41 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition never became true")
+}
+
+// TestCommitRetryAfterStoreFailureActuallyWrites pins the arm-retention rule in
+// commitDue. Clearing the armed cursor before the store write meant a retried
+// Commit found nothing armed and returned nil - a FALSE durability ack. The
+// caller shuts down believing its position is safe; the next start finds an
+// empty store, begins forward-only, and never delivers what happened in
+// between. That is a lost event, not a replayed one.
+func TestCommitRetryAfterStoreFailureActuallyWrites(t *testing.T) {
+	client, _ := startScripted(t, sendAll(blockEvent(10), blockEvent(11)))
+	store := &recordingStore{}
+	sub := client.ResilientSubscribe(context.Background(), SubscribeOptions{},
+		ResilientConfig{CursorStore: store})
+	defer func() { _ = sub.Close() }()
+
+	if got := nextBlock(t, sub).Height; got != 10 {
+		t.Fatalf("height = %d", got)
+	}
+
+	// Arm block 10, then fail the write the caller asked for.
+	store.mu.Lock()
+	store.storeErr = errors.New("disk full")
+	store.mu.Unlock()
+	if err := sub.Commit(context.Background()); err == nil {
+		t.Fatal("Commit reported success while the store was failing")
+	}
+
+	// The store recovers. The retry must WRITE, not report a no-op success.
+	store.mu.Lock()
+	store.storeErr = nil
+	store.mu.Unlock()
+	if err := sub.Commit(context.Background()); err != nil {
+		t.Fatalf("Commit after recovery: %v", err)
+	}
+	if c := store.last(); c == nil || c.Height != 10 {
+		t.Fatalf("store holds %v after a retried Commit, want block 10", c)
+	}
 }

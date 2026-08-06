@@ -1,6 +1,7 @@
 package satdevents
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 
@@ -451,4 +452,96 @@ func TestCursorRejectTransientClassification(t *testing.T) {
 			t.Errorf("%s should be surfaced, not retried", r)
 		}
 	}
+}
+
+// TestDecodeMapsSameTypedFieldsFaithfully pins the arms where a transposed
+// assignment type-checks and so survives review.
+//
+// TestDecoderCoversEveryNodeEventBody proves every arm decodes to the right Go
+// TYPE, which a swap does not disturb; TestDecodeMapsFieldsFaithfully covers 16
+// arms by field but not these. The two below are the dangerous shapes: three
+// adjacent uint32 counters, and four adjacent 32-byte-ish slices.
+func TestDecodeMapsSameTypedFieldsFaithfully(t *testing.T) {
+	t.Run("watch set replaced counters are not transposed", func(t *testing.T) {
+		// Distinct values, so any permutation of the three fails.
+		in := &eventspb.NodeEvent{Body: &eventspb.NodeEvent_SetWatchSetResult{
+			SetWatchSetResult: &eventspb.WatchSetResult{
+				Outcome: &eventspb.WatchSetResult_Accepted{Accepted: &eventspb.WatchSetAccepted{
+					Added: 11, Removed: 22, Unchanged: 33,
+				}},
+			},
+		}}
+		got, ok := decodeEvent(in).(*WatchSetReplaced)
+		if !ok {
+			t.Fatalf("decoded to %T", decodeEvent(in))
+		}
+		if got.Added != 11 || got.Removed != 22 || got.Unchanged != 33 {
+			t.Errorf("added/removed/unchanged = %d/%d/%d, want 11/22/33",
+				got.Added, got.Removed, got.Unchanged)
+		}
+	})
+
+	t.Run("silent payment byte fields are not transposed", func(t *testing.T) {
+		// Each slice is a different length AND a different value, so a swap
+		// cannot pass by coincidence.
+		scan := []byte{0xaa, 0xaa, 0xaa}
+		txid := []byte{0xbb, 0xbb}
+		outKey := []byte{0xcc}
+		tweak := []byte{0xdd, 0xdd, 0xdd, 0xdd}
+		raw := []byte{0xee, 0xee, 0xee, 0xee, 0xee}
+		label := uint32(7)
+
+		in := &eventspb.NodeEvent{Body: &eventspb.NodeEvent_SilentPaymentMatched{
+			SilentPaymentMatched: &eventspb.SilentPaymentMatched{
+				ScanPubkey: scan, Txid: txid, Vout: 3, OutputPubkey: outKey,
+				Amount: 5000, Tweak: tweak, K: 2, Confirmed: true, Height: 812345,
+				HasLabel: true, Label: label, RawTx: raw,
+			},
+		}}
+		got, ok := decodeEvent(in).(*SilentPaymentMatched)
+		if !ok {
+			t.Fatalf("decoded to %T", decodeEvent(in))
+		}
+		if !bytes.Equal(got.ScanPubkey, scan) {
+			t.Errorf("ScanPubkey = %x", got.ScanPubkey)
+		}
+		if !bytes.Equal(got.Txid, txid) {
+			t.Errorf("Txid = %x", got.Txid)
+		}
+		// The pair a wallet cannot afford to have swapped: deriving from the
+		// output key instead of the tweak yields a key that controls nothing.
+		if !bytes.Equal(got.OutputPubkey, outKey) {
+			t.Errorf("OutputPubkey = %x, want %x", got.OutputPubkey, outKey)
+		}
+		if !bytes.Equal(got.Tweak, tweak) {
+			t.Errorf("Tweak = %x, want %x", got.Tweak, tweak)
+		}
+		if !bytes.Equal(got.RawTx, raw) {
+			t.Errorf("RawTx = %x", got.RawTx)
+		}
+		if got.Vout != 3 || got.Amount != 5000 || got.K != 2 {
+			t.Errorf("vout/amount/k = %d/%d/%d, want 3/5000/2", got.Vout, got.Amount, got.K)
+		}
+		if got.Label == nil || *got.Label != label {
+			t.Errorf("Label = %v, want %d", got.Label, label)
+		}
+		if got.Height == nil || *got.Height != 812345 {
+			t.Errorf("Height = %v, want 812345", got.Height)
+		}
+	})
+
+	t.Run("unconfirmed silent payment has no height and absent label stays nil", func(t *testing.T) {
+		in := &eventspb.NodeEvent{Body: &eventspb.NodeEvent_SilentPaymentMatched{
+			SilentPaymentMatched: &eventspb.SilentPaymentMatched{
+				Txid: []byte{0x01}, Confirmed: false, Height: 0, HasLabel: false, Label: 9,
+			},
+		}}
+		got := decodeEvent(in).(*SilentPaymentMatched)
+		if got.Height != nil {
+			t.Errorf("Height = %v on an unconfirmed match, want nil", got.Height)
+		}
+		if got.Label != nil {
+			t.Errorf("Label = %v with has_label false, want nil", got.Label)
+		}
+	})
 }

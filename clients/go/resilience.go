@@ -282,20 +282,30 @@ func (s *ResilientSubscription) Close() error {
 func (s *ResilientSubscription) commitDue(ctx context.Context) error {
 	s.mu.Lock()
 	armed := s.commitNext
-	if armed == nil || s.commitNextGen != s.gen ||
+	gen := s.commitNextGen
+	if armed == nil || gen != s.gen ||
 		(s.committed != nil && *s.committed == *armed) {
 		s.commitNext = nil
 		s.mu.Unlock()
 		return nil
 	}
-	s.commitNext = nil
 	c := *armed
 	s.mu.Unlock()
 
 	if err := s.config.store().Store(ctx, c); err != nil {
+		// The arm STAYS armed. Clearing it before the write turned a transient
+		// store failure into a false durability ack: the retried Commit found
+		// nothing armed, returned nil, and a restart with no FromCursor then
+		// began forward-only - losing every event that occurred while the
+		// process was down. That is an at-least-once violation, not a replay.
 		return err
 	}
 	s.mu.Lock()
+	// Retire only the arm actually written, and only if nothing superseded it
+	// while the store write was in flight.
+	if s.commitNext != nil && s.commitNextGen == gen && *s.commitNext == c {
+		s.commitNext = nil
+	}
 	s.committed = &c
 	s.mu.Unlock()
 	return nil
@@ -309,6 +319,21 @@ func (s *ResilientSubscription) pump(ctx context.Context) {
 	defer close(s.events)
 
 	backoff := s.config.backoff()
+
+	// Each attempt's stream gets its own cancellable context. A gRPC stream is
+	// only released by cancelling its context, closing the ClientConn, or
+	// receiving an error from Recv - so abandoning one (the lag auto-resume
+	// path below) without cancelling leaves it open server-side, holding a
+	// subscription slot until the whole process exits.
+	var streamCancel context.CancelFunc
+	dropStream := func() {
+		if streamCancel != nil {
+			streamCancel()
+			streamCancel = nil
+		}
+	}
+	defer dropStream()
+
 	var (
 		stream *Stream
 		// attempts counts consecutive reconnects that have produced NO event.
@@ -338,8 +363,10 @@ func (s *ResilientSubscription) pump(ctx context.Context) {
 					return
 				}
 			}
-			st, expect, err := s.connectOnce(ctx)
+			streamCtx, cancel := context.WithCancel(ctx)
+			st, expect, err := s.connectOnce(streamCtx)
 			if err != nil {
+				cancel()
 				if !Retryable(err) || ctx.Err() != nil {
 					s.deliver(ctx, delivery{err: err})
 					return
@@ -348,12 +375,14 @@ func (s *ResilientSubscription) pump(ctx context.Context) {
 				lastError = err
 				continue
 			}
+			streamCancel = cancel
 			stream, expectFirstHeight = st, expect
 		}
 
 		ev, err := stream.Recv()
 		if err != nil {
 			stream = nil
+			dropStream()
 			if err == io.EOF {
 				// The server closed cleanly; reconnect from the resume anchor,
 				// backing off since this connection yielded nothing new.
@@ -399,29 +428,32 @@ func (s *ResilientSubscription) pump(ctx context.Context) {
 		}
 
 		if lag, ok := ev.(*Lagged); ok && s.config.LagPolicy == LagAutoResume {
-			// Re-anchor from the notice's cursor, then reconnect. A lag
-			// re-anchor is a recovery point the server handed us, not
-			// caller-delivered data, so persist it immediately (superseding any
-			// deferred commit): a crash then resumes from the same place the
-			// live re-anchor would.
+			// Re-anchor from the notice's cursor, then reconnect.
+			//
+			// The re-anchor moves the IN-MEMORY resume point only. It must not
+			// write the store: the node's resume_cursor is the last position it
+			// DELIVERED, which is the event the caller is holding right now and
+			// has not acked. Persisting it here let a crash mid-processing skip
+			// that event permanently - commit-on-poll exists precisely so the
+			// store never runs ahead of the caller, and the pump is the one
+			// goroutine that cannot know what the caller has finished.
+			//
+			// The caller's armed cursor is left alone for the same reason: it
+			// is at most this position, so the ordinary commit-on-poll ack
+			// still lands it durably, in order.
 			if lag.ResumeCursor != nil {
 				c := *lag.ResumeCursor
 				s.mu.Lock()
 				s.resume = &c
-				s.commitNext = nil
-				// Supersede anything armed from before this re-anchor, including
-				// an arm the caller has not performed yet.
-				s.gen++
-				s.mu.Unlock()
-				if err := s.config.store().Store(ctx, c); err != nil {
-					s.deliver(ctx, delivery{err: err})
-					return
-				}
-				s.mu.Lock()
-				s.committed = &c
 				s.mu.Unlock()
 			}
+			// Count this as a reconnect attempt so a chronically slow consumer
+			// backs off. The event receipt above reset attempts to 0, which made
+			// every lag notice trigger an immediate re-subscribe - and each one
+			// costs the node a fresh confirmed-history replay.
+			attempts++
 			stream = nil
+			dropStream()
 			continue
 		}
 

@@ -6,8 +6,16 @@
 //! `satd-events-client` in-process here, and `clients/go/cmd/paritydump` as a
 //! subprocess — register byte-identical watch specs, and write every event they
 //! receive as canonical JSON lines. A scenario then drives the node through
-//! mempool admission, confirmation, RBF, a reorg, and a rescan. At the end the
-//! two dumps are diffed line by line.
+//! mempool admission, a confirmation, and four blocks. At the end the two dumps
+//! are sorted by content and diffed line by line.
+//!
+//! SCOPE, stated plainly so nobody reads more into a green run than is there:
+//! the scenario exercises mempool_enter, script_matched, outpoint_spent,
+//! mempool_leave_confirmed and block_connected. It does NOT yet cover reorgs,
+//! replacement, rescan output, prefix or silent-payment matches, or the
+//! lifecycle/depth-alarm events - those render arms are compiled and unit-tested
+//! on both sides but are not differentially compared here. Widening the
+//! scenario is the way to widen the guarantee.
 //!
 //! Any divergence fails: a variant one SDK cannot decode, a field typed
 //! differently, an off-by-one height, an enum mapped to the wrong constant.
@@ -698,7 +706,7 @@ async fn rust_dump(
     handle.rescan(1, 0).await.expect("readiness probe");
     let mut is_ready = false;
     let mut ready = Some(ready);
-    let mut out: Vec<([u64; 3], String)> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
 
     while let Some(ev) = stream.message().await.expect("rust dumper recv") {
         if !is_ready {
@@ -715,13 +723,12 @@ async fn rust_dump(
             continue;
         }
 
-        // Keyed by cursor for the same reason the Go dumper sorts: arrival
-        // order is server scheduling, not a parity property. See the comment
-        // in clients/go/cmd/paritydump/main.go.
-        let key = stream.cursor().map_or([0u64; 3], |c| {
-            [u64::from(c.height), u64::from(c.tx_index), c.mempool_seq]
-        });
-        out.push((key, serde_json::to_string(&render(&ev)).expect("render")));
+        // Sorted by rendered CONTENT, matching the Go dumper's flush. Keying on
+        // the cursor was wrong: only confirmed events carry one, so every
+        // mempool-side event inherited whichever block cursor arrived before it
+        // on that connection, and identical events landed in different buckets
+        // on the two streams. See the note on flush() in the Go dumper.
+        out.push(serde_json::to_string(&render(&ev)).expect("render"));
 
         if let Event::BlockConnected { height, .. } = ev
             && height >= until_height
@@ -730,7 +737,7 @@ async fn rust_dump(
         }
     }
     out.sort();
-    out.into_iter().map(|(_, line)| line).collect()
+    out
 }
 
 // ---- the Go dumper ----------------------------------------------------------
@@ -863,6 +870,32 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         .spawn()
         .expect("spawn paritydump");
 
+    // Drain the child's stderr on a thread. Piping it and never reading it lost
+    // every Go-side diagnostic ("dial refused", "recv after N events: ...") and
+    // would eventually block the child on a full pipe; the buffer is printed
+    // with any failure below. A killer guard makes sure the child cannot outlive
+    // this test as an orphan writing into a deleted TempDir, on any panic path.
+    let go_stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        use std::io::Read;
+        let mut pipe = go_proc.stderr.take().expect("stderr piped");
+        let sink = std::sync::Arc::clone(&go_stderr);
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = pipe.read_to_string(&mut buf);
+            *sink.lock().unwrap() = buf;
+        });
+    }
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut go_proc = KillOnDrop(go_proc);
+
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let port = sn.grpc_port();
     let rust_task = {
@@ -870,7 +903,10 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         tokio::spawn(async move { rust_dump(port, &spec, until_height, ready_tx).await })
     };
 
-    ready_rx.await.expect("rust dumper never became ready");
+    tokio::time::timeout(e2e_test_timeout(120), ready_rx)
+        .await
+        .expect("rust dumper never became ready (timed out)")
+        .expect("rust dumper never became ready");
     wait_for_file(&go_ready, e2e_test_timeout(120)).await;
 
     // ---- scenario ----------------------------------------------------------
@@ -881,17 +917,38 @@ async fn go_and_rust_sdks_agree_event_for_event() {
     {
         let rpc = sn.node.rpc_handle();
         let w = wallet.clone();
-        tokio::task::spawn_blocking(move || {
+        // build_signed_p2wpkh_spend_seq only BUILDS and signs - it returns the
+        // raw hex and never touches the node. Discarding that pair (as this
+        // scenario did) meant no transaction was ever broadcast: no mempool
+        // admission, no spend of the watched outpoint, no confirmation. The
+        // harness silently compared only block_connected and the coinbase
+        // script_matched, while its own doc claimed mempool admission, RBF, a
+        // reorg and a rescan. The non-vacuity assertion below is what caught it.
+        let (raw, txid) = tokio::task::spawn_blocking(move || {
             build_signed_p2wpkh_spend_seq(&rpc, &w, dest, 1_000, 0xffff_ffff)
         })
         .await
         .unwrap();
+        let rpc2 = sn.node.rpc_handle();
+        let sent = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw)).await.unwrap();
+        assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
+        // Let the mempool events reach both streams before the first block
+        // confirms the transaction out of the mempool again.
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    for _ in 0..4 {
+    // The first three blocks go to the WATCHED address, so each yields a
+    // coinbase script match. The final, sentinel block is mined elsewhere on
+    // purpose: a match for the sentinel block travels on the watch-matcher
+    // channel while the block event travels on the live channel, so whether it
+    // arrives before or after the sentinel is a per-connection race - and each
+    // dumper stops ON the sentinel. Mining it to an unwatched address leaves no
+    // such match to race, so both dumps end on exactly the same event set.
+    let unwatched = DeterministicWallet::from_secret([0x7c; 32]).address.to_string();
+    for i in 0..4 {
         let rpc = sn.node.rpc_handle();
-        let addr = addr.clone();
-        tokio::task::spawn_blocking(move || rpc.mine(1, &addr)).await.unwrap();
+        let target = if i == 3 { unwatched.clone() } else { addr.clone() };
+        tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -902,8 +959,12 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         .expect("rust dumper timed out")
         .expect("rust dumper panicked");
 
-    let status = wait_for_exit(&mut go_proc, e2e_test_timeout(120));
-    assert!(status, "go paritydump did not exit cleanly");
+    let status = wait_for_exit(&mut go_proc.0, e2e_test_timeout(120));
+    assert!(
+        status,
+        "go paritydump did not exit cleanly. stderr:\n{}",
+        go_stderr.lock().unwrap()
+    );
 
     let go_lines: Vec<String> = std::fs::read_to_string(&go_out)
         .expect("go dump")
@@ -912,19 +973,74 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         .collect();
     let rust_lines: Vec<String> = rust_lines.iter().map(|l| normalize_line(l)).collect();
 
-    assert!(!rust_lines.is_empty(), "the scenario produced no events at all");
-    assert_eq!(
-        go_lines, rust_lines,
-        "\nGo and Rust SDKs disagree.\n\
-         Each line is one event in canonical form; the first differing line is the finding.\n\
-         Go dump:   {}\n",
-        go_out.display()
-    );
+    // Non-vacuity. `!is_empty()` alone could never fail: the dumper pushes the
+    // sentinel block BEFORE breaking, so the four block_connected lines always
+    // satisfied it - even if every watch registration had been REJECTED and not
+    // a single watch event was ever compared. (Registration rejections land
+    // before the readiness barrier and are dropped by both sides, so that
+    // failure is invisible here by construction.) Assert the kinds the scenario
+    // is supposed to produce actually turned up.
+    for kind in [
+        "mempool_enter",
+        "script_matched",
+        "outpoint_spent",
+        "mempool_leave_confirmed",
+        "block_connected",
+    ] {
+        let needle = format!("\"type\":\"{kind}\"");
+        assert!(
+            rust_lines.iter().any(|l| l.contains(&needle)),
+            "no {kind} event was compared. The scenario or the watch registration is \
+             broken, and a green run would prove nothing about the watch surface.\n\
+             kinds actually present: {:?}",
+            observed_kinds(&rust_lines)
+        );
+    }
+
+    if go_lines != rust_lines {
+        // The dumps live in a TempDir that is deleted as this unwind runs, so
+        // print the finding itself rather than a path that no longer exists.
+        let first_diff = go_lines
+            .iter()
+            .zip(rust_lines.iter())
+            .find(|(g, r)| g != r)
+            .map(|(g, r)| format!("go:   {g}\nrust: {r}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "no differing line; the dumps differ in LENGTH: go={} rust={}",
+                    go_lines.len(),
+                    rust_lines.len()
+                )
+            });
+        let stderr = go_stderr.lock().unwrap().clone();
+        panic!(
+            "\nGo and Rust SDKs disagree ({} vs {} events).\n\
+             Each line is one event in canonical form.\n\n{}\n\n\
+             go paritydump stderr:\n{}\n",
+            go_lines.len(),
+            rust_lines.len(),
+            first_diff,
+            if stderr.is_empty() { "(empty)" } else { stderr.as_str() }
+        );
+    }
 }
 
 /// Re-encode a line through serde_json so both sides' number formatting and key
 /// order are normalized. Without this a difference in how one encoder renders a
 /// large integer would read as a protocol divergence.
+/// The distinct `type` values present in a dump, for a failure message that says
+/// what DID arrive rather than only what did not.
+fn observed_kinds(lines: &[String]) -> Vec<String> {
+    let mut kinds: Vec<String> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
 fn normalize_line(line: &str) -> String {
     let v: Value = serde_json::from_str(line).expect("dump line is not JSON");
     serde_json::to_string(&v).unwrap()
