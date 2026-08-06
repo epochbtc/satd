@@ -1,8 +1,12 @@
 // Command sp_light_scan is the BIP 352 silent-payments CLIENT-SIDE SCAN
 // (Tier 1, zero-custody) mode — the recommended one.
 //
-//	go run ./sp_light_scan -endpoint 127.0.0.1:50051 \
-//	    -scan-secret <32-byte hex> -spend-secret <32-byte hex>
+//	export SATD_SP_SCAN_SECRET=<32-byte hex> SATD_SP_SPEND_SECRET=<32-byte hex>
+//	go run ./sp_light_scan -endpoint 127.0.0.1:50051
+//
+// The secrets are read from the environment rather than from flags: a flag value
+// is world-readable in /proc/<pid>/cmdline and shows up in `ps` and in shell
+// history. Flags still work, with a warning.
 //
 // Subscribe to the tweaks firehose and do the ECDH locally: for each block the
 // node sends only the public tweak T of every silent-payment-eligible
@@ -45,24 +49,32 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	satdevents "github.com/epochbtc/satd/clients/go"
 	"github.com/epochbtc/satd/clients/go/examples/internal/bip352"
+	"github.com/epochbtc/satd/clients/go/examples/internal/secret"
 )
 
 func main() {
 	endpoint := flag.String("endpoint", "127.0.0.1:50051", "satd gRPC endpoint")
-	scanHex := flag.String("scan-secret", "", "32-byte hex scan secret b_scan (required)")
-	spendHex := flag.String("spend-secret", "", "32-byte hex spend secret b_spend (required)")
+	scanHex := flag.String("scan-secret", "", "32-byte hex scan secret b_scan; prefer $SATD_SP_SCAN_SECRET")
+	spendHex := flag.String("spend-secret", "", "32-byte hex spend secret b_spend; prefer $SATD_SP_SPEND_SECRET")
 	probeK := flag.Uint("probe-k", 2, "how many output counters k to probe per transaction")
 	label := flag.Int("label", 0, "receiver label to also scan for; negative for none")
 	flag.Parse()
 
-	if *scanHex == "" || *spendHex == "" {
-		log.Fatal("-scan-secret and -spend-secret are required")
-	}
-	scanSecret, err := privKeyFromHex(*scanHex)
+	// Secrets come from the environment by default: a flag value is visible in
+	// `ps` and /proc/<pid>/cmdline. See the internal/secret package.
+	scanText, err := secret.FromEnvOrFlag("SATD_SP_SCAN_SECRET", *scanHex, "-scan-secret")
 	if err != nil {
 		log.Fatalf("scan secret: %v", err)
 	}
-	spendSecret, err := privKeyFromHex(*spendHex)
+	spendText, err := secret.FromEnvOrFlag("SATD_SP_SPEND_SECRET", *spendHex, "-spend-secret")
+	if err != nil {
+		log.Fatalf("spend secret: %v", err)
+	}
+	scanSecret, err := privKeyFromHex(scanText)
+	if err != nil {
+		log.Fatalf("scan secret: %v", err)
+	}
+	spendSecret, err := privKeyFromHex(spendText)
 	if err != nil {
 		log.Fatalf("spend secret: %v", err)
 	}
@@ -104,7 +116,7 @@ func main() {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
 				return
 			}
 			log.Fatalf("recv: %v", err)
@@ -153,9 +165,13 @@ func (s *scanner) scanEntry(entry *satdevents.TweakEntry, where string) {
 			}
 
 			if out := findOutput(entry.TaprootOutputs, c.OutputKey); out != nil {
-				fmt.Printf("%s tx %s k=%d%s: MATCH — vout=%d value=%d sat is yours (spend key %s)\n",
+				// c.SpendKey — the private scalar controlling this output — is
+				// deliberately not printed. Hand it to your signer, never to a
+				// log; stdout here is journald or a log aggregator in any real
+				// deployment. The output key is public and identifies the coin.
+				fmt.Printf("%s tx %s k=%d%s: MATCH — vout=%d value=%d sat is yours (output key %s)\n",
 					where, satdevents.DisplayHex(entry.Txid), k, lbl,
-					out.Vout, out.Value, satdevents.DisplayHexUnreversed(c.SpendKey[:]))
+					out.Vout, out.Value, satdevents.DisplayHexUnreversed(c.OutputKey[:]))
 				continue
 			}
 			if len(entry.TaprootOutputs) == 0 {

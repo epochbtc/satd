@@ -16,9 +16,13 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"os/signal"
 
 	satdevents "github.com/epochbtc/satd/clients/go"
 )
@@ -36,7 +40,11 @@ func main() {
 		log.Fatalf("script: %v", err)
 	}
 
-	ctx := context.Background()
+	// Ctrl-C cancels the context, which unblocks Recv and lets the deferred
+	// Close calls actually run. context.Background() here would make every
+	// defer below unreachable, since the loop's only other exit is a fatal.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	client, err := satdevents.Dial(ctx, *endpoint)
 	if err != nil {
@@ -63,7 +71,14 @@ func main() {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
-			log.Fatal(err)
+			// ctx.Err(), not errors.Is(err, context.Canceled): a cancelled
+			// context surfaces as a gRPC CANCELED status, which does not
+			// unwrap to context.Canceled.
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+				return
+			}
+			log.Printf("recv: %v", err)
+			return
 		}
 		if m, ok := ev.(*satdevents.ScriptMatched); ok && m.IsOutput {
 			state := "in the mempool"

@@ -79,7 +79,7 @@ func (c ResilientWatchConfig) backoff() Backoff {
 
 // ReloadSummary is what an explicit [ResilientWatch.Reload] changed.
 //
-// The counts are advisory: the server's [WatchSetAccepted] carries the
+// The counts are advisory: the server's [WatchSetReplaced] carries the
 // authoritative numbers by effective coverage (a scripthash already covered by a
 // descriptor, say, is not charged twice). These are computed client-side from
 // the mirror so a caller can see the shape of a reload without waiting for the
@@ -156,6 +156,19 @@ type ResilientWatch struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
+	// replayMu orders a caller edit against a reconnect's watch-set replay.
+	//
+	// Without it, an edit landing between the replay's snapshot and the handle
+	// install saw handle == nil, took the "the mirror carries it onto the next
+	// stream" path, and was carried onto a stream whose snapshot had ALREADY
+	// been taken - so it reached the server on no stream at all. Ordering the
+	// two makes an edit either wholly before the snapshot (and thus in it) or
+	// wholly after the install (and thus sent live).
+	//
+	// Always taken BEFORE mu. Next and Commit deliberately do not take it, so a
+	// slow replay cannot stall event delivery or cancellation.
+	replayMu sync.Mutex
+
 	// mu guards the mirror, the live handle, and the cursor bookkeeping. Caller
 	// methods hold it across the wire send that accompanies a mirror mutation, so
 	// the mirror and the stream can never disagree about the order edits were
@@ -179,6 +192,17 @@ type ResilientWatch struct {
 	// reanchorAttempts counts consecutive transient re-anchor rejections, driving
 	// the in-place retry backoff.
 	reanchorAttempts uint32
+	// reloadRollback is the mirror as it stood before an in-flight Reload's
+	// SetWatchSet, restored if the node rejects it. Nil when none is in flight.
+	reloadRollback *WatchSet
+	// reanchorPending is true from the moment a SetCursor goes out until the node
+	// answers it. While it is set, arriving events must NOT advance resume: the
+	// node subscribes the live bus when the stream opens and applies the inbound
+	// SetCursor asynchronously, so live tip events legitimately arrive first.
+	// Letting one of those move the high-water pushed resume PAST the range the
+	// re-anchor was about to replay, and a drop in that window then skipped the
+	// range for good, with no ReplayGap to show for it.
+	reanchorPending bool
 
 	closeOnce sync.Once
 }
@@ -207,7 +231,7 @@ func (c *Client) ResilientWatch(ctx context.Context, config ResilientWatchConfig
 // It returns an error only when reconnect retries are exhausted (see
 // [Backoff.MaxRetries]), on a non-retryable failure, when ctx is done, or when
 // the watch is closed - which surfaces as [io.EOF]. The deterministic in-band
-// results ([CursorAccepted], a terminal [CursorRejected], [WatchSetAccepted],
+// results ([CursorAccepted], a terminal [CursorRejected], [WatchSetReplaced],
 // [WatchSetRejected]) are handed to the caller; only a transient re-anchor
 // reject is absorbed and retried internally.
 func (w *ResilientWatch) Next(ctx context.Context) (Event, error) {
@@ -373,12 +397,14 @@ func (w *ResilientWatch) AddSilentPayments(ctx context.Context, targets ...Silen
 	// Validate (and derive the identity key) before anything is mutated or sent,
 	// so a malformed target is a clean client-side error rather than a silent
 	// server-side skip.
-	staged := NewWatchSet()
-	if err := staged.AddSilentPayments(targets...); err != nil {
-		return err
-	}
-	return w.edit(ctx, func(h *WatchHandle) error { return h.AddSilentPayments(ctx, targets) },
-		func(m *WatchSet) { _ = m.AddSilentPayments(targets...) })
+	//
+	// The cap is checked against the LIVE mirror, not against this batch. It
+	// used to be staged in a fresh set, so sixteen calls of one target each all
+	// passed, the mirror's own error was discarded, and the over-cap set only
+	// failed on the next reconnect - where the server sheds the whole message
+	// and every silent-payment watch silently disappears.
+	return w.editErr(ctx, func(h *WatchHandle) error { return h.AddSilentPayments(ctx, targets) },
+		func(m *WatchSet) error { return m.AddSilentPayments(targets...) })
 }
 
 // RemoveSilentPayments removes scan-key targets by their identity b_scan*G.
@@ -418,6 +444,9 @@ func (w *ResilientWatch) SetCursor(ctx context.Context, cursor Cursor) error {
 	return w.edit(ctx, func(h *WatchHandle) error { return h.SetCursor(ctx, c) },
 		func(*WatchSet) {
 			w.desired = &c
+			// Hold the high-water still until the node answers, so an event
+			// racing the ack cannot move it past the requested anchor.
+			w.reanchorPending = true
 			// A fresh explicit re-anchor supersedes any in-flight transient-reject
 			// retry, so it starts the retry budget over rather than inheriting the
 			// previous anchor's exhausted one.
@@ -445,7 +474,7 @@ func (w *ResilientWatch) Rescan(ctx context.Context, fromHeight, toHeight uint32
 // reconciles under its own lock - there is no client-computed sequence of
 // Add*/Remove* messages whose ordering could strand coverage or double-charge a
 // quota mid-swap. The deterministic result arrives in-band on
-// [ResilientWatch.Next] as [WatchSetAccepted] or [WatchSetRejected].
+// [ResilientWatch.Next] as [WatchSetReplaced] or [WatchSetRejected].
 //
 // If the stream is down, the reloaded set still becomes the mirror and is
 // registered by the pending reconnect; the returned summary reports
@@ -492,6 +521,12 @@ func (w *ResilientWatch) Reload(ctx context.Context) (ReloadSummary, error) {
 		case errors.Is(err, ErrControlClosed):
 			w.teardownLocked()
 		default:
+			// The SetWatchSet itself may already have landed - only the
+			// follow-up options toggle failed. Adopt the mirror before
+			// returning, or the server holds the new set while the mirror holds
+			// the old one and the next reconnect replays the stale set, undoing
+			// the reload with no error anywhere.
+			w.mirror = loaded.clone()
 			return ReloadSummary{}, err
 		}
 	}
@@ -499,6 +534,14 @@ func (w *ResilientWatch) Reload(ctx context.Context) (ReloadSummary, error) {
 	// The reloaded set becomes the mirror either way: a deferred reload is
 	// rebuilt from the same loader on the next reconnect. Copied for the same
 	// reason as the connect-time adopt.
+	//
+	// Keep the outgoing set so a WatchSetRejected can put it back: the node
+	// leaves its live set UNTOUCHED on rejection, so adopting unconditionally
+	// left the mirror describing a set the server never had - every item the
+	// reload added silently unmatched, every item it removed still matching.
+	if applied {
+		w.reloadRollback = w.mirror.clone()
+	}
 	w.mirror = loaded.clone()
 
 	return ReloadSummary{
@@ -514,10 +557,23 @@ func (w *ResilientWatch) Reload(ctx context.Context) (ReloadSummary, error) {
 // edit applies a mirror mutation and its live control message atomically with
 // respect to other edits.
 func (w *ResilientWatch) edit(ctx context.Context, send func(*WatchHandle) error, mutate func(*WatchSet)) error {
+	return w.editErr(ctx, send, func(m *WatchSet) error { mutate(m); return nil })
+}
+
+// editErr is edit for a mutation that can be refused. The check runs against the
+// LIVE mirror under the lock, so a bound is enforced against everything already
+// registered rather than against the batch in hand.
+func (w *ResilientWatch) editErr(ctx context.Context, send func(*WatchHandle) error, mutate func(*WatchSet) error) error {
+	// Ordered against a reconnect replay before touching any state.
+	w.replayMu.Lock()
+	defer w.replayMu.Unlock()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	mutate(w.mirror)
+	if err := mutate(w.mirror); err != nil {
+		return err
+	}
 	h := w.handle
 	if h == nil {
 		// Disconnected: the mirror carries the edit onto the next stream.
@@ -544,20 +600,26 @@ func (w *ResilientWatch) teardownLocked() {
 func (w *ResilientWatch) commitDue(ctx context.Context) error {
 	w.mu.Lock()
 	armed := w.commitNext
-	if armed == nil || w.commitNextGen != w.gen ||
+	gen := w.commitNextGen
+	if armed == nil || gen != w.gen ||
 		(w.committed != nil && *w.committed == *armed) {
 		w.commitNext = nil
 		w.mu.Unlock()
 		return nil
 	}
-	w.commitNext = nil
 	c := *armed
 	w.mu.Unlock()
 
 	if err := w.config.store().Store(ctx, c); err != nil {
+		// The arm stays armed on failure - see the note in
+		// ResilientSubscription.commitDue for why clearing it here silently
+		// broke at-least-once.
 		return err
 	}
 	w.mu.Lock()
+	if w.commitNext != nil && w.commitNextGen == gen && *w.commitNext == c {
+		w.commitNext = nil
+	}
 	w.committed = &c
 	w.mu.Unlock()
 	return nil
@@ -570,6 +632,23 @@ func (w *ResilientWatch) pump(ctx context.Context) {
 	defer close(w.events)
 
 	backoff := w.config.backoff()
+
+	// Each attempt's Watch stream gets its own cancellable context, cancelled
+	// the moment the attempt is abandoned. Without it every failed connect -
+	// a loader error, a rejected control, a failed re-anchor - orphaned a LIVE
+	// server-side Watch stream holding a subscription slot and its watch quota.
+	// A loader whose durable truth is briefly unreachable is documented as
+	// retrying forever, which turned a transient outage into hundreds of
+	// leaked subscriptions and eventually locked every client off the node.
+	var streamCancel context.CancelFunc
+	dropStream := func() {
+		if streamCancel != nil {
+			streamCancel()
+			streamCancel = nil
+		}
+	}
+	defer dropStream()
+
 	var (
 		stream    *Stream
 		attempts  uint32
@@ -590,8 +669,10 @@ func (w *ResilientWatch) pump(ctx context.Context) {
 					return
 				}
 			}
-			st, err := w.connectOnce(ctx)
+			streamCtx, cancel := context.WithCancel(ctx)
+			st, err := w.connectOnce(streamCtx)
 			if err != nil {
+				cancel()
 				if !reconnectable(err) || ctx.Err() != nil {
 					w.deliver(ctx, delivery{err: err})
 					return
@@ -600,12 +681,14 @@ func (w *ResilientWatch) pump(ctx context.Context) {
 				lastError = err
 				continue
 			}
+			streamCancel = cancel
 			stream = st
 		}
 
 		ev, err := stream.Recv()
 		if err != nil {
 			stream = nil
+			dropStream()
 			w.mu.Lock()
 			w.teardownLocked()
 			w.mu.Unlock()
@@ -646,7 +729,18 @@ func (w *ResilientWatch) pump(ctx context.Context) {
 // the event was handled internally (and so must not reach the caller).
 func (w *ResilientWatch) handleEvent(ctx context.Context, ev Event, cur *Cursor, backoff Backoff) (bool, error) {
 	w.mu.Lock()
-	if cur != nil {
+	// The high-water only ever moves FORWARD, and never while a re-anchor is
+	// outstanding. Two distinct bugs lived in the unconditional assignment this
+	// replaces:
+	//
+	//   - A Rescan's matches are stamped with historical cursors, so they
+	//     dragged resume backwards into the scanned range. A reconnect then
+	//     re-anchored there, the node clamped the over-long replay, and the
+	//     SDK reported a ReplayGap - which the docs tell operators means data
+	//     was permanently lost, triggering a resync that was never needed.
+	//   - Live events racing an unacked SetCursor pushed resume past the gap
+	//     the re-anchor existed to close. See reanchorPending.
+	if cur != nil && !w.reanchorPending && cursorForward(w.resume, cur) {
 		w.resume = cur
 	}
 
@@ -668,23 +762,49 @@ func (w *ResilientWatch) handleEvent(ctx context.Context, ev Event, cur *Cursor,
 	w.mu.Unlock()
 
 	switch e := ev.(type) {
+	case *WatchSetReplaced:
+		// The node adopted the reloaded set; the mirror already matches it.
+		w.mu.Lock()
+		w.reloadRollback = nil
+		w.mu.Unlock()
+	case *WatchSetRejected:
+		// The node kept its previous set, so the mirror must go back to
+		// describing that set - otherwise every reconnect replays a set the
+		// server refused and the divergence becomes permanent.
+		w.mu.Lock()
+		if w.reloadRollback != nil {
+			w.mirror = w.reloadRollback
+			w.reloadRollback = nil
+		}
+		w.mu.Unlock()
 	case *CursorRejected:
 		if e.Reason == CursorRejectRateLimited || e.Reason == CursorRejectConcurrentReanchor {
 			return w.retryReanchor(ctx, backoff)
 		}
+		// Terminal rejection: the node will not re-anchor, so stop holding the
+		// high-water back or it would never advance again.
+		w.mu.Lock()
+		w.reanchorPending = false
+		w.mu.Unlock()
 	case *CursorAccepted:
 		// The node has committed to replaying from this anchor. Adopt it as the
 		// resume point NOW, not once the first replayed event advances the
 		// high-water: if the stream drops between the ack and that first event,
 		// the reconnect re-anchors from resume, and leaving it at the stale
 		// high-water would silently skip the catch-up window the caller asked for.
+		w.mu.Lock()
 		if e.From != nil {
-			w.mu.Lock()
 			c := *e.From
 			w.resume, w.desired = &c, &c
-			w.mu.Unlock()
+			// Supersede any cursor armed before this re-anchor. Without the
+			// bump the guard in commitDue was inert (gen was never incremented
+			// anywhere in this type), so a BACKWARD re-anchor still committed
+			// the older, higher cursor - and a crash in that window skipped
+			// exactly the range the caller had asked to replay.
+			w.gen++
+			w.commitNext = nil
 		}
-		w.mu.Lock()
+		w.reanchorPending = false
 		w.reanchorAttempts = 0
 		w.mu.Unlock()
 	}
@@ -739,6 +859,11 @@ func (w *ResilientWatch) connectOnce(ctx context.Context) (*Stream, error) {
 	if err := w.seedResume(ctx); err != nil {
 		return nil, err
 	}
+	// Order this whole sequence - loader, snapshot, replay, install - against
+	// caller edits. See replayMu.
+	w.replayMu.Lock()
+	defer w.replayMu.Unlock()
+
 	h, stream, err := w.client.Watch(ctx)
 	if err != nil {
 		return nil, err
@@ -781,9 +906,34 @@ func (w *ResilientWatch) connectOnce(ctx context.Context) (*Stream, error) {
 	w.mu.Lock()
 	w.handle = h
 	w.desired = resume
+	// A re-anchor is outstanding until the node answers it; hold the high-water
+	// still until then so a live event racing the ack cannot skip the replay
+	// range. With no anchor to send there is nothing to wait for.
+	w.reanchorPending = resume != nil
 	w.reanchorAttempts = 0
 	w.mu.Unlock()
 	return stream, nil
+}
+
+// cursorForward reports whether b is at or beyond a, so the resume high-water
+// can be advanced monotonically.
+//
+// A differing InstanceID means the node restarted and its cursor space is new,
+// so the previous ordering carries no meaning and b is adopted.
+func cursorForward(a, b *Cursor) bool {
+	if a == nil || b == nil {
+		return b != nil
+	}
+	if a.InstanceID != b.InstanceID {
+		return true
+	}
+	if b.Height != a.Height {
+		return b.Height > a.Height
+	}
+	if b.TxIndex != a.TxIndex {
+		return b.TxIndex > a.TxIndex
+	}
+	return b.MempoolSeq >= a.MempoolSeq
 }
 
 // seedResume establishes the anchor on the first connect: the in-memory

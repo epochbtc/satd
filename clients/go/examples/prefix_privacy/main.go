@@ -78,13 +78,23 @@ func main() {
 	}
 	// Distinct scripts sharing a bucket collapse into one registration, which
 	// is the point — the node cannot tell how many scripts a bucket covers.
+	// Report the bits actually registered, not the flag: PrefixOf clamps to
+	// [1, MaxPrefixBits], so printing the raw flag would misstate the
+	// privacy/bandwidth trade-off this example exists to show. Note also that a
+	// node enforces its own floor (streamprefixminbits, default 8) and SILENTLY
+	// DROPS a bucket below it — a narrower prefix than that registers no watch
+	// and reports no error.
+	registered := *bits
+	if len(prefixes) > 0 {
+		registered = uint(prefixes[0].Bits)
+	}
 	fmt.Printf("watching %d script(s) as %d bucket(s) at %d bits\n",
-		watcher.Len(), len(prefixes), *bits)
+		watcher.Len(), len(prefixes), registered)
 
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
 				return
 			}
 			log.Fatalf("recv: %v", err)

@@ -124,6 +124,19 @@ func main() {
 					summary.Added, summary.Removed, summary.Unchanged, summary.Applied)
 			}
 
+		case *satdevents.ReplayGap:
+			// The one event that is NOT at-least-once: the server could not
+			// replay this range, so these blocks were never delivered and never
+			// will be. Everything else the SDK redelivers on reconnect; this
+			// has to be repaired from the caller's own chain access.
+			//
+			// A durable watcher that logs this and moves on has silently lost
+			// every match in [From, To) — which for a deposit watcher means
+			// credited funds that were never credited.
+			log.Printf("REPLAY GAP %d..%d: rescan this range or resync from your "+
+				"own chain source; these matches will not be redelivered",
+				e.ResumeHeight, e.FirstHeight)
+
 		case *satdevents.CursorRejected:
 			// The persisted cursor is outside what this node can replay (a
 			// stale store, or a node whose retention window moved past it). A

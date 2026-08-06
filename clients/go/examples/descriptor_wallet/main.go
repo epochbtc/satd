@@ -30,6 +30,7 @@ func main() {
 	descriptor := flag.String("descriptor", "", "ranged output descriptor (required)")
 	gapLimit := flag.Uint("gap-limit", 20, "window width to keep watched")
 	start := flag.Uint("start", 0, "first derivation index of the window")
+	branches := flag.Uint("branches", 2, "BIP-389 branch count: 2 for <0;1>, 1 for a single-path descriptor")
 	flag.Parse()
 
 	if *descriptor == "" {
@@ -53,6 +54,10 @@ func main() {
 
 	window := uint32(*start)
 	gap := uint32(*gapLimit)
+	// consumed[branch] is one past the highest funded index seen on that branch.
+	// A branch with no funding yet is absent, reads as 0, and so holds the
+	// shared window still - which is exactly right: its addresses are unused.
+	consumed := map[uint32]uint32{}
 	if err := handle.AddDescriptor(ctx, *descriptor, gap, window); err != nil {
 		log.Fatalf("add descriptor: %v", err)
 	}
@@ -61,7 +66,7 @@ func main() {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
 				return
 			}
 			log.Fatalf("recv: %v", err)
@@ -88,16 +93,41 @@ func main() {
 				satdevents.DisplayHex(e.Txid), side, e.Index, d.Branch, d.DerivationIndex, where)
 
 			// Only FUNDING (output-side) hits consume addresses — never a
-			// spend, which pays out of an index already in use. Advance once a
-			// funding hit lands in the top half of the window, so unused
-			// addresses stay covered well before anyone pays one.
+			// spend, which pays out of an index already in use.
+			if !e.IsOutput {
+				continue
+			}
+			if d.DerivationIndex+1 > consumed[d.Branch] {
+				consumed[d.Branch] = d.DerivationIndex + 1
+			}
+
+			// A single `start` anchors EVERY branch: the server expands
+			// [start, start+gap) for each BIP-389 branch from the same index.
+			// So the window may only advance as far as the LEAST-advanced
+			// branch allows, and the frontier is the minimum across all of
+			// them — a branch with no funding yet holds it at zero.
 			//
-			// Re-anchoring at the hit drops the indices below it. That is right
-			// for a wallet that hands out addresses in order (they are spent
-			// for), and wrong for one that does not — such a wallet should
-			// widen the window rather than slide it.
-			if e.IsOutput && d.DerivationIndex+gap/2 >= window+gap {
-				window = d.DerivationIndex + 1
+			// Sliding on one branch's hits alone is the bug this guards: change
+			// indices routinely run ahead of external ones, so a change hit at
+			// index 25 would un-watch external addresses 0..25 that were handed
+			// out as invoices and not yet paid. Those deposits then arrive
+			// unseen, which is the one failure a deposit watcher must not have.
+			frontier := ^uint32(0)
+			for b := uint32(0); b < uint32(*branches); b++ {
+				if consumed[b] < frontier {
+					frontier = consumed[b]
+				}
+			}
+
+			// Advance once the frontier reaches the top half of the window, so
+			// unused addresses stay covered well before anyone pays one.
+			//
+			// Re-anchoring drops the indices below it. That is right for a
+			// wallet that hands out addresses in order (they are spent for),
+			// and wrong for one that does not — such a wallet should widen the
+			// window rather than slide it.
+			if frontier > 0 && frontier+gap/2 > window+gap {
+				window = frontier
 				if err := handle.AddDescriptor(ctx, *descriptor, gap, window); err != nil {
 					log.Fatalf("advance window: %v", err)
 				}

@@ -90,6 +90,10 @@ satdevents.DisplayHexUnreversed(pubkey) // pubkeys, tweaks, scripts — NOT reve
 Do **not** apply `DisplayHex` to a public key, tweak, or scriptPubKey. Those are
 raw bytes; reversing them produces a plausible-looking string that is wrong.
 
+Nor to a **scripthash**, even though it is 32 bytes and looks like a txid.
+Electrum reverses scripthashes; this API does not, and neither does
+`ScripthashOf`. Mixing the two gives a key that silently matches nothing.
+
 ## Choosing a surface
 
 | You want | Use | Reconnects |
@@ -168,7 +172,7 @@ breaking import-path change, so the bar for v1 is "we can live with this API".
 ## Development
 
 ```sh
-./lint.sh          # gofmt, vet, staticcheck, errcheck — across all four modules
+./lint.sh          # gofmt, vet, staticcheck, errcheck — SDK, examples, and e2e
 ./gen.sh           # regenerate eventspb/ from the proto
 go test ./...      # unit tests
 ```

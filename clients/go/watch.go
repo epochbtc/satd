@@ -322,7 +322,14 @@ func (h *WatchHandle) RemoveDescriptor(ctx context.Context, descriptor string) e
 // bucket. Charged by coarseness - a smaller Bits costs more.
 //
 // Bits must be in [1, MaxPrefixBits] and Prefix exactly ceil(Bits/8) bytes;
-// both are checked before anything reaches the wire.
+// both are checked before anything reaches the wire. Prefix is normalized to
+// its bucket (bits past Bits zeroed) to match how the node keys it.
+//
+// The NODE enforces its own floor, streamprefixminbits (default 8), and drops a
+// narrower bucket SILENTLY - no error, no rejection event. Registering below the
+// node's floor therefore looks exactly like "nobody has paid you yet". The
+// floor is server configuration the client cannot see, so this cannot be
+// checked here; if you register narrow buckets, confirm the node's setting.
 func (h *WatchHandle) AddScriptPrefixes(ctx context.Context, prefixes []ScriptPrefix) error {
 	validated, err := validatePrefixes(prefixes)
 	if err != nil || len(validated) == 0 {
@@ -368,8 +375,17 @@ func validatePrefix(p ScriptPrefix) (*eventspb.ScriptPrefix, error) {
 		return nil, newError(KindInvalidArgument,
 			"prefix for %d bits must be %d bytes, got %d", p.Bits, want, len(p.Prefix))
 	}
+	// NORMALIZE to the bucket the server will key on. The node masks every bit
+	// past Bits before bucketing, so an unmasked prefix registers under one key
+	// and is mirrored locally under another - a later Remove built with
+	// [PrefixOf] then drops the server's bucket while the mirror keeps its
+	// entry, and the SDK reports a bucket as watched that receives nothing.
+	//
+	// It also matters for privacy: the sub-Bits remainder is the part the
+	// anonymity-set argument assumes was never sent, and a hand-built
+	// ScriptPrefix would have put it on the wire verbatim.
 	return &eventspb.ScriptPrefix{
-		Prefix: append([]byte(nil), p.Prefix...),
+		Prefix: maskPrefix(p.Prefix, p.Bits),
 		Bits:   p.Bits,
 	}, nil
 }

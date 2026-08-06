@@ -125,6 +125,21 @@ func (f *FileCursorStore) Store(_ context.Context, cursor Cursor) error {
 	if err := os.Rename(name, f.path); err != nil {
 		return wrapError(KindDecode, err, "cursor store rename: %s", err)
 	}
+	// Syncing the file's contents makes the DATA durable; syncing the directory
+	// is what makes the NAME durable. Without this, a power loss just after the
+	// rename returns can leave the directory entry unwritten - and for the first
+	// ever Store, that means no cursor file at all. Load then reports "no cursor
+	// yet", the subscription starts forward-only, and everything that happened
+	// while the process was down is skipped silently. That is the exact failure
+	// this store exists to prevent, so it is worth the extra fsync.
+	//
+	// A directory that cannot be opened or synced is not fatal: the cursor is
+	// written and the common case (a clean shutdown) is already correct, so
+	// report nothing rather than failing a write that did land.
+	if dir, err := os.Open(filepath.Dir(f.path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 	return nil
 }
 

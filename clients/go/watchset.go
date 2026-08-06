@@ -143,8 +143,13 @@ func (w *WatchSet) AddScriptPrefixes(prefixes ...ScriptPrefix) *WatchSet {
 		w.prefixes = map[prefixKey]ScriptPrefix{}
 	}
 	for _, p := range prefixes {
-		w.prefixes[prefixKey{bits: p.Bits, prefix: string(p.Prefix)}] = ScriptPrefix{
-			Prefix: append([]byte(nil), p.Prefix...),
+		// Key on the MASKED bucket, the same normalization the server applies
+		// and validatePrefix now sends. Keying on the caller's raw bytes let an
+		// unmasked add and a PrefixOf-built remove disagree, so the removal
+		// dropped the server's bucket and left the mirror's entry behind.
+		masked := maskPrefixSafe(p.Prefix, p.Bits)
+		w.prefixes[prefixKey{bits: p.Bits, prefix: string(masked)}] = ScriptPrefix{
+			Prefix: masked,
 			Bits:   p.Bits,
 		}
 	}
@@ -158,18 +163,34 @@ func (w *WatchSet) AddSilentPayments(targets ...SilentPaymentTarget) error {
 	if w.silentPayments == nil {
 		w.silentPayments = map[[33]byte]SilentPaymentTarget{}
 	}
+	// Validate and resolve identities BEFORE mutating, so a rejected batch
+	// leaves the set untouched. Mutating first meant an over-cap call returned
+	// an error while the offending targets stayed in the map - and every later
+	// render (a reconnect replay, or toProto for a SetWatchSet) then emitted an
+	// over-cap message, which the server rejects WHOLESALE. One rejected batch
+	// thus took every silent-payment watch down with it.
+	ids := make([][33]byte, len(targets))
 	for i := range targets {
 		id, err := targets[i].Validate()
 		if err != nil {
 			return err
 		}
-		// Last-wins on a repeated identity, matching the server's reconcile.
-		w.silentPayments[id] = targets[i].clone()
+		ids[i] = id
 	}
-	if len(w.silentPayments) > MaxSPTargetsPerConnection {
+	projected := len(w.silentPayments)
+	for i := range ids {
+		if _, ok := w.silentPayments[ids[i]]; !ok {
+			projected++
+		}
+	}
+	if projected > MaxSPTargetsPerConnection {
 		return newError(KindInvalidArgument,
 			"silent-payment target cap exceeded: %d > %d",
-			len(w.silentPayments), MaxSPTargetsPerConnection)
+			projected, MaxSPTargetsPerConnection)
+	}
+	for i := range targets {
+		// Last-wins on a repeated identity, matching the server's reconcile.
+		w.silentPayments[ids[i]] = targets[i].clone()
 	}
 	return nil
 }
@@ -190,9 +211,13 @@ func (w *WatchSet) SetWatchOptions(includeRawTx bool) *WatchSet {
 	return w
 }
 
-// Len is the number of watch ENTRIES in the set - the unit the per-connection
-// cap (streamwsmaxsubscriptions) counts, and what a
-// [WatchSetRejectCapExceeded] reports.
+// Len is the number of watch ENTRIES declared in the set.
+//
+// It is NOT the number the per-connection cap counts when descriptors are
+// involved: the server charges each descriptor its EXPANDED scripts, so a set
+// holding one descriptor with a gap limit of 200 reports 1 here and consumes
+// about 200 units of the cap and the watch quota. Size against the cap by
+// summing each descriptor's gap limit rather than by this value.
 func (w *WatchSet) Len() int {
 	return len(w.scripts) + len(w.outpoints) + len(w.lifecycles) +
 		len(w.depthAlarms) + len(w.descriptors) + len(w.prefixes) + len(w.silentPayments)

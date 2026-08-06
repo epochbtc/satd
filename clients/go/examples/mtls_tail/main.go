@@ -73,7 +73,7 @@ func main() {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
 				return
 			}
 			log.Fatalf("recv: %v", err)

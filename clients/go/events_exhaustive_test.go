@@ -296,12 +296,35 @@ func TestDecoderCoversEveryNodeEventBody(t *testing.T) {
 // TestDecoderCoversNestedOneofs does the same walk for the oneofs one level
 // down, which the NodeEvent walk cannot see.
 func TestDecoderCoversNestedOneofs(t *testing.T) {
-	messages := map[string]protoreflect.MessageDescriptor{
-		"satd.events.v1.MempoolEvent":    (&eventspb.MempoolEvent{}).ProtoReflect().Descriptor(),
-		"satd.events.v1.ChainEvent":      (&eventspb.ChainEvent{}).ProtoReflect().Descriptor(),
-		"satd.events.v1.SetCursorResult": (&eventspb.SetCursorResult{}).ProtoReflect().Descriptor(),
-		"satd.events.v1.WatchSetResult":  (&eventspb.WatchSetResult{}).ProtoReflect().Descriptor(),
-		"satd.events.v1.RescanResult":    (&eventspb.RescanResult{}).ProtoReflect().Descriptor(),
+	// DISCOVER the nested oneofs by walking out from NodeEvent, rather than
+	// listing them. A hand-maintained list cannot catch the case this test
+	// exists for: the schema's established growth pattern is a new NodeEvent arm
+	// wrapping its own accepted/rejected oneof (SetCursorResult, WatchSetResult
+	// and RescanResult are all that shape). The outer arm would be caught by the
+	// NodeEvent walk, but a missing INNER variant would decode to UnknownEvent
+	// with nothing failing - because the new message was never in the list.
+	messages := map[string]protoreflect.MessageDescriptor{}
+	nodeBody := oneofByName(t, (&eventspb.NodeEvent{}).ProtoReflect().Descriptor(), "body")
+	for i := 0; i < nodeBody.Fields().Len(); i++ {
+		f := nodeBody.Fields().Get(i)
+		if f.Kind() != protoreflect.MessageKind {
+			continue
+		}
+		md := f.Message()
+		if md.Oneofs().Len() == 0 {
+			continue
+		}
+		messages[string(md.FullName())] = md
+	}
+	if len(messages) == 0 {
+		t.Fatal("discovered no nested oneofs; the walk is broken")
+	}
+	// And the reverse: a fixture table for a message the walk no longer reaches
+	// would otherwise sit unconsulted, quietly covering nothing.
+	for full := range nestedOneofFixtures {
+		if _, ok := messages[full]; !ok {
+			t.Errorf("fixture table %q is never reached from NodeEvent.body", full)
+		}
 	}
 	for full, desc := range messages {
 		fixtures := nestedOneofFixtures[full]

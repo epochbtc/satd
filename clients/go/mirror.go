@@ -2,6 +2,8 @@ package satdevents
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/epochbtc/satd/clients/go/eventspb"
 )
@@ -46,7 +48,7 @@ func (w *WatchSet) removeDescriptor(descriptor string) {
 
 func (w *WatchSet) removeScriptPrefixes(prefixes ...ScriptPrefix) {
 	for _, p := range prefixes {
-		delete(w.prefixes, prefixKey{bits: p.Bits, prefix: string(p.Prefix)})
+		delete(w.prefixes, prefixKey{bits: p.Bits, prefix: string(maskPrefixSafe(p.Prefix, p.Bits))})
 	}
 }
 
@@ -128,8 +130,8 @@ func (w *WatchSet) clone() *WatchSet {
 // ScriptMatched must carry raw_tx exactly as they did before the reconnect. The
 // rest are grouped into the wire shapes the [WatchHandle] helpers emit -
 // notably lifecycles grouped by auto-close depth with EMPTY min_depths, and
-// depth alarms grouped per txid with NON-empty min_depths, because that field is
-// what the server dispatches the two apart on.
+// depth alarms grouped by depth SET with NON-empty min_depths, because that
+// field is what the server dispatches the two apart on.
 //
 // Ordering within each kind is by sorted key rather than Go's randomized map
 // order, so a replay is byte-identical run to run (and diffable against the Rust
@@ -189,14 +191,31 @@ func (w *WatchSet) controlMessages() ([]*eventspb.SubscribeControl, error) {
 		}
 	}
 
-	// Depth alarms, grouped per txid - min_depths non-empty is what marks them.
-	for _, g := range groupAlarmsByTxid(w.depthAlarms) {
-		out = append(out, &eventspb.SubscribeControl{Msg: &eventspb.SubscribeControl_AddTransactions{
-			AddTransactions: &eventspb.AddTransactions{
-				Txids:     [][]byte{append([]byte(nil), g.txid[:]...)},
-				MinDepths: g.depths,
-			},
-		}})
+	// Depth alarms - min_depths non-empty is what marks them.
+	//
+	// AddTransactions is a txids x min_depths CROSS PRODUCT, so every txid
+	// sharing the same depth set travels in one message. Emitting one message
+	// per txid instead spent one server rate-limit token per alarmed txid on
+	// every reconnect, and the node sheds an over-budget add SILENTLY, with no
+	// ack - so on a rate-limited node most alarms were simply never
+	// re-registered. Wallets tend to use the same few depth sets throughout,
+	// which collapses hundreds of messages into a handful.
+	{
+		bySet := map[string][][]byte{}
+		depthsFor := map[string][]uint32{}
+		for _, g := range groupAlarmsByTxid(w.depthAlarms) {
+			key := depthSetKey(g.depths)
+			bySet[key] = append(bySet[key], append([]byte(nil), g.txid[:]...))
+			depthsFor[key] = g.depths
+		}
+		for _, key := range sortedStringKeys(bySet) {
+			out = append(out, &eventspb.SubscribeControl{Msg: &eventspb.SubscribeControl_AddTransactions{
+				AddTransactions: &eventspb.AddTransactions{
+					Txids:     bySet[key],
+					MinDepths: depthsFor[key],
+				},
+			}})
+		}
 	}
 
 	for _, d := range sortedDescriptorKeys(w.descriptors) {
@@ -421,5 +440,27 @@ func groupAlarmsByTxid(m map[depthAlarm]struct{}) []alarmGroup {
 		out = append(out, alarmGroup{txid: t, depths: depths})
 	}
 	sort.Slice(out, func(i, j int) bool { return compareBytes(out[i].txid[:], out[j].txid[:]) < 0 })
+	return out
+}
+
+// depthSetKey renders a sorted depth list as a map key, so txids sharing a
+// depth set group into one AddTransactions message.
+func depthSetKey(depths []uint32) string {
+	var b strings.Builder
+	for i, d := range depths {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatUint(uint64(d), 10))
+	}
+	return b.String()
+}
+
+func sortedStringKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }

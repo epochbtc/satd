@@ -15,7 +15,7 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   independently versioned module (`clients/go/vX.Y.Z` tags): full parity with
   `satd-events-client` — firehose, all watch kinds, durable cursors, reconnect,
   rescan, watch-set loaders, prefix re-filtering — in Go idiom, with a published
-  dependency graph of gRPC and protobuf only. Twelve runnable examples; new
+  dependency graph of gRPC and protobuf only. Thirteen runnable examples; new
   [Go SDK](https://epochbtc.github.io/satd/go-sdk.html) manual chapter.
 - CI: a **differential parity harness** drives both SDKs through an identical
   watch spec against one node and diffs their rendered events line by line, so

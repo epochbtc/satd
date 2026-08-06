@@ -256,7 +256,11 @@ process registered.
 
 ## Cancel safety
 
-Every blocking call takes a `ctx`, and cancelling it never consumes an event.
+`ResilientSubscription.Next` and `ResilientWatch.Next` take a `ctx`, and
+cancelling it never consumes an event. (`Stream.Recv` on the non-resilient
+surfaces takes no `ctx`; it is unblocked by cancelling the context passed to
+`Subscribe`/`Watch`, and that surfaces as a gRPC `CANCELED` status rather than
+`context.Canceled` — check `ctx.Err()`, not `errors.Is(err, context.Canceled)`.)
 
 The reconnect state machine runs on its own goroutine and hands events over an
 **unbuffered** channel, so it is never more than one event ahead of the caller.

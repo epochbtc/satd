@@ -3,7 +3,9 @@ package satdevents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,5 +260,36 @@ func sliceRecv(msgs []*eventspb.NodeEvent) func() (*eventspb.NodeEvent, error) {
 		m := msgs[i]
 		i++
 		return m, nil
+	}
+}
+
+// TestClientStringDoesNotLeakTheToken: fmt reflects over unexported fields, so
+// without an explicit String the bearer token appeared verbatim in any
+// `%v`/`%+v` of a *Client - i.e. in logs, on disk, and in a log aggregator.
+func TestClientStringDoesNotLeakTheToken(t *testing.T) {
+	const token = "SUPER_SECRET_TOKEN"
+	c := &Client{auth: "Bearer " + token}
+	for _, verb := range []string{"%v", "%+v", "%s", "%#v"} {
+		if got := fmt.Sprintf(verb, c); strings.Contains(got, token) {
+			t.Errorf("%s leaked the token: %s", verb, got)
+		}
+	}
+}
+
+// TestTLSCredentialsFailClosedOnEmptyPEM: an empty CA PEM means "pin to
+// nothing", which must be an error - silently falling back to the system roots
+// turns a truncated CA file into a MITM opportunity.
+func TestTLSCredentialsFailClosedOnEmptyPEM(t *testing.T) {
+	if _, err := transportCredentials(&dialConfig{tlsEnabled: true, caPEM: []byte{}}); err == nil {
+		t.Error("an empty CA PEM was accepted; the connection would trust the system roots")
+	}
+	// mTLS with both halves empty must not dial without a client identity.
+	cfg := &dialConfig{tlsEnabled: true, certPEM: []byte{}, keyPEM: []byte{}}
+	if _, err := transportCredentials(cfg); err == nil {
+		t.Error("empty mTLS material was accepted; the client would present no certificate")
+	}
+	// Not pinning at all stays valid: nil means "use the system roots".
+	if _, err := transportCredentials(&dialConfig{tlsEnabled: true}); err != nil {
+		t.Errorf("plain WithTLS should still work: %v", err)
 	}
 }
