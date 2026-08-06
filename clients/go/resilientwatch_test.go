@@ -677,11 +677,12 @@ func TestLoaderFailureIsTransient(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	got := waitLegControls(t, srv, srv.legCount()-1, 1)
-	add, ok := got[0].Msg.(*eventspb.SubscribeControl_AddScripts)
-	if !ok {
-		t.Fatalf("controls = %v, want the eventually-loaded set", controlKinds(got))
-	}
+	// The successful load lands on whichever leg the retry finally connected on.
+	// Deriving that index from legCount() races the reconnect: `attempts` is
+	// bumped on ENTRY to the loader, so it can reach 3 before the third leg is
+	// registered, and the assertion then interrogates the wrong (still empty)
+	// leg. Poll every leg for the control instead.
+	add := waitForAddScripts(t, srv)
 	if add.AddScripts.GetScripthashes()[0][0] != 7 {
 		t.Errorf("registered %x after the loader recovered", add.AddScripts.GetScripthashes()[0])
 	}
@@ -1078,4 +1079,31 @@ func countKind(msgs []*eventspb.SubscribeControl, kind string) int {
 		}
 	}
 	return n
+}
+
+// waitForAddScripts polls every leg for an AddScripts control, returning the
+// first one found.
+//
+// Tests that know which leg a control must land on should say so; this exists
+// for the ones where the leg index is genuinely a race against a reconnect the
+// test does not drive.
+func waitForAddScripts(t *testing.T, s *scriptedWatch) *eventspb.SubscribeControl_AddScripts {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for i := 0; i < s.legCount(); i++ {
+			leg := s.leg(i)
+			if leg == nil {
+				continue
+			}
+			for _, c := range leg.controls() {
+				if add, ok := c.Msg.(*eventspb.SubscribeControl_AddScripts); ok {
+					return add
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no AddScripts control on any of %d leg(s)", s.legCount())
+	return nil
 }
