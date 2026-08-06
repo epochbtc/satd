@@ -157,6 +157,22 @@ jobs:
           SATD_BACKFILL_PREFLIGHT_BYTES: "0"
         run: cargo test --test e2e --locked --features e2e
 
+      # The Go SDK (clients/go) is an independent module in this repo. It is
+      # tested here, on satd's own PRs, rather than in a downstream repo, so a
+      # node or proto change that breaks the SDK fails the PR that made it —
+      # the same reason the third-party canary fleet is PR-gating. The SDK is
+      # not dogfooded by the maintainer, so CI is the only thing between a
+      # green badge and a rotted client.
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+
+      - name: Run Go SDK unit tests
+        working-directory: clients/go
+        run: go test ./... -count=1
+
   lint:
     name: "Lint"
     runs-on: ubuntu-24.04
@@ -231,6 +247,34 @@ jobs:
       # without the sanitizer.
       - name: Type-check the fuzz targets
         run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+      # --- Go SDK (clients/go) ------------------------------------------------
+      #
+      # gofmt + vet are the floor. staticcheck adds the classes that actually
+      # bite a gRPC client: SA1019 (grpc-go deprecates aggressively — a version
+      # bump must not silently strand us on a dead API), SA2002 (t.Fatal from a
+      # non-test goroutine, which would make the goroutine-heavy E2E harness
+      # vacuously green), and U1000 (dead unexported code in a library). errcheck
+      # covers what staticcheck does not — unchecked errors, which in a client
+      # library become a consumer's silent data loss. Both are pinned in the
+      # clients/go/tools module.
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+
+      - name: Lint the Go SDK (gofmt, vet, staticcheck, errcheck)
+        run: ./clients/go/lint.sh
+
+      # The committed bindings must match the proto they are generated from. A
+      # proto change that lands without regenerating fails right here, on the PR
+      # that made it, instead of at some later release.
+      - name: Check generated protobuf bindings are current
+        run: |
+          set -euo pipefail
+          ./clients/go/gen.sh
+          git diff --exit-code -- clients/go/eventspb
 
       # A workflow whose only triggers are `schedule` and `workflow_dispatch` is
       # never instantiated by a pull request, so nothing on a PR validates it.

@@ -1,0 +1,27 @@
+# Codegen for the Go SDK's protobuf/gRPC bindings.
+#
+# Managed mode injects `go_package` at generation time, so the shared
+# `satd-events-proto/proto/satd/events/v1/events.proto` — the single source of
+# truth for the wire schema, also compiled by the Rust prost build — needs no
+# Go-specific edits.
+#
+# The generated code is COMMITTED (clients/go/eventspb): `go get` must work with
+# no protoc, no buf, and no Rust toolchain. CI re-runs this and fails on a diff,
+# so the bindings cannot drift from the proto. Run ./gen.sh to regenerate.
+version: v2
+
+managed:
+  enabled: true
+  override:
+    # One flat Go package for the whole schema. `module=` on each plugin strips
+    # this prefix, so the files land at clients/go/eventspb/*.pb.go.
+    - file_option: go_package
+      value: github.com/epochbtc/satd/clients/go/eventspb
+
+plugins:
+  - local: protoc-gen-go
+    out: .
+    opt: module=github.com/epochbtc/satd/clients/go
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=github.com/epochbtc/satd/clients/go
