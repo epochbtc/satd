@@ -8,8 +8,9 @@ capture and persistence, lag recovery, reconnect with backoff, and, for prefix
 watches, local re-filtering. The SDK absorbs all of that behind a small typed
 surface. A consumer can watch outpoints in ten lines instead of a hundred.
 
-It is the recommended way to consume the streaming API from Rust. Non-Rust
-consumers use the gRPC/WebSocket surface directly against the
+It is the recommended way to consume the streaming API from Rust. Go consumers
+have a full-parity sibling in the [Go SDK (`satdevents`)](go-sdk.md); every
+other language uses the gRPC/WebSocket surface directly against the
 [`.proto`](https://github.com/epochbtc/satd/blob/master/satd-events-proto/proto/satd/events/v1/events.proto)
 contract.
 

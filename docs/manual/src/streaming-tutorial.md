@@ -13,8 +13,10 @@ detail:
 Read those when you need a full signature or an edge case.
 
 The tutorial uses the Rust SDK throughout. Nothing here is Rust-specific at the
-protocol level: WebSocket and SSE consumers follow the same sequence over the
-JSON rendering (see the [Transports](streaming.md) section).
+protocol level: the [Go SDK (`satdevents`)](go-sdk.md) is a full-parity sibling
+and every step below maps onto it one-for-one (that chapter has the translation
+table), and WebSocket and SSE consumers follow the same sequence over the JSON
+rendering (see the [Transports](streaming.md) section).
 
 ## Prerequisites
 

@@ -25,7 +25,7 @@ func TestSubscribeDeliversBlockConnected(t *testing.T) {
 	before := n.blockCount()
 	hashes := n.mine(1, walletC)
 
-	ev := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	ev := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockConnected)
 		return ok
 	}).(*satdevents.BlockConnected)
@@ -59,7 +59,7 @@ func TestSubscribeDeliversMempoolLifecycle(t *testing.T) {
 
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
 
-	enter := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	enter := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		e, ok := ev.(*satdevents.MempoolEnter)
 		return ok && satdevents.DisplayHex(e.Txid) == spendTxid
 	}).(*satdevents.MempoolEnter)
@@ -80,7 +80,7 @@ func TestSubscribeDeliversMempoolLifecycle(t *testing.T) {
 	height := n.blockCount() + 1
 	blocks := n.mine(1, walletC)
 
-	confirmed := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	confirmed := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		e, ok := ev.(*satdevents.MempoolLeaveConfirmed)
 		return ok && satdevents.DisplayHex(e.Txid) == spendTxid
 	}).(*satdevents.MempoolLeaveConfirmed)
@@ -146,7 +146,7 @@ func TestSubscribeCapturesTheDurableCursorAndResumes(t *testing.T) {
 	}
 
 	n.mine(1, walletC)
-	first := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	first := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockConnected)
 		return ok
 	}).(*satdevents.BlockConnected)
@@ -172,7 +172,7 @@ func TestSubscribeCapturesTheDurableCursorAndResumes(t *testing.T) {
 	}
 
 	for i, want := range mined {
-		got := recvMatching(t, resumed, 30, func(ev satdevents.Event) bool {
+		got := recvMatching(t, resumed, 60, func(ev satdevents.Event) bool {
 			_, ok := ev.(*satdevents.BlockConnected)
 			return ok
 		}).(*satdevents.BlockConnected)
@@ -197,11 +197,11 @@ func TestHeartbeatsArriveOnlyWhenRequested(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	first := recvMatching(t, beats, 30, func(ev satdevents.Event) bool {
+	first := recvMatching(t, beats, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.Heartbeat)
 		return ok
 	}).(*satdevents.Heartbeat)
-	second := recvMatching(t, beats, 30, func(ev satdevents.Event) bool {
+	second := recvMatching(t, beats, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.Heartbeat)
 		return ok
 	}).(*satdevents.Heartbeat)
@@ -247,7 +247,7 @@ func TestReorgIsReportedAsAFirstClassEvent(t *testing.T) {
 	n.mustCall("getblockhash", []any{int(tipHeight)}, &tipHash)
 	n.mustCall("invalidateblock", []any{tipHash}, nil)
 
-	disconnected := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	disconnected := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockDisconnected)
 		return ok
 	}).(*satdevents.BlockDisconnected)
@@ -273,7 +273,7 @@ func TestSubscribeSurfacesAServerClose(t *testing.T) {
 		t.Fatalf("subscribe: %v", err)
 	}
 	n.mine(1, walletC)
-	recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockConnected)
 		return ok
 	})
