@@ -22,6 +22,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   Go/Rust parity is checked on every PR rather than asserted. Also PR-gating:
   the Go unit tests, a build of every example, and the Go E2E suite against the
   freshly built `satd` binary.
+- SDK (`satd-events-client`): four defects found by the Go SDK review were
+  present in the Rust original and are fixed — a failed cursor-store write no
+  longer reports success on retry (an at-least-once violation on the
+  commit-before-shutdown path), an auto-resumed lag now backs off instead of
+  re-subscribing immediately and unboundedly, prefix watches mask the bits below
+  the declared bucket width instead of leaking them, and `FileCursorStore`
+  fsyncs the temp file and its directory.
 - SDK (`satd-events-client`): an **unset** protobuf field and a value this build
   does not **recognize** are now different variants on every open enum
   (`StatusSeverity`, `StatusKind`, `StatusState`, `EvictReason`) — proto3's zero
