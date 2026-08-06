@@ -58,10 +58,16 @@ func (f *fakeServer) controls() []*eventspb.SubscribeControl {
 // node.
 func startFake(t *testing.T) (*Client, *fakeServer) {
 	t.Helper()
+	fake := &fakeServer{}
+	return startServer(t, fake), fake
+}
+
+// startServer wires a Client to impl over bufconn.
+func startServer(t *testing.T, impl eventspb.NodeEventStreamServer) *Client {
+	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
-	fake := &fakeServer{}
-	eventspb.RegisterNodeEventStreamServer(srv, fake)
+	eventspb.RegisterNodeEventStreamServer(srv, impl)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
@@ -75,7 +81,7 @@ func startFake(t *testing.T) (*Client, *fakeServer) {
 		t.Fatalf("dialing the fake: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return &Client{conn: conn, rpc: eventspb.NewNodeEventStreamClient(conn)}, fake
+	return &Client{conn: conn, rpc: eventspb.NewNodeEventStreamClient(conn)}
 }
 
 // waitForControls blocks until the fake has seen n control messages, so an

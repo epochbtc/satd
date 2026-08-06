@@ -9,14 +9,19 @@ go 1.25.0
 
 toolchain go1.26.5
 
-require github.com/epochbtc/satd/clients/go v0.0.0
+require (
+	github.com/epochbtc/satd/clients/go v0.0.0
+	// Pinned to the same release the SDK module requires: the E2E suite dials
+	// with explicit HTTP/2 window options to force a Lagged, and a skewed grpc
+	// here would be testing a different transport than consumers get.
+	google.golang.org/grpc v1.76.0
+)
 
 require (
 	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.27.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
-	google.golang.org/grpc v1.76.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
