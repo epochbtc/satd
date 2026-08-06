@@ -38,11 +38,28 @@ pub fn scripthash_of(script_pubkey: &[u8]) -> [u8; 32] {
 /// is meaningless and would be silently dropped;
 /// [`WatchHandle::add_script_prefixes`](crate::WatchHandle::add_script_prefixes)
 /// re-validates the same bound before the wire.
+/// Bits below `bits` are masked off. The wire carries whole bytes, so a 12-bit
+/// bucket ships 2 bytes while the server keys on the top 12 bits and masks the
+/// rest away (`prefix_bucket_key`, `node/src/events/watch.rs`). Sending those 4
+/// extra bits unmasked hands the server 16× more of the scripthash than the
+/// declared bucket width — a free narrowing of the anonymity set the consumer
+/// asked for. Masking costs nothing: the bucket key is identical either way.
 pub fn prefix_of(script_pubkey: &[u8], bits: u32) -> (Vec<u8>, u32) {
     let bits = bits.clamp(1, crate::client::MAX_PREFIX_BITS);
     let sh = scripthash_of(script_pubkey);
+    (mask_prefix(&sh, bits), bits)
+}
+
+/// Take the top `ceil(bits/8)` bytes of `scripthash` and zero every bit past
+/// `bits`.
+fn mask_prefix(scripthash: &[u8], bits: u32) -> Vec<u8> {
     let n = (bits as usize).div_ceil(8);
-    (sh[..n].to_vec(), bits)
+    let mut out = scripthash[..n].to_vec();
+    let rem = bits % 8;
+    if rem != 0 {
+        out[n - 1] &= 0xffu8 << (8 - rem);
+    }
+    out
 }
 
 /// An output (funding side) of a delivered tx that pays a watched script.
@@ -175,11 +192,23 @@ impl PrefixWatcher {
     /// Distinct scripts that share a bucket collapse to one registration. `bits`
     /// is clamped to `1..=32` (the server's bucketing ceiling), matching
     /// [`prefix_of`].
+    ///
+    /// Bits below the bucket width are masked off *before* deduplicating, so a
+    /// narrow bucket really does collapse. Deduplicating on the unmasked bytes
+    /// registered one bucket per distinct trailing-bit pattern instead: at 12
+    /// bits, two scripts sharing a bucket but differing in bits 13–16 shipped as
+    /// two registrations, telling the server more than the declared width and
+    /// defeating the collapse this method exists to provide.
+    ///
+    /// The result is sorted, so the same watched set always yields the same
+    /// buckets in the same order.
     pub fn prefixes(&self, bits: u32) -> Vec<(Vec<u8>, u32)> {
         let bits = bits.clamp(1, crate::client::MAX_PREFIX_BITS);
-        let n = (bits as usize).div_ceil(8);
-        let buckets: HashSet<Vec<u8>> = self.watched.iter().map(|sh| sh[..n].to_vec()).collect();
-        buckets.into_iter().map(|p| (p, bits)).collect()
+        let buckets: HashSet<Vec<u8>> =
+            self.watched.iter().map(|sh| mask_prefix(sh, bits)).collect();
+        let mut out: Vec<(Vec<u8>, u32)> = buckets.into_iter().map(|p| (p, bits)).collect();
+        out.sort();
+        out
     }
 
     /// Re-filter a [`PrefixMatch`] against the watched set. Decodes `raw_tx`,
@@ -283,12 +312,82 @@ mod tests {
         assert_eq!(scripthash_of(s.as_bytes()), expect);
     }
 
+    /// A non-byte-aligned width must ship the declared bits and nothing more.
+    ///
+    /// The sibling test below previously asserted the opposite —
+    /// `prefix_of(.., 12) == sh[..2]`, the raw top two bytes — pinning a privacy
+    /// leak as the contract. The server masks to `bits` before keying
+    /// (`prefix_bucket_key`, `node/src/events/watch.rs`), so the low 4 bits move
+    /// no bucket and buy the client nothing; they only hand the server 16× more
+    /// of the scripthash than the anonymity set the consumer asked for.
+    #[test]
+    fn prefix_of_masks_bits_below_the_declared_width() {
+        let s = spk(7);
+        let sh = scripthash_of(s.as_bytes());
+        let (p, bits) = prefix_of(s.as_bytes(), 12);
+        assert_eq!(bits, 12);
+        assert_eq!(p.len(), 2, "ceil(12/8) bytes on the wire");
+        assert_eq!(p[0], sh[0], "the first whole byte is inside the width");
+        assert_eq!(p[1], sh[1] & 0xf0, "the 4 bits past the width are zeroed");
+        // Same bucket either way, which is the point: masking is free.
+        let key = |b0: u8, b1: u8| u32::from_be_bytes([b0, b1, 0, 0]) & (u32::MAX << 20);
+        assert_eq!(key(p[0], p[1]), key(sh[0], sh[1]), "masking must not move the bucket");
+    }
+
+    /// Two scripts in the same bucket must register ONE bucket.
+    ///
+    /// Deduplicating on unmasked bytes broke this at every non-byte-aligned
+    /// width: scripts sharing a 12-bit bucket but differing in bits 13–16
+    /// shipped as two registrations, which both tells the server more than the
+    /// declared width and defeats the collapse `prefixes` exists to provide.
+    #[test]
+    fn prefixes_collapse_when_scripts_share_a_sub_byte_bucket() {
+        // OP_RETURN <4-byte i>, so the search space is not capped at `spk`'s u8.
+        fn spk_n(i: u32) -> ScriptBuf {
+            let mut v = vec![0x6a, 0x04];
+            v.extend_from_slice(&i.to_be_bytes());
+            ScriptBuf::from_bytes(v)
+        }
+
+        // Find two scripts agreeing in the top 12 bits and differing below.
+        // sha256 is fixed, so this search always terminates at the same pair.
+        let mut pair = None;
+        let mut seen: std::collections::HashMap<[u8; 2], ScriptBuf> = Default::default();
+        for i in 0..20_000u32 {
+            let s = spk_n(i);
+            let sh = scripthash_of(s.as_bytes());
+            let bucket = [sh[0], sh[1] & 0xf0];
+            if let Some(prev) = seen.get(&bucket) {
+                if scripthash_of(prev.as_bytes())[1] != sh[1] {
+                    pair = Some((prev.clone(), s));
+                    break;
+                }
+            } else {
+                seen.insert(bucket, s);
+            }
+        }
+        let (a, b) = pair.expect("a 12-bit bucket collision within the search space");
+
+        let mut w = PrefixWatcher::new();
+        w.watch_script(&a);
+        w.watch_script(&b);
+        assert_eq!(w.len(), 2, "two distinct scripts are watched");
+
+        let buckets = w.prefixes(12);
+        assert_eq!(
+            buckets.len(),
+            1,
+            "scripts sharing a 12-bit bucket must collapse to one registration, got {buckets:?}"
+        );
+        assert_eq!(buckets[0].1, 12);
+        assert_eq!(buckets[0].0[1] & 0x0f, 0, "the registered bucket is masked");
+    }
+
     #[test]
     fn prefix_of_takes_top_bytes_of_scripthash() {
         let s = spk(7);
         let sh = scripthash_of(s.as_bytes());
         assert_eq!(prefix_of(s.as_bytes(), 16), (sh[..2].to_vec(), 16));
-        assert_eq!(prefix_of(s.as_bytes(), 12), (sh[..2].to_vec(), 12)); // ceil(12/8)=2
         assert_eq!(prefix_of(s.as_bytes(), 8), (sh[..1].to_vec(), 8));
         // bits beyond the server's 32-bit ceiling clamp to 32 (4 bytes), never
         // a wider prefix the server would silently drop.

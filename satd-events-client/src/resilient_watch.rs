@@ -1771,12 +1771,19 @@ impl ResilientWatch {
     /// Commit-on-poll flush: persist the armed high-water if it differs from the
     /// store's current value.
     fn commit_due(&mut self) -> Result<(), StreamError> {
-        if let Some(c) = self.commit_next.take()
-            && self.committed != Some(c)
-        {
-            self.config.cursor_store.save(c)?;
-            self.committed = Some(c);
+        let Some(c) = self.commit_next else { return Ok(()) };
+        if self.committed == Some(c) {
+            self.commit_next = None;
+            return Ok(());
         }
+        // The arm stays armed until the write lands — see the identical note on
+        // `ResilientSubscription::commit_due`. Clearing it first makes a retried
+        // commit report success after a store failure it never recovered from.
+        self.config.cursor_store.save(c)?;
+        if self.commit_next == Some(c) {
+            self.commit_next = None;
+        }
+        self.committed = Some(c);
         Ok(())
     }
 }
