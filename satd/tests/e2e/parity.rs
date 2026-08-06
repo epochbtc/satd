@@ -917,11 +917,24 @@ async fn go_and_rust_sdks_agree_event_for_event() {
     {
         let rpc = sn.node.rpc_handle();
         let w = wallet.clone();
-        tokio::task::spawn_blocking(move || {
+        // build_signed_p2wpkh_spend_seq only BUILDS and signs - it returns the
+        // raw hex and never touches the node. Discarding that pair (as this
+        // scenario did) meant no transaction was ever broadcast: no mempool
+        // admission, no spend of the watched outpoint, no confirmation. The
+        // harness silently compared only block_connected and the coinbase
+        // script_matched, while its own doc claimed mempool admission, RBF, a
+        // reorg and a rescan. The non-vacuity assertion below is what caught it.
+        let (raw, txid) = tokio::task::spawn_blocking(move || {
             build_signed_p2wpkh_spend_seq(&rpc, &w, dest, 1_000, 0xffff_ffff)
         })
         .await
         .unwrap();
+        let rpc2 = sn.node.rpc_handle();
+        let sent = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw)).await.unwrap();
+        assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
+        // Let the mempool events reach both streams before the first block
+        // confirms the transaction out of the mempool again.
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // The first three blocks go to the WATCHED address, so each yields a
@@ -978,7 +991,9 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         assert!(
             rust_lines.iter().any(|l| l.contains(&needle)),
             "no {kind} event was compared. The scenario or the watch registration is \
-             broken, and a green run would prove nothing about the watch surface."
+             broken, and a green run would prove nothing about the watch surface.\n\
+             kinds actually present: {:?}",
+            observed_kinds(&rust_lines)
         );
     }
 
@@ -1013,6 +1028,19 @@ async fn go_and_rust_sdks_agree_event_for_event() {
 /// Re-encode a line through serde_json so both sides' number formatting and key
 /// order are normalized. Without this a difference in how one encoder renders a
 /// large integer would read as a protocol divergence.
+/// The distinct `type` values present in a dump, for a failure message that says
+/// what DID arrive rather than only what did not.
+fn observed_kinds(lines: &[String]) -> Vec<String> {
+    let mut kinds: Vec<String> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
 fn normalize_line(line: &str) -> String {
     let v: Value = serde_json::from_str(line).expect("dump line is not JSON");
     serde_json::to_string(&v).unwrap()
