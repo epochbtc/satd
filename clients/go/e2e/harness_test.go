@@ -107,6 +107,23 @@ func timeout(seconds float64) time.Duration {
 	return time.Duration(seconds * timeoutMult() * float64(time.Second))
 }
 
+// Two kinds of deadline live in this suite, and they want opposite treatment.
+// Conflating them is how a flake fix turns into a slow suite, or into a weaker
+// assertion that still looks green.
+//
+// A POSITIVE WAIT — recvMatching, awaitRW, a poll loop — returns the instant its
+// condition holds. Its deadline is paid only when the test is about to fail
+// anyway, so a generous one costs nothing on the happy path and buys headroom on
+// a loaded runner. These are 60s here (180s at the CI multiplier). Widen freely.
+//
+// A NEGATIVE WINDOW — collect, or a context deadline used to prove nothing
+// arrives — is paid in full on EVERY run, because "nothing happened" can only be
+// established by waiting. Widening one slows every green run to buy confidence
+// in a claim that is already anchored: each is preceded by a positive wait that
+// proves the stream is live and past the point of interest, so anything wrongly
+// delivered would already have arrived. Leave them small, and if one flakes,
+// strengthen the barrier ahead of it rather than inflating the window.
+
 // node is a running satd regtest daemon with the gRPC streaming listener up.
 type node struct {
 	t        *testing.T

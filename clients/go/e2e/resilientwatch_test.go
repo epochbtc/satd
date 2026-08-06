@@ -570,7 +570,7 @@ func TestE2EFiredDepthAlarmIsNotReArmed(t *testing.T) {
 	})
 
 	// The fired alarm is pruned from the mirror.
-	deadline := time.Now().Add(timeout(10))
+	deadline := time.Now().Add(timeout(45))
 	for w.WatchSetLen() >= before && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}

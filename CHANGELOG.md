@@ -11,6 +11,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- New **Go SDK** (`satdevents`) for the streaming API, at `clients/go/` as an
+  independently versioned module (`clients/go/vX.Y.Z` tags): full parity with
+  `satd-events-client` — firehose, all watch kinds, durable cursors, reconnect,
+  rescan, watch-set loaders, prefix re-filtering — in Go idiom, with a published
+  dependency graph of gRPC and protobuf only. Twelve runnable examples; new
+  [Go SDK](https://epochbtc.github.io/satd/go-sdk.html) manual chapter.
+- CI: a **differential parity harness** drives both SDKs through an identical
+  watch spec against one node and diffs their rendered events line by line, so
+  Go/Rust parity is checked on every PR rather than asserted. Also PR-gating:
+  the Go unit tests, a build of every example, and the Go E2E suite against the
+  freshly built `satd` binary.
 - SDK (`satd-events-client`): an **unset** protobuf field and a value this build
   does not **recognize** are now different variants on every open enum
   (`StatusSeverity`, `StatusKind`, `StatusState`, `EvictReason`) — proto3's zero

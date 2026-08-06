@@ -46,7 +46,7 @@ func TestWatchScriptsMatchesFundingBothSides(t *testing.T) {
 
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
 
-	mempool := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	mempool := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		m, ok := ev.(*satdevents.ScriptMatched)
 		return ok && satdevents.DisplayHex(m.Txid) == spendTxid && !m.Confirmed
 	}).(*satdevents.ScriptMatched)
@@ -72,7 +72,7 @@ func TestWatchScriptsMatchesFundingBothSides(t *testing.T) {
 	}
 
 	n.mine(1, walletC)
-	confirmed := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	confirmed := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		m, ok := ev.(*satdevents.ScriptMatched)
 		return ok && satdevents.DisplayHex(m.Txid) == spendTxid && m.Confirmed
 	}).(*satdevents.ScriptMatched)
@@ -107,7 +107,7 @@ func TestWatchScriptsHonorsTheMinValueFloor(t *testing.T) {
 	n.mine(1, walletC) // pays walletC, so the control watch fires
 
 	// The coinbase paying walletC proves the stream reached this block.
-	recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		m, ok := ev.(*satdevents.ScriptMatched)
 		return ok && m.Confirmed && bytesEq(m.Scripthash, hashSlice(walletC.scripthash()))
 	})
@@ -138,7 +138,7 @@ func TestWatchOutpointsReportsTheSpend(t *testing.T) {
 
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
 
-	spent := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	spent := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		s, ok := ev.(*satdevents.OutpointSpent)
 		return ok && satdevents.DisplayHex(s.SpendingTxid) == spendTxid
 	}).(*satdevents.OutpointSpent)
@@ -176,7 +176,7 @@ func TestWatchTxLifecycleNarratesSeenThenConfirmed(t *testing.T) {
 	height := n.blockCount() + 1
 	n.mine(1, walletC)
 
-	matched := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	matched := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		m, ok := ev.(*satdevents.TxidMatched)
 		return ok && satdevents.DisplayHex(m.Txid) == spendTxid && m.Confirmed
 	}).(*satdevents.TxidMatched)
@@ -186,7 +186,7 @@ func TestWatchTxLifecycleNarratesSeenThenConfirmed(t *testing.T) {
 
 	// Two confirmations deep, the auto-close fires and the watch self-evicts.
 	n.mine(1, walletC)
-	final := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	final := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		f, ok := ev.(*satdevents.TxidFinalized)
 		return ok && satdevents.DisplayHex(f.Txid) == spendTxid
 	}).(*satdevents.TxidFinalized)
@@ -216,7 +216,7 @@ func TestWatchDepthAlarmFires(t *testing.T) {
 	height := n.blockCount() + 1
 	n.mine(3, walletC)
 
-	alarm := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	alarm := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		a, ok := ev.(*satdevents.TxidDepthReached)
 		return ok && satdevents.DisplayHex(a.Txid) == spendTxid
 	}).(*satdevents.TxidDepthReached)
@@ -243,7 +243,7 @@ func TestWatchDescriptorAttributesTheMatch(t *testing.T) {
 
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
 
-	m := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	m := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		sm, ok := ev.(*satdevents.ScriptMatched)
 		return ok && satdevents.DisplayHex(sm.Txid) == spendTxid
 	}).(*satdevents.ScriptMatched)
@@ -277,7 +277,7 @@ func TestWatchOptionsIncludeRawTx(t *testing.T) {
 	}
 
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
-	m := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	m := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		sm, ok := ev.(*satdevents.ScriptMatched)
 		return ok && satdevents.DisplayHex(sm.Txid) == spendTxid
 	}).(*satdevents.ScriptMatched)
@@ -311,7 +311,7 @@ func TestWatchSetReplacesAtomically(t *testing.T) {
 		t.Fatalf("set watch set: %v", err)
 	}
 
-	replaced := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	replaced := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.WatchSetReplaced)
 		return ok
 	}).(*satdevents.WatchSetReplaced)
@@ -321,7 +321,7 @@ func TestWatchSetReplacesAtomically(t *testing.T) {
 
 	// The replaced set is live: the spend hits both the script and the outpoint.
 	spendTxid := n.spend(cb, 0, walletA, walletB, 49.999, 0xffffffff)
-	recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		s, ok := ev.(*satdevents.OutpointSpent)
 		return ok && satdevents.DisplayHex(s.SpendingTxid) == spendTxid
 	})
@@ -332,7 +332,7 @@ func TestWatchSetReplacesAtomically(t *testing.T) {
 		AddScripts(satdevents.ScriptWatch{Scripthash: walletC.scripthash()})); err != nil {
 		t.Fatalf("second set watch set: %v", err)
 	}
-	second := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	second := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.WatchSetReplaced)
 		return ok
 	}).(*satdevents.WatchSetReplaced)
@@ -364,7 +364,7 @@ func TestWatchSetInstallsSilentPaymentTargets(t *testing.T) {
 		t.Fatalf("set watch set: %v", err)
 	}
 
-	ev := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	ev := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		switch ev.(type) {
 		case *satdevents.WatchSetReplaced, *satdevents.WatchSetRejected:
 			return true
@@ -388,7 +388,7 @@ func TestWatchSetInstallsSilentPaymentTargets(t *testing.T) {
 		t.Fatalf("add silent payments: %v", err)
 	}
 	n.mine(1, walletC)
-	recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.BlockConnected)
 		return ok
 	})
@@ -407,7 +407,7 @@ func TestWatchSetRejectionIsSurfaced(t *testing.T) {
 	if err := h.SetWatchSet(ctx, ws); err != nil {
 		t.Fatalf("set watch set: %v", err)
 	}
-	rejected := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	rejected := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.WatchSetRejected)
 		return ok
 	}).(*satdevents.WatchSetRejected)
@@ -443,7 +443,7 @@ func TestSetCursorIsAckedInBand(t *testing.T) {
 		t.Fatalf("set cursor: %v", err)
 	}
 
-	accepted := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	accepted := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.CursorAccepted)
 		return ok
 	}).(*satdevents.CursorAccepted)
@@ -459,7 +459,7 @@ func TestSetCursorIsAckedInBand(t *testing.T) {
 
 	// Replay follows the ack, in height order.
 	for i, want := range mined {
-		got := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+		got := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 			b, ok := ev.(*satdevents.BlockConnected)
 			return ok && b.Height > first.Height
 		}).(*satdevents.BlockConnected)
@@ -535,7 +535,7 @@ func TestRescanWithNoWatchSetIsRejected(t *testing.T) {
 	if err := h.Rescan(ctx, 1, 2); err != nil {
 		t.Fatalf("rescan: %v", err)
 	}
-	rejected := recvMatching(t, stream, 30, func(ev satdevents.Event) bool {
+	rejected := recvMatching(t, stream, 60, func(ev satdevents.Event) bool {
 		_, ok := ev.(*satdevents.RescanRejected)
 		return ok
 	}).(*satdevents.RescanRejected)

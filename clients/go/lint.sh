@@ -26,10 +26,28 @@ if [[ -n "$unformatted" ]]; then
 	exit 1
 fi
 
-go vet ./...
-"$bin_dir/staticcheck" ./...
-# Generated code checks nothing; -ignoregenerated skips files carrying the
-# standard "Code generated ... DO NOT EDIT." header.
-"$bin_dir/errcheck" -ignoregenerated ./...
+# gofmt walks directories, but the three analyzers resolve `./...` against the
+# main module and stop at a nested go.mod — so `examples` and `e2e` would be
+# silently unlinted if this only ran once, here. Run the gate in each module.
+#
+# `e2e` needs its build tag, or its files are excluded from the build and every
+# analyzer reports a clean run over nothing at all.
+lint_module() {
+	local dir="$1"
+	shift
+	echo "--- linting ${dir}"
+	(
+		cd "$dir"
+		go vet "$@" ./...
+		"$bin_dir/staticcheck" "$@" ./...
+		# Generated code checks nothing; -ignoregenerated skips files carrying
+		# the standard "Code generated ... DO NOT EDIT." header.
+		"$bin_dir/errcheck" -ignoregenerated "$@" ./...
+	)
+}
+
+lint_module .
+lint_module examples
+lint_module e2e -tags e2e
 
 echo "lint ok"

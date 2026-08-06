@@ -185,6 +185,18 @@ jobs:
         working-directory: clients/go
         run: go test ./... -count=1
 
+      # The examples are their own module — their curve dependency must not
+      # reach an application that only imports the SDK — so the `./...` above
+      # stops at their go.mod and never sees them. Compiling them here makes
+      # every example a build-time check that the API still reads the way its
+      # doc comment claims. Nobody runs these by hand, so without this step a
+      # renamed method rots in a file whose whole job is to be copied.
+      - name: Build and test the Go SDK examples
+        working-directory: clients/go/examples
+        run: |
+          go build ./...
+          go test ./... -count=1
+
       # The Go E2E suite drives the SAME satd binary the Rust E2E step above
       # just built, over a real gRPC socket. It is an independent module (so its
       # test-only dependencies never reach the published SDK's graph) behind the

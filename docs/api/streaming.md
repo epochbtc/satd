@@ -29,6 +29,15 @@ the same matcher.
 is the venue), wallet key management and signing (the node stays keyless), and any
 consensus or block-production knobs.
 
+**First-party clients.** This document specifies the wire contract; it is
+implementable directly from the `.proto`. Two SDKs implement it in full and are
+maintained in this repository — `satd-events-client` (Rust) and `satdevents`
+(Go, at `clients/go/`). They are held at parity by a differential harness that
+drives both against one node through an identical watch spec and diffs their
+rendered events, so a behaviour described below as "the SDK does X" is true of
+both. Where this spec names one SDK's method, the other's counterpart carries
+the same name in its own idiom.
+
 ## 2. Relationship to existing surfaces
 
 This is a **consolidation of existing substrate, not a greenfield build.** satd
@@ -715,7 +724,8 @@ Semantics:
 This closes the streaming-watch-set cold-sync / beyond-`MAX_REPLAY_BLOCKS` recovery
 gap without the client walking blocks itself. (BIP157 P2P still covers bulk
 trustless filter-based sync; this is the server-side push-model equivalent for the
-watch-set path.) SDK: `ResilientWatch::rescan(from, to)` — the ack, matches, and
+watch-set path.) SDK: `ResilientWatch::rescan(from, to)` / Go
+`ResilientWatch.Rescan(ctx, from, to)` — the ack, matches, and
 `RescanComplete` arrive in-band on `next()`.
 
 ### 7.7 Silent-payment (BIP 352) subscriptions
@@ -725,9 +735,9 @@ Two consumption modes for BIP 352 silent payments ride on the streaming surface.
 block and replays them by index on `from_cursor` resume, and requires the node's
 tweak index (`silentpaymentindex=1`). Tier 2 (server-side scan-key matching) is
 live for both confirmed and mempool payments and works with the index off
-(recompute); a complete index only accelerates its rescan cold-sync. The Rust
-SDK (`satd-events-client`) exposes both modes with typed events and helpers (see
-below).** The messages are additive — existing subscribers are unaffected, and
+(recompute); a complete index only accelerates its rescan cold-sync. Both
+first-party SDKs (`satd-events-client`, `satdevents`) expose both modes with
+typed events and helpers (see below).** The messages are additive — existing subscribers are unaffected, and
 the schema version does not bump (§4).
 
 **Tier 1 — client-side scan (the recommended, zero-custody mode).** A new
@@ -913,6 +923,17 @@ every reconnect — the D3 custody model) register `SilentPaymentTarget`s and
 deliver `Event::SilentPaymentMatched`; `examples/sp_wallet.rs` re-derives each
 match's spending key offline from `tweak` + `k`. The scan-key helpers need the
 crate's default `bitcoin` feature (to derive the removal identity `b_scan·G`).
+
+**SDK (`satdevents`, Go).** The same two modes, same names:
+`SubscribeOptions{Categories: CategoryTweaks, TweakDustLimit, TweaksOnly,
+MempoolTweaks, TweakOutputs}` with `*BlockTweaks` / `*MempoolTweak` for Tier 1,
+and `WatchHandle.AddSilentPayments` / `RemoveSilentPayments` (plus the
+`ResilientWatch` and `WatchSet` equivalents) with `*SilentPaymentMatched` for
+Tier 2. `examples/sp_light_scan` and `examples/sp_wallet` are the counterparts
+of the two Rust examples. The removal identity `b_scan·G` is derived without a
+curve dependency — `SilentPaymentTarget.Validate` is an in-tree on-curve check,
+so the published SDK graph stays gRPC + protobuf and consuming it never forces
+a secp256k1 implementation on an application that already has one.
 
 ### 7.8 Node-health status events
 
