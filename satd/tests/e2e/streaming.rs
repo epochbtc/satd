@@ -2132,3 +2132,179 @@ async fn ws_status_absent_from_the_default_category_mask() {
         "the default subscriber should still see chain events; saw: {seen:?}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// BIP 352 silent payments — the live path, end to end
+// -----------------------------------------------------------------------------
+//
+// Everything else about silent payments is covered against fixtures: the
+// `node-sp-index` kernel against the BIP 352 receiving vectors, the test sender
+// in `tests/common/sp_send.rs` against the sending vectors, and both SDKs' watch
+// registration against a node that accepts the target. Nothing joined them up.
+// No test anywhere constructed a real silent-payment output, so the chain
+// index -> tweak -> watch matcher -> event had never actually run, and a break
+// anywhere along it would have gone unnoticed.
+
+/// A real BIP 352 payment is matched in the mempool and re-emitted on confirm.
+///
+/// The sender derives the output key from the *actual* outpoint being spent, so
+/// this fails if the node's `input_hash` derivation, the shared-secret
+/// computation, or the k-indexing disagrees with the spec by a single byte —
+/// none of which the fixture tests on either side can catch alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_silent_payment_matches_mempool_then_confirmed() {
+    use crate::common::sp_send::{sp_outputs, SpInput, SpRecipient};
+    use bitcoin::key::TweakedPublicKey;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{OutPoint, ScriptBuf};
+    use std::str::FromStr;
+
+    // The index is opt-in; without the flag the node never computes a tweak and
+    // the watch registration is accepted but can never fire.
+    let (sn, wallet) = matured_node_args(vec!["-silentpaymentindex=1"]).await;
+
+    let secp = Secp256k1::new();
+    let scan_secret = SecretKey::from_slice(&[0x11; 32]).expect("scan secret");
+    let spend_secret = SecretKey::from_slice(&[0x22; 32]).expect("spend secret");
+    let scan_pubkey = scan_secret.public_key(&secp);
+    let spend_pubkey = spend_secret.public_key(&secp);
+
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    let (_tx, mut stream) = client
+        .watch(vec![crate::common::grpc_client::add_silent_payments(
+            &scan_secret.secret_bytes(),
+            &spend_pubkey.serialize(),
+            &[],
+        )])
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // `build_signed_p2wpkh_spend_seq` always spends block 1's coinbase vout 0.
+    // That outpoint is knowable before the tx exists, which is what makes this
+    // orderable at all: the silent-payment output key is a function of the
+    // input being spent, so it has to be derived first and then paid to.
+    let rpc = sn.node.rpc_handle();
+    let cb_txid_str = tokio::task::spawn_blocking(move || block1_coinbase_txid(&rpc))
+        .await
+        .unwrap();
+    let outpoint = OutPoint {
+        txid: bitcoin::Txid::from_str(&cb_txid_str).expect("txid"),
+        vout: 0,
+    };
+
+    let derived = sp_outputs(
+        &secp,
+        &[SpInput { outpoint, secret: wallet.sk, is_taproot: false }],
+        &[outpoint],
+        &[SpRecipient { scan_pubkey, spend_pubkey }],
+    )
+    .expect("a single P2WPKH input can carry a silent payment");
+    let output_key = derived[0];
+    // The silent-payment output key IS the final taproot output key — it is not
+    // tweaked again by a merkle root.
+    let spk = ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(output_key));
+
+    let fee_sat = 10_000u64;
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let (raw, txid) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_seq(&rpc, &w, spk, fee_sat, 0xffff_ffff)
+    })
+    .await
+    .unwrap();
+    let rpc = sn.node.rpc_handle();
+    let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
+    assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
+
+    // Mempool match.
+    let ev = next_event_matching(&mut stream, 20, |b| {
+        matches!(b, Body::SilentPaymentMatched(m) if !m.confirmed)
+    })
+    .await;
+    let Some(Body::SilentPaymentMatched(m)) = ev.body else {
+        unreachable!("matched above")
+    };
+    assert_eq!(
+        hex::encode(&m.scan_pubkey),
+        hex::encode(scan_pubkey.serialize()),
+        "the match names the registered target identity (b_scan·G), never the secret"
+    );
+    assert_eq!(
+        hex::encode(&m.output_pubkey),
+        hex::encode(output_key.serialize()),
+        "the node derived the same output key the sender paid to"
+    );
+    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid), "txid, internal order");
+    assert_eq!(m.vout, 0, "the only output");
+    assert_eq!(m.amount, 50 * 100_000_000 - fee_sat, "output value rides the event");
+    assert_eq!(m.k, 0, "first output for this scan key");
+    assert!(!m.has_label, "no labels were registered");
+    assert_eq!(m.tweak.len(), 33, "the shared-secret tweak is a compressed point");
+
+    // The `tweak` + `k` pair must let a light client re-derive the output key —
+    // and hence its spending key — offline, without the node ever holding a
+    // spending key. That is the entire purpose of shipping the field, and it is
+    // checked here rather than assumed.
+    //
+    // `tweak` is the transaction's PUBLIC tweak `T = input_hash·A_sum`, not the
+    // ECDH point: the client still multiplies by its own `b_scan` to get the
+    // shared secret. Skipping that step derives a plausible-looking key that
+    // matches nothing, which is precisely why this is worth pinning.
+    {
+        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::secp256k1::{PublicKey, Scalar};
+
+        let t = PublicKey::from_slice(&m.tweak).expect("tweak is a compressed point");
+        let ecdh = t
+            .mul_tweak(&secp, &Scalar::from_be_bytes(scan_secret.secret_bytes()).expect("< order"))
+            .expect("b_scan·T");
+
+        let tag = sha256::Hash::hash(b"BIP0352/SharedSecret").to_byte_array();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&tag);
+        buf.extend_from_slice(&tag);
+        buf.extend_from_slice(&ecdh.serialize());
+        buf.extend_from_slice(&m.k.to_be_bytes());
+        let t_k = sha256::Hash::hash(&buf).to_byte_array();
+
+        let t_k_sk = SecretKey::from_slice(&t_k).expect("t_k is a valid scalar");
+        let rederived = spend_pubkey
+            .combine(&t_k_sk.public_key(&secp))
+            .expect("B_spend + t_k·G")
+            .x_only_public_key()
+            .0;
+        assert_eq!(
+            rederived, output_key,
+            "b_scan·tweak + k must re-derive the output key offline"
+        );
+
+        // And the spending key itself: d = b_spend + t_k, whose public key is
+        // the output key. This is the claim that makes the watch credential
+        // safe to hand the node — it can find the payment, it cannot spend it.
+        let spending_key = spend_secret
+            .add_tweak(&Scalar::from_be_bytes(t_k).expect("t_k < order"))
+            .expect("b_spend + t_k");
+        assert_eq!(
+            spending_key.public_key(&secp).x_only_public_key().0,
+            output_key,
+            "the recipient can derive the spending key; the node never could"
+        );
+    }
+
+    // Confirmed re-emission (D7).
+    mine_n(&sn, 1).await;
+    let ev = next_event_matching(&mut stream, 20, |b| {
+        matches!(b, Body::SilentPaymentMatched(m) if m.confirmed)
+    })
+    .await;
+    let Some(Body::SilentPaymentMatched(m)) = ev.body else {
+        unreachable!("matched above")
+    };
+    assert_eq!(hex::encode(&m.txid), display_to_internal_hex(&txid), "same tx, confirmed");
+    assert_eq!(
+        hex::encode(&m.output_pubkey),
+        hex::encode(output_key.serialize()),
+        "the confirmed re-emission carries the same output key"
+    );
+    assert!(m.height > 0, "a confirmed match carries its block height");
+}

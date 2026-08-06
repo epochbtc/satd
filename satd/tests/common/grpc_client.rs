@@ -262,6 +262,27 @@ pub fn add_scripts(scripthash_hex: &[&str]) -> SubscribeControl {
 /// is parallel to `scripthash_hex` (index `i` is the floor for scripthash `i`);
 /// a floor of `0` means "deliver every match". Re-sending an already-watched
 /// scripthash updates its floor in place (the `reassert` metadata-refresh path).
+/// Register a BIP 352 scan-key watch target.
+///
+/// `scan_secret` is a *watch* credential, not a spend key: the node needs it to
+/// compute the shared secret, and the events it emits name the derived identity
+/// `b_scan·G` rather than echoing the secret back.
+pub fn add_silent_payments(
+    scan_secret: &[u8; 32],
+    spend_pubkey: &[u8; 33],
+    labels: &[u32],
+) -> SubscribeControl {
+    SubscribeControl {
+        msg: Some(Control::AddSilentPayments(pb::AddSilentPayments {
+            targets: vec![pb::SilentPaymentTarget {
+                scan_secret: scan_secret.to_vec(),
+                spend_pubkey: spend_pubkey.to_vec(),
+                labels: labels.to_vec(),
+            }],
+        })),
+    }
+}
+
 pub fn add_scripts_with_floors(scripthash_hex: &[&str], floors: &[u64]) -> SubscribeControl {
     assert_eq!(
         scripthash_hex.len(),
