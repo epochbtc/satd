@@ -173,6 +173,21 @@ jobs:
         working-directory: clients/go
         run: go test ./... -count=1
 
+      # The Go E2E suite drives the SAME satd binary the Rust E2E step above
+      # just built, over a real gRPC socket. It is an independent module (so its
+      # test-only dependencies never reach the published SDK's graph) behind the
+      # `e2e` build tag, and it boots its own regtest node per test.
+      #
+      # Serialized like the Rust E2E suite, and for the same reason: each test
+      # binds RPC/P2P/gRPC ports on one hosted runner. SATD_E2E_TIMEOUT_MULT
+      # matches the Rust step's headroom.
+      - name: Run Go SDK E2E suite
+        working-directory: clients/go/e2e
+        env:
+          SATD_BIN: ${{ github.workspace }}/target/debug/satd
+          SATD_E2E_TIMEOUT_MULT: "3"
+        run: go test -tags e2e -count=1 -p 1 ./...
+
   lint:
     name: "Lint"
     runs-on: ubuntu-24.04
