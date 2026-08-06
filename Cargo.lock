@@ -4095,6 +4095,7 @@ dependencies = [
  "satd-auth",
  "satd-events",
  "satd-events-client",
+ "satd-events-proto",
  "satd-mcp",
  "sd-notify",
  "serde",

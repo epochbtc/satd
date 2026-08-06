@@ -102,6 +102,11 @@ futures-util = "0.3"
 # tests/e2e/sdk.rs (folded into the `e2e` target). Default features include
 # `bitcoin`, so the prefix-watch local re-filter (`PrefixWatcher`) is available.
 satd-events-client = { path = "../satd-events-client" }
+# The generated wire types, used by tests/e2e/parity.rs only to render enum
+# values by their PROTO name. Going through the descriptor rather than a
+# hand-written table is what keeps the Go and Rust dumps comparable: both sides
+# derive their spelling from the same `.proto`, so nothing exists to drift.
+satd-events-proto = { path = "../satd-events-proto" }
 # Third-party Electrum client for the E2E suite. Independent
 # implementation of the wire protocol (predates `electrum-proto`;
 # ships its own message types). Drives the Electrum test group so

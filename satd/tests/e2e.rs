@@ -27,6 +27,12 @@ mod sdk;
 // scriptable loopback receiver.
 #[path = "e2e/webhooks.rs"]
 mod webhooks;
+// Differential parity harness: the Rust SDK and the Go SDK driven through one
+// watch spec against one node, their event streams diffed line for line. This
+// is what makes "the Go SDK is at parity" a checkable claim rather than a
+// promise.
+#[path = "e2e/parity.rs"]
+mod parity;
 
 use common::{
     DeterministicWallet, TestNode, build_signed_p2wpkh_spend_from_block1_coinbase,
