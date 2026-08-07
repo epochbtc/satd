@@ -22,6 +22,7 @@
 //!   replayed verbatim; the server discards a stale `mempool_seq` on an
 //!   instance mismatch (daemon restart) while confirmed replay is unaffected.
 
+use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,12 +115,28 @@ impl CursorStore for FileCursorStore {
         let tmp = self
             .path
             .with_extension(format!("tmp.{}.{n}", std::process::id()));
-        let res = std::fs::write(&tmp, line.as_bytes())
-            .map_err(|e| StreamError::Decode(format!("cursor store write: {e}")))
-            .and_then(|()| {
-                std::fs::rename(&tmp, &self.path)
-                    .map_err(|e| StreamError::Decode(format!("cursor store rename: {e}")))
-            });
+        // fsync the temp before the rename and the directory after it. A rename
+        // is atomic with respect to *readers*, but atomicity is not durability:
+        // without the first fsync the rename can reach the disk while the bytes
+        // it points at have not, and without the second the rename itself can be
+        // lost. Either way a power loss resurrects the previous cursor — or an
+        // empty file — and surviving exactly that is the store's whole purpose.
+        let res = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(line.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &self.path)?;
+            if let Some(dir) = self.path.parent() {
+                // Best-effort: a filesystem that refuses to open a directory
+                // read-only must not fail an otherwise-complete write.
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|e| StreamError::Decode(format!("cursor store write: {e}")));
         if res.is_err() {
             // Best-effort cleanup of the temp on a failed rename.
             let _ = std::fs::remove_file(&tmp);
@@ -358,12 +375,26 @@ impl ResilientSubscription {
     /// top of every [`next`](Self::next) (and by [`commit`](Self::commit)); it
     /// therefore can never run ahead of an event the caller has received.
     fn commit_due(&mut self) -> Result<(), StreamError> {
-        if let Some(c) = self.commit_next.take()
-            && self.committed != Some(c)
-        {
-            self.config.cursor_store.save(c)?;
-            self.committed = Some(c);
+        let Some(c) = self.commit_next else { return Ok(()) };
+        if self.committed == Some(c) {
+            self.commit_next = None;
+            return Ok(());
         }
+        // The arm STAYS armed until the write lands. Taking it first turned a
+        // transient store failure into a false durability ack: the error
+        // propagated, but the retried `commit()` found nothing armed and
+        // returned `Ok(())`. A caller that commits explicitly before shutdown —
+        // the one path where no further event re-arms the cursor — then exits
+        // believing the cursor is durable. The restart finds an empty store and
+        // resumes forward-only, losing every event that occurred while the
+        // process was down. That is an at-least-once violation, not a replay.
+        self.config.cursor_store.save(c)?;
+        // Retire only the arm actually written, and only if nothing superseded
+        // it while the write was in flight.
+        if self.commit_next == Some(c) {
+            self.commit_next = None;
+        }
+        self.committed = Some(c);
         Ok(())
     }
 
@@ -529,6 +560,15 @@ impl ResilientSubscription {
                     self.commit_next = None;
                 }
                 self.stream = None;
+                // Count the re-anchor as a reconnect attempt. Receiving the
+                // `Lagged` notice reset `reconnect_attempts` to 0 (an event is
+                // progress), so without this the loop re-subscribes IMMEDIATELY
+                // and `max_retries` never bounds it — a consumer that is
+                // chronically too slow lags, re-anchors, lags again, and spins,
+                // with each cycle costing the node a full confirmed-history
+                // replay. Backing off turns that into pressure the server can
+                // absorb.
+                self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
                 Ok(None)
             }
             // Deterministic re-anchor acks (#441) are a `Watch`-only signal — a
@@ -686,6 +726,141 @@ mod tests {
             *self.0.lock().unwrap() = Some(cursor);
             Ok(())
         }
+    }
+
+    /// A store that fails the first `n` saves, then behaves. Models a transient
+    /// I/O failure (a full disk that is then cleared, an EINTR, a briefly
+    /// unwritable mount) rather than a permanent one.
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: Mutex<Option<Cursor>>,
+        fail_next: Mutex<u32>,
+        saves_attempted: Mutex<u32>,
+    }
+    impl FlakyStore {
+        fn failing(n: u32) -> Self {
+            Self {
+                fail_next: Mutex::new(n),
+                ..Default::default()
+            }
+        }
+    }
+    impl CursorStore for FlakyStore {
+        fn load(&self) -> Result<Option<Cursor>, StreamError> {
+            Ok(*self.inner.lock().unwrap())
+        }
+        fn save(&self, cursor: Cursor) -> Result<(), StreamError> {
+            *self.saves_attempted.lock().unwrap() += 1;
+            let mut left = self.fail_next.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(StreamError::Decode("disk full".into()));
+            }
+            *self.inner.lock().unwrap() = Some(cursor);
+            Ok(())
+        }
+    }
+
+    /// A store write that fails must leave the cursor ARMED, so the retry
+    /// actually writes it.
+    ///
+    /// The bug this pins: `commit_due` took the arm before attempting the save,
+    /// so a transient failure propagated the error *and* discarded the arm. The
+    /// retried `commit()` then found nothing armed and returned `Ok(())` — a
+    /// false durability ack. The window is an idle stream, which is exactly the
+    /// graceful-shutdown path where a caller commits explicitly and no further
+    /// event re-arms the cursor. The process exits believing the cursor is
+    /// durable; the restart finds an empty store and resumes forward-only,
+    /// losing everything that happened while it was down.
+    #[tokio::test]
+    async fn commit_retry_after_a_store_failure_actually_writes() {
+        let store = Arc::new(FlakyStore::failing(1));
+        let mut sub = ResilientSubscription::new(
+            StreamClient::for_test(),
+            SubscribeOptions::default(),
+            ResilientConfig::new().cursor_store(store.clone()),
+        );
+        let c100 = cur(100);
+
+        sub.handle_event(
+            Event::BlockConnected {
+                hash: vec![0xaa],
+                height: 100,
+            },
+            Some(c100),
+        )
+        .await
+        .unwrap();
+        sub.arm_commit();
+
+        // First flush fails. The error must surface...
+        let err = sub.commit_due().unwrap_err();
+        assert!(
+            matches!(err, StreamError::Decode(_)),
+            "transient store failure surfaces"
+        );
+        assert_eq!(store.load().unwrap(), None, "nothing was written");
+
+        // ...and the retry must actually write, not report a vacuous success.
+        sub.commit_due().expect("retry after a transient failure");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(c100),
+            "the retried commit must persist the cursor the failed one armed; \
+             returning Ok() with an empty store is a false durability ack"
+        );
+        assert_eq!(
+            *store.saves_attempted.lock().unwrap(),
+            2,
+            "the retry reached the store"
+        );
+    }
+
+    /// An auto-resumed lag must count as a reconnect attempt, so backoff and
+    /// `max_retries` apply to it.
+    ///
+    /// The bug this pins: receiving the `Lagged` notice reset
+    /// `reconnect_attempts` to 0 (an event is progress), and the auto-resume arm
+    /// then dropped the stream and returned to the loop — which skips the
+    /// backoff sleep entirely when the counter is 0. A consumer that is
+    /// chronically too slow therefore lagged, re-subscribed instantly, lagged
+    /// again, and spun, with each cycle costing the node a full
+    /// confirmed-history replay and nothing ever bounding it.
+    #[tokio::test]
+    async fn lag_auto_resume_counts_a_reconnect_attempt() {
+        let store = Arc::new(MemStore::default());
+        let mut sub = ResilientSubscription::new(
+            StreamClient::for_test(),
+            SubscribeOptions::default(),
+            ResilientConfig::new()
+                .cursor_store(store.clone())
+                .lag_policy(LagPolicy::AutoResume),
+        );
+        // The state `next()` is in when a Lagged arrives: the notice itself was
+        // an event, so progress cleared the counter.
+        sub.reconnect_attempts = 0;
+
+        let out = sub
+            .handle_event(
+                Event::Lagged {
+                    dropped_count: 500,
+                    resume_cursor: Some(cur(42)),
+                },
+                Some(cur(42)),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.is_none(), "an auto-resumed lag is consumed internally");
+        assert!(
+            sub.stream.is_none(),
+            "the stream is dropped so the loop reconnects"
+        );
+        assert_eq!(
+            sub.reconnect_attempts, 1,
+            "the re-anchor must count as an attempt; at 0 the loop skips the backoff \
+             sleep and max_retries never bounds a chronically slow consumer"
+        );
     }
 
     #[test]

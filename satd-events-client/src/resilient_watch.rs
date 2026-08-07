@@ -1771,12 +1771,19 @@ impl ResilientWatch {
     /// Commit-on-poll flush: persist the armed high-water if it differs from the
     /// store's current value.
     fn commit_due(&mut self) -> Result<(), StreamError> {
-        if let Some(c) = self.commit_next.take()
-            && self.committed != Some(c)
-        {
-            self.config.cursor_store.save(c)?;
-            self.committed = Some(c);
+        let Some(c) = self.commit_next else { return Ok(()) };
+        if self.committed == Some(c) {
+            self.commit_next = None;
+            return Ok(());
         }
+        // The arm stays armed until the write lands — see the identical note on
+        // `ResilientSubscription::commit_due`. Clearing it first makes a retried
+        // commit report success after a store failure it never recovered from.
+        self.config.cursor_store.save(c)?;
+        if self.commit_next == Some(c) {
+            self.commit_next = None;
+        }
+        self.committed = Some(c);
         Ok(())
     }
 }
@@ -2410,6 +2417,62 @@ mod tests {
         // The next poll acks it.
         w.commit_due().unwrap();
         assert_eq!(store.load().unwrap(), Some(c));
+    }
+
+    /// A store that fails its first `n` saves, then behaves — a transient I/O
+    /// failure (a briefly full disk, an unwritable mount), not a permanent one.
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: Mutex<Option<Cursor>>,
+        fail_next: Mutex<u32>,
+    }
+    impl CursorStore for FlakyStore {
+        fn load(&self) -> Result<Option<Cursor>, StreamError> {
+            Ok(*self.inner.lock().unwrap())
+        }
+        fn save(&self, cursor: Cursor) -> Result<(), StreamError> {
+            let mut left = self.fail_next.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(StreamError::Decode("disk full".into()));
+            }
+            *self.inner.lock().unwrap() = Some(cursor);
+            Ok(())
+        }
+    }
+
+    /// A failed store write must leave the cursor ARMED so the retry writes it.
+    ///
+    /// `ResilientWatch` carries its own copy of `commit_due`, so the
+    /// subscription-side regression test does not cover this one. Same bug, same
+    /// consequence: taking the arm before the write made the retry return
+    /// `Ok(())` with nothing persisted, and a caller committing before shutdown
+    /// exits believing a cursor is durable that was never written.
+    #[tokio::test]
+    async fn commit_retry_after_a_store_failure_actually_writes() {
+        let store = Arc::new(FlakyStore { fail_next: Mutex::new(1), ..Default::default() });
+        let mut w = ResilientWatch::new(
+            StreamClient::for_test(),
+            ResilientWatchConfig { cursor_store: store.clone(), ..Default::default() },
+        );
+        let c = cur(900);
+
+        w.handle_event(Event::BlockConnected { hash: vec![0xaa], height: 900 }, Some(c))
+            .await
+            .unwrap();
+        w.arm_commit();
+
+        let err = w.commit_due().unwrap_err();
+        assert!(matches!(err, StreamError::Decode(_)), "the transient failure surfaces");
+        assert_eq!(store.load().unwrap(), None, "nothing was written");
+
+        w.commit_due().expect("retry after a transient failure");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(c),
+            "the retried commit must persist the cursor the failed one armed; \
+             returning Ok() with an empty store is a false durability ack"
+        );
     }
 
     #[tokio::test]
