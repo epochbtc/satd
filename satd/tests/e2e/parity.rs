@@ -9,13 +9,23 @@
 //! mempool admission, a confirmation, and four blocks. At the end the two dumps
 //! are sorted by content and diffed line by line.
 //!
-//! SCOPE, stated plainly so nobody reads more into a green run than is there:
-//! the scenario exercises mempool_enter, script_matched, outpoint_spent,
-//! mempool_leave_confirmed and block_connected. It does NOT yet cover reorgs,
-//! replacement, rescan output, prefix or silent-payment matches, or the
-//! lifecycle/depth-alarm events - those render arms are compiled and unit-tested
-//! on both sides but are not differentially compared here. Widening the
-//! scenario is the way to widen the guarantee.
+//! SCOPE, stated plainly so nobody reads more into a green run than is there.
+//! Four scenarios are compared today:
+//!
+//!   S1  funding + spend match, mempool then confirmed  (mempool_enter,
+//!       script_matched, outpoint_spent, mempool_leave_confirmed)
+//!   S2  reorg via invalidateblock                      (reorg,
+//!       block_disconnected)
+//!   S3  tx lifecycle + depth alarms                    (txid_depth_reached,
+//!       txid_finalized)
+//!   S5  prefix watch, decoys included                  (prefix_matched)
+//!
+//! Still NOT differentially compared: replacement (txid_replaced), rescan
+//! output, silent-payment matches, descriptor attribution, and the cursor
+//! control acks. Those render arms are compiled and unit-tested on both sides
+//! but no scenario drives them here. Adding a scenario is the way to widen the
+//! guarantee - each is a `parity_begin` -> drive -> `finish` triple, and the
+//! non-vacuity floor passed to `finish` is what stops a broken one going green.
 //!
 //! Any divergence fails: a variant one SDK cannot decode, a field typed
 //! differently, an off-by-one height, an enum mapped to the wrong constant.
@@ -38,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::common::{
+    script_prefix_hex,
     build_signed_p2wpkh_spend_seq, block1_coinbase_txid, display_to_internal_hex,
     e2e_test_timeout, DeterministicWallet, StreamingNode,
 };
@@ -795,19 +806,67 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
-// ---- the test ---------------------------------------------------------------
+// ---- the harness --------------------------------------------------------------
 
 const WALLET_SEED: u8 = 0x41;
+/// Blocks mined to this address produce no watch match, so the sentinel block
+/// that ends every run carries nothing that could race it. See `finish`.
+const UNWATCHED_SEED: u8 = 0x7c;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn go_and_rust_sdks_agree_event_for_event() {
+/// What a scenario's spec is built from, pre-fetched so the builder stays
+/// synchronous (every RPC here is blocking and would otherwise need its own
+/// `spawn_blocking` inside each scenario).
+struct SpecInputs<'a> {
+    wallet: &'a DeterministicWallet,
+    /// Block 1's coinbase txid in **internal** byte order — the form the watch
+    /// API takes.
+    coinbase_internal: &'a str,
+}
+
+/// One parity run in progress: both dumpers are connected and registered, and
+/// the caller is expected to drive the node before calling [`finish`].
+///
+/// Split into begin/finish rather than taking a scenario closure because the
+/// scenario needs `&StreamingNode` across an await, and expressing that as an
+/// `AsyncFnOnce` bound buys nothing a plain struct does not.
+struct ParityRun {
+    sn: StreamingNode,
+    wallet: DeterministicWallet,
+    addr: String,
+    _tmp: tempfile::TempDir,
+    go_out: PathBuf,
+    go_proc: KillOnDrop,
+    go_stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    rust_task: tokio::task::JoinHandle<Vec<String>>,
+}
+
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Boot a node, connect both SDKs, and register `spec` on each.
+///
+/// `blocks` is how many blocks the scenario itself will mine, EXCLUDING the
+/// sentinel [`finish`] adds. Both dumpers stop on a `block_connected` at or
+/// above `tip + blocks + 1`, so the count has to be right or the run either
+/// ends early or hangs to its timeout.
+///
+/// Returns `None` — a skip, not a failure — when there is no Go toolchain and
+/// `PARITYDUMP_BIN` is unset.
+async fn parity_begin(
+    node_args: &[&'static str],
+    build_spec: impl FnOnce(SpecInputs<'_>) -> Spec,
+    blocks: u32,
+) -> Option<ParityRun> {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let Some(go_bin) = paritydump_binary(tmp.path()) else {
-        eprintln!("skipping parity test: no Go toolchain and PARITYDUMP_BIN unset");
-        return;
-    };
+    let go_bin = paritydump_binary(tmp.path())?;
 
-    let sn = tokio::task::spawn_blocking(|| StreamingNode::start(&[])).await.unwrap();
+    let args = node_args.to_vec();
+    let sn = tokio::task::spawn_blocking(move || StreamingNode::start(&args)).await.unwrap();
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
     let rpc = sn.node.rpc_handle();
@@ -818,25 +877,18 @@ async fn go_and_rust_sdks_agree_event_for_event() {
     .await
     .unwrap();
 
-    // Watch the wallet's own script, plus block 1's coinbase outpoint, so the
-    // scenario exercises both a funding match and a spend match.
-    let coinbase = tokio::task::spawn_blocking({
+    let coinbase_display = tokio::task::spawn_blocking({
         let rpc = sn.node.rpc_handle();
         move || block1_coinbase_txid(&rpc)
     })
     .await
     .unwrap();
+    let coinbase_internal = display_to_internal_hex(&coinbase_display);
 
-    let spec = Spec {
-        include_raw_tx: true,
-        scripts: vec![SpecScript {
-            scripthash: canonical::hexs(&sha256(wallet.address.script_pubkey().as_bytes())),
-            min_value: None,
-        }],
-        outpoints: vec![SpecOutpoint { txid: display_to_internal_hex(&coinbase), vout: 0 }],
-        ..Default::default()
-    };
-
+    let spec = build_spec(SpecInputs {
+        wallet: &wallet,
+        coinbase_internal: &coinbase_internal,
+    });
     let spec_path = tmp.path().join("watch.json");
     std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
 
@@ -846,7 +898,7 @@ async fn go_and_rust_sdks_agree_event_for_event() {
     })
     .await
     .unwrap();
-    let until_height = tip as u32 + 4;
+    let until_height = tip as u32 + blocks + 1;
 
     // Both dumpers connect and register BEFORE the scenario starts. A client
     // that subscribes mid-scenario sees a different prefix of the event stream,
@@ -873,8 +925,7 @@ async fn go_and_rust_sdks_agree_event_for_event() {
     // Drain the child's stderr on a thread. Piping it and never reading it lost
     // every Go-side diagnostic ("dial refused", "recv after N events: ...") and
     // would eventually block the child on a full pipe; the buffer is printed
-    // with any failure below. A killer guard makes sure the child cannot outlive
-    // this test as an orphan writing into a deleted TempDir, on any panic path.
+    // with any failure below.
     let go_stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     {
         use std::io::Read;
@@ -886,15 +937,9 @@ async fn go_and_rust_sdks_agree_event_for_event() {
             *sink.lock().unwrap() = buf;
         });
     }
-
-    struct KillOnDrop(std::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut go_proc = KillOnDrop(go_proc);
+    // A killer guard makes sure the child cannot outlive this test as an orphan
+    // writing into a deleted TempDir, on any panic path.
+    let go_proc = KillOnDrop(go_proc);
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let port = sn.grpc_port();
@@ -909,120 +954,193 @@ async fn go_and_rust_sdks_agree_event_for_event() {
         .expect("rust dumper never became ready");
     wait_for_file(&go_ready, e2e_test_timeout(120)).await;
 
-    // ---- scenario ----------------------------------------------------------
-    //
-    // Mempool admission, then confirmation, then two more blocks so the
-    // sentinel height is reached on both sides at the same event.
-    let dest = DeterministicWallet::from_secret([0x42; 32]).address.script_pubkey();
-    {
-        let rpc = sn.node.rpc_handle();
-        let w = wallet.clone();
-        // build_signed_p2wpkh_spend_seq only BUILDS and signs - it returns the
-        // raw hex and never touches the node. Discarding that pair (as this
-        // scenario did) meant no transaction was ever broadcast: no mempool
-        // admission, no spend of the watched outpoint, no confirmation. The
-        // harness silently compared only block_connected and the coinbase
-        // script_matched, while its own doc claimed mempool admission, RBF, a
-        // reorg and a rescan. The non-vacuity assertion below is what caught it.
+    Some(ParityRun {
+        sn,
+        wallet,
+        addr,
+        _tmp: tmp,
+        go_out,
+        go_proc,
+        go_stderr,
+        rust_task,
+    })
+}
+
+impl ParityRun {
+    /// Make a JSON-RPC call against the node, returning the whole response.
+    async fn rpc_call(&self, method: &'static str, params: Vec<Value>) -> Value {
+        let rpc = self.sn.node.rpc_handle();
+        tokio::task::spawn_blocking(move || rpc.call(method, params))
+            .await
+            .unwrap()
+            .expect("rpc call")
+    }
+
+    /// A JSON-RPC call whose `result` is a bare string (a block hash, say).
+    async fn rpc_string(&self, method: &'static str, params: Vec<Value>) -> String {
+        self.rpc_call(method, params).await["result"]
+            .as_str()
+            .expect("string result")
+            .to_string()
+    }
+
+    /// Mine `n` blocks to the watched address, pausing so both streams see them.
+    async fn mine_watched(&self, n: u32) {
+        for _ in 0..n {
+            let rpc = self.sn.node.rpc_handle();
+            let target = self.addr.clone();
+            tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Mine `n` blocks to an address neither dumper watches.
+    async fn mine_unwatched(&self, n: u32) {
+        let unwatched = DeterministicWallet::from_secret([UNWATCHED_SEED; 32]).address.to_string();
+        for _ in 0..n {
+            let rpc = self.sn.node.rpc_handle();
+            let target = unwatched.clone();
+            tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Build, sign, and BROADCAST a spend of block 1's coinbase to `dest`.
+    ///
+    /// `build_signed_p2wpkh_spend_seq` only builds and signs — it never touches
+    /// the node. A scenario that discards the returned pair broadcasts nothing,
+    /// which is how the original harness silently compared only block events
+    /// while claiming to cover mempool admission.
+    async fn broadcast_spend(&self, dest: bitcoin::ScriptBuf, fee_sat: u64, sequence: u32) -> String {
+        let rpc = self.sn.node.rpc_handle();
+        let w = self.wallet.clone();
         let (raw, txid) = tokio::task::spawn_blocking(move || {
-            build_signed_p2wpkh_spend_seq(&rpc, &w, dest, 1_000, 0xffff_ffff)
+            build_signed_p2wpkh_spend_seq(&rpc, &w, dest, fee_sat, sequence)
         })
         .await
         .unwrap();
-        let rpc2 = sn.node.rpc_handle();
-        let sent = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw)).await.unwrap();
+        let rpc = self.sn.node.rpc_handle();
+        let sent = tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
         assert_eq!(sent, txid, "sendrawtransaction returns the computed txid");
-        // Let the mempool events reach both streams before the first block
-        // confirms the transaction out of the mempool again.
+        // Let the mempool events reach both streams before anything confirms.
         tokio::time::sleep(Duration::from_millis(500)).await;
+        txid
     }
 
-    // The first three blocks go to the WATCHED address, so each yields a
-    // coinbase script match. The final, sentinel block is mined elsewhere on
-    // purpose: a match for the sentinel block travels on the watch-matcher
-    // channel while the block event travels on the live channel, so whether it
-    // arrives before or after the sentinel is a per-connection race - and each
-    // dumper stops ON the sentinel. Mining it to an unwatched address leaves no
-    // such match to race, so both dumps end on exactly the same event set.
-    let unwatched = DeterministicWallet::from_secret([0x7c; 32]).address.to_string();
-    for i in 0..4 {
-        let rpc = sn.node.rpc_handle();
-        let target = if i == 3 { unwatched.clone() } else { addr.clone() };
-        tokio::task::spawn_blocking(move || rpc.mine(1, &target)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    /// Mine the sentinel block, collect both dumps, and diff them.
+    ///
+    /// `expect_kinds` is the non-vacuity floor: every one must appear, or the
+    /// run proved nothing. `!is_empty()` alone could never fail — the dumpers
+    /// push the sentinel block BEFORE breaking, so the block_connected lines
+    /// always satisfy it even if every watch registration had been REJECTED and
+    /// not a single watch event was compared. (Registration rejections land
+    /// before the readiness barrier and are dropped by both sides, so that
+    /// failure is invisible here by construction.)
+    async fn finish(mut self, expect_kinds: &[&str]) {
+        // The sentinel is mined to an UNWATCHED address on purpose: a match for
+        // the sentinel block travels on the watch-matcher channel while the
+        // block event travels on the live channel, so whether it arrives before
+        // or after the sentinel is a per-connection race — and each dumper stops
+        // ON the sentinel. Mining it elsewhere leaves no such match to race, so
+        // both dumps end on exactly the same event set.
+        self.mine_unwatched(1).await;
+
+        let rust_lines = tokio::time::timeout(e2e_test_timeout(300), &mut self.rust_task)
+            .await
+            .expect("rust dumper timed out")
+            .expect("rust dumper panicked");
+
+        let status = wait_for_exit(&mut self.go_proc.0, e2e_test_timeout(120));
+        assert!(
+            status,
+            "go paritydump did not exit cleanly. stderr:\n{}",
+            self.go_stderr.lock().unwrap()
+        );
+
+        let go_lines: Vec<String> = std::fs::read_to_string(&self.go_out)
+            .expect("go dump")
+            .lines()
+            .map(normalize_line)
+            .collect();
+        let rust_lines: Vec<String> = rust_lines.iter().map(|l| normalize_line(l)).collect();
+
+        for kind in expect_kinds {
+            let needle = format!("\"type\":\"{kind}\"");
+            assert!(
+                rust_lines.iter().any(|l| l.contains(&needle)),
+                "no {kind} event was compared. The scenario or the watch registration is \
+                 broken, and a green run would prove nothing about the watch surface.\n\
+                 kinds actually present: {:?}",
+                observed_kinds(&rust_lines)
+            );
+        }
+
+        if go_lines != rust_lines {
+            // The dumps live in a TempDir deleted as this unwind runs, so print
+            // the finding itself rather than a path that no longer exists.
+            let first_diff = go_lines
+                .iter()
+                .zip(rust_lines.iter())
+                .find(|(g, r)| g != r)
+                .map(|(g, r)| format!("go:   {g}\nrust: {r}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "no differing line; the dumps differ in LENGTH: go={} rust={}",
+                        go_lines.len(),
+                        rust_lines.len()
+                    )
+                });
+            let stderr = self.go_stderr.lock().unwrap().clone();
+            panic!(
+                "\nGo and Rust SDKs disagree ({} vs {} events).\n\
+                 Each line is one event in canonical form.\n\n{}\n\n\
+                 go paritydump stderr:\n{}\n",
+                go_lines.len(),
+                rust_lines.len(),
+                first_diff,
+                if stderr.is_empty() { "(empty)" } else { stderr.as_str() }
+            );
+        }
     }
+}
 
-    // ---- collect and diff --------------------------------------------------
+// ---- the scenarios --------------------------------------------------------
 
-    let rust_lines = tokio::time::timeout(e2e_test_timeout(300), rust_task)
-        .await
-        .expect("rust dumper timed out")
-        .expect("rust dumper panicked");
+/// S1: a funding match and a spend match, mempool then confirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn parity_script_and_outpoint_mempool_then_confirmed() {
+    let Some(run) = parity_begin(
+        &[],
+        |i| Spec {
+            include_raw_tx: true,
+            scripts: vec![SpecScript {
+                scripthash: canonical::hexs(&sha256(i.wallet.address.script_pubkey().as_bytes())),
+                min_value: None,
+            }],
+            outpoints: vec![SpecOutpoint { txid: i.coinbase_internal.to_string(), vout: 0 }],
+            ..Default::default()
+        },
+        3,
+    )
+    .await
+    else {
+        eprintln!("skipping parity test: no Go toolchain and PARITYDUMP_BIN unset");
+        return;
+    };
 
-    let status = wait_for_exit(&mut go_proc.0, e2e_test_timeout(120));
-    assert!(
-        status,
-        "go paritydump did not exit cleanly. stderr:\n{}",
-        go_stderr.lock().unwrap()
-    );
+    let dest = DeterministicWallet::from_secret([0x42; 32]).address.script_pubkey();
+    run.broadcast_spend(dest, 1_000, 0xffff_ffff).await;
+    // Three blocks to the watched address: each yields a coinbase script match.
+    run.mine_watched(3).await;
 
-    let go_lines: Vec<String> = std::fs::read_to_string(&go_out)
-        .expect("go dump")
-        .lines()
-        .map(normalize_line)
-        .collect();
-    let rust_lines: Vec<String> = rust_lines.iter().map(|l| normalize_line(l)).collect();
-
-    // Non-vacuity. `!is_empty()` alone could never fail: the dumper pushes the
-    // sentinel block BEFORE breaking, so the four block_connected lines always
-    // satisfied it - even if every watch registration had been REJECTED and not
-    // a single watch event was ever compared. (Registration rejections land
-    // before the readiness barrier and are dropped by both sides, so that
-    // failure is invisible here by construction.) Assert the kinds the scenario
-    // is supposed to produce actually turned up.
-    for kind in [
+    run.finish(&[
         "mempool_enter",
         "script_matched",
         "outpoint_spent",
         "mempool_leave_confirmed",
         "block_connected",
-    ] {
-        let needle = format!("\"type\":\"{kind}\"");
-        assert!(
-            rust_lines.iter().any(|l| l.contains(&needle)),
-            "no {kind} event was compared. The scenario or the watch registration is \
-             broken, and a green run would prove nothing about the watch surface.\n\
-             kinds actually present: {:?}",
-            observed_kinds(&rust_lines)
-        );
-    }
-
-    if go_lines != rust_lines {
-        // The dumps live in a TempDir that is deleted as this unwind runs, so
-        // print the finding itself rather than a path that no longer exists.
-        let first_diff = go_lines
-            .iter()
-            .zip(rust_lines.iter())
-            .find(|(g, r)| g != r)
-            .map(|(g, r)| format!("go:   {g}\nrust: {r}"))
-            .unwrap_or_else(|| {
-                format!(
-                    "no differing line; the dumps differ in LENGTH: go={} rust={}",
-                    go_lines.len(),
-                    rust_lines.len()
-                )
-            });
-        let stderr = go_stderr.lock().unwrap().clone();
-        panic!(
-            "\nGo and Rust SDKs disagree ({} vs {} events).\n\
-             Each line is one event in canonical form.\n\n{}\n\n\
-             go paritydump stderr:\n{}\n",
-            go_lines.len(),
-            rust_lines.len(),
-            first_diff,
-            if stderr.is_empty() { "(empty)" } else { stderr.as_str() }
-        );
-    }
+    ])
+    .await;
 }
 
 /// Re-encode a line through serde_json so both sides' number formatting and key
@@ -1073,4 +1191,126 @@ fn wait_for_exit(proc: &mut std::process::Child, timeout: Duration) -> bool {
 fn sha256(b: &[u8]) -> [u8; 32] {
     use bitcoin::hashes::{sha256, Hash};
     sha256::Hash::hash(b).to_byte_array()
+}
+
+/// S2: a reorg. `invalidateblock` rolls the tip back, and both SDKs must
+/// narrate it identically — the `reorg` marker and the per-block
+/// `block_disconnected`, neither of which any earlier scenario produced.
+#[tokio::test(flavor = "multi_thread")]
+async fn parity_reorg_disconnects_and_renarrates() {
+    let Some(run) = parity_begin(
+        &[],
+        |i| Spec {
+            scripts: vec![SpecScript {
+                scripthash: canonical::hexs(&sha256(i.wallet.address.script_pubkey().as_bytes())),
+                min_value: None,
+            }],
+            ..Default::default()
+        },
+        // net +3: mine 2, invalidate 1, mine 2.
+        3,
+    )
+    .await
+    else {
+        eprintln!("skipping parity test: no Go toolchain and PARITYDUMP_BIN unset");
+        return;
+    };
+
+    run.mine_watched(2).await;
+    // Invalidating the tip is the one way to make a SINGLE node reorg
+    // deterministically; a two-node race would make the diff a scheduling
+    // artifact rather than a finding.
+    let tip_hash = run.rpc_string("getbestblockhash", vec![]).await;
+    let resp = run.rpc_call("invalidateblock", vec![serde_json::json!(tip_hash)]).await;
+    assert!(resp["error"].is_null(), "invalidateblock errored: {resp:?}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Mine past the invalidated height so the sentinel is reachable: the tip
+    // went backwards, and `-until-height` counts forwards only.
+    //
+    // These go to the UNWATCHED address, and that is load-bearing rather than
+    // incidental. Re-mining to the same address at the same height reproduces
+    // the same coinbase and therefore the same block hash — which the node
+    // rejects, since it just marked that hash invalid. The chain then never
+    // advances, the sentinel height is never reached, and the run dies at its
+    // timeout with nothing to point at. A different coinbase makes the
+    // replacement block genuinely new.
+    run.mine_unwatched(2).await;
+
+    // Fail loudly if the chain did not actually advance, rather than letting
+    // `finish` block until the dumper timeout and report only "timed out".
+    let height = run.rpc_call("getblockcount", vec![]).await["result"]
+        .as_u64()
+        .expect("block count");
+    assert_eq!(
+        height, 104,
+        "the chain must be back above the invalidated height before the sentinel; \
+         a stuck tip here means the replacement blocks were rejected"
+    );
+
+    run.finish(&["reorg", "block_disconnected", "block_connected", "script_matched"]).await;
+}
+
+/// S3: transaction lifecycle and depth alarms.
+///
+/// Both are registered against block 1's coinbase, whose txid is knowable at
+/// spec-build time — the alternative (a txid the scenario creates) cannot be
+/// named in a spec that has to be written before the node is driven.
+#[tokio::test(flavor = "multi_thread")]
+async fn parity_lifecycle_and_depth_alarms() {
+    let Some(run) = parity_begin(
+        &[],
+        |i| Spec {
+            // The chain is at 101, so block 1's coinbase sits at depth 101.
+            // Both thresholds are ahead of that and fire as the scenario mines.
+            lifecycles: vec![SpecLifecycle {
+                txid: i.coinbase_internal.to_string(),
+                auto_close_depth: 104,
+            }],
+            depth_alarms: vec![SpecDepth { txid: i.coinbase_internal.to_string(), depth: 103 }],
+            ..Default::default()
+        },
+        3,
+    )
+    .await
+    else {
+        eprintln!("skipping parity test: no Go toolchain and PARITYDUMP_BIN unset");
+        return;
+    };
+
+    run.mine_unwatched(3).await;
+
+    run.finish(&["txid_depth_reached", "txid_finalized", "block_connected"]).await;
+}
+
+/// S5: a privacy prefix watch, decoys and all.
+///
+/// The bucket is deliberately wide (8 bits), so the deliveries include
+/// transactions the consumer never asked for. Both SDKs must receive the SAME
+/// decoy set — a prefix watch whose decoys differed between clients would leak
+/// differently on each, which no per-SDK test can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn parity_prefix_watch_including_decoys() {
+    let Some(run) = parity_begin(
+        &[],
+        |i| Spec {
+            prefixes: vec![SpecPrefix {
+                prefix: script_prefix_hex(&i.wallet.address.script_pubkey(), 8),
+                bits: 8,
+            }],
+            ..Default::default()
+        },
+        3,
+    )
+    .await
+    else {
+        eprintln!("skipping parity test: no Go toolchain and PARITYDUMP_BIN unset");
+        return;
+    };
+
+    let dest = DeterministicWallet::from_secret([0x43; 32]).address.script_pubkey();
+    run.broadcast_spend(dest, 1_000, 0xffff_ffff).await;
+    run.mine_watched(3).await;
+
+    run.finish(&["prefix_matched", "block_connected"]).await;
 }
