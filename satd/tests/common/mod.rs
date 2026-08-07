@@ -18,6 +18,7 @@ pub mod core_node;
 /// `mod common`-imports this; the `regtest`/`e2e` binaries don't use them,
 /// hence the module-level `#![allow(dead_code)]` inside each.
 pub mod grpc_client;
+pub mod sp_send;
 pub mod ws_client;
 
 use base64::Engine;
