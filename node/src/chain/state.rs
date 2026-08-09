@@ -6102,7 +6102,13 @@ impl node_sp_index::SpIndex for ChainState {
     }
 
     fn activation_height(&self) -> u32 {
-        crate::validation::script::activation_heights(self.network).taproot
+        // The trait contract is "the lowest height that carries a tweak row",
+        // which is the same floor the backfill walks from — including the
+        // `.max(1)`, since genesis is never connected via `connect_block` and
+        // so never gets a row even on the chains where taproot is active from
+        // height 0. Sharing the definition keeps this from drifting against
+        // the runner the way the progress origin did.
+        crate::index::silent_payments::walk_start(self.network)
     }
 
     fn is_complete(&self) -> bool {

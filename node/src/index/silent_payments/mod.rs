@@ -24,9 +24,10 @@ pub mod stats;
 /// This is the floor of the backfill's walk *and* the origin its progress
 /// is measured from. On mainnet it is 709_632, so a walk to the tip covers
 /// roughly a quarter of the chain; treating 0 as the origin overstates
-/// progress from the first block onward. Signet, testnet4 and regtest have
-/// taproot from genesis, so the offset is 1 there and the distinction is
-/// invisible — which is exactly why it went unnoticed.
+/// progress from the first stamped block onward. Testnet3 is offset too
+/// (834_624). Signet, testnet4 and regtest have taproot from genesis, so
+/// the offset is 1 there and the distinction is invisible — which is why
+/// it went unnoticed, every test having used a genesis-activation shape.
 pub fn walk_start(network: bitcoin::Network) -> u32 {
     crate::validation::script::activation_heights(network)
         .taproot

@@ -124,7 +124,7 @@ impl BackfillCursor {
 
     /// Progress toward the snapshot height. Single-pass walk over
     /// `[walk_start, snapshot_height]`, so total work is
-    /// `snapshot_height - walk_start` blocks, **not** `snapshot_height`:
+    /// `snapshot_height - walk_start + 1` blocks, **not** `snapshot_height`:
     /// the walk begins at taproot activation because no block below it can
     /// carry a tweak row (§3.2). `cursor_height` is the last height with a
     /// stamped row.
@@ -132,21 +132,35 @@ impl BackfillCursor {
     /// `walk_start` must be the same value the runner walks from
     /// (`node::index::silent_payments::walk_start` for the chain's
     /// network). Passing 0 measures from genesis and overstates progress on
-    /// any chain whose taproot activation is above genesis — on mainnet
-    /// that means opening at 0.738 with no work done, and an ETA derived
-    /// from it that is ~3x optimistic.
+    /// any chain whose taproot activation is above genesis. On mainnet that
+    /// put the gauge at 0.738 from the *first* stamped block onward (a fresh
+    /// cursor persists 0, so it read 0.0 until then and jumped), and left it
+    /// unable to report below that floor for the rest of the run. The ETA
+    /// derived from it was optimistic by a factor that grows as the walk
+    /// gets shorter — roughly 4x over most of a mainnet run, far worse in
+    /// the first percent.
     ///
-    /// Returns 0.0 for a degenerate span (`snapshot_height <= walk_start`),
-    /// which covers both the idle cursor and a chain that has not yet
-    /// reached activation.
+    /// Returns 0.0 when there is nothing to walk: the idle cursor (no
+    /// snapshot taken) and a chain that has not yet reached activation.
     pub fn progress_ratio(&self, walk_start: u32) -> f64 {
-        if self.snapshot_height <= walk_start {
+        if self.snapshot_height == 0 || self.snapshot_height < walk_start {
             return 0.0;
         }
-        let total = (self.snapshot_height - walk_start) as f64;
-        // A fresh cursor sits at 0 and a resumed one never below
-        // `walk_start`, so saturating_sub floors both at "no work done".
-        let done = self.cursor_height.saturating_sub(walk_start) as f64;
+        // Both ends inclusive, matching the runner's `walk_start..=snapshot`
+        // loop: the span is `snapshot_height - walk_start + 1` blocks. That
+        // matters at the edge — the runner's own guard is
+        // `walk_start > snapshot_height`, so a snapshot sitting exactly ON
+        // the walk start is one block of work that does get walked and
+        // completed, not a zero-width span. Counting inclusively is what
+        // keeps a completed cursor at exactly 1.0 for every span width.
+        let total = (self.snapshot_height - walk_start) as f64 + 1.0;
+        let done = if self.cursor_height < walk_start {
+            // Fresh cursor: `start()` persists 0, which is below `walk_start`
+            // on any chain with a non-genesis activation. Nothing stamped yet.
+            0.0
+        } else {
+            (self.cursor_height - walk_start) as f64 + 1.0
+        };
         (done / total).clamp(0.0, 1.0)
     }
 }
@@ -197,14 +211,17 @@ mod tests {
 
     #[test]
     fn progress_ratio_edges() {
-        assert_eq!(BackfillCursor::idle().progress_ratio(0), 0.0);
+        assert_eq!(BackfillCursor::idle().progress_ratio(1), 0.0);
+        // walk_start is floored at 1 in production, and with an inclusive
+        // span that makes the arithmetic land on the intuitive value:
+        // heights 1..=1000 is 1000 blocks, done through 250 is 250 of them.
         let c = running_at(250, 1000);
-        assert!((c.progress_ratio(0) - 0.25).abs() < 1e-9);
+        assert!((c.progress_ratio(1) - 0.25).abs() < 1e-9);
         let over = BackfillCursor {
             cursor_height: 5_000,
             ..c
         };
-        assert_eq!(over.progress_ratio(0), 1.0);
+        assert_eq!(over.progress_ratio(1), 1.0);
     }
 
     /// The regression this function exists for: with taproot activation as
@@ -216,18 +233,19 @@ mod tests {
 
         // The cursor observed on the dogfood mainnet node moments after
         // the backfill started: 231 blocks past activation, i.e. 0.09% of
-        // the 251_963-block walk.
+        // the 251_964-block walk.
         let fresh = running_at(709_863, TIP);
         let ratio = fresh.progress_ratio(ACTIVATION);
         assert!(
             ratio < 0.01,
             "a just-started mainnet backfill must read ~0.0, got {ratio}"
         );
-        // The pre-fix behaviour on that same cursor, kept explicit so a
-        // regression is legible rather than a bare number change.
+        // Measuring from genesis instead is what produced the 0.738 floor —
+        // asserted on the same cursor so a regression reads as intent rather
+        // than a bare number change.
         assert!(
             (fresh.progress_ratio(0) - 0.738_214).abs() < 1e-5,
-            "measuring from genesis is what produced the 0.738 floor"
+            "genesis-origin value should reproduce the reported 0.738"
         );
 
         // Halfway through the *eligible* span, not through the chain.
@@ -239,15 +257,26 @@ mod tests {
     }
 
     #[test]
-    fn progress_ratio_degenerate_spans_are_zero_not_nan() {
-        // Idle cursor with a non-zero walk_start: snapshot 0 <= start.
+    fn progress_ratio_nothing_to_walk_is_zero() {
+        // Idle cursor: no snapshot taken.
         assert_eq!(BackfillCursor::idle().progress_ratio(709_632), 0.0);
-        // Chain not yet past activation — the runner walks nothing.
+        // Chain not yet past activation — the runner returns without walking
+        // (its guard is `walk_start > snapshot_height`).
         assert_eq!(running_at(0, 500).progress_ratio(709_632), 0.0);
-        // snapshot == walk_start: a zero-width span must not divide by zero.
+    }
+
+    /// A snapshot sitting exactly on the walk start is NOT a zero-width span:
+    /// the runner's guard is `>`, so it walks that one block and completes.
+    /// Reporting 0.0 for a completed backfill is the same fencepost error
+    /// this function was fixed for, one step further out.
+    #[test]
+    fn progress_ratio_single_block_span_completes_at_one() {
         let r = running_at(1_000, 1_000).progress_ratio(1_000);
-        assert_eq!(r, 0.0);
-        assert!(r.is_finite());
+        assert!(r.is_finite(), "must not divide by zero");
+        assert_eq!(r, 1.0, "one-block walk, cursor on the snapshot => complete");
+
+        // Same span before that block is stamped (fresh cursor persists 0).
+        assert_eq!(running_at(0, 1_000).progress_ratio(1_000), 0.0);
     }
 
     #[test]

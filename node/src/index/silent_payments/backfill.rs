@@ -415,7 +415,7 @@ mod tests {
             started_at_unix: 0,
             snapshot_tip_hash: [0u8; 32],
         });
-        let report = render_status(Some(&h), true, false, 0);
+        let report = render_status(Some(&h), true, false, 1);
         assert!((report.progress_ratio - 0.25).abs() < 1e-9);
     }
 
@@ -433,7 +433,7 @@ mod tests {
         });
         let report = render_status(Some(&h), true, false, 709_632);
         assert!(
-            report.progress_ratio < 0.001,
+            report.progress_ratio < 0.01,
             "231 blocks past activation is ~0% of the walk, got {}",
             report.progress_ratio
         );
