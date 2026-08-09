@@ -130,6 +130,22 @@ pub struct LoadSnapshotSummary {
     pub tip_height: u32,
 }
 
+/// Outcome of [`ChainState::repair_block_data`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDataRepair {
+    /// The block's bytes were missing or unreadable and have been rewritten
+    /// from the supplied copy; the index entry now points at the new record.
+    Repaired {
+        height: u32,
+        /// True when the entry claimed to hold data (`DataStored`/`Valid`) —
+        /// i.e. this repaired a durability hole rather than filling in a
+        /// block we had only ever held the header for.
+        replaced_claimed_data: bool,
+    },
+    /// The stored bytes read back fine; nothing was written.
+    AlreadyPresent { height: u32 },
+}
+
 /// Result of a `repair_block_index_holes` pass.
 #[derive(Debug, Default, Clone)]
 pub struct RepairOutcome {
@@ -511,9 +527,17 @@ impl ChainState {
             }
         } else {
             let block_data = serialize(&genesis);
-            flat_files
+            let pos = flat_files
                 .write_block(&block_data, network_magic(network))
-                .map_err(|e| ChainError::FlatFile(e.to_string()))?
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            // Same data-before-pointer ordering `write_block_durable`
+            // enforces on the steady-state paths. This one runs once per
+            // datadir and predates the `ChainState` that owns that helper,
+            // so it syncs inline.
+            flat_files
+                .sync_all()
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+            pos
         };
 
         let parent_work = [0u8; 32];
@@ -2355,6 +2379,61 @@ impl ChainState {
         self.store.flush_durable()
     }
 
+    /// Append a block record to the flat files, upholding the "data before
+    /// the index entry that references it" ordering `flush_durable`
+    /// documents. Every caller that follows this with a `block_index` write
+    /// carrying the returned [`FlatFilePos`] MUST come through here.
+    ///
+    /// `flush_durable`'s ordering only binds at a flush. Between flushes the
+    /// two streams are independently buffered, and which one the kernel
+    /// writes back first is undefined:
+    ///
+    /// - `BulkLoad` (IBD): RocksDB writes bypass the WAL entirely, so an
+    ///   index entry cannot reach disk except through `flush_durable` — which
+    ///   fsyncs the flat files first. Correct by construction, and the fsync
+    ///   here is skipped so IBD keeps its sequential-append throughput.
+    /// - `Normal` (steady state): the WAL is on but `WriteOptions::sync` is
+    ///   not set, so an index entry can be written back to disk at any moment
+    ///   while the block bytes it points at are still dirty page cache. A
+    ///   kernel panic or power loss in that window commits the pointer and
+    ///   drops the payload, leaving a `DataStored` entry over a truncated
+    ///   record — `getblock` returns "block data not available", any index
+    ///   backfill walking that height fails hard, and the block cannot be
+    ///   served to peers. Consensus is unaffected (the UTXO delta was already
+    ///   applied), so the node looks healthy until something re-reads history.
+    ///
+    /// Observed on the mainnet dogfood node at height 954866: the record was
+    /// cut at a 4 KiB page boundary and the next block was appended at the
+    /// resulting EOF, 1.6 MB short of where the index said it ended.
+    ///
+    /// The fix is to fsync before returning in `Normal` mode. That is one
+    /// fsync per accepted block outside IBD — negligible at one block per
+    /// ~10 minutes, and zero on the IBD path that actually cares.
+    fn write_block_durable(&self, block_data: &[u8]) -> Result<FlatFilePos, ChainError> {
+        let mut flat = self.flat_files.lock();
+        let pos = flat
+            .write_block(block_data, network_magic(self.network))
+            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        if self.store.current_write_mode() == crate::storage::WriteMode::Normal {
+            flat.sync_all()
+                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        }
+        Ok(pos)
+    }
+
+    /// Re-derive the flat-file append offset from the file on disk.
+    ///
+    /// Opening a datadir already does this, so it matters only when the block
+    /// files change underneath a running node — which in practice means tests
+    /// simulating a crash-truncation without a restart. See
+    /// [`FlatFileManager::resync_append_pos`].
+    pub fn resync_block_append_pos(&self) -> Result<(), ChainError> {
+        self.flat_files
+            .lock()
+            .resync_append_pos()
+            .map_err(|e| ChainError::FlatFile(e.to_string()))
+    }
+
     /// Get the blocks directory path.
     pub fn blocks_dir(&self) -> &std::path::Path {
         &self.blocks_dir
@@ -2943,14 +3022,10 @@ impl ChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
-        // Write raw block to flat file
+        // Write raw block to flat file, durably enough that the index entry
+        // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self
-            .flat_files
-            .lock()
-            
-            .write_block(&block_data, network_magic(self.network))
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        let flat_pos = self.write_block_durable(&block_data)?;
 
         // Store block index entry as DataStored
         let chainwork = add_u256(&parent.chainwork, &work_for_bits(block.header.bits));
@@ -2990,6 +3065,154 @@ impl ChainState {
         }
 
         Ok((block_hash, new_height))
+    }
+
+    /// Whether this block's stored bytes can actually be read back.
+    ///
+    /// Distinct from the `block_index` status: a `DataStored`/`Valid` entry
+    /// asserts that data was written, but the record it points at can be
+    /// truncated or unreadable (see [`Self::write_block_durable`]). Callers
+    /// deciding whether a block needs re-fetching must ask this, not the
+    /// status flag.
+    pub fn block_data_readable(&self, hash: &BlockHash) -> bool {
+        self.get_block(hash).is_some()
+    }
+
+    /// Rewrite the on-disk copy of a block whose data is missing or
+    /// unreadable, repointing its `block_index` entry at the new record.
+    ///
+    /// This is the recovery half of the durability hole
+    /// [`Self::write_block_durable`] closes: an index entry that outlived the
+    /// bytes it referenced leaves the node with no way to serve, re-read, or
+    /// backfill over that height, and until now no way to fix it short of a
+    /// full resync. `block` is an untrusted copy supplied by a peer (see
+    /// `getblockfrompeer`).
+    ///
+    /// Authentication chain, given that we look the entry up *by the hash of
+    /// the block we were handed*:
+    /// - the hash matching a `block_index` entry means the header is one we
+    ///   already accepted (PoW, difficulty, and checkpoints checked then);
+    /// - the block hash commits to the merkle root, and
+    ///   [`validation::block::check_block_for_stored_copy`] ties the txdata to
+    ///   that root, rejects CVE-2012-2459 mutation, and — the part that
+    ///   matters here — verifies the BIP 141 commitment even for a block that
+    ///   presents as witness-free, so a witness-stripped copy is refused.
+    ///
+    /// So a peer can only supply the genuine block or be rejected. Status is
+    /// preserved: a `Valid` block stays `Valid` (its UTXO delta was applied
+    /// long ago and is not revisited), and a `HeaderOnly` entry becomes
+    /// `DataStored` so the normal connect machinery can pick it up.
+    ///
+    /// `Pruned` and `Invalid` entries are refused: the operator deliberately
+    /// discarded or rejected those, and silently repopulating them would
+    /// contradict that decision (and, for `Pruned`, desynchronize the prune
+    /// accounting).
+    pub fn repair_block_data(&self, block: &Block) -> Result<BlockDataRepair, ChainError> {
+        let hash = block.block_hash();
+        let entry = self
+            .store
+            .get_block_index(&hash)
+            .ok_or(ChainError::BlockNotFound)?;
+
+        match entry.status {
+            BlockStatus::Pruned => {
+                return Err(ChainError::InvalidArgument(format!(
+                    "block {hash} at height {} is pruned; refusing to \
+                     repopulate data the prune accounting no longer tracks",
+                    entry.height
+                )));
+            }
+            BlockStatus::Invalid => {
+                return Err(ChainError::InvalidArgument(format!(
+                    "block {hash} at height {} is marked invalid; refusing \
+                     to write data for it",
+                    entry.height
+                )));
+            }
+            _ => {}
+        }
+
+        if self.block_data_readable(&hash) {
+            return Ok(BlockDataRepair::AlreadyPresent {
+                height: entry.height,
+            });
+        }
+
+        validation::block::check_block_for_stored_copy(block)?;
+
+        // Append the record BEFORE taking `accept_lock`. `write_block_durable`
+        // takes the flat-file mutex, and `store_block` holds `accept_lock`
+        // while writing its batch *after* releasing that mutex — acquiring
+        // them in the other order here would invert the pairing.
+        let block_data = serialize(block);
+        let flat_pos = self.write_block_durable(&block_data)?;
+        // `write_block_durable` only syncs in `Normal` mode, where the index
+        // write below could otherwise reach disk first. A repair must hold
+        // that ordering in *every* mode: repointing the entry at a record
+        // that has not landed would relocate the hole rather than close it,
+        // and unlike a fresh block there is no re-download that fixes it
+        // automatically. In `Normal` mode the record is already synced and
+        // this is a no-op.
+        self.flat_files
+            .lock()
+            .sync_all()
+            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+
+        let _accept_guard = self.accept_lock.lock();
+
+        // Re-read under the lock. Two things can have changed since the checks
+        // above: a concurrent accept may have supplied this block's data (then
+        // leave its entry alone — our record simply becomes flat-file slack),
+        // or a concurrent `invalidateblock` may have rejected it (then the
+        // refusal above applies, and must not be bypassed by having already
+        // written the record).
+        let entry = self
+            .store
+            .get_block_index(&hash)
+            .ok_or(ChainError::BlockNotFound)?;
+        if matches!(entry.status, BlockStatus::Pruned | BlockStatus::Invalid) {
+            return Err(ChainError::InvalidArgument(format!(
+                "block {hash} at height {} became {:?} while the repair copy \
+                 was being written; not repointing its entry",
+                entry.height, entry.status
+            )));
+        }
+        if self.block_data_readable(&hash) {
+            return Ok(BlockDataRepair::AlreadyPresent {
+                height: entry.height,
+            });
+        }
+
+        let replaced_claimed_data = matches!(
+            entry.status,
+            BlockStatus::DataStored | BlockStatus::Valid
+        );
+        let height = entry.height;
+        let mut repaired = entry;
+        repaired.file_number = flat_pos.file_number;
+        repaired.data_pos = flat_pos.data_pos;
+        repaired.num_tx = block.txdata.len() as u32;
+        if repaired.status == BlockStatus::HeaderOnly {
+            repaired.status = BlockStatus::DataStored;
+        }
+
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, repaired));
+        self.store.write_batch(batch)?;
+
+        tracing::info!(
+            %hash,
+            height,
+            file_number = flat_pos.file_number,
+            data_pos = flat_pos.data_pos,
+            replaced_claimed_data,
+            "Repaired block data from a peer-supplied copy"
+        );
+
+        Ok(BlockDataRepair::Repaired {
+            height,
+            replaced_claimed_data,
+        })
     }
 
     /// Connect an already-stored block (DataStored) to the chain tip.
@@ -4449,14 +4672,10 @@ impl ChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
-        // Write raw block to flat file
+        // Write raw block to flat file, durably enough that the index entry
+        // below can never outlive the bytes it points at.
         let block_data = serialize(block);
-        let flat_pos = self
-            .flat_files
-            .lock()
-            
-            .write_block(&block_data, network_magic(self.network))
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+        let flat_pos = self.write_block_durable(&block_data)?;
 
         // Check if this extends the current tip or is a side chain
         let current_tip = self.tip_hash();
@@ -6098,6 +6317,228 @@ pub(crate) mod tests {
             blocks.push(b);
         }
         blocks
+    }
+
+    /// Truncate the flat file so `hash`'s record can no longer be read,
+    /// reproducing the shape of the mainnet-954866 hole: the `block_index`
+    /// entry survives and still claims `DataStored`/`Valid`, but the bytes it
+    /// points at are gone.
+    fn punch_block_data_hole(cs: &ChainState, dir: &std::path::Path, hash: &BlockHash) {
+        let entry = cs.get_block_index(hash).expect("entry must exist");
+        let path = dir
+            .join("blocks")
+            .join(format!("blk{:05}.dat", entry.file_number));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open flat file");
+        // Cut the file at the record's payload start: the header is readable,
+        // the body is not — exactly what a lost page-cache tail leaves behind.
+        f.set_len(entry.data_pos as u64 + 8).expect("truncate");
+        drop(f);
+        // A real crash-truncation is followed by a restart, which derives the
+        // append offset from the file length. Do the same here: without it the
+        // manager's cached `current_pos` still describes the pre-truncation
+        // file and would misreport where the repair's record landed.
+        cs.flat_files
+            .lock()
+            .resync_append_pos()
+            .expect("resync append offset as a restart would");
+        assert!(
+            !cs.block_data_readable(hash),
+            "the fixture must actually make the block unreadable"
+        );
+    }
+
+    /// The durability invariant behind the mainnet-954866 hole: in `Normal`
+    /// write mode nothing may leave a `block_index` entry referencing block
+    /// bytes that are still only in the page cache. `store_block` and
+    /// `accept_block` must therefore hand back a *synced* flat file.
+    #[test]
+    fn normal_mode_block_writes_are_synced_before_the_index_entry() {
+        let (cs, dir) = make_chain_state();
+        cs.set_write_mode(crate::storage::WriteMode::Normal);
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert!(
+            !cs.flat_files.lock().has_unsynced_writes(),
+            "store_block must fsync the block record before its index entry \
+             can reach disk"
+        );
+
+        cs.connect_stored_block(&b1.block_hash()).unwrap();
+        let b2 = build_test_block(b1.block_hash(), 2, 1_300_000_002);
+        cs.accept_block(&b2).unwrap();
+        assert!(
+            !cs.flat_files.lock().has_unsynced_writes(),
+            "accept_block must fsync the block record before its index entry \
+             can reach disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IBD keeps the unsynced fast path: `BulkLoad` disables the WAL, so an
+    /// index entry cannot reach disk except via `flush_durable`, which syncs
+    /// the flat files first. Paying an fsync per block here would cost real
+    /// IBD throughput for no safety gain.
+    #[test]
+    fn bulkload_mode_block_writes_stay_unsynced() {
+        let (cs, dir) = make_chain_state();
+        cs.set_write_mode(crate::storage::WriteMode::BulkLoad);
+
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let b1 = build_test_block(genesis.block_hash(), 1, 1_300_000_001);
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        assert!(
+            cs.flat_files.lock().has_unsynced_writes(),
+            "BulkLoad must not fsync per block"
+        );
+
+        // ...and flush_durable still closes the window, in the right order.
+        cs.flush_durable().unwrap();
+        assert!(!cs.flat_files.lock().has_unsynced_writes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_block_data_restores_an_unreadable_block() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let target = blocks[1].clone();
+        let hash = target.block_hash();
+        let before = cs.get_block_index(&hash).unwrap();
+
+        punch_block_data_hole(&cs, &dir, &hash);
+
+        let outcome = cs.repair_block_data(&target).expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            BlockDataRepair::Repaired {
+                height: 2,
+                replaced_claimed_data: true,
+            }
+        );
+
+        // The block reads back byte-identically, and the entry was repointed
+        // without disturbing anything else about it.
+        assert_eq!(cs.get_block(&hash).as_ref(), Some(&target));
+        let after = cs.get_block_index(&hash).unwrap();
+        assert_eq!(after.status, before.status, "status must be preserved");
+        assert_eq!(after.height, before.height);
+        assert_eq!(after.chainwork, before.chainwork);
+        assert_eq!(after.header, before.header);
+        assert_ne!(
+            (after.file_number, after.data_pos),
+            (before.file_number, before.data_pos),
+            "the entry must point at the newly written record"
+        );
+
+        // The chain is still intact around the repaired height.
+        assert_eq!(cs.tip_height(), 3);
+        assert_eq!(cs.check_block_index(None), Ok(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_block_data_is_a_noop_when_the_data_is_readable() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 2);
+        let target = blocks[0].clone();
+        let before = cs.get_block_index(&target.block_hash()).unwrap();
+
+        assert_eq!(
+            cs.repair_block_data(&target).unwrap(),
+            BlockDataRepair::AlreadyPresent { height: 1 }
+        );
+        let after = cs.get_block_index(&target.block_hash()).unwrap();
+        assert_eq!(
+            (after.file_number, after.data_pos),
+            (before.file_number, before.data_pos),
+            "a readable block must not be rewritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_block_data_rejects_a_block_we_never_accepted_a_header_for() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 1);
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let stranger = build_test_block(genesis.block_hash(), 1, 1_999_999_999);
+
+        assert!(matches!(
+            cs.repair_block_data(&stranger),
+            Err(ChainError::BlockNotFound)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The peer supplying the repair copy is untrusted. A body that does not
+    /// match the header we already accepted must be refused rather than
+    /// written over the hole.
+    #[test]
+    fn repair_block_data_rejects_a_body_that_does_not_match_the_header() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 2);
+        let target = blocks[1].clone();
+        let hash = target.block_hash();
+        punch_block_data_hole(&cs, &dir, &hash);
+
+        // Keep the authentic header, swap in foreign txdata. The merkle root
+        // no longer matches, which is what `check_block` catches.
+        let mut forged = target.clone();
+        forged.txdata = build_test_block(blocks[0].block_hash(), 2, 1_300_000_777).txdata;
+        assert_eq!(
+            forged.header, target.header,
+            "the fixture keeps the accepted header"
+        );
+
+        let err = cs
+            .repair_block_data(&forged)
+            .expect_err("a mismatched body must be rejected");
+        assert!(
+            matches!(err, ChainError::Validation(_)),
+            "expected a validation failure, got {err:?}"
+        );
+        assert!(
+            !cs.block_data_readable(&hash),
+            "a rejected repair must not leave the entry pointing at bad data"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_block_data_refuses_invalidated_blocks() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let target = blocks[2].clone();
+        let hash = target.block_hash();
+
+        cs.invalidate_block(hash).expect("invalidate");
+        assert_eq!(
+            cs.get_block_index(&hash).unwrap().status,
+            BlockStatus::Invalid
+        );
+
+        let err = cs
+            .repair_block_data(&target)
+            .expect_err("an invalidated block must not be repaired");
+        assert!(
+            matches!(err, ChainError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -63,6 +63,26 @@ pub fn check_block(block: &Block) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// [`check_block`] plus the strict witness check required before a block's
+/// bytes may be written over — or in place of — a copy we already treat as
+/// validated.
+///
+/// The extra rule: if the coinbase carries a BIP 141 commitment output, verify
+/// it whether or not the block appears to carry witnesses. See
+/// [`verify_witness_commitment`] for why the consensus path's short-circuit is
+/// unsafe here.
+///
+/// Used by `ChainState::repair_block_data`, whose input is an untrusted peer's
+/// copy of a block our index already records as `Valid` — the block hash and
+/// merkle root authenticate the txids, and this authenticates the witnesses.
+pub fn check_block_for_stored_copy(block: &Block) -> Result<(), ValidationError> {
+    check_block(block)?;
+    if has_witness_commitment_output(block) {
+        verify_witness_commitment(block)?;
+    }
+    Ok(())
+}
+
 /// Validate the witness commitment in a block (BIP 141).
 /// If any non-coinbase transaction has witness data, the coinbase must contain
 /// a valid witness commitment output.
@@ -75,6 +95,41 @@ fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
         return Ok(()); // No witness data, no commitment needed
     }
 
+    verify_witness_commitment(block)
+}
+
+/// Whether the coinbase carries a BIP 141 witness-commitment output.
+pub fn has_witness_commitment_output(block: &Block) -> bool {
+    block
+        .txdata
+        .first()
+        .is_some_and(|coinbase| {
+            coinbase.output.iter().any(|output| {
+                let script = output.script_pubkey.as_bytes();
+                script.len() >= 38 && script[..6] == WITNESS_COMMITMENT_HEADER
+            })
+        })
+}
+
+/// Verify the BIP 141 commitment unconditionally — no "block carries no
+/// witnesses, nothing to check" short-circuit.
+///
+/// [`check_witness_commitment`] deliberately keeps that short-circuit: it is
+/// the consensus path, and a block whose transactions carry no witness data
+/// needs no commitment. But the short-circuit is exactly what a peer exploits
+/// to hand back a *witness-stripped* copy of a segwit block: the merkle root
+/// commits to txids only, so stripping every witness leaves the block hash
+/// and merkle root intact, `has_witness` false, and the check skipped.
+///
+/// On the connect path that costs nothing — a stripped block fails script
+/// validation. On a path that *replaces stored bytes for an already-validated
+/// block* nothing re-runs scripts, so the strip would be silently persisted.
+/// Those callers use [`check_block_for_stored_copy`] instead.
+///
+/// A genuinely witness-free block that still carries a commitment output is
+/// handled correctly rather than rejected: with no witnesses every wtxid
+/// equals its txid, so the commitment recomputes and matches.
+fn verify_witness_commitment(block: &Block) -> Result<(), ValidationError> {
     // Find the witness commitment in coinbase outputs (last matching one wins)
     let coinbase = &block.txdata[0];
     let mut commitment_hash = None;
@@ -716,5 +771,167 @@ mod tests {
         // The plain regtest genesis block (coinbase only) is not mutated.
         let block = bitcoin::constants::genesis_block(Network::Regtest);
         assert!(!is_block_mutated(&block));
+    }
+
+    /// A segwit block whose coinbase carries a valid BIP 141 commitment and
+    /// whose single spend carries witness data. Mirrors the construction in
+    /// `test_witness_valid_commitment`.
+    fn segwit_block_with_commitment() -> Block {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+        let witness_nonce = [0u8; 32];
+
+        let mut witness = Witness::new();
+        witness.push([0x01; 72]);
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let wtxid_hashes: Vec<[u8; 32]> = vec![
+            [0u8; 32],
+            spending.compute_wtxid().to_raw_hash().to_byte_array(),
+        ];
+        let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&witness_root);
+        preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+
+        let mut commitment_script = Vec::with_capacity(38);
+        commitment_script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        commitment_script.extend_from_slice(&commitment);
+
+        let mut coinbase_witness = Witness::new();
+        coinbase_witness.push(witness_nonce);
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: coinbase_witness,
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: bitcoin::ScriptBuf::from(commitment_script),
+                },
+            ],
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    /// The attack `check_block_for_stored_copy` exists to stop.
+    ///
+    /// Stripping every witness from a segwit block leaves the txids — and so
+    /// the merkle root and the block hash — untouched. `check_block` accepts
+    /// it, because its commitment check short-circuits on "no witnesses
+    /// present". Any path that overwrites the stored bytes of an
+    /// already-validated block with peer-supplied data must not.
+    #[test]
+    fn witness_stripped_block_passes_check_block_but_not_the_stored_copy_check() {
+        let block = segwit_block_with_commitment();
+        assert!(check_block(&block).is_ok(), "the honest block is valid");
+        assert!(check_block_for_stored_copy(&block).is_ok());
+
+        let mut stripped = block.clone();
+        for tx in &mut stripped.txdata {
+            for input in &mut tx.input {
+                input.witness = bitcoin::Witness::new();
+            }
+        }
+
+        // The strip is invisible to everything the block hash commits to.
+        assert_eq!(
+            stripped.block_hash(),
+            block.block_hash(),
+            "stripping witnesses must not change the block hash — that is why \
+             the hash alone cannot authenticate a re-fetched body"
+        );
+        assert_eq!(stripped.header.merkle_root, block.header.merkle_root);
+        assert!(
+            stripped.txdata.iter().any(|tx| tx.input.iter().any(|i| i.witness.is_empty())),
+            "the fixture must actually be stripped"
+        );
+
+        assert!(
+            check_block(&stripped).is_ok(),
+            "documents the consensus path's short-circuit: a witness-free \
+             block needs no commitment, so check_block cannot catch this"
+        );
+        assert!(
+            matches!(
+                check_block_for_stored_copy(&stripped),
+                Err(ValidationError::BadWitnessCommitment)
+            ),
+            "the strict check must reject a witness-stripped copy"
+        );
+    }
+
+    /// The strict check must not reject a block that legitimately carries a
+    /// commitment output while having no witness data — every wtxid equals
+    /// its txid there, so the commitment still recomputes.
+    #[test]
+    fn stored_copy_check_accepts_a_genuinely_witness_free_block_with_a_commitment() {
+        use bitcoin::hashes::Hash as _;
+
+        let mut block = segwit_block_with_commitment();
+        // Drop the witnesses, then rebuild the commitment over the resulting
+        // (witness-free) wtxid set — this is an honest block, not a strip.
+        for tx in &mut block.txdata {
+            for input in &mut tx.input {
+                input.witness = bitcoin::Witness::new();
+            }
+        }
+        let wtxid_hashes: Vec<[u8; 32]> = std::iter::once([0u8; 32])
+            .chain(
+                block.txdata[1..]
+                    .iter()
+                    .map(|tx| tx.compute_wtxid().to_raw_hash().to_byte_array()),
+            )
+            .collect();
+        let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&witness_root);
+        // The nonce comes from the coinbase witness, which we just cleared,
+        // so the verifier will use the all-zero default.
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+        let mut script = Vec::with_capacity(38);
+        script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        script.extend_from_slice(&commitment);
+        let last = block.txdata[0].output.len() - 1;
+        block.txdata[0].output[last].script_pubkey = bitcoin::ScriptBuf::from(script);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(has_witness_commitment_output(&block));
+        assert!(
+            check_block_for_stored_copy(&block).is_ok(),
+            "an honest witness-free block carrying a commitment must pass"
+        );
     }
 }

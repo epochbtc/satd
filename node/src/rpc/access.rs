@@ -167,6 +167,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "clearbanned"
         | "setnetworkactive"
         | "logging"
+        // directs a named peer to send us a block, and rewrites that
+        // block's stored data — operator peer management, not a read
+        | "getblockfrompeer"
         // mempool *policy* mutation (mining priority), not a submit
         | "prioritisetransaction"
         // operational flush of the mempool to disk
@@ -242,6 +245,7 @@ mod tests {
             "clearbanned",
             "setnetworkactive",
             "logging",
+            "getblockfrompeer",
             "prioritisetransaction",
             "savemempool",
             "backfillindex",

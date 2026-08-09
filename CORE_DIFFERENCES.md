@@ -328,6 +328,18 @@ preserved; the satd extension is opt-in per request or per flag.
   that have not yet upgraded, so it stays opt-in until v2 adoption is
   high. `getpeerinfo.transport_protocol_type` reports `v1`/`v2` per peer.
 
+- **`getblockfrompeer` without a peer id, and readability-based
+  "already downloaded"** — Core requires `peer_id` and refuses the call
+  when the block index's `BLOCK_HAVE_DATA` flag is set. satd accepts
+  Core's exact call unchanged, and additionally (a) makes `peer_id`
+  optional, picking a connected `NODE_NETWORK` peer itself, and (b)
+  decides "already downloaded" by whether the block's bytes can actually
+  be *read back*. Core's flag test refuses precisely the case the RPC is
+  most useful for: an index entry that claims to hold data whose flat-file
+  record was lost. The reply is authenticated against the header already
+  in our index and repairs the stored copy in place. See
+  [Repairing lost block data](https://epochbtc.github.io/satd/disk-footprint.html#repairing-lost-block-data).
+
 - **`--profile=<preset>`** — bundled config presets (`archival`,
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`). CLI
   flags override profile values. `getconfig` RPC + `sat-cli node config`

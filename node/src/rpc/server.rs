@@ -524,6 +524,19 @@ pub async fn start(
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
 
+    module.register_method("getblockfrompeer", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let hash: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        // Optional as a satd extension; Core requires it. See
+        // `network::get_block_from_peer`.
+        let peer_id: Option<crate::net::peer::PeerId> =
+            seq.optional_next().unwrap_or(None);
+        network::get_block_from_peer(&ctx.chain_state, &ctx.peer_manager, &hash, peer_id)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("getdifficulty", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_difficulty(&ctx.chain_state))
     })?;
@@ -1488,6 +1501,7 @@ pub async fn start(
             "getblockchaininfo",
             "getblockcount",
             "getblockhash",
+            "getblockfrompeer",
             "getblockheader",
             "getblockstats",
             "getblocktemplate",

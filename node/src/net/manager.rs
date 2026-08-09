@@ -82,6 +82,12 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+/// How long a `getblockfrompeer` request stays armed. A block arriving after
+/// this window is treated as an ordinary unsolicited block rather than a
+/// repair, so a peer that answers minutes late cannot divert a block the
+/// normal paths were already handling. Generous relative to a single-block
+/// round trip, short enough that the map self-drains.
+const BLOCK_REFETCH_TTL: Duration = Duration::from_secs(600);
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -220,6 +226,13 @@ pub struct PeerManager {
     /// Track blocks currently in-flight (requested but not yet received).
     #[allow(dead_code)]
     in_flight_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
+    /// Blocks explicitly requested by `getblockfrompeer`, with the time of
+    /// the request. An arriving block whose hash is in this map is routed to
+    /// `ChainState::repair_block_data` instead of the normal accept path —
+    /// the normal path rejects it as a duplicate, which is precisely the
+    /// case a repair needs to handle. Entries expire so an unanswered
+    /// request cannot pin memory or silently divert a much later arrival.
+    block_refetch: RwLock<HashMap<bitcoin::BlockHash, Instant>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
     /// Operator-declared external addresses (Bitcoin Core's
@@ -478,6 +491,7 @@ impl PeerManager {
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
+            block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
@@ -2657,8 +2671,116 @@ impl PeerManager {
         false
     }
 
+    /// Ask `peer_id` for a single block, routing the reply to the block-data
+    /// repair path rather than the normal accept path.
+    ///
+    /// Backs the `getblockfrompeer` RPC. Returns an error string suitable for
+    /// surfacing to the operator when the peer is unknown, not connected, or
+    /// its send queue is full.
+    pub fn request_block_from_peer(
+        &self,
+        hash: bitcoin::BlockHash,
+        peer_id: PeerId,
+    ) -> Result<(), String> {
+        {
+            let peers = self.peers.read();
+            match peers.get(&peer_id) {
+                None => return Err(format!("Peer {peer_id} does not exist")),
+                Some(h) if h.info.state != PeerState::Connected => {
+                    return Err(format!("Peer {peer_id} is not connected"));
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Register before sending: the reply can land on the peer thread
+        // before `send_to_peer` even returns.
+        {
+            let mut pending = self.block_refetch.write();
+            pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+            pending.insert(hash, Instant::now());
+        }
+
+        if !self.send_to_peer(peer_id, sync::make_getdata_blocks(&[hash])) {
+            self.block_refetch.write().remove(&hash);
+            return Err(format!("Failed to send getdata to peer {peer_id}"));
+        }
+
+        tracing::info!(%hash, peer_id, "Requested single block from peer for data repair");
+        Ok(())
+    }
+
+    /// Peer ids eligible to serve a block re-fetch: connected, and
+    /// advertising `NODE_NETWORK` so they should hold historical blocks.
+    pub fn block_serving_peer_ids(&self) -> Vec<PeerId> {
+        let peers = self.peers.read();
+        peers
+            .iter()
+            .filter(|(_, h)| {
+                h.info.state == PeerState::Connected
+                    && h.info.services.has(ServiceFlags::NETWORK)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Route a block that `getblockfrompeer` asked for into the repair path.
+    /// Returns true when the block was consumed here.
+    fn handle_refetched_block(&self, id: PeerId, block: &bitcoin::Block) -> bool {
+        let hash = block.block_hash();
+        {
+            let mut pending = self.block_refetch.write();
+            pending.retain(|_, at| at.elapsed() < BLOCK_REFETCH_TTL);
+            if pending.remove(&hash).is_none() {
+                return false;
+            }
+        }
+
+        match self.chain_state.repair_block_data(block) {
+            Ok(crate::chain::state::BlockDataRepair::Repaired {
+                height,
+                replaced_claimed_data,
+            }) => {
+                tracing::info!(
+                    %hash, height, id, replaced_claimed_data,
+                    "getblockfrompeer: block data repaired"
+                );
+            }
+            Ok(crate::chain::state::BlockDataRepair::AlreadyPresent { height }) => {
+                tracing::info!(
+                    %hash, height, id,
+                    "getblockfrompeer: block data was already readable; nothing written"
+                );
+            }
+            // The block failed to authenticate against a header we already
+            // accepted — the peer sent something it should not have. Same
+            // penalty as a mutated block.
+            Err(e @ crate::chain::state::ChainError::Validation(_)) => {
+                tracing::warn!(
+                    %hash, id, error = %e,
+                    "getblockfrompeer: peer returned a block that does not match the header"
+                );
+                self.add_ban_score(id, 100, "bad-refetched-block");
+            }
+            // Everything else is ours, not the peer's: a storage or flat-file
+            // failure, or the block having been pruned or invalidated in the
+            // meantime. Penalizing the peer for our disk would be wrong.
+            Err(e) => {
+                tracing::warn!(%hash, id, error = %e, "getblockfrompeer: repair failed locally");
+            }
+        }
+        true
+    }
+
     fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
         if self.reject_if_mutated(id, &block) {
+            return;
+        }
+
+        // Operator-requested single-block re-fetch. Must come before every
+        // other route: the normal paths reject a block we already have an
+        // index entry for, which is the whole point of a repair.
+        if self.handle_refetched_block(id, &block) {
             return;
         }
 

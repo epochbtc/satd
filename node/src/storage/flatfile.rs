@@ -251,27 +251,85 @@ impl FlatFileManager {
             }
         };
 
-        if self.xor_key == ZERO_XOR_KEY {
-            file.write_all(&network_magic)?;
-            file.write_all(&(block_data.len() as u32).to_le_bytes())?;
-            file.write_all(block_data)?;
-        } else {
-            // Obfuscated (Core v28+ `xor.dat`): every on-disk byte is
-            // XORed with the key at its absolute file offset.
-            let mut header = [0u8; 8];
-            header[..4].copy_from_slice(&network_magic);
-            header[4..].copy_from_slice(&(block_data.len() as u32).to_le_bytes());
-            xor_in_place(&mut header, &self.xor_key, self.current_pos);
-            file.write_all(&header)?;
-            let mut payload = block_data.to_vec();
-            xor_in_place(&mut payload, &self.xor_key, self.current_pos + 8);
-            file.write_all(&payload)?;
+        // Copy what the write needs so the closure borrows only `file` —
+        // `file` is itself borrowed from `self.write_handle`, and the error
+        // arm below needs `&mut self`.
+        let xor_key = self.xor_key;
+        let record_start = self.current_pos;
+        let write_result = (|| -> std::io::Result<()> {
+            if xor_key == ZERO_XOR_KEY {
+                file.write_all(&network_magic)?;
+                file.write_all(&(block_data.len() as u32).to_le_bytes())?;
+                file.write_all(block_data)?;
+            } else {
+                // Obfuscated (Core v28+ `xor.dat`): every on-disk byte is
+                // XORed with the key at its absolute file offset.
+                let mut header = [0u8; 8];
+                header[..4].copy_from_slice(&network_magic);
+                header[4..].copy_from_slice(&(block_data.len() as u32).to_le_bytes());
+                xor_in_place(&mut header, &xor_key, record_start);
+                file.write_all(&header)?;
+                let mut payload = block_data.to_vec();
+                xor_in_place(&mut payload, &xor_key, record_start + 8);
+                file.write_all(&payload)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            // A failed `write_all` — ENOSPC mid-record is the realistic one —
+            // may still have put bytes on disk. `current_pos` was not
+            // advanced, so it now understates the real end of file. Because
+            // the handle is opened `append(true)`, the *next* write would land
+            // at the true EOF while being recorded at this stale, lower
+            // offset: every subsequent block-index entry would then point
+            // into the middle of its predecessor's record. Resync from the
+            // file so the next record is recorded where it actually goes.
+            self.resync_append_pos()?;
+            return Err(e);
         }
 
         self.current_pos += record_size;
         self.dirty = true;
 
         Ok(pos)
+    }
+
+    /// Recompute the append offset from the file on disk and drop the cached
+    /// write handle.
+    ///
+    /// `current_pos` is a cached mirror of the current file's length. The two
+    /// diverge when bytes reach the file without this manager accounting for
+    /// them (a partially-completed `write_block`) or when the file is
+    /// shortened underneath it (a crash that lost an unsynced tail). Since
+    /// writes are appends, a stale `current_pos` does not misplace the bytes —
+    /// it misreports *where they went*, which is worse: the `block_index`
+    /// entry ends up pointing at the wrong offset.
+    ///
+    /// Opening the manager already derives `current_pos` this way, so a
+    /// restart is self-correcting; this makes the same correction available
+    /// without one.
+    pub fn resync_append_pos(&mut self) -> std::io::Result<()> {
+        // Flush what the outgoing handle already wrote before dropping it.
+        // Records that completed before the divergence are accounted for and
+        // may already be referenced by a `block_index` entry, and once the
+        // handle is gone `sync_all` has nothing to fsync through. Best-effort:
+        // the usual caller is an error path where the disk is already
+        // unhappy, and the failure it is reporting takes precedence.
+        if self.dirty
+            && let Some(f) = &self.write_handle
+        {
+            let _ = f.sync_data();
+        }
+        self.dirty = false;
+        self.write_handle = None;
+        let path = self.file_path(self.current_file);
+        self.current_pos = if path.exists() {
+            std::fs::metadata(&path)?.len()
+        } else {
+            0
+        };
+        Ok(())
     }
 
     /// Fsync any unsynced block-file writes (Core's `FlushBlockFile`).
@@ -733,6 +791,58 @@ mod tests {
         assert!(!mgr.has_unsynced_writes());
         assert_eq!(mgr.read_block(&pos_a).unwrap(), vec![0xAA; 1024]);
         assert_eq!(mgr.read_block(&pos_c).unwrap(), vec![0xCC; 1024]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `current_pos` is a cached mirror of the file length. If the file is
+    /// shortened underneath the manager — a crash that lost an unsynced tail —
+    /// the cache overstates it, and because writes are appends the next record
+    /// lands at the real EOF while being *recorded* at the stale offset. A
+    /// `block_index` entry built from that offset points at nothing.
+    #[test]
+    fn resync_append_pos_recovers_the_offset_after_the_file_is_shortened() {
+        let dir = temp_dir("resync-append-pos");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+
+        let first = mgr.write_block(&vec![0xAA; 4096], magic).unwrap();
+        mgr.sync_all().unwrap();
+
+        // Lose the tail of the file, as an unsynced page-cache loss would.
+        let path = dir.join("blk00000.dat");
+        let truncated_len = 2048u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(truncated_len)
+            .unwrap();
+
+        // Without a resync the manager still believes the file is long, so it
+        // hands back an offset the record was not written at.
+        let stale = mgr.write_block(&vec![0xBB; 512], magic).unwrap();
+        assert!(
+            !matches!(mgr.read_block(&stale), Ok(ref d) if d.as_slice() == [0xBB; 512]),
+            "the stale offset must not resolve to the record just written"
+        );
+
+        // A resync on the SAME manager restores the truth — deliberately not
+        // a fresh `FlatFileManager::new`, whose constructor would recompute
+        // the offset by itself and so prove nothing about this method.
+        mgr.resync_append_pos().unwrap();
+        assert_eq!(
+            mgr.current_pos,
+            std::fs::metadata(&path).unwrap().len(),
+            "resync must adopt the real file length"
+        );
+
+        // Records written afterwards read back at the offset reported.
+        let good = mgr.write_block(&vec![0xCC; 777], magic).unwrap();
+        assert_eq!(mgr.read_block(&good).unwrap(), vec![0xCC; 777]);
+
+        // The surviving prefix of the first record is still where it was.
+        assert_eq!(first.data_pos, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

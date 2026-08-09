@@ -11,6 +11,19 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Fixed: a crash could leave a block's index entry pointing at block bytes
+  that never reached disk.** Outside bulk-load mode a block's flat-file record
+  is now fsync'd before the `block_index` entry referencing it can be
+  committed. The resulting hole was silent — consensus is unaffected — until
+  something re-read history, at which point `getblock` returned "Block data not
+  available", index backfills failed at that height, and the block could not be
+  served to peers.
+- New **`getblockfrompeer`** RPC (Core-compatible) re-fetches a single block
+  from one peer and repairs its stored copy in place, so a lost block body no
+  longer requires a full resync. `peer_id` is optional (Core requires it), and
+  "already downloaded" is decided by whether the bytes actually read back
+  rather than by the index status flag. Peer-supplied blocks are authenticated
+  against the header already held, including the BIP 141 witness commitment.
 - New **Go SDK** (`satdevents`) for the streaming API, at `clients/go/` as an
   independently versioned module (`clients/go/vX.Y.Z` tags): full parity with
   `satd-events-client` — firehose, all watch kinds, durable cursors, reconnect,

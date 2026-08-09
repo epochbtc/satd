@@ -198,7 +198,10 @@ impl CoinCache {
         self.write_mode.store(v, Ordering::Relaxed);
     }
 
-    fn current_write_mode(&self) -> WriteMode {
+    /// The active write-durability mode. `ChainState::write_block_durable`
+    /// reads this to decide whether a flat-file fsync is required before the
+    /// referencing `block_index` entry can be committed.
+    pub fn current_write_mode(&self) -> WriteMode {
         decode_write_mode(self.write_mode.load(Ordering::Relaxed))
     }
 

@@ -329,10 +329,22 @@ impl BackgroundChainState {
             }
             _ => {
                 let block_data = serialize(block);
-                self.flat_files
-                    .lock()
+                let mut flat = self.flat_files.lock();
+                let pos = flat
                     .write_block(&block_data, network_magic(self.network))
-                    .map_err(|e| ChainError::FlatFile(e.to_string()))?
+                    .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+                // Same "data before the pointer" ordering
+                // `ChainState::write_block_durable` enforces, and for the same
+                // reason: the `block_index` entry written below would
+                // otherwise be able to reach disk first and outlive these
+                // bytes. Unconditional rather than mode-gated — this struct
+                // routes index writes through `SplitStore` to the shared block
+                // store, whose write mode is not the one `self.coins` reports,
+                // and the background connector fully script-verifies every
+                // block, so one fsync per block is far below the noise floor.
+                flat.sync_all()
+                    .map_err(|e| ChainError::FlatFile(e.to_string()))?;
+                pos
             }
         };
 

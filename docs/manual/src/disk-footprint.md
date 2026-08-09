@@ -154,6 +154,63 @@ surfaces refuse a request rather than return a partial result.
 > address indices. About 85% of tweaks describe dust outputs; a subscription
 > can drop them with a `tweak_dust_limit`.
 
+## Repairing lost block data
+
+Block bodies live in the flat files under `blocks/` (`blk*.dat`), not in
+RocksDB. The `block_index` entry for a block records which file and offset its
+record starts at. Those are two independently buffered write streams, so it is
+possible — after a kernel panic or power loss, never after a clean shutdown or
+a plain process crash — to end up with an index entry that survived while the
+block bytes it points at did not.
+
+The symptom is a single block that behaves as if it were pruned on a node that
+is not pruning:
+
+```console
+$ sat-cli getblock 000000000000000000000b951399b504a52a3fdfa1d33bcde59ac6c019c4af1c 0
+error code: -5
+error message:
+Block data not available
+```
+
+`getblockheader` still works and shows the block connected with a normal
+confirmation count, because consensus never re-reads the body: the UTXO delta
+was applied when the block connected. Nothing surfaces the hole until something
+walks history — an index backfill fails at that height, or a peer's request for
+the block cannot be served.
+
+Fetch a fresh copy of just that block from a peer:
+
+```sh
+sat-cli getblockfrompeer <blockhash>          # satd picks a peer
+sat-cli getblockfrompeer <blockhash> <peer_id>  # or name one from `getpeerinfo`
+```
+
+The call returns as soon as the request is sent; the repair happens when the
+block arrives. Re-run `getblock` to confirm, and check the log for
+`Repaired block data from a peer-supplied copy`.
+
+The supplied block is authenticated before anything is written. Its hash must
+match a header already in the index — which is what carries the proof-of-work
+and difficulty checks made when that header was accepted — and its transactions
+must match the merkle root that hash commits to, with the BIP 141 witness
+commitment verified as well, so a peer cannot substitute a witness-stripped
+body. A peer that fails those checks is disconnected. Blocks that are pruned or
+marked invalid are refused: those states are deliberate, and repopulating them
+would contradict the decision that produced them.
+
+To find holes ahead of time rather than discovering them through a failed
+backfill, walk the range you care about with `getblockstats`, which reads each
+block body and returns `-5` for any that cannot be read.
+
+> **Note.** satd fsyncs a block's record before its index entry can reach disk
+> whenever it is not in bulk-load mode, so the window above is closed for
+> blocks written by current versions. During initial block download the index
+> writes bypass the write-ahead log entirely and become durable only through a
+> flush that syncs the flat files first, which is why IBD keeps its unsynced
+> fast path without being exposed. Datadirs that predate this may still carry a
+> hole from an earlier crash.
+
 ## Compaction
 
 RocksDB background compaction runs continuously. satd's bulk-load reindex mode
