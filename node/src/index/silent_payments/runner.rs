@@ -99,13 +99,11 @@ pub struct BackfillRunner {
 }
 
 impl BackfillRunner {
-    /// Lowest height that can carry a BIP 352 tweak row: taproot
-    /// activation, but never below 1 (genesis is never connected via
-    /// `connect_block`, so the live path emits no row there).
+    /// Lowest height that can carry a BIP 352 tweak row. Delegates to the
+    /// module-level definition so the runner's walk floor and the origin
+    /// progress is measured from can never drift apart.
     fn walk_start(&self) -> u32 {
-        crate::validation::script::activation_heights(self.chain.network)
-            .taproot
-            .max(1)
+        super::walk_start(self.chain.network)
     }
 
     /// Run to completion (or pause/cancel/shutdown). Synchronous; callers
@@ -241,9 +239,7 @@ impl BackfillRunner {
         if cur.snapshot_height == 0 {
             return Ok(());
         }
-        let walk_start = crate::validation::script::activation_heights(chain.network)
-            .taproot
-            .max(1);
+        let walk_start = super::walk_start(chain.network);
         let old_anchor = BlockHash::from_byte_array(cur.snapshot_tip_hash);
         let mut old_hashes = vec![BlockHash::all_zeros(); (cur.snapshot_height + 1) as usize];
         {

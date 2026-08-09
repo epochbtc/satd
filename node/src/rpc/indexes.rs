@@ -170,6 +170,7 @@ pub fn get_index_info(
             sp_backfill.map(|h| h.as_ref()),
             sp_index_enabled,
             sp_complete,
+            silent_payments::walk_start(chain.network),
         );
         let mut spi = serde_json::Map::new();
         spi.insert("synced".into(), json!(report.synced));
@@ -855,9 +856,7 @@ fn sp_start_fresh(
     // marker means "no holes below the tip", which is trivially true when
     // there are no eligible blocks. A later block connect above activation
     // is handled by the live emit path (which keeps the index whole).
-    let walk_start = crate::validation::script::activation_heights(chain.network)
-        .taproot
-        .max(1);
+    let walk_start = silent_payments::walk_start(chain.network);
     if tip_height < walk_start {
         h.reset_flags();
         h.start(store.as_ref(), tip_height, tip_hash.to_byte_array())

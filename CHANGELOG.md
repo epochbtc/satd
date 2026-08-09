@@ -76,7 +76,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   stamps a completeness marker; `pauseindex`/`resumeindex`/`cancelindex
   silentpayment` control it. `getindexinfo` gains a `silentpayments` section
   (synced + backfill progress) and a `satd_spindex_backfill_progress_ratio`
-  gauge is exported. Until a backfill completes (or the sync ran from genesis
+  gauge is exported; both measure progress across the walked span
+  `[taproot activation, tip]`, so on mainnet a fresh backfill reads 0.0 rather
+  than 0.74. Until a backfill completes (or the sync ran from genesis
   with the index on), the index reports not-synced so tweak-serving surfaces
   refuse rather than return holes.
 - Silent payments (BIP 352): streaming-API wire schema (`satd-events-proto`) for

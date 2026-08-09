@@ -295,11 +295,15 @@ impl BackfillHandle {
 pub const PREFLIGHT_REQUIRED_FREE_BYTES: u64 = 6 * 1_073_741_824;
 
 /// Build the snapshot reported by `getindexinfo`'s `silent payment index`
-/// sibling. Same shape as the filter-index `render_status`.
+/// sibling. Same shape as the filter-index `render_status`, except that
+/// progress is measured from `walk_start` (taproot activation) rather than
+/// from genesis — the filter index walks the whole chain, this one does
+/// not. Pass `super::walk_start(network)`.
 pub fn render_status(
     handle: Option<&BackfillHandle>,
     sp_enabled: bool,
     sp_complete: bool,
+    walk_start: u32,
 ) -> StatusReport {
     let cursor = handle
         .map(|h| h.cursor())
@@ -316,7 +320,7 @@ pub fn render_status(
         cursor_height: cursor.cursor_height,
         snapshot_height: cursor.snapshot_height,
         started_at_unix: cursor.started_at_unix,
-        progress_ratio: cursor.progress_ratio(),
+        progress_ratio: cursor.progress_ratio(walk_start),
     }
 }
 
@@ -337,7 +341,7 @@ mod tests {
 
     #[test]
     fn status_idle_when_no_handle_and_complete() {
-        let report = render_status(None, true, true);
+        let report = render_status(None, true, true, 1);
         assert!(report.synced);
         assert!(report.enabled);
         assert_eq!(report.state, "idle");
@@ -345,14 +349,14 @@ mod tests {
 
     #[test]
     fn status_disabled_not_synced() {
-        let report = render_status(None, false, true);
+        let report = render_status(None, false, true, 1);
         assert!(!report.synced);
         assert!(!report.enabled);
     }
 
     #[test]
     fn status_incomplete_not_synced() {
-        let report = render_status(None, true, false);
+        let report = render_status(None, true, false, 1);
         assert!(!report.synced);
         assert!(report.enabled);
     }
@@ -366,7 +370,7 @@ mod tests {
             started_at_unix: 1,
             snapshot_tip_hash: [0u8; 32],
         });
-        let report = render_status(Some(&h), true, true);
+        let report = render_status(Some(&h), true, true, 1);
         assert!(!report.synced);
     }
 
@@ -411,7 +415,27 @@ mod tests {
             started_at_unix: 0,
             snapshot_tip_hash: [0u8; 32],
         });
-        let report = render_status(Some(&h), true, false);
+        let report = render_status(Some(&h), true, false, 0);
         assert!((report.progress_ratio - 0.25).abs() < 1e-9);
+    }
+
+    /// `render_status` must carry the walk-start offset through to the
+    /// report, not just to the cursor: the reported ratio is what feeds the
+    /// `getindexinfo` ETA and the Prometheus gauge.
+    #[test]
+    fn progress_ratio_reported_from_walk_start_on_mainnet_shape() {
+        let h = BackfillHandle::new(BackfillCursor {
+            state: BackfillState::Running,
+            cursor_height: 709_863,
+            snapshot_height: 961_595,
+            started_at_unix: 1,
+            snapshot_tip_hash: [0u8; 32],
+        });
+        let report = render_status(Some(&h), true, false, 709_632);
+        assert!(
+            report.progress_ratio < 0.001,
+            "231 blocks past activation is ~0% of the walk, got {}",
+            report.progress_ratio
+        );
     }
 }

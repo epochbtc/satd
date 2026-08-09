@@ -324,15 +324,19 @@ impl MetricsContext {
         // Deferred-backfill progress ratio (0.0–1.0). Reads the persisted
         // SP-index backfill cursor: 0.0 when idle / not started, 1.0 on
         // completion. A float gauge, so emitted directly rather than via
-        // the u64 `metric` helper.
+        // the u64 `metric` helper. Measured from taproot activation, the
+        // height the walk actually starts at — from genesis it would open
+        // at ~0.74 on mainnet and never read 0.0 while running.
         let sp_backfill_ratio = self
             .chain_state
             .store_ref()
             .read_sp_backfill_cursor()
-            .progress_ratio();
+            .progress_ratio(crate::index::silent_payments::walk_start(
+                self.chain_state.network,
+            ));
         let _ = writeln!(
             out,
-            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed (0.0 idle/none, 1.0 complete)."
+            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot] (0.0 idle/none/just-started, 1.0 complete)."
         );
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");

@@ -17,6 +17,22 @@ pub mod emit;
 pub mod runner;
 pub mod stats;
 
+/// Lowest height that can carry a BIP 352 tweak row: taproot activation,
+/// but never below 1 (genesis is never connected via `connect_block`, so
+/// the live path emits no row there).
+///
+/// This is the floor of the backfill's walk *and* the origin its progress
+/// is measured from. On mainnet it is 709_632, so a walk to the tip covers
+/// roughly a quarter of the chain; treating 0 as the origin overstates
+/// progress from the first block onward. Signet, testnet4 and regtest have
+/// taproot from genesis, so the offset is 1 there and the distinction is
+/// invisible — which is exactly why it went unnoticed.
+pub fn walk_start(network: bitcoin::Network) -> u32 {
+    crate::validation::script::activation_heights(network)
+        .taproot
+        .max(1)
+}
+
 pub use backfill::{
     BackfillError, BackfillHandle, PREFLIGHT_REQUIRED_FREE_BYTES, StatusReport, render_status,
 };
