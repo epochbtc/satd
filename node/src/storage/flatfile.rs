@@ -221,15 +221,22 @@ impl FlatFileManager {
         // it here keeps the "only the current file can be dirty" invariant
         // that lets `sync_all` ignore closed files.
         if self.current_pos > 0 && self.current_pos + record_size > MAX_FILE_SIZE {
-            if self.dirty
-                && let Some(f) = &self.write_handle
-            {
-                f.sync_data()?;
-                self.dirty = false;
-            }
+            // Fsync the outgoing file first: it will never be written again,
+            // and syncing it here keeps the "only the current file can be
+            // dirty" invariant that lets `sync_all` ignore closed files.
+            self.release_write_handle()?;
             self.current_file += 1;
-            self.current_pos = 0;
-            self.write_handle = None; // Close old handle, open new file below
+            // Derive the new offset from the file rather than assuming zero.
+            // The next file number is normally absent, but it need not be:
+            // `with_xor_mode`'s discovery loop stops at the first *gap*, and
+            // `delete_file` (pruning) makes gaps by removing low-numbered
+            // files. A pruned datadir can therefore reopen with a low
+            // `current_file` while populated files sit above it, and rotating
+            // into one of those with `current_pos = 0` would record every
+            // subsequent record at an offset it was not written at — the
+            // append-mode corruption `resync_append_pos` exists to prevent,
+            // reached through the rotation door.
+            self.resync_append_pos()?;
         }
 
         let pos = FlatFilePos {
@@ -242,10 +249,23 @@ impl FlatFileManager {
             Some(f) => f,
             None => {
                 let path = self.file_path(self.current_file);
+                let existed = path.exists();
                 let f = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)?;
+                if !existed {
+                    // fsync the directory so the new file's name is durable.
+                    // Without this a power loss can leave a fully-fsync'd blk
+                    // file with no directory entry while the `block_index`
+                    // rows pointing into it are committed — the same
+                    // "pointer outlives the data" failure this module guards
+                    // against, once per 128 MB rollover. Best-effort: not
+                    // every platform/filesystem supports directory fsync.
+                    if let Ok(dir) = File::open(&self.blocks_dir) {
+                        let _ = dir.sync_all();
+                    }
+                }
                 self.write_handle = Some(f);
                 self.write_handle.as_mut().unwrap()
             }
@@ -278,14 +298,27 @@ impl FlatFileManager {
 
         if let Err(e) = write_result {
             // A failed `write_all` — ENOSPC mid-record is the realistic one —
-            // may still have put bytes on disk. `current_pos` was not
-            // advanced, so it now understates the real end of file. Because
-            // the handle is opened `append(true)`, the *next* write would land
-            // at the true EOF while being recorded at this stale, lower
-            // offset: every subsequent block-index entry would then point
-            // into the middle of its predecessor's record. Resync from the
-            // file so the next record is recorded where it actually goes.
-            self.resync_append_pos()?;
+            // may still have put bytes on disk. `current_pos` was not advanced,
+            // so it now understates the real end of file, and because the
+            // handle is `append(true)` the next write would land at the true
+            // EOF while being *recorded* at this stale, lower offset: every
+            // subsequent index entry would point into the middle of its
+            // predecessor's record.
+            //
+            // Cut the torn record off rather than appending past it. Adopting
+            // the torn EOF would keep the offsets honest but leave a record
+            // whose length field describes bytes that were never written, and
+            // the sequential scanners (`for_each_block`, used by `-reindex`
+            // and the hole repair) have no resynchronization: they read that
+            // length, step over it, land mid-stream, and `break` — silently
+            // dropping every remaining block in a file that can hold 128 MB of
+            // them. Truncation is safe by construction, since `current_pos`
+            // was never advanced and so no `block_index` entry can reference
+            // anything at or after `record_start`.
+            let truncate_result = self.truncate_current_file_to(record_start);
+            // The write error is what the caller needs to see; surface a
+            // truncation failure only if the write itself somehow succeeded.
+            truncate_result?;
             return Err(e);
         }
 
@@ -293,6 +326,41 @@ impl FlatFileManager {
         self.dirty = true;
 
         Ok(pos)
+    }
+
+    /// Cut the current append file back to `len` and resync the append offset.
+    /// Used to discard a torn record after a failed write.
+    fn truncate_current_file_to(&mut self, len: u64) -> std::io::Result<()> {
+        self.release_write_handle()?;
+        let path = self.file_path(self.current_file);
+        if path.exists() {
+            let f = OpenOptions::new().write(true).open(&path)?;
+            f.set_len(len)?;
+            f.sync_data()?;
+        }
+        self.current_pos = len;
+        Ok(())
+    }
+
+    /// Fsync and drop the cached write handle, preserving the "dirty implies a
+    /// live handle" invariant.
+    ///
+    /// The fsync error is **propagated**, not swallowed. Clearing `dirty` after
+    /// a failed sync would leave completed records unsynced while `sync_all`
+    /// reports success — so `flush_durable` would go on to make their
+    /// `block_index` entries durable over bytes that never reached disk, which
+    /// is precisely the hole this module exists to keep shut. A caller on an
+    /// error path should prefer its own error but must not treat this as
+    /// having succeeded.
+    fn release_write_handle(&mut self) -> std::io::Result<()> {
+        if self.dirty
+            && let Some(f) = &self.write_handle
+        {
+            f.sync_data()?;
+        }
+        self.dirty = false;
+        self.write_handle = None;
+        Ok(())
     }
 
     /// Recompute the append offset from the file on disk and drop the cached
@@ -310,25 +378,23 @@ impl FlatFileManager {
     /// restart is self-correcting; this makes the same correction available
     /// without one.
     pub fn resync_append_pos(&mut self) -> std::io::Result<()> {
-        // Flush what the outgoing handle already wrote before dropping it.
-        // Records that completed before the divergence are accounted for and
-        // may already be referenced by a `block_index` entry, and once the
-        // handle is gone `sync_all` has nothing to fsync through. Best-effort:
-        // the usual caller is an error path where the disk is already
-        // unhappy, and the failure it is reporting takes precedence.
-        if self.dirty
-            && let Some(f) = &self.write_handle
-        {
-            let _ = f.sync_data();
-        }
-        self.dirty = false;
-        self.write_handle = None;
+        // Flush what the outgoing handle already wrote before dropping it:
+        // records completed before the divergence may already be referenced by
+        // a `block_index` entry, and once the handle is gone `sync_all` has
+        // nothing to fsync through. A failure here is propagated rather than
+        // ignored — see `release_write_handle`.
+        self.release_write_handle()?;
         let path = self.file_path(self.current_file);
-        self.current_pos = if path.exists() {
+        // Compute into a local first: on error, leaving `current_pos` at its
+        // stale value while the handle has been dropped would reintroduce the
+        // mis-recorded-offset corruption this method exists to prevent. Better
+        // to fail loudly with the old value untouched.
+        let len = if path.exists() {
             std::fs::metadata(&path)?.len()
         } else {
             0
         };
+        self.current_pos = len;
         Ok(())
     }
 
@@ -830,19 +896,87 @@ mod tests {
         // A resync on the SAME manager restores the truth — deliberately not
         // a fresh `FlatFileManager::new`, whose constructor would recompute
         // the offset by itself and so prove nothing about this method.
+        let real_len = std::fs::metadata(&path).unwrap().len();
         mgr.resync_append_pos().unwrap();
         assert_eq!(
-            mgr.current_pos,
-            std::fs::metadata(&path).unwrap().len(),
+            mgr.current_pos, real_len,
             "resync must adopt the real file length"
         );
 
         // Records written afterwards read back at the offset reported.
         let good = mgr.write_block(&vec![0xCC; 777], magic).unwrap();
         assert_eq!(mgr.read_block(&good).unwrap(), vec![0xCC; 777]);
+        assert_eq!(
+            good.data_pos as u64, real_len,
+            "the new record must be recorded at the real end of file"
+        );
 
-        // The surviving prefix of the first record is still where it was.
+        // The first record's offset is unchanged, but its payload was cut, so
+        // it must now fail to read rather than return short or stale bytes.
         assert_eq!(first.data_pos, 0);
+        assert!(
+            mgr.read_block(&first).is_err(),
+            "the truncated record must not read back as if intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails partway must leave the file *scannable*. Adopting the
+    /// torn EOF and appending after it keeps offsets honest but leaves a record
+    /// whose length field describes bytes that were never written — and
+    /// `for_each_block` (used by `-reindex`) has no resynchronization: it steps
+    /// over that phantom length, lands mid-stream, and stops, silently dropping
+    /// every remaining block in a file that can hold 128 MB of them.
+    #[test]
+    fn a_torn_record_is_truncated_so_the_file_stays_scannable() {
+        let dir = temp_dir("torn-record-truncate");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+
+        let a = mgr.write_block(&vec![0xAA; 256], magic).unwrap();
+        let clean_len = std::fs::metadata(dir.join("blk00000.dat")).unwrap().len();
+
+        // Simulate the aftermath of a torn write: a record header claiming far
+        // more payload than actually landed, with `current_pos` still at the
+        // pre-write value (the error path never advances it).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("blk00000.dat"))
+                .unwrap();
+            f.write_all(&magic).unwrap();
+            f.write_all(&(9_000_000u32).to_le_bytes()).unwrap();
+            f.write_all(&[0x77; 64]).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(std::fs::metadata(dir.join("blk00000.dat")).unwrap().len() > clean_len);
+
+        // The recovery the error arm performs.
+        mgr.truncate_current_file_to(clean_len).unwrap();
+
+        let b = mgr.write_block(&[0xBB; 128], magic).unwrap();
+        assert_eq!(
+            b.data_pos as u64, clean_len,
+            "the next record must start where the torn one was cut off"
+        );
+
+        // Both real records are visible to a sequential scan — the property a
+        // reindex depends on and that adopting the torn EOF would destroy.
+        let mut seen = Vec::new();
+        mgr.for_each_block(|data, _pos| {
+            seen.push(data.len());
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![256, 128],
+            "the scan must find exactly the two intact records"
+        );
+        assert_eq!(mgr.read_block(&a).unwrap(), vec![0xAA; 256]);
+        assert_eq!(mgr.read_block(&b).unwrap(), vec![0xBB; 128]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

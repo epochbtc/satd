@@ -168,9 +168,7 @@ is not pruning:
 
 ```console
 $ sat-cli getblock 000000000000000000000b951399b504a52a3fdfa1d33bcde59ac6c019c4af1c 0
-error code: -5
-error message:
-Block data not available
+error code: -5: Block data not available
 ```
 
 `getblockheader` still works and shows the block connected with a normal
@@ -193,23 +191,36 @@ block arrives. Re-run `getblock` to confirm, and check the log for
 The supplied block is authenticated before anything is written. Its hash must
 match a header already in the index — which is what carries the proof-of-work
 and difficulty checks made when that header was accepted — and its transactions
-must match the merkle root that hash commits to, with the BIP 141 witness
-commitment verified as well, so a peer cannot substitute a witness-stripped
-body. A peer that fails those checks is disconnected. Blocks that are pruned or
-marked invalid are refused: those states are deliberate, and repopulating them
-would contradict the decision that produced them.
+must match the merkle root that hash commits to. Witnesses need their own
+chain, because the merkle root commits only to txids: when the coinbase carries
+a BIP 141 commitment it must hold exactly one 32-byte witness item and the
+commitment must verify; otherwise no transaction may carry witness data at all.
+Together those pin every byte, so a peer can only return the genuine block or
+be rejected. A peer whose reply fails is banned.
+
+Blocks that are pruned or marked invalid are refused: those states are
+deliberate, and repopulating them would contradict the decision that produced
+them. A block you hold only the header for is not repaired either — it is
+downloaded through the normal path, which applies the checkpoint and signet
+checks and connects it.
 
 To find holes ahead of time rather than discovering them through a failed
-backfill, walk the range you care about with `getblockstats`, which reads each
-block body and returns `-5` for any that cannot be read.
+backfill, use the block-file audit:
 
-> **Note.** satd fsyncs a block's record before its index entry can reach disk
-> whenever it is not in bulk-load mode, so the window above is closed for
-> blocks written by current versions. During initial block download the index
-> writes bypass the write-ahead log entirely and become durable only through a
-> flush that syncs the flat files first, which is why IBD keeps its unsynced
-> fast path without being exposed. Datadirs that predate this may still carry a
-> hole from an earlier crash.
+```sh
+sat-cli debug blockfile-audit
+```
+
+It reports `unresolved_entries` for index entries whose record falls past the
+end of its file, in one pass over the file metadata — as opposed to
+`getblockstats` across every height, which reads and deserializes every block
+body on the chain and cannot distinguish a data hole from an unknown block
+(both return `-5`).
+
+> **Note.** satd fsyncs a block's record before its index entry is committed on
+> every write path, so the window above is closed for blocks written by current
+> versions. Datadirs that predate this may still carry a hole from an earlier
+> crash; nothing audits or migrates them on upgrade.
 
 ## Compaction
 

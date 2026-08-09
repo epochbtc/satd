@@ -12,19 +12,28 @@ const RPC_INVALID_PARAMETER: i32 = -8;
 
 /// `getblockfrompeer "blockhash" ( peer_id )` — ask one peer for one block.
 ///
-/// Core-compatible in name, arguments, error codes and its empty-object
-/// result. Two deliberate differences, both strictly more permissive than
-/// Core, so any call Core would accept behaves identically:
+/// Core-compatible in name, positional arguments and its empty-object result.
+/// It differs from Core in three ways, and the differences are not all in the
+/// permissive direction:
 ///
 /// 1. `peer_id` is optional. Core requires the operator to pick a peer; when
-///    it is omitted satd picks a connected `NODE_NETWORK` peer itself, which
-///    is what the repair use case wants (the operator generally does not care
-///    *which* peer supplies a block they are missing).
+///    it is omitted satd picks a connected `NODE_NETWORK` + `NODE_WITNESS`
+///    peer itself, which is what the repair use case wants. A *malformed*
+///    peer_id is still an error rather than an auto-select.
 /// 2. "Block already downloaded" is decided by whether the block's bytes can
 ///    actually be *read back*, not by the `block_index` status flag. Core
 ///    tests the flag, which would refuse exactly the case this exists for: an
 ///    entry that claims to hold data whose record was lost to a crash before
 ///    it reached disk.
+/// 3. **More restrictive than Core:** satd refuses pruned blocks. Core allows
+///    re-fetching them (noting the block may be re-pruned immediately and
+///    carries no undo data); satd's repair path will not repopulate data the
+///    prune accounting no longer tracks, so refusing here is better than
+///    accepting the call and failing after the download.
+///
+/// Error message strings are close to Core's but not identical, and named
+/// arguments are not supported (a satd-wide limitation, not specific to this
+/// method). Clients matching on exact Core error text should not rely on them.
 ///
 /// The reply is routed to `ChainState::repair_block_data`, not the normal
 /// accept path — see `PeerManager::request_block_from_peer`. Delivery is
@@ -42,12 +51,32 @@ pub fn get_block_from_peer(
 
     // We must already hold the header: it is what authenticates whatever the
     // peer sends back (see `repair_block_data`).
-    if chain_state.get_block_index(&hash).is_none() {
-        return Err((RPC_MISC_ERROR, "Block header missing".to_string()));
-    }
+    let entry = chain_state
+        .get_block_index(&hash)
+        .ok_or((RPC_MISC_ERROR, "Block header missing".to_string()))?;
 
     if chain_state.block_data_readable(&hash) {
         return Err((RPC_MISC_ERROR, "Block already downloaded".to_string()));
+    }
+
+    // Refuse statuses the arrival path will refuse anyway, *before* spending a
+    // round trip and a block download on them. Without this the operator gets
+    // an empty-object success, the block is fetched, and the repair is then
+    // rejected with nothing but a log line to show for it.
+    match entry.status {
+        crate::storage::blockindex::BlockStatus::Pruned => {
+            return Err((
+                RPC_MISC_ERROR,
+                "Block is pruned; satd does not repopulate pruned block data".to_string(),
+            ));
+        }
+        crate::storage::blockindex::BlockStatus::Invalid => {
+            return Err((
+                RPC_MISC_ERROR,
+                "Block is marked invalid".to_string(),
+            ));
+        }
+        _ => {}
     }
 
     let peer_id = match peer_id {
@@ -276,7 +305,8 @@ mod tests {
         let (code, msg) =
             get_block_from_peer(&cs, &pm, &hash.to_string(), Some(4242)).unwrap_err();
         assert_eq!(code, RPC_MISC_ERROR);
-        assert_eq!(msg, "Peer 4242 does not exist");
+        // Core's exact wording, so a Core-derived client's assertion holds.
+        assert_eq!(msg, "Peer does not exist");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

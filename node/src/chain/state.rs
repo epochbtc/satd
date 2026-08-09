@@ -135,13 +135,7 @@ pub struct LoadSnapshotSummary {
 pub enum BlockDataRepair {
     /// The block's bytes were missing or unreadable and have been rewritten
     /// from the supplied copy; the index entry now points at the new record.
-    Repaired {
-        height: u32,
-        /// True when the entry claimed to hold data (`DataStored`/`Valid`) —
-        /// i.e. this repaired a durability hole rather than filling in a
-        /// block we had only ever held the header for.
-        replaced_claimed_data: bool,
-    },
+    Repaired { height: u32 },
     /// The stored bytes read back fine; nothing was written.
     AlreadyPresent { height: u32 },
 }
@@ -2359,6 +2353,21 @@ impl ChainState {
     /// recovery replay stays bounded. `Normal` restores per-write
     /// durability for steady-state operation.
     pub fn set_write_mode(&self, mode: crate::storage::WriteMode) {
+        // Sync the flat files first. `CoinCache::set_write_mode` flushes
+        // memtables on the BulkLoad→Normal transition (so WAL-less writes are
+        // not stranded), and that flush is the *store-level* one — it has no
+        // flat-file step in front of it, which is the exact inverse of the
+        // ordering `flush_durable` exists to enforce. Callers are supposed to
+        // call `flush_durable` first, but the IBD guard proceeds with the mode
+        // switch even when that call fails, so make the ordering hold here
+        // rather than depending on every caller getting it right.
+        if let Err(e) = self.flat_files.lock().sync_all() {
+            tracing::error!(
+                error = %e,
+                "flat-file sync before a write-mode switch failed; \
+                 block index entries may become durable ahead of their data"
+            );
+        }
         self.store.set_write_mode(mode);
     }
 
@@ -2385,39 +2394,46 @@ impl ChainState {
     /// carrying the returned [`FlatFilePos`] MUST come through here.
     ///
     /// `flush_durable`'s ordering only binds at a flush. Between flushes the
-    /// two streams are independently buffered, and which one the kernel
-    /// writes back first is undefined:
-    ///
-    /// - `BulkLoad` (IBD): RocksDB writes bypass the WAL entirely, so an
-    ///   index entry cannot reach disk except through `flush_durable` — which
-    ///   fsyncs the flat files first. Correct by construction, and the fsync
-    ///   here is skipped so IBD keeps its sequential-append throughput.
-    /// - `Normal` (steady state): the WAL is on but `WriteOptions::sync` is
-    ///   not set, so an index entry can be written back to disk at any moment
-    ///   while the block bytes it points at are still dirty page cache. A
-    ///   kernel panic or power loss in that window commits the pointer and
-    ///   drops the payload, leaving a `DataStored` entry over a truncated
-    ///   record — `getblock` returns "block data not available", any index
-    ///   backfill walking that height fails hard, and the block cannot be
-    ///   served to peers. Consensus is unaffected (the UTXO delta was already
-    ///   applied), so the node looks healthy until something re-reads history.
+    /// two streams are independently buffered — the flat-file append sits in
+    /// the page cache until `sync_all`, and RocksDB's WAL is written without
+    /// `WriteOptions::sync` — and which one the kernel writes back first is
+    /// undefined. A kernel panic or power loss in that window commits the
+    /// pointer and drops the payload, leaving a `DataStored` entry over a
+    /// truncated record: `getblock` returns "Block data not available", any
+    /// index backfill walking that height fails hard, and the block cannot be
+    /// served to peers. Consensus is unaffected (the UTXO delta was already
+    /// applied), so the node looks healthy until something re-reads history.
     ///
     /// Observed on the mainnet dogfood node at height 954866: the record was
     /// cut at a 4 KiB page boundary and the next block was appended at the
     /// resulting EOF, 1.6 MB short of where the index said it ended.
     ///
-    /// The fix is to fsync before returning in `Normal` mode. That is one
-    /// fsync per accepted block outside IBD — negligible at one block per
-    /// ~10 minutes, and zero on the IBD path that actually cares.
+    /// **The sync is unconditional, including under `BulkLoad`.** An earlier
+    /// version of this fix skipped it during IBD, reasoning that `BulkLoad`
+    /// disables the WAL so an index entry could only become durable through
+    /// `flush_durable` — which syncs the flat files first. That reasoning is
+    /// wrong: disabling the WAL does not stop a memtable from being flushed
+    /// to an SST on its own. `write_buffer_size` is per-CF and
+    /// `set_atomic_flush(true)` (see `rocksdb_store.rs`) makes every listed
+    /// CF flush as one unit whenever any of them fills, so the 64 MB `coins`
+    /// buffer filling during IBD drags `block_index` to disk with it — while
+    /// the flat files are only fsync'd every ~1000 blocks. IBD was in fact
+    /// the *more* exposed path, not the safe one.
+    ///
+    /// The cost is one fsync per stored block. In steady state that is
+    /// nothing (one block per ~10 minutes). During IBD it is real but
+    /// bounded, and paying it is not optional: correctness of the block store
+    /// is not something to trade for sync throughput. Amortizing it properly
+    /// means deferring `block_index` writes until the record they reference
+    /// has been synced — Bitcoin Core's model — which is a larger change than
+    /// this fix and is tracked separately.
     fn write_block_durable(&self, block_data: &[u8]) -> Result<FlatFilePos, ChainError> {
         let mut flat = self.flat_files.lock();
         let pos = flat
             .write_block(block_data, network_magic(self.network))
             .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-        if self.store.current_write_mode() == crate::storage::WriteMode::Normal {
-            flat.sync_all()
-                .map_err(|e| ChainError::FlatFile(e.to_string()))?;
-        }
+        flat.sync_all()
+            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
         Ok(pos)
     }
 
@@ -2902,7 +2918,27 @@ impl ChainState {
             data_pos: entry.data_pos,
         };
         let data = self.flat_files.lock().read_block(&pos).ok()?;
-        bitcoin::consensus::deserialize(&data).ok()
+        let block: Block = bitcoin::consensus::deserialize(&data).ok()?;
+        // Verify the record we landed on is the block we asked for.
+        //
+        // The recorded offset can describe the wrong record — that is the
+        // whole failure class the flat-file durability work addresses, and a
+        // mis-recorded offset lands on another record's *start*, not on
+        // garbage, so deserialization succeeds and returns a different block
+        // under the requested hash. Without this check `getblock` serves the
+        // wrong block, `block_data_readable` reports a broken entry as
+        // healthy, and `getblockfrompeer` refuses to repair it.
+        if block.block_hash() != *hash {
+            tracing::error!(
+                requested = %hash,
+                found = %block.block_hash(),
+                file_number = entry.file_number,
+                data_pos = entry.data_pos,
+                "block_index entry points at a different block; treating as missing data"
+            );
+            return None;
+        }
+        Some(block)
     }
 
     /// Read the block at a given active-chain height. Returns `None` for
@@ -3078,6 +3114,31 @@ impl ChainState {
         self.get_block(hash).is_some()
     }
 
+    /// Gate for [`Self::repair_block_data`]: only an entry that claims to hold
+    /// data is a repairable hole. See that function's docs for why
+    /// `HeaderOnly`, `Pruned` and `Invalid` are each refused.
+    fn check_repairable(hash: &BlockHash, entry: &BlockIndexEntry) -> Result<(), ChainError> {
+        match entry.status {
+            BlockStatus::DataStored | BlockStatus::Valid => Ok(()),
+            BlockStatus::HeaderOnly => Err(ChainError::InvalidArgument(format!(
+                "block {hash} at height {} is header-only, not a data hole; \
+                 it must be downloaded through the normal block path so the \
+                 checkpoint, signet and invalidated-parent checks apply",
+                entry.height
+            ))),
+            BlockStatus::Pruned => Err(ChainError::InvalidArgument(format!(
+                "block {hash} at height {} is pruned; refusing to repopulate \
+                 data the prune accounting no longer tracks",
+                entry.height
+            ))),
+            BlockStatus::Invalid => Err(ChainError::InvalidArgument(format!(
+                "block {hash} at height {} is marked invalid; refusing to \
+                 write data for it",
+                entry.height
+            ))),
+        }
+    }
+
     /// Rewrite the on-disk copy of a block whose data is missing or
     /// unreadable, repointing its `block_index` entry at the new record.
     ///
@@ -3099,14 +3160,24 @@ impl ChainState {
     ///   presents as witness-free, so a witness-stripped copy is refused.
     ///
     /// So a peer can only supply the genuine block or be rejected. Status is
-    /// preserved: a `Valid` block stays `Valid` (its UTXO delta was applied
-    /// long ago and is not revisited), and a `HeaderOnly` entry becomes
-    /// `DataStored` so the normal connect machinery can pick it up.
+    /// preserved exactly: a `Valid` block stays `Valid` (its UTXO delta was
+    /// applied long ago and is not revisited).
     ///
-    /// `Pruned` and `Invalid` entries are refused: the operator deliberately
-    /// discarded or rejected those, and silently repopulating them would
-    /// contradict that decision (and, for `Pruned`, desynchronize the prune
-    /// accounting).
+    /// **Only `DataStored`/`Valid` entries are repairable.** This function
+    /// exists for one narrow job — an entry that claims to hold data whose
+    /// record is gone — and deliberately refuses everything else:
+    ///
+    /// - `HeaderOnly` is not a hole, it is a block we never fetched. It must
+    ///   go through `store_block`, which applies the checkpoint and signet
+    ///   block-solution checks and the invalidated-parent refusal that
+    ///   `accept_header` does not, writes the `height_hash` row, and wakes the
+    ///   connect machinery. Filling it in here would store data for a block
+    ///   contradicting a checkpoint, or under an operator-invalidated parent,
+    ///   and would then leave it `DataStored` but unconnected.
+    /// - `Pruned` and `Invalid` are deliberate decisions — operator pruning or
+    ///   a consensus/operator rejection — and silently repopulating them would
+    ///   contradict the decision that produced them (and, for `Pruned`,
+    ///   desynchronize the prune accounting).
     pub fn repair_block_data(&self, block: &Block) -> Result<BlockDataRepair, ChainError> {
         let hash = block.block_hash();
         let entry = self
@@ -3114,23 +3185,7 @@ impl ChainState {
             .get_block_index(&hash)
             .ok_or(ChainError::BlockNotFound)?;
 
-        match entry.status {
-            BlockStatus::Pruned => {
-                return Err(ChainError::InvalidArgument(format!(
-                    "block {hash} at height {} is pruned; refusing to \
-                     repopulate data the prune accounting no longer tracks",
-                    entry.height
-                )));
-            }
-            BlockStatus::Invalid => {
-                return Err(ChainError::InvalidArgument(format!(
-                    "block {hash} at height {} is marked invalid; refusing \
-                     to write data for it",
-                    entry.height
-                )));
-            }
-            _ => {}
-        }
+        Self::check_repairable(&hash, &entry)?;
 
         if self.block_data_readable(&hash) {
             return Ok(BlockDataRepair::AlreadyPresent {
@@ -3138,7 +3193,19 @@ impl ChainState {
             });
         }
 
-        validation::block::check_block_for_stored_copy(block)?;
+        // The P2P entry point rejects mutated blocks before routing here, but
+        // this is a `pub` API whose contract is "authenticate the bytes", and
+        // the 64-byte-transaction merkle collision is the one way a different
+        // transaction list can sit under the same merkle root. Re-check it so
+        // the guarantee does not depend on the caller.
+        if validation::block::is_block_mutated(block) {
+            return Err(ChainError::Validation(
+                validation::ValidationError::BadTxDuplicate,
+            ));
+        }
+        let segwit_active =
+            entry.height >= crate::validation::script::activation_heights(self.network).segwit;
+        validation::block::check_block_for_stored_copy(block, segwit_active)?;
 
         // Append the record BEFORE taking `accept_lock`. `write_block_durable`
         // takes the flat-file mutex, and `store_block` holds `accept_lock`
@@ -3146,55 +3213,40 @@ impl ChainState {
         // them in the other order here would invert the pairing.
         let block_data = serialize(block);
         let flat_pos = self.write_block_durable(&block_data)?;
-        // `write_block_durable` only syncs in `Normal` mode, where the index
-        // write below could otherwise reach disk first. A repair must hold
-        // that ordering in *every* mode: repointing the entry at a record
-        // that has not landed would relocate the hole rather than close it,
-        // and unlike a fresh block there is no re-download that fixes it
-        // automatically. In `Normal` mode the record is already synced and
-        // this is a no-op.
-        self.flat_files
-            .lock()
-            .sync_all()
-            .map_err(|e| ChainError::FlatFile(e.to_string()))?;
 
         let _accept_guard = self.accept_lock.lock();
 
-        // Re-read under the lock. Two things can have changed since the checks
-        // above: a concurrent accept may have supplied this block's data (then
-        // leave its entry alone — our record simply becomes flat-file slack),
-        // or a concurrent `invalidateblock` may have rejected it (then the
-        // refusal above applies, and must not be bypassed by having already
-        // written the record).
+        // Re-read under the lock. `accept_lock` serializes this against
+        // `accept_block`, `store_block`, `invalidate_block` and
+        // `reconsider_block`; it does NOT exclude the connect thread, which
+        // rewrites index entries without taking it. So this narrows the window
+        // rather than closing it — a concurrent connect committing the entry it
+        // captured earlier would still clobber the repair, and the operator's
+        // recourse is to re-run the RPC.
+        //
+        // Two things can have changed since the checks above: a concurrent
+        // accept may have supplied this block's data (then leave its entry
+        // alone — our record simply becomes flat-file slack), or the entry may
+        // have been invalidated or pruned (then the refusal above applies, and
+        // must not be bypassed by having already written the record).
         let entry = self
             .store
             .get_block_index(&hash)
             .ok_or(ChainError::BlockNotFound)?;
-        if matches!(entry.status, BlockStatus::Pruned | BlockStatus::Invalid) {
-            return Err(ChainError::InvalidArgument(format!(
-                "block {hash} at height {} became {:?} while the repair copy \
-                 was being written; not repointing its entry",
-                entry.height, entry.status
-            )));
-        }
+        Self::check_repairable(&hash, &entry)?;
         if self.block_data_readable(&hash) {
             return Ok(BlockDataRepair::AlreadyPresent {
                 height: entry.height,
             });
         }
 
-        let replaced_claimed_data = matches!(
-            entry.status,
-            BlockStatus::DataStored | BlockStatus::Valid
-        );
         let height = entry.height;
         let mut repaired = entry;
         repaired.file_number = flat_pos.file_number;
         repaired.data_pos = flat_pos.data_pos;
+        // Re-derived from a merkle-authenticated body, so this cannot drift
+        // from the truth; `status` is left exactly as it was.
         repaired.num_tx = block.txdata.len() as u32;
-        if repaired.status == BlockStatus::HeaderOnly {
-            repaired.status = BlockStatus::DataStored;
-        }
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, repaired));
@@ -3205,13 +3257,11 @@ impl ChainState {
             height,
             file_number = flat_pos.file_number,
             data_pos = flat_pos.data_pos,
-            replaced_claimed_data,
             "Repaired block data from a peer-supplied copy"
         );
 
         Ok(BlockDataRepair::Repaired {
             height,
-            replaced_claimed_data,
         })
     }
 
@@ -6381,12 +6431,19 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// IBD keeps the unsynced fast path: `BulkLoad` disables the WAL, so an
-    /// index entry cannot reach disk except via `flush_durable`, which syncs
-    /// the flat files first. Paying an fsync per block here would cost real
-    /// IBD throughput for no safety gain.
+    /// `BulkLoad` gets the same treatment as `Normal` — deliberately, and this
+    /// test exists to stop the exemption from being reintroduced.
+    ///
+    /// An earlier revision skipped the fsync during IBD, reasoning that
+    /// `BulkLoad` disables the WAL so an index entry could only become durable
+    /// through `flush_durable`, which syncs the flat files first. That is
+    /// wrong: disabling the WAL does not stop RocksDB from flushing a memtable
+    /// to an SST on its own, and with `set_atomic_flush(true)` the 64 MB
+    /// `coins` write buffer filling during IBD drags `block_index` to disk with
+    /// it — while the flat files are only fsync'd every ~1000 blocks. IBD was
+    /// the *more* exposed path, not the safe one.
     #[test]
-    fn bulkload_mode_block_writes_stay_unsynced() {
+    fn bulkload_mode_block_writes_are_synced_too() {
         let (cs, dir) = make_chain_state();
         cs.set_write_mode(crate::storage::WriteMode::BulkLoad);
 
@@ -6395,13 +6452,10 @@ pub(crate) mod tests {
         cs.accept_header(&b1.header).unwrap();
         cs.store_block(&b1).unwrap();
         assert!(
-            cs.flat_files.lock().has_unsynced_writes(),
-            "BulkLoad must not fsync per block"
+            !cs.flat_files.lock().has_unsynced_writes(),
+            "BulkLoad must fsync the record too: WAL-less index entries still \
+             reach disk on their own via automatic memtable flushes"
         );
-
-        // ...and flush_durable still closes the window, in the right order.
-        cs.flush_durable().unwrap();
-        assert!(!cs.flat_files.lock().has_unsynced_writes());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6419,10 +6473,7 @@ pub(crate) mod tests {
         let outcome = cs.repair_block_data(&target).expect("repair must succeed");
         assert_eq!(
             outcome,
-            BlockDataRepair::Repaired {
-                height: 2,
-                replaced_claimed_data: true,
-            }
+            BlockDataRepair::Repaired { height: 2 }
         );
 
         // The block reads back byte-identically, and the entry was repointed
@@ -6536,6 +6587,74 @@ pub(crate) mod tests {
         assert!(
             matches!(err, ChainError::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HeaderOnly` entry is not a data hole, and repairing it would bypass
+    /// the checkpoint / signet-solution / invalidated-parent gates that only
+    /// `store_block` applies. It must be refused so the block goes through the
+    /// normal download path — which also actually connects it.
+    #[test]
+    fn repair_block_data_refuses_header_only_entries() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 1);
+        let tip = cs.tip_hash();
+        let next = build_test_block(tip, 2, 1_300_000_002);
+        cs.accept_header(&next.header).unwrap();
+        assert_eq!(
+            cs.get_block_index(&next.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        let err = cs
+            .repair_block_data(&next)
+            .expect_err("header-only is not a repairable hole");
+        assert!(
+            matches!(err, ChainError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        // Still header-only: the repair must not have written anything.
+        assert_eq!(
+            cs.get_block_index(&next.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        // ...and the normal path still accepts it, which is the point.
+        cs.store_block(&next).expect("store_block must accept it");
+        cs.connect_stored_block(&next.block_hash()).unwrap();
+        assert_eq!(cs.tip_height(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index entry whose offset lands on a *different* valid record must
+    /// read as missing, not as that other block. Deserialization succeeds in
+    /// this case, so only a hash check catches it — without one `getblock`
+    /// serves the wrong block and the repair path refuses to act.
+    #[test]
+    fn a_block_index_entry_pointing_at_another_record_reads_as_missing() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let victim = blocks[1].block_hash();
+        let other = cs.get_block_index(&blocks[2].block_hash()).unwrap();
+
+        // Repoint the height-2 entry at the height-3 block's record.
+        let mut entry = cs.get_block_index(&victim).unwrap();
+        entry.file_number = other.file_number;
+        entry.data_pos = other.data_pos;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((victim, entry));
+        cs.store.write_batch(batch).unwrap();
+
+        assert!(
+            cs.get_block(&victim).is_none(),
+            "a record that decodes but is a different block must not be served"
+        );
+        assert!(
+            !cs.block_data_readable(&victim),
+            "and it must be reported as a hole so a repair can fix it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

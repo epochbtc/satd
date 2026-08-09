@@ -531,8 +531,17 @@ pub async fn start(
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         // Optional as a satd extension; Core requires it. See
         // `network::get_block_from_peer`.
-        let peer_id: Option<crate::net::peer::PeerId> =
-            seq.optional_next().unwrap_or(None);
+        //
+        // The error is propagated, not collapsed into `None`:
+        // `optional_next` returns `Err` for a *type mismatch* as well as
+        // `Ok(None)` for an absent argument, so `unwrap_or(None)` would turn
+        // `getblockfrompeer(hash, "3")` into "no peer named" and silently
+        // send the request to an arbitrary peer instead. For an RPC whose
+        // whole point is that the operator chose the peer, redirecting on a
+        // typo is the wrong failure mode — and Core rejects those calls.
+        let peer_id: Option<crate::net::peer::PeerId> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
         network::get_block_from_peer(&ctx.chain_state, &ctx.peer_manager, &hash, peer_id)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
