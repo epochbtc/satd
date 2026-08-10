@@ -178,7 +178,7 @@ fn spawn_base() -> Base {
 /// (`check_block_version`), then the contextual checks + real script
 /// verification (`connect_block`). `true` = accept.
 fn satd_accepts(b: &Block, base: &Base) -> bool {
-    if check_block(b).is_err() {
+    if check_block(b, Network::Regtest, base.height + 1).is_err() {
         return false;
     }
     if check_block_version(&b.header, base.height + 1, Network::Regtest).is_err() {

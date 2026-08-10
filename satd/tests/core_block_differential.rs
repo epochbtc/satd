@@ -690,6 +690,63 @@ fn c_intra_block_spend_ok(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![mid, child]))
 }
 
+// -- BIP 141 witness rules (Core: `CheckWitnessMalleation`) --
+//
+// satd was laxer than Core on all three of these (issue #538): it had no
+// nonce-size rule at all, its `unexpected-witness` scan skipped the coinbase,
+// and it verified the commitment only when some non-coinbase transaction
+// carried witness data. None of them is reachable through honest mining, which
+// is why they went unnoticed — and why they are pinned live here.
+
+/// The BIP 141 commitment output for a given witness root and nonce.
+fn commitment_output(witness_root: [u8; 32], nonce: [u8; 32]) -> TxOut {
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&witness_root);
+    preimage[32..].copy_from_slice(&nonce);
+    let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+    let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    spk.extend_from_slice(&commitment);
+    TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) }
+}
+
+/// A coinbase-only candidate: the witness root is the merkle root over the
+/// single (all-zero) coinbase wtxid, i.e. all zeros.
+const COINBASE_ONLY_WITNESS_ROOT: [u8; 32] = [0u8; 32];
+
+/// Commitment present, but the coinbase witness is not one 32-byte item.
+/// Nothing in the block hash covers that witness, so the block is otherwise
+/// indistinguishable from the honest one.
+fn c_witness_nonce_size(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    cb.output.push(commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]));
+    cb.input[0].witness.push([0x11; 7]);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
+/// No commitment output, but the coinbase carries witness data. satd's scan
+/// ran over `txdata[1..]`, so this was invisible to it.
+fn c_unexpected_witness_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    cb.input[0].witness.push([0u8; 32]);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
+/// A well-formed nonce and a commitment that does not match, in a block with
+/// no witness transactions — the case satd skipped outright.
+fn c_witness_commitment_mismatch(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut wrong = commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]);
+    let mut spk = wrong.script_pubkey.to_bytes();
+    spk[37] ^= 0x01; // flip one bit of the committed hash
+    wrong.script_pubkey = ScriptBuf::from_bytes(spk);
+    cb.output.push(wrong);
+    cb.input[0].witness.push([0u8; 32]);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
 fn cases() -> Vec<Case> {
     // Shorthand: most cases demand exact reason parity (`core_reason_differs:
     // None`). Only the documented BIP68 label gap sets it.
@@ -709,6 +766,10 @@ fn cases() -> Vec<Case> {
         case("coinbase_scriptsig_too_short", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_short),
         case("coinbase_scriptsig_too_long", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_long),
         case("merkle_mutation_cve_2012_2459", "block-structure", Some("bad-txns-duplicate"), c_merkle_mutation),
+        // BIP 141 witness rules (issue #538)
+        case("witness_nonce_size", "witness", Some("bad-witness-nonce-size"), c_witness_nonce_size),
+        case("unexpected_witness_coinbase", "witness", Some("unexpected-witness"), c_unexpected_witness_coinbase),
+        case("witness_commitment_mismatch", "witness", Some("bad-witness-merkle-match"), c_witness_commitment_mismatch),
         // context-free transaction
         case("tx_no_outputs", "tx-context-free", Some("bad-txns-vout-empty"), c_tx_no_outputs),
         case("tx_output_over_max", "tx-context-free", Some("bad-txns-vout-toolarge"), c_tx_output_over_max),

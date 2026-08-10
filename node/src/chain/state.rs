@@ -3029,8 +3029,8 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // Context-free block validation
-        validation::block::check_block(block)?;
+        // Structural + witness block validation
+        validation::block::check_block(block, self.network, new_height)?;
 
         // PoW validation
         validation::pow::check_proof_of_work(&block.header)?;
@@ -3154,10 +3154,12 @@ impl ChainState {
     /// - the hash matching a `block_index` entry means the header is one we
     ///   already accepted (PoW, difficulty, and checkpoints checked then);
     /// - the block hash commits to the merkle root, and
-    ///   [`validation::block::check_block_for_stored_copy`] ties the txdata to
-    ///   that root, rejects CVE-2012-2459 mutation, and — the part that
-    ///   matters here — verifies the BIP 141 commitment even for a block that
-    ///   presents as witness-free, so a witness-stripped copy is refused.
+    ///   [`validation::block::check_block`] ties the txdata to that root,
+    ///   rejects CVE-2012-2459 mutation, and — the part that matters here —
+    ///   applies the BIP 141 witness rules, which pin the witness bytes the
+    ///   block hash does not cover (a stripped, padded, or truncated coinbase
+    ///   witness is refused, as is a witness-stripped copy that presents as
+    ///   witness-free).
     ///
     /// So a peer can only supply the genuine block or be rejected. Status is
     /// preserved exactly: a `Valid` block stays `Valid` (its UTXO delta was
@@ -3221,21 +3223,18 @@ impl ChainState {
                 validation::ValidationError::BadTxDuplicate,
             ));
         }
-        let segwit_active =
-            height >= crate::validation::script::activation_heights(self.network).segwit;
-        validation::block::check_block_for_stored_copy(block, segwit_active)?;
+        validation::block::check_block(block, self.network, height)?;
 
         // Only *now* decide whether there is anything to do. The check is
         // "are the stored bytes the canonical block", not "do they parse":
         // a copy that deserializes and hashes correctly can still be
-        // non-canonical in its witnesses (that is the whole reason
-        // `check_block_for_stored_copy` exists), and short-circuiting on
-        // readability alone would make this RPC unable to repair the one
-        // corruption it can actually detect. Ordering it after validation
-        // also means a peer's bad bytes can never displace a good stored
-        // copy — they are rejected before we look.
+        // non-canonical in its witnesses (nothing in the block hash covers
+        // them), and short-circuiting on readability alone would make this RPC
+        // unable to repair the one corruption it can actually detect.
+        // Ordering it after validation also means a peer's bad bytes can never
+        // displace a good stored copy — they are rejected before we look.
         if let Some(stored) = self.get_block(&hash)
-            && validation::block::check_block_for_stored_copy(&stored, segwit_active).is_ok()
+            && validation::block::check_block(&stored, self.network, height).is_ok()
         {
             return Ok(BlockDataRepair::AlreadyPresent { height });
         }
@@ -3271,7 +3270,7 @@ impl ChainState {
         // writer may have landed a good copy while we were validating, but a
         // parse-able bad one is still a hole.
         if let Some(stored) = self.get_block(&hash)
-            && validation::block::check_block_for_stored_copy(&stored, segwit_active).is_ok()
+            && validation::block::check_block(&stored, self.network, height).is_ok()
         {
             return Ok(BlockDataRepair::AlreadyPresent { height });
         }
@@ -3944,7 +3943,7 @@ impl ChainState {
         self.require_extends_tip(&pre.block.header, pre.height)?;
         // Normally already done by the prefetch worker, off this thread.
         if !pre.context_free_checked {
-            validation::block::check_block(&pre.block)?;
+            validation::block::check_block(&pre.block, self.network, pre.height)?;
         }
         let use_noop = self.should_skip_scripts(pre.height);
         let noop = NoopVerifier;
@@ -4028,7 +4027,7 @@ impl ChainState {
         // inside a transaction payload survives every check above: the 80-byte
         // header still hashes to the planned block. Only re-deriving the block
         // from its own bytes catches it (issue #505).
-        validation::block::check_block(&block)?;
+        validation::block::check_block(&block, self.network, height)?;
         let parent = self
             .store
             .get_block_index(&block.header.prev_blockhash)
@@ -4436,7 +4435,7 @@ impl ChainState {
             // the block index is being rebuilt from them — and their framing
             // carries no checksum. `scan_one_file` validated magic and length;
             // this is what validates the payload (issue #505).
-            validation::block::check_block(&block)?;
+            validation::block::check_block(&block, self.network, height)?;
 
             let use_noop = self.should_skip_scripts(height);
             let noop = NoopVerifier;
@@ -4640,7 +4639,7 @@ impl ChainState {
                 skipped += 1;
                 continue;
             }
-            if let Err(e) = validation::block::check_block(&block) {
+            if let Err(e) = validation::block::check_block(&block, self.network, *height) {
                 tracing::warn!(
                     block = %hash,
                     height,
@@ -4739,8 +4738,8 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // Context-free block validation
-        validation::block::check_block(block)?;
+        // Structural + witness block validation
+        validation::block::check_block(block, self.network, new_height)?;
 
         // PoW validation
         validation::pow::check_proof_of_work(&block.header)?;

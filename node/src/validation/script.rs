@@ -111,6 +111,16 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
             taproot: 834_624,
         },
         // Signet, Testnet4, Regtest: always active.
+        //
+        // Core's chainparams say `SegwitHeight = 1` for signet and testnet4
+        // (regtest is 0), not 0. The difference is only the genesis block, and
+        // it changes no verdict: genesis carries no witness data and no
+        // commitment output, so `check_witness_rules` routes it to the
+        // `unexpected-witness` scan and passes under either gate. Kept at 0 so
+        // the whole table reads "everything from genesis" — but the segwit row
+        // now gates a consensus rule (BIP 141 witness checks), not just script
+        // flags, so the discrepancy is recorded rather than left to be
+        // rediscovered.
         _ => ActivationHeights {
             p2sh: 0,
             dersig: 0,
@@ -559,6 +569,8 @@ mod tests {
         // at height 394.
         assert_eq!(t3.p2sh, 395);
 
+        // Core has `SegwitHeight = 1` for signet and testnet4 (0 for regtest);
+        // see the note in `activation_heights` for why 0 is equivalent here.
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             assert_eq!(
                 activation_heights(net),

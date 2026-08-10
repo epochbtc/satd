@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Consensus fix:** the BIP 141 witness rules are now enforced exactly as
+  Bitcoin Core enforces them. satd previously accepted three classes of block
+  Core rejects — a malformed coinbase witness nonce, witness data hung off the
+  coinbase in a block that commits to none, and a commitment that is never
+  verified because no other transaction carries witness data. Each was a
+  potential chain split with satd on the losing side.
 - Fixed: a crash could leave a block's `block_index` entry pointing at block
   bytes that never reached disk. Block records are now fsync'd before the entry
   referencing them is committed, on every write path including IBD.
