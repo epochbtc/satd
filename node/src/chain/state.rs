@@ -6103,11 +6103,13 @@ impl node_sp_index::SpIndex for ChainState {
 
     fn activation_height(&self) -> u32 {
         // The trait contract is "the lowest height that carries a tweak row",
-        // which is the same floor the backfill walks from — including the
-        // `.max(1)`, since genesis is never connected via `connect_block` and
-        // so never gets a row even on the chains where taproot is active from
-        // height 0. Sharing the definition keeps this from drifting against
-        // the runner the way the progress origin did.
+        // which is the same floor the backfill walks from and the same floor
+        // `connect_block` emits at — including the `.max(1)`. Genesis IS
+        // connected through `connect_block` (see `ChainState::new`), so on the
+        // chains where taproot is active from height 0 the `.max(1)` is what
+        // keeps a height-0 row from existing on one path and not the other;
+        // it is not merely defensive. Sharing the definition keeps all three
+        // from drifting the way the progress origin did.
         crate::index::silent_payments::walk_start(self.network)
     }
 

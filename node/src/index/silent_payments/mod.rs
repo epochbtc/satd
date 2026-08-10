@@ -45,3 +45,25 @@ pub use node_sp_index::{
     CF_SP_TWEAKS, SP_TWEAKS_VERSION, SpBlockRow, SpIndex, SpIndexConfig, SpIndexError, TweakEntry,
     compute_tweak, eligible_inputs, scan_outputs,
 };
+
+#[cfg(test)]
+mod walk_start_tests {
+    use bitcoin::Network;
+
+    /// Pin the walk origin per network against Core's taproot activation
+    /// heights. Every other test in this module passes `walk_start` in as an
+    /// explicit literal, so without this the whole table — including the
+    /// load-bearing `.max(1)` — could be changed with the suite still green.
+    #[test]
+    fn walk_start_matches_taproot_activation() {
+        assert_eq!(super::walk_start(Network::Bitcoin), 709_632);
+        assert_eq!(super::walk_start(Network::Testnet), 834_624);
+        // Taproot is active from genesis here, but genesis itself never
+        // carries a row: `ChainState::new` connects it, and both the emit
+        // gate and the backfill floor start at 1. Deleting the `.max(1)`
+        // must fail this.
+        for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
+            assert_eq!(super::walk_start(net), 1, "{net}");
+        }
+    }
+}

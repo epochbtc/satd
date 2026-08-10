@@ -209,6 +209,12 @@ pub fn get_index_info(
 /// linear `progress_ratio` (no two-pass weighting).
 #[cfg(feature = "block-filter-index")]
 fn estimate_filter_remaining_seconds(report: &filter::StatusReport) -> u64 {
+    // Same gate as the SP estimator, for the same reason — see
+    // `estimate_sp_remaining_seconds`. One `getindexinfo` response carries all
+    // three of these side by side; a stale ETA is no less wrong here.
+    if !report.enabled || report.state != filter::BackfillState::Running.label() {
+        return 0;
+    }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }
@@ -238,7 +244,7 @@ fn estimate_sp_remaining_seconds(report: &silent_payments::StatusReport) -> u64 
     // small early in the mainnet walk, which turns that stale number into an
     // absurd one (a failure near activation projects weeks), so the state
     // gate has to land with the ratio fix rather than after it.
-    if report.state != silent_payments::BackfillState::Running.label() {
+    if !report.enabled || report.state != silent_payments::BackfillState::Running.label() {
         return 0;
     }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
@@ -263,6 +269,11 @@ fn estimate_sp_remaining_seconds(report: &silent_payments::StatusReport) -> u64 
 /// ratio. Returns 0 when no estimate is available (idle, just
 /// started, or no snapshot height yet).
 fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusReport) -> u64 {
+    // Same gate as the SP estimator, for the same reason — see
+    // `estimate_sp_remaining_seconds`.
+    if !report.enabled || report.state != crate::index::address::BackfillState::Running.label() {
+        return 0;
+    }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }

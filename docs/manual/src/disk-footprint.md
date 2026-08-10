@@ -145,9 +145,16 @@ add the index to an existing datadir, run a backfill:
 sat-cli backfillindex silentpayment
 ```
 
-The backfill walks from taproot activation to the tip and resumes across a
-restart. `getindexinfo` reports a `silentpayments` section with the synced flag
-and the backfill progress. Until a backfill completes, the tweak-serving
+The backfill walks from taproot activation to the snapshot height it pinned at
+start, and resumes across a restart. `getindexinfo` reports a `silentpayments`
+section with the synced flag and the backfill progress. Progress is measured
+across that walked span, not from genesis, so it starts near zero rather than
+near the fraction of the chain that predates taproot.
+
+`estimated_remaining_seconds` is reported only while a backfill is both enabled
+and running. A paused, cancelled, failed or disabled cursor reports `0` — its
+progress is frozen while elapsed wall-clock keeps growing, so any estimate
+derived from it would grow without bound for as long as the node stays up. Until a backfill completes, the tweak-serving
 surfaces refuse a request rather than return a partial result.
 
 > **Note.** At roughly 4 GB on mainnet, `sp_tweaks` is small next to the
