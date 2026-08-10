@@ -170,6 +170,7 @@ pub fn get_index_info(
             sp_backfill.map(|h| h.as_ref()),
             sp_index_enabled,
             sp_complete,
+            silent_payments::walk_start(chain.network),
         );
         let mut spi = serde_json::Map::new();
         spi.insert("synced".into(), json!(report.synced));
@@ -208,6 +209,12 @@ pub fn get_index_info(
 /// linear `progress_ratio` (no two-pass weighting).
 #[cfg(feature = "block-filter-index")]
 fn estimate_filter_remaining_seconds(report: &filter::StatusReport) -> u64 {
+    // Same gate as the SP estimator, for the same reason — see
+    // `estimate_sp_remaining_seconds`. One `getindexinfo` response carries all
+    // three of these side by side; a stale ETA is no less wrong here.
+    if !report.enabled || report.state != filter::BackfillState::Running.label() {
+        return 0;
+    }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }
@@ -229,6 +236,17 @@ fn estimate_filter_remaining_seconds(report: &filter::StatusReport) -> u64 {
 /// ETA estimator for the single-pass SP-index backfill. Same shape as the
 /// filter estimator — reads the linear `progress_ratio`.
 fn estimate_sp_remaining_seconds(report: &silent_payments::StatusReport) -> u64 {
+    // Only a running backfill has an ETA. A paused, cancelled or failed
+    // cursor freezes `progress_ratio` while `started_at_unix` recedes, so
+    // `elapsed * (1-r)/r` grows without bound for as long as the node stays
+    // up — a failed run was observed serving a confidently wrong ETA
+    // indefinitely. Measuring from taproot activation makes `r` genuinely
+    // small early in the mainnet walk, which turns that stale number into an
+    // absurd one (a failure near activation projects weeks), so the state
+    // gate has to land with the ratio fix rather than after it.
+    if !report.enabled || report.state != silent_payments::BackfillState::Running.label() {
+        return 0;
+    }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }
@@ -251,6 +269,11 @@ fn estimate_sp_remaining_seconds(report: &silent_payments::StatusReport) -> u64 
 /// ratio. Returns 0 when no estimate is available (idle, just
 /// started, or no snapshot height yet).
 fn estimate_remaining_seconds(report: &crate::index::address::backfill::StatusReport) -> u64 {
+    // Same gate as the SP estimator, for the same reason — see
+    // `estimate_sp_remaining_seconds`.
+    if !report.enabled || report.state != crate::index::address::BackfillState::Running.label() {
+        return 0;
+    }
     if report.progress_ratio <= 0.0 || report.progress_ratio >= 1.0 {
         return 0;
     }
@@ -855,9 +878,7 @@ fn sp_start_fresh(
     // marker means "no holes below the tip", which is trivially true when
     // there are no eligible blocks. A later block connect above activation
     // is handled by the live emit path (which keeps the index whole).
-    let walk_start = crate::validation::script::activation_heights(chain.network)
-        .taproot
-        .max(1);
+    let walk_start = silent_payments::walk_start(chain.network);
     if tip_height < walk_start {
         h.reset_flags();
         h.start(store.as_ref(), tip_height, tip_hash.to_byte_array())
@@ -1143,4 +1164,68 @@ pub fn get_silent_payment_block_data(
         "height": height,
         "tweaks": tweaks,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sp_report(state: &str, progress_ratio: f64, started_at_unix: u64) -> silent_payments::StatusReport {
+        silent_payments::StatusReport {
+            synced: false,
+            enabled: true,
+            state: state.to_string(),
+            cursor_height: 0,
+            snapshot_height: 961_595,
+            started_at_unix,
+            progress_ratio,
+        }
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// A running backfill gets a real estimate: at 25% after an hour, the
+    /// remaining three quarters are ~3 hours.
+    #[test]
+    fn sp_eta_estimates_while_running() {
+        let eta = estimate_sp_remaining_seconds(&sp_report("running", 0.25, now() - 3600));
+        assert!(
+            (10_000..=11_000).contains(&eta),
+            "expected ~10800s for 25% after 1h, got {eta}"
+        );
+    }
+
+    /// The regression guard: a backfill that is not running has no ETA.
+    ///
+    /// `progress_ratio` freezes in these states while `started_at_unix`
+    /// recedes, so `elapsed * (1-r)/r` climbs forever. Measuring progress
+    /// from taproot activation makes `r` genuinely small early in the
+    /// mainnet walk, so without this gate a run that failed just past
+    /// activation projects weeks of remaining work — and keeps doing so for
+    /// as long as the node stays up.
+    #[test]
+    fn sp_eta_is_zero_for_non_running_states() {
+        // Ratio of a mainnet backfill that died ~230 blocks past activation,
+        // an hour ago. Ungated this is elapsed * (1-r)/r ~= 45 days.
+        let ratio = 231.0 / 251_964.0;
+        for state in ["failed", "paused", "cancelled", "completed", "idle", "rejected"] {
+            let eta = estimate_sp_remaining_seconds(&sp_report(state, ratio, now() - 3600));
+            assert_eq!(eta, 0, "state {state:?} must not report an ETA");
+        }
+    }
+
+    #[test]
+    fn sp_eta_is_zero_at_the_boundaries() {
+        // Just started (ratio pinned to 0.0) and complete both yield no
+        // estimate rather than a division blow-up.
+        assert_eq!(estimate_sp_remaining_seconds(&sp_report("running", 0.0, now() - 60)), 0);
+        assert_eq!(estimate_sp_remaining_seconds(&sp_report("running", 1.0, now() - 60)), 0);
+        // No start timestamp recorded.
+        assert_eq!(estimate_sp_remaining_seconds(&sp_report("running", 0.5, 0)), 0);
+    }
 }

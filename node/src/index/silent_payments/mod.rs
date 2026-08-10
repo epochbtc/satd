@@ -17,6 +17,23 @@ pub mod emit;
 pub mod runner;
 pub mod stats;
 
+/// Lowest height that can carry a BIP 352 tweak row: taproot activation,
+/// but never below 1 (genesis is never connected via `connect_block`, so
+/// the live path emits no row there).
+///
+/// This is the floor of the backfill's walk *and* the origin its progress
+/// is measured from. On mainnet it is 709_632, so a walk to the tip covers
+/// roughly a quarter of the chain; treating 0 as the origin overstates
+/// progress from the first stamped block onward. Testnet3 is offset too
+/// (834_624). Signet, testnet4 and regtest have taproot from genesis, so
+/// the offset is 1 there and the distinction is invisible — which is why
+/// it went unnoticed, every test having used a genesis-activation shape.
+pub fn walk_start(network: bitcoin::Network) -> u32 {
+    crate::validation::script::activation_heights(network)
+        .taproot
+        .max(1)
+}
+
 pub use backfill::{
     BackfillError, BackfillHandle, PREFLIGHT_REQUIRED_FREE_BYTES, StatusReport, render_status,
 };
@@ -28,3 +45,25 @@ pub use node_sp_index::{
     CF_SP_TWEAKS, SP_TWEAKS_VERSION, SpBlockRow, SpIndex, SpIndexConfig, SpIndexError, TweakEntry,
     compute_tweak, eligible_inputs, scan_outputs,
 };
+
+#[cfg(test)]
+mod walk_start_tests {
+    use bitcoin::Network;
+
+    /// Pin the walk origin per network against Core's taproot activation
+    /// heights. Every other test in this module passes `walk_start` in as an
+    /// explicit literal, so without this the whole table — including the
+    /// load-bearing `.max(1)` — could be changed with the suite still green.
+    #[test]
+    fn walk_start_matches_taproot_activation() {
+        assert_eq!(super::walk_start(Network::Bitcoin), 709_632);
+        assert_eq!(super::walk_start(Network::Testnet), 834_624);
+        // Taproot is active from genesis here, but genesis itself never
+        // carries a row: `ChainState::new` connects it, and both the emit
+        // gate and the backfill floor start at 1. Deleting the `.max(1)`
+        // must fail this.
+        for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
+            assert_eq!(super::walk_start(net), 1, "{net}");
+        }
+    }
+}

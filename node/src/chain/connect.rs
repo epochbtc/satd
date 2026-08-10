@@ -854,8 +854,19 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // even when empty so row-presence means "indexed, no eligible txs".
     // Below activation, nothing on chain is SP-eligible and no row is
     // written at all (§3.2). No-op when the index is disabled at runtime.
+    //
+    // The floor is `walk_start`, not the raw taproot height, because this is
+    // the *other* end of the drift this module's single-definition rule
+    // exists to prevent. On the chains where taproot is active from genesis
+    // (regtest, signet, testnet4) the raw height is 0, and `ChainState::new`
+    // really does connect genesis through this function — so writing at
+    // `>= 0` put a row at height 0 that the backfill, `activation_height()`
+    // and the deep pager all agree does not exist. Empty either way (a
+    // coinbase-only block yields a present-but-empty row), but a live-synced
+    // datadir and a backfilled one must not differ in which heights carry a
+    // row.
     if sp_index.enabled
-        && height >= crate::validation::script::activation_heights(network).taproot
+        && height >= crate::index::silent_payments::walk_start(network)
         && let Some(row) = crate::index::silent_payments::build_sp_row(
             sp_index,
             block,
@@ -957,6 +968,51 @@ mod tests {
         assert_eq!(batch.block_index_puts.len(), 1);
         assert_eq!(batch.height_hash_puts.len(), 1);
         assert!(batch.tip.is_some());
+    }
+
+    /// Genesis is connected through this function (`ChainState::new` does
+    /// exactly that), and on regtest taproot is active from height 0 — so the
+    /// SP emit gate has to be the shared `walk_start`, not the raw activation
+    /// height, or a live-synced datadir carries a height-0 `sp_tweaks` row
+    /// that a backfilled one does not.
+    #[test]
+    fn genesis_writes_no_sp_row_even_with_taproot_active_at_zero() {
+        let store = InMemoryStore::new();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let sp_index = crate::index::silent_payments::SpIndexConfig { enabled: true };
+        assert_eq!(
+            crate::validation::script::activation_heights(Network::Regtest).taproot,
+            0,
+            "fixture premise: regtest activates taproot at genesis"
+        );
+
+        let batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &genesis,
+            height: 0,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: FlatFilePos { file_number: 0, data_pos: 0 },
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            sp_index: &sp_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+        .unwrap();
+
+        assert!(
+            batch.sp_tweak_puts.is_empty(),
+            "genesis must not carry an sp_tweaks row; the backfill floor \
+             (walk_start = {}) does not cover it",
+            crate::index::silent_payments::walk_start(Network::Regtest)
+        );
     }
 
     #[test]

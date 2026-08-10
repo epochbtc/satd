@@ -321,18 +321,25 @@ impl MetricsContext {
             &[],
             sp_stats.row_removes,
         );
-        // Deferred-backfill progress ratio (0.0–1.0). Reads the persisted
-        // SP-index backfill cursor: 0.0 when idle / not started, 1.0 on
-        // completion. A float gauge, so emitted directly rather than via
-        // the u64 `metric` helper.
+        // Deferred-backfill progress ratio (0.0–1.0), read from the persisted
+        // SP-index backfill cursor. A float gauge, so emitted directly rather
+        // than via the u64 `metric` helper. Measured from taproot activation,
+        // the height the walk actually starts at — from genesis it would sit
+        // at ~0.74 on mainnet from the first stamped block onward.
+        //
+        // 0.0 is deliberately not a "nothing is wrong" signal: it covers an
+        // idle cursor, a node whose index was built inline from genesis (and
+        // is therefore complete without any backfill having run), and a
+        // backfill that has only just started. Read it together with
+        // `getindexinfo`'s `silentpayments.backfill.state` rather than alone.
         let sp_backfill_ratio = self
             .chain_state
             .store_ref()
             .read_sp_backfill_cursor()
-            .progress_ratio();
+            .progress_ratio(crate::index::silent_payments::walk_start(self.network));
         let _ = writeln!(
             out,
-            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed (0.0 idle/none, 1.0 complete)."
+            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot]. 1.0 means a deferred backfill ran to completion; 0.0 means no backfill progress and does NOT imply the index is incomplete (an index built inline from genesis needs no backfill and stays at 0.0)."
         );
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
