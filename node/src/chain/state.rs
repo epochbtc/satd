@@ -3187,10 +3187,28 @@ impl ChainState {
 
         Self::check_repairable(&hash, &entry)?;
 
-        if self.block_data_readable(&hash) {
-            return Ok(BlockDataRepair::AlreadyPresent {
-                height: entry.height,
-            });
+        // The height this block is judged at gates a consensus rule (segwit
+        // activation), so take it from the block's own parent link rather than
+        // from the entry alone. `prev_blockhash` is inside the 80 bytes the
+        // block hash commits to, and the hash is how we found `entry` — so the
+        // link is authenticated, while `entry.height` is index state of the
+        // very index this function exists to repair. The two must agree: a
+        // disagreement means the index is inconsistent, and writing block
+        // bytes on the strength of it is exactly what not to do. Refuse, and
+        // deliberately NOT as `ChainError::Validation` — the peer is not at
+        // fault and must not be banned for our damaged index.
+        let parent_height = self
+            .store
+            .get_block_index(&block.header.prev_blockhash)
+            .ok_or(ChainError::BadPrevBlock)?
+            .height;
+        let height = parent_height + 1;
+        if height != entry.height {
+            return Err(ChainError::InvalidArgument(format!(
+                "block {hash}: index entry says height {} but its parent chain says {height}; \
+                 refusing to repair against an inconsistent index",
+                entry.height
+            )));
         }
 
         // The P2P entry point rejects mutated blocks before routing here, but
@@ -3204,8 +3222,23 @@ impl ChainState {
             ));
         }
         let segwit_active =
-            entry.height >= crate::validation::script::activation_heights(self.network).segwit;
+            height >= crate::validation::script::activation_heights(self.network).segwit;
         validation::block::check_block_for_stored_copy(block, segwit_active)?;
+
+        // Only *now* decide whether there is anything to do. The check is
+        // "are the stored bytes the canonical block", not "do they parse":
+        // a copy that deserializes and hashes correctly can still be
+        // non-canonical in its witnesses (that is the whole reason
+        // `check_block_for_stored_copy` exists), and short-circuiting on
+        // readability alone would make this RPC unable to repair the one
+        // corruption it can actually detect. Ordering it after validation
+        // also means a peer's bad bytes can never displace a good stored
+        // copy — they are rejected before we look.
+        if let Some(stored) = self.get_block(&hash)
+            && validation::block::check_block_for_stored_copy(&stored, segwit_active).is_ok()
+        {
+            return Ok(BlockDataRepair::AlreadyPresent { height });
+        }
 
         // Append the record BEFORE taking `accept_lock`. `write_block_durable`
         // takes the flat-file mutex, and `store_block` holds `accept_lock`
@@ -3234,13 +3267,23 @@ impl ChainState {
             .get_block_index(&hash)
             .ok_or(ChainError::BlockNotFound)?;
         Self::check_repairable(&hash, &entry)?;
-        if self.block_data_readable(&hash) {
-            return Ok(BlockDataRepair::AlreadyPresent {
-                height: entry.height,
-            });
+        // Same "canonical, not merely readable" test as above — a concurrent
+        // writer may have landed a good copy while we were validating, but a
+        // parse-able bad one is still a hole.
+        if let Some(stored) = self.get_block(&hash)
+            && validation::block::check_block_for_stored_copy(&stored, segwit_active).is_ok()
+        {
+            return Ok(BlockDataRepair::AlreadyPresent { height });
+        }
+        // The entry was re-read under the lock, so re-confirm the height the
+        // validation above was gated on still describes it.
+        if entry.height != height {
+            return Err(ChainError::InvalidArgument(format!(
+                "block {hash}: height changed from {height} to {} while repairing",
+                entry.height
+            )));
         }
 
-        let height = entry.height;
         let mut repaired = entry;
         repaired.file_number = flat_pos.file_number;
         repaired.data_pos = flat_pos.data_pos;
@@ -3306,6 +3349,28 @@ impl ChainState {
         let block = self
             .read_block_direct(&flat_pos)
             .ok_or(ChainError::FlatFile("failed to read stored block".to_string()))?;
+        // Verify the record is the block the entry claims, exactly as
+        // `get_block` and the reindex paths (`require_planned_block`) do. A
+        // mis-recorded offset lands on another record's *start*, not on
+        // garbage, so deserialization succeeds and hands back a different
+        // block — and here that block would be connected: a sibling at the
+        // same height with the same parent can validate, after which
+        // `connect_block` writes `height_hash[h]` and `block_index` for the
+        // sibling while this function sets the in-memory tip to `hash`.
+        if block.block_hash() != *hash {
+            tracing::error!(
+                %hash,
+                found = %block.block_hash(),
+                height = entry.height,
+                file_number = flat_pos.file_number,
+                data_pos = flat_pos.data_pos,
+                "block index entry points at a different block's record"
+            );
+            return Err(ChainError::FlatFile(format!(
+                "block {hash}: stored record holds {} instead",
+                block.block_hash()
+            )));
+        }
 
         let parent = self
             .store
@@ -6373,6 +6438,38 @@ pub(crate) mod tests {
     /// reproducing the shape of the mainnet-954866 hole: the `block_index`
     /// entry survives and still claims `DataStored`/`Valid`, but the bytes it
     /// points at are gone.
+    /// Overwrite a block's stored record in place with different bytes of the
+    /// same length. Used to plant a copy that parses but is not canonical.
+    fn overwrite_block_record(
+        cs: &ChainState,
+        dir: &std::path::Path,
+        hash: &BlockHash,
+        replacement: &Block,
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+        let entry = cs.get_block_index(hash).expect("entry must exist");
+        let bytes = serialize(replacement);
+        let path = dir
+            .join("blocks")
+            .join(format!("blk{:05}.dat", entry.file_number));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open flat file");
+        // The 8-byte record header carries the payload length, so rewrite it
+        // too rather than assuming the replacement is the same size.
+        f.seek(SeekFrom::Start(entry.data_pos as u64 + 4))
+            .expect("seek to the size field");
+        f.write_all(&(bytes.len() as u32).to_le_bytes())
+            .expect("rewrite record size");
+        f.write_all(&bytes).expect("rewrite record payload");
+        drop(f);
+        cs.flat_files
+            .lock()
+            .resync_append_pos()
+            .expect("resync append offset");
+    }
+
     fn punch_block_data_hole(cs: &ChainState, dir: &std::path::Path, hash: &BlockHash) {
         let entry = cs.get_block_index(hash).expect("entry must exist");
         let path = dir
@@ -6455,6 +6552,114 @@ pub(crate) mod tests {
             !cs.flat_files.lock().has_unsynced_writes(),
             "BulkLoad must fsync the record too: WAL-less index entries still \
              reach disk on their own via automatic memtable flushes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repair must be able to replace bytes that *parse* but are not the
+    /// canonical block. Gating on "does `get_block` return something" made the
+    /// one corruption this RPC can actually detect — a non-canonical witness,
+    /// which leaves the block hash and merkle root intact — unrepairable, so
+    /// the tool built for the job could not do it.
+    #[test]
+    fn repair_block_data_replaces_a_readable_but_noncanonical_copy() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let target = blocks[1].clone();
+        let hash = target.block_hash();
+
+        // Overwrite the stored record with a witness-mutated copy: identical
+        // block hash, identical merkle root, junk appended to the coinbase
+        // witness. This is what a hostile peer could have planted.
+        let mut forged = target.clone();
+        forged.txdata[0].input[0].witness.push([0xde; 64]);
+        assert_eq!(forged.block_hash(), hash, "the forgery must be hash-invisible");
+        assert_ne!(serialize(&forged), serialize(&target));
+        overwrite_block_record(&cs, &dir, &hash, &forged);
+
+        assert!(
+            cs.get_block(&hash).is_some(),
+            "the forged copy must still be readable — that is the point"
+        );
+        assert_eq!(
+            cs.get_block(&hash).as_ref(),
+            Some(&forged),
+            "fixture premise: the forged bytes are what is stored"
+        );
+
+        let outcome = cs
+            .repair_block_data(&target)
+            .expect("an honest copy must be accepted over a non-canonical one");
+        assert_eq!(outcome, BlockDataRepair::Repaired { height: 2 });
+        assert_eq!(
+            cs.get_block(&hash).as_ref(),
+            Some(&target),
+            "the canonical bytes must now be stored"
+        );
+
+        // ...and a second repair with the same good copy is a no-op.
+        assert_eq!(
+            cs.repair_block_data(&target).unwrap(),
+            BlockDataRepair::AlreadyPresent { height: 2 }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer offering a non-canonical copy must never displace a good stored
+    /// one — validation runs before the "is it already present" question.
+    #[test]
+    fn repair_block_data_refuses_a_noncanonical_copy_over_a_good_one() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let target = blocks[1].clone();
+        let hash = target.block_hash();
+
+        let mut forged = target.clone();
+        forged.txdata[0].input[0].witness.push([0xde; 64]);
+
+        let err = cs.repair_block_data(&forged).expect_err("must be rejected");
+        assert!(
+            matches!(err, ChainError::Validation(_)),
+            "a witness forgery is peer fault: {err:?}"
+        );
+        assert_eq!(
+            cs.get_block(&hash).as_ref(),
+            Some(&target),
+            "the good stored copy must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The segwit gate is a consensus rule, so the height it is taken from
+    /// must be cross-checked against the block's own parent link rather than
+    /// trusted from the index this function exists to repair. A disagreement
+    /// is refused — and NOT as a validation error, because the peer is not at
+    /// fault and must not be banned for our damaged index.
+    #[test]
+    fn repair_block_data_refuses_when_the_index_height_disagrees_with_the_chain() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let target = blocks[1].clone();
+        let hash = target.block_hash();
+
+        punch_block_data_hole(&cs, &dir, &hash);
+
+        // Corrupt just the height on the entry, leaving the parent link alone.
+        let mut entry = cs.get_block_index(&hash).unwrap();
+        entry.height = 999_999;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        cs.store.write_batch(batch).unwrap();
+
+        let err = cs
+            .repair_block_data(&target)
+            .expect_err("an inconsistent index must not be repaired against");
+        assert!(
+            !matches!(err, ChainError::Validation(_)),
+            "must not be a validation error — the peer would be banned for it: {err:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

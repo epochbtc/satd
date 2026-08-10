@@ -19,7 +19,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   new `blk*.dat` files get a directory fsync.
 - New `getblockfrompeer` RPC (Core-compatible) re-fetches one block from one
   peer and repairs its stored copy in place, so a lost block body no longer
-  requires a full resync.
+  requires a full resync. It also replaces a stored copy that parses but is not
+  the canonical block — a non-canonical witness leaves the block hash intact,
+  so nothing else surfaces it.
 - Fixed: `getblock` no longer serves a different block when an index entry's
   offset lands on another record; the block hash is verified on read.
 - New **Go SDK** (`satdevents`) for the streaming API, at `clients/go/` as an

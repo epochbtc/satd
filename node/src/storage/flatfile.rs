@@ -315,10 +315,21 @@ impl FlatFileManager {
             // them. Truncation is safe by construction, since `current_pos`
             // was never advanced and so no `block_index` entry can reference
             // anything at or after `record_start`.
-            let truncate_result = self.truncate_current_file_to(record_start);
-            // The write error is what the caller needs to see; surface a
-            // truncation failure only if the write itself somehow succeeded.
-            truncate_result?;
+            // The write error is what the caller needs to see, so it wins.
+            // A truncation failure is strictly worse — it leaves the torn
+            // record in place with `current_pos` still pointing before it, so
+            // the next write would append over it and record the new block at
+            // a stale offset — but it is also strictly rarer, and losing the
+            // original cause would make the common case undiagnosable. Log it
+            // loudly and return the cause.
+            if let Err(te) = self.truncate_current_file_to(record_start) {
+                tracing::error!(
+                    file = self.current_file,
+                    record_start,
+                    "failed to truncate a torn block record after a failed write: {te}; \
+                     the file may now contain a partial record"
+                );
+            }
             return Err(e);
         }
 
@@ -431,7 +442,30 @@ impl FlatFileManager {
     }
 
     /// Delete a flat file from disk. Invalidates any cached read handle.
+    ///
+    /// **Refuses the current append file.** Deleting it would unlink the inode
+    /// `write_handle` still points at: subsequent `write_block` calls would
+    /// succeed, `sync_all` would succeed, and the `block_index` entries
+    /// committed alongside them would reference a path that does not exist —
+    /// the "entry outlives its bytes" failure this module exists to prevent,
+    /// with every block written after the unlink lost for good.
+    ///
+    /// The pruner alone could never select it: it only prunes files whose
+    /// every block is at or below the prune horizon, and the current file
+    /// always also holds the blocks just connected. `repair_block_data`
+    /// breaks that invariant — it appends an *old-height* block's record to
+    /// the current file, and if that append rotates, the fresh file holds
+    /// nothing but a prunable-height block. Hence the guard here rather than
+    /// at the call site: the invariant belongs to whoever owns the handle.
     pub fn delete_file(&mut self, file_number: u32) -> std::io::Result<()> {
+        if file_number == self.current_file {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to delete blk{file_number:05}.dat: it is the current append file"
+                ),
+            ));
+        }
         self.read_cache.remove(&file_number);
         let path = self.file_path(file_number);
         if path.exists() {
@@ -625,6 +659,37 @@ impl FlatFileManager {
 mod tests {
     use super::*;
 
+    /// Deleting the file we are still appending to would unlink the inode
+    /// `write_handle` points at: later writes and their fsyncs would all
+    /// "succeed" into a file that no longer exists, and every `block_index`
+    /// entry committed alongside them would reference a missing path.
+    ///
+    /// Only the repair path can put the pruner in a position to try it (it
+    /// appends an old-height block's record to the current file), so the guard
+    /// lives here, with the handle, rather than at the call site.
+    #[test]
+    fn delete_file_refuses_the_current_append_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("satd-flatfile-delcur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+
+        let pos = mgr.write_block(b"a block", magic).unwrap();
+        let err = mgr
+            .delete_file(pos.file_number)
+            .expect_err("the current append file must not be deletable");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // The file is still there and still writable through the same handle.
+        assert!(mgr.file_exists(pos.file_number));
+        let second = mgr.write_block(b"another block", magic).unwrap();
+        assert_eq!(second.file_number, pos.file_number);
+        assert_eq!(mgr.read_block(&second).unwrap(), b"another block");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_write_and_read_block() {
         let dir = std::env::temp_dir().join(format!("satd-flatfile-test-{}", std::process::id()));
@@ -758,6 +823,15 @@ mod tests {
         mgr.write_block(b"data", magic).unwrap();
 
         // After writing, file 0 exists
+        assert!(mgr.file_exists(0));
+
+        // File 0 is the current append file, so it is exempt from deletion
+        // (see `delete_file_refuses_the_current_append_file`). Advance past it
+        // the way a restart after rotation would: `new` adopts the
+        // highest-numbered file present.
+        drop(mgr);
+        std::fs::write(dir.join("blk00001.dat"), b"").unwrap();
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
         assert!(mgr.file_exists(0));
 
         // Delete it

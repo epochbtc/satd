@@ -198,10 +198,15 @@ impl CoinCache {
         self.write_mode.store(v, Ordering::Relaxed);
     }
 
-    /// The active write-durability mode. `ChainState::write_block_durable`
-    /// reads this to decide whether a flat-file fsync is required before the
-    /// referencing `block_index` entry can be committed.
-    pub fn current_write_mode(&self) -> WriteMode {
+    /// The active write-durability mode.
+    ///
+    /// Deliberately private: it describes RocksDB batching only. It was
+    /// briefly `pub` so `ChainState::write_block_durable` could skip the
+    /// flat-file fsync in `BulkLoad` — an exemption that was wrong (a
+    /// WAL-less write still lands via automatic memtable flush, so IBD is the
+    /// *more* exposed path, not the safe one) and has been removed. Nothing
+    /// outside this module should gate durability on it.
+    fn current_write_mode(&self) -> WriteMode {
         decode_write_mode(self.write_mode.load(Ordering::Relaxed))
     }
 

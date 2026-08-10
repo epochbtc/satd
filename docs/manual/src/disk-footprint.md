@@ -198,6 +198,13 @@ commitment must verify; otherwise no transaction may carry witness data at all.
 Together those pin every byte, so a peer can only return the genuine block or
 be rejected. A peer whose reply fails is banned.
 
+The same test decides whether there is anything to repair. A stored copy is
+left alone only if it is the *canonical* block, not merely one that parses —
+witness bytes are outside everything the block hash commits to, so a copy can
+deserialize and hash correctly while still carrying a padded, truncated or
+stripped witness. `getblockfrompeer` will replace such a copy; `getblock` on it
+succeeds, so nothing else would ever surface it.
+
 Blocks that are pruned or marked invalid are refused: those states are
 deliberate, and repopulating them would contradict the decision that produced
 them. A block you hold only the header for is not repaired either — it is
