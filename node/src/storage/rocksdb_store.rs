@@ -1890,7 +1890,7 @@ impl Store for RocksDbStore {
         // integer property here, but on the live mainnet datadir it
         // came back as `Ok(None)` for every CF and was silently
         // coerced to 0 by the property helper — see the 2026-05-14
-        // dogfood log where the chainstate is hundreds of GB on disk
+        // diagnostic log where the chainstate is hundreds of GB on disk
         // yet the diagnostic reported `total_mb=0` with an empty
         // `per_cf=`. The metadata API is the documented, non-stringly-
         // typed accessor for the same number and does not depend on

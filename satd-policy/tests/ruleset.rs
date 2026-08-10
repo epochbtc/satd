@@ -356,9 +356,9 @@ fn cr_only_line_endings_parse_as_separate_lines() {
     assert_eq!(rs.rules().len(), 1);
 }
 
-/// The shipped example/dogfood ruleset (`contrib/policy/example.policy`) must
-/// always compile and stay within budget — it is loaded by the dogfood fleet and
-/// referenced from the Operator Manual, so a grammar change that breaks it must
+/// The shipped example ruleset (`contrib/policy/example.policy`) must always
+/// compile and stay within budget — it is loaded in production and referenced
+/// from the Operator Manual, so a grammar change that breaks it must
 /// fail CI here, not in production.
 #[test]
 fn shipped_example_policy_compiles() {

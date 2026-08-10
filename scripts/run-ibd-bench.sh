@@ -2,7 +2,7 @@
 # Partial-IBD benchmark: fresh sync from genesis to a target height,
 # running satd with --consensus=cpp-shadow (Rust authoritative).
 #
-# Uses a dedicated datadir (/satd/bench-run) and alternate RPC/P2P ports
+# Uses a dedicated datadir (\$HOME/.satd-bench by default) and alternate RPC/P2P ports
 # so it doesn't collide with the production satd-mainnet service.
 #
 # Prereq: systemctl --user stop satd-mainnet  (frees CPU/mem/peers)
@@ -11,16 +11,17 @@
 
 set -euo pipefail
 
-SATD="$HOME/.local/bin/satd"
-DATADIR="${IBD_BENCH_DATADIR:-/satd/bench-run}"
+SATD="${SATD:-$HOME/.local/bin/satd}"
+DATADIR="${IBD_BENCH_DATADIR:-$HOME/.satd-bench}"
 RPCPORT="${IBD_BENCH_RPCPORT:-18890}"
 P2PPORT="${IBD_BENCH_P2PPORT:-18891}"
 CONSENSUS="${IBD_BENCH_CONSENSUS:-cpp-shadow}"
 ASSUMEVALID="${IBD_BENCH_ASSUMEVALID:-0}"
 SHADOW_WORKERS="${IBD_BENCH_SHADOW_WORKERS:-8}"
 # P2P ports of local peers we should force-connect to. 8333 = Bitcoin Core.
-# (The satd-mainnet service at 18881 was tried too, but when it's running its
-# own IBD catchup it competes for CPU and skews the bench — skip it.)
+# (Another satd instance on the same host was tried too, but when it is
+# running its own IBD catchup it competes for CPU and skews the bench, so it
+# is deliberately left out.)
 LOCAL_PEER_PORTS=(8333)
 MAINNET_P2P_PORT=8333
 LOG_FILE="${DATADIR}/satd-bench.log"

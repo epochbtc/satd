@@ -2,10 +2,13 @@
 # Launch satd on mainnet with local Bitcoin Core + DNS-seeded external peers.
 set -euo pipefail
 
-SATD="$HOME/.local/bin/satd"
-DATADIR="/satd"
-RPCPORT=18880
-P2PPORT=18881
+# Paths and ports are overridable so this script carries no assumption about
+# any particular host's layout: export SATD/DATADIR/RPCPORT/P2PPORT to match
+# your own, or drop them in an env file and source it before running.
+SATD="${SATD:-$HOME/.local/bin/satd}"
+DATADIR="${DATADIR:-$HOME/.satd-mainnet}"
+RPCPORT="${RPCPORT:-8332}"
+P2PPORT="${P2PPORT:-8333}"
 MAINNET_P2P_PORT=8333
 DNS_SEEDS=(
     "seed.bitcoin.sipa.be"

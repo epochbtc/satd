@@ -139,7 +139,8 @@ jobs:
       # tested here, on satd's own PRs, rather than in a downstream repo, so a
       # node or proto change that breaks the SDK fails the PR that made it —
       # the same reason the third-party canary fleet is PR-gating. The SDK is
-      # not dogfooded by the maintainer, so CI is the only thing between a
+      # not exercised by day-to-day node operation, so CI is the only thing
+      # between a
       # green badge and a rotted client.
       - name: Set up Go toolchain
         uses: actions/setup-go@v7

@@ -26,7 +26,7 @@
 //!
 //! The constants below are *calibration* values: defensible defaults plus the
 //! calibration test (`tests/`) that reports ns/unit on the host. Final numbers
-//! land after the dogfood-fleet bench (§7, §14 precondition).
+//! land after the hardware bench (§7, §14 precondition).
 
 use crate::ast::*;
 

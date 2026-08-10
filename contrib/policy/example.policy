@@ -1,4 +1,4 @@
-# satd transaction-filtering policy — annotated example / dogfood-soak ruleset
+# satd transaction-filtering policy — annotated example / soak-test ruleset
 # ---------------------------------------------------------------------------
 # Load with `policyfile=/path/to/example.policy` (or `-policyfile=...`), reload
 # live with SIGHUP. Validate offline first: `sat-cli policylint --explain this`.

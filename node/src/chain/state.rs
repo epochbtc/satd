@@ -2404,7 +2404,7 @@ impl ChainState {
     /// served to peers. Consensus is unaffected (the UTXO delta was already
     /// applied), so the node looks healthy until something re-reads history.
     ///
-    /// Observed on the mainnet dogfood node at height 954866: the record was
+    /// Observed on a mainnet node at height 954866: the record was
     /// cut at a 4 KiB page boundary and the next block was appended at the
     /// resulting EOF, 1.6 MB short of where the index said it ended.
     ///
@@ -4580,7 +4580,7 @@ impl ChainState {
     ///     the reorg path either.
     ///   * No `height_hash` entry is ever written. The height→hash index names
     ///     the *active* chain; letting a losing branch write there is the
-    ///     bad-cb-height pollution that wedged a dogfood node (#322).
+    ///     bad-cb-height pollution that wedged a mainnet node (#322).
     fn index_reindex_side_chain(
         &self,
         side: &[(BlockHash, u32, [u8; 32])],

@@ -150,7 +150,7 @@ pub mod defaults {
         }
     }
     /// 10 GiB. Enough headroom to notice before a mainnet node wedges mid-block
-    /// (the 2026-05-13 dogfood incident was a silent disk-fill).
+    /// (the 2026-05-13 incident was a silent disk-fill).
     pub const DISK_FREE_MB: u64 = 10_240;
     /// Percent of the mempool byte cap.
     pub const MEMPOOL_FULL_PCT: u64 = 90;

@@ -46,7 +46,7 @@ Operator Manual chapter.
 **Fast-follow (Tier 2):** general byte transforms (`rc4`/`sha256`/`reverse` +
 `tx.first_input_txid`/`out.op_return_data`, a `version 2` file) for protocols
 that obfuscate a self-carried marker — sequenced after the version-1 cost model
-is proven on the dogfood fleet.
+is proven under sustained production use.
 
 ### Dynamic Dust Thresholds
 **Proposal:** `--dynamic-dust=1` — Automatically scales the dust threshold as a percentage of the trailing 24-hour median block fee.

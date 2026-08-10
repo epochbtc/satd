@@ -659,7 +659,7 @@ mod tests {
         (tx, vec![prev])
     }
 
-    // Regression for the signet dogfood incident (2026-06-09): an unsigned
+    // Regression for the signet incident (2026-06-09): an unsigned
     // P2WPKH spend was accepted because the verifier applied MAINNET
     // activation heights on signet — at signet height 308_124 < 481_824 the
     // WITNESS flag was off, making witness programs anyone-can-spend. With
