@@ -11,6 +11,24 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **P2P hardening:** the block-ingress mutation gate now ports Core's
+  `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated
+  block (same hash, same merkle root) is rejected at ingress instead of one
+  layer later — and a merkle-root mismatch. It also *stops* rejecting two shapes
+  Core accepts: a block containing a 64-byte transaction when a coinbase is
+  present, and any block whose parent is unknown. Both were stricter than Core
+  on a gate that bans at 100 points, i.e. a way to ban honest peers.
+- Fixed: `-reindex` no longer aborts permanently on a block it cannot replay.
+  Because the chainstate is wiped before the replay begins, that abort left the
+  node with no chain at all and failed identically on every retry. It now stops
+  at that height, keeps everything below it, says so loudly, and lets normal
+  sync re-fetch the rest from peers.
+- Fixed: block data that is missing or unreadable behind a live `block_index`
+  entry is now reported as local corruption — an error log and a standing
+  warning naming `getblockfrompeer` — instead of being indistinguishable from a
+  pruned block.
+- CI: every third-party action is pinned by commit SHA; none run from a mutable
+  branch ref. The fuzz job's pinned nightly now has a single source of truth.
 - **Consensus fix:** the BIP 141 witness rules are now enforced exactly as
   Bitcoin Core enforces them. satd previously accepted three classes of block
   Core rejects — a malformed coinbase witness nonce, witness data hung off the
