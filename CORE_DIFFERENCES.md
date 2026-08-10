@@ -26,7 +26,7 @@ The compatibility contract itself — what is Tier 1 / Tier 2 / Tier 3,
 how deprecations are staged, what migration invariants apply — lives
 in `STABILITY_POLICY.md`.
 
-Last updated: 2026-06-01.
+Last updated: 2026-08-09.
 
 ---
 
@@ -327,6 +327,22 @@ preserved; the satd extension is opt-in per request or per flag.
   traffic without banlists — at the cost of also dropping honest peers
   that have not yet upgraded, so it stays opt-in until v2 adoption is
   high. `getpeerinfo.transport_protocol_type` reports `v1`/`v2` per peer.
+
+- **`getblockfrompeer`** — same method name, positional arguments and
+  empty-object result as Core, with three behavioral differences. (a)
+  `peer_id` is optional; when omitted satd picks a connected
+  `NODE_NETWORK` + `NODE_WITNESS` peer (a *malformed* peer id is still an
+  error). (b) "Block already downloaded" is decided by whether the
+  block's bytes can actually be *read back*, not by the index status
+  flag — Core's flag test refuses precisely the case the RPC is most
+  useful for, an entry that claims to hold data whose flat-file record
+  was lost. (c) **More restrictive than Core:** pruned blocks are
+  refused, because satd's repair path will not repopulate data the prune
+  accounting no longer tracks. Error strings are close to Core's but not
+  identical, and named arguments are unsupported (satd-wide). The reply
+  is authenticated against the header already in our index and repairs
+  the stored copy in place. See
+  [Repairing lost block data](https://epochbtc.github.io/satd/disk-footprint.html#repairing-lost-block-data).
 
 - **`--profile=<preset>`** — bundled config presets (`archival`,
   `pruned-home`, `mining`, `regtest-dev`, `signet-watchtower`). CLI

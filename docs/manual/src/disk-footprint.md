@@ -154,6 +154,81 @@ surfaces refuse a request rather than return a partial result.
 > address indices. About 85% of tweaks describe dust outputs; a subscription
 > can drop them with a `tweak_dust_limit`.
 
+## Repairing lost block data
+
+Block bodies live in the flat files under `blocks/` (`blk*.dat`), not in
+RocksDB. The `block_index` entry for a block records which file and offset its
+record starts at. Those are two independently buffered write streams, so it is
+possible — after a kernel panic or power loss, never after a clean shutdown or
+a plain process crash — to end up with an index entry that survived while the
+block bytes it points at did not.
+
+The symptom is a single block that behaves as if it were pruned on a node that
+is not pruning:
+
+```console
+$ sat-cli getblock 000000000000000000000b951399b504a52a3fdfa1d33bcde59ac6c019c4af1c 0
+error code: -5: Block data not available
+```
+
+`getblockheader` still works and shows the block connected with a normal
+confirmation count, because consensus never re-reads the body: the UTXO delta
+was applied when the block connected. Nothing surfaces the hole until something
+walks history — an index backfill fails at that height, or a peer's request for
+the block cannot be served.
+
+Fetch a fresh copy of just that block from a peer:
+
+```sh
+sat-cli getblockfrompeer <blockhash>          # satd picks a peer
+sat-cli getblockfrompeer <blockhash> <peer_id>  # or name one from `getpeerinfo`
+```
+
+The call returns as soon as the request is sent; the repair happens when the
+block arrives. Re-run `getblock` to confirm, and check the log for
+`Repaired block data from a peer-supplied copy`.
+
+The supplied block is authenticated before anything is written. Its hash must
+match a header already in the index — which is what carries the proof-of-work
+and difficulty checks made when that header was accepted — and its transactions
+must match the merkle root that hash commits to. Witnesses need their own
+chain, because the merkle root commits only to txids: when the coinbase carries
+a BIP 141 commitment it must hold exactly one 32-byte witness item and the
+commitment must verify; otherwise no transaction may carry witness data at all.
+Together those pin every byte, so a peer can only return the genuine block or
+be rejected. A peer whose reply fails is banned.
+
+The same test decides whether there is anything to repair. A stored copy is
+left alone only if it is the *canonical* block, not merely one that parses —
+witness bytes are outside everything the block hash commits to, so a copy can
+deserialize and hash correctly while still carrying a padded, truncated or
+stripped witness. `getblockfrompeer` will replace such a copy; `getblock` on it
+succeeds, so nothing else would ever surface it.
+
+Blocks that are pruned or marked invalid are refused: those states are
+deliberate, and repopulating them would contradict the decision that produced
+them. A block you hold only the header for is not repaired either — it is
+downloaded through the normal path, which applies the checkpoint and signet
+checks and connects it.
+
+To find holes ahead of time rather than discovering them through a failed
+backfill, use the block-file audit:
+
+```sh
+sat-cli debug blockfile-audit
+```
+
+It reports `unresolved_entries` for index entries whose record falls past the
+end of its file, in one pass over the file metadata — as opposed to
+`getblockstats` across every height, which reads and deserializes every block
+body on the chain and cannot distinguish a data hole from an unknown block
+(both return `-5`).
+
+> **Note.** satd fsyncs a block's record before its index entry is committed on
+> every write path, so the window above is closed for blocks written by current
+> versions. Datadirs that predate this may still carry a hole from an earlier
+> crash; nothing audits or migrates them on upgrade.
+
 ## Compaction
 
 RocksDB background compaction runs continuously. satd's bulk-load reindex mode

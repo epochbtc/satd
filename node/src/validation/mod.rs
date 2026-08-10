@@ -53,6 +53,14 @@ pub enum ValidationError {
     BadTxNullInput,
     #[error("bad-witness-merkle-match")]
     BadWitnessCommitment,
+    /// The coinbase witness is not exactly one 32-byte item while a BIP 141
+    /// commitment output is present. Core's `bad-witness-nonce-size`.
+    #[error("bad-witness-nonce-size")]
+    BadWitnessNonceSize,
+    /// A transaction carries witness data in a block that commits to none.
+    /// Core's `unexpected-witness`.
+    #[error("unexpected-witness")]
+    UnexpectedWitness,
     #[error("bad-signet-solution")]
     BadSignetSolution,
     #[error("time-timewarp-attack")]

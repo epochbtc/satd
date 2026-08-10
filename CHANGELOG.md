@@ -11,6 +11,19 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed: a crash could leave a block's `block_index` entry pointing at block
+  bytes that never reached disk. Block records are now fsync'd before the entry
+  referencing them is committed, on every write path including IBD.
+- Fixed: a torn flat-file record (ENOSPC mid-write) is truncated rather than
+  appended past, so `-reindex` no longer silently skips the rest of that file;
+  new `blk*.dat` files get a directory fsync.
+- New `getblockfrompeer` RPC (Core-compatible) re-fetches one block from one
+  peer and repairs its stored copy in place, so a lost block body no longer
+  requires a full resync. It also replaces a stored copy that parses but is not
+  the canonical block — a non-canonical witness leaves the block hash intact,
+  so nothing else surfaces it.
+- Fixed: `getblock` no longer serves a different block when an index entry's
+  offset lands on another record; the block hash is verified on read.
 - New **Go SDK** (`satdevents`) for the streaming API, at `clients/go/` as an
   independently versioned module (`clients/go/vX.Y.Z` tags): full parity with
   `satd-events-client` — firehose, all watch kinds, durable cursors, reconnect,
