@@ -3,10 +3,10 @@
 # `--addressindex={0,1}` flag so operators can quantify the cost of
 # enabling the index. Usage:
 #
-#   IBD_BENCH_DATADIR=/satd/bench-run-addr-off \
+#   IBD_BENCH_DATADIR="$HOME/.satd-bench-addr-off" \
 #     ADDRINDEX=0 ./scripts/run-ibd-bench-with-addrindex.sh
 #
-#   IBD_BENCH_DATADIR=/satd/bench-run-addr-on \
+#   IBD_BENCH_DATADIR="$HOME/.satd-bench-addr-on" \
 #     ADDRINDEX=1 ./scripts/run-ibd-bench-with-addrindex.sh
 #
 # Two consecutive runs (off vs on) using distinct datadirs let you
@@ -34,5 +34,5 @@ esac
 export IBD_BENCH_EXTRA_ARGS="${IBD_BENCH_EXTRA_ARGS:-} --addressindex=${ADDRINDEX}"
 
 echo "[bench] Launching IBD bench with --addressindex=${ADDRINDEX}"
-echo "[bench] Datadir: ${IBD_BENCH_DATADIR:-/satd/bench-run}"
+echo "[bench] Datadir: ${IBD_BENCH_DATADIR:-$HOME/.satd-bench}"
 exec "$SCRIPT_DIR/run-ibd-bench.sh" "$@"

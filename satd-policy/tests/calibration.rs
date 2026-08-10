@@ -2,7 +2,7 @@
 //!
 //! This is the "cost-calibration bench" the PR-1 plan calls for, shipped as an
 //! `#[ignore]`d test so it does not gate CI but can be run on demand — crucially
-//! on the dogfood fleet's slowest (Pi-class) hardware, where the real ns/unit
+//! on the slowest supported (Pi-class) hardware, where the real ns/unit
 //! number that sets `POLICY_BUDGET` / `DEFAULT_FUEL` is established.
 //!
 //! Run with:  `cargo test -p satd-policy --release -- --ignored --nocapture`

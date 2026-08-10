@@ -20,7 +20,7 @@
 #
 # Runtime overrides — `/etc/default/satd` (optional):
 #   SATD_DATADIR=/var/lib/satd       # override datadir path
-#   SATD_OPTS="--rpcport=18880 ..."  # extra flags appended to ExecStart
+#   SATD_OPTS="--rpcport=8332 ..."   # extra flags appended to ExecStart
 #
 # If you set SATD_DATADIR to anything other than `/var/lib/satd`, you
 # also need a drop-in that updates the hardening directives, since
@@ -60,7 +60,7 @@ NotifyAccess=main
 # Operators can override the datadir or append extra flags via
 # /etc/default/satd without forking the unit. ${SATD_DATADIR} stays a
 # single argv token; $SATD_OPTS is word-split, so multi-flag strings
-# like `--rpcport=18880 --txindex` expand to separate arguments.
+# like `--rpcport=8332 --txindex` expand to separate arguments.
 Environment=SATD_DATADIR=/var/lib/satd
 Environment=SATD_OPTS=
 EnvironmentFile=-/etc/default/satd

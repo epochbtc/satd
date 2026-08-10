@@ -140,7 +140,7 @@ Because `POLICY_BUDGET` already bounds ruleset complexity, fuel exhaustion is
 *unreachable* for a budget-respecting ruleset on a normally-sized transaction —
 if `__fuel` ever fires in production it signals a bug or a pathological input,
 and the fail-safe (below) keeps it safe meanwhile. The constants are
-fleet-calibration defaults pending the dogfood bench (`§14`).
+fleet-calibration defaults pending the hardware bench (`§14`).
 
 ---
 
@@ -428,7 +428,7 @@ comments resolve here.
 | §8 | Live SIGHUP reload + lossless topological re-placement |
 | §10 | Observability RPCs, MCP tools, Prometheus metrics, quarantine event channel |
 | §13 | Quarantine-class budget; the Tier-2 / `version 2` fast-follow boundary |
-| §14 | Cost-constant calibration precondition (dogfood-fleet bench) |
+| §14 | Cost-constant calibration precondition (hardware bench) |
 | §17 | Worked cookbook examples (also exercised as integration tests) |
 
 ---

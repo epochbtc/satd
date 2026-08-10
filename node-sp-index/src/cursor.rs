@@ -231,7 +231,7 @@ mod tests {
         const ACTIVATION: u32 = 709_632;
         const TIP: u32 = 961_595;
 
-        // The cursor observed on the dogfood mainnet node moments after
+        // The cursor observed on a mainnet node moments after
         // the backfill started: 231 blocks past activation, i.e. 0.09% of
         // the 251_964-block walk.
         let fresh = running_at(709_863, TIP);

@@ -4,8 +4,8 @@ for real-block benchmarks.
 
 Usage:
     extract_block.py <height> <output-path>
-              [--rpc URL]           default http://127.0.0.1:18880/
-              [--cookie PATH]       default /satd/.cookie
+              [--rpc URL]           default http://127.0.0.1:8332/
+              [--cookie PATH]       default ~/.bitcoin/.cookie
               [--rpcuser USER]      optional (if set, --rpcpassword required)
               [--rpcpassword PW]    optional
 
@@ -15,6 +15,7 @@ enabled so it can resolve every input's prevout via getrawtransaction.
 JSON is parsed with `parse_float=Decimal` so satoshi conversions don't
 lose precision through a float round-trip.
 """
+import pathlib
 import argparse
 import json
 import sys
@@ -77,13 +78,13 @@ def main():
     parser.add_argument("output_path", type=Path, help="destination JSON file")
     parser.add_argument(
         "--rpc",
-        default="http://127.0.0.1:18880/",
-        help="RPC URL (default: http://127.0.0.1:18880/)",
+        default="http://127.0.0.1:8332/",
+        help="RPC URL (default: http://127.0.0.1:8332/)",
     )
     parser.add_argument(
         "--cookie",
-        default="/satd/.cookie",
-        help="cookie file path (default: /satd/.cookie)",
+        default=str(pathlib.Path.home() / ".bitcoin" / ".cookie"),
+        help="cookie file path (default: ~/.bitcoin/.cookie)",
     )
     parser.add_argument("--rpcuser", help="explicit RPC username (overrides cookie)")
     parser.add_argument("--rpcpassword", help="explicit RPC password")

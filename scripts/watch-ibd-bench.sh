@@ -7,7 +7,7 @@
 set -euo pipefail
 
 TARGET_HEIGHT="${1:-500000}"
-DATADIR="${IBD_BENCH_DATADIR:-/satd/bench-run}"
+DATADIR="${IBD_BENCH_DATADIR:-$HOME/.satd-bench}"
 RPCPORT="${IBD_BENCH_RPCPORT:-18890}"
 COOKIE_PATH="$DATADIR/.cookie"
 

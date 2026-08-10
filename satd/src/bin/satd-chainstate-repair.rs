@@ -38,7 +38,7 @@ struct Args {
     /// Network datadir of the node (the directory holding `chainstate/`
     /// and `blocks/`), e.g. /satd for a mainnet node. For non-mainnet
     /// nodes pass the network subdirectory itself (e.g.
-    /// /satd/signet/signet).
+    /// ~/.satd/signet/signet).
     #[arg(long)]
     datadir: PathBuf,
 
@@ -55,13 +55,13 @@ struct Args {
     #[arg(long)]
     blockhash: String,
 
-    /// Whether the node runs with -txindex (mainnet dogfood: yes).
+    /// Whether the node runs with -txindex.
     /// Must match the node's configuration so the rebuilt delta only
     /// populates indices the node actually maintains.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     txindex: bool,
 
-    /// Whether the node runs with -addressindex (mainnet dogfood: yes).
+    /// Whether the node runs with -addressindex.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     addressindex: bool,
 
