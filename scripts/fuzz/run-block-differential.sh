@@ -15,11 +15,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MAX_TOTAL_TIME="${MAX_TOTAL_TIME:-300}"
-# Pinned nightly, not floating: an upstream rustc regression must not red this
-# job (see the FUZZ_NIGHTLY comment in
-# .github/workflows/core_block_differential_fuzz.yml). Keep this default in
-# sync with that workflow so a local run reproduces CI exactly; override with
-# FUZZ_NIGHTLY=nightly to test a newer toolchain before bumping both.
+# Pinned nightly, not floating: cargo-fuzz needs nightly, but this job exists
+# to find consensus divergence, not to track rustc. A floating `nightly` makes
+# any upstream regression red the job — nightly-2026-07-24 (rustc 89c61a754)
+# ICEs in rustc_codegen_ssa building `tokio` in release mode, which broke every
+# run until this pin.
+#
+# THIS LINE IS THE SINGLE SOURCE OF TRUTH for the pinned toolchain.
+# `.github/workflows/core_block_differential_fuzz.yml` parses it out of this
+# file rather than declaring its own copy: when the two were kept in sync by
+# comment, a drift would have sent the on-call a reproducer that runs on a
+# different toolchain than the job that failed. Keep the assignment on one
+# line, in this exact `FUZZ_NIGHTLY="${FUZZ_NIGHTLY:-...}"` form — the
+# workflow's parser matches it, and fails the job if it stops matching.
+#
+# Bump deliberately, after checking the new toolchain builds this script
+# locally; override with FUZZ_NIGHTLY=nightly to try a newer one first.
 FUZZ_NIGHTLY="${FUZZ_NIGHTLY:-nightly-2026-07-22}"
 
 cleanup() { docker rm -f satd-fuzz-core >/dev/null 2>&1 || true; }

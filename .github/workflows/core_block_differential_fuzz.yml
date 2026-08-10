@@ -44,14 +44,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # cargo-fuzz needs a nightly toolchain, but this job is here to find
-  # consensus divergence, not to track rustc. A floating `nightly` makes any
-  # upstream regression red the job: nightly-2026-07-24 (rustc 89c61a754) ICEs
-  # in rustc_codegen_ssa building `tokio` in release mode, which broke every
-  # run until this pin. Bump deliberately after checking the new toolchain
-  # builds `scripts/fuzz/run-block-differential.sh` locally; keep in sync with
-  # the default in that script.
-  FUZZ_NIGHTLY: nightly-2026-07-22
+  # The pinned nightly is NOT declared here. It lives in
+  # `scripts/fuzz/run-block-differential.sh` and is parsed out of it by the
+  # "Resolve the pinned nightly" step below, so the job and the reproducer this
+  # workflow hands the on-call cannot run different toolchains.
+  #
   # cargo-fuzz's own version, pinned for the same reason the toolchain is.
   # `--locked` pins cargo-fuzz's *dependencies*, not cargo-fuzz itself, so an
   # unpinned install silently tracks upstream — and when it raises its MSRV past
@@ -85,10 +82,24 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang cmake libclang-dev libssl-dev pkg-config
 
+      - name: Resolve the pinned nightly
+        id: nightly
+        run: |
+          set -euo pipefail
+          script=scripts/fuzz/run-block-differential.sh
+          toolchain=$(sed -n 's/^FUZZ_NIGHTLY="${FUZZ_NIGHTLY:-\(.*\)}"$/\1/p' "$script")
+          if [ -z "$toolchain" ]; then
+            echo "::error file=$script::could not parse the FUZZ_NIGHTLY default;" \
+                 "keep the assignment on one line in the documented form" >&2
+            exit 1
+          fi
+          echo "Pinned nightly from $script: $toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master as of 2026-08-05
         with:
-          toolchain: ${{ env.FUZZ_NIGHTLY }}
+          toolchain: ${{ steps.nightly.outputs.toolchain }}
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version ${{ env.CARGO_FUZZ_VERSION }}
@@ -102,7 +113,6 @@ jobs:
         id: fuzz
         env:
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1800' }}
-          FUZZ_NIGHTLY: ${{ env.FUZZ_NIGHTLY }}
         run: bash scripts/fuzz/run-block-differential.sh
 
       - name: Upload divergence artifacts
