@@ -50,9 +50,16 @@
 //! Finally, the four cases that previously rejected with a satd-specific reason
 //! string (tracked as `Expect::ReasonDiffers`) have been aligned to Core's exact
 //! reject reason and promoted to `Expect::Match`: empty block (`bad-blk-length`),
-//! missing/!match witness commitment (`bad-witness-merkle-match`), output over
-//! `MAX_MONEY` (`bad-txns-vout-toolarge`), and bad PoW (`high-hash`). The matrix
-//! is now 32/32 exact (verdict **and** reject reason) against Core.
+//! missing/!match witness commitment, output over `MAX_MONEY`
+//! (`bad-txns-vout-toolarge`), and bad PoW (`high-hash`). The matrix is now
+//! 32/32 exact (verdict **and** reject reason) against Core.
+//!
+//! One of those transcriptions was wrong, and satd's own laxness agreed with
+//! it: `witness_commitment_missing` was pinned to `bad-witness-merkle-match`,
+//! but Core's `CheckWitnessMalleation` only reaches the merkle comparison when
+//! a commitment output exists. With none, it falls through to the
+//! "no witness data allowed" scan and emits `unexpected-witness`. Corrected
+//! with the rest of issue #538.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
@@ -218,7 +225,9 @@ fn spending_tx(prevout: OutPoint, value: u64, version: i32, sequence: u32, lockt
 // ── satd-verdict adapters ─────────────────────────────────────────────
 
 fn cb(block: &Block) -> Satd {
-    check_block(block).map_err(|e| e.to_string())
+    // Regtest, where segwit is active from height 0 — the same context the
+    // live differential's blocks are judged in.
+    check_block(block, Network::Regtest, 1).map_err(|e| e.to_string())
 }
 
 fn tx(tx: &Transaction) -> Satd {
@@ -298,7 +307,9 @@ fn case_oversize_block() -> Satd {
 }
 
 /// A spending tx carrying witness data, but the coinbase has no witness
-/// commitment output (BIP141). Core: `bad-witness-merkle-match`.
+/// commitment output (BIP141). Core: `unexpected-witness` — with no
+/// commitment there is nothing to match against, so `CheckWitnessMalleation`
+/// falls through to the "no witness data allowed" scan over every tx.
 fn case_witness_commitment_missing() -> Satd {
     let mut witness = Witness::new();
     witness.push([0x01; 72]);
@@ -612,7 +623,7 @@ fn cases() -> Vec<Case> {
         Case { name: "multiple_coinbase", core: Reject("bad-cb-multiple"), expect: Match, run: case_multiple_coinbase },
         Case { name: "bad_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_bad_merkle_root },
         Case { name: "oversize_block", core: Reject("bad-blk-length"), expect: Match, run: case_oversize_block },
-        Case { name: "witness_commitment_missing", core: Reject("bad-witness-merkle-match"), expect: Match, run: case_witness_commitment_missing },
+        Case { name: "witness_commitment_missing", core: Reject("unexpected-witness"), expect: Match, run: case_witness_commitment_missing },
         // context-free transaction
         Case { name: "tx_no_inputs", core: Reject("bad-txns-vin-empty"), expect: Match, run: case_tx_no_inputs },
         Case { name: "tx_no_outputs", core: Reject("bad-txns-vout-empty"), expect: Match, run: case_tx_no_outputs },

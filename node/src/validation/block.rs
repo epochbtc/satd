@@ -1,6 +1,7 @@
 use bitcoin::hashes::Hash;
-use bitcoin::Block;
+use bitcoin::{Block, Network};
 
+use crate::validation::script::activation_heights;
 use crate::validation::ValidationError;
 
 /// Maximum block weight (4 million weight units, per BIP 141).
@@ -9,8 +10,25 @@ const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 /// BIP 141 witness commitment header (OP_RETURN + push 36 bytes + magic).
 const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
-/// Perform context-free validation checks on a block.
-pub fn check_block(block: &Block) -> Result<(), ValidationError> {
+/// Validate a block's structure and its BIP 141 witness data.
+///
+/// This is Bitcoin Core's `CheckBlock` (structure, merkle root, CVE-2012-2459
+/// mutation, weight) plus the witness half of `ContextualCheckBlock`
+/// ([`check_witness_rules`]). Core splits the two because it reaches them at
+/// different points; satd keeps them together so that *every* caller which
+/// validates a block gets both halves.
+///
+/// The witness rules are gated on segwit activation exactly as Core gates them
+/// on `DEPLOYMENT_SEGWIT`, which is why this is not context-free: it needs
+/// `network` and `height` to decide. Threading them through the signature
+/// rather than reading them from an optional argument is deliberate — the
+/// compiler makes a new caller supply the context instead of silently
+/// inheriting the laxer, context-free behaviour.
+pub fn check_block(
+    block: &Block,
+    network: Network,
+    height: u32,
+) -> Result<(), ValidationError> {
     // Block must have at least one transaction
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
@@ -51,69 +69,85 @@ pub fn check_block(block: &Block) -> Result<(), ValidationError> {
         return Err(ValidationError::BadTxDuplicate);
     }
 
-    // Check block weight
+    // Check block weight.
+    //
+    // Core runs this AFTER the witness rules below, because it can mark a
+    // block permanently failed: an attacker who pads the coinbase witness
+    // inflates the weight without changing the block hash, so weighing first
+    // would let a mutated copy poison the index against the honest block.
+    // satd never persists a verdict from this function — a rejected block
+    // leaves no `block_index` entry, and only the `invalidateblock` RPC ever
+    // marks a hash `Invalid` — so the cheap check can stay first. If a failure
+    // here ever becomes durable, this ordering must flip to Core's.
     let weight = block.weight().to_wu() as usize;
     if weight > MAX_BLOCK_WEIGHT {
         return Err(ValidationError::OversizedBlock);
     }
 
-    // Check witness commitment (BIP 141)
-    check_witness_commitment(block)?;
+    // Witness commitment (BIP 141), height-gated as Core gates it.
+    check_witness_rules(block, height >= activation_heights(network).segwit)?;
 
     Ok(())
 }
 
-/// [`check_block`] plus the witness rules required before a block's bytes may
-/// be written over — or in place of — a copy we already treat as validated.
+/// The witness half of Bitcoin Core's `ContextualCheckBlock`, rule for rule.
 ///
-/// Used by `ChainState::repair_block_data`, whose input is an untrusted peer's
-/// copy of a block our index already records as `Valid`. Nothing re-runs
-/// script validation on that path, so this function alone has to guarantee
-/// that the supplied bytes are the block's *canonical serialization* — not
-/// merely that they hash correctly.
-///
-/// The block hash and merkle root authenticate the txids, and therefore every
-/// non-witness byte. Witnesses are not covered by either, so they need their
-/// own chain, and it must cover the coinbase input as well:
+/// Two rules, and a block is subject to exactly one of them:
 ///
 /// - **A commitment output is present** (and segwit is active at this height):
 ///   the coinbase witness must be exactly one 32-byte item — Core's
-///   `bad-witness-nonce-size` — and the BIP 141 commitment must verify. That
-///   pins every non-coinbase witness (their wtxids feed the witness root) and
-///   pins the nonce (it is the other input to the commitment hash), so the
-///   whole serialization is determined.
+///   `bad-witness-nonce-size` — and the BIP 141 commitment must verify.
 /// - **Otherwise**: no transaction may carry witness data at all, coinbase
-///   included — Core's `unexpected-witness`.
+///   *included* — Core's `unexpected-witness`.
 ///
-/// Both checks are needed, and the *coinbase* side is the one that is easy to
-/// miss. [`check_block`]'s `has_witness` scan deliberately skips `txdata[0]`,
-/// and [`verify_witness_commitment`] constrains only witness item 0 and only
-/// when it is 32 bytes long, while the coinbase wtxid is hardcoded to zero in
-/// the witness root. So without the rules above a peer can append junk items
-/// to the coinbase witness, replace it with a short item, or drop it
-/// entirely, and none of the block hash, the merkle root, or the commitment
-/// changes. Those bytes would then be persisted as our authoritative copy —
-/// non-canonical forever, re-accepted by a later `-reindex`, and grounds for
-/// every Core peer to ban us the moment we serve that block.
+/// Together they pin the block's entire serialization. The header's merkle
+/// root commits to txids, and so authenticates every non-witness byte, but
+/// nothing in the block hash covers witnesses. The first rule closes that: the
+/// commitment covers every non-coinbase witness (their wtxids feed the witness
+/// root) and the nonce (the other input to the commitment hash), while the
+/// coinbase wtxid is hardcoded to zero. The second rule closes the case where
+/// there is no commitment to lean on.
 ///
-/// `segwit_active` gates the first rule exactly as Core gates it, so a
-/// pre-activation block whose coinbase happens to carry a commitment-shaped
-/// `OP_RETURN` is judged by the second rule and is not spuriously rejected.
-pub fn check_block_for_stored_copy(
-    block: &Block,
-    segwit_active: bool,
-) -> Result<(), ValidationError> {
-    check_block(block)?;
-
+/// Both halves used to be laxer than Core (issue #538), and in both the
+/// *coinbase* side was what was missing:
+///
+/// - the `unexpected-witness` scan ran over `txdata[1..]`, so witness data
+///   hung off the coinbase input alone was accepted;
+/// - there was no nonce-size rule at all — [`verify_witness_commitment`] took
+///   witness item 0 when it happened to be 32 bytes and silently substituted
+///   an all-zero nonce otherwise. Since Core mines a zero nonce, that fallback
+///   *is* the real value for essentially the whole chain, so a coinbase
+///   witness could be truncated, padded with junk items, or dropped entirely
+///   and the commitment would still recompute;
+/// - the commitment was only verified when some non-coinbase transaction
+///   carried witness data, so a witness-stripped copy of a segwit block —
+///   same block hash, same merkle root — skipped the check outright.
+///
+/// Each of those accepts a block Core rejects as `BLOCK_MUTATED`: a chain
+/// split with satd on the losing side. They also matter for any path that
+/// *stores* the bytes without re-running scripts (`repair_block_data`), where
+/// a non-canonical copy would be persisted as authoritative, re-accepted by a
+/// later `-reindex`, and grounds for every Core peer to ban us the moment we
+/// served that block.
+///
+/// `segwit_active` gates the first rule exactly as Core gates it on
+/// `DEPLOYMENT_SEGWIT`, so a pre-activation block whose coinbase happens to
+/// carry a commitment-shaped `OP_RETURN` — mainnet has these, from miners
+/// running segwit-ready software before lock-in — is judged by the second rule
+/// and is not spuriously rejected.
+fn check_witness_rules(block: &Block, segwit_active: bool) -> Result<(), ValidationError> {
     let mut commits_to_witnesses = false;
+
     if segwit_active && has_witness_commitment_output(block) {
+        // `has_witness_commitment_output` only returns true for a non-empty
+        // `txdata`, so the coinbase is present here.
         let coinbase_witness = block.txdata[0].input.first().map(|i| &i.witness);
-        let nonce_is_well_formed = coinbase_witness
-            .is_some_and(|w| w.len() == 1 && w.nth(0).is_some_and(|item| item.len() == 32));
-        if !nonce_is_well_formed {
-            return Err(ValidationError::BadWitnessNonceSize);
-        }
-        verify_witness_commitment(block)?;
+        let nonce = coinbase_witness
+            .filter(|w| w.len() == 1)
+            .and_then(|w| w.nth(0))
+            .and_then(|item| <[u8; 32]>::try_from(item).ok())
+            .ok_or(ValidationError::BadWitnessNonceSize)?;
+        verify_witness_commitment(block, nonce)?;
         commits_to_witnesses = true;
     }
 
@@ -129,21 +163,6 @@ pub fn check_block_for_stored_copy(
     Ok(())
 }
 
-/// Validate the witness commitment in a block (BIP 141).
-/// If any non-coinbase transaction has witness data, the coinbase must contain
-/// a valid witness commitment output.
-fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
-    let has_witness = block.txdata[1..].iter().any(|tx| {
-        tx.input.iter().any(|i| !i.witness.is_empty())
-    });
-
-    if !has_witness {
-        return Ok(()); // No witness data, no commitment needed
-    }
-
-    verify_witness_commitment(block)
-}
-
 /// Whether the coinbase carries a BIP 141 witness-commitment output.
 pub fn has_witness_commitment_output(block: &Block) -> bool {
     block
@@ -157,25 +176,25 @@ pub fn has_witness_commitment_output(block: &Block) -> bool {
         })
 }
 
-/// Verify the BIP 141 commitment unconditionally — no "block carries no
-/// witnesses, nothing to check" short-circuit.
+/// Verify the BIP 141 commitment against a caller-validated 32-byte nonce.
 ///
-/// [`check_witness_commitment`] deliberately keeps that short-circuit: it is
-/// the consensus path, and a block whose transactions carry no witness data
-/// needs no commitment. But the short-circuit is exactly what a peer exploits
-/// to hand back a *witness-stripped* copy of a segwit block: the merkle root
-/// commits to txids only, so stripping every witness leaves the block hash
-/// and merkle root intact, `has_witness` false, and the check skipped.
+/// Taking the nonce as a parameter is what keeps [`check_witness_rules`]'
+/// `bad-witness-nonce-size` rule from being quietly re-opened here: there is
+/// no way to reach this code with a coinbase witness that Core would have
+/// rejected, and no fallback value to substitute when one is missing.
 ///
-/// On the connect path that costs nothing — a stripped block fails script
-/// validation. On a path that *replaces stored bytes for an already-validated
-/// block* nothing re-runs scripts, so the strip would be silently persisted.
-/// Those callers use [`check_block_for_stored_copy`] instead.
-///
-/// A genuinely witness-free block that still carries a commitment output is
-/// handled correctly rather than rejected: with no witnesses every wtxid
-/// equals its txid, so the commitment recomputes and matches.
-fn verify_witness_commitment(block: &Block) -> Result<(), ValidationError> {
+/// Runs unconditionally once a commitment output is present — no "the block
+/// carries no witnesses, so there is nothing to check" short-circuit. That
+/// short-circuit is what let a peer hand back a *witness-stripped* copy of a
+/// segwit block: the merkle root commits to txids only, so stripping every
+/// witness leaves the block hash and merkle root intact and the check skipped.
+/// A genuinely witness-free block that carries a commitment output is still
+/// accepted rather than rejected — with no witnesses every wtxid equals its
+/// txid, so the commitment recomputes and matches.
+fn verify_witness_commitment(
+    block: &Block,
+    witness_nonce: [u8; 32],
+) -> Result<(), ValidationError> {
     // Find the witness commitment in coinbase outputs (last matching one wins)
     let coinbase = &block.txdata[0];
     let mut commitment_hash = None;
@@ -193,24 +212,6 @@ fn verify_witness_commitment(block: &Block) -> Result<(), ValidationError> {
     let expected_commitment = match commitment_hash {
         Some(h) => h,
         None => return Err(ValidationError::BadWitnessCommitment),
-    };
-
-    // Get the witness nonce from the coinbase's first input. `check_block`
-    // already rejected a non-coinbase first tx (a coinbase has exactly one
-    // input), so `input[0]` is present on the validated path; use `first()`
-    // anyway so this function never panics if called in another context.
-    let coinbase_witness = coinbase.input.first().map(|i| &i.witness);
-    let witness_nonce = if coinbase_witness.is_some_and(|w| !w.is_empty()) {
-        let item = coinbase_witness.unwrap().nth(0).unwrap_or(&[0u8; 32]);
-        if item.len() == 32 {
-            let mut nonce = [0u8; 32];
-            nonce.copy_from_slice(item);
-            nonce
-        } else {
-            [0u8; 32]
-        }
-    } else {
-        [0u8; 32]
     };
 
     // Compute witness root from wtxids (coinbase wtxid = 0x00...00)
@@ -325,20 +326,20 @@ mod tests {
     #[test]
     fn test_regtest_genesis_passes_check() {
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        assert!(check_block(&genesis).is_ok());
+        assert!(check_block(&genesis, Network::Regtest, 0).is_ok());
     }
 
     #[test]
     fn test_mainnet_genesis_passes_check() {
         let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
-        assert!(check_block(&genesis).is_ok());
+        assert!(check_block(&genesis, Network::Regtest, 0).is_ok());
     }
 
     #[test]
     fn test_empty_block_rejected() {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         block.txdata.clear();
-        assert!(matches!(check_block(&block), Err(ValidationError::EmptyBlock)));
+        assert!(matches!(check_block(&block, Network::Regtest, 0), Err(ValidationError::EmptyBlock)));
     }
 
     #[test]
@@ -371,7 +372,7 @@ mod tests {
         // Fix merkle root so we don't fail on that first
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        assert!(matches!(check_block(&block), Err(ValidationError::NoCoinbase)));
+        assert!(matches!(check_block(&block, Network::Regtest, 0), Err(ValidationError::NoCoinbase)));
     }
 
     #[test]
@@ -414,7 +415,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         assert!(matches!(
-            check_block(&block),
+            check_block(&block, Network::Regtest, 0),
             Err(ValidationError::MultipleCoinbase)
         ));
     }
@@ -426,7 +427,7 @@ mod tests {
         block.header.merkle_root =
             bitcoin::TxMerkleNode::from_byte_array([0xde; 32]);
         assert!(matches!(
-            check_block(&block),
+            check_block(&block, Network::Regtest, 0),
             Err(ValidationError::BadMerkleRoot)
         ));
     }
@@ -465,7 +466,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         assert!(matches!(
-            check_block(&block),
+            check_block(&block, Network::Regtest, 0),
             Err(ValidationError::OversizedBlock)
         ));
     }
@@ -514,7 +515,7 @@ mod tests {
         block.txdata = vec![coinbase, spending];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        assert!(check_block(&block).is_ok());
+        assert!(check_block(&block, Network::Regtest, 0).is_ok());
     }
 
     #[test]
@@ -593,7 +594,7 @@ mod tests {
         block.txdata = vec![coinbase, spending];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        assert!(check_block(&block).is_ok());
+        assert!(check_block(&block, Network::Regtest, 0).is_ok());
     }
 
     #[test]
@@ -643,9 +644,13 @@ mod tests {
         block.txdata = vec![coinbase, spending];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
+        // Core's verdict for "witness data, no commitment output" is
+        // `unexpected-witness`, not `bad-witness-merkle-match`: with no
+        // commitment there is nothing to match against. satd reported the
+        // latter until issue #538.
         assert!(matches!(
-            check_block(&block),
-            Err(ValidationError::BadWitnessCommitment)
+            check_block(&block, Network::Regtest, 0),
+            Err(ValidationError::UnexpectedWitness)
         ));
     }
 
@@ -709,7 +714,7 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         assert!(matches!(
-            check_block(&block),
+            check_block(&block, Network::Regtest, 0),
             Err(ValidationError::BadWitnessCommitment)
         ));
     }
@@ -751,7 +756,7 @@ mod tests {
         block.txdata = vec![coinbase, t1, t2.clone(), t2];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         assert!(matches!(
-            check_block(&block),
+            check_block(&block, Network::Regtest, 0),
             Err(ValidationError::BadTxDuplicate)
         ));
     }
@@ -765,7 +770,7 @@ mod tests {
         block.txdata = vec![coinbase, dummy_spend(0x11), dummy_spend(0x22)];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         assert!(!merkle_tree_mutated(&block));
-        assert!(check_block(&block).is_ok());
+        assert!(check_block(&block, Network::Regtest, 0).is_ok());
     }
 
     // -- IsBlockMutated (P2P-layer 64-byte / merkle malleation gate) --
@@ -892,18 +897,25 @@ mod tests {
         block
     }
 
-    /// The attack `check_block_for_stored_copy` exists to stop.
+    /// Segwit-active and segwit-inactive contexts for the fixtures below.
     ///
+    /// Mainnet's boundary is used rather than regtest's always-on 0 so the
+    /// pair also pins the gate against Core's `consensus.SegwitHeight`.
+    const SEGWIT_ON: (Network, u32) = (Network::Bitcoin, 481_824);
+    const SEGWIT_OFF: (Network, u32) = (Network::Bitcoin, 481_823);
+
+    fn check(block: &Block, ctx: (Network, u32)) -> Result<(), ValidationError> {
+        check_block(block, ctx.0, ctx.1)
+    }
+
     /// Stripping every witness from a segwit block leaves the txids — and so
-    /// the merkle root and the block hash — untouched. `check_block` accepts
-    /// it, because its commitment check short-circuits on "no witnesses
-    /// present". Any path that overwrites the stored bytes of an
-    /// already-validated block with peer-supplied data must not.
+    /// the merkle root and the block hash — untouched. satd used to accept the
+    /// result: its commitment check short-circuited on "no witnesses present"
+    /// (issue #538). Core rejects it as `BLOCK_MUTATED`.
     #[test]
-    fn witness_stripped_block_passes_check_block_but_not_the_stored_copy_check() {
+    fn witness_stripped_block_is_rejected() {
         let block = segwit_block_with_commitment();
-        assert!(check_block(&block).is_ok(), "the honest block is valid");
-        assert!(check_block_for_stored_copy(&block, true).is_ok());
+        assert!(check(&block, SEGWIT_ON).is_ok(), "the honest block is valid");
 
         let mut stripped = block.clone();
         for tx in &mut stripped.txdata {
@@ -917,7 +929,7 @@ mod tests {
             stripped.block_hash(),
             block.block_hash(),
             "stripping witnesses must not change the block hash — that is why \
-             the hash alone cannot authenticate a re-fetched body"
+             the hash alone cannot authenticate a block body"
         );
         assert_eq!(stripped.header.merkle_root, block.header.merkle_root);
         assert!(
@@ -926,32 +938,24 @@ mod tests {
         );
 
         assert!(
-            check_block(&stripped).is_ok(),
-            "documents the consensus path's short-circuit: a witness-free \
-             block needs no commitment, so check_block cannot catch this"
-        );
-        assert!(
             matches!(
-                check_block_for_stored_copy(&stripped, true),
+                check(&stripped, SEGWIT_ON),
                 Err(ValidationError::BadWitnessNonceSize)
             ),
-            "the strict check must reject a witness-stripped copy"
+            "a witness-stripped copy must be rejected, as Core rejects it"
         );
     }
 
-    /// The hole an independent review found in the first version of
-    /// [`check_block_for_stored_copy`]: it only looked at *non-coinbase*
-    /// witnesses, so the coinbase input was left entirely unauthenticated.
-    ///
-    /// Nothing in the block commits to the coinbase witness — the merkle root
-    /// covers txids, and the coinbase wtxid is hardcoded to zero in the
+    /// Nothing in the block commits to the *coinbase* witness — the merkle
+    /// root covers txids, and the coinbase wtxid is hardcoded to zero in the
     /// witness root — so a peer could append junk to it, shorten it, or drop
     /// it, and the block hash, merkle root and commitment were all unchanged.
-    /// Those bytes would then be persisted as our authoritative copy.
+    /// Core's `bad-witness-nonce-size` is what closes this; satd had no
+    /// equivalent (issue #538).
     #[test]
-    fn coinbase_witness_forgeries_are_rejected_for_a_stored_copy() {
+    fn coinbase_witness_forgeries_are_rejected() {
         let honest = segwit_block_with_commitment();
-        assert!(check_block_for_stored_copy(&honest, true).is_ok());
+        assert!(check(&honest, SEGWIT_ON).is_ok());
 
         // Every case below is the genuine block with only the coinbase
         // witness altered.
@@ -979,31 +983,26 @@ mod tests {
             assert!(
                 bitcoin::consensus::serialize(&forged)
                     != bitcoin::consensus::serialize(&honest),
-                "{label}: the fixture must actually change the stored bytes"
-            );
-            assert!(
-                check_block(&forged).is_ok(),
-                "{label}: the consensus path does not catch this, which is why \
-                 the stored-copy check has to"
+                "{label}: the fixture must actually change the serialized bytes"
             );
             assert!(
                 matches!(
-                    check_block_for_stored_copy(&forged, true),
+                    check(&forged, SEGWIT_ON),
                     Err(ValidationError::BadWitnessNonceSize)
                 ),
-                "{label}: must be rejected before it can be written to disk"
+                "{label}: must be rejected"
             );
         }
     }
 
     /// The second half of the rule: a block that commits to no witnesses must
-    /// carry none — including on the coinbase, which is where a forgery would
-    /// otherwise be invisible for every pre-segwit block.
+    /// carry none — including on the coinbase, which is exactly where satd's
+    /// `txdata[1..]` scan was blind (issue #538).
     #[test]
     fn witness_injected_into_a_commitment_less_block_is_rejected() {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         assert!(!has_witness_commitment_output(&block));
-        assert!(check_block_for_stored_copy(&block, true).is_ok());
+        assert!(check(&block, SEGWIT_ON).is_ok());
         let honest_hash = block.block_hash();
 
         block.txdata[0].input[0].witness.push([0xab; 64]);
@@ -1013,22 +1012,46 @@ mod tests {
             "injecting a coinbase witness must not change the block hash"
         );
         assert!(
-            check_block(&block).is_ok(),
-            "check_block scans only txdata[1..] for witnesses"
-        );
-        assert!(
             matches!(
-                check_block_for_stored_copy(&block, true),
+                check(&block, SEGWIT_ON),
                 Err(ValidationError::UnexpectedWitness)
             ),
             "a block committing to no witnesses must carry none"
         );
     }
 
+    /// A commitment output demands a verified commitment even when no
+    /// transaction in the block carries witness data. satd used to skip the
+    /// check entirely in that case (issue #538); Core does not.
+    #[test]
+    fn wrong_commitment_is_rejected_even_with_no_witness_transactions() {
+        let mut block = segwit_block_with_commitment();
+        for tx in &mut block.txdata[1..] {
+            for input in &mut tx.input {
+                input.witness = bitcoin::Witness::new();
+            }
+        }
+        // The commitment still covers the pre-strip wtxid set, so it is now
+        // wrong for this block — and no witness data remains to hint at it.
+        assert!(has_witness_commitment_output(&block));
+        assert_eq!(block.txdata[0].input[0].witness.len(), 1);
+        assert!(
+            !block.txdata[1..]
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty())),
+            "the fixture must carry no non-coinbase witnesses"
+        );
+        assert!(matches!(
+            check(&block, SEGWIT_ON),
+            Err(ValidationError::BadWitnessCommitment)
+        ));
+    }
+
     /// The strict nonce rule is gated on segwit activation exactly as Core
-    /// gates it, so a pre-activation block whose coinbase happens to carry a
-    /// commitment-shaped `OP_RETURN` is not spuriously rejected — and an
-    /// honest peer serving it is not banned for it.
+    /// gates it on `DEPLOYMENT_SEGWIT`, so a pre-activation block whose
+    /// coinbase happens to carry a commitment-shaped `OP_RETURN` — mainnet has
+    /// these — is not spuriously rejected, and an honest peer serving one is
+    /// not banned for it.
     #[test]
     fn pre_segwit_block_with_a_commitment_shaped_output_is_not_rejected() {
         let mut block = segwit_block_with_commitment();
@@ -1042,13 +1065,14 @@ mod tests {
 
         assert!(has_witness_commitment_output(&block));
         assert!(
-            check_block_for_stored_copy(&block, false).is_ok(),
-            "before segwit activation the commitment output is just an OP_RETURN"
+            check(&block, SEGWIT_OFF).is_ok(),
+            "one block below mainnet's segwit height the commitment output is \
+             just an OP_RETURN"
         );
-        // ...and with segwit active the same block is refused, because a
+        // ...and at the activation height the same block is refused, because a
         // commitment then demands a well-formed nonce.
         assert!(matches!(
-            check_block_for_stored_copy(&block, true),
+            check(&block, SEGWIT_ON),
             Err(ValidationError::BadWitnessNonceSize)
         ));
     }
@@ -1058,7 +1082,7 @@ mod tests {
     /// witness to one 32-byte item, it does not require that item to be
     /// non-zero or that the block carry witness transactions.
     #[test]
-    fn stored_copy_check_accepts_a_committed_block_with_no_witness_transactions() {
+    fn committed_block_with_no_witness_transactions_is_accepted() {
         use bitcoin::hashes::Hash as _;
 
         let mut block = segwit_block_with_commitment();
@@ -1091,7 +1115,7 @@ mod tests {
         assert!(has_witness_commitment_output(&block));
         assert_eq!(block.txdata[0].input[0].witness.len(), 1);
         assert!(
-            check_block_for_stored_copy(&block, true).is_ok(),
+            check(&block, SEGWIT_ON).is_ok(),
             "a committed block with a zero nonce and no witness txs is the \
              common mainnet shape and must pass"
         );

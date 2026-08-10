@@ -284,7 +284,7 @@ impl BackgroundChainState {
         // Full context-free + contextual validation, mirroring
         // `ChainState::accept_block` (minus side-chain/reorg handling,
         // which cannot occur on this linear in-order replay).
-        validation::block::check_block(block)?;
+        validation::block::check_block(block, self.network, new_height)?;
         validation::pow::check_proof_of_work(&block.header)?;
         validation::pow::check_difficulty(
             &block.header,

@@ -114,7 +114,7 @@ pub fn prefetch_block(
     // Bitcoin Core runs `CheckBlock` on every block during reindex for this
     // reason. Returning `None` hands the block to the direct-read path, which
     // repeats the check and fails the replay with the specific error.
-    if let Err(e) = crate::validation::block::check_block(&block) {
+    if let Err(e) = crate::validation::block::check_block(&block, network, height) {
         tracing::warn!(
             height,
             block = %hash,
