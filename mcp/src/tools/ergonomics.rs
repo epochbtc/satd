@@ -46,6 +46,7 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         // address-index state, not a hardcoded "disabled" / zero.
         addr_subs: ctx.addr_subs.clone(),
         addr_enabled: ctx.addr_enabled,
+        sp_enabled: ctx.sp_enabled,
         health: ctx.health.clone(),
         webhooks: ctx.webhooks.clone(),
     };
@@ -80,6 +81,7 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         version: env!("CARGO_PKG_VERSION"),
         addr_subs: None,
         addr_enabled: false,
+        sp_enabled: false,
         // Readiness reads only chain heights; the health gauges are not
         // consulted, so there is nothing to thread through here.
         health: None,

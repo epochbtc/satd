@@ -45,6 +45,73 @@ labels) and does not consume an RPC worker on every scrape.
 > one-time handshake bytes are not included, so absolute socket totals read
 > marginally lower than the kernel's.
 
+### Index readiness
+
+The silent-payment index exports whether it is switched on, whether it is ready
+to serve, and what its deferred backfill is doing:
+
+| Metric | Meaning |
+|---|---|
+| `satd_spindex_enabled` | 1 if the silent-payment tweak index is enabled at runtime |
+| `satd_spindex_synced` | 1 if the tweak-serving surfaces will return data — enabled, complete on disk, and no backfill in flight. Matches `getindexinfo`'s `silentpayments.synced` |
+| `satd_spindex_backfill_state{state="…"}` | one series per lifecycle state, exactly one of them 1 |
+| `satd_spindex_backfill_progress_ratio` | fraction of the deferred backfill walked, over `[taproot activation, snapshot]` |
+
+The address index exports `satd_addrindex_enabled` and row counters but has no
+readiness or backfill gauges; the block-filter index exports none at all. Both
+have deferred backfills, so a failed one is currently invisible to Prometheus —
+check `getindexinfo` for those two.
+
+**Do not alert on the progress ratio alone.** `0.0` is not an error signal: it
+covers an index that is switched off, one built inline from a genesis sync (which
+never needs a backfill and stays at `0.0` while being perfectly complete), a
+backfill that has only just started, and one that failed near taproot
+activation. Alert on the state series instead, which distinguishes them:
+
+```promql
+# The backfill failed.
+satd_spindex_backfill_state{state="failed"} == 1
+  and ignoring(state) satd_spindex_enabled == 1
+
+# Enabled but never going to become ready on its own: no backfill was ever
+# started. This is the state an existing datadir lands in when the index is
+# switched on without running `backfillindex silentpayment`.
+satd_spindex_backfill_state{state="idle"} == 1
+  and ignoring(state) satd_spindex_enabled == 1
+  and ignoring(state) satd_spindex_synced == 0
+
+# Running, but not making progress — stuck rather than merely slow.
+satd_spindex_backfill_state{state="running"} == 1
+  and ignoring(state) satd_spindex_enabled == 1
+  and ignoring(state) delta(satd_spindex_backfill_progress_ratio[30m]) == 0
+```
+
+Three things worth copying exactly rather than paraphrasing:
+
+- **The `satd_spindex_enabled == 1` guard belongs on every one of them**,
+  including the `failed` rule. The state series is derived from the *persisted*
+  cursor, which outlives the config: switch `silentpaymentindex` back off after
+  a failed backfill and the node keeps exporting
+  `satd_spindex_backfill_state{state="failed"} 1` for ever, because the cursor
+  stays on disk and is deliberately not auto-resumed. Without the guard that
+  pages continuously for an index the operator has turned off.
+- **`ignoring(state)` is required.** `and` matches on identical label sets, and
+  `satd_spindex_backfill_state{state="running"} == 1` carries a `state` label
+  that `satd_spindex_enabled` does not. Plain `and` finds no matching series and
+  the rule silently evaluates to nothing, for ever — it will sit at "0 active"
+  in the Prometheus UI, which reads as healthy.
+- **`delta()`, not `rate()`.** The ratio is a gauge. `rate()` treats the drop
+  back to `0.0` when a backfill restarts as a counter reset and compensates for
+  it, which is not what you want here.
+
+Give the last two a `for:` of at least an hour in the alert rule. A backfill
+that has not committed its first 1000-block batch yet legitimately shows no
+progress.
+
+All seven state series are always present, so a rule can reference
+`state="failed"` before it has ever fired — the same reason `satd_alert_active`
+pre-registers at 0 (see [below](#node-health-alerts)).
+
 ## Node-health alerts
 
 Metrics tell you what the node is doing; health alerts tell you when it has

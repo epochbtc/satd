@@ -2455,15 +2455,22 @@ impl Store for RocksDbStore {
     fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
         use node_sp_index::cursor as scur;
         let cf = self.cf(CF_METADATA);
+        // One consistent view across all the cursor's keys. The runner writes
+        // state / cursor_height / snapshot_height in a single `WriteBatch`,
+        // so independent `get_cf` calls can straddle a write — most
+        // damagingly across a restart, where the previous run's
+        // `cursor_height` pairs with the new `snapshot_height` and the
+        // progress gauge reads high for a backfill that just began (#549).
+        let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            self.db
+            snap
                 .get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
         };
         let read_u32_be = |k: &[u8]| -> Option<u32> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 4 {
                     Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
                 } else {
@@ -2472,7 +2479,7 @@ impl Store for RocksDbStore {
             })
         };
         let read_u64_be = |k: &[u8]| -> Option<u64> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 8 {
                     Some(u64::from_be_bytes([
                         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
@@ -2482,8 +2489,7 @@ impl Store for RocksDbStore {
                 }
             })
         };
-        let snapshot_tip_hash: [u8; 32] = self
-            .db
+        let snapshot_tip_hash: [u8; 32] = snap
             .get_cf(&cf, scur::META_KEY_SNAPSHOT_HASH)
             .ok()
             .flatten()
@@ -2647,15 +2653,23 @@ impl Store for RocksDbStore {
     fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
         use crate::index::address::cursor as cur;
         let cf = self.cf(CF_METADATA);
+        // One consistent view across every key (this family also carries
+        // `pass`). The runner writes
+        // state / cursor_height / snapshot_height in a single `WriteBatch`,
+        // so independent `get_cf` calls can straddle a write — most
+        // damagingly across a restart, where the previous run's
+        // `cursor_height` pairs with the new `snapshot_height` and the
+        // progress gauge reads high for a backfill that just began (#549).
+        let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            self.db
+            snap
                 .get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
         };
         let read_u32_be = |k: &[u8]| -> Option<u32> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 4 {
                     Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
                 } else {
@@ -2664,7 +2678,7 @@ impl Store for RocksDbStore {
             })
         };
         let read_u64_be = |k: &[u8]| -> Option<u64> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 8 {
                     Some(u64::from_be_bytes([
                         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
@@ -2674,8 +2688,7 @@ impl Store for RocksDbStore {
                 }
             })
         };
-        let snapshot_tip_hash: [u8; 32] = self
-            .db
+        let snapshot_tip_hash: [u8; 32] = snap
             .get_cf(&cf, cur::META_KEY_SNAPSHOT_HASH)
             .ok()
             .flatten()
@@ -2742,15 +2755,22 @@ impl Store for RocksDbStore {
     fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
         use node_filter_index::cursor as fcur;
         let cf = self.cf(CF_METADATA);
+        // One consistent view across all the cursor's keys. The runner writes
+        // state / cursor_height / snapshot_height in a single `WriteBatch`,
+        // so independent `get_cf` calls can straddle a write — most
+        // damagingly across a restart, where the previous run's
+        // `cursor_height` pairs with the new `snapshot_height` and the
+        // progress gauge reads high for a backfill that just began (#549).
+        let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            self.db
+            snap
                 .get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
         };
         let read_u32_be = |k: &[u8]| -> Option<u32> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 4 {
                     Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
                 } else {
@@ -2759,7 +2779,7 @@ impl Store for RocksDbStore {
             })
         };
         let read_u64_be = |k: &[u8]| -> Option<u64> {
-            self.db.get_cf(&cf, k).ok().flatten().and_then(|v| {
+            snap.get_cf(&cf, k).ok().flatten().and_then(|v| {
                 if v.len() == 8 {
                     Some(u64::from_be_bytes([
                         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
@@ -2769,8 +2789,7 @@ impl Store for RocksDbStore {
                 }
             })
         };
-        let snapshot_tip_hash: [u8; 32] = self
-            .db
+        let snapshot_tip_hash: [u8; 32] = snap
             .get_cf(&cf, fcur::META_KEY_SNAPSHOT_HASH)
             .ok()
             .flatten()

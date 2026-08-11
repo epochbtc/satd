@@ -26,6 +26,21 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   (address, filter, silent payments) now measure the rate over the span the
   runner has actually been walking, and report `0` (no estimate) for the first
   few seconds after a start, resume, or restart.
+- The silent-payment backfill is now alertable. `satd_spindex_backfill_progress_ratio`
+  alone could not distinguish a failed backfill from a disabled index or from a
+  node that never needed one; three new gauges —
+  `satd_spindex_enabled`, `satd_spindex_synced`, and
+  `satd_spindex_backfill_state{state=...}` — separate those cases.
+- Fixed: an AssumeUTXO background validation failure stopped the catch-up thread
+  permanently while `getchainstates` still reported the snapshot as not
+  rejected, with only a log line to show for it. It now raises a standing
+  warning, so it reaches `getwarnings` and `-alertnotify`.
+- Fixed: the silent-payment, filter and address backfill cursors are read under
+  a RocksDB snapshot, so a reader can no longer pair one run's `cursor_height`
+  with the next run's `snapshot_height` and report a just-restarted backfill as
+  most of the way done. Only the silent-payment cursor is read by a metrics
+  scrape today; the other two are read by `getindexinfo` and at startup.
+
 - **P2P hardening:** the block-ingress mutation gate now ports Core's
   `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated
   block (same hash, same merkle root) is rejected at ingress instead of one

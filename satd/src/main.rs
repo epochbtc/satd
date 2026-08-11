@@ -2298,6 +2298,7 @@ async fn main() {
             effective_config: config.effective_view(),
             mempool_history: mempool_history.clone(),
             addr_enabled: config.addressindex,
+            sp_enabled: config.silentpaymentindex,
             addr_subs: Some(address_index_concrete.subscription_registry()),
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
@@ -2410,6 +2411,7 @@ async fn main() {
             version: env!("CARGO_PKG_VERSION"),
             addr_subs: Some(address_index_concrete.subscription_registry()),
             addr_enabled: config.addressindex,
+            sp_enabled: config.silentpaymentindex,
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
         };

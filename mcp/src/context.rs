@@ -22,6 +22,11 @@ pub struct McpContext {
     /// `MetricsContext::addr_enabled` so the `get_metrics_snapshot` tool
     /// reports the same `satd_addrindex_enabled` value as the HTTP scrape.
     pub addr_enabled: bool,
+    /// Whether the silent-payment tweak index is enabled at runtime. Mirrors
+    /// `MetricsContext::sp_enabled` for the same reason as `addr_enabled`: the
+    /// `get_metrics_snapshot` tool must report the same `satd_spindex_enabled`
+    /// value as the HTTP scrape, not a hardcoded zero.
+    pub sp_enabled: bool,
     /// Subscription registry handle for the active-subscribers gauge.
     /// `None` in tests that bypass main.rs.
     pub addr_subs: Option<Arc<node::index::address::SubscriptionRegistry>>,
