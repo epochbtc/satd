@@ -24,6 +24,7 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// Severity of a node warning. `Error` is for conditions that block
 /// progress or indicate data inconsistency; `Warn` is for conditions
@@ -74,13 +75,44 @@ pub struct NodeWarnings {
     /// id — not on repeats, which only bump the count. `None` when no hook
     /// is configured, so the common path stays a cheap lock + drop.
     alert_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// Per-id rate-limit state for [`notify_event`](Self::notify_event):
+    /// when the last exec fired, and how many occurrences have been suppressed
+    /// since. See `EVENT_HOOK_MIN_INTERVAL`.
+    event_rate: Mutex<HashMap<String, EventRate>>,
 }
+
+#[derive(Debug)]
+struct EventRate {
+    last_fired: std::time::Instant,
+    suppressed: u64,
+}
+
+/// Minimum interval between `-alertnotify` execs for the same **edge-event**
+/// id.
+///
+/// Edge events fire per occurrence by design — three reorgs are three things
+/// that happened, and deduping them by id would lose information an operator
+/// wants, which is why [`notify_event`](NodeWarnings::notify_event) exists
+/// separately from [`record`](NodeWarnings::record). But each message spawns a
+/// shell command over an unbounded channel, so "per occurrence" with no floor
+/// means a burst of at-threshold reorgs — a scripted
+/// `invalidateblock`/`reconsiderblock` loop, or a thin-hashrate chain having a
+/// rough time — queues one process spawn each, unboundedly (#497).
+///
+/// A rate limit rather than dedup keeps the semantics: nothing is collapsed,
+/// occurrences during the window are *counted* and reported on the next exec,
+/// so the operator learns both that it happened again and how often. One
+/// minute is well below any human response time to a paging hook, and the
+/// full-fidelity record is unaffected — the subsystem's own log and the
+/// `status` event on the streaming API still carry every occurrence.
+const EVENT_HOOK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl NodeWarnings {
     pub fn new() -> Self {
         Self {
             active: Mutex::new(HashMap::new()),
             alert_tx: Mutex::new(None),
+            event_rate: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,19 +153,59 @@ impl NodeWarnings {
     /// where reorgs several blocks deep are routine, the first one would do
     /// that permanently.
     ///
-    /// Every occurrence fires the hook, since each is a distinct event rather
-    /// than a restatement of a standing condition. The durable record of what
-    /// happened is the subsystem's own log (`ReorgLog` for reorgs) and the
-    /// `status` event on the streaming API; this is only the shell hook.
+    /// Each occurrence is a distinct event rather than a restatement of a
+    /// standing condition, so occurrences are never *collapsed* — but the shell
+    /// hook is rate-limited per id by `EVENT_HOOK_MIN_INTERVAL`, and
+    /// occurrences inside that window are counted and reported on the next
+    /// exec. Without a floor, a burst of at-threshold reorgs would queue one
+    /// process spawn each on an unbounded channel (#497).
+    ///
+    /// The rate limit applies only to this shell hook. The durable,
+    /// full-fidelity record of what happened is the subsystem's own log
+    /// (`ReorgLog` for reorgs) and the `status` event on the streaming API,
+    /// neither of which this touches.
     pub fn notify_event(&self, id: &str, severity: Severity, message: impl Into<String>) {
+        // Decide under the rate-limit lock, then send outside it.
+        let suppressed_before = {
+            let now = std::time::Instant::now();
+            let mut rate = self.event_rate.lock();
+            match rate.get_mut(id) {
+                Some(state) if now.duration_since(state.last_fired) < EVENT_HOOK_MIN_INTERVAL => {
+                    state.suppressed += 1;
+                    return;
+                }
+                Some(state) => {
+                    let n = state.suppressed;
+                    state.last_fired = now;
+                    state.suppressed = 0;
+                    n
+                }
+                None => {
+                    rate.insert(
+                        id.to_string(),
+                        EventRate {
+                            last_fired: now,
+                            suppressed: 0,
+                        },
+                    );
+                    0
+                }
+            }
+        };
+
         let guard = self.alert_tx.lock();
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(format!(
-                "[{}] {}: {}",
-                severity.as_str(),
-                id,
-                message.into()
-            ));
+            let mut msg = format!("[{}] {}: {}", severity.as_str(), id, message.into());
+            if suppressed_before > 0 {
+                // Say what the window hid, so a burst is visibly a burst
+                // rather than looking like a single isolated event.
+                let _ = write!(
+                    msg,
+                    " ({suppressed_before} further occurrence(s) in the previous {}s)",
+                    EVENT_HOOK_MIN_INTERVAL.as_secs()
+                );
+            }
+            let _ = tx.send(msg);
         }
     }
 
@@ -178,6 +250,19 @@ impl NodeWarnings {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(format!("[{}] {}: {}", severity.as_str(), id, message));
             }
+        }
+    }
+
+    /// Push an event id's rate-limit window into the past so the next
+    /// `notify_event` for it is allowed through.
+    ///
+    /// Test-only. The window is measured with `Instant`, which cannot be
+    /// faked, and sleeping for the real interval would put a minute of wall
+    /// clock into the suite for every case.
+    #[cfg(test)]
+    fn rewind_event_window_for_test(&self, id: &str) {
+        if let Some(state) = self.event_rate.lock().get_mut(id) {
+            state.last_fired -= EVENT_HOOK_MIN_INTERVAL + std::time::Duration::from_secs(1);
         }
     }
 
@@ -359,22 +444,82 @@ mod tests {
         assert!(w.as_strings().is_empty(), "nor appear in getwarnings");
     }
 
-    /// Every occurrence pages — unlike `record`, which dedupes by id. Each
-    /// reorg is a distinct event, not a restatement of one condition.
+    /// A burst pages once and counts the rest, rather than spawning a shell
+    /// command per occurrence on an unbounded channel (#497).
+    ///
+    /// This replaces an earlier test asserting that *every* occurrence pages.
+    /// That was the behaviour the issue was filed about: unlike `record`, which
+    /// dedupes by id, `notify_event` had no floor at all, so a scripted
+    /// `invalidateblock`/`reconsiderblock` loop or a thin-hashrate chain having
+    /// a rough patch queued one process spawn per reorg.
     #[test]
-    fn every_occurrence_of_an_event_pages() {
+    fn a_burst_of_events_pages_once_and_counts_the_rest() {
         let w = NodeWarnings::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         w.set_alert_notifier(tx);
 
-        for i in 0..3 {
+        for i in 0..5 {
             w.notify_event("alert.deep_reorg", Severity::Error, format!("reorg {i}"));
         }
-        for i in 0..3 {
-            let msg = rx.try_recv().unwrap_or_else(|_| panic!("occurrence {i} did not page"));
-            assert!(msg.contains(&format!("reorg {i}")), "{msg}");
+
+        let first = rx.try_recv().expect("the first occurrence must page");
+        assert!(first.contains("reorg 0"), "{first}");
+        assert!(
+            rx.try_recv().is_err(),
+            "the rest of the burst must not each spawn a hook"
+        );
+        assert_eq!(w.count(), 0, "still not a standing warning");
+    }
+
+    /// Nothing is *lost*: once the window passes, the next occurrence pages and
+    /// says how many it stood in for. Suppressing silently would turn a burst
+    /// into something that looks like one isolated event.
+    #[test]
+    fn the_next_event_after_the_window_reports_what_was_suppressed() {
+        let w = NodeWarnings::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg 0");
+        let _ = rx.try_recv().expect("first pages");
+        for i in 1..4 {
+            w.notify_event("alert.deep_reorg", Severity::Error, format!("reorg {i}"));
         }
-        assert_eq!(w.count(), 0);
+        assert!(rx.try_recv().is_err(), "suppressed inside the window");
+
+        w.rewind_event_window_for_test("alert.deep_reorg");
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg 4");
+
+        let msg = rx.try_recv().expect("must page again after the window");
+        assert!(msg.contains("reorg 4"), "{msg}");
+        assert!(
+            msg.contains("3 further occurrence(s)"),
+            "the message must account for the suppressed burst: {msg}"
+        );
+
+        // And the counter resets, so the next window starts clean.
+        w.rewind_event_window_for_test("alert.deep_reorg");
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg 5");
+        let msg = rx.try_recv().expect("pages");
+        assert!(!msg.contains("further occurrence"), "counter must reset: {msg}");
+    }
+
+    /// The limit is per id, so one noisy event cannot mute a different one.
+    #[test]
+    fn the_rate_limit_is_per_event_id() {
+        let w = NodeWarnings::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        w.set_alert_notifier(tx);
+
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg");
+        w.notify_event("alert.deep_reorg", Severity::Error, "reorg again");
+        w.notify_event("alert.other_thing", Severity::Warn, "unrelated");
+
+        let a = rx.try_recv().expect("first id pages");
+        assert!(a.contains("alert.deep_reorg"), "{a}");
+        let b = rx.try_recv().expect("a different id must page independently");
+        assert!(b.contains("alert.other_thing"), "{b}");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

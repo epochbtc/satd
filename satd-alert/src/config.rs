@@ -565,7 +565,15 @@ fn validate_url(
 fn is_local_host(host: Option<url::Host<&str>>) -> bool {
     match host {
         Some(url::Host::Domain(d)) => d == "localhost",
-        Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        // Loopback and RFC1918 only — the waiver the spec and the manual both
+        // describe. Link-local (169.254.0.0/16) is neither, and used to be
+        // waived here, which put `http://169.254.169.254/...` — the cloud
+        // instance-metadata address this module's own SSRF comments name as
+        // the interesting target — past the plaintext gate with no
+        // `allow_insecure_http = true`. The IPv6 arm never had the
+        // equivalent hole: it waives unique-local but not `fe80::`, so the
+        // two arms now agree with each other and with the prose (#495).
+        Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_private(),
         Some(url::Host::Ipv6(v6)) => v6.is_loopback() || v6.is_unique_local(),
         None => false,
     }
@@ -855,6 +863,40 @@ categories = ["chain"]
             "categories = [\"status\"]\nallow_insecure_http = true",
         );
         assert!(parse(&opted).is_ok());
+    }
+
+    #[test]
+    fn link_local_is_not_waived_by_the_plaintext_gate() {
+        // Link-local is neither loopback nor RFC1918, so it is not covered by
+        // the waiver the spec and the Operator Manual describe — but the v4
+        // arm used to waive it anyway (#495). 169.254.169.254 is the cloud
+        // instance-metadata address, i.e. the one host where posting a signed
+        // body in cleartext is most obviously not what the operator meant.
+        for link_local in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://169.254.0.1:8080/hook",
+        ] {
+            let text = MINIMAL.replace("https://alerts.example/satd", link_local);
+            assert!(
+                parse(&text).is_err(),
+                "{link_local} must require allow_insecure_http"
+            );
+            // Still reachable deliberately, like any other non-local host.
+            let opted = text.replace(
+                "categories = [\"status\"]",
+                "categories = [\"status\"]\nallow_insecure_http = true",
+            );
+            assert!(parse(&opted).is_ok(), "{link_local} opt-in must still work");
+        }
+
+        // The v6 arm was always correct; pin it so the two cannot drift apart
+        // again. `fe80::/10` is link-local and gated; `fc00::/7` is
+        // unique-local (the v6 analogue of RFC1918) and waived.
+        let v6_link_local =
+            MINIMAL.replace("https://alerts.example/satd", "http://[fe80::1]:9000/hook");
+        assert!(parse(&v6_link_local).is_err(), "fe80:: must be gated");
+        let v6_ula = MINIMAL.replace("https://alerts.example/satd", "http://[fd00::1]:9000/hook");
+        assert!(parse(&v6_ula).is_ok(), "unique-local is the v6 RFC1918");
     }
 
     #[test]
