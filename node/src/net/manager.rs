@@ -2659,10 +2659,8 @@ impl PeerManager {
     }
 
     /// Core's `IsBlockMutated` gate. Returns true (and penalizes the peer) when
-    /// the block is malleated — its merkle tree is malleable (CVE-2012-2459) or
-    /// it contains a transaction whose non-witness serialized size is exactly 64
-    /// bytes (reinterpretable as an inner merkle node, enabling forged SPV
-    /// merkle proofs). Must be applied at EVERY block-ingress point before the
+    /// the block is malleated — see [`crate::validation::block::is_block_mutated`]
+    /// for the rules. Must be applied at EVERY block-ingress point before the
     /// block enters the processing channel, since blocks reach `block_tx` via
     /// several routes (direct `Block` messages and both compact-block
     /// reconstruction paths). The peer is penalized but the block is NOT marked
@@ -2670,7 +2668,29 @@ impl PeerManager {
     /// acceptable from another peer (avoids the CVE-2012-2459 index-poisoning
     /// DoS).
     fn reject_if_mutated(&self, id: PeerId, block: &bitcoin::Block) -> bool {
-        if crate::validation::block::is_block_mutated(block) {
+        // The witness half of the gate is segwit-gated, so it needs the block's
+        // height, and the only way to know that before accepting the block is
+        // its parent's index entry. Core does the same lookup and, when the
+        // parent is unknown, **skips the gate entirely**:
+        //
+        //     const CBlockIndex* prev_block{...LookupBlockIndex(pblock->hashPrevBlock)};
+        //     if (prev_block && IsBlockMutated(*pblock, DeploymentActiveAfter(prev_block, ...)))
+        //
+        // Skipping rather than falling back to a guessed activation state is
+        // the safe direction: a block we cannot place cannot be connected
+        // either, so it is rejected downstream on its own merits, whereas
+        // guessing wrong here bans a peer at 100 points for an honest block.
+        let Some(parent) = self
+            .chain_state
+            .get_block_index(&block.header.prev_blockhash)
+        else {
+            return false;
+        };
+        let segwit_active = crate::validation::block::segwit_active_at(
+            self.chain_state.network,
+            parent.height + 1,
+        );
+        if crate::validation::block::is_block_mutated(block, segwit_active) {
             tracing::warn!(hash = %block.block_hash(), id, "Rejecting mutated block");
             self.add_ban_score(id, 100, "mutated-block");
             return true;

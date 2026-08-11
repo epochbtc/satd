@@ -85,9 +85,24 @@ pub fn check_block(
     }
 
     // Witness commitment (BIP 141), height-gated as Core gates it.
-    check_witness_rules(block, height >= activation_heights(network).segwit)?;
+    check_witness_rules(block, segwit_active_at(network, height))?;
 
     Ok(())
+}
+
+/// Whether BIP 141's witness rules apply to a block at `height` on `network`.
+///
+/// Core spells this `DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT)`,
+/// evaluated against the *parent* index entry. Segwit is a buried deployment,
+/// so that reduces to `pindexPrev->nHeight + 1 >= SegwitHeight`
+/// (`deploymentstatus.h`) — i.e. the height of the block being judged, which is
+/// what this takes.
+///
+/// It exists as a named function because two independent gates now depend on
+/// the same predicate — [`check_block`]'s consensus check and the P2P
+/// [`is_block_mutated`] gate — and they must not be able to drift apart.
+pub fn segwit_active_at(network: Network, height: u32) -> bool {
+    height >= activation_heights(network).segwit
 }
 
 /// The witness half of Bitcoin Core's `ContextualCheckBlock`, rule for rule.
@@ -280,17 +295,71 @@ fn merkle_tree_mutated(block: &Block) -> bool {
 }
 
 /// Detect a "mutated" block per Bitcoin Core's `IsBlockMutated` — the P2P-layer
-/// anti-malleation gate, distinct from consensus `check_block`. A block is
-/// mutated if its merkle tree is malleable (CVE-2012-2459; see
-/// `merkle_tree_mutated`) or it contains a transaction whose non-witness
-/// serialized size is exactly 64 bytes. A 64-byte transaction can be
-/// reinterpreted as a pair of 32-byte hashes (an internal merkle node),
-/// enabling forged merkle proofs against SPV clients. Core refuses to process a
-/// mutated block and penalizes the sender, but does NOT mark the block
-/// permanently invalid (an honest block sharing the same hash must remain
-/// acceptable). satd applies this at block receipt, before acceptance.
-pub fn is_block_mutated(block: &Block) -> bool {
-    merkle_tree_mutated(block) || block.txdata.iter().any(|tx| tx.base_size() == 64)
+/// anti-malleation gate, distinct from consensus [`check_block`].
+///
+/// A mutated block is one whose *contents* can be altered while its **block
+/// hash stays the same**, so it is not enough to reject it: an honest block
+/// sharing that hash must remain acceptable afterwards. That is why Core
+/// penalizes the sender but never marks the hash permanently invalid, and why
+/// this gate must run at *every* ingress point — a direct `Block` message and
+/// both compact-block reconstruction paths — rather than once, deeper in.
+///
+/// Ported rule for rule from Core's `IsBlockMutated`, in its order:
+///
+/// 1. `CheckMerkleRoot` — the computed merkle root must match the header
+///    (`bad-txnmrklroot`), then the tree must not be malleable
+///    (CVE-2012-2459; see [`merkle_tree_mutated`]).
+/// 2. If the block has **no coinbase**, any transaction whose non-witness
+///    serialization is exactly 64 bytes makes it mutated. Such a transaction
+///    can be reinterpreted as a pair of 32-byte hashes — an inner merkle node
+///    — which is what forges merkle proofs against SPV clients.
+/// 3. Otherwise `CheckWitnessMalleation` ([`check_witness_rules`]), gated on
+///    `check_witness_root`.
+///
+/// Two of those are deliberate *relaxations* of what satd did before, both
+/// restoring Core parity on a gate that bans at 100 points — where being
+/// stricter than Core means banning honest peers and partitioning ourselves:
+///
+/// - **The 64-byte rule is skipped when a coinbase is present.** Core confines
+///   it to coinbase-less blocks precisely so it is not a consensus change:
+///   such a block is already invalid, so no valid block is affected. A
+///   64-byte transaction is otherwise consensus-legal today, and satd applied
+///   the rule unconditionally — so an honest block containing one was rejected
+///   at ingress and its sender banned, where Core accepts and connects it.
+///   Core notes the residual case (a 64-byte *coinbase*) is neglected because
+///   reaching it costs at least 224 bits of work.
+/// - **The witness half is new** (issue #543). Without it a witness-mutated
+///   block — same hash, same merkle root — passed ingress and was caught one
+///   layer later in `store_block`, worth 10 ban points instead of 100. That is
+///   also how such a block reached disk in the first place, which is the
+///   precondition for the reindex abort in issue #542.
+///
+/// `check_witness_root` is Core's parameter of the same name: pass
+/// [`segwit_active_at`] for the block's own height. The caller needs the parent
+/// index entry to know that height, which is why Core skips this gate entirely
+/// for a block whose parent is unknown.
+pub fn is_block_mutated(block: &Block, check_witness_root: bool) -> bool {
+    // 1. Core's `CheckMerkleRoot`, both halves. `compute_merkle_root` returns
+    // `None` only for an empty transaction list, where Core's `BlockMerkleRoot`
+    // yields all-zero — so an empty block is judged against that, exactly as
+    // Core judges it, rather than being special-cased here.
+    let computed = block
+        .compute_merkle_root()
+        .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
+    if computed != block.header.merkle_root {
+        return true;
+    }
+    if merkle_tree_mutated(block) {
+        return true;
+    }
+
+    // 2. The 64-byte rule, confined to coinbase-less blocks as Core confines it.
+    if block.txdata.is_empty() || !block.txdata[0].is_coinbase() {
+        return block.txdata.iter().any(|tx| tx.base_size() == 64);
+    }
+
+    // 3. `CheckWitnessMalleation`.
+    check_witness_rules(block, check_witness_root).is_err()
 }
 
 fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
@@ -775,13 +844,10 @@ mod tests {
 
     // -- IsBlockMutated (P2P-layer 64-byte / merkle malleation gate) --
 
-    #[test]
-    fn test_is_block_mutated_64byte_tx() {
-        // A 1-in/1-out tx serializes (no witness) to 60 bytes + the output
-        // script length; a 4-byte output script makes it exactly 64 bytes — the
-        // merkle-node-confusion vector. is_block_mutated must flag it even though
-        // the block is otherwise well-formed (correct merkle root, no dup txs).
-        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+    /// A 1-in/1-out transaction serializes (no witness) to 60 bytes plus the
+    /// output script length, so a 4-byte output script makes it exactly 64 —
+    /// the merkle-node-confusion vector.
+    fn tx_of_64_base_bytes() -> Transaction {
         let tx64 = Transaction {
             version: TxVersion::ONE,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -800,10 +866,60 @@ mod tests {
             }],
         };
         assert_eq!(tx64.base_size(), 64, "test setup: tx must be 64 base bytes");
+        tx64
+    }
+
+    #[test]
+    fn sixty_four_byte_tx_without_a_coinbase_is_mutated() {
+        // Core confines the 64-byte rule to blocks whose first transaction is
+        // not a coinbase, which is exactly this shape.
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
-        block.txdata = vec![coinbase, tx64];
+        block.txdata = vec![dummy_spend(0x11), tx_of_64_base_bytes()];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        assert!(is_block_mutated(&block));
+        assert!(!block.txdata[0].is_coinbase(), "test setup: no coinbase");
+        assert!(is_block_mutated(&block, true));
+    }
+
+    #[test]
+    fn sixty_four_byte_tx_with_a_coinbase_is_not_mutated() {
+        // Core parity, and a deliberate relaxation of what satd did before.
+        //
+        // `IsBlockMutated` runs the 64-byte check ONLY in the no-coinbase arm:
+        //
+        //     if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
+        //         return std::any_of(... GetSerializeSize(TX_NO_WITNESS(tx)) == 64);
+        //     } else {
+        //         // Theoretically it is still possible for a block with a 64
+        //         // byte coinbase transaction to be mutated but we neglect
+        //         // that possibility here as it requires at least 224 bits of
+        //         // work.
+        //     }
+        //
+        // That confinement is what keeps the rule from being a consensus
+        // change: a coinbase-less block is already invalid, so no valid block
+        // is affected. A 64-byte transaction is otherwise consensus-legal, so
+        // applying the rule unconditionally — as satd did — rejected an honest
+        // block at ingress and banned its sender 100 points while Core
+        // accepted and connected it.
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, tx_of_64_base_bytes()];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(!is_block_mutated(&block, true));
+    }
+
+    #[test]
+    fn merkle_root_mismatch_is_mutated() {
+        // Core's `IsBlockMutated` starts at `CheckMerkleRoot`, which rejects a
+        // root mismatch (`bad-txnmrklroot`) before the malleability check.
+        // satd's gate previously tested only malleability, so a block whose
+        // transaction list does not match its header reached the processing
+        // channel and was rejected a layer later, for fewer ban points.
+        let coinbase = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, dummy_spend(0x11)];
+        // Deliberately do NOT recompute the merkle root.
+        assert!(is_block_mutated(&block, true));
     }
 
     #[test]
@@ -814,14 +930,14 @@ mod tests {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         block.txdata = vec![coinbase, dummy_spend(0x11), t2.clone(), t2];
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        assert!(is_block_mutated(&block));
+        assert!(is_block_mutated(&block, true));
     }
 
     #[test]
     fn test_honest_block_not_mutated() {
         // The plain regtest genesis block (coinbase only) is not mutated.
         let block = bitcoin::constants::genesis_block(Network::Regtest);
-        assert!(!is_block_mutated(&block));
+        assert!(!is_block_mutated(&block, true));
     }
 
     /// A segwit block whose coinbase carries a valid BIP 141 commitment and
@@ -1118,6 +1234,95 @@ mod tests {
             check(&block, SEGWIT_ON).is_ok(),
             "a committed block with a zero nonce and no witness txs is the \
              common mainnet shape and must pass"
+        );
+    }
+
+    // -- The witness half of IsBlockMutated (issue #543) --
+
+    /// The same-hash forgery the P2P gate exists to stop: strip every witness
+    /// from a committed segwit block. The merkle root commits to txids only, so
+    /// the block hash is unchanged and the honest block must stay acceptable.
+    fn witness_stripped(block: &Block) -> Block {
+        let mut stripped = block.clone();
+        for tx in &mut stripped.txdata {
+            for input in &mut tx.input {
+                input.witness = bitcoin::Witness::default();
+            }
+        }
+        assert_eq!(
+            stripped.block_hash(),
+            block.block_hash(),
+            "test setup: stripping witnesses must not change the block hash"
+        );
+        stripped
+    }
+
+    #[test]
+    fn witness_stripped_block_is_mutated_when_segwit_is_active() {
+        // Before #543 this returned false: the ingress gate saw an intact
+        // merkle tree and no 64-byte transaction, so the forgery passed and was
+        // caught a layer later in store_block for 10 ban points instead of 100.
+        let honest = segwit_block_with_commitment();
+        assert!(!is_block_mutated(&honest, true), "the honest block is not mutated");
+        assert!(is_block_mutated(&witness_stripped(&honest), true));
+    }
+
+    #[test]
+    fn witness_stripped_block_is_not_mutated_before_segwit_activates() {
+        // `check_witness_root=false` routes to the `unexpected-witness` arm,
+        // and a stripped block carries no witness data — so it is judged
+        // exactly as Core judges it below the activation height, not
+        // spuriously rejected. This is the half that makes the height matter.
+        let honest = segwit_block_with_commitment();
+        assert!(!is_block_mutated(&witness_stripped(&honest), false));
+    }
+
+    #[test]
+    fn witness_bearing_block_is_mutated_before_segwit_activates() {
+        // The other direction: with segwit inactive, ANY witness data makes the
+        // block mutated. The honest committed block carries witnesses, so the
+        // same bytes flip verdict on the gate's height argument alone.
+        let honest = segwit_block_with_commitment();
+        assert!(is_block_mutated(&honest, false));
+        assert!(!is_block_mutated(&honest, true));
+    }
+
+    // -- segwit_active_at: the predicate every call site depends on (#551) --
+
+    #[test]
+    fn segwit_activation_boundary_per_network() {
+        // Mainnet and testnet3 are the only networks where this is not
+        // constantly true, so they are the only place a wrong height at a call
+        // site changes a verdict — and every integration test and regtest E2E
+        // runs where segwit is active from 0, which is precisely why the
+        // boundary is pinned here instead.
+        assert!(!segwit_active_at(Network::Bitcoin, 481_823));
+        assert!(segwit_active_at(Network::Bitcoin, 481_824));
+        assert!(!segwit_active_at(Network::Testnet, 834_623));
+        assert!(segwit_active_at(Network::Testnet, 834_624));
+        for network in [Network::Signet, Network::Regtest] {
+            assert!(
+                segwit_active_at(network, 0),
+                "{network:?} activates segwit at genesis"
+            );
+        }
+    }
+
+    #[test]
+    fn an_off_by_one_height_flips_the_verdict_at_the_boundary() {
+        // What a call site passing the PARENT's height instead of the block's
+        // own would do, at the one height where it is observable. This is the
+        // failure mode issue #551 is about: it is invisible to every test that
+        // runs on regtest.
+        let honest = segwit_block_with_commitment();
+        let stripped = witness_stripped(&honest);
+        assert!(
+            is_block_mutated(&stripped, segwit_active_at(Network::Bitcoin, 481_824)),
+            "at the activation height the forgery is caught"
+        );
+        assert!(
+            !is_block_mutated(&stripped, segwit_active_at(Network::Bitcoin, 481_823)),
+            "one height lower it is not — so the height must be the block's own"
         );
     }
 }

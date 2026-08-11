@@ -2917,8 +2917,40 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let data = self.flat_files.lock().read_block(&pos).ok()?;
-        let block: Block = bitcoin::consensus::deserialize(&data).ok()?;
+        // Past this point the index entry *asserts* the bytes are here: the
+        // status is not `HeaderOnly`/`Pruned`, and every block has at least a
+        // coinbase. So a read or deserialize failure is not "we do not have
+        // this block", it is local corruption — a live entry pointing at bytes
+        // that are missing, truncated, or malformed.
+        //
+        // The distinction is the whole of issue #533. Returning a bare `None`
+        // makes corruption indistinguishable from pruning to every caller, and
+        // the index runners turn that into "missing block data (pruned or
+        // corrupt?)" — which is where a mainnet node sat with a block truncated
+        // to 2083 of 1619761 bytes, failing the same backfill on every restart
+        // with nothing in the warnings system and no operator-actionable
+        // signal. `None` is still the return value, because that is what the
+        // callers are built around; what changes is that the condition is now
+        // *reported*.
+        let data = match self.flat_files.lock().read_block(&pos) {
+            Ok(data) => data,
+            Err(e) => {
+                self.report_corrupt_block_data(hash, &entry, &pos, &format!("read failed: {e}"));
+                return None;
+            }
+        };
+        let block: Block = match bitcoin::consensus::deserialize(&data) {
+            Ok(block) => block,
+            Err(e) => {
+                self.report_corrupt_block_data(
+                    hash,
+                    &entry,
+                    &pos,
+                    &format!("record does not deserialize ({} bytes on disk): {e}", data.len()),
+                );
+                return None;
+            }
+        };
         // Verify the record we landed on is the block we asked for.
         //
         // The recorded offset can describe the wrong record — that is the
@@ -2929,16 +2961,66 @@ impl ChainState {
         // wrong block, `block_data_readable` reports a broken entry as
         // healthy, and `getblockfrompeer` refuses to repair it.
         if block.block_hash() != *hash {
-            tracing::error!(
-                requested = %hash,
-                found = %block.block_hash(),
-                file_number = entry.file_number,
-                data_pos = entry.data_pos,
-                "block_index entry points at a different block; treating as missing data"
+            self.report_corrupt_block_data(
+                hash,
+                &entry,
+                &pos,
+                &format!(
+                    "record holds a different block ({}); the entry points at the wrong offset",
+                    block.block_hash()
+                ),
             );
             return None;
         }
         Some(block)
+    }
+
+    /// Report a live `block_index` entry whose block data is unusable.
+    ///
+    /// Reached only when the entry claims the bytes are present, so every
+    /// caller of this is a genuine local-storage fault rather than a pruned or
+    /// absent block. Logs at error and raises a standing warning, which is what
+    /// puts it in front of an operator: `getwarnings`, the TUI, and
+    /// `-alertnotify`/the alerting surface all read the warnings registry.
+    ///
+    /// The warning id is per block, so a node with several damaged records
+    /// reports each one instead of collapsing them, and a repeat read of the
+    /// same block refreshes the existing entry rather than adding another.
+    /// Nothing clears these: the condition is durable until the operator
+    /// repairs it with `getblockfrompeer`, and a cleared-on-next-read warning
+    /// would flap.
+    fn report_corrupt_block_data(
+        &self,
+        hash: &BlockHash,
+        entry: &BlockIndexEntry,
+        pos: &FlatFilePos,
+        detail: &str,
+    ) {
+        tracing::error!(
+            block = %hash,
+            height = entry.height,
+            file_number = pos.file_number,
+            data_pos = pos.data_pos,
+            detail,
+            "Block data is unusable behind a live block_index entry (local corruption). \
+             Repair it with: getblockfrompeer <blockhash> <peerid>"
+        );
+        self.warnings.record(
+            &format!("blockdata.corrupt.{hash}"),
+            crate::warnings::Severity::Error,
+            format!(
+                "Block {hash} at height {} has a block_index entry but unusable data ({detail}); \
+                 repair with getblockfrompeer",
+                entry.height
+            ),
+            serde_json::json!({
+                "block": hash.to_string(),
+                "height": entry.height,
+                "file_number": pos.file_number,
+                "data_pos": pos.data_pos,
+                "detail": detail,
+            }),
+        );
     }
 
     /// Read the block at a given active-chain height. Returns `None` for
@@ -3218,7 +3300,10 @@ impl ChainState {
         // the 64-byte-transaction merkle collision is the one way a different
         // transaction list can sit under the same merkle root. Re-check it so
         // the guarantee does not depend on the caller.
-        if validation::block::is_block_mutated(block) {
+        if validation::block::is_block_mutated(
+            block,
+            validation::block::segwit_active_at(self.network, height),
+        ) {
             return Err(ChainError::Validation(
                 validation::ValidationError::BadTxDuplicate,
             ));
@@ -4408,6 +4493,10 @@ impl ChainState {
         let mut last_interval: u32 = 0;
 
         let mut connected: u32 = 0;
+        // Set when a block on the planned path cannot be replayed. See the
+        // handling after the loop for why this stops the replay rather than
+        // failing it (issue #542).
+        let mut halted: Option<(BlockHash, u32, String)> = None;
         for hash in &plan.path {
             let hash = *hash;
             let entry = match header_by_hash.remove(&hash) {
@@ -4415,17 +4504,21 @@ impl ChainState {
                 None => continue,
             };
 
-            // Re-read the raw block from disk; we only kept the header during
-            // phase 1.
-            let block = self
-                .read_block_direct(&entry.pos)
-                .ok_or_else(|| ChainError::FlatFile("read failed during reindex".into()))?;
-
+            // The parent lookup comes before the read so that `height` is known
+            // for the halt diagnostics below, which report on a block whose
+            // bytes may be exactly what is unreadable.
             let parent = self
                 .store
                 .get_block_index(&entry.header.prev_blockhash)
                 .ok_or(ChainError::BadPrevBlock)?;
             let height = parent.height + 1;
+
+            // Re-read the raw block from disk; we only kept the header during
+            // phase 1.
+            let Some(block) = self.read_block_direct(&entry.pos) else {
+                halted = Some((hash, height, "block data unreadable on disk".to_string()));
+                break;
+            };
             // `plan_reindex_chain` builds the path by walking parent pointers,
             // so this holds by construction — which is exactly why it is worth
             // asserting: it is the guard that keeps a future change to the
@@ -4435,7 +4528,10 @@ impl ChainState {
             // the block index is being rebuilt from them — and their framing
             // carries no checksum. `scan_one_file` validated magic and length;
             // this is what validates the payload (issue #505).
-            validation::block::check_block(&block, self.network, height)?;
+            if let Err(e) = validation::block::check_block(&block, self.network, height) {
+                halted = Some((hash, height, format!("fails validation: {e}")));
+                break;
+            }
 
             let use_noop = self.should_skip_scripts(height);
             let noop = NoopVerifier;
@@ -4528,6 +4624,62 @@ impl ChainState {
                 self.store.flush_durable()?;
                 return Ok(());
             }
+        }
+
+        // A block on the planned path could not be replayed.
+        //
+        // This must not fail the reindex, and that is the whole point of issue
+        // #542. By the time this code runs the caller has already called
+        // `clear_all()`, so returning `Err` leaves the node with **no**
+        // chainstate at all, and the retry re-derives the same plan and dies at
+        // the same block — an unrecoverable state produced by the recovery
+        // tool. The block that triggers it is durably on disk from an older
+        // release, so an upgrade alone can arm it.
+        //
+        // Stopping instead is recoverable in the ordinary way: everything below
+        // this height is fully replayed and durable, no index entry is written
+        // for the offending block or anything above it, and normal IBD then
+        // fetches those heights from peers — which is also how the bad bytes
+        // get replaced, since a peer's copy no longer collides with a stored
+        // entry. Side-chain indexing is skipped for the same reason a
+        // `-stopatheight` run skips it: the index would describe a tree the
+        // chainstate has not caught up to.
+        //
+        // What this must never be is *quiet*. A reindex that stops early and
+        // reports success is the "completed reindex over a partial chain" shape
+        // (issue #504), so the halt is logged at error, recorded as a standing
+        // warning so it reaches `getwarnings`/`-alertnotify`, and kept out of
+        // the "complete" log line below.
+        if let Some((hash, height, reason)) = halted {
+            tracing::error!(
+                block = %hash,
+                height,
+                reason = %reason,
+                connected,
+                "Reindex stopped early: this block cannot be replayed from the block files. \
+                 Heights below it are intact; the node will sync the rest from peers. \
+                 To repair the stored copy, use getblockfrompeer once connected."
+            );
+            self.warnings.record(
+                "reindex.halted",
+                crate::warnings::Severity::Error,
+                format!(
+                    "Reindex stopped at height {height} ({reason}); \
+                     the chain above it will be re-fetched from peers"
+                ),
+                serde_json::json!({
+                    "block": hash.to_string(),
+                    "height": height,
+                    "reason": reason,
+                    "connected": connected,
+                }),
+            );
+            self.store.flush()?;
+            self.store.flush_durable()?;
+            if let Some(p) = &progress {
+                p.set_current(connected as u64);
+            }
+            return Ok(());
         }
 
         // Re-index the side-chain blocks the replay skipped. Only after a full
@@ -10575,6 +10727,126 @@ pub(crate) mod tests {
         assert!(
             re.store.get_block_index(&sibling_hash).is_none(),
             "a block whose bytes fail validation was indexed as DataStored —              `connect_stored_block` would apply them verbatim if the branch won"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #542. A main-chain block whose stored bytes fail validation must
+    /// stop the replay, not fail it.
+    ///
+    /// The caller has already wiped the chainstate by the time the replay runs,
+    /// so an `Err` here leaves the node with nothing *and* re-derives the same
+    /// plan on every retry — an unrecoverable state produced by the recovery
+    /// tool, armed by an upgrade alone because the offending block is already
+    /// on disk from an older release.
+    #[test]
+    fn reindex_from_flat_files_stops_at_an_unreplayable_main_chain_block() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        let mut main_hashes = Vec::new();
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_709_100_000 + h);
+            parent = cs.accept_block(&b).expect("accept main block");
+            main_hashes.push(parent);
+        }
+
+        // Corrupt block 2's payload in place, leaving its header — and so its
+        // hash — untouched, as an in-place bit flip would. Phase 1 scans the
+        // header and puts the block on the planned path; the payload then fails
+        // `check_block` on its merkle root.
+        let mut corrupt = build_test_block(main_hashes[0], 2, 1_709_100_002);
+        assert_eq!(corrupt.block_hash(), main_hashes[1], "test setup: same block");
+        let mut script = corrupt.txdata[0].input[0].script_sig.to_bytes();
+        let last = script.len() - 1;
+        script[last] ^= 0xff;
+        corrupt.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from(script);
+        assert_eq!(
+            corrupt.block_hash(),
+            main_hashes[1],
+            "test setup: the header must be untouched"
+        );
+        overwrite_block_record(&cs, &dir, &main_hashes[1], &corrupt);
+
+        cs.flush_coin_cache().expect("flush before snapshotting");
+        cs.store.flush().unwrap();
+
+        let re = reindexing_chain_state_over(&dir);
+        re.reindex_from_flat_files(None, None)
+            .expect("an unreplayable block must stop the reindex, not fail it");
+
+        assert_eq!(
+            re.tip_height(),
+            1,
+            "everything below the bad block must stay replayed and durable"
+        );
+        assert_eq!(re.tip_hash(), main_hashes[0]);
+
+        // No index entry for the bad block or anything above it: that is what
+        // lets normal IBD re-fetch those heights from peers, since a peer's
+        // copy no longer collides with a stored entry.
+        for (i, hash) in main_hashes.iter().enumerate().skip(1) {
+            assert!(
+                re.store.get_block_index(hash).is_none(),
+                "block {} was indexed; a peer's copy can no longer replace it",
+                i + 1
+            );
+        }
+
+        // And it must not be quiet — a reindex that stops early and reports
+        // success is the "completed reindex over a partial chain" shape.
+        let warnings = re.warnings().list();
+        let halted = warnings
+            .iter()
+            .find(|w| w.id == "reindex.halted")
+            .expect("the halt must reach the warnings registry");
+        assert_eq!(halted.severity, crate::warnings::Severity::Error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #533. A live `block_index` entry whose data is unreadable is local
+    /// corruption, not pruning, and must be reported as such.
+    #[test]
+    fn unreadable_block_data_behind_a_live_entry_raises_a_warning() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis_hash, 1, 1_709_200_001);
+        let h1 = cs.accept_block(&b1).expect("accept");
+
+        assert!(cs.get_block(&h1).is_some(), "readable before the hole");
+        assert!(
+            cs.warnings().list().is_empty(),
+            "no warning before the corruption"
+        );
+
+        punch_block_data_hole(&cs, &dir, &h1);
+
+        assert!(
+            cs.get_block(&h1).is_none(),
+            "`None` stays the return value; callers are built around it"
+        );
+        let id = format!("blockdata.corrupt.{h1}");
+        let warnings = cs.warnings().list();
+        let w = warnings
+            .iter()
+            .find(|w| w.id == id)
+            .expect("corruption must be distinguishable from pruning");
+        assert_eq!(w.severity, crate::warnings::Severity::Error);
+        assert!(
+            w.message.contains("getblockfrompeer"),
+            "the warning must name the repair: {}",
+            w.message
+        );
+
+        // Per block, so several damaged records report separately, and a repeat
+        // read refreshes rather than accumulating.
+        assert!(cs.get_block(&h1).is_none());
+        assert_eq!(
+            cs.warnings().list().iter().filter(|w| w.id == id).count(),
+            1
         );
 
         let _ = std::fs::remove_dir_all(&dir);
