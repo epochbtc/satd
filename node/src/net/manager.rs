@@ -3142,12 +3142,33 @@ impl PeerManager {
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) {
         let mut since_flush: u64 = 0;
-        /// Consecutive handoff-retry failures (~1s apart) before the condition
-        /// is escalated to a warning. Long enough that a brief disk hiccup
+        /// How long the handoff must keep failing before the condition is
+        /// escalated to a warning. Long enough that a brief disk hiccup
         /// resolves without paging anyone, short enough that a real stall is
         /// reported in well under a minute.
-        const HANDOFF_RETRY_WARN_AFTER: u32 = 10;
+        ///
+        /// Measured in elapsed time rather than in attempts, because an attempt
+        /// count is not a clock here: the wait below is a 1s *timeout*, not a
+        /// period, and `note_bg_block_stored` wakes it on every stored
+        /// background block — including duplicates, which a peer can send at
+        /// will. Counting attempts would let a peer turn a 200ms hiccup into a
+        /// page by feeding us blocks we already have.
+        const HANDOFF_RETRY_WARN_AFTER: Duration = Duration::from_secs(10);
+        /// Floor between two handoff attempts, doubling up to a ceiling while
+        /// the failure persists. Without it those same peer-driven wakeups spin
+        /// `retry_background_handoff` as fast as blocks arrive — and that call
+        /// flushes the coin cache and can rehash the whole background UTXO set,
+        /// which is not something to run in a hot loop on a node that is
+        /// already failing its I/O.
+        const HANDOFF_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(1);
+        const HANDOFF_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+        const HANDOFF_WARNING_ID: &str = "assumeutxo.handoff_failing";
         let mut handoff_retry_failures: u32 = 0;
+        let mut handoff_first_failure: Option<Instant> = None;
+        let mut handoff_last_attempt: Option<Instant> = None;
+        let mut handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
+        let mut handoff_warned = false;
+        let mut handoff_snapshot: Option<u32> = None;
         loop {
             if *shutdown.borrow() {
                 return;
@@ -3186,39 +3207,90 @@ impl PeerManager {
                 // retrying and nothing reported. That is issue #545's "halts
                 // silently and permanently", reached without any connect ever
                 // failing.
-                match chain_state.retry_background_handoff() {
-                    Ok(_) => {
-                        handoff_retry_failures = 0;
+                // A `loadtxoutset` can replace the snapshot under us. Counting
+                // the new one's failures on top of the old one's would report
+                // the wrong total for the wrong height, so start clean.
+                if handoff_snapshot != Some(bg.snapshot_height()) {
+                    if handoff_warned {
+                        chain_state.warnings().clear(HANDOFF_WARNING_ID);
                     }
-                    Err(e) => {
-                        // Transient by assumption (disk full, a failed flush),
-                        // so keep retrying — but say so once it stops looking
-                        // transient, because until the handoff completes the
-                        // snapshot is unvalidated and `getchainstates` reports
-                        // it as neither validated nor rejected.
-                        handoff_retry_failures += 1;
-                        if handoff_retry_failures == HANDOFF_RETRY_WARN_AFTER {
-                            tracing::error!(
-                                height = bg.snapshot_height(),
-                                error = %e,
-                                attempts = handoff_retry_failures,
-                                "AssumeUTXO: handoff keeps failing; the snapshot stays unvalidated"
-                            );
-                            chain_state.warnings().record(
-                                "assumeutxo.handoff_failing",
-                                crate::warnings::Severity::Error,
-                                format!(
-                                    "AssumeUTXO handoff at height {} has failed {} times ({e}); \
-                                     the snapshot remains unvalidated until it succeeds",
-                                    bg.snapshot_height(),
-                                    handoff_retry_failures
-                                ),
-                                serde_json::json!({
-                                    "height": bg.snapshot_height(),
-                                    "attempts": handoff_retry_failures,
-                                    "error": e.to_string(),
-                                }),
-                            );
+                    handoff_snapshot = Some(bg.snapshot_height());
+                    handoff_retry_failures = 0;
+                    handoff_first_failure = None;
+                    handoff_last_attempt = None;
+                    handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
+                    handoff_warned = false;
+                }
+
+                let due = handoff_last_attempt.is_none_or(|at| at.elapsed() >= handoff_backoff);
+                if due {
+                    handoff_last_attempt = Some(Instant::now());
+                    match chain_state.retry_background_handoff() {
+                        Ok(_) => {
+                            // The condition resolved: the snapshot is validated
+                            // (or condemned), so the standing warning is now a
+                            // false statement. Clearing it is what keeps
+                            // `has_errors()` — and the TUI's blocking modal —
+                            // from latching for the life of the process.
+                            if handoff_warned {
+                                tracing::info!(
+                                    height = bg.snapshot_height(),
+                                    attempts = handoff_retry_failures,
+                                    "AssumeUTXO: handoff succeeded; clearing the standing warning"
+                                );
+                                chain_state.warnings().clear(HANDOFF_WARNING_ID);
+                                handoff_warned = false;
+                            }
+                            handoff_retry_failures = 0;
+                            handoff_first_failure = None;
+                            handoff_backoff = HANDOFF_RETRY_MIN_BACKOFF;
+                        }
+                        Err(e) => {
+                            // Transient by assumption (disk full, a failed
+                            // flush), so keep retrying — but say so once it
+                            // stops looking transient, because until the
+                            // handoff completes the snapshot is unvalidated and
+                            // `getchainstates` reports it as neither validated
+                            // nor rejected.
+                            handoff_retry_failures += 1;
+                            let failing_since =
+                                *handoff_first_failure.get_or_insert_with(Instant::now);
+                            handoff_backoff =
+                                (handoff_backoff * 2).min(HANDOFF_RETRY_MAX_BACKOFF);
+                            if failing_since.elapsed() >= HANDOFF_RETRY_WARN_AFTER {
+                                // Re-recorded on every failure, not only the
+                                // first: `record` bumps `count` and refreshes
+                                // `last_seen`, while `-alertnotify` still fires
+                                // once. Recording once would leave an operator
+                                // reading `count: 1` with an hours-old
+                                // `last_seen` for a condition that is failing
+                                // right now.
+                                tracing::error!(
+                                    height = bg.snapshot_height(),
+                                    error = %e,
+                                    attempts = handoff_retry_failures,
+                                    "AssumeUTXO: handoff keeps failing; the snapshot stays unvalidated"
+                                );
+                                chain_state.warnings().record(
+                                    HANDOFF_WARNING_ID,
+                                    crate::warnings::Severity::Error,
+                                    format!(
+                                        "AssumeUTXO handoff at height {} has been failing for {}s \
+                                         over {} attempts ({e}); the snapshot remains unvalidated \
+                                         until it succeeds",
+                                        bg.snapshot_height(),
+                                        failing_since.elapsed().as_secs(),
+                                        handoff_retry_failures
+                                    ),
+                                    serde_json::json!({
+                                        "height": bg.snapshot_height(),
+                                        "attempts": handoff_retry_failures,
+                                        "failing_for_secs": failing_since.elapsed().as_secs(),
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                                handoff_warned = true;
+                            }
                         }
                     }
                 }

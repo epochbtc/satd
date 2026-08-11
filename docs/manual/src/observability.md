@@ -71,6 +71,7 @@ activation. Alert on the state series instead, which distinguishes them:
 ```promql
 # The backfill failed.
 satd_spindex_backfill_state{state="failed"} == 1
+  and ignoring(state) satd_spindex_enabled == 1
 
 # Enabled but never going to become ready on its own: no backfill was ever
 # started. This is the state an existing datadir lands in when the index is
@@ -85,8 +86,15 @@ satd_spindex_backfill_state{state="running"} == 1
   and ignoring(state) delta(satd_spindex_backfill_progress_ratio[30m]) == 0
 ```
 
-Two things worth copying exactly rather than paraphrasing:
+Three things worth copying exactly rather than paraphrasing:
 
+- **The `satd_spindex_enabled == 1` guard belongs on every one of them**,
+  including the `failed` rule. The state series is derived from the *persisted*
+  cursor, which outlives the config: switch `silentpaymentindex` back off after
+  a failed backfill and the node keeps exporting
+  `satd_spindex_backfill_state{state="failed"} 1` for ever, because the cursor
+  stays on disk and is deliberately not auto-resumed. Without the guard that
+  pages continuously for an index the operator has turned off.
 - **`ignoring(state)` is required.** `and` matches on identical label sets, and
   `satd_spindex_backfill_state{state="running"} == 1` carries a `state` label
   that `satd_spindex_enabled` does not. Plain `and` finds no matching series and

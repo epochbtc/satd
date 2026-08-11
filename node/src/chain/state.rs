@@ -777,19 +777,6 @@ impl ChainState {
         Ok(Some(outcome))
     }
 
-    /// Resolve the handoff once the background reaches `snapshot_height`.
-    ///
-    /// On a hash match: mark validated by dropping the background and
-    /// removing its private DB (the shared block store now holds the full
-    /// genesis→tip block index).
-    ///
-    /// On a mismatch the node has just *proven* the active snapshot is
-    /// invalid, so we fail closed: persist a durable rejected marker (so
-    /// the rejection survives restart and startup refuses to keep serving
-    /// the snapshot), raise a loud error warning, and return an error so
-    /// the catch-up driver halts instead of continuing to advance an
-    /// invalid chain. We do NOT panic. Full demote-to-primary recovery is
-    /// a follow-up; until then the operator must reindex/reload.
     /// Re-attempt the handoff for a background that has already reached its
     /// snapshot height.
     ///
@@ -816,6 +803,19 @@ impl ChainState {
         Ok(true)
     }
 
+    /// Resolve the handoff once the background reaches `snapshot_height`.
+    ///
+    /// On a hash match: mark validated by dropping the background and
+    /// removing its private DB (the shared block store now holds the full
+    /// genesis→tip block index).
+    ///
+    /// On a mismatch the node has just *proven* the active snapshot is
+    /// invalid, so we fail closed: persist a durable rejected marker (so
+    /// the rejection survives restart and startup refuses to keep serving
+    /// the snapshot), raise a loud error warning, and return an error so
+    /// the catch-up driver halts instead of continuing to advance an
+    /// invalid chain. We do NOT panic. Full demote-to-primary recovery is
+    /// a follow-up; until then the operator must reindex/reload.
     fn run_background_handoff(
         &self,
         bg: &Arc<crate::chain::background::BackgroundChainState>,
