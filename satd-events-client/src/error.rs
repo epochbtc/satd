@@ -40,7 +40,8 @@ pub enum StreamError {
     /// [`insecure_bearer_token`](crate::StreamClientBuilder::insecure_bearer_token).
     #[error(
         "refusing to send a bearer token over an unencrypted endpoint: {0}. \
-         Use an https:// endpoint with tls()/tls_ca_pem(), or call \
+         Encrypt the connection (an https:// endpoint plus tls()/tls_ca_pem(), \
+         both of which need this crate's `tls` feature), or call \
          insecure_bearer_token() instead of bearer_token() to accept the risk."
     )]
     InsecureCredential(String),

@@ -691,7 +691,7 @@ pub(crate) fn validate_prefix(
     Ok(pb::ScriptPrefix { prefix, bits })
 }
 
-/// Whether `endpoint` names an encrypted transport.
+/// Whether `endpoint` carries the `https://` scheme.
 ///
 /// tonic selects TLS from the URI scheme alone, so the scheme — not the
 /// builder's `tls` field — is what decides whether bytes are encrypted. A
@@ -700,6 +700,67 @@ fn endpoint_is_https(endpoint: &str) -> bool {
     endpoint
         .split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+}
+
+/// Whether connecting to `endpoint` will actually encrypt the bytes.
+///
+/// This is *not* the same question as [`endpoint_is_https`], and conflating the
+/// two is how a credential leaks. tonic only honours the `https://` scheme when
+/// it is itself compiled with its `tls` feature: the scheme test and the whole
+/// TLS branch of its connector are `#[cfg(feature = "tls")]`, and it disables
+/// `enforce_http`. In a build without that feature an `https://` URI therefore
+/// opens an ordinary TCP connection and speaks cleartext h2c — no error, no
+/// downgrade warning. So the scheme is transport-truthful only in a TLS-capable
+/// build; in a build without one, nothing is, and this returns `false` for every
+/// endpoint.
+#[cfg(feature = "tls")]
+fn endpoint_is_encrypted(endpoint: &str) -> bool {
+    endpoint_is_https(endpoint)
+}
+
+#[cfg(not(feature = "tls"))]
+fn endpoint_is_encrypted(_endpoint: &str) -> bool {
+    false
+}
+
+/// Strip `user:password@` userinfo out of an endpoint before it is put into an
+/// error string. Refusals are normally logged, and a password in a URL is a
+/// credential too — an error whose whole purpose is to stop a credential
+/// reaching the wire must not spill a different one into the log.
+fn redact_endpoint_userinfo(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        // No scheme, so the whole string is an authority (`host:port`).
+        return match endpoint.rsplit_once('@') {
+            Some((_, host)) => format!("***@{host}"),
+            None => endpoint.to_string(),
+        };
+    };
+    // Userinfo lives in the authority only: everything before the first `/`.
+    // Splitting there keeps a later `@` in a path from being mistaken for it.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{path}"),
+        None => endpoint.to_string(),
+    }
+}
+
+/// The endpoint as it should appear in an [`StreamError::InsecureCredential`],
+/// naming the reason when the reason is not visible in the endpoint itself.
+#[cfg(feature = "tls")]
+fn insecure_credential_reason(endpoint: &str) -> String {
+    redact_endpoint_userinfo(endpoint)
+}
+
+#[cfg(not(feature = "tls"))]
+fn insecure_credential_reason(endpoint: &str) -> String {
+    format!(
+        "{} — this build of satd-events-client has the `tls` feature disabled, \
+         so no endpoint is encrypted here, https:// included",
+        redact_endpoint_userinfo(endpoint)
+    )
 }
 
 /// TLS settings assembled by the `StreamClientBuilder::tls*` methods and applied
@@ -887,18 +948,21 @@ impl StreamClientBuilder {
         // server configuration. Both ends behave as configured while the
         // credential is on the wire (#521).
         //
-        // The scheme is the transport-truthful predicate here, not the builder's
-        // `tls` field: tonic selects TLS from the URI scheme alone. `https://`
-        // is TLS or a connect failure, never a silent downgrade. Checked even
-        // without the `tls` feature, where an https endpoint cannot connect at
-        // all — an error either way, but this one names the reason.
+        // The predicate is `endpoint_is_encrypted`, not the builder's `tls`
+        // field and not the scheme on its own: tonic selects TLS from the URI
+        // scheme, but only in a build that has its `tls` feature. Without that
+        // feature an `https://` endpoint connects in cleartext rather than
+        // failing, so this crate's own `tls` feature is part of the question.
+        // See `endpoint_is_encrypted`.
         //
         // Ordered after the TLS-scheme check above so the more specific
         // diagnosis wins when a caller asked for TLS *and* gave an http:// URL,
         // matching the Go SDK, where the scheme conflict is likewise reported
         // first.
-        if has_token && !self.allow_insecure_token && !endpoint_is_https(&self.endpoint) {
-            return Err(StreamError::InsecureCredential(self.endpoint));
+        if has_token && !self.allow_insecure_token && !endpoint_is_encrypted(&self.endpoint) {
+            return Err(StreamError::InsecureCredential(insecure_credential_reason(
+                &self.endpoint,
+            )));
         }
 
         let mut endpoint = Endpoint::from_shared(self.endpoint)
@@ -1082,6 +1146,50 @@ mod tests {
         assert!(!endpoint_is_https("127.0.0.1:50051"));
     }
 
+    /// The scheme decides only in a build that can actually do TLS. tonic gates
+    /// its whole https branch on its own `tls` feature and turns `enforce_http`
+    /// off, so without that feature an `https://` URI connects in cleartext h2c
+    /// instead of failing — which would have let a token past the gate below in
+    /// exactly the configuration the gate advertises as safe.
+    #[test]
+    fn encryption_requires_the_tls_feature_and_not_just_the_scheme() {
+        assert_eq!(endpoint_is_encrypted("https://node.example:50051"), cfg!(feature = "tls"));
+        assert!(!endpoint_is_encrypted("http://node.example:50051"));
+        assert!(!endpoint_is_encrypted("node.example:50051"));
+    }
+
+    /// The refusal is normally logged, so it must not spill a password that was
+    /// embedded in the endpoint. A later `@` in the path is not userinfo.
+    #[test]
+    fn the_refusal_does_not_echo_url_userinfo() {
+        assert_eq!(
+            redact_endpoint_userinfo("http://user:hunter2@node.example:50051"),
+            "http://***@node.example:50051"
+        );
+        assert_eq!(
+            redact_endpoint_userinfo("http://user:hunter2@node.example:50051/a@b"),
+            "http://***@node.example:50051/a@b"
+        );
+        assert_eq!(redact_endpoint_userinfo("user:hunter2@node.example:50051"), "***@node.example:50051");
+        // Untouched when there is nothing to redact.
+        assert_eq!(
+            redact_endpoint_userinfo("https://node.example:50051/path"),
+            "https://node.example:50051/path"
+        );
+        assert_eq!(redact_endpoint_userinfo("node.example:50051"), "node.example:50051");
+    }
+
+    #[tokio::test]
+    async fn a_password_in_the_endpoint_is_not_quoted_back() {
+        let err = StreamClient::builder("http://user:hunter2@node.example:50051")
+            .bearer_token("SECRET")
+            .connect()
+            .await
+            .expect_err("a bearer token over plaintext must be refused");
+        assert!(!err.to_string().contains("hunter2"), "leaked the URL password: {err}");
+        assert!(!err.to_string().contains("SECRET"), "leaked the token: {err}");
+    }
+
     /// The #521 guard. The token is attached as ordinary metadata, so there is
     /// no `PerRPCCredentials` for tonic to apply a transport-security
     /// requirement to, and a remote-bound node with `eventsgrpcauth=1` and no
@@ -1106,6 +1214,17 @@ mod tests {
         }
     }
 
+    /// Reaching the transport is what proves the gate did not fire. Asserting
+    /// merely "not `InsecureCredential`" would also hold if `connect()` started
+    /// failing for some unrelated wrong reason, so name the errors a connect to
+    /// a dead port is allowed to produce.
+    fn assert_reached_the_transport(err: &StreamError, ctx: &str) {
+        assert!(
+            matches!(err, StreamError::Connect(_) | StreamError::Transport(_)),
+            "{ctx}: expected a transport/connect error, got {err:?}"
+        );
+    }
+
     /// A plaintext connection with no token is the default local setup and is
     /// unaffected: it gets as far as the transport (and fails there, since
     /// nothing is listening on port 1).
@@ -1115,10 +1234,7 @@ mod tests {
             .connect()
             .await
             .expect_err("nothing is listening on port 1");
-        assert!(
-            !matches!(err, StreamError::InsecureCredential(_)),
-            "got {err:?}"
-        );
+        assert_reached_the_transport(&err, "no token");
     }
 
     /// The named waiver gets past the gate — it too fails at the transport,
@@ -1130,10 +1246,7 @@ mod tests {
             .connect()
             .await
             .expect_err("nothing is listening on port 1");
-        assert!(
-            !matches!(err, StreamError::InsecureCredential(_)),
-            "got {err:?}"
-        );
+        assert_reached_the_transport(&err, "waiver");
     }
 
     /// A later `bearer_token` must clear an earlier waiver rather than inherit

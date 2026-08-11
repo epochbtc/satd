@@ -272,6 +272,18 @@ jobs:
       - name: Run clippy (node, consensus-only build)
         run: cargo clippy -p node --no-default-features --all-targets -- -D warnings
 
+      # The published SDK's `tls` feature is default-on, and turning it off
+      # changes behaviour rather than just shrinking the dependency tree: tonic
+      # gates its own https handling on its `tls` feature, so a build without
+      # ours connects an `https://` endpoint in cleartext. The bearer-token
+      # guard is compiled differently in that build and nothing else here
+      # exercises it — the doc-advertised `default-features = false` build was
+      # never compiled in CI at all, and a doctest had been broken in it.
+      - name: Run clippy + tests (satd-events-client, plaintext-only build)
+        run: |
+          cargo clippy -p satd-events-client --no-default-features --all-targets -- -D warnings
+          cargo test -p satd-events-client --no-default-features
+
       # `fuzz/` is a separate workspace (the root `Cargo.toml` excludes it), so
       # none of the steps above compile it and no other PR job touches it. The
       # fuzz targets are hand-written against `node`'s internal API, which

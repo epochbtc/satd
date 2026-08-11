@@ -82,7 +82,9 @@
 //!   certificate name (SNI) when connecting by IP or through a proxy.
 //!
 //! ```no_run
+//! # #[cfg(feature = "tls")]
 //! # use satd_events_client::StreamClient;
+//! # #[cfg(feature = "tls")]
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let ca = std::fs::read("node-ca.pem")?;
 //! let client = StreamClient::builder("https://node.example:50051")
@@ -96,8 +98,12 @@
 //! ```
 //!
 //! TLS uses the `ring` rustls provider. Opt out with `default-features = false`
-//! for a plaintext-only build. The raw wire types are re-exported under
-//! [`proto`] for low-level use.
+//! for a plaintext-only build — but note that such a build cannot encrypt
+//! *anything*: tonic only honours the `https://` scheme when it too is compiled
+//! with TLS, so without this feature an `https://` endpoint connects in
+//! cleartext. [`bearer_token`](StreamClientBuilder::bearer_token) therefore
+//! refuses every endpoint in a build without `tls`. The raw wire types are
+//! re-exported under [`proto`] for low-level use.
 //!
 //! ## Stability & versioning
 //!

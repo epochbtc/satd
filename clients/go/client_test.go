@@ -363,3 +363,34 @@ func TestTLSCredentialsFailClosedOnEmptyPEM(t *testing.T) {
 		t.Errorf("plain WithTLS should still work: %v", err)
 	}
 }
+
+// The refusal is normally logged, so it must not spill a password that was
+// embedded in the target. A later `@` in the path is not userinfo.
+func TestRedactUserinfo(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://user:hunter2@node.example:50051", "http://***@node.example:50051"},
+		{"http://user:hunter2@node.example:50051/a@b", "http://***@node.example:50051/a@b"},
+		{"user:hunter2@node.example:50051", "***@node.example:50051"},
+		{"https://node.example:50051/path", "https://node.example:50051/path"},
+		{"node.example:50051", "node.example:50051"},
+	}
+	for _, c := range cases {
+		if got := redactUserinfo(c.in); got != c.want {
+			t.Errorf("redactUserinfo(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestAPasswordInTheTargetIsNotQuotedBack(t *testing.T) {
+	_, err := Dial(context.Background(), "http://user:hunter2@node.example:50051",
+		WithBearerToken("SECRET"))
+	if err == nil {
+		t.Fatal("a bearer token over plaintext must be refused")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("leaked the URL password: %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("leaked the token: %v", err)
+	}
+}

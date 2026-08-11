@@ -51,6 +51,14 @@ tree that hands you raw bytes to filter yourself:
 satd-events-client = { version = "0.4", default-features = false }
 ```
 
+Note that this also drops the default-on `tls` feature, which is not merely a
+smaller dependency tree — it is a plaintext-only client. Keep `tls` unless the
+node is genuinely reachable over loopback only:
+
+```toml
+satd-events-client = { version = "0.4", default-features = false, features = ["tls"] }
+```
+
 ## Connecting
 
 ```rust,ignore
@@ -122,6 +130,12 @@ let client = StreamClient::builder("https://node.example:50051")
 not used. Plain `tls()` uses the public roots. TLS uses the `ring` rustls
 provider. For a plaintext-only minimal build, depend with
 `default-features = false`.
+
+In a build without the `tls` feature, no endpoint is encrypted — including an
+`https://` one. tonic gates its own https handling behind its `tls` feature, so
+without it an `https://` URI opens a plain TCP connection and speaks cleartext
+h2c rather than failing. `bearer_token()` therefore refuses *every* endpoint in
+such a build; if you need a token, keep the `tls` feature.
 
 ## Firehose: `subscribe`
 
