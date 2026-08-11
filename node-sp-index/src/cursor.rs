@@ -90,6 +90,12 @@ impl BackfillState {
     /// `state="failed"` *absent* rather than `0` when healthy, and an alert on
     /// an absent series either needs `absent()` gymnastics or silently never
     /// fires. Enumerating keeps every series continuously present.
+    ///
+    /// Kept exhaustive by the compile-time guard below the impl block — an
+    /// array is not exhaustiveness-checked, so a new variant left out of here
+    /// would compile clean and simply never be exported, and every alerting
+    /// rule over this family would keep evaluating against a state set that
+    /// silently no longer matches reality.
     pub const ALL: [Self; 7] = [
         Self::Idle,
         Self::Running,
@@ -112,6 +118,43 @@ impl BackfillState {
         }
     }
 }
+
+/// Compile-time guard that [`BackfillState::ALL`] covers every variant.
+///
+/// The exhaustive `match` is what does the work: adding a variant without
+/// adding it to `ALL` fails to compile here, rather than compiling clean and
+/// dropping a Prometheus series nobody notices is missing. A runtime test
+/// cannot provide this — it would have to enumerate the variants itself, and
+/// any list it enumerates is exactly the list that would go stale.
+const _: () = {
+    const fn rank(s: BackfillState) -> usize {
+        // No wildcard arm. This is the point of the guard.
+        match s {
+            BackfillState::Idle => 0,
+            BackfillState::Running => 1,
+            BackfillState::Paused => 2,
+            BackfillState::Completed => 3,
+            BackfillState::Cancelled => 4,
+            BackfillState::Rejected => 5,
+            BackfillState::Failed => 6,
+        }
+    }
+    // Every rank appears exactly once in ALL, so the array is a permutation of
+    // the variant set rather than merely the right length.
+    let mut seen = [false; 7];
+    let mut i = 0;
+    while i < BackfillState::ALL.len() {
+        let r = rank(BackfillState::ALL[i]);
+        assert!(!seen[r], "BackfillState::ALL lists a state twice");
+        seen[r] = true;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < seen.len() {
+        assert!(seen[j], "BackfillState::ALL is missing a state");
+        j += 1;
+    }
+};
 
 /// Snapshot of the persisted backfill cursor for `getindexinfo`.
 /// `last_error` is loaded out-of-band by the storage layer (the cursor is

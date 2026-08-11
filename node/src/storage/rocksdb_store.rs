@@ -2455,7 +2455,7 @@ impl Store for RocksDbStore {
     fn read_sp_backfill_cursor(&self) -> node_sp_index::cursor::BackfillCursor {
         use node_sp_index::cursor as scur;
         let cf = self.cf(CF_METADATA);
-        // One consistent view across all five keys. The runner writes
+        // One consistent view across all the cursor's keys. The runner writes
         // state / cursor_height / snapshot_height in a single `WriteBatch`,
         // so independent `get_cf` calls can straddle a write — most
         // damagingly across a restart, where the previous run's
@@ -2653,7 +2653,8 @@ impl Store for RocksDbStore {
     fn read_backfill_cursor(&self) -> crate::index::address::cursor::BackfillCursor {
         use crate::index::address::cursor as cur;
         let cf = self.cf(CF_METADATA);
-        // One consistent view across all five keys. The runner writes
+        // One consistent view across every key (this family also carries
+        // `pass`). The runner writes
         // state / cursor_height / snapshot_height in a single `WriteBatch`,
         // so independent `get_cf` calls can straddle a write — most
         // damagingly across a restart, where the previous run's
@@ -2754,7 +2755,7 @@ impl Store for RocksDbStore {
     fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
         use node_filter_index::cursor as fcur;
         let cf = self.cf(CF_METADATA);
-        // One consistent view across all five keys. The runner writes
+        // One consistent view across all the cursor's keys. The runner writes
         // state / cursor_height / snapshot_height in a single `WriteBatch`,
         // so independent `get_cf` calls can straddle a write — most
         // damagingly across a restart, where the previous run's

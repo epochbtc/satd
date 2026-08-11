@@ -3521,6 +3521,16 @@ fn test_metrics_and_health_endpoints() {
         "satd_addrindex_funding_rows_total",
         "satd_addrindex_spending_rows_total",
         "satd_addrindex_subscriptions_active",
+        // Silent-payment index readiness. These are what make the backfill
+        // alertable, so a dropped emission must fail a test rather than just
+        // leaving an alert that can never fire.
+        "satd_spindex_enabled",
+        "satd_spindex_synced",
+        // Every state series is emitted, present-and-zero when inactive —
+        // asserting a state the node is NOT in is what proves that, and it is
+        // the property alerting rules depend on.
+        "satd_spindex_backfill_state{state=\"failed\"} 0",
+        "satd_spindex_backfill_state{state=\"idle\"} 1",
     ] {
         assert!(
             body.contains(required),

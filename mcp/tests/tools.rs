@@ -616,7 +616,7 @@ mod mining {
             effective_config: serde_json::json!({"network": "bitcoin"}),
             mempool_history: None,
             addr_enabled: false,
-        sp_enabled: false,
+            sp_enabled: false,
             addr_subs: None,
             health: None,
             webhooks: None,
@@ -886,6 +886,48 @@ mod ergonomics {
         assert!(
             body.contains("satd_addrindex_enabled 0"),
             "addr_enabled=false must render `satd_addrindex_enabled 0`; got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_get_metrics_snapshot_reflects_sp_enabled() {
+        // Same bug class as `..._reflects_addr_enabled` above, which exists
+        // because that field once shipped hardcoded to false on this path.
+        // `sp_enabled` is plumbed the same way through the same struct, so it
+        // gets the same guard: without it, a regression that reports
+        // `satd_spindex_enabled 0` on a node with the index on — two surfaces
+        // disagreeing about one node — would be invisible.
+        let (mut ctx, _dir) = make_test_ctx();
+        ctx.sp_enabled = true;
+        let out = ergonomics::get_metrics_snapshot(&ctx);
+        let body = serde_json::from_str::<serde_json::Value>(&out).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("satd_spindex_enabled 1"),
+            "sp_enabled=true must render `satd_spindex_enabled 1`; got: {}",
+            body
+        );
+
+        ctx.sp_enabled = false;
+        let out = ergonomics::get_metrics_snapshot(&ctx);
+        let body = serde_json::from_str::<serde_json::Value>(&out).unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            body.contains("satd_spindex_enabled 0"),
+            "sp_enabled=false must render `satd_spindex_enabled 0`; got: {}",
+            body
+        );
+        // `synced` is gated on `enabled`, so switching the index off must also
+        // withdraw the readiness claim rather than leaving the stale marker
+        // asserting that tweak surfaces will serve.
+        assert!(
+            body.contains("satd_spindex_synced 0"),
+            "sp_enabled=false must render `satd_spindex_synced 0`; got: {}",
             body
         );
     }

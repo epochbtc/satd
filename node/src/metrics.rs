@@ -334,16 +334,27 @@ impl MetricsContext {
         // 0.0 is deliberately not a "nothing is wrong" signal: it covers an
         // idle cursor, a node whose index was built inline from genesis (and
         // is therefore complete without any backfill having run), and a
-        // backfill that has only just started. Read it together with
-        // `getindexinfo`'s `silentpayments.backfill.state` rather than alone.
-        // One cursor read for both the ratio and the state gauge, so the two
-        // can never disagree within a scrape.
+        // backfill that has only just started. Never alert on it alone — the
+        // `satd_spindex_enabled` / `_synced` / `_backfill_state` gauges below
+        // are what distinguish those cases.
+        // Read the completeness marker BEFORE the cursor snapshot, and the
+        // cursor once for both the ratio and the state gauge.
+        //
+        // The two live in different writes — `mark_silent_payment_index_complete`
+        // is a standalone put, the cursor transition is a `WriteBatch` — so a
+        // scrape can still land between them. Ordering the marker first bounds
+        // which way that can go: `synced` below requires the cursor to be
+        // quiescent, so a straddle can only report `synced 0` for an index
+        // that just became complete, never `synced 1` for one that is still
+        // walking. Under-claiming readiness for one scrape is safe;
+        // over-claiming it is what would make an alert miss.
+        let sp_complete = self.chain_state.store_ref().silent_payment_index_complete();
         let sp_cursor = self.chain_state.store_ref().read_sp_backfill_cursor();
         let sp_backfill_ratio =
             sp_cursor.progress_ratio(crate::index::silent_payments::walk_start(self.network));
         let _ = writeln!(
             out,
-            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot]. 1.0 means a deferred backfill ran to completion; 0.0 means no backfill progress and does NOT imply the index is incomplete (an index built inline from genesis needs no backfill and stays at 0.0)."
+            "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot]. 1.0 means a deferred backfill ran to completion; 0.0 means no backfill progress and does NOT imply the index is incomplete (an index built inline from genesis needs no backfill and stays at 0.0) - read satd_spindex_synced and satd_spindex_backfill_state to tell those apart; do not alert on this gauge alone."
         );
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
@@ -372,13 +383,34 @@ impl MetricsContext {
             &[],
             u64::from(self.sp_enabled),
         );
+        // `synced` is the *serving* predicate, not the raw on-disk marker.
+        //
+        // `ChainState`'s `SpIndex::is_complete()` — the gate the tweak
+        // surfaces actually consult — and `getindexinfo`'s
+        // `silentpayments.synced` both require enabled AND the marker AND a
+        // quiescent cursor, and `is_complete` carries a comment saying it
+        // mirrors the status gate "so the serving surface and the
+        // `getindexinfo` status can never disagree". Exporting the bare marker
+        // here would have made this the third surface that disagrees with the
+        // other two: the marker is stamped at open time and outlives a
+        // redundant backfill that is mid-walk or failed, so a node refusing to
+        // serve tweaks would have reported `satd_spindex_synced 1`. It also
+        // reads 1 on a fresh datadir with the index switched off, until the
+        // first block connects and clears it.
+        let sp_synced = self.sp_enabled
+            && sp_complete
+            && matches!(
+                sp_cursor.state,
+                node_sp_index::cursor::BackfillState::Idle
+                    | node_sp_index::cursor::BackfillState::Completed
+            );
         metric(
             &mut out,
             "satd_spindex_synced",
-            "1 if the silent-payment index is marked complete on disk (fully built for the active chain), 0 otherwise. A node that built the index inline from a genesis sync reports 1 with a backfill progress ratio of 0.0.",
+            "1 if the silent-payment index is enabled, marked complete on disk, and has no backfill in flight — i.e. the tweak-serving surfaces will return data. Matches getindexinfo's silentpayments.synced. A node that built the index inline from a genesis sync reports 1 with a backfill progress ratio of 0.0.",
             "gauge",
             &[],
-            u64::from(self.chain_state.store_ref().silent_payment_index_complete()),
+            u64::from(sp_synced),
         );
         // One series per state, always present — see `BackfillState::ALL`.
         metric_header(

@@ -35,10 +35,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   permanently while `getchainstates` still reported the snapshot as not
   rejected, with only a log line to show for it. It now raises a standing
   warning, so it reaches `getwarnings` and `-alertnotify`.
-- Fixed: the sp/filter/address backfill cursors are read under a RocksDB
-  snapshot, so a metrics scrape can no longer pair one run's `cursor_height`
+- Fixed: the silent-payment, filter and address backfill cursors are read under
+  a RocksDB snapshot, so a reader can no longer pair one run's `cursor_height`
   with the next run's `snapshot_height` and report a just-restarted backfill as
-  most of the way done.
+  most of the way done. Only the silent-payment cursor is read by a metrics
+  scrape today; the other two are read by `getindexinfo` and at startup.
 
 - **P2P hardening:** the block-ingress mutation gate now ports Core's
   `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated

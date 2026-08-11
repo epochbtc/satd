@@ -3142,6 +3142,12 @@ impl PeerManager {
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) {
         let mut since_flush: u64 = 0;
+        /// Consecutive handoff-retry failures (~1s apart) before the condition
+        /// is escalated to a warning. Long enough that a brief disk hiccup
+        /// resolves without paging anyone, short enough that a real stall is
+        /// reported in well under a minute.
+        const HANDOFF_RETRY_WARN_AFTER: u32 = 10;
+        let mut handoff_retry_failures: u32 = 0;
         loop {
             if *shutdown.borrow() {
                 return;
@@ -3167,8 +3173,55 @@ impl PeerManager {
 
             let next_height = bg.tip_height() + 1;
             if next_height > bg.snapshot_height() {
-                // At/past the snapshot but still attached: handoff did not
-                // complete (e.g. it errored). Don't spin — wait and re-check.
+                // At/past the snapshot but still attached: the handoff did not
+                // complete. Actually re-attempt it rather than only sleeping.
+                //
+                // Waiting alone made this branch a permanent stall: the
+                // handoff runs from `background_connect_block`, i.e. only
+                // after a successful connect, and no further connect is
+                // possible once the tip is at `snapshot_height`. So an I/O
+                // failure inside the handoff — `verify_at_snapshot` flushes
+                // coins and hashes the whole UTXO set, either of which can hit
+                // ENOSPC — left the snapshot pending forever with nothing
+                // retrying and nothing reported. That is issue #545's "halts
+                // silently and permanently", reached without any connect ever
+                // failing.
+                match chain_state.retry_background_handoff() {
+                    Ok(_) => {
+                        handoff_retry_failures = 0;
+                    }
+                    Err(e) => {
+                        // Transient by assumption (disk full, a failed flush),
+                        // so keep retrying — but say so once it stops looking
+                        // transient, because until the handoff completes the
+                        // snapshot is unvalidated and `getchainstates` reports
+                        // it as neither validated nor rejected.
+                        handoff_retry_failures += 1;
+                        if handoff_retry_failures == HANDOFF_RETRY_WARN_AFTER {
+                            tracing::error!(
+                                height = bg.snapshot_height(),
+                                error = %e,
+                                attempts = handoff_retry_failures,
+                                "AssumeUTXO: handoff keeps failing; the snapshot stays unvalidated"
+                            );
+                            chain_state.warnings().record(
+                                "assumeutxo.handoff_failing",
+                                crate::warnings::Severity::Error,
+                                format!(
+                                    "AssumeUTXO handoff at height {} has failed {} times ({e}); \
+                                     the snapshot remains unvalidated until it succeeds",
+                                    bg.snapshot_height(),
+                                    handoff_retry_failures
+                                ),
+                                serde_json::json!({
+                                    "height": bg.snapshot_height(),
+                                    "attempts": handoff_retry_failures,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                }
                 let (lock, cvar) = &**bg_connect_signal;
                 let mut ready = lock.lock();
                 *ready = false;
@@ -3247,36 +3300,47 @@ impl PeerManager {
                         "AssumeUTXO: background catch-up halted — connect failed"
                     );
                     // Returning here ends the only thread that advances the
-                    // background chainstate, permanently for this process, and
-                    // a restart re-attaches and fails at the same height. That
-                    // has to reach the operator: without this the snapshot
-                    // stays attached, `getchainstates` keeps reporting
-                    // `assumeutxo_rejected: false`, and the only trace is the
-                    // log line above — a background tip frozen forever with no
-                    // surfaced reason (#545). The IBD connector records
-                    // `connect.persistent_failure` for the same class of stop;
-                    // this is its missing counterpart.
+                    // background chainstate, permanently for this process.
+                    // That has to reach the operator: without it the only
+                    // trace is the log line above — a background tip frozen
+                    // forever with no surfaced reason (#545).
                     //
-                    // Deliberately NOT `bg.mark_rejected()`. That marker is a
-                    // durable "this snapshot is invalid" verdict, and only the
-                    // handoff hash mismatch actually proves that. A failure
-                    // here can equally be a bad or corrupt *block* on the way
-                    // in, which says nothing about the snapshot — and marking
-                    // it rejected on that basis would let one bad historical
-                    // block permanently condemn a perfectly good snapshot.
-                    chain_state.warnings().record(
-                        "assumeutxo.catchup_halted",
-                        crate::warnings::Severity::Error,
-                        format!(
-                            "AssumeUTXO background validation stopped at height {next_height} \
-                             ({e}) and will not resume without operator action; the snapshot \
-                             remains unvalidated"
-                        ),
-                        serde_json::json!({
-                            "height": next_height,
-                            "error": e.to_string(),
-                        }),
-                    );
+                    // Two different failures arrive here, and they must not be
+                    // described the same way. `background_connect_block` runs
+                    // the handoff via `?`, so a *proven invalid* snapshot —
+                    // hash mismatch at the snapshot height — lands in this arm
+                    // having already been marked rejected and warned about
+                    // upstream as `assumeutxo-validation-failed`. Telling that
+                    // operator the snapshot "remains unvalidated" would be the
+                    // weaker of two truths at the moment the stronger one
+                    // applies, so the rejected case is left to the warning
+                    // that already describes it exactly.
+                    //
+                    // Deliberately NOT `bg.mark_rejected()` here. That marker
+                    // is a durable "this snapshot is invalid" verdict and only
+                    // the handoff comparison proves it. What actually reaches
+                    // this arm otherwise is storage and flat-file I/O failure
+                    // — a full disk must not condemn a good snapshot. (A bad
+                    // *block* cannot reach it: while a background is attached
+                    // only the canonical block for a historical height is
+                    // storable, `store_block` validates it before it lands,
+                    // and `get_block` re-derives the hash and reports
+                    // corruption rather than returning foreign bytes.)
+                    if !bg.is_rejected() {
+                        chain_state.warnings().record(
+                            "assumeutxo.catchup_halted",
+                            crate::warnings::Severity::Error,
+                            format!(
+                                "AssumeUTXO background validation stopped at height \
+                                 {next_height} ({e}) and will not resume without a restart; \
+                                 the snapshot remains unvalidated"
+                            ),
+                            serde_json::json!({
+                                "height": next_height,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    }
                     let _ = bg.flush();
                     return;
                 }

@@ -790,6 +790,32 @@ impl ChainState {
     /// the catch-up driver halts instead of continuing to advance an
     /// invalid chain. We do NOT panic. Full demote-to-primary recovery is
     /// a follow-up; until then the operator must reindex/reload.
+    /// Re-attempt the handoff for a background that has already reached its
+    /// snapshot height.
+    ///
+    /// The handoff is normally driven from [`Self::background_connect_block`],
+    /// i.e. only after a *successful connect*. That leaves a hole: if the
+    /// handoff itself fails on I/O — `verify_at_snapshot` flushes coins and
+    /// hashes the UTXO set, either of which can hit ENOSPC or a RocksDB error
+    /// — it returns `Err` **before** reaching either `mark_rejected` arm, and
+    /// the background tip is already at `snapshot_height`. No further connect
+    /// is possible, so nothing can ever call the handoff again and the
+    /// snapshot stays pending forever. The catch-up loop's wait branch says it
+    /// will "wait and re-check"; this is what makes that true.
+    ///
+    /// Returns `Ok(false)` when there is nothing to do (no background
+    /// attached, or it has not reached the snapshot height yet).
+    pub fn retry_background_handoff(&self) -> Result<bool, ChainError> {
+        let Some(bg) = self.background() else {
+            return Ok(false);
+        };
+        if bg.tip_height() < bg.snapshot_height() {
+            return Ok(false);
+        }
+        self.run_background_handoff(&bg)?;
+        Ok(true)
+    }
+
     fn run_background_handoff(
         &self,
         bg: &Arc<crate::chain::background::BackgroundChainState>,
