@@ -656,6 +656,14 @@ impl BackfillRunner {
     /// `Err(Cancelled)` or `Err(Shutdown)` as appropriate; otherwise
     /// returns `Ok(())` after waiting out any pause window.
     fn check_pause_loop(&self) -> Result<(), BackfillError> {
+        // Whether *this* call stopped the ETA's clock. The re-anchor below
+        // keys off this rather than off the persisted state, because
+        // `mark_paused` can fail and its error is deliberately not fatal to
+        // the walk — and a failing store is exactly the situation that gets
+        // a backfill paused. Keying off the persisted state would then skip
+        // the re-anchor for ever, leaving `getindexinfo` reporting no ETA on
+        // a backfill that is running normally again.
+        let mut stint_ended = false;
         loop {
             if *self.shutdown.borrow() {
                 return Err(BackfillError::Shutdown);
@@ -669,10 +677,13 @@ impl BackfillRunner {
             if !self.handle.is_paused() {
                 // Paused → Running mirror when an operator hits
                 // `resumeindex` mid-pause.
-                if self.handle.cursor().state == BackfillState::Paused {
+                let was_paused = self.handle.cursor().state == BackfillState::Paused;
+                if was_paused {
                     let _ = self.handle.mark_running(self.chain.store_ref().as_ref());
-                    // Back to work: re-anchor so the paused span is not
-                    // extrapolated as working time (#546).
+                }
+                // Back to work: re-anchor so the paused span is not
+                // extrapolated as working time (#546).
+                if stint_ended || was_paused {
                     self.handle.reanchor_stint(self.progress_ratio());
                 }
                 return Ok(());
@@ -682,6 +693,7 @@ impl BackfillRunner {
             // against an already-`Paused` cursor never takes the
             // Running→Paused transition below.
             self.handle.end_stint();
+            stint_ended = true;
             // First entry into pause: persist Paused so a restart
             // during a paused run stays paused.
             if self.handle.cursor().state == BackfillState::Running {

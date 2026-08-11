@@ -45,12 +45,28 @@ use parking_lot::Mutex;
 
 /// Minimum stint length before an estimate is offered.
 ///
-/// Under this, one unusually slow or fast block dominates the measured
-/// rate: the cursor advances per block, so a stint sampled a millisecond
-/// in has a rate derived from a single sample. Short enough that an
-/// operator watching `getindexinfo` after `resumeindex` sees a number
-/// almost immediately, long enough to average over a batch of blocks.
+/// Short enough that an operator watching `getindexinfo` after
+/// `resumeindex` sees a number almost immediately, long enough to skip the
+/// first instants of a stint, where the elapsed term is so small that
+/// dividing by it amplifies everything.
+///
+/// This bounds *elapsed time*, which on its own does not bound the number
+/// of blocks sampled — see [`MIN_STINT_PROGRESS`].
 pub const MIN_STINT: Duration = Duration::from_secs(2);
+
+/// Minimum forward progress, as a fraction of the whole walk, before an
+/// estimate is offered.
+///
+/// [`MIN_STINT`] alone does not prevent a single block from dominating the
+/// rate; it only prevents sub-second sampling. On a mainnet silent-payment
+/// walk (~252k blocks) one block is ~4e-6 of the ratio, so a stint that
+/// spends its first 2.1s on one large block plus a cold undo read would
+/// extrapolate ~6 days, displayed immediately after a resume and then
+/// collapsing to minutes on the next poll. Requiring a floor on progress
+/// as well means the rate is always averaged over a batch: ~25 blocks on
+/// that walk, and proportionally fewer on a shorter one, where a bad
+/// estimate is also shorter-lived.
+pub const MIN_STINT_PROGRESS: f64 = 0.0001;
 
 #[derive(Debug, Clone, Copy)]
 struct Stint {
@@ -89,9 +105,40 @@ impl StintMeter {
     /// Seconds of work remaining at the rate measured over the current
     /// stint, or `None` when no estimate can be justified: no stint in
     /// flight, too little of it elapsed, or no forward progress within it.
+    ///
+    /// `ratio_now` is read by the caller before this locks, so the two are
+    /// not one atomic snapshot. The dangerous direction is closed:
+    /// `progressed <= 0` returns `None`, so an anchor *ahead* of the ratio
+    /// passed in degrades to no estimate rather than to a negative or huge
+    /// one. The open direction is benign and self-correcting — if a runner
+    /// restarts in the gap, a stale-high `ratio_now` against a fresh anchor
+    /// reports an ETA that is too small for one poll. It needs the reader
+    /// to be preempted for longer than `MIN_STINT` between the two reads,
+    /// and the next poll corrects it. Tying them together would mean
+    /// threading a generation counter through all three families for a
+    /// transient wrong number on a progress display; not worth it.
     pub fn estimate_remaining_secs(&self, ratio_now: f64) -> Option<u64> {
         let stint = (*self.current.lock())?;
         remaining_seconds(stint.began.elapsed(), stint.ratio_at_begin, ratio_now)
+    }
+
+    /// Whether a stint is currently anchored.
+    #[cfg(test)]
+    pub(crate) fn is_anchored(&self) -> bool {
+        self.current.lock().is_some()
+    }
+
+    /// Shift the current anchor back in time, leaving its *ratio* alone.
+    ///
+    /// This is what lets a test exercise a stint that the code under test
+    /// anchored, rather than one the test anchored for it — back-dating in
+    /// place keeps whatever ratio the production path recorded, so a bug
+    /// in that path still shows up in the estimate.
+    #[cfg(test)]
+    pub(crate) fn backdate_anchor(&self, ago: Duration) {
+        if let Some(stint) = self.current.lock().as_mut() {
+            stint.began = stint.began.checked_sub(ago).unwrap_or(stint.began);
+        }
     }
 
     /// Back-date the anchor so tests can exercise stint lengths without
@@ -119,11 +166,12 @@ fn remaining_seconds(elapsed: Duration, ratio_at_begin: f64, ratio_now: f64) -> 
     if ratio_now >= 1.0 {
         return None;
     }
-    // No forward progress in this stint. Covers the equal case (nothing
-    // walked yet) and a ratio that went backwards, which a reorg-aborted
-    // run could in principle produce.
+    // Too little forward progress in this stint to divide by. Covers the
+    // equal case (nothing walked yet), a ratio that went backwards — which
+    // a reorg-aborted run could in principle produce — and the handful of
+    // blocks whose individual timing would otherwise set the whole rate.
     let progressed = ratio_now - ratio_at_begin;
-    if progressed <= 0.0 {
+    if progressed < MIN_STINT_PROGRESS {
         return None;
     }
     let secs = elapsed.as_secs_f64() * ((1.0 - ratio_now) / progressed);
@@ -139,6 +187,13 @@ fn remaining_seconds(elapsed: Duration, ratio_at_begin: f64, ratio_now: f64) -> 
 /// so that every exit path — completion, pause-then-shutdown, `?` on a
 /// storage error, or an unwinding panic — leaves the meter with no anchor
 /// rather than one that keeps aging while nothing is walking.
+///
+/// `#[must_use]` because binding it to `_` instead of a named `_stint`
+/// drops it immediately, clearing the anchor before the first block is
+/// walked and silently disabling every ETA. That is a one-character
+/// mistake with no other symptom.
+#[must_use = "the stint ends the moment this guard is dropped; bind it for the \
+              duration of the walk (`let _stint = ...`), not to `_`"]
 pub struct StintGuard(Arc<StintMeter>);
 
 impl StintGuard {
@@ -268,17 +323,28 @@ mod tests {
         assert!((280..=320).contains(&eta), "expected ~300s, got {eta}");
     }
 
+    /// The guard both *starts* and ends the stint. Constructing it must
+    /// anchor at the ratio it was handed — nothing else anchors on the
+    /// runner's behalf, so if this call went missing every ETA would be
+    /// permanently `None` with no other symptom.
     #[test]
-    fn guard_ends_the_stint_on_drop() {
+    fn guard_anchors_on_construction_and_clears_on_drop() {
         let m = Arc::new(StintMeter::new());
+        assert!(!m.is_anchored());
         {
-            let _g = StintGuard::new(m.clone(), 0.0);
-            m.begin_backdated(0.25, HOUR);
-            assert!(m.estimate_remaining_secs(0.5).is_some());
+            let _g = StintGuard::new(m.clone(), 0.25);
+            assert!(m.is_anchored(), "constructing the guard must anchor a stint");
+            // Back-date in place, so the anchor's *ratio* is still the one
+            // the guard recorded. An anchor at 0.0 would give 3600s here.
+            m.backdate_anchor(HOUR);
+            let eta = m.estimate_remaining_secs(0.50).expect("estimate");
+            assert!(
+                (7000..=7400).contains(&eta),
+                "0.25 walked in 1h leaves 0.50 => ~7200s, got {eta}"
+            );
         }
-        assert_eq!(
-            m.estimate_remaining_secs(0.5),
-            None,
+        assert!(
+            !m.is_anchored(),
             "the guard must clear the anchor when the runner leaves"
         );
     }
@@ -294,11 +360,33 @@ mod tests {
         // thing under test: the guard's Drop must leave it in the "no
         // stint" state, which is a valid state to observe post-unwind.
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _g = StintGuard::new(m2.clone(), 0.0);
-            m2.begin_backdated(0.25, HOUR);
+            let _g = StintGuard::new(m2.clone(), 0.25);
+            assert!(m2.is_anchored());
             panic!("runner blew up mid-walk");
         }));
         assert!(res.is_err());
-        assert_eq!(m.estimate_remaining_secs(0.5), None);
+        assert!(!m.is_anchored());
+    }
+
+    /// The time floor alone does not bound how many blocks were sampled.
+    /// A stint that has been running long enough but has barely moved must
+    /// not extrapolate from that sliver.
+    #[test]
+    fn a_sliver_of_progress_does_not_produce_an_estimate() {
+        // One block of a ~252k-block mainnet walk, after a full 2s.
+        let one_block = 1.0 / 252_000.0;
+        assert_eq!(
+            remaining_seconds(Duration::from_millis(2100), 0.30, 0.30 + one_block),
+            None,
+            "a single block must not set the rate for the whole walk"
+        );
+        // Either side of the floor. Not *on* it: `(r + p) - r` is not
+        // exactly `p` in binary floating point, so an assertion at the
+        // exact boundary tests the rounding, not the rule.
+        assert_eq!(
+            remaining_seconds(HOUR, 0.30, 0.30 + MIN_STINT_PROGRESS * 0.5),
+            None
+        );
+        assert!(remaining_seconds(HOUR, 0.30, 0.30 + MIN_STINT_PROGRESS * 2.0).is_some());
     }
 }

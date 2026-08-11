@@ -5330,6 +5330,34 @@ fn test_sp_index_backfill_disabled_returns_error() {
 /// wait for completion. Uses `SATD_SP_BACKFILL_DEBUG_DELAY_MS` to slow the
 /// runner so the test can race the pause flag in. Exercises the
 /// `pauseindex`/`resumeindex silentpayment` control RPCs end to end.
+/// Poll `getindexinfo` until the silent-payment backfill reports a *non-zero*
+/// ETA, the walk finishes, or `timeout` elapses.
+///
+/// These are the only assertions in the suite that observe a non-zero ETA end
+/// to end. Everything else checks that a *non-running* backfill reports `0`,
+/// which is equally true of a backfill whose rate meter was never anchored at
+/// all — so without these the runners could stop anchoring stints entirely,
+/// the whole suite would stay green, and `getindexinfo` would report `0` for
+/// ever on a multi-day mainnet walk.
+fn poll_for_nonzero_sp_eta(node: &TestNode, timeout: Duration) -> Option<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let info = node.rpc_call("getindexinfo").expect("rpc");
+        let bf = &info["result"]["silentpayments"]["backfill"];
+        if let Some(eta) = bf["estimated_remaining_seconds"].as_u64()
+            && eta > 0
+        {
+            return Some(eta);
+        }
+        // Don't outlast the walk: a completed backfill correctly reports no
+        // ETA, so waiting past that point can only time out.
+        if bf["state"] == "completed" || Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn test_sp_index_backfill_pause_resume() {
     // The cursor is Idle on a fresh --silentpaymentindex=1 datadir, so a
@@ -5339,10 +5367,14 @@ fn test_sp_index_backfill_pause_resume() {
         &[("SATD_SP_BACKFILL_DEBUG_DELAY_MS", "30")],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    // 300 blocks at 30ms each is a ~9s walk. Long enough that the span after
+    // the resume comfortably exceeds `MIN_STINT`, which is what the ETA
+    // assertion below needs; the old 30-block walk finished in under a second
+    // and so could never produce one.
     let _ = node
         .rpc_call_with_params(
             "generatetoaddress",
-            vec![serde_json::json!(30), serde_json::json!(addr)],
+            vec![serde_json::json!(300), serde_json::json!(addr)],
         )
         .expect("rpc");
 
@@ -5356,7 +5388,15 @@ fn test_sp_index_backfill_pause_resume() {
         started
     );
 
-    std::thread::sleep(Duration::from_millis(100));
+    // Two distinct code paths anchor a stint, and each needs its own
+    // observation. This one is the runner's `begin_stint` at the start of the
+    // walk; the one after the resume below is `reanchor_stint`. A test that
+    // only checked after a resume passes with the initial anchor deleted.
+    assert!(
+        poll_for_nonzero_sp_eta(&node, test_timeout(45)).is_some(),
+        "a running backfill must report an ETA once its first stint is long enough"
+    );
+
     let pause_resp = node
         .rpc_call_with_params("pauseindex", vec![serde_json::json!("silentpayment")])
         .expect("rpc");
@@ -5393,6 +5433,13 @@ fn test_sp_index_backfill_pause_resume() {
         .rpc_call_with_params("resumeindex", vec![serde_json::json!("silentpayment")])
         .expect("rpc");
     assert_eq!(resume_resp["result"]["resumed"].as_bool(), Some(true));
+
+    // Back to work: the resumed stint re-anchors, so an ETA becomes available
+    // again once it has run for `MIN_STINT` with real progress in it.
+    assert!(
+        poll_for_nonzero_sp_eta(&node, test_timeout(45)).is_some(),
+        "a resumed backfill must report an ETA once its stint is long enough"
+    );
 
     poll_sp_backfill_state(&node, &["completed"], Duration::from_secs(60));
 

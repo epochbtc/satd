@@ -390,6 +390,78 @@ pub struct StatusReport {
 mod tests {
     use super::*;
 
+    /// Fixture for a filter backfill mid-walk. `started_at_unix`
+    /// is deliberately ancient — an hour into 1970 — so a reintroduction of
+    /// the pre-#546 wall-clock formula would show up here as an estimate
+    /// measured in decades rather than hours.
+    fn filter_running_at(cursor_height: u32, snapshot_height: u32) -> BackfillCursor {
+        BackfillCursor {
+            state: BackfillState::Running,
+            cursor_height,
+            snapshot_height,
+            started_at_unix: 3600,
+            snapshot_tip_hash: [0u8; 32],
+        }
+    }
+
+    /// The ETA comes from the stint the runner is in, not from
+    /// `started_at_unix`.
+    #[test]
+    fn eta_is_measured_over_the_runners_stint() {
+        let h = BackfillHandle::new(filter_running_at(250, 1000));
+        assert_eq!(
+            render_status(Some(&h), true, false).estimated_remaining_seconds,
+            0,
+            "no runner walking yet: nothing to estimate from"
+        );
+
+        // An hour of walking took the ratio from 5% to 25%
+        // (250/1000, single pass). 0.20/h with 0.75 left.
+        h.inner
+            .stint
+            .begin_backdated(0.05, std::time::Duration::from_secs(3600));
+        let eta = render_status(Some(&h), true, false).estimated_remaining_seconds;
+        assert!((13_300..=13_700).contains(&eta), "expected ~13500s, got {eta}");
+    }
+
+    /// The #532 guard: a backfill that is not running reports no ETA even
+    /// with a live anchor, because `progress_ratio` freezes in those states
+    /// and anything derived from it would age without bound.
+    #[test]
+    fn eta_is_zero_for_non_running_states() {
+        for state in [
+            BackfillState::Failed,
+            BackfillState::Paused,
+            BackfillState::Cancelled,
+            BackfillState::Completed,
+            BackfillState::Idle,
+            BackfillState::Rejected,
+        ] {
+            let h = BackfillHandle::new(BackfillCursor {
+                state,
+                ..filter_running_at(250, 1000)
+            });
+            h.inner
+                .stint
+                .begin_backdated(0.05, std::time::Duration::from_secs(3600));
+            assert_eq!(
+                render_status(Some(&h), true, false).estimated_remaining_seconds,
+                0,
+                "state {:?} must not report an ETA",
+                state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn eta_is_zero_when_the_index_is_disabled() {
+        let h = BackfillHandle::new(filter_running_at(250, 1000));
+        h.inner
+            .stint
+            .begin_backdated(0.05, std::time::Duration::from_secs(3600));
+        assert_eq!(render_status(Some(&h), false, false).estimated_remaining_seconds, 0);
+    }
+
     #[test]
     fn test_status_idle_when_no_handle_and_complete() {
         let report = render_status(None, true, true);
