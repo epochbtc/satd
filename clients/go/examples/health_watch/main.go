@@ -81,6 +81,9 @@ func main() {
 	defer stop()
 
 	var opts []satdevents.Option
+	// WithBearerToken refuses a plaintext connection: add a WithTLS* option (see
+	// examples/tls_tail). Against a loopback node, swap in
+	// WithInsecureBearerToken.
 	if *token != "" {
 		opts = append(opts, satdevents.WithBearerToken(*token))
 	}

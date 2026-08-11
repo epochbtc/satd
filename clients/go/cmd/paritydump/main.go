@@ -81,7 +81,10 @@ func run(endpoint, specPath, outPath, readyPath string,
 
 	var opts []satdevents.Option
 	if token != "" {
-		opts = append(opts, satdevents.WithBearerToken(token))
+		// The harness dumps a local regtest node over plaintext loopback, which
+		// is what the insecure variant exists for. Using WithBearerToken here
+		// would refuse the connection.
+		opts = append(opts, satdevents.WithInsecureBearerToken(token))
 	}
 	client, err := satdevents.Dial(ctx, endpoint, opts...)
 	if err != nil {

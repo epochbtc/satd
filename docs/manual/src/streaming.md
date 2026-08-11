@@ -253,6 +253,13 @@ slow or probing clients. Certificates hot-reload from the same paths on
 `SIGUSR1`, like the other TLS surfaces. TLS uses the workspace `ring` provider
 exclusively.
 
+A remote bind must also be **encrypted** when bearer auth is what authenticates
+it: `eventsgrpcallowremote` together with `eventsgrpcauth` requires
+`eventsgrpctlscert` and `eventsgrpctlskey`. A bearer token is sent on every RPC,
+and the stream can carry BIP 352 scan keys, so a routable plaintext listener
+puts both on the wire for every host on the path. mTLS needs no separate flag
+here — it already requires the certificate and key.
+
 If a TLS-terminating reverse proxy fronts the node, keep the loopback bind and
 leave these options unset.
 

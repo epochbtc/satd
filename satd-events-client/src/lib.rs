@@ -10,7 +10,10 @@
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut client = StreamClient::builder("http://127.0.0.1:50051")
-//!     .bearer_token("…")
+//!     // Loopback, so the token never leaves the host. Off-host, use
+//!     // `.bearer_token(..)` with an `https://` endpoint — it refuses to send
+//!     // a credential over an unencrypted connection.
+//!     .insecure_bearer_token("…")
 //!     .keepalive_default()
 //!     .connect()
 //!     .await?;

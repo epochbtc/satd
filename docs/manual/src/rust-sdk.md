@@ -56,7 +56,8 @@ satd-events-client = { version = "0.4", default-features = false }
 ```rust,ignore
 use satd_events_client::{StreamClient, SubscribeOptions, Categories, Event};
 
-let mut client = StreamClient::builder("http://node:50051")
+let mut client = StreamClient::builder("https://node:50051")
+    .tls()
     .bearer_token(token)     // sent as `authorization: Bearer …` on every call
     .keepalive_default()     // http2 keepalive matching the server (30s/20s)
     .connect()
@@ -64,10 +65,26 @@ let mut client = StreamClient::builder("http://node:50051")
 ```
 
 The bearer token is honored only when the server enforces auth
-(`-eventsgrpcauth`). Over a plaintext `http://` connection the token travels
-in cleartext. Enable TLS (below), restrict bearer auth to loopback, or front
-the node with a TLS-terminating proxy. The client's `Debug` impl redacts the
-token and never prints TLS key material.
+(`-eventsgrpcauth`). The client's `Debug` impl redacts the token and never
+prints TLS key material.
+
+### A token requires an encrypted endpoint
+
+`connect()` returns `StreamError::InsecureCredential` for a bearer token
+combined with a non-`https://` endpoint, rather than putting the credential on
+the wire in the clear. Anyone who captures the token can subscribe to the
+firehose and register watches; on a Tier 2 scan-key watch the same stream also
+carries BIP 352 scan secrets, which disclose which outputs belong to the
+receiver.
+
+tonic selects TLS from the URI scheme alone, so `https://` is the thing that
+decides — a scheme-less `node:50051` is plaintext even with `.tls()` called (and
+is rejected for that separately).
+
+For loopback and test harnesses, `insecure_bearer_token(token)` is the same
+thing with the risk accepted explicitly. It is a separate method rather than a
+flag so the unsafe choice has to be named at the call site, and so that
+switching back to `bearer_token` cannot silently leave the waiver behind.
 
 ## TLS / mTLS
 

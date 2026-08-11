@@ -169,6 +169,22 @@ the node refuses an unauthenticated remote bind. The chain is:
 -mcpallowremote         →  requires -mcpauth         →  requires -authfile
 ```
 
+Where a bearer token is what authenticates a remote bind, the transport must
+also be encrypted — the token crosses the wire on every request, and so does
+everything the connection carries:
+
+```
+-eventsgrpcallowremote + -eventsgrpcauth  →  requires -eventsgrpctlscert / -eventsgrpctlskey
+-mcpallowremote                           →  requires -mcpcert / -mcpkey
+```
+
+`-eventsgrpcmtls` satisfies the events-gRPC requirement on its own: it already
+requires the certificate and key, and it authenticates without a token.
+
+`-streamwsallowremote` is the exception, because that transport has no TLS of
+its own. A remote streamws bind sends its bearer token in cleartext unless a
+TLS-terminating proxy fronts it — prefer the loopback bind plus a proxy.
+
 For a proxy-terminated or mTLS-terminated deployment, bind to loopback and
 omit the `*-allow-remote` flag. JSON-RPC remote exposure is governed by
 Core's existing `-rpcbind`/`-rpcallowip`; there is no separate allow-remote

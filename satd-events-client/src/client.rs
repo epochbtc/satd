@@ -691,6 +691,17 @@ pub(crate) fn validate_prefix(
     Ok(pb::ScriptPrefix { prefix, bits })
 }
 
+/// Whether `endpoint` names an encrypted transport.
+///
+/// tonic selects TLS from the URI scheme alone, so the scheme — not the
+/// builder's `tls` field — is what decides whether bytes are encrypted. A
+/// scheme-less endpoint (`host:port`, the common form) is plaintext.
+fn endpoint_is_https(endpoint: &str) -> bool {
+    endpoint
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+}
+
 /// TLS settings assembled by the `StreamClientBuilder::tls*` methods and applied
 /// in [`connect`](StreamClientBuilder::connect). `Some(..)` on the builder means
 /// TLS is enabled; the fields refine trust and identity.
@@ -714,6 +725,9 @@ struct TlsSettings {
 pub struct StreamClientBuilder {
     endpoint: String,
     token: Option<String>,
+    /// Set only by [`StreamClientBuilder::insecure_bearer_token`]: the caller
+    /// has explicitly accepted sending the token over an unencrypted endpoint.
+    allow_insecure_token: bool,
     keepalive: Option<(Duration, Duration)>,
     #[cfg(feature = "tls")]
     tls: Option<TlsSettings>,
@@ -724,6 +738,9 @@ impl std::fmt::Debug for StreamClientBuilder {
         let mut d = f.debug_struct("StreamClientBuilder");
         d.field("endpoint", &self.endpoint)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            // Not the token, but worth seeing in a bug report: it says whether
+            // the plaintext waiver is in force.
+            .field("allow_insecure_token", &self.allow_insecure_token)
             .field("keepalive", &self.keepalive);
         #[cfg(feature = "tls")]
         d.field("tls", &self.tls.is_some());
@@ -736,13 +753,35 @@ impl StreamClientBuilder {
     /// on every RPC.
     ///
     /// The token is only honored when the server enforces auth
-    /// (`-eventsgrpcauth`); a no-auth (loopback-trust) server ignores it. Over a
-    /// plaintext `http://` endpoint the token travels in cleartext — enable
-    /// [`tls`](Self::tls) (or [`tls_ca_pem`](Self::tls_ca_pem)) so the connection
-    /// is encrypted, or restrict bearer auth to loopback / a TLS-terminating
-    /// proxy.
+    /// (`-eventsgrpcauth`); a no-auth (loopback-trust) server ignores it.
+    ///
+    /// **The endpoint must be encrypted.** [`connect`](Self::connect) returns
+    /// [`StreamError::InsecureCredential`] for a token combined with a
+    /// non-`https://` endpoint rather than putting it on the wire in the clear.
+    /// Pair this with [`tls`](Self::tls) or [`tls_ca_pem`](Self::tls_ca_pem),
+    /// or use [`insecure_bearer_token`](Self::insecure_bearer_token) to accept
+    /// the risk explicitly.
     pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self.allow_insecure_token = false;
+        self
+    }
+
+    /// Like [`bearer_token`](Self::bearer_token), but permits sending the token
+    /// over an unencrypted endpoint.
+    ///
+    /// Only for loopback and test harnesses. Over anything else the token is
+    /// readable by every host on the path, and so is everything the stream
+    /// carries — including the BIP 352 scan keys a Tier 2 watch registers,
+    /// which disclose which outputs belong to the receiver.
+    ///
+    /// This is a separate method rather than a flag so that the unsafe choice
+    /// has to be named at the call site, and so that a later switch back to
+    /// [`bearer_token`](Self::bearer_token) cannot silently leave the waiver
+    /// behind.
+    pub fn insecure_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self.allow_insecure_token = true;
         self
     }
 
@@ -812,6 +851,9 @@ impl StreamClientBuilder {
 
     /// Connect the transport and return a ready [`StreamClient`].
     pub async fn connect(self) -> Result<StreamClient, StreamError> {
+        // Captured before the match below moves `self.token`; the credential
+        // check that reads it is ordered later on purpose (see there).
+        let has_token = self.token.is_some();
         let auth = match self.token {
             Some(t) => Some(
                 format!("Bearer {t}")
@@ -827,20 +869,36 @@ impl StreamClientBuilder {
         // leaking the bearer token and the whole event stream while the caller
         // believes the link is encrypted. Fail closed rather than downgrade.
         #[cfg(feature = "tls")]
-        if self.tls.is_some() {
-            let scheme_is_https = self
-                .endpoint
-                .split_once("://")
-                .map(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
-                .unwrap_or(false);
-            if !scheme_is_https {
-                return Err(StreamError::InvalidEndpoint(
-                    "TLS was requested (tls / tls_ca_pem / tls_client_identity / tls_domain) but \
-                     the endpoint scheme is not https:// — refusing to connect in cleartext; use \
-                     an https:// endpoint"
-                        .to_string(),
-                ));
-            }
+        if self.tls.is_some() && !endpoint_is_https(&self.endpoint) {
+            return Err(StreamError::InvalidEndpoint(
+                "TLS was requested (tls / tls_ca_pem / tls_client_identity / tls_domain) but \
+                 the endpoint scheme is not https:// — refusing to connect in cleartext; use \
+                 an https:// endpoint"
+                    .to_string(),
+            ));
+        }
+
+        // A bearer token on an unencrypted endpoint crosses the network in the
+        // clear, and so does everything the stream carries — including the BIP
+        // 352 scan keys a Tier 2 watch registers. Nothing downstream catches
+        // this: the token is attached as ordinary metadata, so tonic has no
+        // credential to apply a transport-security requirement to, and a
+        // remote-bound node with `eventsgrpcauth=1` and no TLS is a supported
+        // server configuration. Both ends behave as configured while the
+        // credential is on the wire (#521).
+        //
+        // The scheme is the transport-truthful predicate here, not the builder's
+        // `tls` field: tonic selects TLS from the URI scheme alone. `https://`
+        // is TLS or a connect failure, never a silent downgrade. Checked even
+        // without the `tls` feature, where an https endpoint cannot connect at
+        // all — an error either way, but this one names the reason.
+        //
+        // Ordered after the TLS-scheme check above so the more specific
+        // diagnosis wins when a caller asked for TLS *and* gave an http:// URL,
+        // matching the Go SDK, where the scheme conflict is likewise reported
+        // first.
+        if has_token && !self.allow_insecure_token && !endpoint_is_https(&self.endpoint) {
+            return Err(StreamError::InsecureCredential(self.endpoint));
         }
 
         let mut endpoint = Endpoint::from_shared(self.endpoint)
@@ -914,6 +972,7 @@ impl StreamClient {
         StreamClientBuilder {
             endpoint: endpoint.into(),
             token: None,
+            allow_insecure_token: false,
             keepalive: None,
             #[cfg(feature = "tls")]
             tls: None,
@@ -1010,6 +1069,105 @@ mod tests {
 
     fn next(rx: &mut mpsc::Receiver<pb::SubscribeControl>) -> Msg {
         rx.try_recv().expect("a control message was sent").msg.expect("msg set")
+    }
+
+    #[test]
+    fn only_an_https_scheme_counts_as_encrypted() {
+        assert!(endpoint_is_https("https://node.example:50051"));
+        assert!(endpoint_is_https("HTTPS://node.example:50051"));
+        assert!(!endpoint_is_https("http://node.example:50051"));
+        // The common scheme-less form. tonic treats it as plaintext, so this
+        // must not be mistaken for encrypted.
+        assert!(!endpoint_is_https("node.example:50051"));
+        assert!(!endpoint_is_https("127.0.0.1:50051"));
+    }
+
+    /// The #521 guard. The token is attached as ordinary metadata, so there is
+    /// no `PerRPCCredentials` for tonic to apply a transport-security
+    /// requirement to, and a remote-bound node with `eventsgrpcauth=1` and no
+    /// TLS is a supported server configuration — nothing else stops the
+    /// credential reaching the wire in the clear.
+    #[tokio::test]
+    async fn a_bearer_token_over_plaintext_is_refused() {
+        for endpoint in ["http://127.0.0.1:1", "http://node.example:50051", "node.example:50051"] {
+            let err = StreamClient::builder(endpoint)
+                .bearer_token("SECRET")
+                .connect()
+                .await
+                .expect_err("a bearer token over plaintext must be refused");
+            assert!(
+                matches!(err, StreamError::InsecureCredential(_)),
+                "{endpoint}: got {err:?}"
+            );
+            assert!(
+                !err.to_string().contains("SECRET"),
+                "{endpoint}: the error must not quote the token: {err}"
+            );
+        }
+    }
+
+    /// A plaintext connection with no token is the default local setup and is
+    /// unaffected: it gets as far as the transport (and fails there, since
+    /// nothing is listening on port 1).
+    #[tokio::test]
+    async fn plaintext_without_a_token_is_unaffected() {
+        let err = StreamClient::builder("http://127.0.0.1:1")
+            .connect()
+            .await
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            !matches!(err, StreamError::InsecureCredential(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The named waiver gets past the gate — it too fails at the transport,
+    /// which is the proof that the credential check no longer short-circuits.
+    #[tokio::test]
+    async fn the_named_waiver_permits_a_token_over_plaintext() {
+        let err = StreamClient::builder("http://127.0.0.1:1")
+            .insecure_bearer_token("SECRET")
+            .connect()
+            .await
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            !matches!(err, StreamError::InsecureCredential(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// A later `bearer_token` must clear an earlier waiver rather than inherit
+    /// it — the reason the waiver is a token-carrying method and not a flag.
+    #[tokio::test]
+    async fn the_waiver_does_not_leak_into_a_subsequent_bearer_token() {
+        let err = StreamClient::builder("http://127.0.0.1:1")
+            .insecure_bearer_token("SECRET")
+            .bearer_token("SECRET")
+            .connect()
+            .await
+            .expect_err("the waiver must not survive a later bearer_token");
+        assert!(
+            matches!(err, StreamError::InsecureCredential(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// An `https://` endpoint is accepted with a token whether or not a `tls*`
+    /// method was called — tonic selects TLS from the scheme, so the scheme is
+    /// what decides.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn https_permits_a_token() {
+        let err = StreamClient::builder("https://127.0.0.1:1")
+            .tls()
+            .bearer_token("SECRET")
+            .connect()
+            .await
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            !matches!(err, StreamError::InsecureCredential(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
