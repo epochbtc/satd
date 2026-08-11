@@ -73,6 +73,55 @@ pub fn e2e_test_timeout(secs: u64) -> Duration {
     Duration::from_secs_f64(secs as f64 * e2e)
 }
 
+/// Allocate a directory under the temp dir for one test, and guarantee it is
+/// empty. Use this for every datadir a test starts a node on — the *only*
+/// paths that should be built by hand are the second and later uses of a
+/// directory a restart test is deliberately reusing.
+///
+/// Test directories used to be named after something stable across runs —
+/// usually the RPC port, sometimes the pid — and were not reliably removed. An
+/// RPC port is drawn by binding an ephemeral socket and releasing it, so the
+/// same port, and therefore the same directory, is redrawn regularly; pids get
+/// recycled the same way. Removal was not guaranteed either: a `SIGKILL`ed
+/// test binary never runs `Drop`, and until this change the spawn-retry path
+/// leaked one directory per failed attempt.
+///
+/// So a test could start on top of an earlier run's chainstate.
+/// `test_getchaintips_fields` was seen asserting a fresh node's tip is at
+/// height 0 against the 101-block chain another test had mined into that
+/// directory (#550). That is worse than an ordinary flake: a test can pass
+/// against the wrong state as easily as it can fail, so it erodes the signal
+/// in both directions. One site had already been patched in place with a
+/// wipe-before-create and a comment about the CI runner persisting `/tmp`;
+/// this generalises that fix.
+///
+/// Two independent guarantees, because neither alone is sufficient:
+///
+/// - **Unique per call.** The pid separates test binaries, which cargo runs
+///   in parallel and which all draw ports from the same ephemeral range; the
+///   counter separates calls within one binary, including two tests that pass
+///   the same tag. A leaked directory now belongs to a pid that is not
+///   running, so it is inert rather than poisonous.
+/// - **Empty on arrival.** Pid recycling means the name alone is not proof of
+///   freshness. Removing first makes the starting state deterministic whatever
+///   the name collided with.
+pub fn fresh_test_datadir(tag: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("{}-{}-{}", tag, std::process::id(), seq));
+    prepare_empty_dir(&dir);
+    dir
+}
+
+/// Remove `dir` and recreate it empty. Split out of `fresh_test_datadir` so
+/// the wipe half of its contract can be tested against a directory that
+/// actually has something in it — the name half is unique by construction, so
+/// a test driving only the entry point would never exercise this.
+pub fn prepare_empty_dir(dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::create_dir_all(dir);
+}
+
 pub struct TestNode {
     pub process: Child,
     pub datadir: PathBuf,
@@ -147,8 +196,9 @@ impl TestNode {
         capture_stderr: bool,
     ) -> Result<Self, String> {
         let rpcport = find_available_port();
-        let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
-        let _ = std::fs::create_dir_all(&datadir);
+        // The port stays in the tag so a leftover directory can still be
+        // matched to the port in a captured log.
+        let datadir = fresh_test_datadir(&format!("satd-test-{rpcport}"));
 
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
@@ -235,10 +285,16 @@ impl TestNode {
             // Fail fast if satd already exited — no point polling a corpse until
             // the deadline. `try_wait` reaps the child when it reports `Some`.
             if let Ok(Some(status)) = process.try_wait() {
-                return Err(format!(
+                let reason = format!(
                     "satd (port {rpcport}) exited with {status} before its RPC came up{}",
                     read_stderr_tail(&stderr_log)
-                ));
+                );
+                // No `TestNode` is constructed on this path, so nothing will
+                // ever run `Drop` for this datadir. Remove it here — after the
+                // stderr tail has been read out of it — or every failed
+                // attempt leaves one behind (#550).
+                let _ = std::fs::remove_dir_all(&datadir);
+                return Err(reason);
             }
             let rpc_ready = if uses_userpass {
                 let client = reqwest::blocking::Client::builder()
@@ -285,10 +341,14 @@ impl TestNode {
                 // Kill and reap the hung process so it can't leak across a retry.
                 let _ = process.kill();
                 let _ = process.wait();
-                return Err(format!(
+                let reason = format!(
                     "satd (port {rpcport}) did not answer RPC within the startup deadline{}",
                     read_stderr_tail(&stderr_log)
-                ));
+                );
+                // Same as the early-exit path above: no `TestNode`, so no
+                // `Drop` to clean this up (#550).
+                let _ = std::fs::remove_dir_all(&datadir);
+                return Err(reason);
             }
             std::thread::sleep(Duration::from_millis(100));
         }

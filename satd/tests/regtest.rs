@@ -6,9 +6,55 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    DeterministicWallet, TestNode, find_available_port, get_rpc_str, get_rpc_u64, poll_until,
-    test_timeout,
+    DeterministicWallet, TestNode, find_available_port, fresh_test_datadir, get_rpc_str,
+    get_rpc_u64, poll_until, test_timeout,
 };
+
+/// #550: test datadirs used to be named after the RPC port, which is redrawn
+/// regularly, and were not reliably removed — so a test could start on top of
+/// an earlier run's chainstate. `test_getchaintips_fields` was seen asserting
+/// a fresh node's tip is at height 0 against a 101-block chain another test
+/// had mined there. Two calls must never hand out the same directory.
+#[test]
+fn test_fresh_test_datadir_is_unique_per_call() {
+    let a = fresh_test_datadir("satd-datadir-uniqueness");
+    let b = fresh_test_datadir("satd-datadir-uniqueness");
+    assert_ne!(
+        a, b,
+        "the same tag must not hand out the same directory twice"
+    );
+    for d in [&a, &b] {
+        assert!(d.is_dir(), "{} should exist", d.display());
+        assert_eq!(
+            std::fs::read_dir(d).unwrap().count(),
+            0,
+            "{} should be handed over empty",
+            d.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+/// The other half of #550: a name is not proof of freshness, because pids get
+/// recycled. Whatever a colliding name points at must be wiped, not reused.
+#[test]
+fn test_fresh_test_datadir_wipes_a_reused_path() {
+    let dir = fresh_test_datadir("satd-datadir-wipe");
+    // Stand in for the chainstate an earlier run left behind.
+    std::fs::create_dir_all(dir.join("regtest")).unwrap();
+    std::fs::write(dir.join("regtest").join("leftover"), b"101 blocks").unwrap();
+
+    common::prepare_empty_dir(&dir);
+
+    assert!(dir.is_dir(), "the directory must still exist after the wipe");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "a reused path must arrive empty, not carrying a previous run's chain"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn test_regtest_getblockchaininfo() {
@@ -340,8 +386,7 @@ fn test_rpc_bearer_token_capability_scoping() {
         "42c59631c8af2dcca2366d951bb29cf66b43e6637967315e2eaab48a39c9f474";
 
     // Write a 0600 auth.toml in a dedicated temp dir (absolute path required).
-    let dir = std::env::temp_dir().join(format!("satd-authfile-it-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_test_datadir("satd-authfile-it");
     let authfile = dir.join("auth.toml");
     let toml = format!(
         "version = 1\n\
@@ -2110,9 +2155,7 @@ fn test_node_restart_persistence() {
     // We use raw process management here because TestNode::start always creates its own
     // datadir, and we need to reuse the same datadir across two invocations.
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir().join(format!("satd-restart-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-restart-test");
 
     // Guard that kills the child on drop. Needed because an assertion
     // failure between spawn and the explicit cleanup below would
@@ -2727,8 +2770,7 @@ fn test_uptime_increases() {
 fn test_reindex_chainstate() {
     // Mine blocks, stop, restart with -reindex-chainstate, verify chain is intact
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-reindex-cs-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-reindex-cs-test");
 
     // Start node and mine blocks
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
@@ -2765,8 +2807,7 @@ fn test_reindex_chainstate() {
 #[test]
 fn test_reindex_chainstate_stopatheight_exits() {
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-reindex-stop-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-reindex-stop");
 
     // Phase 1: build chainstate up to height 10 the normal way.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
@@ -2996,9 +3037,7 @@ fn test_sighup_reload_applies_mempool_policy_live() {
 fn test_clean_shutdown_marker_graceful_stop() {
     // Graceful RPC stop should write the marker and next startup should see it.
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-clean-shutdown-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-clean-shutdown");
 
     // First run: start, stop gracefully.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
@@ -3047,9 +3086,7 @@ fn test_clean_shutdown_marker_graceful_stop() {
 fn test_clean_shutdown_marker_after_kill() {
     // SIGKILL bypasses the graceful shutdown path — no marker should be written.
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-dirty-shutdown-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-dirty-shutdown");
 
     {
         let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
@@ -3331,8 +3368,7 @@ fn test_sat_cli_node_version_returns_version_not_uptime() {
 fn test_reindex() {
     // Mine blocks, stop, restart with -reindex, verify chain is rebuilt from flat files
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-reindex-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-reindex-test");
 
     // Start node and mine blocks
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
@@ -3901,9 +3937,7 @@ fn test_log_format_json_emits_valid_json_with_trace_id() {
     // mined, the corresponding span carries a trace_id we can verify.
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-jsonlog-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    std::fs::create_dir_all(&datadir).unwrap();
+    let datadir = fresh_test_datadir("satd-jsonlog");
 
     let log_path = datadir.join("stderr.log");
     let log_file = std::fs::File::create(&log_path).unwrap();
@@ -5493,8 +5527,7 @@ fn test_address_index_backfill_cancel_then_restart_succeeds() {
 /// to walk.
 #[test]
 fn test_address_index_backfill_resumable_after_kill() {
-    let datadir = std::env::temp_dir().join(format!("satd-backfill-resume-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-backfill-resume");
 
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
@@ -5546,9 +5579,7 @@ fn test_address_index_backfill_resumable_after_kill() {
 /// "already completed" no-op.
 #[test]
 fn test_address_index_backfill_persists_completed_across_restart() {
-    let datadir =
-        std::env::temp_dir().join(format!("satd-backfill-persist-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-backfill-persist");
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let port_arg = format!("--port={}", p2p_port);
@@ -5629,8 +5660,7 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
     // ── Subject: mine with --addressindex=0 (no rows written), then
     // restart with =1 (live indexer covers heights from restart-tip
     // onward, but pre-restart rows are missing), then run backfill. ──
-    let datadir = std::env::temp_dir().join(format!("satd-backfill-parity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-backfill-parity");
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let port_arg = format!("--port={}", p2p_port);
@@ -5772,9 +5802,7 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
     // enabled from the start, live `connect_block` already writes
     // the spending row and a broken backfill would still be silent
     // (review-2 #8).
-    let datadir =
-        std::env::temp_dir().join(format!("satd-spending-row-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-spending-row-test");
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let port_arg = format!("--port={}", p2p_port);
@@ -6358,13 +6386,11 @@ fn test_esplora_missing_cookie_file_fails_startup() {
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-esplora-bad-cookie-{}", rpcport));
-    // Self-hosted CI runner persists /tmp between runs; a prior run
-    // with the same rpcport hashing leaves chainstate rows that flip
-    // the address_index.complete marker to false on reopen and break
-    // this test's expected error path. Wipe before recreating.
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    // This test is why `fresh_test_datadir` wipes: the CI runner persists
+    // /tmp between runs, and a prior run's chainstate rows here flipped the
+    // address_index.complete marker to false on reopen and broke the expected
+    // error path. The wipe now happens for every test, not just this one.
+    let datadir = fresh_test_datadir("satd-esplora-bad-cookie");
     let missing = datadir.join("definitely-not-a-cookie");
 
     let out = Command::new(satd_bin)
@@ -6402,9 +6428,7 @@ fn test_esplora_port_conflict_fails_startup() {
     let occupied = squatter.local_addr().unwrap().port();
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-esplora-port-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-esplora-port");
 
     let out = Command::new(satd_bin)
         .arg("--regtest")
@@ -6939,9 +6963,7 @@ fn test_esplora_default_startup_auto_enables_txindex() {
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-default-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-default");
 
     let mut child = Command::new(satd_bin)
         .arg("--regtest")
@@ -6994,9 +7016,7 @@ fn test_esplora_default_startup_auto_enables_txindex() {
 fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
     use std::process::Command;
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir().join(format!("satd-legacy-txi-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-legacy-txi");
 
     // Phase 1: sync with --esplora=0 (no txindex implication, no
     // tx_index rows written).
@@ -7055,9 +7075,7 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
 fn test_esplora_refuses_partial_txindex_history() {
     use std::process::Command;
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir().join(format!("satd-partial-txi-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-partial-txi");
 
     // Phase 1: legacy sync with --esplora=0 --txindex=0. tx_index
     // stays empty; the marker is invalidated to false on first
@@ -7130,9 +7148,7 @@ fn test_esplora_refuses_partial_txindex_history() {
 fn test_esplora_refuses_after_txindex_disabled_gap() {
     use std::process::Command;
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir().join(format!("satd-disabled-gap-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-disabled-gap");
 
     // Phase 1: full sync with --esplora=0 --txindex=1. Marker stays
     // true after open (fresh datadir); blocks land with their
@@ -7205,9 +7221,7 @@ fn test_esplora_cli_txindex_overrides_config_disable() {
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
     let esplora_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-cli-override-{}", rpcport));
-    let _ = std::fs::remove_dir_all(&datadir);
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-cli-override");
     // Plant txindex=0 in the config file.
     std::fs::write(datadir.join("bitcoin.conf"), "txindex=0\n").unwrap();
 
@@ -7260,8 +7274,7 @@ fn test_esplora_with_explicit_txindex_disabled_fails_startup() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
     let rpcport = find_available_port();
     let p2p_port = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-conflict-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-conflict");
     let net_dir = datadir.join("regtest");
     let _ = std::fs::create_dir_all(&net_dir);
     std::fs::write(net_dir.join("bitcoin.conf"), "txindex=0\n").unwrap();
@@ -8913,8 +8926,7 @@ fn test_esplora_sse_watch_quota_enforced() {
     const TOKEN_RO_SHA256: &str =
         "423c2d4c280d24c496e639d3ff2a9e1c49e0bbf0d26736a92b0aa7dfb4e4fd7b";
 
-    let dir = std::env::temp_dir().join(format!("satd-watchquota-it-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_test_datadir("satd-watchquota-it");
     let authfile = dir.join("auth.toml");
     let toml = format!(
         "version = 1\n\
@@ -9356,8 +9368,7 @@ fn test_filter_backfill_idempotent_after_completion() {
 #[test]
 fn test_filter_backfill_pause_resume() {
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-filter-bf-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-filter-bf-test");
     let mut node = TestNode::start_with_datadir_env(
         &datadir,
         rpcport,
@@ -9411,8 +9422,7 @@ fn test_filter_backfill_pause_resume() {
 #[test]
 fn test_filter_backfill_cancel_drops_progress() {
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-filter-bf-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-filter-bf-test");
     let mut node = TestNode::start_with_datadir_env(
         &datadir,
         rpcport,
@@ -9474,8 +9484,7 @@ fn test_filter_backfill_cancel_drops_progress() {
 #[ignore]
 fn test_filter_backfill_resume_after_restart() {
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-filter-bf-resume-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-filter-bf-resume-test");
 
     // Use shadowing rather than a `{...}` block so the first
     // `TestNode`'s Drop (which `remove_dir_all`s the datadir) doesn't
@@ -9555,8 +9564,7 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
     // walks to the snapshot height (sufficient evidence the backfill
     // visited every block).
     let rpcport_a = find_available_port();
-    let datadir_a = std::env::temp_dir().join(format!("satd-filter-bf-ref-test-{}", rpcport_a));
-    let _ = std::fs::create_dir_all(&datadir_a);
+    let datadir_a = fresh_test_datadir("satd-filter-bf-ref-test");
     let mut node_a =
         TestNode::start_with_datadir(&datadir_a, rpcport_a, &["--blockfilterindex=basic"]);
     node_a
@@ -9579,8 +9587,7 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
     // Now: fresh datadir mined with the index OFF, restart with on,
     // backfill, assert it walks to snapshot_height.
     let rpcport_b = find_available_port();
-    let datadir_b = std::env::temp_dir().join(format!("satd-filter-bf-upgrade-test-{}", rpcport_b));
-    let _ = std::fs::create_dir_all(&datadir_b);
+    let datadir_b = fresh_test_datadir("satd-filter-bf-upgrade-test");
     // Shadow the binding rather than wrapping in `{...}` so the
     // first node's `Drop::remove_dir_all` doesn't fire before the
     // second `start_with_datadir` reads from it.
@@ -9634,8 +9641,7 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
 #[test]
 fn test_filter_backfill_tail_catchup_after_concurrent_live_block() {
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-filter-bf-tail-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-filter-bf-tail-test");
 
     // Phase 1: mine a chain with the index OFF so historical heights
     // have no filter rows.
@@ -9938,8 +9944,7 @@ fn test_p2p_getcfheaders_returns_chain() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfheaders-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-cfheaders-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10016,8 +10021,7 @@ fn test_p2p_getcfilters_returns_blobs() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfilters-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-cfilters-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10078,8 +10082,7 @@ fn test_p2p_getcfcheckpt_thousand_block_intervals() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-p2p-cfcheckpt-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-cfcheckpt-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10142,8 +10145,7 @@ fn test_p2p_silent_drop_when_peer_serve_disabled() {
     // NODE_COMPACT_FILTERS.
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!("satd-p2p-silent-test-{}", rpcport));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-silent-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10198,11 +10200,7 @@ fn test_p2p_silent_drop_invalid_filter_type() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-p2p-bad-filter-type-test-{}",
-        rpcport
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-bad-filter-type-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10254,11 +10252,7 @@ fn test_p2p_getcfilters_max_size_response_not_truncated() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-p2p-cfilters-1000-test-{}",
-        rpcport
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-cfilters-1000-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10318,11 +10312,7 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-p2p-cfheaders-2000-test-{}",
-        rpcport
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-cfheaders-2000-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10414,11 +10404,7 @@ fn test_p2p_silent_drop_oversized_range() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-p2p-oversize-test-{}",
-        rpcport
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-oversize-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10467,11 +10453,7 @@ fn test_p2p_silent_drop_off_chain_stop_hash() {
 
     let p2p_port = find_available_port();
     let rpcport = find_available_port();
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-p2p-offchain-test-{}",
-        rpcport
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-p2p-offchain-test");
     let mut node = TestNode::start_with_datadir(
         &datadir,
         rpcport,
@@ -10903,11 +10885,7 @@ fn test_rpc_tls_stop_rpc_shuts_down_cleanly() {
 #[test]
 fn test_rpc_tls_partial_config_aborts_startup() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir().join(format!(
-        "satd-test-rpctls-partial-{}",
-        find_available_port()
-    ));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-test-rpctls-partial");
     let rpcport = find_available_port();
     let tls_port = find_available_port();
 
@@ -11245,9 +11223,7 @@ fn test_rpc_mtls_allowlist_drops_unlisted_principal() {
 #[test]
 fn test_rpc_mtls_without_ca_aborts_startup() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir()
-        .join(format!("satd-test-rpcmtls-noca-{}", find_available_port()));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-test-rpcmtls-noca");
     let tmp = tempfile::tempdir().unwrap();
     let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
     let rpcport = find_available_port();
@@ -11287,9 +11263,7 @@ fn test_rpc_mtls_without_ca_aborts_startup() {
 #[test]
 fn test_rpc_disableauth_without_mtls_aborts_startup() {
     let satd_bin = env!("CARGO_BIN_EXE_satd");
-    let datadir = std::env::temp_dir()
-        .join(format!("satd-test-rpcda-nomtls-{}", find_available_port()));
-    let _ = std::fs::create_dir_all(&datadir);
+    let datadir = fresh_test_datadir("satd-test-rpcda-nomtls");
     let rpcport = find_available_port();
 
     let out = Command::new(satd_bin)
