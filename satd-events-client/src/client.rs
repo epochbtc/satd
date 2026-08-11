@@ -696,6 +696,12 @@ pub(crate) fn validate_prefix(
 /// tonic selects TLS from the URI scheme alone, so the scheme — not the
 /// builder's `tls` field — is what decides whether bytes are encrypted. A
 /// scheme-less endpoint (`host:port`, the common form) is plaintext.
+///
+/// Only the TLS-capable build consults this: without the `tls` feature the
+/// scheme carries no security meaning at all, which is the whole point of
+/// [`endpoint_is_encrypted`]. Kept compiled in both so the unit test that
+/// pins its behaviour runs in both.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
 fn endpoint_is_https(endpoint: &str) -> bool {
     endpoint
         .split_once("://")
