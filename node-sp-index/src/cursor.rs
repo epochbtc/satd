@@ -83,6 +83,23 @@ impl BackfillState {
         self as u8
     }
 
+    /// Every state, for callers that must enumerate the whole domain.
+    ///
+    /// The Prometheus state gauge emits one series per state rather than only
+    /// the current one: a family that publishes just the active label makes
+    /// `state="failed"` *absent* rather than `0` when healthy, and an alert on
+    /// an absent series either needs `absent()` gymnastics or silently never
+    /// fires. Enumerating keeps every series continuously present.
+    pub const ALL: [Self; 7] = [
+        Self::Idle,
+        Self::Running,
+        Self::Paused,
+        Self::Completed,
+        Self::Cancelled,
+        Self::Rejected,
+        Self::Failed,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -171,17 +188,32 @@ mod tests {
 
     #[test]
     fn state_byte_roundtrip() {
-        for s in [
-            BackfillState::Idle,
-            BackfillState::Running,
-            BackfillState::Paused,
-            BackfillState::Completed,
-            BackfillState::Cancelled,
-            BackfillState::Rejected,
-            BackfillState::Failed,
-        ] {
+        for s in BackfillState::ALL {
             assert_eq!(BackfillState::from_byte(s.as_byte()), s);
         }
+    }
+
+    #[test]
+    fn all_covers_every_state_exactly_once() {
+        // `ALL` drives the Prometheus state gauge, which emits one series per
+        // state so that `state="failed"` reads 0 when healthy rather than
+        // being absent. A state missing from here would have no series at all
+        // — an alert on it would never fire, and nothing else would notice.
+        // Anchored on the byte encoding so a new variant fails this test
+        // rather than silently going unexported.
+        let mut seen: Vec<u8> = BackfillState::ALL.iter().map(|s| s.as_byte()).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0u8..=6).collect::<Vec<_>>(),
+            "ALL must cover every encoded state"
+        );
+
+        let mut labels: Vec<&str> = BackfillState::ALL.iter().map(|s| s.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "two states share a label");
     }
 
     #[test]

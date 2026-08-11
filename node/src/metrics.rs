@@ -48,6 +48,10 @@ pub struct MetricsContext {
     /// so operators can confirm at a glance which DB-backed indexes
     /// are live.
     pub addr_enabled: bool,
+    /// Silent-payment-index runtime config, exported as an `enabled` gauge for
+    /// the same reason as `addr_enabled`: without it, a `0.0` backfill-progress
+    /// reading cannot be told apart from the index being switched off.
+    pub sp_enabled: bool,
     /// Live readings from the health detectors. `None` in test backends and
     /// anywhere the detector task was not spawned, in which case the health
     /// gauges are omitted entirely rather than reported as zeros (a zero
@@ -332,17 +336,65 @@ impl MetricsContext {
         // is therefore complete without any backfill having run), and a
         // backfill that has only just started. Read it together with
         // `getindexinfo`'s `silentpayments.backfill.state` rather than alone.
-        let sp_backfill_ratio = self
-            .chain_state
-            .store_ref()
-            .read_sp_backfill_cursor()
-            .progress_ratio(crate::index::silent_payments::walk_start(self.network));
+        // One cursor read for both the ratio and the state gauge, so the two
+        // can never disagree within a scrape.
+        let sp_cursor = self.chain_state.store_ref().read_sp_backfill_cursor();
+        let sp_backfill_ratio =
+            sp_cursor.progress_ratio(crate::index::silent_payments::walk_start(self.network));
         let _ = writeln!(
             out,
             "# HELP satd_spindex_backfill_progress_ratio Fraction of the silent-payment-index deferred backfill completed, over the walked span [taproot activation, snapshot]. 1.0 means a deferred backfill ran to completion; 0.0 means no backfill progress and does NOT imply the index is incomplete (an index built inline from genesis needs no backfill and stays at 0.0)."
         );
         let _ = writeln!(out, "# TYPE satd_spindex_backfill_progress_ratio gauge");
         let _ = writeln!(out, "satd_spindex_backfill_progress_ratio {sp_backfill_ratio}");
+
+        // The three gauges that make the ratio interpretable (#535).
+        //
+        // On its own, `satd_spindex_backfill_progress_ratio == 0.0` means five
+        // different things: the index is off; it was built inline from a
+        // genesis sync and is complete without a backfill ever running; a
+        // backfill completed via the below-activation short-circuit; one has
+        // just started; or one failed at or near taproot activation. So
+        // neither `ratio == 0` nor `ratio < 1` identifies a problem — the
+        // first pages on every node with the index disabled, the second on
+        // every healthy from-genesis node, forever. There was no expression
+        // over the exported set that answered "is the backfill stuck or
+        // failed", which is the only question the gauge exists to support.
+        //
+        // Together these disambiguate all five: `enabled` separates off from
+        // on, `synced` separates complete-without-backfill from incomplete,
+        // and the state series separates running from failed from idle.
+        metric(
+            &mut out,
+            "satd_spindex_enabled",
+            "1 if the silent-payment tweak index is enabled at runtime, 0 otherwise.",
+            "gauge",
+            &[],
+            u64::from(self.sp_enabled),
+        );
+        metric(
+            &mut out,
+            "satd_spindex_synced",
+            "1 if the silent-payment index is marked complete on disk (fully built for the active chain), 0 otherwise. A node that built the index inline from a genesis sync reports 1 with a backfill progress ratio of 0.0.",
+            "gauge",
+            &[],
+            u64::from(self.chain_state.store_ref().silent_payment_index_complete()),
+        );
+        // One series per state, always present — see `BackfillState::ALL`.
+        metric_header(
+            &mut out,
+            "satd_spindex_backfill_state",
+            "Current state of the silent-payment-index deferred backfill: exactly one series is 1, the rest are 0.",
+            "gauge",
+        );
+        for state in node_sp_index::cursor::BackfillState::ALL {
+            metric_sample(
+                &mut out,
+                "satd_spindex_backfill_state",
+                &[("state", state.label())],
+                u64::from(state == sp_cursor.state),
+            );
+        }
 
         // Node-health gauges, rendered only when the detector task is running.
         render_health_metrics(&mut out, self.health.as_deref());
@@ -907,6 +959,72 @@ mod tests {
         assert!(out.contains("# HELP foo_bar help text\n"));
         assert!(out.contains("# TYPE foo_bar gauge\n"));
         assert!(out.contains("foo_bar 42\n"));
+    }
+
+    /// The property that makes the SP backfill alertable (#535): every state
+    /// gets a series, and exactly one of them is 1.
+    ///
+    /// Mirrors the emission in `render_prometheus`, which needs a live
+    /// `ChainState` and so cannot be driven from a unit test. What is asserted
+    /// here is the part that can silently rot — a missing series reads as
+    /// "absent" to Prometheus, and an alert on an absent series never fires.
+    #[test]
+    fn sp_backfill_state_series_is_exhaustive_and_one_hot() {
+        use node_sp_index::cursor::BackfillState;
+
+        // Written out rather than derived from `ALL`, deliberately. A test that
+        // both emits and asserts over `ALL` uses the thing under test as its
+        // own oracle: drop a state and the test stays green because both sides
+        // dropped it together. This list is the independent expectation — the
+        // set of series an operator's alerting rules are allowed to depend on.
+        const EXPECTED: [&str; 7] = [
+            "idle",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "rejected",
+            "failed",
+        ];
+
+        for current in BackfillState::ALL {
+            let mut out = String::new();
+            metric_header(&mut out, "satd_spindex_backfill_state", "help", "gauge");
+            for state in BackfillState::ALL {
+                metric_sample(
+                    &mut out,
+                    "satd_spindex_backfill_state",
+                    &[("state", state.label())],
+                    u64::from(state == current),
+                );
+            }
+
+            // Exactly one `# HELP`/`# TYPE` pair: a repeated header makes a
+            // strict parser discard the entire page, taking every unrelated
+            // satd metric down with it.
+            assert_eq!(out.matches("# HELP").count(), 1);
+            assert_eq!(out.matches("# TYPE").count(), 1);
+
+            for label in EXPECTED {
+                let expected = u64::from(label == current.label());
+                let line =
+                    format!("satd_spindex_backfill_state{{state=\"{label}\"}} {expected}\n");
+                assert!(
+                    out.contains(&line),
+                    "missing or wrong series for state={label:?} while current is {current:?}:\n{out}"
+                );
+            }
+            assert_eq!(
+                out.lines().filter(|l| l.starts_with("satd_")).count(),
+                EXPECTED.len(),
+                "series count must match the expected state set exactly"
+            );
+            assert_eq!(
+                out.lines().filter(|l| l.ends_with(" 1")).count(),
+                1,
+                "exactly one series must be hot"
+            );
+        }
     }
 
     #[test]

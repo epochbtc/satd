@@ -3246,6 +3246,37 @@ impl PeerManager {
                         error = %e,
                         "AssumeUTXO: background catch-up halted — connect failed"
                     );
+                    // Returning here ends the only thread that advances the
+                    // background chainstate, permanently for this process, and
+                    // a restart re-attaches and fails at the same height. That
+                    // has to reach the operator: without this the snapshot
+                    // stays attached, `getchainstates` keeps reporting
+                    // `assumeutxo_rejected: false`, and the only trace is the
+                    // log line above — a background tip frozen forever with no
+                    // surfaced reason (#545). The IBD connector records
+                    // `connect.persistent_failure` for the same class of stop;
+                    // this is its missing counterpart.
+                    //
+                    // Deliberately NOT `bg.mark_rejected()`. That marker is a
+                    // durable "this snapshot is invalid" verdict, and only the
+                    // handoff hash mismatch actually proves that. A failure
+                    // here can equally be a bad or corrupt *block* on the way
+                    // in, which says nothing about the snapshot — and marking
+                    // it rejected on that basis would let one bad historical
+                    // block permanently condemn a perfectly good snapshot.
+                    chain_state.warnings().record(
+                        "assumeutxo.catchup_halted",
+                        crate::warnings::Severity::Error,
+                        format!(
+                            "AssumeUTXO background validation stopped at height {next_height} \
+                             ({e}) and will not resume without operator action; the snapshot \
+                             remains unvalidated"
+                        ),
+                        serde_json::json!({
+                            "height": next_height,
+                            "error": e.to_string(),
+                        }),
+                    );
                     let _ = bg.flush();
                     return;
                 }

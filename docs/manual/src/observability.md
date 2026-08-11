@@ -45,6 +45,40 @@ labels) and does not consume an RPC worker on every scrape.
 > one-time handshake bytes are not included, so absolute socket totals read
 > marginally lower than the kernel's.
 
+### Index readiness
+
+Each DB-backed index exports whether it is switched on, whether it is complete,
+and — where it has a deferred backfill — what that backfill is doing:
+
+| Metric | Meaning |
+|---|---|
+| `satd_addrindex_enabled` | 1 if the address-history index is enabled at runtime |
+| `satd_spindex_enabled` | 1 if the silent-payment tweak index is enabled at runtime |
+| `satd_spindex_synced` | 1 if the silent-payment index is marked complete on disk |
+| `satd_spindex_backfill_state{state="…"}` | one series per lifecycle state, exactly one of them 1 |
+| `satd_spindex_backfill_progress_ratio` | fraction of the deferred backfill walked, over `[taproot activation, snapshot]` |
+
+**Do not alert on the progress ratio alone.** `0.0` is not an error signal: it
+covers an index that is switched off, one built inline from a genesis sync (which
+never needs a backfill and stays at `0.0` while being perfectly complete), a
+backfill that has only just started, and one that failed near taproot
+activation. Alert on the state series instead, which distinguishes them:
+
+```promql
+# The silent-payment backfill failed.
+satd_spindex_backfill_state{state="failed"} == 1
+
+# Enabled, not complete, and not making progress — stuck rather than idle.
+satd_spindex_enabled == 1
+  and satd_spindex_synced == 0
+  and satd_spindex_backfill_state{state="running"} == 1
+  and rate(satd_spindex_backfill_progress_ratio[30m]) == 0
+```
+
+All seven state series are always present, so a rule can reference
+`state="failed"` before it has ever fired — the same reason `satd_alert_active`
+pre-registers at 0 (see [below](#node-health-alerts)).
+
 ## Node-health alerts
 
 Metrics tell you what the node is doing; health alerts tell you when it has
