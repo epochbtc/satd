@@ -19,6 +19,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   The node closes the same hole from its end: `-eventsgrpcallowremote` with
   `-eventsgrpcauth` now requires `-eventsgrpctlscert`/`-eventsgrpctlskey`,
   matching the rule `-mcpallowremote` already enforces. mTLS satisfies it.
+- Fixed: `getindexinfo`'s `estimated_remaining_seconds` counted idle time as
+  work. It measured wall-clock since the backfill was *first* started, so a
+  paused or restarted job extrapolated the downtime — pausing 48 hours at 10%
+  projected 20 days against ~54 hours of real work left. All three backfills
+  (address, filter, silent payments) now measure the rate over the span the
+  runner has actually been walking, and report `0` (no estimate) for the first
+  few seconds after a start, resume, or restart.
 - **P2P hardening:** the block-ingress mutation gate now ports Core's
   `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated
   block (same hash, same merkle root) is rejected at ingress instead of one

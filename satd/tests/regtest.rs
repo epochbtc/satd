@@ -5367,11 +5367,25 @@ fn test_sp_index_backfill_pause_resume() {
         pause_resp
     );
 
+    // Wait for the runner to observe the flag so the assertions below see a
+    // settled `paused` cursor rather than the ≤500ms window where the RPC
+    // has returned but the runner is still between batches.
+    poll_sp_backfill_state(&node, &["paused"], Duration::from_secs(10));
+
     let mid = node.rpc_call("getindexinfo").expect("rpc");
     assert_eq!(
         mid["result"]["silentpayments"]["backfill"]["active"].as_bool(),
         Some(true),
         "{}",
+        mid
+    );
+    // A paused backfill makes no progress, so it has no ETA. Reporting one
+    // here is what let a stalled cursor serve a confidently wrong number
+    // that grew for as long as the node stayed up (#532/#546).
+    assert_eq!(
+        mid["result"]["silentpayments"]["backfill"]["estimated_remaining_seconds"].as_u64(),
+        Some(0),
+        "paused backfill must not report an ETA: {}",
         mid
     );
 

@@ -22,6 +22,7 @@ use std::sync::{
 
 use node_filter_index::cursor::{BackfillCursor, BackfillState};
 
+use crate::index::stint::{StintGuard, StintMeter};
 use crate::storage::{FilterBackfillCursorWrite, Store, StoreBatch, StoreError, WriteMode};
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +72,11 @@ struct BackfillInner {
     cursor: Mutex<BackfillCursor>,
     paused: AtomicBool,
     cancelled: AtomicBool,
+    /// Rate meter for `estimated_remaining_seconds`. In-memory only, and
+    /// anchored by the runner rather than by `start()`, so idle time
+    /// (paused, or the daemon simply not running) is never extrapolated
+    /// as work — see `crate::index::stint` and #546.
+    stint: Arc<StintMeter>,
 }
 
 impl BackfillHandle {
@@ -83,8 +89,34 @@ impl BackfillHandle {
                 cursor: Mutex::new(initial),
                 paused: AtomicBool::new(paused_initial),
                 cancelled: AtomicBool::new(false),
+                stint: Arc::new(StintMeter::new()),
             }),
         }
+    }
+
+    /// Anchor a working stint at `ratio_now`. The returned guard clears
+    /// the anchor on drop, so no runner exit path — including an
+    /// unwinding panic — can leave the meter aging while nothing walks.
+    pub fn begin_stint(&self, ratio_now: f64) -> StintGuard {
+        StintGuard::new(self.inner.stint.clone(), ratio_now)
+    }
+
+    /// Re-anchor after a pause. Discards the pre-pause stint so the
+    /// paused span is not counted as working time.
+    pub fn reanchor_stint(&self, ratio_now: f64) {
+        self.inner.stint.begin(ratio_now);
+    }
+
+    /// Stop the clock while paused. Idempotent.
+    pub fn end_stint(&self) {
+        self.inner.stint.end();
+    }
+
+    /// Seconds of work remaining at the rate measured over the current
+    /// stint; `None` when no runner is walking or the stint is too young
+    /// to have measured anything.
+    pub fn estimated_remaining_secs(&self, ratio_now: f64) -> Option<u64> {
+        self.inner.stint.estimate_remaining_secs(ratio_now)
     }
 
     pub fn cursor(&self) -> BackfillCursor {
@@ -302,6 +334,7 @@ pub fn render_status(
     // shape as address-index status reporting.
     let bf_quiet = matches!(cursor.state, BackfillState::Idle | BackfillState::Completed);
     let synced = filter_enabled && filter_complete && bf_quiet;
+    let progress_ratio = cursor.progress_ratio();
     StatusReport {
         synced,
         enabled: filter_enabled,
@@ -309,8 +342,31 @@ pub fn render_status(
         cursor_height: cursor.cursor_height,
         snapshot_height: cursor.snapshot_height,
         started_at_unix: cursor.started_at_unix,
-        progress_ratio: cursor.progress_ratio(),
+        progress_ratio,
+        estimated_remaining_seconds: estimate_remaining_seconds(
+            handle,
+            filter_enabled,
+            &cursor,
+            progress_ratio,
+        ),
     }
+}
+
+/// ETA for the `getindexinfo` sibling, in seconds; 0 means "no estimate".
+/// Same two gates as the silent-payment estimator — see
+/// `crate::index::silent_payments::backfill::estimate_remaining_seconds`.
+fn estimate_remaining_seconds(
+    handle: Option<&BackfillHandle>,
+    filter_enabled: bool,
+    cursor: &BackfillCursor,
+    progress_ratio: f64,
+) -> u64 {
+    if !filter_enabled || cursor.state != BackfillState::Running {
+        return 0;
+    }
+    handle
+        .and_then(|h| h.estimated_remaining_secs(progress_ratio))
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -320,8 +376,14 @@ pub struct StatusReport {
     pub state: String,
     pub cursor_height: u32,
     pub snapshot_height: u32,
+    /// When the backfill was *first* started, carried forward across
+    /// pause/resume/restart. Reported for operator context only — the ETA
+    /// deliberately does not derive from it (#546).
     pub started_at_unix: u64,
     pub progress_ratio: f64,
+    /// Seconds of work remaining at the rate measured over the runner's
+    /// current stint; 0 when no estimate can be justified.
+    pub estimated_remaining_seconds: u64,
 }
 
 #[cfg(test)]

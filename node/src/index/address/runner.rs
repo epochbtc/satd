@@ -105,6 +105,12 @@ pub struct BackfillRunner {
 }
 
 impl BackfillRunner {
+    /// Current progress over the two-pass walk, as the ETA's rate meter
+    /// measures it.
+    fn progress_ratio(&self) -> f64 {
+        self.handle.cursor().progress_ratio()
+    }
+
     /// Run to completion (or pause/cancel/shutdown). Synchronous;
     /// callers should `tokio::task::spawn_blocking` this.
     ///
@@ -147,6 +153,11 @@ impl BackfillRunner {
         // A reorg that invalidated the anchor between RPC dispatch and
         // runner start surfaces as ReorgInvalidated → Failed.
         let snapshot = self.acquire_snapshot()?;
+
+        // Anchor the ETA's rate meter here — the moment this process
+        // starts walking — rather than at `start()` time. Held across
+        // both passes so every exit path clears it (#546).
+        let _stint = self.handle.begin_stint(self.progress_ratio());
 
         // Pass 1: funding rows + temp CF. Resume from cursor_height
         // when picking up after pause/crash.
@@ -660,9 +671,17 @@ impl BackfillRunner {
                 // `resumeindex` mid-pause.
                 if self.handle.cursor().state == BackfillState::Paused {
                     let _ = self.handle.mark_running(self.chain.store_ref().as_ref());
+                    // Back to work: re-anchor so the paused span is not
+                    // extrapolated as working time (#546).
+                    self.handle.reanchor_stint(self.progress_ratio());
                 }
                 return Ok(());
             }
+            // Stop the ETA's clock for as long as the pause lasts. Called
+            // unconditionally (and idempotent) because a runner spawned
+            // against an already-`Paused` cursor never takes the
+            // Running→Paused transition below.
+            self.handle.end_stint();
             // First entry into pause: persist Paused so a restart
             // during a paused run stays paused.
             if self.handle.cursor().state == BackfillState::Running {

@@ -31,6 +31,7 @@ use std::sync::{
 };
 
 use crate::index::address::cursor::{BackfillCursor, BackfillState};
+use crate::index::stint::{StintGuard, StintMeter};
 use crate::storage::{BackfillCursorWrite, Store, StoreBatch, StoreError, WriteMode};
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +76,11 @@ struct BackfillInner {
     paused: AtomicBool,
     /// Operator-set cancel request. The task checks it on each batch.
     cancelled: AtomicBool,
+    /// Rate meter for `estimated_remaining_seconds`. In-memory only, and
+    /// anchored by the runner rather than by `start()`, so idle time
+    /// (paused, or the daemon simply not running) is never extrapolated
+    /// as work — see `crate::index::stint` and #546.
+    stint: Arc<StintMeter>,
 }
 
 impl BackfillHandle {
@@ -90,8 +96,34 @@ impl BackfillHandle {
                 cursor: Mutex::new(initial),
                 paused: AtomicBool::new(paused_initial),
                 cancelled: AtomicBool::new(false),
+                stint: Arc::new(StintMeter::new()),
             }),
         }
+    }
+
+    /// Anchor a working stint at `ratio_now`. The returned guard clears
+    /// the anchor on drop, so no runner exit path — including an
+    /// unwinding panic — can leave the meter aging while nothing walks.
+    pub fn begin_stint(&self, ratio_now: f64) -> StintGuard {
+        StintGuard::new(self.inner.stint.clone(), ratio_now)
+    }
+
+    /// Re-anchor after a pause. Discards the pre-pause stint so the
+    /// paused span is not counted as working time.
+    pub fn reanchor_stint(&self, ratio_now: f64) {
+        self.inner.stint.begin(ratio_now);
+    }
+
+    /// Stop the clock while paused. Idempotent.
+    pub fn end_stint(&self) {
+        self.inner.stint.end();
+    }
+
+    /// Seconds of work remaining at the rate measured over the current
+    /// stint; `None` when no runner is walking or the stint is too young
+    /// to have measured anything.
+    pub fn estimated_remaining_secs(&self, ratio_now: f64) -> Option<u64> {
+        self.inner.stint.estimate_remaining_secs(ratio_now)
     }
 
     /// Snapshot the in-memory cursor for `getindexinfo`. Cheap;
@@ -400,6 +432,7 @@ pub fn render_status(handle: Option<&BackfillHandle>, address_enabled: bool) -> 
         cursor.state,
         BackfillState::Idle | BackfillState::Completed
     ) && address_enabled;
+    let progress_ratio = cursor.progress_ratio();
     StatusReport {
         synced,
         enabled: address_enabled,
@@ -408,8 +441,35 @@ pub fn render_status(handle: Option<&BackfillHandle>, address_enabled: bool) -> 
         cursor_height: cursor.cursor_height,
         snapshot_height: cursor.snapshot_height,
         started_at_unix: cursor.started_at_unix,
-        progress_ratio: cursor.progress_ratio(),
+        progress_ratio,
+        estimated_remaining_seconds: estimate_remaining_seconds(
+            handle,
+            address_enabled,
+            &cursor,
+            progress_ratio,
+        ),
     }
+}
+
+/// ETA for the `getindexinfo` sibling, in seconds; 0 means "no estimate".
+/// Same two gates as the silent-payment estimator — see
+/// `crate::index::silent_payments::backfill::estimate_remaining_seconds`.
+///
+/// The two-pass ratio is monotone across the pass boundary (pass 2 counts
+/// from `snapshot_height`), so a stint that spans it measures the same way
+/// as one inside a single pass.
+fn estimate_remaining_seconds(
+    handle: Option<&BackfillHandle>,
+    address_enabled: bool,
+    cursor: &BackfillCursor,
+    progress_ratio: f64,
+) -> u64 {
+    if !address_enabled || cursor.state != BackfillState::Running {
+        return 0;
+    }
+    handle
+        .and_then(|h| h.estimated_remaining_secs(progress_ratio))
+        .unwrap_or(0)
 }
 
 /// Serializable shape returned by `getindexinfo` under the `address`
@@ -424,8 +484,14 @@ pub struct StatusReport {
     pub pass: u8,
     pub cursor_height: u32,
     pub snapshot_height: u32,
+    /// When the backfill was *first* started, carried forward across
+    /// pause/resume/restart. Reported for operator context only — the ETA
+    /// deliberately does not derive from it (#546).
     pub started_at_unix: u64,
     pub progress_ratio: f64,
+    /// Seconds of work remaining at the rate measured over the runner's
+    /// current stint; 0 when no estimate can be justified.
+    pub estimated_remaining_seconds: u64,
 }
 
 #[cfg(test)]

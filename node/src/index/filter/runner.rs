@@ -96,6 +96,12 @@ pub struct BackfillRunner {
 }
 
 impl BackfillRunner {
+    /// Current progress over the walked span, as the ETA's rate meter
+    /// measures it.
+    fn progress_ratio(&self) -> f64 {
+        self.handle.cursor().progress_ratio()
+    }
+
     /// Run to completion (or pause/cancel/shutdown). Synchronous;
     /// callers should `tokio::task::spawn_blocking` this.
     pub fn run(self) -> Result<(), BackfillError> {
@@ -119,6 +125,10 @@ impl BackfillRunner {
 
         let snapshot = self.acquire_snapshot()?;
         let cur = self.handle.cursor();
+        // Anchor the ETA's rate meter here — the moment this process
+        // starts walking — rather than at `start()` time. Held across the
+        // whole walk so every exit path clears it (#546).
+        let _stint = self.handle.begin_stint(self.progress_ratio());
         self.run_pass(&snapshot, cur.cursor_height)?;
 
         // Tail catch-up: while the runner was filling 0..=snapshot_height
@@ -584,9 +594,17 @@ impl BackfillRunner {
             if !self.handle.is_paused() {
                 if self.handle.cursor().state == BackfillState::Paused {
                     let _ = self.handle.mark_running(self.chain.store_ref().as_ref());
+                    // Back to work: re-anchor so the paused span is not
+                    // extrapolated as working time (#546).
+                    self.handle.reanchor_stint(self.progress_ratio());
                 }
                 return Ok(());
             }
+            // Stop the ETA's clock for as long as the pause lasts. Called
+            // unconditionally (and idempotent) because a runner spawned
+            // against an already-`Paused` cursor never takes the
+            // Running→Paused transition below.
+            self.handle.end_stint();
             if self.handle.cursor().state == BackfillState::Running {
                 let _ = self.handle.mark_paused(self.chain.store_ref().as_ref());
             }
