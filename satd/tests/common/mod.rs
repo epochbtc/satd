@@ -122,6 +122,73 @@ pub fn prepare_empty_dir(dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(dir);
 }
 
+/// The port from an `--esplorabind=host:port` / `--esploratlsbind=host:port`
+/// argument, when that port is one this harness can usefully wait on.
+///
+/// Three cases return `None`, and each of them is a test that would otherwise
+/// hang to the startup deadline and fail:
+///
+/// - **`--esplora=0`** — disabled outright.
+/// - **`--esplora=1 --addressindex=0`** — satd boots but skips the Esplora
+///   bind, since Esplora reads through the address index. Two tests pass a bind
+///   argument in exactly these shapes *precisely* to assert nothing listens on
+///   it.
+/// - **Port `0`** — an ephemeral bind, where the kernel picks the port and only
+///   the node knows it. `connect()` to port 0 returns `ECONNREFUSED` forever,
+///   so waiting on it can never succeed. The E2E suite binds this way and
+///   already solves the readiness problem correctly, by polling
+///   `getserverstatus` until the listener reports a non-zero port
+///   (`E2eNode::boot_with`) — that poll is the readiness signal here, and this
+///   wait exists to give the *regtest* tests, which bind a fixed port and had
+///   no such poll, the same guarantee.
+pub fn requested_esplora_port(extra_args: &[&str]) -> Option<u16> {
+    let disabled = extra_args
+        .iter()
+        .any(|a| *a == "--esplora=0" || *a == "--addressindex=0");
+    if disabled {
+        return None;
+    }
+    extra_args
+        .iter()
+        .find_map(|a| {
+            a.strip_prefix("--esplorabind=")
+                .or_else(|| a.strip_prefix("--esploratlsbind="))
+        })
+        .and_then(|hostport| hostport.rsplit_once(':'))
+        .and_then(|(_, port)| port.parse().ok())
+        .filter(|port| *port != 0)
+}
+
+/// Block until the Esplora listener accepts a connection.
+///
+/// The startup readiness probe above waits for the *JSON-RPC* listener, but
+/// satd binds Esplora several hundred lines later in startup. A test that
+/// requested an Esplora bind and issued its first request as soon as `start`
+/// returned was racing that bind, and lost often enough to matter: the failure
+/// is a bare `Connection refused` on the Esplora port, landing on a different
+/// test each run because it depends only on machine timing. Waiting here fixes
+/// every Esplora test at once, rather than each one growing its own poll loop.
+///
+/// A plain TCP connect is the right probe: it is what "the listener is bound"
+/// means, and it works for the TLS bind too, where an HTTP GET would not.
+fn wait_for_requested_esplora(extra_args: &[&str], deadline: Instant) -> Result<(), String> {
+    let Some(port) = requested_esplora_port(extra_args) else {
+        return Ok(());
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "esplora listener on port {port} never accepted a connection"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub struct TestNode {
     pub process: Child,
     pub datadir: PathBuf,
@@ -357,6 +424,17 @@ impl TestNode {
         // with (empty for the userpass path, which doesn't use a cookie).
         let cookie = captured_cookie;
 
+        if let Err(reason) = wait_for_requested_esplora(extra_args, deadline) {
+            // Same contract as the two failure paths above: kill and reap the
+            // process, then remove the datadir, since no `TestNode` (and so no
+            // `Drop`) will exist to do it.
+            let _ = process.kill();
+            let _ = process.wait();
+            let reason = format!("{reason}{}", read_stderr_tail(&stderr_log));
+            let _ = std::fs::remove_dir_all(&datadir);
+            return Err(reason);
+        }
+
         Ok(TestNode {
             process,
             datadir,
@@ -455,6 +533,12 @@ impl TestNode {
         }
 
         let cookie = std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file");
+
+        // Same Esplora-bind race as the cold-start path; this one panics rather
+        // than returning Err because it has no retry above it.
+        if let Err(reason) = wait_for_requested_esplora(extra_args, deadline) {
+            panic!("{reason}");
+        }
 
         TestNode {
             process,
@@ -582,6 +666,34 @@ impl TestNode {
             .expect("Failed to send request");
 
         response.status().as_u16()
+    }
+
+    /// Mine `count` blocks to `addr`, in chunks small enough that no single
+    /// `generatetoaddress` call can outrun the harness's per-request timeout.
+    ///
+    /// `rpc_call_with_params` uses a fixed 10s `reqwest` timeout, deliberately
+    /// *not* scaled by `SATD_TEST_TIMEOUT_MULT` — a long per-request timeout
+    /// masks bugs, per the note on [`test_timeout`]. That is right for the
+    /// requests it was written for, but a bulk mine is not one of them: the
+    /// filter-index tests mine 1000–2010 blocks in a single call, and under a
+    /// loaded full-suite run that exceeds 10s and fails the test on timing
+    /// alone. `test_p2p_getcfheaders_accepts_2000_headers` was observed doing
+    /// exactly that on two unrelated branches while passing in isolation.
+    ///
+    /// Chunking keeps every individual request well inside the timeout without
+    /// weakening it for anything else.
+    pub fn mine_blocks(&mut self, count: u64, addr: &str) {
+        const CHUNK: u64 = 250;
+        let mut left = count;
+        while left > 0 {
+            let n = left.min(CHUNK);
+            self.rpc_call_with_params(
+                "generatetoaddress",
+                vec![serde_json::json!(n), serde_json::json!(addr)],
+            )
+            .expect("generatetoaddress");
+            left -= n;
+        }
     }
 
     pub fn stop(&mut self) {

@@ -56,6 +56,48 @@ fn test_fresh_test_datadir_wipes_a_reused_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `TestNode` waits for the Esplora listener to accept a connection, because
+/// satd binds it hundreds of lines after the JSON-RPC listener that `start`
+/// waits on. Which arguments that wait applies to is the whole correctness
+/// question: a wait on a port that will never accept blocks to the startup
+/// deadline and fails, which is strictly worse than the race it replaces.
+#[test]
+fn test_requested_esplora_port_only_waits_on_a_port_that_can_accept() {
+    use common::requested_esplora_port;
+
+    // A concrete bind is the case the wait exists for.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--esplorabind=127.0.0.1:3002"]),
+        Some(3002)
+    );
+    // The TLS bind counts too — a TCP connect probes it just as well.
+    assert_eq!(
+        requested_esplora_port(&["--esploratlsbind=127.0.0.1:3003"]),
+        Some(3003)
+    );
+    // No Esplora requested at all.
+    assert_eq!(requested_esplora_port(&["--txindex"]), None);
+
+    // Disabled outright: nothing will ever listen.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=0", "--esplorabind=127.0.0.1:3002"]),
+        None
+    );
+    // Enabled, but satd skips the bind because Esplora reads through the
+    // address index.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--addressindex=0", "--esplorabind=127.0.0.1:3002"]),
+        None
+    );
+    // Ephemeral bind: the kernel picks the port, so connecting to 0 refuses
+    // forever. The E2E suite binds this way and discovers the real port from
+    // `getserverstatus`, which is its own readiness signal.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--esplorabind=127.0.0.1:0"]),
+        None
+    );
+}
+
 #[test]
 fn test_regtest_getblockchaininfo() {
     let mut node = TestNode::start(&[]);
@@ -10095,11 +10137,7 @@ fn test_p2p_getcfcheckpt_thousand_block_intervals() {
     // Mine just enough to get a single 1000-boundary checkpoint.
     // Mining 1500 regtest blocks via generatetoaddress is cheap.
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_call_with_params(
-        "generatetoaddress",
-        vec![serde_json::json!(1500), serde_json::json!(addr)],
-    )
-    .expect("rpc");
+    node.mine_blocks(1500, addr);
 
     let bci = node.rpc_call("getblockchaininfo").expect("rpc");
     let stop_hex = bci["result"]["bestblockhash"]
@@ -10263,11 +10301,7 @@ fn test_p2p_getcfilters_max_size_response_not_truncated() {
         ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_call_with_params(
-        "generatetoaddress",
-        vec![serde_json::json!(1000), serde_json::json!(addr)],
-    )
-    .expect("rpc");
+    node.mine_blocks(1000, addr);
 
     let bci = node.rpc_call("getblockchaininfo").expect("rpc");
     let stop_hex = bci["result"]["bestblockhash"]
@@ -10323,11 +10357,7 @@ fn test_p2p_getcfheaders_accepts_2000_headers() {
         ],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_call_with_params(
-        "generatetoaddress",
-        vec![serde_json::json!(2010), serde_json::json!(addr)],
-    )
-    .expect("rpc");
+    node.mine_blocks(2010, addr);
 
     let bci = node.rpc_call("getblockchaininfo").expect("rpc");
     let tip_hex = bci["result"]["bestblockhash"]
@@ -10416,11 +10446,7 @@ fn test_p2p_silent_drop_oversized_range() {
     );
     // Need >=1000 blocks so we can form a >1000-range request.
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    node.rpc_call_with_params(
-        "generatetoaddress",
-        vec![serde_json::json!(1100), serde_json::json!(addr)],
-    )
-    .expect("rpc");
+    node.mine_blocks(1100, addr);
 
     let bci = node.rpc_call("getblockchaininfo").expect("rpc");
     let stop_hex = bci["result"]["bestblockhash"]
