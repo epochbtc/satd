@@ -96,6 +96,22 @@ fn test_requested_esplora_port_only_waits_on_a_port_that_can_accept() {
         requested_esplora_port(&["--esplora=1", "--esplorabind=127.0.0.1:0"]),
         None
     );
+    // The wildcard is reachable over loopback, so it is probed.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--esplorabind=0.0.0.0:3004"]),
+        Some(3004)
+    );
+    // A host the loopback probe cannot stand in for. Taking the port alone
+    // here would wait out the whole startup deadline against a listener that
+    // is up and healthy — worse than not waiting at all.
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--esplorabind=[::1]:3005"]),
+        None
+    );
+    assert_eq!(
+        requested_esplora_port(&["--esplora=1", "--esplorabind=192.0.2.10:3006"]),
+        None
+    );
 }
 
 #[test]
@@ -3135,7 +3151,14 @@ fn test_clean_shutdown_marker_after_kill() {
         // Kill hard — skip the RPC stop path entirely.
         let _ = node.process.kill();
         let _ = node.process.wait();
-        // Don't call node.stop(); Drop will just try kill again (no-op).
+        // `TestNode::drop` would *delete the datadir*, not merely re-kill, and
+        // this test's whole subject is what the datadir contains afterwards.
+        // Letting it run made both assertions below vacuous: the marker was
+        // absent because `regtest/` was gone, and the "restart" was a cold
+        // start on a missing directory, so `last_shutdown == "dirty"` held by
+        // construction. A bug that wrote the marker unconditionally on SIGKILL
+        // — the exact regression this guards — would have passed.
+        std::mem::forget(node);
     }
 
     let marker = datadir.join("regtest").join(".clean_shutdown");
@@ -6451,6 +6474,10 @@ fn test_esplora_missing_cookie_file_fails_startup() {
         .expect("spawn satd");
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // No `TestNode` here, so no `Drop` to clean up. Removed before the
+    // assertions so a failure does not also leak the directory; the
+    // process is already gone by this point (#550).
+    let _ = std::fs::remove_dir_all(&datadir);
     assert!(
         stderr.contains("esplora startup failed") || stderr.contains("auth init failed"),
         "expected esplora auth failure in stderr; got: {stderr}"
@@ -6485,6 +6512,10 @@ fn test_esplora_port_conflict_fails_startup() {
     drop(squatter);
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // No `TestNode` here, so no `Drop` to clean up. Removed before the
+    // assertions so a failure does not also leak the directory; the
+    // process is already gone by this point (#550).
+    let _ = std::fs::remove_dir_all(&datadir);
     assert!(
         stderr.contains("could not bind"),
         "expected bind failure in stderr; got: {stderr}"
@@ -7041,6 +7072,10 @@ fn test_esplora_default_startup_auto_enables_txindex() {
     }
     let _ = child.kill();
     let _ = child.wait();
+    // No `TestNode` here, so no `Drop` to clean up. Removed before the
+    // assertions so a failure does not also leak the directory; the
+    // process is already gone by this point (#550).
+    let _ = std::fs::remove_dir_all(&datadir);
     assert!(
         ready,
         "esplora listener didn't come up under default startup"
@@ -7301,6 +7336,10 @@ fn test_esplora_cli_txindex_overrides_config_disable() {
     }
     let _ = child.kill();
     let _ = child.wait();
+    // No `TestNode` here, so no `Drop` to clean up. Removed before the
+    // assertions so a failure does not also leak the directory; the
+    // process is already gone by this point (#550).
+    let _ = std::fs::remove_dir_all(&datadir);
     assert!(
         ready,
         "esplora listener didn't come up; CLI --txindex must override config txindex=0"
@@ -7334,6 +7373,10 @@ fn test_esplora_with_explicit_txindex_disabled_fails_startup() {
         .expect("spawn satd");
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // No `TestNode` here, so no `Drop` to clean up. Removed before the
+    // assertions so a failure does not also leak the directory; the
+    // process is already gone by this point (#550).
+    let _ = std::fs::remove_dir_all(&datadir);
     assert!(
         stderr.contains("txindex=0"),
         "expected explicit-disable diag in stderr; got: {stderr}"
@@ -9808,9 +9851,33 @@ mod cf_client {
             let mut saw_version = false;
             let mut saw_verack = false;
             while !(saw_version && saw_verack) {
-                if Instant::now() >= deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     panic!("handshake timeout waiting for peer version+verack");
                 }
+                // One read timeout covering the whole remaining deadline,
+                // rather than the connect-time 5s with `WouldBlock => continue`.
+                //
+                // That pairing was a stream-corrupting bug, for the same reason
+                // `recv_cfilters` documents: `recv_msg` does `read_exact(header)`
+                // then `read_exact(payload)`, and a timeout firing *between* them
+                // has already consumed the header irrecoverably. Continuing then
+                // resumes mid-message and every subsequent frame misparses, so
+                // the client never sees the reply it is waiting for — it fails
+                // far away, at the `.expect` on that reply, looking like the node
+                // did not respond.
+                //
+                // It needs a slow node and a partially-arrived message to line
+                // up, which is exactly what mining 2000+ blocks before a
+                // getcfheaders exchange arranges: the node floods inv/headers
+                // right after verack. Suspected cause of the intermittent
+                // `test_p2p_getcfheaders_accepts_2000_headers` failures.
+                //
+                // With the timeout set to the deadline, a `WouldBlock` *is* the
+                // deadline, so there is nothing to continue for.
+                self.stream
+                    .set_read_timeout(Some(remaining.max(Duration::from_millis(100))))
+                    .unwrap();
                 match recv_msg(&mut self.stream) {
                     Ok(NetworkMessage::Version(v)) => {
                         self.peer_services = v.services;
@@ -9818,8 +9885,7 @@ mod cf_client {
                     }
                     Ok(NetworkMessage::Verack) => saw_verack = true,
                     Ok(_) => continue,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(e) => panic!("handshake recv failed: {}", e),
+                    Err(e) => panic!("handshake recv failed: {e}"),
                 }
             }
             self.send_msg(NetworkMessage::Verack);
