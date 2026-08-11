@@ -73,6 +73,150 @@ pub fn e2e_test_timeout(secs: u64) -> Duration {
     Duration::from_secs_f64(secs as f64 * e2e)
 }
 
+/// Allocate a directory under the temp dir for one test, and guarantee it is
+/// empty. Use this for every datadir a test starts a node on — the *only*
+/// paths that should be built by hand are the second and later uses of a
+/// directory a restart test is deliberately reusing.
+///
+/// Test directories used to be named after something stable across runs —
+/// usually the RPC port, sometimes the pid — and were not reliably removed. An
+/// RPC port is drawn by binding an ephemeral socket and releasing it, so the
+/// same port, and therefore the same directory, is redrawn regularly; pids get
+/// recycled the same way. Removal was not guaranteed either: a `SIGKILL`ed
+/// test binary never runs `Drop`, and until this change the spawn-retry path
+/// leaked one directory per failed attempt.
+///
+/// So a test could start on top of an earlier run's chainstate.
+/// `test_getchaintips_fields` was seen asserting a fresh node's tip is at
+/// height 0 against the 101-block chain another test had mined into that
+/// directory (#550). That is worse than an ordinary flake: a test can pass
+/// against the wrong state as easily as it can fail, so it erodes the signal
+/// in both directions. One site had already been patched in place with a
+/// wipe-before-create and a comment about the CI runner persisting `/tmp`;
+/// this generalises that fix.
+///
+/// Two independent guarantees, because neither alone is sufficient:
+///
+/// - **Unique per call.** The pid separates test binaries, which cargo runs
+///   in parallel and which all draw ports from the same ephemeral range; the
+///   counter separates calls within one binary, including two tests that pass
+///   the same tag. A leaked directory now belongs to a pid that is not
+///   running, so it is inert rather than poisonous.
+/// - **Empty on arrival.** Pid recycling means the name alone is not proof of
+///   freshness. Removing first makes the starting state deterministic whatever
+///   the name collided with.
+pub fn fresh_test_datadir(tag: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("{}-{}-{}", tag, std::process::id(), seq));
+    prepare_empty_dir(&dir);
+    dir
+}
+
+/// Remove `dir` and recreate it empty. Split out of `fresh_test_datadir` so
+/// the wipe half of its contract can be tested against a directory that
+/// actually has something in it — the name half is unique by construction, so
+/// a test driving only the entry point would never exercise this.
+pub fn prepare_empty_dir(dir: &std::path::Path) {
+    // The remove is best-effort — "it was not there" is the expected case.
+    // The create is not: if a plain file sits at the path (a stray leftover,
+    // or a collision against something that is not a directory) both calls
+    // fail and satd is then started against a path that is a file, which
+    // surfaces as an unrelated-looking error hundreds of lines away.
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)
+        .unwrap_or_else(|e| panic!("could not create test datadir {}: {e}", dir.display()));
+}
+
+/// The port from an `--esplorabind=host:port` / `--esploratlsbind=host:port`
+/// argument, when that port is one this harness can usefully wait on.
+///
+/// Three cases return `None`, and each of them is a test that would otherwise
+/// hang to the startup deadline and fail:
+///
+/// - **`--esplora=0`** — disabled outright.
+/// - **`--esplora=1 --addressindex=0`** — satd boots but skips the Esplora
+///   bind, since Esplora reads through the address index. Two tests pass a bind
+///   argument in exactly these shapes *precisely* to assert nothing listens on
+///   it.
+/// - **Port `0`** — an ephemeral bind, where the kernel picks the port and only
+///   the node knows it. `connect()` to port 0 returns `ECONNREFUSED` forever,
+///   so waiting on it can never succeed. The E2E suite binds this way and
+///   already solves the readiness problem correctly, by polling
+///   `getserverstatus` until the listener reports a non-zero port
+///   (`E2eNode::boot_with`) — that poll is the readiness signal here, and this
+///   wait exists to give the *regtest* tests, which bind a fixed port and had
+///   no such poll, the same guarantee.
+/// - **A host this harness cannot probe.** The port alone is not enough: the
+///   probe goes to loopback, so reading `[::1]:8080` as "port 8080" would wait
+///   out the full deadline against a listener that is up and healthy. Only
+///   loopback and the wildcard (which loopback reaches) are accepted;
+///   everything else is left alone.
+pub fn requested_esplora_port(extra_args: &[&str]) -> Option<u16> {
+    let disabled = extra_args
+        .iter()
+        .any(|a| *a == "--esplora=0" || *a == "--addressindex=0");
+    if disabled {
+        return None;
+    }
+    extra_args
+        .iter()
+        .find_map(|a| {
+            a.strip_prefix("--esplorabind=")
+                .or_else(|| a.strip_prefix("--esploratlsbind="))
+        })
+        .and_then(|hostport| hostport.rsplit_once(':'))
+        .filter(|(host, _)| matches!(*host, "127.0.0.1" | "localhost" | "0.0.0.0"))
+        .and_then(|(_, port)| port.parse().ok())
+        .filter(|port| *port != 0)
+}
+
+/// Block until the Esplora listener accepts a connection.
+///
+/// The startup readiness probe above waits for the *JSON-RPC* listener, but
+/// satd binds Esplora several hundred lines later in startup. A test that
+/// requested an Esplora bind and issued its first request as soon as `start`
+/// returned was racing that bind, and lost often enough to matter: the failure
+/// is a bare `Connection refused` on the Esplora port, landing on a different
+/// test each run because it depends only on machine timing. Waiting here fixes
+/// every Esplora test at once, rather than each one growing its own poll loop.
+///
+/// A plain TCP connect is the right probe: it is what "the listener is bound"
+/// means, and it works for the TLS bind too, where an HTTP GET would not.
+/// `process` is polled so a node that has already exited fails immediately
+/// rather than spinning against a corpse until the deadline. That case is
+/// real: the Esplora port comes from `find_available_port`, which binds and
+/// releases, so a parallel test can take it in the gap; satd then reports RPC
+/// ready and exits later at the Esplora bind. Without the poll, a race that
+/// used to fail in about a second instead burns the whole startup deadline —
+/// three times over, inside the retry loop above it.
+fn wait_for_requested_esplora(
+    process: &mut Child,
+    extra_args: &[&str],
+    deadline: Instant,
+) -> Result<(), String> {
+    let Some(port) = requested_esplora_port(extra_args) else {
+        return Ok(());
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = process.try_wait() {
+            return Err(format!(
+                "satd exited with {status} before binding the esplora listener on port {port}"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "esplora listener on port {port} never accepted a connection"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub struct TestNode {
     pub process: Child,
     pub datadir: PathBuf,
@@ -147,8 +291,9 @@ impl TestNode {
         capture_stderr: bool,
     ) -> Result<Self, String> {
         let rpcport = find_available_port();
-        let datadir = std::env::temp_dir().join(format!("satd-test-{}", rpcport));
-        let _ = std::fs::create_dir_all(&datadir);
+        // The port stays in the tag so a leftover directory can still be
+        // matched to the port in a captured log.
+        let datadir = fresh_test_datadir(&format!("satd-test-{rpcport}"));
 
         let satd_bin = env!("CARGO_BIN_EXE_satd");
 
@@ -235,10 +380,16 @@ impl TestNode {
             // Fail fast if satd already exited — no point polling a corpse until
             // the deadline. `try_wait` reaps the child when it reports `Some`.
             if let Ok(Some(status)) = process.try_wait() {
-                return Err(format!(
+                let reason = format!(
                     "satd (port {rpcport}) exited with {status} before its RPC came up{}",
                     read_stderr_tail(&stderr_log)
-                ));
+                );
+                // No `TestNode` is constructed on this path, so nothing will
+                // ever run `Drop` for this datadir. Remove it here — after the
+                // stderr tail has been read out of it — or every failed
+                // attempt leaves one behind (#550).
+                let _ = std::fs::remove_dir_all(&datadir);
+                return Err(reason);
             }
             let rpc_ready = if uses_userpass {
                 let client = reqwest::blocking::Client::builder()
@@ -285,10 +436,14 @@ impl TestNode {
                 // Kill and reap the hung process so it can't leak across a retry.
                 let _ = process.kill();
                 let _ = process.wait();
-                return Err(format!(
+                let reason = format!(
                     "satd (port {rpcport}) did not answer RPC within the startup deadline{}",
                     read_stderr_tail(&stderr_log)
-                ));
+                );
+                // Same as the early-exit path above: no `TestNode`, so no
+                // `Drop` to clean this up (#550).
+                let _ = std::fs::remove_dir_all(&datadir);
+                return Err(reason);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -296,6 +451,17 @@ impl TestNode {
         // `captured_cookie` is the value the readiness probe authenticated
         // with (empty for the userpass path, which doesn't use a cookie).
         let cookie = captured_cookie;
+
+        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline) {
+            // Same contract as the two failure paths above: kill and reap the
+            // process, then remove the datadir, since no `TestNode` (and so no
+            // `Drop`) will exist to do it.
+            let _ = process.kill();
+            let _ = process.wait();
+            let reason = format!("{reason}{}", read_stderr_tail(&stderr_log));
+            let _ = std::fs::remove_dir_all(&datadir);
+            return Err(reason);
+        }
 
         Ok(TestNode {
             process,
@@ -360,7 +526,7 @@ impl TestNode {
             }
             None => (std::process::Stdio::null(), PathBuf::new()),
         };
-        let process = cmd
+        let mut process = cmd
             .stdout(std::process::Stdio::null())
             .stderr(stderr_target)
             .spawn()
@@ -395,6 +561,18 @@ impl TestNode {
         }
 
         let cookie = std::fs::read_to_string(&cookie_path).expect("Failed to read cookie file");
+
+        // Same Esplora-bind race as the cold-start path; this one panics rather
+        // than returning Err because it has no retry above it. Kill and reap
+        // first: `Child::drop` does not kill, so unwinding past a live handle
+        // orphans a satd that goes on holding the RPC port, the P2P port and
+        // the datadir lock for the rest of the test binary's run — which then
+        // fails whichever later tests draw those ports.
+        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline) {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("{reason}{}", read_stderr_tail(&stderr_log));
+        }
 
         TestNode {
             process,
@@ -522,6 +700,57 @@ impl TestNode {
             .expect("Failed to send request");
 
         response.status().as_u16()
+    }
+
+    /// Mine `count` blocks to `addr`, in chunks small enough that no single
+    /// `generatetoaddress` call can outrun the harness's per-request timeout.
+    ///
+    /// `rpc_call_with_params` uses a fixed 10s `reqwest` timeout, deliberately
+    /// *not* scaled by `SATD_TEST_TIMEOUT_MULT` — a long per-request timeout
+    /// masks bugs, per the note on [`test_timeout`]. That is right for the
+    /// requests it was written for, but a bulk mine is not one of them: the
+    /// filter-index tests mine 1000–2010 blocks in a single call. The
+    /// neighbouring 1000- and 1500-block tests pass routinely, which puts the
+    /// suite at roughly 100–200 blocks/s and 2010-in-10s right at the edge —
+    /// close enough that a loaded full-suite run can cross it.
+    ///
+    /// Confirmed on CI: a run on an unrelated branch (a one-line dependency
+    /// bump, nothing near P2P) failed **four** filter-index tests at once —
+    /// `getcfcheckpt`, `getcfheaders`, `getcfilters`, `silent_drop_oversized_range`
+    /// — every one of them panicking on this exact call with
+    /// `rpc: "error sending request for url"`, i.e. the reqwest timeout, at
+    /// 1500 and 2010 blocks. So this is the dominant failure mode, and
+    /// chunking addresses it directly.
+    ///
+    /// It is not the *only* one, and an earlier version of this comment
+    /// overreached by attributing a specific local failure to it. That one
+    /// panicked in the CFHeaders exchange forty lines below the mining call,
+    /// which a mining timeout cannot produce; its cause was the handshake
+    /// read-timeout desync fixed in `CFilterClient::handshake`.
+    ///
+    /// Chunking keeps every individual request well inside the timeout without
+    /// weakening it for anything else.
+    pub fn mine_blocks(&mut self, count: u64, addr: &str) {
+        const CHUNK: u64 = 250;
+        let mut left = count;
+        while left > 0 {
+            let n = left.min(CHUNK);
+            let resp = self
+                .rpc_call_with_params(
+                    "generatetoaddress",
+                    vec![serde_json::json!(n), serde_json::json!(addr)],
+                )
+                .expect("generatetoaddress");
+            // `rpc_call_with_params` returns `Ok` for a JSON-RPC-level error,
+            // so without this a failed chunk is skipped silently and the test
+            // dies much later on a missing block, with no trace of the cause.
+            assert!(
+                resp["error"].is_null(),
+                "generatetoaddress({n}) failed: {}",
+                resp["error"]
+            );
+            left -= n;
+        }
     }
 
     pub fn stop(&mut self) {

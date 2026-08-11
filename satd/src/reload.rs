@@ -1052,17 +1052,22 @@ mod tests {
 
     /// Build a deterministic `Config` for tests: regtest, isolated empty
     /// datadir (so no `bitcoin.conf` is read), all other values at defaults.
-    fn test_config() -> Config {
-        let dir = std::env::temp_dir().join(format!("satd-reload-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    ///
+    /// The `TempDir` is returned rather than dropped here because the `Config`
+    /// keeps the datadir path: dropping it would hand back a config pointing at
+    /// a directory that no longer exists. Callers bind it (`_dir`) to hold it
+    /// open for the test. It used to be a `satd-reload-test-{pid}` directory
+    /// that was never removed (#550).
+    fn test_config() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli = config::CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
         ])
         .expect("parse test CLI");
-        Config::from_cli(cli).expect("build test config")
+        (Config::from_cli(cli).expect("build test config"), dir)
     }
 
     /// Anti-drift guard: every known config-file key must have exactly one
@@ -1156,7 +1161,7 @@ mod tests {
     /// shared target the dispatcher reads.
     #[test]
     fn webhook_target_tracks_config() {
-        let mut c = test_config();
+        let (mut c, _dir) = test_config();
         c.reorg_webhook = None;
         c.reorg_webhook_secret = None;
         assert!(webhook_target_from(&c).is_none(), "no URL => no target");
@@ -1176,7 +1181,7 @@ mod tests {
     /// across several field types (numeric, bool, Option, Vec, enum).
     #[test]
     fn diff_detects_changes() {
-        let base = test_config();
+        let (base, _dir) = test_config();
 
         let mut changed = base.clone();
         changed.dbcache = base.dbcache + 64;
@@ -1201,7 +1206,7 @@ mod tests {
     /// "changed" on every reload and spam the log forever.
     #[test]
     fn identical_config_yields_no_changes() {
-        let c = test_config();
+        let (c, _dir) = test_config();
         let same = c.clone();
         for spec in field_specs() {
             assert!(

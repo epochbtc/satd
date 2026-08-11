@@ -6847,11 +6847,9 @@ rpcport=8332
     #[test]
     fn rpc_admission_defaults_match_core() {
         use clap::Parser;
-        let dir =
-            std::env::temp_dir().join(format!("satd-admission-default-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Bitcoin Core's defaults.
@@ -6872,13 +6870,12 @@ rpcport=8332
     #[test]
     fn health_alert_threshold_defaults_and_parsing() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-alert-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults come from the single source of truth in `node::health`, so
         // the config layer and the detector can never disagree about them.
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert_eq!(cfg.alert_disk_free_mb, 10_240);
@@ -6897,7 +6894,7 @@ rpcport=8332
         // ...all armed where the condition really does mean something is
         // wrong.
         let cli =
-            CliArgs::try_parse_from(["satd", "--datadir", dir.to_str().unwrap()]).unwrap();
+            CliArgs::try_parse_from(["satd", "--datadir", dir.path().to_str().unwrap()]).unwrap();
         let cfg_mainnet = Config::from_cli(cli).unwrap();
         assert_eq!(cfg_mainnet.alert_tip_stall_seconds, 3_600, "mainnet keeps the hour");
         assert_eq!(cfg_mainnet.alert_peer_floor, 3, "mainnet keeps the floor");
@@ -6908,7 +6905,7 @@ rpcport=8332
         // alert, which costs them the mainnet one too — so the floor is raised
         // rather than defaulted to mainnet's sensitivity.
         let cli =
-            CliArgs::try_parse_from(["satd", "--signet", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--signet", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg_signet = Config::from_cli(cli).unwrap();
         assert_eq!(cfg_signet.alert_reorg_depth, 10, "signet does not page on routine reorgs");
@@ -6923,7 +6920,7 @@ rpcport=8332
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--alerttipstallseconds",
             "7200",
             "--alertdiskfreemb",
@@ -6952,10 +6949,9 @@ rpcport=8332
     #[test]
     fn the_peer_floor_default_follows_the_connect_list() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-alert-connect-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let with = |args: &[&str]| {
-            let mut argv = vec!["satd", "--datadir", dir.to_str().unwrap()];
+            let mut argv = vec!["satd", "--datadir", dir.path().to_str().unwrap()];
             argv.extend_from_slice(args);
             Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap()
         };
@@ -6998,13 +6994,13 @@ rpcport=8332
 
         // The config file is the same path — this is where a -connect node's
         // settings actually live.
-        let conf = dir.join("connect-floor.conf");
+        let conf = dir.path().join("connect-floor.conf");
         std::fs::write(&conf, "connect=10.0.0.5:8333\nconnect=10.0.0.6:8333\n").unwrap();
         let cfg = Config::from_cli(
             CliArgs::try_parse_from([
                 "satd",
                 "--datadir",
-                dir.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
                 "--conf",
                 conf.to_str().unwrap(),
             ])
@@ -7038,12 +7034,11 @@ rpcport=8332
     #[test]
     fn policy_engine_config_defaults_and_parsing() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-policy-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
 
         // Defaults: no policy file, 50 MB quarantine budget.
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.policyfile.is_none());
@@ -7054,7 +7049,7 @@ rpcport=8332
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--policyfile",
             "/etc/satd/policy.conf",
             "--quarantinemempool",
@@ -7069,13 +7064,12 @@ rpcport=8332
     #[test]
     fn policyfile_must_be_absolute() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-policy-rel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--policyfile",
             "relative/policy.conf",
         ])
@@ -7090,10 +7084,9 @@ rpcport=8332
     #[test]
     fn rpc_readonly_listener_disabled_by_default() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-ro-default-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli =
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         // Opt-in: no read-only listener unless -rpcreadonlybind is set.
@@ -7107,13 +7100,12 @@ rpcport=8332
     #[test]
     fn rpc_readonly_listener_cli_enables_and_overrides() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-ro-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcreadonlybind",
             "127.0.0.1",
             "--rpcreadonlyport",
@@ -7136,15 +7128,14 @@ rpcport=8332
     #[test]
     fn rpc_readonly_nonloopback_requires_allowip() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-ro-guard-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         // A non-loopback read-only bind with no allowlist must be rejected,
         // mirroring the main listener's accidental-exposure guard.
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcreadonlybind",
             "0.0.0.0:9330",
         ])
@@ -7177,14 +7168,13 @@ rpcport=8332
     #[test]
     fn rpc_readonly_tls_partial_config_is_rejected() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-ro-tls-partial-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         // TLS bind without cert/key must be rejected, mirroring -rpctlsbind.
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcreadonlytlsbind",
             "127.0.0.1:9443",
         ])
@@ -7199,14 +7189,13 @@ rpcport=8332
     #[test]
     fn rpc_readonly_mtls_requires_tls_bind_and_ca() {
         use clap::Parser;
-        let dir = std::env::temp_dir().join(format!("satd-ro-mtls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         // mTLS without a TLS bind is rejected.
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcreadonlymtls",
             "true",
         ])
@@ -7218,14 +7207,12 @@ rpcport=8332
     #[test]
     fn rpc_readonly_mtls_clientallow_requires_mtls() {
         use clap::Parser;
-        let dir =
-            std::env::temp_dir().join(format!("satd-ro-mtls-allow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcreadonlymtlsclientallow",
             "CN=foo",
         ])
@@ -7237,14 +7224,12 @@ rpcport=8332
     #[test]
     fn rpc_admission_cli_overrides() {
         use clap::Parser;
-        let dir =
-            std::env::temp_dir().join(format!("satd-admission-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
             "--datadir",
-            dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             "--rpcthreads",
             "8",
             "--rpcworkqueue",
@@ -7278,10 +7263,9 @@ rpcport=8332
         assert!(default_api_threads() >= 2, "API thread floor is 2");
         assert!(is_known_config_key("apithreads"), "apithreads must be known");
 
-        let dir = std::env::temp_dir().join(format!("satd-apithreads-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Config::from_cli(
-            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.to_str().unwrap()])
+            CliArgs::try_parse_from(["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()])
                 .unwrap(),
         )
         .unwrap();
@@ -7293,7 +7277,7 @@ rpcport=8332
                 "satd",
                 "--regtest",
                 "--datadir",
-                dir.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
                 "--api-threads",
                 "3",
             ])
@@ -7310,7 +7294,7 @@ rpcport=8332
                 "satd",
                 "--regtest",
                 "--datadir",
-                dir.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
                 "--api-threads",
                 "1000000000",
             ])
