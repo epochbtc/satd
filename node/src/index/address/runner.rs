@@ -105,6 +105,12 @@ pub struct BackfillRunner {
 }
 
 impl BackfillRunner {
+    /// Current progress over the two-pass walk, as the ETA's rate meter
+    /// measures it.
+    fn progress_ratio(&self) -> f64 {
+        self.handle.cursor().progress_ratio()
+    }
+
     /// Run to completion (or pause/cancel/shutdown). Synchronous;
     /// callers should `tokio::task::spawn_blocking` this.
     ///
@@ -147,6 +153,11 @@ impl BackfillRunner {
         // A reorg that invalidated the anchor between RPC dispatch and
         // runner start surfaces as ReorgInvalidated → Failed.
         let snapshot = self.acquire_snapshot()?;
+
+        // Anchor the ETA's rate meter here — the moment this process
+        // starts walking — rather than at `start()` time. Held across
+        // both passes so every exit path clears it (#546).
+        let _stint = self.handle.begin_stint(self.progress_ratio());
 
         // Pass 1: funding rows + temp CF. Resume from cursor_height
         // when picking up after pause/crash.
@@ -645,6 +656,14 @@ impl BackfillRunner {
     /// `Err(Cancelled)` or `Err(Shutdown)` as appropriate; otherwise
     /// returns `Ok(())` after waiting out any pause window.
     fn check_pause_loop(&self) -> Result<(), BackfillError> {
+        // Whether *this* call stopped the ETA's clock. The re-anchor below
+        // keys off this rather than off the persisted state, because
+        // `mark_paused` can fail and its error is deliberately not fatal to
+        // the walk — and a failing store is exactly the situation that gets
+        // a backfill paused. Keying off the persisted state would then skip
+        // the re-anchor for ever, leaving `getindexinfo` reporting no ETA on
+        // a backfill that is running normally again.
+        let mut stint_ended = false;
         loop {
             if *self.shutdown.borrow() {
                 return Err(BackfillError::Shutdown);
@@ -658,11 +677,23 @@ impl BackfillRunner {
             if !self.handle.is_paused() {
                 // Paused → Running mirror when an operator hits
                 // `resumeindex` mid-pause.
-                if self.handle.cursor().state == BackfillState::Paused {
+                let was_paused = self.handle.cursor().state == BackfillState::Paused;
+                if was_paused {
                     let _ = self.handle.mark_running(self.chain.store_ref().as_ref());
+                }
+                // Back to work: re-anchor so the paused span is not
+                // extrapolated as working time (#546).
+                if stint_ended || was_paused {
+                    self.handle.reanchor_stint(self.progress_ratio());
                 }
                 return Ok(());
             }
+            // Stop the ETA's clock for as long as the pause lasts. Called
+            // unconditionally (and idempotent) because a runner spawned
+            // against an already-`Paused` cursor never takes the
+            // Running→Paused transition below.
+            self.handle.end_stint();
+            stint_ended = true;
             // First entry into pause: persist Paused so a restart
             // during a paused run stays paused.
             if self.handle.cursor().state == BackfillState::Running {

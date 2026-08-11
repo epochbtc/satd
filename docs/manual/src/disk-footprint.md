@@ -154,8 +154,25 @@ near the fraction of the chain that predates taproot.
 `estimated_remaining_seconds` is reported only while a backfill is both enabled
 and running. A paused, cancelled, failed or disabled cursor reports `0` — its
 progress is frozen while elapsed wall-clock keeps growing, so any estimate
-derived from it would grow without bound for as long as the node stays up. Until a backfill completes, the tweak-serving
-surfaces refuse a request rather than return a partial result.
+derived from it would grow without bound for as long as the node stays up.
+
+The estimate is measured over the current *stint* — the uninterrupted span
+since the running backfill last started walking blocks. It is not an average
+over the life of the job. Two consequences worth knowing:
+
+- Time the backfill was not working is never counted. Pause it for two days and
+  resume, or stop the daemon for a week and restart, and the estimate reflects
+  the throughput it is achieving now, not the idle time in between.
+- The estimate is unavailable for the first few seconds after a start, a
+  resume, or a daemon restart, and reads `0` until the new stint has measured
+  something. `0` here means "no estimate yet", not "nearly done"; the `state`
+  and `cursor_height` fields are the ones to watch during that window.
+
+This applies to all three backfills (`address`, `basic block filter index`,
+`silentpayments`) — they share one estimator.
+
+Until a backfill completes, the tweak-serving surfaces refuse a request rather
+than return a partial result.
 
 > **Note.** At roughly 4 GB on mainnet, `sp_tweaks` is small next to the
 > address indices. About 85% of tweaks describe dust outputs; a subscription

@@ -247,7 +247,7 @@ addr-idx <state>   esplora <state>   electrum <state>
 |---|---|
 | `⬤ synced` (green) | Address-history index is at tip. Esplora and Electrum are safe to serve history. |
 | `⬤ syncing` (yellow) | Backfill in progress. Address queries may return partial history. |
-| `⬤ backfill pass N/2 XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height. |
+| `⬤ backfill pass N/2 XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height. The `ETA` is omitted for the first few seconds after a start, resume, or daemon restart — it is measured over the current working span, so it has nothing to report until that span has run (see [Disk footprint](./disk-footprint.md)). |
 | `⬤ backfill paused …` (yellow) | Backfill paused. Resume with `sat-cli resumeindex address`. |
 | `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
 | `⬭ off` (gray) | Address index disabled (`-addressindex=0`). |
