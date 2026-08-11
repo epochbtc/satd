@@ -714,12 +714,19 @@ impl TestNode {
     /// suite at roughly 100–200 blocks/s and 2010-in-10s right at the edge —
     /// close enough that a loaded full-suite run can cross it.
     ///
-    /// This is a margin, not a diagnosis of any particular failure. An earlier
-    /// version of this comment claimed it explained an observed
-    /// `test_p2p_getcfheaders_accepts_2000_headers` failure; it does not. That
-    /// panic was in the CFHeaders exchange some forty lines further down, and
-    /// a `generatetoaddress` timeout would have reported the mining line. That
-    /// test has a separate intermittent failure which this does not address.
+    /// Confirmed on CI: a run on an unrelated branch (a one-line dependency
+    /// bump, nothing near P2P) failed **four** filter-index tests at once —
+    /// `getcfcheckpt`, `getcfheaders`, `getcfilters`, `silent_drop_oversized_range`
+    /// — every one of them panicking on this exact call with
+    /// `rpc: "error sending request for url"`, i.e. the reqwest timeout, at
+    /// 1500 and 2010 blocks. So this is the dominant failure mode, and
+    /// chunking addresses it directly.
+    ///
+    /// It is not the *only* one, and an earlier version of this comment
+    /// overreached by attributing a specific local failure to it. That one
+    /// panicked in the CFHeaders exchange forty lines below the mining call,
+    /// which a mining timeout cannot produce; its cause was the handshake
+    /// read-timeout desync fixed in `CFilterClient::handshake`.
     ///
     /// Chunking keeps every individual request well inside the timeout without
     /// weakening it for anything else.
