@@ -2357,6 +2357,25 @@ impl Config {
                     .to_string(),
             );
         }
+        // Authentication alone is not enough once the listener is reachable
+        // off-host: a bearer token crosses the wire on every RPC, and so does
+        // everything the stream carries — including the BIP 352 scan keys a
+        // Tier 2 watch registers, which disclose which outputs belong to a
+        // receiver. Same rule, and the same reasoning, as `--mcpallowremote`
+        // below. mTLS satisfies it implicitly: it requires the TLS cert/key.
+        //
+        // This is the server half of #521; the first-party SDKs refuse to send
+        // a token over an unencrypted connection, but that only binds clients
+        // that use them.
+        if events_grpc_allow_remote && events_grpc_auth && events_grpc_tls_cert.is_none() {
+            return Err(
+                "--events-grpc-allow-remote with --events-grpc-auth requires \
+                 --events-grpc-tls-cert and --events-grpc-tls-key (a remote events-gRPC listener \
+                 must use TLS so the bearer token is never sent in cleartext). For a \
+                 proxy/TLS-terminated setup, bind loopback and omit --events-grpc-allow-remote."
+                    .to_string(),
+            );
+        }
         let streamws_auth = cli
             .streamws_auth
             .or_else(|| file_get("streamwsauth").and_then(|v| parse_bool(&v)))
@@ -5236,7 +5255,7 @@ pub struct CliArgs {
     #[arg(
         long = "events-grpc-bind",
         value_name = "ADDR",
-        help = "host:port to bind the events gRPC streaming server. Loopback bind is unauthenticated by default; a remote bind requires --events-grpc-allow-remote AND --events-grpc-auth. Default: disabled"
+        help = "host:port to bind the events gRPC streaming server. Loopback bind is unauthenticated by default; a remote bind requires --events-grpc-allow-remote AND either --events-grpc-mtls, or --events-grpc-auth together with --events-grpc-tls-cert/--events-grpc-tls-key. Default: disabled"
     )]
     pub events_grpc_bind: Option<String>,
 
@@ -8762,10 +8781,77 @@ rpcport=8332
             "--authfile=/etc/satd/auth.toml",
             "--events-grpc-auth=1",
             "--events-grpc-allow-remote=1",
+            // Required since #521: bearer auth on a remote bind must be
+            // encrypted.
+            "--events-grpc-tls-cert=/tmp/cert.pem",
+            "--events-grpc-tls-key=/tmp/key.pem",
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
         assert!(cfg.events_grpc_auth && cfg.events_grpc_allow_remote);
+    }
+
+    /// #521: a remote events-gRPC bind with bearer auth must be encrypted. The
+    /// token crosses the wire on every RPC, and so do the BIP 352 scan keys a
+    /// Tier 2 watch registers. Same rule as `--mcpallowremote`.
+    #[test]
+    fn eventsgrpc_remote_auth_requires_tls() {
+        let err = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-grpc-remote-notls",
+                "--authfile=/etc/satd/auth.toml",
+                "--events-grpc-auth=1",
+                "--events-grpc-allow-remote=1",
+            ])
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("--events-grpc-tls-cert"), "got: {err}");
+    }
+
+    /// mTLS satisfies the encryption requirement without `--events-grpc-auth`:
+    /// it already requires the TLS cert/key, and there is no bearer token to
+    /// expose. Guards against the new rule being written so that it rejects the
+    /// mTLS deployment shape.
+    #[test]
+    fn eventsgrpc_remote_mtls_without_bearer_auth_is_still_accepted() {
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-grpc-remote-mtls-only",
+                "--events-grpc-bind=0.0.0.0:50051",
+                "--events-grpc-allow-remote=1",
+                "--events-grpc-tls-cert=/tmp/cert.pem",
+                "--events-grpc-tls-key=/tmp/key.pem",
+                "--events-grpc-mtls=1",
+                "--events-grpc-mtls-client-ca=/tmp/ca.pem",
+            ])
+            .unwrap(),
+        )
+        .expect("mTLS is encrypted and authenticated");
+        assert!(cfg.events_grpc_allow_remote && !cfg.events_grpc_auth);
+    }
+
+    /// A loopback bind with bearer auth is unaffected — the new rule keys on
+    /// `--events-grpc-allow-remote`, not on auth alone, so the ordinary local
+    /// setup does not suddenly require a certificate.
+    #[test]
+    fn eventsgrpc_loopback_auth_does_not_require_tls() {
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-grpc-loopback-auth",
+                "--authfile=/etc/satd/auth.toml",
+                "--events-grpc-auth=1",
+            ])
+            .unwrap(),
+        )
+        .expect("loopback bearer auth needs no certificate");
+        assert!(cfg.events_grpc_auth && !cfg.events_grpc_allow_remote);
     }
 
     #[test]

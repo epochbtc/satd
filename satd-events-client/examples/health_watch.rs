@@ -72,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = args.next().unwrap_or_else(|| "http://127.0.0.1:50051".into());
 
     let mut builder = StreamClient::builder(endpoint).keepalive_default();
+    // `bearer_token` refuses a plaintext endpoint: pass an `https://` one (see
+    // `tls_tail.rs`). Against a loopback node, swap in `insecure_bearer_token`.
     if let Some(token) = args.next() {
         builder = builder.bearer_token(token);
     }

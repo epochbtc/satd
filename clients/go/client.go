@@ -80,6 +80,9 @@ type Client struct {
 
 type dialConfig struct {
 	token string
+	// allowInsecureToken is set only by WithInsecureBearerToken: the caller has
+	// explicitly accepted sending the token over an unencrypted connection.
+	allowInsecureToken bool
 
 	tlsEnabled bool
 	caPEM      []byte
@@ -101,12 +104,35 @@ type Option func(*dialConfig)
 // <token>` metadata on every RPC.
 //
 // The token is only honored when the server enforces auth (-eventsgrpcauth); a
-// no-auth (loopback-trust) server ignores it. Over a plaintext endpoint the
-// token travels in cleartext - enable TLS ([WithTLS] or [WithTLSCAPem]) so the
-// connection is encrypted, or restrict bearer auth to loopback or a
-// TLS-terminating proxy.
+// no-auth (loopback-trust) server ignores it.
+//
+// The connection must be encrypted. [Dial] returns a [KindInsecureCredential]
+// error for a token combined with an insecure transport rather than putting it
+// on the wire in the clear. Pair this with [WithTLS] or [WithTLSCAPem], or use
+// [WithInsecureBearerToken] to accept the risk explicitly.
 func WithBearerToken(token string) Option {
-	return func(c *dialConfig) { c.token = token }
+	return func(c *dialConfig) {
+		c.token = token
+		c.allowInsecureToken = false
+	}
+}
+
+// WithInsecureBearerToken is [WithBearerToken] but permits sending the token
+// over a connection with no transport encryption.
+//
+// Only for loopback and test harnesses. Over anything else the token is readable
+// by every host on the path, and so is everything the stream carries - including
+// the BIP 352 scan keys a Tier 2 watch registers, which disclose which outputs
+// belong to the receiver.
+//
+// This is a separate option rather than a flag so that the unsafe choice has to
+// be named at the call site, and so that a later switch back to
+// [WithBearerToken] cannot silently leave the waiver behind.
+func WithInsecureBearerToken(token string) Option {
+	return func(c *dialConfig) {
+		c.token = token
+		c.allowInsecureToken = true
+	}
 }
 
 // WithTLS enables TLS for the connection, trusting the host's system root CAs
@@ -174,6 +200,21 @@ func WithoutKeepalive() Option {
 // for anything this SDK does not wrap (a custom resolver, interceptors,
 // message-size limits, a proxy dialer). They are applied last, so they override
 // the SDK's own options where they overlap.
+//
+// That last property extends to transport credentials, and [Dial]'s
+// bearer-token guard cannot see through it. The guard tests the SDK's own view
+// of the connection (WithTLS, WithTLSCAPem, an https:// target), so passing
+// grpc.WithTransportCredentials here decides the actual transport while leaving
+// that view unchanged, in both directions:
+//
+//   - insecure.NewCredentials() alongside WithTLS and WithBearerToken passes the
+//     guard and then sends the token in cleartext;
+//   - credentials.NewTLS(cfg) without any WithTLS* option is genuinely
+//     encrypted, but the guard sees plaintext and refuses the token. Add
+//     WithTLS() as well - the option passed here still wins for the transport,
+//     so the custom tls.Config is what is used.
+//
+// Prefer the WithTLS* options for anything they can express.
 func WithGRPCDialOption(opts ...grpc.DialOption) Option {
 	return func(c *dialConfig) { c.extra = append(c.extra, opts...) }
 }
@@ -216,6 +257,25 @@ func Dial(ctx context.Context, target string, opts ...Option) (*Client, error) {
 	case scheme == "https" && !cfg.tlsEnabled:
 		// An https target with no TLS option means TLS with the system roots.
 		cfg.tlsEnabled = true
+	}
+
+	// A bearer token on an unencrypted connection crosses the network in the
+	// clear, and so does everything the stream carries - including the BIP 352
+	// scan keys a Tier 2 watch registers. gRPC-Go's own guard does not fire
+	// here: it refuses to attach a PerRPCCredentials whose
+	// RequireTransportSecurity reports true to an insecure channel, but this SDK
+	// attaches the token with metadata.AppendToOutgoingContext, which that check
+	// never sees. And a remote-bound node with eventsgrpcauth=1 and no TLS is a
+	// supported server configuration, so both ends behave as configured while
+	// the credential is on the wire (#521).
+	//
+	// Checked after the scheme switch above, so an https:// target counts as
+	// encrypted whether or not a WithTLS* option was passed.
+	if cfg.token != "" && !cfg.allowInsecureToken && !cfg.tlsEnabled {
+		return nil, newError(KindInsecureCredential,
+			"refusing to send a bearer token to %q over an unencrypted connection; "+
+				"use WithTLS or WithTLSCAPem (or an https:// target), or "+
+				"WithInsecureBearerToken to accept the risk", redactUserinfo(target))
 	}
 
 	creds, err := transportCredentials(&cfg)
@@ -444,6 +504,30 @@ func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream,
 // there is no way for a scheme-less target to silently downgrade a TLS
 // connection to cleartext. What is still worth refusing is an explicit
 // http:// alongside TLS options, which [Dial] does.
+// redactUserinfo strips a `user:password@` prefix out of a target before it
+// goes into an error string. Refusals are normally logged, and a password in a
+// URL is a credential too - an error whose whole purpose is to keep a
+// credential off the wire must not spill a different one into the log.
+func redactUserinfo(target string) string {
+	rest := target
+	prefix := ""
+	if i := strings.Index(target, "://"); i >= 0 {
+		prefix = target[:i+3]
+		rest = target[i+3:]
+	}
+	// Userinfo lives in the authority only: everything before the first `/`.
+	// Splitting there keeps a later `@` in a path from being mistaken for it.
+	authority, path := rest, ""
+	if i := strings.Index(rest, "/"); i >= 0 {
+		authority, path = rest[:i], rest[i:]
+	}
+	i := strings.LastIndex(authority, "@")
+	if i < 0 {
+		return target
+	}
+	return prefix + "***@" + authority[i+1:] + path
+}
+
 func splitScheme(target string) (endpoint, scheme string, err error) {
 	i := strings.Index(target, "://")
 	if i < 0 {

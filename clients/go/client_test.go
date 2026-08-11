@@ -145,11 +145,11 @@ func TestHTTPSTargetEnablesTLS(t *testing.T) {
 }
 
 func TestDialRejectsAnInvalidBearerToken(t *testing.T) {
-	// gRPC metadata for a non-binary key must be printable ASCII; a token with a
-	// newline would be rejected (or mangled) deep in the transport, so reject it
-	// at the call site with a clear error.
+	// TLS throughout: a plaintext target with a token is refused before the
+	// token is ever inspected, which would make this test assert the wrong
+	// thing.
 	for _, bad := range []string{"tok\nen", "tok\x00en", "töken"} {
-		c, err := Dial(context.Background(), "127.0.0.1:1", WithBearerToken(bad))
+		c, err := Dial(context.Background(), "127.0.0.1:1", WithTLS(), WithBearerToken(bad))
 		if err == nil {
 			_ = c.Close()
 			t.Errorf("token %q was accepted", bad)
@@ -159,9 +159,79 @@ func TestDialRejectsAnInvalidBearerToken(t *testing.T) {
 			t.Errorf("token %q: got %v, want ErrInvalidToken", bad, err)
 		}
 	}
-	c, err := Dial(context.Background(), "127.0.0.1:1", WithBearerToken("valid-token"))
+	c, err := Dial(context.Background(), "127.0.0.1:1", WithTLS(), WithBearerToken("valid-token"))
 	if err != nil {
 		t.Fatalf("a printable-ASCII token must be accepted: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBearerTokenOverPlaintextIsRefused is the #521 guard. gRPC-Go's own
+// RequireTransportSecurity check never fires for this SDK - the token is
+// attached with metadata.AppendToOutgoingContext, not as PerRPCCredentials - and
+// a remote-bound node with eventsgrpcauth=1 and no TLS is a supported server
+// configuration, so nothing else stops the credential reaching the wire in the
+// clear.
+func TestBearerTokenOverPlaintextIsRefused(t *testing.T) {
+	for _, target := range []string{"127.0.0.1:1", "http://node.example:50051", "node.example:50051"} {
+		c, err := Dial(context.Background(), target, WithBearerToken("SECRET"))
+		if err == nil {
+			_ = c.Close()
+			t.Errorf("target %q: a bearer token over plaintext must be refused", target)
+			continue
+		}
+		if !errors.Is(err, ErrInsecureCredential) {
+			t.Errorf("target %q: got %v, want ErrInsecureCredential", target, err)
+		}
+		if strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("target %q: the error must not quote the token: %v", target, err)
+		}
+	}
+}
+
+// The three ways a token is legitimately allowed on the wire.
+func TestBearerTokenIsAllowedOverTLSOrByExplicitWaiver(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		opts   []Option
+	}{
+		{"explicit TLS", "node.example:50051", []Option{WithTLS(), WithBearerToken("SECRET")}},
+		{"https target", "https://node.example:50051", []Option{WithBearerToken("SECRET")}},
+		{"named waiver", "127.0.0.1:50051", []Option{WithInsecureBearerToken("SECRET")}},
+	}
+	for _, tc := range cases {
+		c, err := Dial(context.Background(), tc.target, tc.opts...)
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		_ = c.Close()
+	}
+}
+
+// A later WithBearerToken must clear an earlier waiver rather than inherit it -
+// the reason the waiver is a token-carrying option and not a standalone flag.
+func TestInsecureWaiverDoesNotLeakIntoASubsequentBearerToken(t *testing.T) {
+	c, err := Dial(context.Background(), "127.0.0.1:1",
+		WithInsecureBearerToken("SECRET"), WithBearerToken("SECRET"))
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("the waiver must not survive a later WithBearerToken")
+	}
+	if !errors.Is(err, ErrInsecureCredential) {
+		t.Errorf("got %v, want ErrInsecureCredential", err)
+	}
+}
+
+// No token, no rule: a plaintext loopback dial without credentials is the
+// default local setup and must keep working.
+func TestPlaintextWithoutATokenIsUnaffected(t *testing.T) {
+	c, err := Dial(context.Background(), "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("a plaintext dial with no token must be allowed: %v", err)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
@@ -291,5 +361,36 @@ func TestTLSCredentialsFailClosedOnEmptyPEM(t *testing.T) {
 	// Not pinning at all stays valid: nil means "use the system roots".
 	if _, err := transportCredentials(&dialConfig{tlsEnabled: true}); err != nil {
 		t.Errorf("plain WithTLS should still work: %v", err)
+	}
+}
+
+// The refusal is normally logged, so it must not spill a password that was
+// embedded in the target. A later `@` in the path is not userinfo.
+func TestRedactUserinfo(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://user:hunter2@node.example:50051", "http://***@node.example:50051"},
+		{"http://user:hunter2@node.example:50051/a@b", "http://***@node.example:50051/a@b"},
+		{"user:hunter2@node.example:50051", "***@node.example:50051"},
+		{"https://node.example:50051/path", "https://node.example:50051/path"},
+		{"node.example:50051", "node.example:50051"},
+	}
+	for _, c := range cases {
+		if got := redactUserinfo(c.in); got != c.want {
+			t.Errorf("redactUserinfo(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestAPasswordInTheTargetIsNotQuotedBack(t *testing.T) {
+	_, err := Dial(context.Background(), "http://user:hunter2@node.example:50051",
+		WithBearerToken("SECRET"))
+	if err == nil {
+		t.Fatal("a bearer token over plaintext must be refused")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("leaked the URL password: %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("leaked the token: %v", err)
 	}
 }

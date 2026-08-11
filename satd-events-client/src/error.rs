@@ -30,6 +30,22 @@ pub enum StreamError {
     #[error("invalid bearer token: not a valid header value")]
     InvalidToken,
 
+    /// A bearer token was configured against an endpoint that is not encrypted,
+    /// so the token — and, on a scan-key watch, the BIP 352 scan secrets that
+    /// share the stream — would cross the network in cleartext.
+    ///
+    /// Use an `https://` endpoint with [`tls`](crate::StreamClientBuilder::tls)
+    /// or [`tls_ca_pem`](crate::StreamClientBuilder::tls_ca_pem). For loopback
+    /// or a test harness, name the risk with
+    /// [`insecure_bearer_token`](crate::StreamClientBuilder::insecure_bearer_token).
+    #[error(
+        "refusing to send a bearer token over an unencrypted endpoint: {0}. \
+         Encrypt the connection (an https:// endpoint plus tls()/tls_ca_pem(), \
+         both of which need this crate's `tls` feature), or call \
+         insecure_bearer_token() instead of bearer_token() to accept the risk."
+    )]
+    InsecureCredential(String),
+
     /// The bearer token was missing, malformed, or rejected (gRPC
     /// `UNAUTHENTICATED`). Potentially fixable by presenting a valid token.
     #[error("unauthenticated: {0}")]

@@ -356,7 +356,7 @@ Core ZMQ wire-format compatible.)
 | `eventsnodeid` | auto (persisted to `<datadir>/node_id`) | restart | satd | Stable per-node identifier (32-char hex) stamped on events envelopes. |
 | `eventsregion` | none | restart | satd | Optional region tag (≤8 ASCII bytes) on events envelopes. |
 | `eventsgrpcbind` | off | restart | satd | host:port to bind the events gRPC streaming server. |
-| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` or `eventsgrpcmtls`). |
+| `eventsgrpcallowremote` | false | restart | satd | Permit `eventsgrpcbind` on a non-loopback address (requires `eventsgrpcauth` or `eventsgrpcmtls`; with `eventsgrpcauth`, also requires `eventsgrpctlscert`/`eventsgrpctlskey` so the bearer token is never sent in cleartext). |
 | `eventsgrpcauth` | false | restart | satd | Require bearer tokens (`stream:subscribe`) on events gRPC (requires `authfile`). |
 | `eventsgrpcmaxconns` | 64 (`0` disables) | restart | satd | Hard cap on simultaneously-open events gRPC connections. |
 | `eventsgrpcmaxsubscriptions` | 256 (`0` disables) | restart | satd | Hard cap on concurrent events gRPC `Subscribe` streams. |

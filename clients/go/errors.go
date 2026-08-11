@@ -69,6 +69,11 @@ const (
 	// momentary failure of the integrator's source-of-truth does not crash the
 	// consumer.
 	KindWatchSetLoader
+	// KindInsecureCredential is a bearer token configured against a connection
+	// with no transport encryption. [Dial] refuses rather than putting the
+	// credential on the wire in the clear; use TLS, or [WithInsecureBearerToken]
+	// to accept the risk explicitly.
+	KindInsecureCredential
 )
 
 // Sentinels for [errors.Is]. `errors.Is(err, ErrUnauthenticated)` is true for
@@ -88,6 +93,7 @@ var (
 	ErrDecode               = errors.New("satdevents: decode error")
 	ErrControlClosed        = errors.New("satdevents: control channel closed")
 	ErrWatchSetLoaderFailed = errors.New("satdevents: watch-set loader failed")
+	ErrInsecureCredential   = errors.New("satdevents: insecure credential")
 )
 
 // sentinelsByKind maps each class to its sentinel, for Error's Is and Error
@@ -107,6 +113,7 @@ var sentinelsByKind = map[ErrorKind]error{
 	KindDecode:               ErrDecode,
 	KindControlClosed:        ErrControlClosed,
 	KindWatchSetLoader:       ErrWatchSetLoaderFailed,
+	KindInsecureCredential:   ErrInsecureCredential,
 }
 
 // Error is the SDK's error type. Match its class with [errors.Is] against a

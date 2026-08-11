@@ -11,6 +11,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- **Breaking, security:** both SDKs refused nothing when a bearer token was
+  paired with an unencrypted connection — the credential, and any BIP 352 scan
+  key registered over the same stream, went out in cleartext with no error and
+  no warning. `Dial` / `connect()` now fail closed; `WithInsecureBearerToken` /
+  `insecure_bearer_token` accept the risk explicitly for loopback and tests.
+  The node closes the same hole from its end: `-eventsgrpcallowremote` with
+  `-eventsgrpcauth` now requires `-eventsgrpctlscert`/`-eventsgrpctlskey`,
+  matching the rule `-mcpallowremote` already enforces. mTLS satisfies it.
 - **P2P hardening:** the block-ingress mutation gate now ports Core's
   `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated
   block (same hash, same merkle root) is rejected at ingress instead of one

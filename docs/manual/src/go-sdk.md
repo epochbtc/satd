@@ -71,6 +71,7 @@ this table is the translation key.
 
 ```go
 client, err := satdevents.Dial(ctx, "node:50051",
+    satdevents.WithTLSCAPem(caPEM),
     satdevents.WithBearerToken(token), // sent as `authorization: Bearer …`
 )
 defer client.Close()
@@ -85,9 +86,27 @@ Keepalive matching the server (30s/20s) is on by default; `WithoutKeepalive`
 and `WithKeepalive` override it.
 
 The bearer token is honored only when the server enforces auth
-(`-eventsgrpcauth`). Over a plaintext connection it travels in cleartext —
-enable TLS, restrict bearer auth to loopback, or front the node with a
-TLS-terminating proxy.
+(`-eventsgrpcauth`).
+
+### A token requires an encrypted connection
+
+`Dial` returns a `KindInsecureCredential` error (`errors.Is(err,
+ErrInsecureCredential)`) for a bearer token combined with an insecure
+transport, rather than putting the credential on the wire in the clear. Anyone
+who captures the token can subscribe to the firehose and register watches; on a
+Tier 2 scan-key watch the same stream also carries BIP 352 scan secrets, which
+disclose which outputs belong to the receiver.
+
+gRPC-Go's own safety net does not cover this. It refuses to attach a
+`PerRPCCredentials` whose `RequireTransportSecurity()` reports true to an
+insecure channel, but this SDK attaches the token with
+`metadata.AppendToOutgoingContext`, which that check never sees.
+
+Any `WithTLS*` option satisfies the requirement, as does an `https://` target.
+For loopback and test harnesses, `WithInsecureBearerToken(token)` is the same
+thing with the risk accepted explicitly. It is a separate option rather than a
+flag so the unsafe choice has to be named at the call site, and so that
+switching back to `WithBearerToken` cannot silently leave the waiver behind.
 
 ## TLS / mTLS
 
