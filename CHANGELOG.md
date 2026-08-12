@@ -11,6 +11,21 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed: a reorg could delete the height→hash and txindex rows the replacement
+  block had just written. Disconnecting the displaced block and connecting the
+  replacement coalesce into one write batch, which applies every put before
+  every remove — so the remove of height H ran after the put of height H and
+  won, though the put was the later operation. The other indexes were already
+  deduplicated by key for this sequence; these two were not. Symptoms appear
+  only after a restart, because the in-memory caches stay correct:
+  `getblockhash` reporting `Block height out of range` for a height in the
+  middle of the active chain, and — the likelier case, since a reorg routinely
+  re-mines the transactions it displaces — `getrawtransaction` reporting a
+  transaction that is in the chain as unknown. A missing height row inside the
+  eleven-block MTP window can also shift the median that gates BIP 113 and BIP
+  68, which needs a restart within eleven blocks of the reorg to reach.
+  Reindex and index backfills are not exposed; `-reindex` repairs existing
+  damage.
 - **Breaking, security:** both SDKs refused nothing when a bearer token was
   paired with an unencrypted connection — the credential, and any BIP 352 scan
   key registered over the same stream, went out in cleartext with no error and

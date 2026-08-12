@@ -209,15 +209,23 @@ pub struct SpBackfillCursorWrite {
 impl StoreBatch {
     /// Merge another batch into this one (for atomic multi-block operations).
     ///
-    /// Address-index puts and removes are merged with last-writer-wins
-    /// semantics by key: an incoming remove drops any prior put for
-    /// the same key, and an incoming put drops any prior remove. This
-    /// keeps the merged batch's puts/removes vectors disjoint by key,
-    /// so a CoinCache pending batch correctly reflects the most-recent
-    /// op for each address-index key — important for connect→
+    /// Every keyed index's puts and removes are merged with
+    /// last-writer-wins semantics by key: an incoming remove drops any
+    /// prior put for the same key, and an incoming put drops any prior
+    /// remove. This keeps the merged batch's puts/removes vectors
+    /// disjoint by key, so a CoinCache pending batch correctly reflects
+    /// the most-recent op for each key — important for connect→
     /// disconnect→connect (e.g. A→B→A reorgs) and disconnect→connect
     /// (alternate block at the same height containing the same row)
     /// sequences before flush.
+    ///
+    /// Disjointness is what makes the merged batch order-independent at
+    /// apply time. `Store` implementations write every put and then
+    /// every remove within one `WriteBatch`, so a put and a remove that
+    /// survived for the same key would resolve to "removed" regardless
+    /// of which one the caller issued last. Any keyed field added here
+    /// in future needs the same treatment; a plain `extend` silently
+    /// turns a disconnect→connect sequence into a lost row.
     pub fn merge(&mut self, other: StoreBatch) {
         self.block_index_puts.extend(other.block_index_puts);
         self.coin_puts.extend(other.coin_puts);
@@ -225,9 +233,44 @@ impl StoreBatch {
         if other.tip.is_some() {
             self.tip = other.tip;
         }
+
+        // height→hash: last-writer-wins by height. A reorg disconnects
+        // the displaced block (remove at H) and connects the replacement
+        // (put at H) in separate `write_batch` calls that coalesce into
+        // one pending batch, so without this the replacement's row is
+        // annihilated by the earlier remove and `getblockhash H` fails
+        // for a height in the middle of the active chain.
+        if !other.height_hash_removes.is_empty() {
+            let drop: std::collections::HashSet<u32> =
+                other.height_hash_removes.iter().copied().collect();
+            self.height_hash_puts.retain(|(h, _)| !drop.contains(h));
+        }
+        if !other.height_hash_puts.is_empty() {
+            let drop: std::collections::HashSet<u32> =
+                other.height_hash_puts.iter().map(|(h, _)| *h).collect();
+            self.height_hash_removes.retain(|h| !drop.contains(h));
+        }
         self.height_hash_puts.extend(other.height_hash_puts);
         self.height_hash_removes.extend(other.height_hash_removes);
+
         self.undo_puts.extend(other.undo_puts);
+
+        // tx_index: last-writer-wins by txid, same shape as the height
+        // index. The trigger here is routine rather than incidental — a
+        // reorg removes the displaced block's txids and the replacement
+        // chain re-mines the same transactions, so put and remove collide
+        // on one txid and `getrawtransaction` reports a transaction that
+        // IS in the chain as unknown.
+        if !other.tx_index_removes.is_empty() {
+            let drop: std::collections::HashSet<Txid> =
+                other.tx_index_removes.iter().copied().collect();
+            self.tx_index_puts.retain(|(txid, _)| !drop.contains(txid));
+        }
+        if !other.tx_index_puts.is_empty() {
+            let drop: std::collections::HashSet<Txid> =
+                other.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
+            self.tx_index_removes.retain(|txid| !drop.contains(txid));
+        }
         self.tx_index_puts.extend(other.tx_index_puts);
         self.tx_index_removes.extend(other.tx_index_removes);
         // chain_tx is hash-keyed; extend like block_index_puts (last write

@@ -3210,6 +3210,34 @@ mod tests {
         assert!(store.get_block_hash_by_height(999).is_none());
     }
 
+    /// Pins the apply-order contract that `StoreBatch::merge` depends on.
+    ///
+    /// A single `WriteBatch` writes every put and then every remove, so a
+    /// batch that is NOT disjoint by key resolves to "removed" no matter
+    /// which op the caller issued last. That is why `merge` deduplicates
+    /// keyed puts/removes rather than relying on ordering — reversing the
+    /// loops here would just move the data loss to the opposite sequence.
+    #[test]
+    fn keyed_index_put_and_remove_in_one_batch_resolves_to_removed() {
+        let (store, _dir) = temp_store(true);
+        let hash = make_block_hash(0x12);
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x34; 32]));
+
+        let mut batch = StoreBatch::default();
+        batch.height_hash_puts.push((100, hash));
+        batch.height_hash_removes.push(100);
+        batch.tx_index_puts.push((txid, hash));
+        batch.tx_index_removes.push(txid);
+        store.write_batch(batch).unwrap();
+
+        assert!(
+            store.get_block_hash_by_height(100).is_none(),
+            "apply order changed: `StoreBatch::merge` must keep keyed puts \
+             and removes disjoint, and this test documents why"
+        );
+        assert!(store.get_tx_location(&txid).is_none());
+    }
+
     #[test]
     fn test_undo_roundtrip() {
         let (store, _dir) = temp_store(false);
