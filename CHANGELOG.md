@@ -11,6 +11,23 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed, Core compatibility: `confirmations` was computed from a block's height
+  alone, with no check that the block is actually on the active chain. A valid
+  block on a losing branch therefore reported the depth its height implied —
+  one buried 60,000 deep claimed 60,000 confirmations — where Core reports
+  `-1`. `getblock`, `getblockheader` and `getrawtransaction` are all corrected
+  (`getrawtransaction` reports `0` for an off-chain block, matching Core's
+  different convention there). `nextblockhash` was likewise resolved through
+  the height index, handing an off-chain block the *active* chain's successor;
+  it is now reported only for blocks on the active chain. Together these made a
+  stale block and the canonical block at the same height indistinguishable
+  through satd's own RPC, which actively impeded a fork investigation.
+- Fixed: `mediantime` returned the block's own timestamp rather than the median
+  of the block and its ten ancestors, on `getblock`, `getblockheader`,
+  `getblockstats` and `getblockchaininfo`. It is now a real median-time-past,
+  walked through parent pointers so a block off the active chain is measured
+  against its own ancestry.
+
 - satd now audits the height→hash index at startup and rebuilds missing rows
   by walking the tip's ancestry, so a gap left by the reorg batching defect
   below no longer needs a `-reindex` to clear. The height index is derived

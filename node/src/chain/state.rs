@@ -1622,6 +1622,14 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
+    /// Direct store handle for tests that need to construct index states the
+    /// public API cannot reach — e.g. a stale sibling block that exists in the
+    /// block index but is deliberately absent from the height index.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &dyn Store {
+        &*self.store
+    }
+
     /// Cumulative transaction count through (and including) the given
     /// block, or `None` if not yet recorded (e.g. a pre-snapshot block an
     /// AssumeUTXO background hasn't validated). Backs `getchaintxstats`.
