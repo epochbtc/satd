@@ -324,8 +324,20 @@ impl CoinCache {
             || batch.tip.is_some()
             || !batch.block_index_puts.is_empty()
             || !batch.height_hash_puts.is_empty()
+            // Removes need their own terms. `take` above has already emptied
+            // `pending`, so anything this gate misses is DISCARDED, not
+            // deferred. A removes-only pending batch became materially more
+            // likely once `merge` started retaining away the put that used to
+            // keep this gate true; today it is still covered incidentally
+            // because `disconnect_block` always sets `tip`, which is an
+            // accident of that emitter rather than a guarantee.
+            || !batch.height_hash_removes.is_empty()
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
+            || !batch.tx_index_removes.is_empty()
+            || !batch.addr_funding_removes.is_empty()
+            || !batch.addr_spending_removes.is_empty()
+            || !batch.outpoint_spend_removes.is_empty()
             || !batch.chain_tx_puts.is_empty()
             // Silent-payment tweak rows ride the chainstate batch. They only
             // ever enter `pending` alongside a connect/disconnect (which set

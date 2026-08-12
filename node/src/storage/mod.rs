@@ -219,6 +219,12 @@ impl StoreBatch {
     /// (alternate block at the same height containing the same row)
     /// sequences before flush.
     ///
+    /// Each dedup block is guarded on BOTH vectors being non-empty. Guarding
+    /// only the incoming one would build a set of every txid in the block on
+    /// each connect — `connect_block` fills `tx_index_puts` regardless of
+    /// whether `-txindex` is on, so that is the default path — purely to
+    /// filter a `tx_index_removes` that is empty outside a reorg.
+    ///
     /// Disjointness is what makes the merged batch order-independent at
     /// apply time. `Store` implementations write every put and then
     /// every remove within one `WriteBatch`, so a put and a remove that
@@ -240,12 +246,12 @@ impl StoreBatch {
         // one pending batch, so without this the replacement's row is
         // annihilated by the earlier remove and `getblockhash H` fails
         // for a height in the middle of the active chain.
-        if !other.height_hash_removes.is_empty() {
+        if !other.height_hash_removes.is_empty() && !self.height_hash_puts.is_empty() {
             let drop: std::collections::HashSet<u32> =
                 other.height_hash_removes.iter().copied().collect();
             self.height_hash_puts.retain(|(h, _)| !drop.contains(h));
         }
-        if !other.height_hash_puts.is_empty() {
+        if !other.height_hash_puts.is_empty() && !self.height_hash_removes.is_empty() {
             let drop: std::collections::HashSet<u32> =
                 other.height_hash_puts.iter().map(|(h, _)| *h).collect();
             self.height_hash_removes.retain(|h| !drop.contains(h));
@@ -261,12 +267,12 @@ impl StoreBatch {
         // chain re-mines the same transactions, so put and remove collide
         // on one txid and `getrawtransaction` reports a transaction that
         // IS in the chain as unknown.
-        if !other.tx_index_removes.is_empty() {
+        if !other.tx_index_removes.is_empty() && !self.tx_index_puts.is_empty() {
             let drop: std::collections::HashSet<Txid> =
                 other.tx_index_removes.iter().copied().collect();
             self.tx_index_puts.retain(|(txid, _)| !drop.contains(txid));
         }
-        if !other.tx_index_puts.is_empty() {
+        if !other.tx_index_puts.is_empty() && !self.tx_index_removes.is_empty() {
             let drop: std::collections::HashSet<Txid> =
                 other.tx_index_puts.iter().map(|(txid, _)| *txid).collect();
             self.tx_index_removes.retain(|txid| !drop.contains(txid));
