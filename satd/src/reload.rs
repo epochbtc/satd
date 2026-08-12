@@ -421,12 +421,44 @@ const LOAD_ONLY_KEYS: &[&str] = &[
 /// `policyfile`: the transaction-filtering ruleset — re-read, recompiled, swapped,
 /// and re-placed live (path change, in-place content edit, and removal all live).
 ///
-/// `alertfile`: the outbound webhook set — re-read, re-validated, and the
-/// dispatcher generation replaced. A parse/permission error keeps the last-good
-/// dispatcher running (silently losing alerting after a typo is the worse
-/// failure); the *path* itself is restart-only.
+/// `alertfile` is deliberately NOT here: like `authfile`, its *contents* are
+/// re-read by a handler on every SIGHUP while its *path* is restart-only, and
+/// that split is expressed by giving it a `restart!` spec — the path diff is
+/// then reported as restart-required instead of being silently applied to the
+/// old file. Being listed here as well would satisfy the coverage test without
+/// anyone noticing the path was going unreported, which is how #494 happened.
 #[allow(dead_code)]
-const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile", "alertfile"];
+const HANDLER_RELOAD_KEYS: &[&str] = &["policyfile"];
+
+/// How the alertfile the dispatcher is actually running relates to the path
+/// `alertfile=` names after a reload.
+#[derive(Debug, PartialEq, Eq)]
+enum AlertfilePath {
+    /// The reloaded contents came from the configured path. The ordinary case.
+    InEffect,
+    /// `alertfile=` now names a different file. The dispatcher bound its path at
+    /// startup, so the contents that just went live came from the *old* one.
+    Changed,
+    /// `alertfile=` was removed. The dispatcher keeps running the file it
+    /// started with until restart.
+    Unconfigured,
+}
+
+/// Classify a SIGHUP's alertfile situation.
+///
+/// Split out from the log site so the three cases can be pinned by a test: the
+/// residual harm in #494 was not the reload itself but the *line* it printed —
+/// `alertfile reloaded` naming a path that was no longer configured reads as
+/// success, and an operator who has just moved the file has no reason to doubt
+/// it. The `restart!` spec reports the path change; this stops the reload line
+/// contradicting it.
+fn alertfile_disposition(configured: Option<&std::path::Path>, running: &std::path::Path) -> AlertfilePath {
+    match configured {
+        None => AlertfilePath::Unconfigured,
+        Some(p) if p == running => AlertfilePath::InEffect,
+        Some(_) => AlertfilePath::Changed,
+    }
+}
 
 /// Build the field-disposition table. Constructed at call time (once per
 /// reload) so the non-capturing `diff`/`apply` closures coerce to `fn`
@@ -548,6 +580,16 @@ fn field_specs() -> Vec<FieldSpec> {
         // edits / revocations) is picked up live by the independent
         // `token_store.reload()` at the end of `reload_from_sighup`.
         restart!("authfile", authfile),
+        // Exactly the `authfile` situation, and fixed the same way (#494). The
+        // `AlertReloader` binds its path when it is built at startup, so a
+        // changed `alertfile=` reloaded the OLD file and logged success naming
+        // a path that is no longer configured — the accept-and-ignore failure
+        // the config layer's whole posture exists to prevent, and worse than a
+        // rejected key because it looks like it worked. Changing WHERE the
+        // file lives needs a restart; changing its CONTENTS (adding, editing
+        // or removing a hook) stays live via the reloader at the end of
+        // `reload_from_sighup`, which is the point of the feature.
+        restart!("alertfile", alertfile),
         // Whether a listener installs the bearer carrier + capability filter is
         // decided when the listener is built at startup, so toggling it requires
         // a restart. (Token edits/revocations are live — see authfile.)
@@ -1005,14 +1047,39 @@ pub fn reload_from_sighup(handles: &ReloadHandles, running: &Config) -> Config {
     // the log, whereas an operator whose alerting silently stopped finds out
     // the next time something breaks.
     if let Some(reloader) = &handles.alert_reloader {
+        // Which file this actually re-read. The reloader bound its path at
+        // startup, so if `alertfile=` now names a different one, the contents
+        // that just went live came from the OLD path. Saying "alertfile
+        // reloaded" and naming that path is how #494 read as success: the
+        // operator moved the file, got a line reporting a reload, and never
+        // learned their new file was not the one in effect. The `restart!`
+        // spec reports the path change separately; this makes the reload line
+        // itself stop implying otherwise.
+        let disposition = alertfile_disposition(new.alertfile.as_deref(), reloader.path());
         match reloader.apply() {
-            Ok(hooks) => tracing::info!(
-                hooks,
-                path = %reloader.path().display(),
-                "alertfile reloaded"
-            ),
+            Ok(hooks) => match disposition {
+                AlertfilePath::InEffect => tracing::info!(
+                    hooks,
+                    path = %reloader.path().display(),
+                    "alertfile reloaded"
+                ),
+                AlertfilePath::Changed => tracing::warn!(
+                    hooks,
+                    reloaded = %reloader.path().display(),
+                    configured = %new.alertfile.as_deref().unwrap_or(reloader.path()).display(),
+                    "alertfile contents reloaded from the path this node started with — the \
+                     newly configured path needs a restart to take effect"
+                ),
+                AlertfilePath::Unconfigured => tracing::warn!(
+                    hooks,
+                    reloaded = %reloader.path().display(),
+                    "alertfile contents reloaded, but alertfile= is no longer configured — the \
+                     dispatcher this node started with keeps running until restart"
+                ),
+            },
             Err(e) => tracing::error!(
                 error = %e,
+                path = %reloader.path().display(),
                 "alertfile reload failed — keeping the last-good webhook set"
             ),
         }
@@ -1115,6 +1182,79 @@ mod tests {
         assert!(find("timeout").apply.is_some(), "timeout should be live");
         assert!(find("dbcache").apply.is_none(), "dbcache should be restart-only");
         assert!(find("rpcport").apply.is_none(), "rpcport should be restart-only");
+    }
+
+    /// An external-file key whose handler binds the path at startup must have a
+    /// `restart!` spec, so a *path* change is reported rather than silently
+    /// applied to the old file (#494).
+    ///
+    /// `alertfile` had a handler and no spec: changing `alertfile=` and sending
+    /// SIGHUP re-read the previous file and logged "alertfile reloaded" naming
+    /// a path that was no longer configured. That is the accept-and-ignore
+    /// failure the config layer rejects unknown keys to prevent — and worse,
+    /// because it reports success.
+    #[test]
+    fn path_bound_file_keys_report_a_path_change_as_restart_required() {
+        let specs = field_specs();
+        for key in ["authfile", "alertfile"] {
+            let spec = specs
+                .iter()
+                .find(|s| s.key == key)
+                .unwrap_or_else(|| panic!("{key} must have a FieldSpec, not a handler entry alone"));
+            assert!(
+                spec.apply.is_none(),
+                "{key} binds its path at startup, so a path change is restart-required"
+            );
+        }
+        // Being in HANDLER_RELOAD_KEYS instead would satisfy the coverage test
+        // while leaving the path change unreported — the exact hole in #494.
+        assert!(
+            !HANDLER_RELOAD_KEYS.contains(&"alertfile"),
+            "alertfile is classified by its FieldSpec; listing it here too would \
+             let a future removal of that spec pass the coverage test silently"
+        );
+        // `policyfile` genuinely is fully live, path included: its handler
+        // matches on `new.policyfile`, so it reads whatever path the reloaded
+        // config names. It correctly has no spec.
+        assert!(
+            HANDLER_RELOAD_KEYS.contains(&"policyfile"),
+            "policyfile is handler-reloaded end to end"
+        );
+        assert!(
+            !specs.iter().any(|s| s.key == "policyfile"),
+            "policyfile must not also be restart-classified"
+        );
+    }
+
+    /// The reload line must not claim a file is in effect when it isn't.
+    ///
+    /// Classifying `alertfile` as restart-required tells the operator the path
+    /// change needs a restart, but the dispatcher's own log line still ran
+    /// unconditionally: it said `alertfile reloaded` and named the path bound at
+    /// startup. To an operator who has just edited `alertfile=`, that reads as
+    /// the new file having taken effect — the same accept-and-ignore reading
+    /// #494 was filed about, one layer down.
+    #[test]
+    fn the_alertfile_reload_line_distinguishes_the_running_file_from_the_configured_one() {
+        use std::path::Path;
+        let running = Path::new("/etc/satd/alerts.toml");
+
+        assert_eq!(
+            alertfile_disposition(Some(running), running),
+            AlertfilePath::InEffect,
+            "the ordinary case: contents re-read from the configured path"
+        );
+        assert_eq!(
+            alertfile_disposition(Some(Path::new("/etc/satd/alerts-v2.toml")), running),
+            AlertfilePath::Changed,
+            "a moved file must not be reported as reloaded"
+        );
+        assert_eq!(
+            alertfile_disposition(None, running),
+            AlertfilePath::Unconfigured,
+            "removing alertfile= leaves the dispatcher running until restart, \
+             which the operator has to be told"
+        );
     }
 
     /// The settings promoted to hot-reloadable in this change are all live.
