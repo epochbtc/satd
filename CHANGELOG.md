@@ -46,10 +46,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 - Fixed: the webhook plaintext-HTTP gate waived IPv4 link-local, so a hook URL
   of `http://169.254.169.254/...` was accepted without `allow_insecure_http`.
   Now only loopback and RFC1918 are waived, matching the IPv6 arm and the spec.
+  **Breaking:** a node with a link-local hook URL will not start until the URL
+  moves to `https://` or the stanza sets `allow_insecure_http = true`.
 - `-alertnotify` for edge events (currently `deep_reorg`) is rate-limited to one
-  exec per minute per event id. A burst previously queued one shell spawn per
-  occurrence on an unbounded channel. Nothing is collapsed: occurrences inside
-  the window are counted and reported on the next exec.
+  exec per minute per event id, and the window reports the **worst** occurrence
+  in it rather than the first — a shallow reorg can no longer claim the window
+  and reduce a deep one to a counter. A strictly worse occurrence escalates
+  immediately (once per window), the rest are held and paged when the window
+  closes, and a burst that stops is drained by the health poll.
+- Fixed: the active-warnings set is capped at 256 distinct ids, with the
+  overflow counted in one `warnings.truncated` row. Ids that embed an
+  identifier (one per corrupt block) could previously grow it without bound.
 
 - **P2P hardening:** the block-ingress mutation gate now ports Core's
   `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated

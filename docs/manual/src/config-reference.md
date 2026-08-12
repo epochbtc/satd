@@ -388,7 +388,7 @@ Core ZMQ wire-format compatible.)
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `blocknotify` | none | restart | core | Shell command run on each new best block; `%s` is replaced by the block hash. Commands run serially on a dedicated subscriber task; a slow hook never stalls block connection, because notifications coalesce instead. The command body is not logged (it may embed credentials). |
-| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). Runs serially like `blocknotify`. |
+| `alertnotify` | none | restart | core | Shell command run on each *new* node warning; `%s` is replaced by the warning text. Deduped by warning id (a repeated condition fires once, not per repeat). One-shot events such as `deep_reorg` have no standing condition to dedupe, so they are rate-limited instead: one exec per minute per event id, reporting the **worst** occurrence in the window rather than the first. Runs serially like `blocknotify`. See [Observability → Node-health alerts](observability.md#node-health-alerts). |
 | `startupnotify` | none | restart | core | Shell command run once after the node finishes starting up (no `%s`). Detached, so a slow hook does not delay startup. Prefer a systemd `ExecStartPost=`. |
 | `shutdownnotify` | none | restart | core | Shell command run once at the start of a graceful shutdown, before the final flush (no `%s`). Bounded by `maxshutdownsecs` so a hung hook can't wedge teardown. Prefer a systemd `ExecStopPost=`. |
 | `reorgwebhook` | none | hot | satd | HTTP(S) endpoint receiving a POST on reorg detection. |

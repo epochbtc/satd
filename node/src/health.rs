@@ -557,6 +557,11 @@ async fn run_detectors(
                     &state, &warnings, &publisher, &thresholds, &peer_manager,
                     &mut peers_below_since, &mut peers_ok_since, &detector_start,
                 );
+                // Drain any edge event the `-alertnotify` rate limiter is still
+                // holding. A burst that stops has no next occurrence to carry
+                // the worst of it out, and "the reorgs stopped" is exactly when
+                // an operator would otherwise hear nothing at all.
+                warnings.flush_due_events();
             }
         }
     }
@@ -596,7 +601,12 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
                 // first one would do that permanently. The durable record is
                 // `ReorgLog` plus the `status` event; this is only the page.
                 if event.state == StatusState::Edge {
-                    warnings.notify_event(&id, severity, event.message.clone());
+                    warnings.notify_event(
+                        &id,
+                        severity,
+                        event.message.clone(),
+                        edge_magnitude(&event),
+                    );
                 } else {
                     let context = serde_json::to_value(&event.details)
                         .unwrap_or(serde_json::Value::Null);
@@ -614,6 +624,29 @@ fn emit(warnings: &NodeWarnings, publisher: &EventPublisher, event: StatusEvent)
         event.message,
     );
     publisher.publish_status(event);
+}
+
+/// How bad *this* occurrence of an edge event is, on a per-kind scale.
+///
+/// The `-alertnotify` rate limiter ranks occurrences by this so that a burst
+/// pages about the worst of it rather than whichever arrived first: a depth-3
+/// reorg must not claim the window and leave a depth-200 reorg a second later
+/// counted and unreported.
+///
+/// Read out of `details` rather than added to `StatusEvent` as a field: the
+/// event is the wire format for the streaming API and the signed webhook body,
+/// and a rate-limiting hint is not something a consumer should be shipped. A
+/// kind with no meaningful scale ranks 0, where the limiter degrades to plain
+/// rate limiting.
+fn edge_magnitude(event: &StatusEvent) -> u64 {
+    match event.kind {
+        StatusKind::DeepReorg => event
+            .details
+            .get("depth")
+            .and_then(|d| d.parse::<u64>().ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// Raise a standing condition if it is not already raised.
@@ -2126,6 +2159,37 @@ mod tests {
         assert_eq!(detail(&env, "from_height"), "900");
         assert_eq!(detail(&env, "to_height"), "902");
         assert_eq!(detail(&env, "fork_height"), "896");
+    }
+
+    /// The depth an operator is paged about must be the depth that happened.
+    ///
+    /// The `-alertnotify` rate limiter ranks occurrences by [`edge_magnitude`],
+    /// which reads the `depth` detail back out of the event. That is a string
+    /// key: if it ever drifts — renamed, reformatted, dropped — every reorg
+    /// silently ranks 0, nothing is ever "worse" than anything else, and a deep
+    /// reorg arriving inside a shallow one's window is reduced to a counter with
+    /// no test failing anywhere. So this drives the whole path, from a reorg
+    /// record to the shell hook's message, rather than asserting on
+    /// `edge_magnitude` in isolation.
+    #[test]
+    fn a_deep_reorg_pages_even_when_a_shallow_one_just_claimed_the_window() {
+        let warnings = NodeWarnings::new();
+        let (tx, mut alerts) = tokio::sync::mpsc::unbounded_channel::<String>();
+        warnings.set_alert_notifier(tx);
+        let pubr = publisher();
+        let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
+        let mut seen = ReorgSeen::default();
+
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 896, 3, 3, 1)], &mut seen);
+        let shallow = alerts.try_recv().expect("the first reorg pages");
+        assert!(shallow.contains("rolled back 3 blocks"), "{shallow}");
+
+        // Same rate-limit window, two orders of magnitude worse.
+        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 700, 200, 3, 2)], &mut seen);
+        let deep = alerts.try_recv().expect(
+            "a 200-block reorg must not be swallowed by the window a 3-block reorg opened",
+        );
+        assert!(deep.contains("rolled back 200 blocks"), "{deep}");
     }
 
     /// The new tip is the end of the reconnected chain, not its first block.

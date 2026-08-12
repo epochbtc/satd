@@ -133,6 +133,35 @@ warning modal open — which on signet and testnet4, where reorgs several blocks
 deep are ordinary, would happen on the first one and never stop. The durable
 record of a reorg is the reorg log (`getreorghistory`), not the warnings set.
 
+Because they have no standing condition to dedupe against, one-shot events are
+rate-limited on the `alertnotify` hook instead: **one exec per minute per event
+id, reporting the worst occurrence in that window.** A run of reorgs otherwise
+queues one shell exec each on a channel drained one at a time, which grows
+without bound and pushes the hook further and further behind real time. Keeping
+the first occurrence and counting the rest would be worse still — a depth-3
+reorg would claim the window and a depth-200 reorg a second later would be
+reduced to an increment, so a script that halts trading on `alertnotify` would
+hear about the harmless one and not the serious one. So:
+
+* the first occurrence pages immediately;
+* an occurrence strictly deeper than anything already paged in the window
+  escalates through at once, capped at one escalation per window;
+* the rest are held, and the worst of them pages when the window closes,
+  carrying a count and the window as measured —
+  `rolled back 41 blocks [3 more in the previous 74s]`;
+* a burst that stops is drained by the detector poll, not left waiting for a
+  next occurrence.
+
+None of this touches the `status` event or `getreorghistory`, which carry every
+occurrence unthrottled. If you are building on reorg data, read those.
+
+The warnings set itself is capped at **256 distinct ids**, with anything past
+the cap counted in a single `warnings.truncated` row. Almost every id is a
+fixed string, but a few embed an identifier — a block whose stored data is
+unreadable gets one per block — and a storage fault across many blocks would
+otherwise fill `getwarnings`, the TUI modal, and the hook. Ids already active
+keep updating, and the node log carries every one in full.
+
 | Condition | Severity | Raises when | Clears when |
 |---|---|---|---|
 | `ibd_complete` | info | initial block download finishes | one-shot |
