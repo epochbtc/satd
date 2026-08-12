@@ -11,6 +11,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- satd now audits the height→hash index at startup and rebuilds missing rows
+  by walking the tip's ancestry, so a gap left by the reorg batching defect
+  below no longer needs a `-reindex` to clear. The height index is derived
+  state: the active chain is the tip's ancestry by definition, so no other
+  index row is consulted. One sequential scan; a clean node writes nothing.
+  The pass only *adds* rows for heights that have none, and never overwrites
+  one that is present — correcting a wrong row means choosing between branches
+  by chainwork, which it does not do; rows it walks past that disagree with the
+  tip's ancestry are logged. Heights whose blocks this chainstate has not
+  validated are reported separately from real damage, so an AssumeUTXO node
+  mid-validation is not told to reindex. Gaps it cannot rederive are logged as
+  errors instead of passing silently.
 - Fixed: a reorg could delete the height→hash and txindex rows the replacement
   block had just written. Disconnecting the displaced block and connecting the
   replacement coalesce into one write batch, which applies every put before

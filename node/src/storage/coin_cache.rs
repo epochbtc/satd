@@ -835,6 +835,38 @@ impl Store for CoinCache {
         self.inner.for_each_block_index(visit)
     }
 
+    /// Scans the inner store with the pending batch overlaid.
+    ///
+    /// Rows still buffered here have not reached the inner store, so a bare
+    /// passthrough would report a height as absent that this cache is about
+    /// to write — and the one caller that exists reads "absent" as "damaged,
+    /// rewrite it". Snapshot the pending state and drop the lock before the
+    /// scan: it can be long, and holding the batch lock across it would stall
+    /// every writer.
+    fn for_each_height_hash(
+        &self,
+        visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<crate::storage::HeightHashScanStats, StoreError> {
+        let (removed, overlaid) = {
+            let pending = self.pending_batch.lock();
+            let removed: std::collections::HashSet<u32> =
+                pending.height_hash_removes.iter().copied().collect();
+            let overlaid: std::collections::HashMap<u32, BlockHash> =
+                pending.height_hash_puts.iter().copied().collect();
+            (removed, overlaid)
+        };
+        let stats = self.inner.for_each_height_hash(&mut |height, hash| {
+            if removed.contains(&height) || overlaid.contains_key(&height) {
+                return;
+            }
+            visit(height, hash);
+        })?;
+        for (height, hash) in overlaid {
+            visit(height, hash);
+        }
+        Ok(stats)
+    }
+
     fn coin_count(&self) -> u64 {
         let base = self.inner.coin_count() as i64;
         let delta = self.count_delta.load(Ordering::Relaxed);
@@ -1801,6 +1833,56 @@ mod tests {
             "height {H} lost: a put and a remove for the same height survived \
              into one batch, and `write_batch` applies every put before every \
              remove"
+        );
+    }
+
+    /// The height-index scan must see rows that are still buffered here.
+    ///
+    /// Its only caller reads "no row" as "damaged, rederive it", so a bare
+    /// passthrough to the inner store would have the audit rebuild heights
+    /// this cache was about to write anyway — and, worse, miss that a pending
+    /// remove had already retired a row the inner store still holds.
+    #[test]
+    fn height_hash_scan_overlays_the_pending_batch() {
+        let cache = make_cache(10);
+        let committed = make_block_hash(0xC0);
+        let buffered = make_block_hash(0xC1);
+
+        // Land one row in the inner store with no coins dirty (pass-through).
+        let mut through = StoreBatch::default();
+        through.height_hash_puts.push((100, committed));
+        cache.write_batch(through).unwrap();
+
+        // Now dirty the coins so subsequent index ops buffer instead.
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x41, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        let mut buffered_batch = StoreBatch::default();
+        buffered_batch
+            .coin_puts
+            .push((make_outpoint(0x42, 0), make_coin(51, 1)));
+        buffered_batch.height_hash_puts.push((101, buffered));
+        buffered_batch.height_hash_removes.push(100);
+        cache.write_batch(buffered_batch).unwrap();
+
+        let mut seen: std::collections::HashMap<u32, BlockHash> =
+            std::collections::HashMap::new();
+        cache
+            .for_each_height_hash(&mut |h, hash| {
+                seen.insert(h, hash);
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen.get(&101),
+            Some(&buffered),
+            "a buffered put must be visible or the audit rewrites it"
+        );
+        assert_eq!(
+            seen.get(&100),
+            None,
+            "a buffered remove must hide the inner store's row"
         );
     }
 

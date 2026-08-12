@@ -2644,6 +2644,28 @@ impl ChainState {
         Ok(written)
     }
 
+    /// Audit the height→hash index for gaps at or below the tip and rederive
+    /// what can be rederived. See
+    /// [`crate::chain::height_index_repair`] for what it will and will not
+    /// touch.
+    ///
+    /// Independent of [`Self::repair_block_index_holes`]: that pass inspects
+    /// only heights strictly above the tip, this one writes only heights at or
+    /// below it, so the two never touch the same row.
+    pub fn repair_height_index(
+        &self,
+    ) -> Result<crate::chain::height_index_repair::HeightIndexAudit, ChainError> {
+        let tip_hash = self.tip_hash();
+        let tip_height = self.tip_height();
+        Ok(
+            crate::chain::height_index_repair::audit_and_repair_height_index(
+                &*self.store,
+                tip_hash,
+                tip_height,
+            )?,
+        )
+    }
+
     pub fn repair_block_index_holes(&self) -> Result<RepairOutcome, ChainError> {
         use crate::storage::flatfile::FlatFilePos;
         let tip_height = self.tip_height();

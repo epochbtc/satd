@@ -1984,6 +1984,28 @@ impl Store for RocksDbStore {
         Ok(stats)
     }
 
+    fn for_each_height_hash(
+        &self,
+        visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<crate::storage::HeightHashScanStats, StoreError> {
+        let cf = self.cf(CF_HEIGHT_INDEX);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut stats = crate::storage::HeightHashScanStats::default();
+        for item in iter {
+            let (k, v) = item.map_err(|e| StoreError::Database(e.to_string()))?;
+            let Ok(key) = <[u8; 4]>::try_from(k.as_ref()) else {
+                stats.skipped_bad_key += 1;
+                continue;
+            };
+            let Some(hash) = hash_from_bytes(&v) else {
+                stats.skipped_bad_value += 1;
+                continue;
+            };
+            visit(u32::from_le_bytes(key), hash);
+        }
+        Ok(stats)
+    }
+
     fn coin_count(&self) -> u64 {
         self.read_u64_meta(UTXO_COUNT_KEY)
     }
@@ -3208,6 +3230,63 @@ mod tests {
         assert_eq!(recovered, hash);
 
         assert!(store.get_block_hash_by_height(999).is_none());
+    }
+
+    /// The scan has to round-trip the real on-disk key encoding. Heights are
+    /// stored little-endian, so lexicographic iteration order is not numeric
+    /// — a scan that assumed otherwise would still return every row, which is
+    /// all its caller needs, but decoding the key wrongly would silently
+    /// report the wrong heights as present.
+    #[test]
+    fn height_hash_scan_returns_every_row_with_its_true_height() {
+        let (store, _dir) = temp_store(false);
+
+        // Heights chosen to straddle byte boundaries, where a wrong-endian
+        // decode would reorder or corrupt them.
+        let heights = [0u32, 1, 255, 256, 65_535, 65_536, 956_337, 962_163];
+        let mut batch = StoreBatch::default();
+        for (i, h) in heights.iter().enumerate() {
+            batch.height_hash_puts.push((*h, make_block_hash(i as u8)));
+        }
+        store.write_batch(batch).unwrap();
+
+        let mut seen: Vec<(u32, BlockHash)> = Vec::new();
+        let stats = store
+            .for_each_height_hash(&mut |h, hash| seen.push((h, hash)))
+            .unwrap();
+        assert_eq!(stats, crate::storage::HeightHashScanStats::default());
+
+        seen.sort_by_key(|(h, _)| *h);
+        let mut expected: Vec<(u32, BlockHash)> = heights
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, make_block_hash(i as u8)))
+            .collect();
+        expected.sort_by_key(|(h, _)| *h);
+        assert_eq!(seen, expected);
+    }
+
+    /// A row removed from the index must not come back in the scan — the
+    /// caller uses absence to decide a height needs repair.
+    #[test]
+    fn height_hash_scan_omits_removed_rows() {
+        let (store, _dir) = temp_store(false);
+        let mut batch = StoreBatch::default();
+        batch.height_hash_puts.push((10, make_block_hash(0x10)));
+        batch.height_hash_puts.push((11, make_block_hash(0x11)));
+        store.write_batch(batch).unwrap();
+
+        let batch = StoreBatch {
+            height_hash_removes: vec![10],
+            ..Default::default()
+        };
+        store.write_batch(batch).unwrap();
+
+        let mut seen: Vec<u32> = Vec::new();
+        store
+            .for_each_height_hash(&mut |h, _| seen.push(h))
+            .unwrap();
+        assert_eq!(seen, vec![11]);
     }
 
     /// Pins the apply-order contract that `StoreBatch::merge` depends on.

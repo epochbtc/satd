@@ -707,6 +707,76 @@ async fn main() {
         }
     }
 
+    // Audit the height→hash index for gaps at or below the tip. Derived
+    // state, fully rebuildable by walking the tip's ancestry, so a gap is
+    // repaired in place rather than requiring a reindex. One sequential scan;
+    // on a clean node it writes nothing.
+    //
+    // Placed here so it completes before the node serves RPC or connects to
+    // peers, i.e. before anything can observe a damaged index. It is
+    // deliberately NOT ordered against `repair_block_index_holes` below —
+    // that pass only inspects heights strictly above the tip, and this one
+    // only writes heights at or below it, so the two ranges are disjoint.
+    match chain_state.repair_height_index() {
+        Ok(audit) => {
+            // Cap what we print: these can carry thousands of heights and a
+            // log line is not a data dump.
+            const SHOW: usize = 16;
+            if audit.skipped_bulk {
+                tracing::info!(
+                    missing = audit.missing.len(),
+                    "Height index is missing most heights at or below the tip; \
+                     declining to rewrite it. Expected while an AssumeUTXO \
+                     snapshot's history is still being validated"
+                );
+            } else if !audit.is_clean() {
+                if !audit.repaired.is_empty() {
+                    tracing::warn!(
+                        repaired = audit.repaired.len(),
+                        heights = ?audit.repaired.iter().take(SHOW).collect::<Vec<_>>(),
+                        elapsed_secs = audit.elapsed_secs,
+                        "Height index had gaps at or below the tip; rederived \
+                         from the tip's ancestry"
+                    );
+                }
+                if !audit.pending_validation.is_empty() {
+                    // Not a fault: the blocks exist but this chainstate has
+                    // not validated them, which is the ordinary state of an
+                    // AssumeUTXO snapshot's history. The background validator
+                    // writes these rows itself.
+                    tracing::info!(
+                        count = audit.pending_validation.len(),
+                        "Height index rows absent for blocks not yet validated \
+                         by this chainstate; leaving them to the validator"
+                    );
+                }
+                if !audit.mismatched.is_empty() {
+                    tracing::error!(
+                        count = audit.mismatched.len(),
+                        heights = ?audit.mismatched.iter().take(SHOW).collect::<Vec<_>>(),
+                        "Height index rows disagree with the tip's ancestry. \
+                         NOT corrected — resolving these means choosing between \
+                         branches by chainwork. A -reindex rebuilds them"
+                    );
+                }
+                if !audit.unrepairable.is_empty() {
+                    tracing::error!(
+                        count = audit.unrepairable.len(),
+                        heights = ?audit.unrepairable.iter().take(SHOW).collect::<Vec<_>>(),
+                        bad_key_rows = audit.scan_stats.skipped_bad_key,
+                        bad_value_rows = audit.scan_stats.skipped_bad_value,
+                        "Height index gaps could NOT be rederived; \
+                         getblockhash will fail at these heights until a \
+                         -reindex"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Height index audit failed; continuing startup");
+        }
+    }
+
     // Repair any HeaderOnly block-index entries above tip whose data is
     // actually present in the flat files. Idempotent: when there are no
     // holes (the healthy case) it's just one cheap index walk over

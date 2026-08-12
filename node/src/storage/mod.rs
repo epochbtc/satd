@@ -440,6 +440,18 @@ pub struct BlockIndexScanStats {
     pub skipped_bad_value: u64,
 }
 
+/// Counts of corruption surfaced during a `for_each_height_hash` scan.
+/// Mirrors [`BlockIndexScanStats`]: a bad row is reported rather than
+/// silently treated as absent, because the caller's whole purpose is
+/// deciding which heights have no row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeightHashScanStats {
+    /// Rows whose key was not a 4-byte height.
+    pub skipped_bad_key: u64,
+    /// Rows whose value was not a 32-byte block hash.
+    pub skipped_bad_value: u64,
+}
+
 /// Abstract storage backend for block index, UTXO set, and metadata.
 pub trait Store: Send + Sync {
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry>;
@@ -588,6 +600,27 @@ pub trait Store: Send + Sync {
         _visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
     ) -> Result<BlockIndexScanStats, StoreError> {
         Ok(BlockIndexScanStats::default())
+    }
+
+    /// Visit every persisted height→hash row.
+    ///
+    /// `get_block_hash_by_height` answers one height; this walks the whole
+    /// index sequentially, which is the cheap way to find heights that have
+    /// no row at all. Rows arrive in the index's own key order — the key is
+    /// a little-endian height, so that order is not numeric and callers must
+    /// not assume it is.
+    ///
+    /// The default refuses rather than reporting an empty scan. A caller that
+    /// read "no rows" as "every height is missing" would set about rewriting
+    /// the entire index, so an unimplemented backend has to be distinguishable
+    /// from a genuinely empty one.
+    fn for_each_height_hash(
+        &self,
+        _visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<HeightHashScanStats, StoreError> {
+        Err(StoreError::Database(
+            "height→hash scan not supported by this store".into(),
+        ))
     }
 
     /// Force a full compaction of the chainstate (coins) column family.

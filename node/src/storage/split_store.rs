@@ -112,6 +112,15 @@ impl Store for SplitStore {
         self.block_store.for_each_block_index(visit)
     }
 
+    /// The height index is routed to the block store on write, so that is
+    /// where the scan has to read from.
+    fn for_each_height_hash(
+        &self,
+        visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<crate::storage::HeightHashScanStats, StoreError> {
+        self.block_store.for_each_height_hash(visit)
+    }
+
     // ---- coins store (private) ----
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
         self.coins_store.get_coin(outpoint)
