@@ -264,6 +264,10 @@ pub struct ChainState {
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
+    /// When [`Self::next_block_to_connect`] last ran its full block-index scan,
+    /// and for which `(tip, height)`. The scan is O(index); the connector polls
+    /// once a second. See the throttle in `next_block_to_connect`.
+    connector_scan_last: Mutex<Option<(BlockHash, u32, std::time::Instant)>>,
     /// Number of threads for parallel script verification.
     num_threads: usize,
     /// Address-history index runtime config. Threaded into every
@@ -476,6 +480,7 @@ impl ChainState {
                     headers_tip_height: AtomicU32::new(htip),
                     best_header: RwLock::new(best_header),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
+                    connector_scan_last: Mutex::new(None),
                     num_threads,
                     address_index,
                     sp_index,
@@ -582,6 +587,7 @@ impl ChainState {
             headers_tip_height: AtomicU32::new(0),
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
+            connector_scan_last: Mutex::new(None),
             num_threads,
             address_index,
             sp_index,
@@ -5986,6 +5992,33 @@ impl ChainState {
         Ok(children)
     }
 
+    /// How often [`Self::next_block_to_connect`] may run its full block-index
+    /// scan for the same stuck `(tip, height)`. Long enough that a wedged
+    /// connector costs a scan a minute rather than one a second; short enough
+    /// that a block arriving mid-wedge is picked up promptly.
+    const CONNECTOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Whether the fallback scan may run now. Always true when the tip or the
+    /// height has moved — progress means the previous answer is stale — and
+    /// otherwise only once per [`Self::CONNECTOR_SCAN_INTERVAL`].
+    fn connector_scan_due(&self, tip: BlockHash, next_height: u32) -> bool {
+        let now = std::time::Instant::now();
+        let mut last = self.connector_scan_last.lock();
+        match *last {
+            Some((t, h, when))
+                if t == tip
+                    && h == next_height
+                    && now.duration_since(when) < Self::CONNECTOR_SCAN_INTERVAL =>
+            {
+                false
+            }
+            _ => {
+                *last = Some((tip, next_height, now));
+                true
+            }
+        }
+    }
+
     /// The block the sequential connector should attempt at `next_height`
     /// (always `tip_height + 1`).
     ///
@@ -6006,11 +6039,19 @@ impl ChainState {
     ///
     /// Fast path is unchanged from before — one point lookup, and a row naming
     /// a block whose parent is the tip is taken as-is, including a header whose
-    /// block has not been downloaded yet (the caller waits for the data). The
-    /// scan below runs only when the row names something that cannot extend
-    /// this chain, which cannot happen on a healthy node and is bounded by the
-    /// length of the dead branch when it does: each block connected rewrites
-    /// its own height row, so a height is only ever repaired once.
+    /// block has not been downloaded yet (the caller waits for the data).
+    ///
+    /// **This never returns `None` when the height row exists.** When the scan
+    /// finds no better candidate it hands back the row unchanged, which is
+    /// precisely what the connector read before this function existed. That
+    /// matters because the connector's recovery from a fork-blocked frontier is
+    /// reached only *through a connect error*: `connect_stored_block` returns
+    /// `BadPrevBlock`, the caller counts to 30, and if a competing higher-work
+    /// header chain exists it tears down the IBD scheduler and hands off to the
+    /// reorg-capable steady-state path. Returning `None` here would instead
+    /// park the connector on its "waiting for header" branch, which sleeps a
+    /// second and loops without incrementing that counter — trading a
+    /// thirty-second self-heal for an unbounded silent stall.
     pub fn next_block_to_connect(&self, next_height: u32) -> Option<BlockHash> {
         let tip = self.tip_hash();
         let row = self.store.get_block_hash_by_height(next_height)?;
@@ -6022,32 +6063,68 @@ impl ChainState {
             return Some(row);
         }
 
+        // The scan below is O(block index) — a full iterate-and-deserialize,
+        // ~1M rows on mainnet — and the connector polls this once a second. On
+        // the path that motivated it that is fine: it finds the canonical
+        // child, connecting rewrites that height's row, and each poisoned
+        // height is repaired once. But when no connectable child exists the
+        // connector polls forever, and scanning the whole index every second
+        // would burn a core on a node that is already in trouble. Rate-limit
+        // it; between scans fall back to the row, which is what the connector
+        // read before this function existed.
+        if !self.connector_scan_due(tip, next_height) {
+            return Some(row);
+        }
+
         // Ask the chain instead of the index: the block to connect is a child
         // of the tip that carries data and has not been invalidated. Highest
         // chainwork wins, ties broken by hash so the choice is deterministic.
-        let children = self.block_index_children().ok()?;
+        //
+        // `DataStored` exactly, not `DataStored | Valid` as elsewhere in this
+        // file: `connect_stored_block` refuses anything else, so returning a
+        // `Valid` child (one a reorg displaced — `disconnect_block` writes no
+        // status, so displaced blocks keep the marker) would hand the caller a
+        // block it cannot connect. Reaching such a child is a reorg, not a
+        // sequential connect, and the fallthrough below routes it there.
         let mut best: Option<BlockIndexEntry> = None;
-        for child in children.get(&tip)? {
-            let Some(e) = self.store.get_block_index(child) else {
-                continue;
-            };
-            if e.status != BlockStatus::DataStored {
-                continue;
-            }
-            let better = match &best {
-                None => true,
-                Some(b) => match compare_u256(&e.chainwork, &b.chainwork) {
-                    1 => true,
-                    -1 => false,
-                    _ => *child < b.header.block_hash(),
-                },
-            };
-            if better {
-                best = Some(e);
+        if let Ok(children) = self.block_index_children()
+            && let Some(kids) = children.get(&tip)
+        {
+            for child in kids {
+                let Some(e) = self.store.get_block_index(child) else {
+                    continue;
+                };
+                if e.status != BlockStatus::DataStored || e.height != next_height {
+                    continue;
+                }
+                let better = match &best {
+                    None => true,
+                    Some(b) => match compare_u256(&e.chainwork, &b.chainwork) {
+                        1 => true,
+                        -1 => false,
+                        _ => *child < b.header.block_hash(),
+                    },
+                };
+                if better {
+                    best = Some(e);
+                }
             }
         }
 
-        let found = best?;
+        let Some(found) = best else {
+            // Nothing better to offer. Hand back the row so the caller's
+            // existing BadPrevBlock -> retry -> fork-handoff recovery still
+            // runs, and so its "stuck waiting for block data" diagnostic —
+            // which is what made this class of stall debuggable — still fires.
+            tracing::debug!(
+                height = next_height,
+                row = %row,
+                tip = %tip,
+                "height row does not extend the tip and no connectable child \
+                 exists; leaving the row for the caller's stall handling"
+            );
+            return Some(row);
+        };
         let hash = found.header.block_hash();
         tracing::warn!(
             height = next_height,
