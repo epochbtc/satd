@@ -52,13 +52,21 @@
 //! direction, since the cost of a false floor is a missed detection while the
 //! cost of a false hole is refusing to start a healthy node.
 //!
-//! The snapshot base itself is the one block the structural rule cannot
-//! classify, because it sits at the *top* of the unvalidated run rather than
-//! inside it: right after `loadtxoutset` the base is the tip, with nothing
-//! connected above it to make it a hole and nothing connected below it to make
-//! it a floor. Its coins are present — streamed in wholesale — so the caller
-//! passes it in and it counts as connected until the background chainstate
-//! writes `Valid` over it.
+//! The structural rule alone is not enough on an AssumeUTXO node, for two
+//! reasons, so the caller also passes the snapshot height and everything at or
+//! below it is floor by fiat:
+//!
+//! - Right after `loadtxoutset` the base *is* the tip, with nothing connected
+//!   above it to make it a hole and nothing below it to make it a floor. Its
+//!   coins are present — streamed in wholesale — so it must count as connected.
+//! - More importantly, the unvalidated history does not stay contiguous. The
+//!   background chainstate re-validates genesis→base with `connect_block`, and
+//!   `SplitStore` routes its block-index writes to the *shared* store, so
+//!   mid-validation the range below the base reads `Valid` up to wherever the
+//!   background has reached and non-`Valid` above that. That is connected
+//!   blocks *beneath* unconnected ones — precisely the shape the structural
+//!   rule calls damage. A healthy AssumeUTXO node would have been told its
+//!   chainstate was corrupt and to throw the snapshot away.
 
 use bitcoin::BlockHash;
 
@@ -73,9 +81,11 @@ use crate::storage::blockindex::BlockStatus;
 /// whether or not its coins are intact, so walking further buys no detection —
 /// only cost.
 ///
-/// One retarget period. At one block-index point lookup per height, served
-/// from the block cache and the in-memory overlay, the whole pass is
-/// microseconds-per-block against a startup that is already doing far more.
+/// One retarget period, at one block-index point lookup per height. These are
+/// cold reads: the pass runs at startup, when the in-memory overlay is empty
+/// and RocksDB's block cache is unwarmed. Sub-second on an SSD, a couple of
+/// seconds on a spinning disk — worth stating, since it is paid on every start
+/// including healthy ones.
 pub const DEFAULT_ANCESTRY_WINDOW: u32 = 2016;
 
 /// An ancestor of the tip that this chainstate never connected.
@@ -131,15 +141,27 @@ impl TipAncestryAudit {
 /// Walk `window` ancestors down from the tip and classify every one that this
 /// chainstate never connected.
 ///
-/// `tip_hash` must be the block at `tip_height`. `snapshot_base` is the
-/// AssumeUTXO base block when a background chainstate is attached, and counts
-/// as connected — see the module docs.
+/// `tip_hash` must be the block at `tip_height`. `snapshot_height` is the
+/// height of the AssumeUTXO base when a background chainstate is attached;
+/// everything at or below it is floor, never a hole.
+///
+/// It has to be the whole range below the base rather than the base block
+/// alone. The background chainstate re-validates genesis→base through
+/// `connect_block`, and `SplitStore` routes its block-index writes to the
+/// *shared* store — so mid-validation the index reads `Valid` for the blocks
+/// the background has reached and non-`Valid` for the ones it has not. That
+/// puts connected blocks *beneath* unconnected ones, which is exactly the
+/// shape the floor rule treats as damage. Exempting only the base block by
+/// hash would have let a healthy AssumeUTXO node report the whole unvalidated
+/// band as holes and refuse to start, telling the operator to
+/// `-reindex-chainstate` and throw the snapshot away. `check_block_index`
+/// already scopes itself this way for the same reason.
 pub fn audit_tip_ancestry(
     store: &dyn Store,
     tip_hash: BlockHash,
     tip_height: u32,
     window: u32,
-    snapshot_base: Option<BlockHash>,
+    snapshot_height: Option<u32>,
 ) -> TipAncestryAudit {
     let started = std::time::Instant::now();
     let mut audit = TipAncestryAudit {
@@ -194,11 +216,12 @@ pub fn audit_tip_ancestry(
     //
     // `Pruned` counts as connected: pruning removes block data from a block
     // that was connected, and keeps its header. It never applies to a block
-    // whose coins were not written. The snapshot base counts too — its coins
-    // are present without this chainstate having connected it.
+    // whose coins were not written. Anything at or below the AssumeUTXO base
+    // counts too — its coins are present without this chainstate having
+    // connected it, and the background rewrites that range as it goes.
     let connected = |a: &UnconnectedAncestor| {
         matches!(a.status, BlockStatus::Valid | BlockStatus::Pruned)
-            || snapshot_base == Some(a.hash)
+            || snapshot_height.is_some_and(|h| a.height <= h)
     };
 
     match chain.iter().rposition(&connected) {
@@ -209,6 +232,24 @@ pub fn audit_tip_ancestry(
                 .cloned()
                 .collect();
             audit.unvalidated_floor = chain[floor_idx + 1..].to_vec();
+            // The snapshot range is exempt from being a hole, but it is still
+            // history this chainstate has not validated, so report it as floor
+            // rather than dropping it — that count is what tells an operator
+            // the background still has work to do.
+            if let Some(h) = snapshot_height {
+                audit.unvalidated_floor.extend(
+                    chain[..=floor_idx]
+                        .iter()
+                        .filter(|a| {
+                            a.height <= h
+                                && !matches!(
+                                    a.status,
+                                    BlockStatus::Valid | BlockStatus::Pruned
+                                )
+                        })
+                        .cloned(),
+                );
+            }
         }
         None => {
             // Nothing in the window was connected here, so there is no
@@ -477,14 +518,16 @@ mod tests {
         let without = audit_tip_ancestry(&store, hashes[49], 49, 2016, None);
         assert!(!without.is_intact());
 
-        let audit = audit_tip_ancestry(&store, hashes[49], 49, 2016, Some(hashes[49]));
+        let audit = audit_tip_ancestry(&store, hashes[49], 49, 2016, Some(49));
         assert!(audit.is_intact());
         assert!(audit.holes.is_empty());
-        assert_eq!(audit.unvalidated_floor.len(), 49);
+        // All 50, the base included: none of them was validated by this
+        // chainstate, which is what the floor reports.
+        assert_eq!(audit.unvalidated_floor.len(), 50);
     }
 
-    /// The exemption covers exactly one block. A hole above the base is still
-    /// a hole.
+    /// The exemption covers the snapshot range and stops there. A hole above
+    /// the base is still a hole.
     #[test]
     fn snapshot_base_does_not_excuse_a_hole_above_it() {
         let store = InMemoryStore::new();
@@ -499,11 +542,12 @@ mod tests {
             set_status(&store, *hash, BlockStatus::DataStored);
         }
 
-        let audit = audit_tip_ancestry(&store, hashes[49], 49, 2016, Some(hashes[40]));
+        let audit = audit_tip_ancestry(&store, hashes[49], 49, 2016, Some(40));
         assert!(!audit.is_intact());
         let heights: Vec<u32> = audit.holes.iter().map(|a| a.height).collect();
         assert_eq!(heights, vec![45, 46, 47]);
-        assert_eq!(audit.unvalidated_floor.len(), 40);
+        // 0..=40 — the snapshot range, base included.
+        assert_eq!(audit.unvalidated_floor.len(), 41);
     }
 
     /// Genesis terminates the walk without a break.

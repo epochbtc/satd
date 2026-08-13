@@ -28,6 +28,12 @@ use node::validation::script::{ConsensusVerifier, RustVerifier, ScriptVerifier, 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Exit status for "the chainstate on disk is damaged and I will not serve it".
+/// Startup uses a bare `exit(1)` for the ordinary refusals — bad config, an
+/// unwritable datadir — and this condition needs a different response from an
+/// operator (stop, audit, reindex) than those do, so it gets its own code.
+const EXIT_CHAINSTATE_DAMAGED: i32 = 3;
+
 /// Watchdog probe over the shared chain state. Uses `is_responsive`
 /// (non-blocking try_read on the tip lock) so a wedged writer in
 /// connect/disconnect-block suppresses watchdog pings — systemd kills
@@ -807,21 +813,54 @@ async fn main() {
                     "Tip is standing on blocks this node never connected"
                 );
             }
+            // Two different faults reach here and they do not have the same
+            // remedy. Holes mean the UTXO set is missing block deltas, which
+            // -reindex-chainstate rebuilds. A broken parent pointer means the
+            // block index itself is wrong, and -reindex-chainstate trusts the
+            // block index — it cannot fix that, and saying so would send an
+            // operator into a multi-hour replay that ends where it started.
+            if let Some(broken) = &audit.broken {
+                eprintln!(
+                    "FATAL: the chainstate tip's ancestry could not be walked: {:?}\n\
+                     The block index disagrees with itself, so this node cannot establish\n\
+                     which blocks its UTXO set was built from.\n\
+                     \n\
+                     Walked {} block(s) down to height {} before stopping.\n\
+                     \n\
+                     Refusing to start. Rebuild the block index with -reindex.\n\
+                     -reindex-chainstate will NOT fix this: it trusts the same block index.",
+                    broken, audit.blocks_checked, audit.lowest_height,
+                );
+            } else {
+                eprintln!(
+                    "FATAL: the chainstate tip stands on {} block(s) that were never connected.\n\
+                     The UTXO set is missing every output those blocks created, so this node\n\
+                     would answer gettxout and every wallet-facing index incorrectly while\n\
+                     reporting a healthy synced tip.\n\
+                     \n\
+                     Affected heights: {:?}{}\n\
+                     \n\
+                     Refusing to start. Rebuild the UTXO set with -reindex-chainstate.",
+                    audit.holes.len(),
+                    audit.holes.iter().take(SHOW).map(|a| a.height).collect::<Vec<_>>(),
+                    if audit.holes.len() > SHOW { " (truncated)" } else { "" },
+                );
+            }
             eprintln!(
-                "FATAL: the chainstate tip stands on {} block(s) that were never connected.\n\
-                 The UTXO set is missing every output those blocks created, so this node\n\
-                 would answer gettxout and every wallet-facing index incorrectly while\n\
-                 reporting a healthy synced tip.\n\
+                "\n\
+                 Before reindexing, you can see exactly what disagrees without starting\n\
+                 the node — it reads the blocks back and checks them against the UTXO set:\n\
                  \n\
-                 Affected heights: {:?}{}\n\
+                 \x20   satd-chainstate-audit --datadir <this datadir>\n\
                  \n\
-                 Refusing to start. Rebuild the UTXO set with -reindex-chainstate.",
-                audit.holes.len(),
-                audit.holes.iter().take(SHOW).map(|a| a.height).collect::<Vec<_>>(),
-                if audit.holes.len() > SHOW { " (truncated)" } else { "" },
+                 A small hole may be cheaper to repair with satd-chainstate-repair than to\n\
+                 reindex. Both tools require the node to be stopped."
             );
             auth.cleanup();
-            std::process::exit(1);
+            // Distinct from the generic exit(1) used throughout startup, so an
+            // operator's alerting can tell "chainstate is damaged" apart from
+            // "the config file has a typo" without scraping stderr.
+            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
         }
         if !audit.unvalidated_floor.is_empty() {
             // Normal on an AssumeUTXO node: history below the snapshot base

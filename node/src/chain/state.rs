@@ -87,6 +87,14 @@ pub enum ChainError {
     Duplicate,
     #[error("bad-prevblk")]
     BadPrevBlock,
+    /// The parent is a block this chainstate never connected. Distinct from
+    /// [`Self::BadPrevBlock`], which the connector reads as "the frontier is
+    /// fork-blocked" and recovers from by handing off to the reorg path. That
+    /// recovery is wrong here and actively harmful: it clears the operator
+    /// warning on the grounds that the transition is self-healing, and this
+    /// one never heals — the coins those ancestors created are simply absent.
+    #[error("parent-never-connected")]
+    ParentNeverConnected,
     #[error("Block decode failed")]
     DecodeFailed,
     #[error("checkpoint mismatch at height {0}")]
@@ -2705,7 +2713,7 @@ impl ChainState {
         height: u32,
     ) -> Result<(), ChainError> {
         let Some(parent) = self.store.get_block_index(parent_hash) else {
-            return Err(ChainError::BadPrevBlock);
+            return Err(ChainError::ParentNeverConnected);
         };
         if matches!(parent.status, BlockStatus::Valid | BlockStatus::Pruned) {
             return Ok(());
@@ -2726,7 +2734,7 @@ impl ChainState {
             parent_status = ?parent.status,
             "refusing to connect onto a parent this chainstate never connected"
         );
-        Err(ChainError::BadPrevBlock)
+        Err(ChainError::ParentNeverConnected)
     }
 
     /// Check that every recent ancestor of the tip is a block this chainstate
@@ -2741,7 +2749,7 @@ impl ChainState {
             self.tip_hash(),
             self.tip_height(),
             crate::chain::tip_ancestry::DEFAULT_ANCESTRY_WINDOW,
-            self.background().map(|bg| bg.snapshot_hash()),
+            self.background().map(|bg| bg.snapshot_height()),
         )
     }
 
@@ -2960,9 +2968,17 @@ impl ChainState {
         }
 
         // The tip must be a block whose coins were actually applied, not just
-        // one whose hash matches. Read fresh from the store rather than
-        // trusting `pre.parent`: the prefetcher captured that entry before the
-        // parent connected, so its status is stale by construction.
+        // one whose hash matches. Re-read rather than trusting `pre.parent`:
+        // the prefetcher captured that entry before the parent connected, so
+        // its status is stale by construction.
+        //
+        // "Re-read", not "read from disk": the store here is the `CoinCache`,
+        // and its block-index LRU answers before the inner store does. So this
+        // sees the intent of writes still buffered in the pending batch, and
+        // catches a divergence that has reached disk only on the first connect
+        // after a restart, or once the entry has been evicted. That is a real
+        // limit on what it can detect — the startup ancestry audit is the pass
+        // that reads the persisted state cold.
         if let Err(e) =
             self.require_connected_parent(&current_tip, &pre.hash, pre.height)
         {
@@ -5399,6 +5415,15 @@ impl ChainState {
 
             // Fall through to connect the new block as a tip-extending block
         }
+
+        // The block about to be connected must sit on a parent this chainstate
+        // actually connected. The two sequential-connect paths check this; a
+        // synced node does not use them — it arrives here, from P2P, from
+        // `submitblock` and from internal mining — and the divergence this
+        // guards against was observed on a synced node. Placed after the reorg
+        // fallthrough so it sees the tip the reorg left behind, not the one it
+        // started from.
+        self.require_connected_parent(&prev_hash, &block_hash, new_height)?;
 
         // Determine script verifier: skip if below assumevalid height
         let use_noop = self.should_skip_scripts(new_height);
@@ -10367,7 +10392,7 @@ pub(crate) mod tests {
 
         let result = cs.connect_stored_block(&next.block_hash());
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
+            matches!(result, Err(ChainError::ParentNeverConnected)),
             "connecting onto an unconnected parent must be refused, got {result:?}"
         );
         assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
@@ -10398,7 +10423,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 cs.connect_stored_block(&next.block_hash()),
-                Err(ChainError::BadPrevBlock)
+                Err(ChainError::ParentNeverConnected)
             ),
             "without a snapshot base to point at, an unconnected parent is damage"
         );
@@ -10489,7 +10514,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 cs.connect_stored_block(&next.block_hash()),
-                Err(ChainError::BadPrevBlock)
+                Err(ChainError::ParentNeverConnected)
             ),
             "only the base itself is exempt"
         );

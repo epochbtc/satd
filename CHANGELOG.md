@@ -13,14 +13,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
-  reporting a healthy synced tip. Both sequential connect paths now require the
-  parent to be a block this chainstate actually connected, not merely one whose
-  hash matches; `connect_preprocessed_block` additionally checks that the block,
-  the index entry authorising it and the hash the tip is set to all agree, the
-  identity check its flat-file counterpart already had. At startup satd walks
-  the tip's ancestry and refuses to start when it finds a block it never
-  connected, rather than serving wrong `gettxout` answers. An AssumeUTXO
-  snapshot's unvalidated history is recognised and is not an error.
+  reporting a healthy synced tip. Every connect path — both sequential (IBD)
+  paths and the steady-state `accept_block` a synced node uses — now requires
+  the parent to be a block this chainstate actually connected, not merely one
+  whose hash matches; `connect_preprocessed_block` additionally checks that the
+  block, the index entry authorising it and the hash the tip is set to all
+  agree, the identity check its flat-file counterpart already had. At startup
+  satd walks the tip's ancestry and refuses to start when it finds a block it
+  never connected, rather than serving wrong `gettxout` answers, exiting with
+  status 3 and naming `satd-chainstate-audit`; a broken parent pointer is
+  reported separately, with `-reindex` as its remedy. An AssumeUTXO snapshot's
+  unvalidated history is recognised and is not an error.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
 
