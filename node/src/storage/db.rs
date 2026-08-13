@@ -285,6 +285,18 @@ impl Store for InMemoryStore {
         Ok(crate::storage::BlockIndexScanStats::default())
     }
 
+    fn for_each_height_hash(
+        &self,
+        visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<crate::storage::HeightHashScanStats, StoreError> {
+        let hi = self.height_index.read();
+        for (height, hash) in hi.iter() {
+            visit(*height, *hash);
+        }
+        // In-memory map can't carry corrupt rows; stats are always zero.
+        Ok(crate::storage::HeightHashScanStats::default())
+    }
+
     fn coin_count(&self) -> u64 {
         self.coins.read().len() as u64
     }

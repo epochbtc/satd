@@ -171,7 +171,7 @@ pub fn get_raw_transaction(
             if tx.compute_txid() == txid {
                 return if verbose {
                     let height = entry.as_ref().map(|e| e.height);
-                    let confirmations = height.map(|h| confirmations_for(chain_state, h));
+                    let confirmations = height.map(|h| confirmations_for(chain_state, &block_hash, h));
                     Ok(decode_transaction_verbose(
                         tx,
                         Some(hash_str),
@@ -196,7 +196,7 @@ pub fn get_raw_transaction(
                         return if verbose {
                             let height = entry.as_ref().map(|e| e.height);
                             let confirmations =
-                                height.map(|h| confirmations_for(chain_state, h));
+                                height.map(|h| confirmations_for(chain_state, &block_hash, h));
                             Ok(decode_transaction_verbose(
                                 tx,
                                 Some(&block_hash.to_string()),
@@ -230,9 +230,19 @@ pub fn decode_raw_transaction(hex_tx: &str) -> Result<Value, (i32, String)> {
 /// `(tip - block_height) + 1`, saturating to 0 if the block is
 /// somehow ahead of the tip (only reachable across a reorg race we
 /// don't otherwise protect against here).
-fn confirmations_for(chain_state: &ChainState, block_height: u32) -> u64 {
+/// Confirmations for a transaction found in a block.
+///
+/// Core's convention for `getrawtransaction` is depth when the containing
+/// block is on the active chain and **0** when it is not — unlike
+/// `getblock`/`getblockheader`, which use `-1` for the off-chain case. Without
+/// the active-chain test a transaction that exists only on a losing branch
+/// reports the same depth as a confirmed one.
+fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, block_height: u32) -> i64 {
+    if !crate::rpc::blockchain::is_on_active_chain(chain_state, block_hash, block_height) {
+        return 0;
+    }
     let tip = chain_state.tip_height();
-    tip.saturating_sub(block_height).saturating_add(1) as u64
+    i64::from(tip.saturating_sub(block_height).saturating_add(1))
 }
 
 /// Build verbose transaction JSON (shared by getrawtransaction and
@@ -243,7 +253,9 @@ pub(crate) fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
     block_height: Option<u32>,
-    confirmations: Option<u64>,
+    // Signed: Core reports -1 for a transaction in a block that is not on the
+    // active chain, the same convention as the block's own `confirmations`.
+    confirmations: Option<i64>,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);

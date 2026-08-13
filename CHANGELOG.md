@@ -11,6 +11,53 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed, Core compatibility: `confirmations` was computed from a block's height
+  alone, with no check that the block is actually on the active chain. A valid
+  block on a losing branch therefore reported the depth its height implied —
+  one buried 60,000 deep claimed 60,000 confirmations — where Core reports
+  `-1`. `getblock`, `getblockheader` and `getrawtransaction` are all corrected
+  (`getrawtransaction` reports `0` for an off-chain block, matching Core's
+  different convention there). `nextblockhash` was likewise resolved through
+  the height index, handing an off-chain block the *active* chain's successor;
+  it is now reported only for blocks on the active chain. Together these made a
+  stale block and the canonical block at the same height indistinguishable
+  through satd's own RPC, which actively impeded a fork investigation.
+- Fixed: `mediantime` returned the block's own timestamp rather than the median
+  of the block and its ten ancestors, on `getblock`, `getblockheader`,
+  `getblockstats` and `getblockchaininfo`. It is now a real median-time-past,
+  walked through parent pointers so a block off the active chain is measured
+  against its own ancestry.
+
+- satd now audits the height→hash index at startup and rebuilds missing rows
+  by walking the tip's ancestry, so a gap left by the reorg batching defect
+  below no longer needs a `-reindex` to clear. The height index is derived
+  state: the active chain is the tip's ancestry by definition, so no other
+  index row is consulted. One sequential scan; a clean node writes nothing.
+  The pass only *adds* rows for heights that have none, and never overwrites
+  one that is present — correcting a wrong row means choosing between branches
+  by chainwork, which it does not do; rows it walks past that disagree with the
+  tip's ancestry are logged. Heights whose blocks this chainstate has not
+  validated are reported separately from real damage, so an AssumeUTXO node
+  mid-validation is not told to reindex. Gaps it cannot rederive are logged as
+  errors instead of passing silently.
+- Fixed: a reorg could delete the height→hash and txindex rows the replacement
+  block had just written. Disconnecting the displaced block and connecting the
+  replacement coalesce into one write batch, which applies every put before
+  every remove — so the remove of height H ran after the put of height H and
+  won, though the put was the later operation. The other indexes were already
+  deduplicated by key for this sequence; these two were not. `getblockhash`
+  reports `Block height out of range` for a height in the middle of the active
+  chain, but only after a restart — the height cache is sized to cover the
+  whole chain, so a running node keeps answering correctly. The likelier and
+  worse case needs no restart at all: a reorg routinely re-mines the
+  transactions it displaces, and the txindex cache holds only a few hundred
+  thousand entries, so within roughly a day of normal operation the evicted
+  row surfaces as `getrawtransaction` reporting a transaction that is in the
+  chain as unknown. A missing height row inside the
+  eleven-block MTP window can also shift the median that gates BIP 113 and BIP
+  68, which needs a restart within eleven blocks of the reorg to reach.
+  Reindex and index backfills are not exposed; `-reindex` repairs existing
+  damage.
 - **Breaking, security:** both SDKs refused nothing when a bearer token was
   paired with an unencrypted connection — the credential, and any BIP 352 scan
   key registered over the same stream, went out in cleartext with no error and

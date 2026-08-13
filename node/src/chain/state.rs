@@ -1622,6 +1622,14 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
+    /// Direct store handle for tests that need to construct index states the
+    /// public API cannot reach — e.g. a stale sibling block that exists in the
+    /// block index but is deliberately absent from the height index.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &dyn Store {
+        &*self.store
+    }
+
     /// Cumulative transaction count through (and including) the given
     /// block, or `None` if not yet recorded (e.g. a pre-snapshot block an
     /// AssumeUTXO background hasn't validated). Backs `getchaintxstats`.
@@ -2642,6 +2650,28 @@ impl ChainState {
         self.store.flush()?;
         self.store.mark_chain_tx_backfill_complete()?;
         Ok(written)
+    }
+
+    /// Audit the height→hash index for gaps at or below the tip and rederive
+    /// what can be rederived. See
+    /// [`crate::chain::height_index_repair`] for what it will and will not
+    /// touch.
+    ///
+    /// Independent of [`Self::repair_block_index_holes`]: that pass inspects
+    /// only heights strictly above the tip, this one writes only heights at or
+    /// below it, so the two never touch the same row.
+    pub fn repair_height_index(
+        &self,
+    ) -> Result<crate::chain::height_index_repair::HeightIndexAudit, ChainError> {
+        let tip_hash = self.tip_hash();
+        let tip_height = self.tip_height();
+        Ok(
+            crate::chain::height_index_repair::audit_and_repair_height_index(
+                &*self.store,
+                tip_hash,
+                tip_height,
+            )?,
+        )
     }
 
     pub fn repair_block_index_holes(&self) -> Result<RepairOutcome, ChainError> {

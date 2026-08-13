@@ -324,8 +324,20 @@ impl CoinCache {
             || batch.tip.is_some()
             || !batch.block_index_puts.is_empty()
             || !batch.height_hash_puts.is_empty()
+            // Removes need their own terms. `take` above has already emptied
+            // `pending`, so anything this gate misses is DISCARDED, not
+            // deferred. A removes-only pending batch became materially more
+            // likely once `merge` started retaining away the put that used to
+            // keep this gate true; today it is still covered incidentally
+            // because `disconnect_block` always sets `tip`, which is an
+            // accident of that emitter rather than a guarantee.
+            || !batch.height_hash_removes.is_empty()
             || !batch.undo_puts.is_empty()
             || !batch.tx_index_puts.is_empty()
+            || !batch.tx_index_removes.is_empty()
+            || !batch.addr_funding_removes.is_empty()
+            || !batch.addr_spending_removes.is_empty()
+            || !batch.outpoint_spend_removes.is_empty()
             || !batch.chain_tx_puts.is_empty()
             // Silent-payment tweak rows ride the chainstate batch. They only
             // ever enter `pending` alongside a connect/disconnect (which set
@@ -711,22 +723,20 @@ impl Store for CoinCache {
             } else {
                 let mut pending = self.pending_batch.lock();
                 pending.block_index_puts.extend(batch.block_index_puts);
-                pending.height_hash_puts.extend(batch.height_hash_puts);
-                pending
-                    .height_hash_removes
-                    .extend(batch.height_hash_removes);
                 pending.undo_puts.extend(batch.undo_puts);
-                pending.tx_index_puts.extend(batch.tx_index_puts);
-                pending.tx_index_removes.extend(batch.tx_index_removes);
                 pending.chain_tx_puts.extend(batch.chain_tx_puts);
-                // Address-index, outpoint-spend, backfill-temp, and
-                // filter-index puts and removes all need last-writer-wins
+                // Every keyed index's puts and removes need last-writer-wins
                 // dedup by key (so connect→disconnect→connect or
                 // disconnect→connect sequences before flush land on the
-                // correct final state). Build a small StoreBatch carrying
-                // only those fields and route it through `merge` — the
-                // rest of `batch` was already extended above.
-                let addr_only = StoreBatch {
+                // correct final state). Build a StoreBatch carrying only
+                // those fields and route it through `merge` — the fields
+                // extended above are put-only, or hash-keyed with no
+                // corresponding remove, so ordering alone resolves them.
+                let keyed = StoreBatch {
+                    height_hash_puts: batch.height_hash_puts,
+                    height_hash_removes: batch.height_hash_removes,
+                    tx_index_puts: batch.tx_index_puts,
+                    tx_index_removes: batch.tx_index_removes,
                     addr_funding_puts: batch.addr_funding_puts,
                     addr_spending_puts: batch.addr_spending_puts,
                     addr_funding_removes: batch.addr_funding_removes,
@@ -748,7 +758,7 @@ impl Store for CoinCache {
                     sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
                     ..Default::default()
                 };
-                pending.merge(addr_only);
+                pending.merge(keyed);
             }
         }
 
@@ -823,6 +833,38 @@ impl Store for CoinCache {
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
     ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
         self.inner.for_each_block_index(visit)
+    }
+
+    /// Scans the inner store with the pending batch overlaid.
+    ///
+    /// Rows still buffered here have not reached the inner store, so a bare
+    /// passthrough would report a height as absent that this cache is about
+    /// to write — and the one caller that exists reads "absent" as "damaged,
+    /// rewrite it". Snapshot the pending state and drop the lock before the
+    /// scan: it can be long, and holding the batch lock across it would stall
+    /// every writer.
+    fn for_each_height_hash(
+        &self,
+        visit: &mut dyn FnMut(u32, BlockHash),
+    ) -> Result<crate::storage::HeightHashScanStats, StoreError> {
+        let (removed, overlaid) = {
+            let pending = self.pending_batch.lock();
+            let removed: std::collections::HashSet<u32> =
+                pending.height_hash_removes.iter().copied().collect();
+            let overlaid: std::collections::HashMap<u32, BlockHash> =
+                pending.height_hash_puts.iter().copied().collect();
+            (removed, overlaid)
+        };
+        let stats = self.inner.for_each_height_hash(&mut |height, hash| {
+            if removed.contains(&height) || overlaid.contains_key(&height) {
+                return;
+            }
+            visit(height, hash);
+        })?;
+        for (height, hash) in overlaid {
+            visit(height, hash);
+        }
+        Ok(stats)
     }
 
     fn coin_count(&self) -> u64 {
@@ -1726,6 +1768,234 @@ mod tests {
         cache.write_batch(batch).unwrap();
 
         assert_eq!(cache.get_block_hash_by_height(100).unwrap(), bh);
+    }
+
+    /// A reorg's remove and the replacement block's put for the SAME height
+    /// coalesce into one pending batch. They must not annihilate each other:
+    /// the put is the later op, so the replacement block's hash has to
+    /// survive the flush.
+    ///
+    /// This was a real defect. Two heights in the middle of a healthy active
+    /// chain answered `-8: Block height out of range` on a synced mainnet
+    /// node — but only after a restart, because the warm in-memory height
+    /// cache sees the ops in correct per-call order and masks the loss for as
+    /// long as the process lives.
+    #[test]
+    fn height_hash_put_after_remove_in_one_pending_batch_survives_flush() {
+        let cache = make_cache(10);
+        let new_hash = make_block_hash(0xB1);
+        const H: u32 = 956337;
+
+        // Coins dirty => non-coin ops are BUFFERED into `pending_batch`
+        // rather than passed straight through to the store.
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x01, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        // 1. The reorg disconnects the old block at height H.
+        let mut disconnect = StoreBatch::default();
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x02, 0), make_coin(51, 1)));
+        disconnect.height_hash_removes.push(H);
+        cache.write_batch(disconnect).unwrap();
+
+        // 2. The replacement block connects at the SAME height.
+        let mut connect = StoreBatch::default();
+        connect
+            .coin_puts
+            .push((make_outpoint(0x03, 0), make_coin(52, 1)));
+        connect.height_hash_puts.push((H, new_hash));
+        cache.write_batch(connect).unwrap();
+
+        // The merge resolved the collision in favour of the later op, so the
+        // pending batch no longer carries both.
+        {
+            let pending = cache.pending_batch.lock();
+            assert!(!pending.height_hash_removes.contains(&H));
+            assert!(pending.height_hash_puts.iter().any(|(h, _)| *h == H));
+        }
+
+        assert_eq!(
+            cache.get_block_hash_by_height(H),
+            Some(new_hash),
+            "warm cache"
+        );
+
+        cache.flush_durable().unwrap();
+
+        // Read as a restarted node does: nothing in the in-memory height
+        // cache, straight through to whatever actually persisted.
+        cache.height_hash_cache.lock().pop(&H);
+        assert_eq!(
+            cache.get_block_hash_by_height(H),
+            Some(new_hash),
+            "height {H} lost: a put and a remove for the same height survived \
+             into one batch, and `write_batch` applies every put before every \
+             remove"
+        );
+    }
+
+    /// The height-index scan must see rows that are still buffered here.
+    ///
+    /// Its only caller reads "no row" as "damaged, rederive it", so a bare
+    /// passthrough to the inner store would have the audit rebuild heights
+    /// this cache was about to write anyway — and, worse, miss that a pending
+    /// remove had already retired a row the inner store still holds.
+    #[test]
+    fn height_hash_scan_overlays_the_pending_batch() {
+        let cache = make_cache(10);
+        let committed = make_block_hash(0xC0);
+        let buffered = make_block_hash(0xC1);
+
+        // Land one row in the inner store with no coins dirty (pass-through).
+        let mut through = StoreBatch::default();
+        through.height_hash_puts.push((100, committed));
+        cache.write_batch(through).unwrap();
+
+        // Now dirty the coins so subsequent index ops buffer instead.
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x41, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        let mut buffered_batch = StoreBatch::default();
+        buffered_batch
+            .coin_puts
+            .push((make_outpoint(0x42, 0), make_coin(51, 1)));
+        buffered_batch.height_hash_puts.push((101, buffered));
+        buffered_batch.height_hash_removes.push(100);
+        cache.write_batch(buffered_batch).unwrap();
+
+        let mut seen: std::collections::HashMap<u32, BlockHash> =
+            std::collections::HashMap::new();
+        cache
+            .for_each_height_hash(&mut |h, hash| {
+                seen.insert(h, hash);
+            })
+            .unwrap();
+
+        assert_eq!(
+            seen.get(&101),
+            Some(&buffered),
+            "a buffered put must be visible or the audit rewrites it"
+        );
+        assert_eq!(
+            seen.get(&100),
+            None,
+            "a buffered remove must hide the inner store's row"
+        );
+    }
+
+    /// The mirror case, which is what stops the fix from being "apply removes
+    /// before puts". Connect then disconnect at the same height inside one
+    /// pending batch has to leave the row GONE — the remove is the later op.
+    #[test]
+    fn height_hash_remove_after_put_in_one_pending_batch_leaves_no_row() {
+        let cache = make_cache(10);
+        const H: u32 = 956337;
+
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x21, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        let mut connect = StoreBatch::default();
+        connect
+            .coin_puts
+            .push((make_outpoint(0x22, 0), make_coin(51, 1)));
+        connect.height_hash_puts.push((H, make_block_hash(0xB3)));
+        cache.write_batch(connect).unwrap();
+
+        let mut disconnect = StoreBatch::default();
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x23, 0), make_coin(52, 1)));
+        disconnect.height_hash_removes.push(H);
+        cache.write_batch(disconnect).unwrap();
+
+        cache.flush_durable().unwrap();
+        cache.height_hash_cache.lock().pop(&H);
+        assert_eq!(
+            cache.get_block_hash_by_height(H),
+            None,
+            "height {H} resurrected: the disconnect was the later op"
+        );
+    }
+
+    /// Same defect on the txindex, with a more routine trigger: a reorg
+    /// removes the displaced block's txids and the replacement chain re-mines
+    /// the same transactions, so put and remove collide on one txid. Losing
+    /// the row makes `getrawtransaction` report a transaction that IS in the
+    /// chain as unknown.
+    #[test]
+    fn tx_index_put_after_remove_in_one_pending_batch_survives_flush() {
+        let cache = make_cache(10);
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x77; 32],
+        ));
+        let new_block = make_block_hash(0xB2);
+
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x11, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        let mut disconnect = StoreBatch::default();
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x12, 0), make_coin(51, 1)));
+        disconnect.tx_index_removes.push(txid);
+        cache.write_batch(disconnect).unwrap();
+
+        let mut connect = StoreBatch::default();
+        connect
+            .coin_puts
+            .push((make_outpoint(0x13, 0), make_coin(52, 1)));
+        connect.tx_index_puts.push((txid, new_block));
+        cache.write_batch(connect).unwrap();
+
+        cache.flush_durable().unwrap();
+        cache.tx_index_cache.lock().pop(&txid);
+        assert_eq!(
+            cache.get_tx_location(&txid),
+            Some(new_block),
+            "txindex entry lost: `getrawtransaction` would report a tx that IS \
+             in the chain as unknown"
+        );
+    }
+
+    /// The txindex mirror: a tx that the replacement chain does *not* re-mine
+    /// must stay gone.
+    #[test]
+    fn tx_index_remove_after_put_in_one_pending_batch_leaves_no_row() {
+        let cache = make_cache(10);
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x78; 32],
+        ));
+
+        let mut warm = StoreBatch::default();
+        warm.coin_puts.push((make_outpoint(0x31, 0), make_coin(50, 1)));
+        cache.write_batch(warm).unwrap();
+
+        let mut connect = StoreBatch::default();
+        connect
+            .coin_puts
+            .push((make_outpoint(0x32, 0), make_coin(51, 1)));
+        connect.tx_index_puts.push((txid, make_block_hash(0xB4)));
+        cache.write_batch(connect).unwrap();
+
+        let mut disconnect = StoreBatch::default();
+        disconnect
+            .coin_puts
+            .push((make_outpoint(0x33, 0), make_coin(52, 1)));
+        disconnect.tx_index_removes.push(txid);
+        cache.write_batch(disconnect).unwrap();
+
+        cache.flush_durable().unwrap();
+        cache.tx_index_cache.lock().pop(&txid);
+        assert_eq!(
+            cache.get_tx_location(&txid),
+            None,
+            "txindex row resurrected: the disconnect was the later op"
+        );
     }
 
     // ---------------------------------------------------------------

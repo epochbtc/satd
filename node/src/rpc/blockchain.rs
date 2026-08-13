@@ -5,7 +5,72 @@ use serde_json::{json, Value};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
-use crate::storage::blockindex::target_to_difficulty;
+use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
+
+/// True when the active chain holds exactly `hash` at `height`.
+///
+/// A block can be valid, fully stored, and still not be on the active chain —
+/// a stale block from a losing branch. Core distinguishes the two everywhere it
+/// reports `confirmations`, and tooling reasoning about forks depends on it.
+pub(crate) fn is_on_active_chain(chain_state: &ChainState, hash: &bitcoin::BlockHash, height: u32) -> bool {
+    height <= chain_state.tip_height()
+        && chain_state.get_block_hash_by_height(height) == Some(*hash)
+}
+
+/// Core's `confirmations`: depth for a block on the active chain, `-1` for a
+/// valid block that is not on it.
+///
+/// Deriving this from height alone reports a stale block as buried — a block
+/// on a losing branch 60,000 deep claimed 60,000 confirmations, which is worse
+/// than useless to anything deciding whether a block is final.
+fn block_confirmations(chain_state: &ChainState, hash: &bitcoin::BlockHash, height: u32) -> i64 {
+    if is_on_active_chain(chain_state, hash, height) {
+        i64::from(chain_state.tip_height() - height + 1)
+    } else {
+        -1
+    }
+}
+
+/// Core's `mediantime`: the median timestamp of this block and its ten
+/// ancestors.
+///
+/// Walked through parent pointers rather than the height index, so a block off
+/// the active chain gets its OWN ancestry instead of the active chain's — and
+/// so the answer does not depend on an index that describes a different branch.
+fn block_median_time(chain_state: &ChainState, entry: &BlockIndexEntry) -> u32 {
+    let mut times = Vec::with_capacity(11);
+    times.push(entry.header.time);
+    let mut height = entry.height;
+    let mut cursor = entry.header.prev_blockhash;
+    while times.len() < 11 && height > 0 {
+        let Some(parent) = chain_state.get_block_index(&cursor) else {
+            break;
+        };
+        times.push(parent.header.time);
+        height = parent.height;
+        cursor = parent.header.prev_blockhash;
+    }
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+/// `nextblockhash`, which Core reports only for blocks on the active chain.
+///
+/// Resolving it by height for an off-chain block hands back the *active*
+/// chain's successor, which makes a stale block and the canonical block at the
+/// same height indistinguishable through this RPC.
+fn next_block_hash(
+    chain_state: &ChainState,
+    hash: &bitcoin::BlockHash,
+    height: u32,
+) -> Option<String> {
+    if !is_on_active_chain(chain_state, hash, height) {
+        return None;
+    }
+    chain_state
+        .get_block_hash_by_height(height + 1)
+        .map(|h| h.to_string())
+}
 
 /// Build the `getblockchaininfo` response from real chain state.
 pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
@@ -26,7 +91,7 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
             (
                 target_to_difficulty(entry.header.bits),
                 entry.header.time as u64,
-                entry.header.time as u64, // simplified; proper MTP would need ancestor walk
+                block_median_time(chain_state, &entry) as u64,
                 cw_hex,
             )
         } else {
@@ -210,11 +275,7 @@ pub fn get_block(
         .get_block(&hash)
         .ok_or("Block data not available")?;
 
-    let confirmations = if chain_state.tip_height() >= entry.height {
-        chain_state.tip_height() - entry.height + 1
-    } else {
-        0
-    };
+    let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
     // Bitcoin Core's verbosity contract:
     //   1 → tx is an array of txid strings
@@ -231,7 +292,7 @@ pub fn get_block(
                     tx,
                     Some(&block_hash_str),
                     Some(entry.height),
-                    Some(confirmations as u64),
+                    Some(confirmations),
                 )
             })
             .collect();
@@ -255,9 +316,7 @@ pub fn get_block(
         None
     };
 
-    let next_hash = chain_state
-        .get_block_hash_by_height(entry.height + 1)
-        .map(|h| h.to_string());
+    let next_hash = next_block_hash(chain_state, &hash, entry.height);
 
     let mut result = json!({
         "hash": block_hash_str,
@@ -268,7 +327,7 @@ pub fn get_block(
         "merkleroot": entry.header.merkle_root.to_string(),
         "tx": tx_field,
         "time": entry.header.time,
-        "mediantime": entry.header.time,
+        "mediantime": block_median_time(chain_state, &entry),
         "nonce": entry.header.nonce,
         "bits": format!("{:08x}", entry.header.bits.to_consensus()),
         "difficulty": difficulty,
@@ -312,11 +371,7 @@ pub fn get_block_header(
     let difficulty = target_to_difficulty(entry.header.bits);
     let chainwork_hex = hex::encode(entry.chainwork);
 
-    let confirmations = if chain_state.tip_height() >= entry.height {
-        chain_state.tip_height() - entry.height + 1
-    } else {
-        0
-    };
+    let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
     let prev_hash = if entry.height > 0 {
         Some(entry.header.prev_blockhash.to_string())
@@ -324,9 +379,7 @@ pub fn get_block_header(
         None
     };
 
-    let next_hash = chain_state
-        .get_block_hash_by_height(entry.height + 1)
-        .map(|h| h.to_string());
+    let next_hash = next_block_hash(chain_state, &hash, entry.height);
 
     let mut result = json!({
         "hash": hash.to_string(),
@@ -336,7 +389,7 @@ pub fn get_block_header(
         "versionHex": format!("{:08x}", entry.header.version.to_consensus()),
         "merkleroot": entry.header.merkle_root.to_string(),
         "time": entry.header.time,
-        "mediantime": entry.header.time,
+        "mediantime": block_median_time(chain_state, &entry),
         "nonce": entry.header.nonce,
         "bits": format!("{:08x}", entry.header.bits.to_consensus()),
         "difficulty": difficulty,
@@ -589,7 +642,7 @@ pub fn get_block_stats(
         "maxfeerate": max_fee_rate,
         "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
         "medianfee": avg_fee, // simplified: use avg as median
-        "mediantime": entry.header.time,
+        "mediantime": block_median_time(chain_state, &entry),
         "mediantxsize": if num_txs > 0 { total_size / num_txs } else { 0 },
         "minfee": min_fee,
         "minfeerate": min_fee_rate,
@@ -1027,6 +1080,8 @@ pub fn load_txout_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
+
     use crate::chain::state::{AssumeValid, ChainState};
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
@@ -1056,6 +1111,159 @@ mod tests {
             Default::default(),)
         .unwrap();
         (cs, dir)
+    }
+
+    /// The reporter's scenario: a block on the active chain and a stale
+    /// sibling at the SAME height. Before this fix both reported positive
+    /// `confirmations` and the SAME `nextblockhash`, which made them
+    /// indistinguishable through satd's own RPC and forced a fork
+    /// investigation to cross-check against Bitcoin Core to tell them apart.
+    #[test]
+    fn a_stale_sibling_is_distinguishable_from_the_canonical_block() {
+        use crate::storage::StoreBatch;
+        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+
+        let (cs, dir) = make_cs();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        let mk = |prev, nonce: u32, height: u32| {
+            let header = bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: genesis.header.merkle_root,
+                time: 1_600_000_000 + nonce,
+                bits: genesis.header.bits,
+                nonce,
+            };
+            (
+                header.block_hash(),
+                BlockIndexEntry {
+                    header,
+                    height,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            )
+        };
+
+        // A stale sibling of the active-chain tip: same height, fully valid,
+        // simply not the block the active chain holds there.
+        let (stale_hash, stale_entry) = mk(genesis.header.prev_blockhash, 7, 0);
+        // A child on the active chain, so `nextblockhash` has something to find.
+        let (child_hash, child_entry) = mk(genesis_hash, 8, 1);
+        assert_ne!(stale_hash, genesis_hash);
+
+        let batch = StoreBatch {
+            block_index_puts: vec![(stale_hash, stale_entry), (child_hash, child_entry)],
+            // The active chain holds genesis at 0 and the child at 1. The
+            // stale sibling appears nowhere in it.
+            height_hash_puts: vec![(1, child_hash)],
+            ..Default::default()
+        };
+        cs.store_for_test().write_batch(batch).unwrap();
+
+        assert_eq!(
+            block_confirmations(&cs, &genesis_hash, 0),
+            1,
+            "the active-chain block is one deep"
+        );
+        assert_eq!(
+            block_confirmations(&cs, &stale_hash, 0),
+            -1,
+            "Core reports -1 for a valid block that is not on the active chain"
+        );
+        assert_eq!(
+            next_block_hash(&cs, &genesis_hash, 0),
+            Some(child_hash.to_string()),
+            "an active-chain block reports its successor"
+        );
+        assert_eq!(
+            next_block_hash(&cs, &stale_hash, 0),
+            None,
+            "a stale block has no successor ON THE ACTIVE CHAIN; handing back \
+             the canonical chain's next block is what made the two \
+             indistinguishable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block buried far below the tip on a losing branch must not claim the
+    /// depth its height would imply.
+    #[test]
+    fn a_deeply_buried_stale_block_does_not_claim_confirmations() {
+        let (cs, dir) = make_cs();
+        let unknown_at_height_0 = bitcoin::BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0x5A; 32]),
+        );
+        // Height 0 is at/below the tip, so a height-only calculation would
+        // return a positive depth for a hash the active chain does not hold.
+        assert_eq!(block_confirmations(&cs, &unknown_at_height_0, 0), -1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mediantime` is the median of the block and its ten ancestors, not the
+    /// block's own timestamp.
+    #[test]
+    fn median_time_is_a_median_not_the_block_timestamp() {
+        use crate::storage::StoreBatch;
+        use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
+
+        let (cs, dir) = make_cs();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut prev = genesis.block_hash();
+        let mut puts = Vec::new();
+        let mut last = None;
+        // Deliberately non-monotonic timestamps so the median differs from
+        // both the newest block's time and a naive midpoint.
+        let times = [500u32, 100, 900, 200, 800, 300, 700, 400, 600, 1000, 50];
+        for (i, t) in times.iter().enumerate() {
+            let header = bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: genesis.header.merkle_root,
+                time: *t,
+                bits: genesis.header.bits,
+                nonce: i as u32,
+            };
+            let h = header.block_hash();
+            puts.push((
+                h,
+                BlockIndexEntry {
+                    header,
+                    height: (i + 1) as u32,
+                    status: BlockStatus::Valid,
+                    num_tx: 1,
+                    file_number: 0,
+                    data_pos: 0,
+                    chainwork: [0u8; 32],
+                },
+            ));
+            prev = h;
+            last = Some((h, header));
+        }
+        let (last_hash, last_header) = last.unwrap();
+        let batch = StoreBatch {
+            block_index_puts: puts.clone(),
+            ..Default::default()
+        };
+        cs.store_for_test().write_batch(batch).unwrap();
+
+        let entry = cs.get_block_index(&last_hash).unwrap();
+        let mtp = block_median_time(&cs, &entry);
+        assert_ne!(
+            mtp, last_header.time,
+            "reporting the block's own timestamp is the bug being fixed"
+        );
+        // The eleven newest timestamps are the whole `times` array; its median
+        // is 500.
+        assert_eq!(mtp, 500);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
