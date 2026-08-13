@@ -15,7 +15,9 @@
 //! It issues no writes of its own, but it is **not** non-mutating: opening the
 //! chainstate opens RocksDB read-write, which replays and truncates the WAL,
 //! may flush memtables and compact, rewrites the MANIFEST, deletes obsolete
-//! files, creates any missing column family, and stamps the schema version.
+//! files, creates any missing column family, drops the legacy address-history
+//! column families, and stamps the schema version — after which an older satd
+//! will no longer open the datadir.
 //! Opening the block files creates `xor.dat` if it is absent. So if the datadir
 //! is evidence — which is the case this tool exists for — copy it first and
 //! audit the copy. The tool says so on every run.
@@ -50,9 +52,14 @@ use node::storage::rocksdb_store::RocksDbStore;
                   This issues no writes of its own, but it is NOT non-mutating: opening the \
                   chainstate opens RocksDB read-write, which replays and truncates the WAL, \
                   may flush and compact, rewrites the MANIFEST, deletes obsolete files, \
-                  creates any missing column family and stamps the schema version. Opening \
-                  the block files creates xor.dat if absent. If the datadir is evidence — the \
-                  case this tool exists for — copy it and audit the copy.\n\n\
+                  creates any missing column family, DROPS the legacy address-history column \
+                  families and stamps the schema version — after which an older satd will no \
+                  longer open the datadir. Opening the block files creates xor.dat if absent. \
+                  If the datadir is evidence — the case this tool exists for — copy it and \
+                  audit the copy.\n\n\
+                  Coin verdicts are withheld for any height at or below a block that could \
+                  not be read, since such a block's spends are unknown. Blocks this node \
+                  pruned are reported separately and are not faults.\n\n\
                   Exit status: 0 consistent, 1 could not run, 2 inconsistencies found."
 )]
 struct Args {
@@ -67,12 +74,23 @@ struct Args {
 
     /// Whether the node runs with -txindex. When false, absent txindex rows
     /// are the correct state and are not reported as faults.
+    ///
+    /// Defaults to true, while satd's own -txindex defaults to off — so pass
+    /// `--txindex false` for a node that does not run it, or every transaction
+    /// in the window is counted as a missing row. The open is read-write, so
+    /// leaving this true against a non-txindex datadir also creates the empty
+    /// column family.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     txindex: bool,
 
     /// How many blocks below the tip to check. The default matches the window
-    /// the node itself audits at startup. Raise it to widen the search; the
-    /// cost is one block read per height.
+    /// the node itself audits at startup.
+    ///
+    /// Raising it costs more than one block read per height: every output the
+    /// window creates and every outpoint it spends is held in memory until the
+    /// end. At mainnet block sizes the default already runs to roughly a
+    /// gigabyte of resident memory, and tens of thousands of blocks will
+    /// exhaust a small machine. Widen it deliberately.
     #[arg(long, default_value_t = DEFAULT_ANCESTRY_WINDOW)]
     window: u32,
 
@@ -96,9 +114,11 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
 
     eprintln!(
         "NOTE: this opens the chainstate read-write. It issues no writes of its own, but\n\
-         RocksDB replays the WAL, may compact, and rewrites bookkeeping on open, and the\n\
-         block-file layer creates xor.dat if absent. If this datadir is evidence, stop now\n\
-         and audit a copy instead.\n"
+         RocksDB replays and truncates the WAL, may compact, and rewrites bookkeeping on\n\
+         open; the open also DROPS the legacy address-history column families and can\n\
+         restamp the schema version, after which an older satd will no longer open this\n\
+         datadir. The block-file layer creates xor.dat if absent. If this datadir is\n\
+         evidence, stop now and audit a copy instead.\n"
     );
 
     // Opening takes the RocksDB lock: fails loudly if the node is still
@@ -118,6 +138,20 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
     let tip_entry = store
         .get_block_index(&tip_hash)
         .ok_or_else(|| format!("tip {tip_hash} has no block-index entry"))?;
+
+    // `chainstate_background/` exists only while an AssumeUTXO snapshot is
+    // still being validated in the background; a completed handoff removes it.
+    // Its absence therefore means "not an AssumeUTXO node, or already done",
+    // both of which want `None`.
+    let snapshot_height =
+        node::chain::background::read_anchor_marker(&args.datadir.join("chainstate_background"))
+            .map(|(height, _, _)| height);
+    if let Some(h) = snapshot_height {
+        eprintln!(
+            "note: AssumeUTXO snapshot base at height {h}; history at or below it was not \
+             validated by this chainstate and is reported separately, not as damage"
+        );
+    }
 
     let blocksdir = args
         .blocksdir
@@ -151,10 +185,21 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
         tip_hash,
         tip_entry.height,
         args.window,
-        // An offline audit has no attached background chainstate, so an
-        // AssumeUTXO node's base cannot be identified. It lands in the
-        // unvalidated floor, which is reported but is not a fault.
-        None,
+        // An AssumeUTXO node's snapshot base, read from the background
+        // chainstate's own marker file.
+        //
+        // Passing `None` here — as this did — is not the harmless "it lands in
+        // the unvalidated floor" the comment claimed. Without a base height the
+        // audit falls back to the purely structural rule: floor is everything
+        // below the *lowest* connected ancestor, and anything unconnected above
+        // that is a hole. While the background chainstate is re-validating
+        // genesis→base it writes its results into the shared block index, so
+        // that range reads connected up to wherever it has reached and
+        // unconnected above — connected blocks beneath unconnected ones, which
+        // is exactly the shape the structural rule calls damage. A healthy
+        // AssumeUTXO node mid-validation would be told its chainstate was
+        // corrupt and to throw the snapshot away.
+        snapshot_height,
     );
 
     Ok(report)
@@ -207,6 +252,19 @@ fn main() -> ExitCode {
         println!(
             "not validated by this chainstate (normal for AssumeUTXO history): {}",
             report.ancestry.unvalidated_floor.len()
+        );
+    }
+
+    if report.pruned > 0 {
+        println!(
+            "blocks pruned (expected on a pruned node, not a fault): {}",
+            report.pruned
+        );
+    }
+    if report.pruned > 0 || !report.unreadable.is_empty() {
+        println!(
+            "  note: coin checks are skipped at and below the highest such block — its \
+             spends are unknown"
         );
     }
 

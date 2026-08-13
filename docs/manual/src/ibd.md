@@ -280,8 +280,10 @@ It takes the RocksDB lock, so **the node must be stopped**.
 It issues no writes of its own, but it is not non-mutating: opening the
 chainstate opens RocksDB read-write, so the WAL is replayed and truncated,
 memtables may flush and compact, the MANIFEST is rewritten, obsolete files are
-deleted, any missing column family is created, and the schema version is
-stamped. Opening the block files creates `xor.dat` if absent. **If the datadir
+deleted, any missing column family is created, the legacy address-history
+column families are **dropped**, and the schema version is stamped — after which
+an older satd will no longer open that datadir. Opening the block files creates
+`xor.dat` if absent. **If the datadir
 is evidence — which is the case this tool exists for — copy it and audit the
 copy.** The tool prints this warning on every run.
 
@@ -298,13 +300,30 @@ pointer is a *block index* fault and needs `-reindex` — `-reindex-chainstate`
 trusts the same block index and cannot fix it.
 
 `--window` bounds the walk, and its cost is not only one block read per height:
-every output in the window is held in memory to check against the UTXO set, so
-a window of tens of thousands of blocks on mainnet runs to gigabytes. Start at
-the default and widen only as far as the search needs.
+every output the window creates and every outpoint it spends is held in memory
+until the end, so the default already runs to roughly a gigabyte on mainnet and
+tens of thousands of blocks runs to many. Start at the default and widen only as
+far as the search needs.
 
-Pass `--txindex` to match the node's configuration. With `--txindex true` on a
-node that runs without it, every transaction is reported as having no index
-row — correct, but noise.
+Pass `--txindex` to match the node's configuration. It defaults to `true`, while
+satd's own `-txindex` defaults to off, so **pass `--txindex false` for a node
+that does not run one** — otherwise every transaction in the window is reported
+as having no index row, which is correct but pure noise, and the read-write open
+also creates the empty column family.
+
+Two states are reported but are not faults. Blocks the node **pruned** are
+counted separately from blocks that could not be read: pruning deletes block
+data deliberately, and treating that as damage would fail every healthy pruned
+node — at the default window, for most of the range — and then recommend
+`-reindex-chainstate`, which a pruned node refuses outright. On an **AssumeUTXO**
+node the snapshot base is read from the background chainstate's marker, so
+history below it is reported as not-yet-validated rather than as a hole.
+
+Where a block could not be read, for either reason, **the coin checks are
+skipped at and below that height** — its spends are unknown, so a coin it spent
+would otherwise look missing. The tool prints a note when this applies. Verdicts
+above that height are unaffected: the walk runs newest-first, and a coin created
+at height H can only be spent at or above H.
 
 ## Differences from Bitcoin Core at a glance
 

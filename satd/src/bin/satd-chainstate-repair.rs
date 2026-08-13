@@ -36,9 +36,9 @@ use node::validation::script::RustVerifier;
 )]
 struct Args {
     /// Network datadir of the node (the directory holding `chainstate/`
-    /// and `blocks/`), e.g. ~/.satd for a mainnet node. For non-mainnet
-    /// nodes pass the network subdirectory itself (e.g.
-    /// ~/.satd/signet/signet).
+    /// and `blocks/`), e.g. ~/.bitcoin for a mainnet node with the default
+    /// -datadir. For non-mainnet nodes pass the network subdirectory itself
+    /// (e.g. ~/.bitcoin/signet).
     #[arg(long)]
     datadir: PathBuf,
 

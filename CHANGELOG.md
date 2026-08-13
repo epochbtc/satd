@@ -45,9 +45,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   UTXO set, height index, txindex and cumulative transaction counts against the
   blocks on its active chain, and names every outpoint, height and txid that
   disagrees. Exits 0 consistent / 1 could not run / 2 inconsistent. Diagnoses
-  only; repair is `-reindex-chainstate` or `satd-chainstate-repair`. It issues
-  no writes of its own but opens RocksDB read-write, so audit a *copy* of a
-  datadir you need to preserve; it warns about this on every run. Not included
+  only; repair is `-reindex-chainstate` or `satd-chainstate-repair`. Blocks the
+  node pruned, and an AssumeUTXO node's unvalidated history below the snapshot
+  base (read from the background chainstate's marker), are reported but are not
+  faults. It issues no writes of its own but opens RocksDB read-write — which
+  also drops the legacy address-history column families and stamps the schema
+  version — so audit a *copy* of a datadir you need to preserve; it warns about
+  this on every run. Not included
   in the release tarballs or Docker image — build from source.
 - The connector's persistent-failure log line said "giving up" and then did not
   give up — breaking the loop exits the connector, not the process, and IBD
