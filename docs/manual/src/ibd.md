@@ -275,15 +275,32 @@ satd-chainstate-audit --datadir /path/to/datadir --txindex true
 satd-chainstate-audit --datadir /path/to/datadir --window 20000 --verbose
 ```
 
-Read-only — it never writes to the datadir — but it takes the RocksDB lock, so
-**the node must be stopped**.
+It takes the RocksDB lock, so **the node must be stopped**.
+
+It issues no writes of its own, but it is not non-mutating: opening the
+chainstate opens RocksDB read-write, so the WAL is replayed and truncated,
+memtables may flush and compact, the MANIFEST is rewritten, obsolete files are
+deleted, any missing column family is created, and the schema version is
+stamped. Opening the block files creates `xor.dat` if absent. **If the datadir
+is evidence — which is the case this tool exists for — copy it and audit the
+copy.** The tool prints this warning on every run.
+
+Note also that it is not included in the release tarballs or the Docker image;
+build it from source (`cargo build --release --bin satd-chainstate-audit`).
 
 Exit status is `0` when consistent, `1` when it could not run, `2` when it found
 inconsistencies, so it scripts cleanly.
 
 It diagnoses and does not repair. A missing coin is recoverable only by
 replaying the block that created it: `-reindex-chainstate`, or
-`satd-chainstate-repair` for a single block's lost delta.
+`satd-chainstate-repair` for a single block's lost delta. A broken parent
+pointer is a *block index* fault and needs `-reindex` — `-reindex-chainstate`
+trusts the same block index and cannot fix it.
+
+`--window` bounds the walk, and its cost is not only one block read per height:
+every output in the window is held in memory to check against the UTXO set, so
+a window of tens of thousands of blocks on mainnet runs to gigabytes. Start at
+the default and widen only as far as the search needs.
 
 Pass `--txindex` to match the node's configuration. With `--txindex true` on a
 node that runs without it, every transaction is reported as having no index
