@@ -204,7 +204,9 @@ missing every output it created, and the only way to recover those is to replay
 the block. satd reports the affected heights and exits:
 
 ```
-FATAL: the chainstate tip stands on 8 block(s) that were never connected.
+FATAL: this node's UTXO set does not agree with the chain its tip claims.
+
+  * The tip stands on 8 block(s) that were never connected.
 ...
 Refusing to start. Rebuild the UTXO set with -reindex-chainstate.
 ```
@@ -212,6 +214,31 @@ Refusing to start. Rebuild the UTXO set with -reindex-chainstate.
 Serving in that state is worse than not starting: the tip is a real block on
 the real chain, the height is correct, and `gettxout` answers confidently and
 wrongly.
+
+Two distinct faults can be reported, and they do not share a remedy. Blocks
+that were never connected mean the UTXO set is missing deltas, which
+`-reindex-chainstate` rebuilds. A broken parent pointer means the block index
+itself is wrong; `-reindex-chainstate` trusts that index, so only a full
+`-reindex` fixes it. Both can be present at once, and both are printed.
+
+The exit status is **3**, distinct from the `1` used for ordinary startup
+failures such as a bad config key, so supervision and alerting can tell
+"chainstate is damaged" from "the config file has a typo" without scraping
+stderr. Because this never heals by restarting, the shipped units set
+`RestartPreventExitStatus=3` alongside `Restart=always`; without it the node
+would restart every few seconds forever and the unit would never settle into
+`failed`, so unit-state alerting would never fire. If you wrote your own unit,
+add that line.
+
+After a `-reindex` or `-reindex-chainstate`, the audit runs again against what
+the replay actually rebuilt — a replay that stops short or reproduces the hole
+fails the same way, in the same run, rather than serving until the next
+restart.
+
+On a **pruned** node none of these remedies can replay the missing blocks,
+because the block data is gone. satd says so rather than naming a remedy that
+cannot work: fetch the affected heights from a peer with `getblockfrompeer` and
+repair them, or resync.
 
 On an AssumeUTXO node the history below the snapshot base is legitimately
 unvalidated until the background chainstate reaches it. That is recognised and

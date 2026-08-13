@@ -719,6 +719,30 @@ impl Store for CoinCache {
                     sp_tweak_removes: batch.sp_tweak_removes,
                     sp_backfill_cursor_advance: batch.sp_backfill_cursor_advance,
                 };
+                // A pass-through write is *newer* than anything still buffered
+                // for the same hash, and it lands in the inner store directly.
+                // Drop the superseded pending entries first, before the write:
+                // leaving them would let `flush_inner` replay a stale `Valid`
+                // over the `Invalid` that `mark_subtree_invalid` just wrote, or
+                // over `prune_blocks`' `Pruned`, resurrecting a status the node
+                // deliberately retired. It also keeps `get_block_index`'s
+                // pending lookup from shadowing the newer inner value.
+                //
+                // Ordering matters: clearing before the write means a reader in
+                // the gap sees the inner store's older value, which is what it
+                // would have seen anyway. Clearing after would briefly serve
+                // the buffered value, which is strictly older.
+                if !pass_through.block_index_puts.is_empty() {
+                    let superseded: std::collections::HashSet<BlockHash> = pass_through
+                        .block_index_puts
+                        .iter()
+                        .map(|(h, _)| *h)
+                        .collect();
+                    let mut pending = self.pending_batch.lock();
+                    pending
+                        .block_index_puts
+                        .retain(|(h, _)| !superseded.contains(h));
+                }
                 self.inner.write_batch_mode(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
@@ -783,6 +807,37 @@ impl Store for CoinCache {
 
     fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
         if let Some(entry) = self.block_index_cache.lock().get(hash) {
+            return Some(entry.clone());
+        }
+        // The LRU is a cache, not the record. `write_batch` mirrors a
+        // coin-carrying batch's `block_index_puts` into it *and* buffers them
+        // in `pending_batch`; only the second survives eviction. Falling
+        // straight through to `inner` on an LRU miss therefore reads the
+        // *pre-connect* status — `store_block`'s `DataStored` — for a block
+        // `connect_block` has already stamped `Valid`, because that upgrade
+        // is still buffered.
+        //
+        // That is not a stale-read nuisance: `require_connected_parent` reads
+        // exactly this to decide whether a parent was ever connected, so an
+        // eviction between two connects turns a healthy parent into
+        // `ParentNeverConnected` and refuses to extend the chain. Eviction is
+        // cheap to provoke — every `store_block` and every `accept_headers`
+        // batch puts to the same LRU, up to 2000 entries per `headers`
+        // message, against a capacity of `dbcache_mb * 66.7`.
+        //
+        // Header and `store_block` batches carry no coins, so they take the
+        // `coin_dirty == 0` pass-through and never land here; the pending vec
+        // holds one entry per connect/disconnect since the last flush. The
+        // scan runs backwards because the buffer is append-only and the last
+        // write for a hash wins, matching how `flush_inner` replays it.
+        if let Some((_, entry)) = self
+            .pending_batch
+            .lock()
+            .block_index_puts
+            .iter()
+            .rev()
+            .find(|(h, _)| h == hash)
+        {
             return Some(entry.clone());
         }
         self.inner.get_block_index(hash)
@@ -1736,6 +1791,94 @@ mod tests {
         // After flush, inner should have it.
         let recovered = cache.inner.get_block_index(&bh).unwrap();
         assert_eq!(recovered.height, 30);
+    }
+
+    /// An evicted LRU entry must not resurrect the pre-connect status.
+    ///
+    /// `store_block` writes `DataStored` through the coin-less pass-through,
+    /// so it lands in the inner store. `connect_block` upgrades it to `Valid`
+    /// in a batch that carries coins, so that upgrade is buffered and only
+    /// *mirrored* into the LRU. If the LRU drops it before the flush,
+    /// `get_block_index` must still report `Valid` — `require_connected_parent`
+    /// reads this to decide whether a parent was ever connected, and reading
+    /// the inner store's stale `DataStored` refuses to extend a healthy chain.
+    #[test]
+    fn buffered_block_index_survives_lru_eviction() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xDE);
+
+        // store_block: no coins, so this passes through to the inner store.
+        let mut stored = make_test_entry(41);
+        stored.status = BlockStatus::DataStored;
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((bh, stored));
+        cache.write_batch(batch).unwrap();
+        assert_eq!(
+            cache.inner.get_block_index(&bh).unwrap().status,
+            BlockStatus::DataStored,
+        );
+
+        // connect_block: carries coins, so the Valid upgrade is buffered.
+        let mut batch = StoreBatch::default();
+        batch
+            .coin_puts
+            .push((make_outpoint(0x81, 0), make_coin(1, 1)));
+        batch.block_index_puts.push((bh, make_test_entry(41)));
+        cache.write_batch(batch).unwrap();
+
+        // The inner store still holds the pre-connect status...
+        assert_eq!(
+            cache.inner.get_block_index(&bh).unwrap().status,
+            BlockStatus::DataStored,
+        );
+        // ...so once the LRU evicts the mirrored copy, the pending batch is
+        // the only remaining witness that this block was connected.
+        cache.block_index_cache.lock().clear();
+        assert_eq!(
+            cache.get_block_index(&bh).unwrap().status,
+            BlockStatus::Valid,
+            "an evicted LRU entry fell through to the inner store's pre-connect status",
+        );
+    }
+
+    /// A flush must not resurrect a status the node deliberately retired.
+    ///
+    /// `mark_subtree_invalid` and `prune_blocks` write block-index entries with
+    /// no coins attached, so they take the pass-through and land in the inner
+    /// store immediately. If the buffered `Valid` from the earlier connect were
+    /// left in place, `flush_inner` would replay it afterwards and put the
+    /// block back to `Valid` — undoing an invalidate or a prune at the next
+    /// flush.
+    #[test]
+    fn a_passthrough_write_supersedes_the_buffered_entry() {
+        let cache = make_cache(10);
+        let bh = make_block_hash(0xDF);
+
+        // connect_block: coins attached, so the Valid entry is buffered.
+        let mut batch = StoreBatch::default();
+        batch
+            .coin_puts
+            .push((make_outpoint(0x82, 0), make_coin(1, 1)));
+        batch.block_index_puts.push((bh, make_test_entry(42)));
+        cache.write_batch(batch).unwrap();
+
+        // invalidate_block: no coins, so this goes straight to the inner store.
+        let mut invalid = make_test_entry(42);
+        invalid.status = BlockStatus::Invalid;
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((bh, invalid));
+        cache.write_batch(batch).unwrap();
+        assert_eq!(
+            cache.get_block_index(&bh).unwrap().status,
+            BlockStatus::Invalid,
+        );
+
+        cache.flush().unwrap();
+        assert_eq!(
+            cache.inner.get_block_index(&bh).unwrap().status,
+            BlockStatus::Invalid,
+            "the flush replayed a stale buffered entry over a newer write",
+        );
     }
 
     // ---------------------------------------------------------------

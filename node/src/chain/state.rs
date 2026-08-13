@@ -3645,7 +3645,14 @@ impl ChainState {
             .ok_or(ChainError::BadPrevBlock)?;
         // Matching the prev hash pins the chain's shape but not that the
         // parent's coins were ever applied. See `require_connected_parent`.
-        self.require_connected_parent(&current_tip, hash, entry.height)?;
+        // Return the tracker to Idle like the other early exits: the connector
+        // parks in its retry condvar after this, and a tracker left in
+        // `EnterConnect` makes the stall watchdog's forensics dump blame a
+        // phase nothing is executing.
+        if let Err(e) = self.require_connected_parent(&current_tip, hash, entry.height) {
+            phases.enter(ConnectPhase::Idle);
+            return Err(e);
+        }
 
         // Determine script verifier
         let use_noop = self.should_skip_scripts(entry.height);
@@ -5332,6 +5339,23 @@ impl ChainState {
                         .store
                         .get_block_index(&side_entry.header.prev_blockhash)
                         .ok_or(ChainError::BadPrevBlock)?;
+                    // The blocks a reorg reconnects need the same parent
+                    // check as the block that triggered it. The check below
+                    // the reorg only ever sees the triggering block, by which
+                    // point its parent has just been stamped `Valid` by this
+                    // loop — so without this, a reorg forking at a block this
+                    // chainstate never connected rebuilds the whole side
+                    // branch on top of the hole and commits a new tip. The
+                    // first iteration checks the fork point itself; later ones
+                    // re-check a parent this loop connected, which is cheap
+                    // and keeps the invariant local to the loop that relies on
+                    // it. Inside the closure, so `?` routes through
+                    // `abort_reorg` like every other failure here.
+                    self.require_connected_parent(
+                        &side_entry.header.prev_blockhash,
+                        side_hash,
+                        side_entry.height,
+                    )?;
                     let use_noop = self.should_skip_scripts(side_entry.height);
                     let noop = NoopVerifier;
                     let verifier: &dyn ScriptVerifier =
@@ -5423,7 +5447,25 @@ impl ChainState {
         // guards against was observed on a synced node. Placed after the reorg
         // fallthrough so it sees the tip the reorg left behind, not the one it
         // started from.
-        self.require_connected_parent(&prev_hash, &block_hash, new_height)?;
+        //
+        // Rolled back like every other failure exit in this region. Reaching
+        // here with `pending_reorg` set means the reorg has already
+        // disconnected the old chain, reconnected the side branch and advanced
+        // `self.tip` onto it, with the whole delta buffered in the coin cache
+        // and `reorg_excl` held so no external flush can persist half of it.
+        // Returning bare would drop that guard at scope exit and leave the tip
+        // standing on a partially-applied reorg — the exact shape this guard
+        // exists to refuse, reintroduced by the guard itself.
+        if let Err(e) = self.require_connected_parent(&prev_hash, &block_hash, new_height) {
+            if let Some(pending) = pending_reorg.as_ref() {
+                tracing::warn!(
+                    error = %e,
+                    "Reorg triggering block sits on an unconnected parent; discarding the cache delta and restoring the pre-reorg tip"
+                );
+                self.abort_reorg(pending.old_tip, pending.old_height);
+            }
+            return Err(e);
+        }
 
         // Determine script verifier: skip if below assumevalid height
         let use_noop = self.should_skip_scripts(new_height);
@@ -10370,6 +10412,54 @@ pub(crate) mod tests {
         batch.block_index_puts.push((*hash, entry));
         cs.store.write_batch(batch).unwrap();
         cs.store.invalidate_block_index_cache(hash);
+    }
+
+    /// A reorg must not rebuild a branch on top of a block that was never
+    /// connected.
+    ///
+    /// The parent check below the reorg only ever sees the *triggering* block,
+    /// and by then this loop has already stamped its parent `Valid` — so the
+    /// fork point itself went unchecked. A reorg forking at a hole would
+    /// reconnect the entire side branch onto it and commit a new tip, which is
+    /// the #567 damage arrived at from the other direction.
+    ///
+    /// Also pins the rollback: a refusal mid-reorg must restore the pre-reorg
+    /// tip rather than strand the chain at the fork point.
+    #[test]
+    fn reorg_refuses_to_rebuild_onto_an_unconnected_fork_point() {
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let genesis_hash = genesis.block_hash();
+
+        // Active chain: genesis -> A1 -> A2.
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        assert_eq!(cs.tip_hash(), a2_hash);
+
+        // A1 becomes a block this chainstate never connected. Its hash is
+        // untouched, so every prev-hash check on the way still passes.
+        force_status(&cs, &a1_hash, BlockStatus::DataStored);
+
+        // A competing branch forking at A1, with more work once B3 lands.
+        let b2 = build_test_block(a1_hash, 2, 1_300_000_003);
+        cs.accept_block(&b2).expect("accept B2 as a side block");
+        let b3 = build_test_block(b2.block_hash(), 3, 1_300_000_004);
+
+        let result = cs.accept_block(&b3);
+        assert!(
+            matches!(result, Err(ChainError::ParentNeverConnected)),
+            "a reorg onto an unconnected fork point must be refused, got {result:?}"
+        );
+        assert_eq!(
+            cs.tip_hash(),
+            a2_hash,
+            "the refused reorg must restore the pre-reorg tip, not strand the chain"
+        );
+        assert_eq!(cs.tip_height(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The tip's hash matching a block's `prev_blockhash` is not evidence the
