@@ -5410,6 +5410,20 @@ impl ChainState {
                         tip.hash = *side_hash;
                         tip.height = side_entry.height;
                     }
+                    // Push the timestamp HERE, not after the loop. The next
+                    // iteration calls `get_median_time_past` for the height
+                    // above this one, and the eleven-block window it reads
+                    // covers the block just connected. Pushing after the loop
+                    // would leave every reconnect from fork+2 up — and the
+                    // triggering block — validated against the timestamps of
+                    // the branch this reorg is displacing.
+                    //
+                    // Consensus-relevant: MTP gates BIP 113 locktimes and BIP
+                    // 68 sequence locks, so a stale window accepts or rejects
+                    // blocks differently from Core. `abort_reorg` clears the
+                    // cache, so entries staged here do not outlive a reorg
+                    // that fails.
+                    self.push_mtp_cache(side_entry.height, side_block.header.time);
                     reconnected_hashes.push(*side_hash);
                     reconnected_blocks.push((side_block, side_entry.height));
                     // Chain event for this side block is staged and
@@ -5660,17 +5674,6 @@ impl ChainState {
                     hash: side_block.block_hash(),
                     height: *side_height,
                 });
-                // The MTP cache has to learn about the blocks a reorg
-                // reconnected, not just the one that triggered it. Without
-                // this it keeps the DISPLACED branch's timestamps at those
-                // heights — the push below only covers `new_height` — and
-                // `get_median_time_past` serves them for as long as they stay
-                // in the window. The invalidate/reconsider reorg path has
-                // always done this; this path did not.
-                //
-                // Consensus-relevant: MTP gates BIP 113 locktimes and BIP 68
-                // sequence locks.
-                self.push_mtp_cache(*side_height, side_block.header.time);
             }
 
             if let Some(log) = self.reorg_log.get() {
@@ -5760,6 +5763,13 @@ impl ChainState {
     /// is structurally impossible here.
     fn abort_reorg(&self, old_tip: BlockHash, old_height: u32) {
         self.store.discard_uncommitted();
+        // The reconnect loop stages each block's timestamp as it goes, so that
+        // the next block up validates against the branch being reconnected
+        // rather than the one being displaced. An abort makes those entries
+        // wrong in the other direction — they describe a branch this node is
+        // no longer on. Drop the cache; it refills from the block index on the
+        // next lookup, which is the pre-reorg chain again.
+        self.mtp_cache.lock().clear();
         let mut tip = self.tip.write();
         tip.hash = old_tip;
         tip.height = old_height;
@@ -6568,6 +6578,12 @@ impl ChainState {
                     tip.hash = *h;
                     tip.height = e.height;
                 }
+                // Staged per block, for the same reason as the `accept_block`
+                // reorg: the next iteration's `get_median_time_past` window
+                // covers this block, and without the push it would read the
+                // displaced branch's timestamp at this height. `abort_reorg`
+                // below clears the cache if this loop fails.
+                self.push_mtp_cache(e.height, block.header.time);
                 reconnected_hashes.push(*h);
                 reconnected_blocks.push((block, e.height));
             }
@@ -6641,9 +6657,9 @@ impl ChainState {
             log.record(record);
         }
 
-        for (block, height) in &reconnected_blocks {
-            self.push_mtp_cache(*height, block.header.time);
-        }
+        // (The reconnect loop above already pushed each of these as it went —
+        // it has to, so each block validates against the branch being
+        // reconnected. Re-pushing them here would be a no-op.)
 
         // Durably commit the new chainstate (the operator-driven reorg is rare
         // and deliberate; flushing keeps the on-disk tip consistent and closes
@@ -10918,6 +10934,120 @@ pub(crate) mod tests {
             report.describe()
         );
         assert_eq!(cs.get_block_hash_by_height(102), Some(b102_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reorg must validate its own reconnected blocks against its own
+    /// timestamps, not against the branch it is displacing.
+    ///
+    /// This is the case the other two MTP tests here cannot see. Both observe
+    /// the cache *after* a reorg commits, and staging the timestamps late — in
+    /// the deferred event-emission block, after the reconnect loop had already
+    /// finished — leaves that final state correct. What it does not leave
+    /// correct is the value handed to `connect_block` for each block from
+    /// fork+2 upward, which is the consensus input for BIP 113 and BIP 68.
+    ///
+    /// Observable through a non-final time-locked transaction in the branch
+    /// being reconnected, with the fixture arranged so the displaced branch's
+    /// MTP clears its locktime and the reconnecting branch's does not. Under
+    /// the correct MTP the block is rejected as non-final; under the displaced
+    /// branch's it is judged final and fails later, at input resolution. The
+    /// *locktime* error is the pass — a missing-input error means the reorg
+    /// validated against the branch that lost.
+    #[test]
+    fn reorg_validates_reconnected_blocks_against_its_own_timestamps() {
+        const BASE: u32 = 1_705_000_000;
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Long enough trunk that genesis is well outside every MTP window.
+        let mut parent = genesis_hash;
+        for h in 1..=20u32 {
+            let b = build_test_block(parent, h, BASE + 1000 * h);
+            parent = cs.accept_block(&b).expect("accept trunk");
+        }
+        let fork_point = parent;
+
+        // Branch A wins the tip first, with timestamps far above the trunk.
+        let mut a_parent = fork_point;
+        let mut a_times: Vec<u32> = Vec::new();
+        for h in 21..=23u32 {
+            let ts = BASE + 100_000 + 1000 * h;
+            let b = build_test_block(a_parent, h, ts);
+            a_parent = cs.accept_block(&b).expect("accept A");
+            a_times.push(ts);
+        }
+        assert_eq!(cs.tip_height(), 23, "A must hold the tip");
+
+        // Branch B's timestamps sit just above the running median, so they land
+        // at the BOTTOM of each window and actually move it — A's land at the
+        // top, where they cannot.
+        let median_of = |mut v: Vec<u32>| -> u32 {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let trunk_at = |h: u32| BASE + 1000 * h;
+        let b_times: Vec<u32> = vec![
+            BASE + 15_500,
+            BASE + 15_600,
+            BASE + 15_700,
+            BASE + 15_800,
+        ];
+
+        // MTP at height 23 under each branch: the eleven blocks at 12..=22.
+        let window_23 = |branch: &[u32]| -> u32 {
+            let mut v: Vec<u32> = (12..=20).map(trunk_at).collect();
+            v.push(branch[0]); // height 21
+            v.push(branch[1]); // height 22
+            median_of(v)
+        };
+        let correct_mtp = window_23(&b_times);
+        let stale_mtp = window_23(&a_times);
+        let lock_time = (correct_mtp + stale_mtp) / 2;
+        assert!(
+            correct_mtp < lock_time && stale_mtp >= lock_time,
+            "fixture must straddle the locktime: {correct_mtp} < {lock_time} <= {stale_mtp}"
+        );
+
+        // B21, B22 — stored as a side chain, not yet connected.
+        let mut b_parent = fork_point;
+        for (i, h) in (21..=22u32).enumerate() {
+            let b = build_test_block(b_parent, h, b_times[i]);
+            b_parent = cs.accept_block(&b).expect("accept B side block");
+        }
+
+        // B23 carries the time-locked transaction. Its input does not exist,
+        // so if the locktime check passes it fails at input resolution — that
+        // is the second half of the observable.
+        let bogus = OutPoint {
+            txid: bitcoin::constants::genesis_block(Network::Regtest).txdata[0].compute_txid(),
+            vout: 7,
+        };
+        let b23 = build_test_block_timelocked(b_parent, 23, b_times[2], bogus, lock_time);
+        b_parent = cs.accept_block(&b23).expect("store B23 as a side block");
+
+        // B24 gives B more work than A and triggers the reorg, which reconnects
+        // B21, B22 and then B23 — where the MTP under test is read.
+        let b24 = build_test_block(b_parent, 24, b_times[3]);
+        let err = cs
+            .accept_block(&b24)
+            .expect_err("B23 must be rejected as non-final");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonfinal") || msg.contains("non-final") || msg.contains("locktime"),
+            "reorg must judge B23 against B's own MTP ({correct_mtp}, below the \
+             {lock_time} locktime). Got: {msg}"
+        );
+        assert!(
+            !msg.contains("missingorspent"),
+            "reaching input resolution means the locktime was cleared by the \
+             DISPLACED branch's MTP ({stale_mtp}): {msg}"
+        );
+
+        // The failed reorg must leave the node on A, not part-way onto B.
+        assert_eq!(cs.tip_height(), 23);
+        assert_eq!(cs.tip_hash(), a_parent, "aborted reorg must restore A's tip");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

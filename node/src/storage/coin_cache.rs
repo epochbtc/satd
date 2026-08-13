@@ -720,8 +720,20 @@ impl Store for CoinCache {
         //
         // The one thing to preserve when touching this: nothing that a failed
         // reorg must be able to retract may reach here. The `coin_dirty == 0`
-        // test is what enforces that, and it holds only because connection and
-        // disconnection always move coins.
+        // test is what enforces that, and it is *nearly* — not entirely —
+        // implied by "connection and disconnection always move coins".
+        //
+        // The exception is a block whose every output is unspendable and which
+        // spends nothing: `connect_block` and `disconnect_block` both skip
+        // unspendable outputs, so such a block yields empty `coin_puts` and
+        // empty `coin_removes`. A coinbase-only block whose sole output is an
+        // OP_RETURN is exactly that, and it is a block a miner can produce (or
+        // a fork-feeder can craft). Its index writes would then pass straight
+        // through and survive a reorg abort that should have retracted them —
+        // the height-row pollution shape of #322/#564. It is a narrow case and
+        // no such block is known on mainnet, but the invariant is not airtight
+        // and this comment should not claim it is. Routing on "a reorg is in
+        // flight" rather than on `coin_dirty` would close it properly.
         if has_non_coin {
             if coin_dirty == 0 {
                 let pass_through = StoreBatch {
