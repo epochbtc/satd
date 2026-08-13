@@ -2674,6 +2674,77 @@ impl ChainState {
         )
     }
 
+    /// The block the tip is standing on must be one whose UTXO delta this
+    /// chainstate has actually applied.
+    ///
+    /// Both sequential connect paths already require
+    /// `prev_blockhash == tip`, which pins the *shape* of the chain but says
+    /// nothing about whether that parent was ever connected. On a synced
+    /// mainnet node the in-memory tip advanced eight blocks past the last
+    /// block actually connected, and every one of those connects satisfied
+    /// the prev-hash check on the way up (see #567). This is the missing
+    /// half: the parent must also be a block that ran through
+    /// `connect_block`, which is the only writer of `BlockStatus::Valid`.
+    ///
+    /// Two exemptions, both cases where the coins are present without this
+    /// chainstate having connected the block:
+    ///
+    /// - `Pruned` — connected, then had its block data removed.
+    /// - The AssumeUTXO snapshot base — its coins were streamed in wholesale
+    ///   by `loadtxoutset`, and its entry stays `HeaderOnly`/`DataStored`
+    ///   until the background chainstate has re-validated all of
+    ///   genesis→base. Without this exemption an AssumeUTXO node could never
+    ///   connect base+1, which is the entire point of a snapshot. The
+    ///   exemption expires on its own: once the background finishes it has
+    ///   written `Valid` for the base like any other block, and it only
+    ///   applies while a background chainstate is attached.
+    fn require_connected_parent(
+        &self,
+        parent_hash: &BlockHash,
+        connecting: &BlockHash,
+        height: u32,
+    ) -> Result<(), ChainError> {
+        let Some(parent) = self.store.get_block_index(parent_hash) else {
+            return Err(ChainError::BadPrevBlock);
+        };
+        if matches!(parent.status, BlockStatus::Valid | BlockStatus::Pruned) {
+            return Ok(());
+        }
+        if self
+            .background()
+            .is_some_and(|bg| bg.snapshot_hash() == *parent_hash)
+        {
+            return Ok(());
+        }
+        // Loud: this means the in-memory tip and the connected chain have
+        // diverged, which is silent UTXO-set corruption if it proceeds.
+        tracing::error!(
+            block = %connecting,
+            height,
+            parent = %parent_hash,
+            parent_height = parent.height,
+            parent_status = ?parent.status,
+            "refusing to connect onto a parent this chainstate never connected"
+        );
+        Err(ChainError::BadPrevBlock)
+    }
+
+    /// Check that every recent ancestor of the tip is a block this chainstate
+    /// actually connected. See [`crate::chain::tip_ancestry`] for what a
+    /// failure means and why an unvalidated AssumeUTXO floor is not one.
+    ///
+    /// Read-only. Unlike [`Self::repair_height_index`] there is nothing to
+    /// repair in place: the remedy for a hole is to replay the missing blocks.
+    pub fn audit_tip_ancestry(&self) -> crate::chain::tip_ancestry::TipAncestryAudit {
+        crate::chain::tip_ancestry::audit_tip_ancestry(
+            &*self.store,
+            self.tip_hash(),
+            self.tip_height(),
+            crate::chain::tip_ancestry::DEFAULT_ANCESTRY_WINDOW,
+            self.background().map(|bg| bg.snapshot_hash()),
+        )
+    }
+
     pub fn repair_block_index_holes(&self) -> Result<RepairOutcome, ChainError> {
         use crate::storage::flatfile::FlatFilePos;
         let tip_height = self.tip_height();
@@ -2886,6 +2957,46 @@ impl ChainState {
         if pre.entry.status != BlockStatus::DataStored {
             phases.enter(ConnectPhase::Idle);
             return Err(ChainError::Duplicate);
+        }
+
+        // The tip must be a block whose coins were actually applied, not just
+        // one whose hash matches. Read fresh from the store rather than
+        // trusting `pre.parent`: the prefetcher captured that entry before the
+        // parent connected, so its status is stale by construction.
+        if let Err(e) =
+            self.require_connected_parent(&current_tip, &pre.hash, pre.height)
+        {
+            phases.enter(ConnectPhase::Idle);
+            return Err(e);
+        }
+
+        // The identity check `connect_stored_block` performs on the record it
+        // reads from the flat file. This path never reads the flat file — the
+        // prefetcher hands over a decoded block — so the equivalent question
+        // is whether the three things about to be committed agree: the block
+        // being validated, the index entry authorizing it, and the hash the
+        // tip is set to. `tip.hash = pre.hash` is otherwise written without
+        // ever being reconciled against `pre.block`.
+        let block_hash = pre.block.block_hash();
+        if block_hash != pre.hash
+            || pre.entry.header.block_hash() != pre.hash
+            || pre.entry.height != pre.height
+        {
+            tracing::error!(
+                declared = %pre.hash,
+                block = %block_hash,
+                entry = %pre.entry.header.block_hash(),
+                declared_height = pre.height,
+                entry_height = pre.entry.height,
+                "preprocessed block is internally inconsistent"
+            );
+            phases.enter(ConnectPhase::Idle);
+            return Err(ChainError::FlatFile(format!(
+                "preprocessed block {}: block {block_hash}, entry {} at height {}",
+                pre.hash,
+                pre.entry.header.block_hash(),
+                pre.entry.height
+            )));
         }
 
         // Determine script verifier.
@@ -3516,6 +3627,9 @@ impl ChainState {
             .store
             .get_block_index(&entry.header.prev_blockhash)
             .ok_or(ChainError::BadPrevBlock)?;
+        // Matching the prev hash pins the chain's shape but not that the
+        // parent's coins were ever applied. See `require_connected_parent`.
+        self.require_connected_parent(&current_tip, hash, entry.height)?;
 
         // Determine script verifier
         let use_noop = self.should_skip_scripts(entry.height);
@@ -10220,6 +10334,169 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Force `hash`'s block-index status, bypassing the writers, and drop the
+    /// overlay so the next read sees it. Reproduces the persisted shape of
+    /// #567, where the `Valid` writes for a run of blocks never reached disk
+    /// while the tip pointer moved past them.
+    fn force_status(cs: &ChainState, hash: &BlockHash, status: BlockStatus) {
+        let mut entry = cs.get_block_index(hash).expect("entry must exist");
+        entry.status = status;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((*hash, entry));
+        cs.store.write_batch(batch).unwrap();
+        cs.store.invalidate_block_index_cache(hash);
+    }
+
+    /// The tip's hash matching a block's `prev_blockhash` is not evidence the
+    /// tip's coins were ever applied. #567: the in-memory tip advanced eight
+    /// blocks past the last block actually connected, and every connect on the
+    /// way up satisfied the prev-hash check.
+    #[test]
+    fn connect_refuses_a_parent_that_was_never_connected() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert_eq!(cs.tip_height(), 5);
+
+        let next = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        cs.accept_header(&next.header).unwrap();
+        cs.store_block(&next).unwrap();
+
+        // The tip reads as a block this chainstate never connected. Its hash
+        // is untouched, so the prev-hash check still passes.
+        force_status(&cs, &blocks[4].block_hash(), BlockStatus::DataStored);
+
+        let result = cs.connect_stored_block(&next.block_hash());
+        assert!(
+            matches!(result, Err(ChainError::BadPrevBlock)),
+            "connecting onto an unconnected parent must be refused, got {result:?}"
+        );
+        assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AssumeUTXO snapshot base is `DataStored` until the background
+    /// chainstate has re-validated all of genesis→base, which can take days.
+    /// Connecting base+1 must not wait for that — it is the entire point of a
+    /// snapshot.
+    #[test]
+    fn connect_allows_the_assumeutxo_snapshot_base_as_parent() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let base = blocks[4].block_hash();
+
+        let next = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        cs.accept_header(&next.header).unwrap();
+        cs.store_block(&next).unwrap();
+
+        // A snapshot base looks exactly like the #567 damage from the block
+        // index alone: never connected here, yet its coins are present.
+        force_status(&cs, &base, BlockStatus::DataStored);
+
+        // Perturbation: with no background attached, this is indistinguishable
+        // from damage and must be refused.
+        assert!(
+            matches!(
+                cs.connect_stored_block(&next.block_hash()),
+                Err(ChainError::BadPrevBlock)
+            ),
+            "without a snapshot base to point at, an unconnected parent is damage"
+        );
+
+        cs.store.flush().unwrap();
+        let (anchor, _) = crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        cs.attach_background(dir.join("chainstate_background"), 5, base, anchor, 64, -1)
+            .unwrap();
+
+        cs.connect_stored_block(&next.block_hash())
+            .expect("base+1 must connect while the background is still validating");
+        assert_eq!(cs.tip_height(), 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `connect_stored_block` verifies that the record it read is the block it
+    /// is connecting. `connect_preprocessed_block` reads no record — the
+    /// prefetcher hands it a decoded block — but it commits `tip.hash =
+    /// pre.hash` without ever reconciling that hash against `pre.block`. A
+    /// prefetcher that paired a block with the wrong entry would connect one
+    /// block's coins and name a different block as the tip.
+    #[test]
+    fn connect_preprocessed_rejects_a_block_that_is_not_its_declared_hash() {
+        use crate::chain::prefetch::PreprocessedBlock;
+        use std::collections::HashSet;
+
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+
+        let next = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        cs.accept_header(&next.header).unwrap();
+        cs.store_block(&next).unwrap();
+        let entry = cs.get_block_index(&next.block_hash()).unwrap();
+        let parent = cs.get_block_index(&cs.tip_hash()).unwrap();
+
+        // A sibling at the same height with the same parent: it validates,
+        // which is exactly what makes the mismatch dangerous.
+        let sibling = build_test_block(cs.tip_hash(), 6, 1_300_000_007);
+        assert_ne!(sibling.block_hash(), next.block_hash());
+
+        let pre = PreprocessedBlock {
+            height: 6,
+            hash: next.block_hash(),
+            block: sibling,
+            entry: entry.clone(),
+            parent,
+            flat_pos: crate::storage::flatfile::FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            },
+            mtp: cs.get_median_time_past(6),
+            txids: Vec::new(),
+            script_verified_txs: HashSet::new(),
+            context_free_checked: false,
+        };
+
+        let result = cs.connect_preprocessed_block(pre);
+        assert!(
+            matches!(result, Err(ChainError::FlatFile(_))),
+            "a preprocessed block that is not its declared hash must be refused, got {result:?}"
+        );
+        assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exemption is one block wide. Once the live chain has built on the
+    /// base, an unconnected block *above* it is damage again.
+    #[test]
+    fn snapshot_base_exemption_does_not_extend_above_the_base() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let base = blocks[3].block_hash();
+
+        let next = build_test_block(cs.tip_hash(), 6, 1_300_000_006);
+        cs.accept_header(&next.header).unwrap();
+        cs.store_block(&next).unwrap();
+
+        cs.store.flush().unwrap();
+        let (anchor, _) = crate::storage::compressed_coin::hash_utxo_set(&*cs.store).unwrap();
+        cs.attach_background(dir.join("chainstate_background"), 4, base, anchor, 64, -1)
+            .unwrap();
+
+        // The tip (height 5) is one above the base, and never connected.
+        force_status(&cs, &blocks[4].block_hash(), BlockStatus::DataStored);
+
+        assert!(
+            matches!(
+                cs.connect_stored_block(&next.block_hash()),
+                Err(ChainError::BadPrevBlock)
+            ),
+            "only the base itself is exempt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dump_utxo_snapshot_roundtrip_via_codec() {
         use crate::storage::compressed_coin::{
@@ -11623,7 +11900,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 err,
-                ChainError::Connect(connect::ConnectError::MissingOrSpentInput)
+                ChainError::Connect(connect::ConnectError::MissingOrSpentInput { .. })
             ),
             "expected the locktime check to pass on the replayed branch's MTP and the \
              connect to fail on the missing input; got {err:?}"

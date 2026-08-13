@@ -11,3 +11,4 @@ pub mod reorg_log;
 pub mod replay_plan;
 pub mod repair;
 pub mod state;
+pub mod tip_ancestry;

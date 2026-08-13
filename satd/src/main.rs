@@ -777,6 +777,62 @@ async fn main() {
         }
     }
 
+    // Check that the tip is standing on blocks this chainstate actually
+    // connected. Unlike the height index above, this is not derived state that
+    // can be rewritten: a hole means the UTXO set is missing those blocks'
+    // deltas, and the only remedy is to replay them. So this refuses to serve
+    // rather than repairing.
+    //
+    // It runs after the AssumeUTXO resume above, so a node with a pending
+    // snapshot has its background chainstate attached and its base is
+    // recognised rather than mistaken for damage.
+    {
+        let audit = chain_state.audit_tip_ancestry();
+        const SHOW: usize = 16;
+        if !audit.is_intact() {
+            if let Some(broken) = &audit.broken {
+                tracing::error!(
+                    ?broken,
+                    checked = audit.blocks_checked,
+                    "Tip ancestry walk hit a broken parent pointer"
+                );
+            }
+            if !audit.holes.is_empty() {
+                let heights: Vec<u32> =
+                    audit.holes.iter().take(SHOW).map(|a| a.height).collect();
+                tracing::error!(
+                    holes = audit.holes.len(),
+                    heights = ?heights,
+                    lowest_checked = audit.lowest_height,
+                    "Tip is standing on blocks this node never connected"
+                );
+            }
+            eprintln!(
+                "FATAL: the chainstate tip stands on {} block(s) that were never connected.\n\
+                 The UTXO set is missing every output those blocks created, so this node\n\
+                 would answer gettxout and every wallet-facing index incorrectly while\n\
+                 reporting a healthy synced tip.\n\
+                 \n\
+                 Affected heights: {:?}{}\n\
+                 \n\
+                 Refusing to start. Rebuild the UTXO set with -reindex-chainstate.",
+                audit.holes.len(),
+                audit.holes.iter().take(SHOW).map(|a| a.height).collect::<Vec<_>>(),
+                if audit.holes.len() > SHOW { " (truncated)" } else { "" },
+            );
+            auth.cleanup();
+            std::process::exit(1);
+        }
+        if !audit.unvalidated_floor.is_empty() {
+            // Normal on an AssumeUTXO node: history below the snapshot base
+            // that the background chainstate has not reached yet.
+            tracing::info!(
+                count = audit.unvalidated_floor.len(),
+                "Tip ancestry includes blocks not yet validated by this chainstate"
+            );
+        }
+    }
+
     // Repair any HeaderOnly block-index entries above tip whose data is
     // actually present in the flat files. Idempotent: when there are no
     // holes (the healthy case) it's just one cheap index walk over

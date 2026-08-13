@@ -186,6 +186,37 @@ A reindex on a synced mainnet node runs for hours. The shipped `systemd` unit
 handles this without tripping the start timeout; see "Reindex resilience" in
 [Packaging](packaging.md).
 
+### Startup integrity checks
+
+Before serving RPC or connecting to peers, satd checks two things about the
+chain it is about to present.
+
+The **height→hash index** is audited for gaps at or below the tip and rebuilt
+in place from the tip's ancestry. It is derived state, so this is a repair and
+startup continues. Heights whose rows disagree with the tip's ancestry are
+logged but never overwritten — correcting one means choosing between branches
+by chainwork.
+
+The **tip's ancestry** is walked back one retarget period, and every block in
+it must be one this chainstate actually connected. This is *not* repaired. A
+block in the tip's ancestry that was never connected means the UTXO set is
+missing every output it created, and the only way to recover those is to replay
+the block. satd reports the affected heights and exits:
+
+```
+FATAL: the chainstate tip stands on 8 block(s) that were never connected.
+...
+Refusing to start. Rebuild the UTXO set with -reindex-chainstate.
+```
+
+Serving in that state is worse than not starting: the tip is a real block on
+the real chain, the height is correct, and `gettxout` answers confidently and
+wrongly.
+
+On an AssumeUTXO node the history below the snapshot base is legitimately
+unvalidated until the background chainstate reaches it. That is recognised and
+logged at `INFO`, not treated as damage.
+
 ## Differences from Bitcoin Core at a glance
 
 - `assumevalid=all` with `assumevalidage`: verify-recent-only mode. Core takes

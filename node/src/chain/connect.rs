@@ -40,8 +40,16 @@ pub(crate) fn is_unspendable(script: &bitcoin::Script) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
+    /// An input's coin was not in the UTXO set.
+    ///
+    /// The `Display` string is Core's reject reason verbatim and must stay
+    /// that way — it goes on the wire and into RPC errors. The outpoint rides
+    /// alongside it for logging: when this fires during connection it is
+    /// usually the first visible symptom of a UTXO set that has silently lost
+    /// coins, and knowing *which* outpoint localises the damage to a block
+    /// immediately instead of by bisection.
     #[error("bad-txns-inputs-missingorspent")]
-    MissingOrSpentInput,
+    MissingOrSpentInput { outpoint: OutPoint },
     #[error("bad-txns-premature-spend-of-coinbase")]
     PrematureCoinbaseSpend,
     #[error("bad-txns-in-belowout")]
@@ -552,7 +560,16 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     .or_else(|| intra_block_coins.remove(&outpoint))
                     .or_else(|| store.get_coin(&outpoint));
 
-                let coin = coin.ok_or(ConnectError::MissingOrSpentInput)?;
+                let Some(coin) = coin else {
+                    tracing::error!(
+                        %outpoint,
+                        txid = %tx.compute_txid(),
+                        input = in_idx,
+                        height,
+                        "input coin is missing from the UTXO set"
+                    );
+                    return Err(ConnectError::MissingOrSpentInput { outpoint });
+                };
 
                 // Check coinbase maturity
                 if coin.coinbase && height - coin.height < COINBASE_MATURITY {
@@ -1651,7 +1668,7 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
         });
-        assert!(matches!(result, Err(ConnectError::MissingOrSpentInput)));
+        assert!(matches!(result, Err(ConnectError::MissingOrSpentInput { .. })));
     }
 
     #[test]
