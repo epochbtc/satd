@@ -11032,6 +11032,76 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A pruned block is not damage, and must not fail the whole report.
+    ///
+    /// Pruned blocks are unreadable by construction — that is what pruning is
+    /// — so counting them alongside genuinely unreadable ones failed every
+    /// healthy pruned node. At the default window a `-prune=550` node has no
+    /// data for most of the range, so it would report a four-figure fault count
+    /// and then be advised to run `-reindex-chainstate`, which a pruned node
+    /// refuses outright. The spends and creates of a pruned block are still
+    /// unknown, so it still bounds the coin verdicts below it.
+    #[test]
+    fn verify_chainstate_does_not_call_a_pruned_block_damage() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert!(cs.verify_chainstate_default().is_consistent());
+
+        force_status(&cs, &blocks[2].block_hash(), BlockStatus::Pruned);
+
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.pruned, 1, "the pruned block should be counted as pruned");
+        assert!(
+            report.unreadable.is_empty(),
+            "a deliberately pruned block is not an unreadable one"
+        );
+        assert!(
+            report.is_consistent(),
+            "a healthy pruned node was reported damaged: {}",
+            report.describe()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The oracle must not count outputs the UTXO set never holds.
+    ///
+    /// `connect_block` never writes an unspendable output — an OP_RETURN, or a
+    /// script over the size limit — so counting one as "created" reports a coin
+    /// missing that was never meant to exist. Every post-segwit coinbase
+    /// carries a witness-commitment OP_RETURN and unspendables run at roughly a
+    /// quarter of all outputs at height 840000, so on mainnet this was millions
+    /// of phantom faults and a healthy node called corrupt.
+    ///
+    /// No other test in the suite builds a block with an unspendable output, so
+    /// without this one the exclusion is proven by nothing.
+    #[test]
+    fn verify_chainstate_ignores_outputs_the_utxo_set_never_holds() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        assert!(cs.verify_chainstate_default().is_consistent());
+
+        let mut block = build_test_block(cs.tip_hash(), 4, 1_300_000_010);
+        block.txdata[0].output.push(bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::script::Builder::new()
+                .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                .into_script(),
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        cs.accept_block(&block).expect("accept a block with an OP_RETURN output");
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert!(
+            report.is_consistent(),
+            "an unspendable output was counted as a coin the UTXO set should hold: {}",
+            report.describe()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// After `invalidateblock` truncates to the fork point, the height rows
     /// above the new tip still name the branch that was just invalidated. The
     /// connector asked for the next height, got a dead block, and logged

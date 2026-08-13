@@ -45,7 +45,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   active chain back and verifies the UTXO set, height index, txindex and
   cumulative transaction counts against them, rather than against each other.
   Used as a test oracle for reorg scenarios; also the basis for an offline
-  audit of a suspect datadir.
+  audit of a suspect datadir. Blocks the node pruned are reported separately
+  from blocks it could not read, so a healthy pruned node is not called
+  damaged; a block that could not be read now only withholds coin verdicts at
+  or below its own height, rather than for the whole window; and the
+  cumulative-count check is skipped when the backfill that populates those rows
+  has not run, which would otherwise fail a datadir whose UTXO set is perfect.
 - Fixed: after `invalidateblock`, the block connector could pin itself to the
   branch that had just been invalidated and stall indefinitely — it selected
   the next block through the height→hash index, which is "best known block at
