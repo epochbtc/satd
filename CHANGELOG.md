@@ -46,10 +46,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   the next block through the height→hash index, which is "best known block at
   this height" rather than an active-chain oracle and which nothing rewrites
   when a branch is invalidated. On a mainnet node this logged `Connector stuck
-  waiting for block data` once a second for five and a half hours while the
+  waiting for block data` every minute for five and a half hours while the
   canonical block at that height sat on disk. The connector now rejects a
   height row naming a block that cannot extend the active chain and connects
-  the tip's best connectable child instead.
+  the tip's best connectable child instead. The fallback scan filters as it
+  iterates rather than materialising an adjacency map of the whole block index,
+  and is rate-limited per stuck height.
+- Fixed: a height row naming a block this chainstate had already connected — a
+  reorg displaces it and no status is rewritten — made the connector retry
+  immediately with no sleep and no retry counter, spinning a core silently.
+  `Duplicate` now counts toward the retry limit like any other connect error,
+  so the existing fork-handoff recovery runs.
 
 - Fixed, Core compatibility: `confirmations` was computed from a block's height
   alone, with no check that the block is actually on the active chain. A valid

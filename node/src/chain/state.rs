@@ -5994,8 +5994,13 @@ impl ChainState {
 
     /// How often [`Self::next_block_to_connect`] may run its full block-index
     /// scan for the same stuck `(tip, height)`. Long enough that a wedged
-    /// connector costs a scan a minute rather than one a second; short enough
-    /// that a block arriving mid-wedge is picked up promptly.
+    /// connector costs one scan per thirty seconds rather than one per poll;
+    /// short enough that a block arriving mid-wedge is picked up promptly.
+    ///
+    /// Note the key is `(tip, height)`, so a *run* of poisoned rows is not
+    /// throttled: each connected block moves the tip and re-arms the scan.
+    /// That is the intended trade — the scan is what repairs each height — but
+    /// it is why the scan itself must stay O(1) in memory.
     const CONNECTOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Whether the fallback scan may run now. Always true when the tip or the
@@ -6029,17 +6034,20 @@ impl ChainState {
     /// the new tip still named the branch that had just been marked `Invalid`.
     /// The connector asked for the next height, got a dead block, found no
     /// usable data for it and logged `Connector stuck waiting for block data`
-    /// once a second for five and a half hours, while the canonical block at
-    /// that same height sat on disk as `DataStored`. The operator's only way
-    /// out was another manual RPC.
+    /// every minute — the line is throttled per stuck height — for five and a
+    /// half hours, while the canonical block at that same height sat on disk
+    /// as `DataStored`. The operator's only way out was another manual RPC.
     ///
     /// Note the row was not obviously wrong: the invalidated block's parent
     /// *is* the fork point, so it is a genuine child of the tip. What
     /// disqualifies it is its status.
     ///
-    /// Fast path is unchanged from before — one point lookup, and a row naming
-    /// a block whose parent is the tip is taken as-is, including a header whose
-    /// block has not been downloaded yet (the caller waits for the data).
+    /// Fast path is two point lookups — the height row, then its entry, since
+    /// the status is the whole point — and a row naming a block whose parent is
+    /// the tip is taken as-is, including a header whose block has not been
+    /// downloaded yet (the caller waits for the data). The connector read one
+    /// lookup before this function existed; the second is what distinguishes a
+    /// live frontier from an invalidated branch.
     ///
     /// **This never returns `None` when the height row exists.** When the scan
     /// finds no better candidate it hands back the row unchanged, which is
@@ -6053,8 +6061,23 @@ impl ChainState {
     /// second and loops without incrementing that counter — trading a
     /// thirty-second self-heal for an unbounded silent stall.
     pub fn next_block_to_connect(&self, next_height: u32) -> Option<BlockHash> {
-        let tip = self.tip_hash();
+        // One acquisition, not two. The caller derived `next_height` from its
+        // own `tip_height()` read; taking the hash from a second read lets a
+        // concurrent `submitblock` or mined block land in between, after which
+        // `next_height` is the *new* tip's own height. The fast path then fails
+        // (the new tip's parent is the old tip), the scan finds no child at
+        // that height, and the fallthrough hands back the new tip itself —
+        // `Duplicate`, one wasted iteration, and a full index scan to pay for
+        // it.
+        let (tip, tip_height) = self.tip_snapshot();
         let row = self.store.get_block_hash_by_height(next_height)?;
+        if tip_height + 1 != next_height {
+            // The tip moved under the caller. Answering for a height that is
+            // no longer the frontier would be answering a stale question, and
+            // burning a full index scan on it is worse than useless. Hand back
+            // the row — the caller re-reads the tip on its next iteration.
+            return Some(row);
+        }
 
         // Only the two statuses the connector can actually make progress on.
         // `HeaderOnly` is deliberately included: the block is not downloaded
@@ -6069,10 +6092,12 @@ impl ChainState {
         //   finds the connectable child on the winning branch instead.
         // - `Valid`: already connected in this chainstate — a reorg displaced
         //   it and `disconnect_block` writes no status, so the marker sticks.
-        //   `connect_stored_block` rejects it with `Duplicate`, which the
-        //   caller treats as harmless and retries with no sleep and no retry
-        //   counter: a silent hot spin. Reaching such a block is a reorg, not
-        //   a sequential connect.
+        //   `connect_stored_block` rejects it with `Duplicate`. Reaching such
+        //   a block is a reorg, not a sequential connect. (The caller used to
+        //   treat `Duplicate` as harmless and retry with no sleep and no retry
+        //   counter — a silent hot spin whenever the fallthrough below handed
+        //   back such a row. It now counts toward the retry limit like any
+        //   other error, so the fork-handoff recovery runs instead.)
         if let Some(entry) = self.store.get_block_index(&row)
             && entry.header.prev_blockhash == tip
             && matches!(
@@ -6106,30 +6131,35 @@ impl ChainState {
         // status, so displaced blocks keep the marker) would hand the caller a
         // block it cannot connect. Reaching such a child is a reorg, not a
         // sequential connect, and the fallthrough below routes it there.
-        let mut best: Option<BlockIndexEntry> = None;
-        if let Ok(children) = self.block_index_children()
-            && let Some(kids) = children.get(&tip)
-        {
-            for child in kids {
-                let Some(e) = self.store.get_block_index(child) else {
-                    continue;
-                };
-                if e.status != BlockStatus::DataStored || e.height != next_height {
-                    continue;
-                }
-                let better = match &best {
-                    None => true,
-                    Some(b) => match compare_u256(&e.chainwork, &b.chainwork) {
-                        1 => true,
-                        -1 => false,
-                        _ => *child < b.header.block_hash(),
-                    },
-                };
-                if better {
-                    best = Some(e);
-                }
+        // Filter during the scan rather than building an adjacency map of the
+        // whole index and then reading one key out of it.
+        // `block_index_children` materialises a HashMap over every row — ~1M
+        // entries and a transient allocation in the hundreds of megabytes on
+        // mainnet — which is defensible for the rare operator-driven
+        // invalidate/reconsider paths it was written for, but not for a poll
+        // loop running on a node that is already short of memory. Same O(N)
+        // time, O(1) space.
+        let mut best: Option<(BlockHash, BlockIndexEntry)> = None;
+        let _ = self.store.for_each_block_index(&mut |child, e| {
+            if e.header.prev_blockhash != tip
+                || e.status != BlockStatus::DataStored
+                || e.height != next_height
+            {
+                return;
             }
-        }
+            let better = match &best {
+                None => true,
+                Some((bh, b)) => match compare_u256(&e.chainwork, &b.chainwork) {
+                    1 => true,
+                    -1 => false,
+                    _ => child < *bh,
+                },
+            };
+            if better {
+                best = Some((child, e));
+            }
+        });
+        let best = best.map(|(_, e)| e);
 
         let Some(found) = best else {
             // Nothing better to offer. Hand back the row so the caller's
@@ -10664,7 +10694,7 @@ pub(crate) mod tests {
     /// After `invalidateblock` truncates to the fork point, the height rows
     /// above the new tip still name the branch that was just invalidated. The
     /// connector asked for the next height, got a dead block, and logged
-    /// `Connector stuck waiting for block data` once a second for five and a
+    /// `Connector stuck waiting for block data` every minute for five and a
     /// half hours while the canonical block at that height sat on disk.
     ///
     /// Note the dead block is a genuine child of the tip — its parent *is* the
