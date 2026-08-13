@@ -2366,6 +2366,42 @@ impl ChainState {
         }
     }
 
+    /// Refill the MTP cache from `tip`'s own ancestry, walking parent
+    /// pointers.
+    ///
+    /// Used when a reorg aborts: the staged entries describe a branch the node
+    /// is no longer on, and `push_mtp_cache`'s per-height dedup has already
+    /// destroyed the displaced ones, so they cannot be restored in place. The
+    /// alternative to refilling is clearing, which is correct but sends the
+    /// next eleven MTP reads through the `height_hash` index — the one this
+    /// file repeatedly warns is not an active-chain oracle. Parent pointers
+    /// cannot be polluted by a side branch, so this reads from the only
+    /// structure that is authoritative about which chain a block is on.
+    ///
+    /// Best-effort: a walk that runs out of index entries leaves the cache
+    /// short, and a short cache simply misses, falling back to the store —
+    /// exactly what clearing would have done, and never a wrong answer.
+    fn repopulate_mtp_cache_from(&self, tip: BlockHash, tip_height: u32) {
+        let mut rebuilt: Vec<(u32, u32)> = Vec::with_capacity(12);
+        let mut cursor = tip;
+        let mut height = tip_height;
+        for _ in 0..12 {
+            let Some(entry) = self.store.get_block_index(&cursor) else {
+                break;
+            };
+            rebuilt.push((height, entry.header.time));
+            if height == 0 {
+                break;
+            }
+            cursor = entry.header.prev_blockhash;
+            height -= 1;
+        }
+        // Ascending, matching the order `push_mtp_cache` builds: the eviction
+        // there drops the front, which must be the lowest height.
+        rebuilt.reverse();
+        *self.mtp_cache.lock() = rebuilt;
+    }
+
     /// Pop the highest entry from MTP cache (used on disconnect).
     pub fn pop_mtp_cache(&self, height: u32) {
         let mut cache = self.mtp_cache.lock();
@@ -3057,6 +3093,30 @@ impl ChainState {
         } else {
             None
         };
+
+        // Recomputed here, not taken from `pre.mtp`. The prefetcher derives
+        // MTP off the height→hash index at the moment it buffers the block,
+        // and this function already refuses to trust anything else it captured
+        // then — it re-derives the parent, re-checks `prev == tip`, and
+        // reconciles the block against the entry authorising it. MTP was the
+        // one consensus input still crossing that boundary unchecked.
+        //
+        // The prefetcher's safety argument was that on the IBD path the index
+        // is authoritative because it is written forward as blocks connect. A
+        // connector that deliberately advances past a height whose row named a
+        // different block falsifies that: blocks buffered while the row was
+        // poisoned keep the MTP they were stamped with, the dispatcher's
+        // eviction only drops entries *below* the cursor, and `pre.hash`
+        // matching the (now repaired) row lets them through. One differing
+        // element shifts an eleven-element median, and MTP gates BIP 113 and
+        // BIP 68.
+        //
+        // It also brings this path under the guarantee the rest of this change
+        // is about: `connect_preprocessed_block` writes the MTP cache but
+        // never read it, so for the bulk of IBD blocks "MTP comes from the
+        // branch being connected" was simply not in force. Normally a cache
+        // hit, since the previous block pushed its own entry.
+        let mtp = self.get_median_time_past(pre.height);
         let batch = connect::connect_block(&connect::ConnectParams {
             replay_plan: None,
             store: &*self.store,
@@ -3065,7 +3125,7 @@ impl ChainState {
             parent_chainwork: &pre.parent.chainwork,
             flat_pos: pre.flat_pos,
             script_verifier: base_verifier,
-            median_time_past: pre.mtp,
+            median_time_past: mtp,
             network: self.network,
             pre_verified_txs: pre_verified,
             num_threads: self.num_threads,
@@ -5767,9 +5827,21 @@ impl ChainState {
         // the next block up validates against the branch being reconnected
         // rather than the one being displaced. An abort makes those entries
         // wrong in the other direction — they describe a branch this node is
-        // no longer on. Drop the cache; it refills from the block index on the
-        // next lookup, which is the pre-reorg chain again.
-        self.mtp_cache.lock().clear();
+        // no longer on.
+        //
+        // Rebuild them from the restored tip's own ancestry rather than just
+        // clearing. Clearing is correct but routes every subsequent MTP read
+        // through `get_median_time_past`'s store fallback, which resolves each
+        // height through `height_hash` — the index this file documents
+        // throughout as "best known block at this height", not an active-chain
+        // oracle, and which an aborted reorg can itself have polluted: a
+        // coinbase-only block whose sole output is unspendable produces no coin
+        // writes, so its batch takes the pass-through and its height row
+        // reaches the inner store even though the reorg was discarded. A wrong
+        // MTP is a consensus fault, so walking parent pointers — which cannot
+        // be polluted — is worth eleven index reads on a path that only runs
+        // when a reorg has already failed.
+        self.repopulate_mtp_cache_from(old_tip, old_height);
         let mut tip = self.tip.write();
         tip.hash = old_tip;
         tip.height = old_height;

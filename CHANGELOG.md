@@ -42,13 +42,23 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
 - Fixed, consensus: median-time-past could be computed from the timestamps of a
-  branch a reorg had already displaced. The MTP cache was updated only for the
-  block that triggered a reorg, never for the blocks the reorg reconnected, so
-  it kept the losing branch's timestamps at those heights and served them until
-  they aged out of the window. MTP gates BIP 113 locktimes and BIP 68 sequence
-  locks, so a wrong median can accept or reject a transaction Bitcoin Core would
-  not. The cache now records every reconnected block and holds at most one entry
-  per height.
+  branch a reorg had already displaced. The blocks a reorg reconnects were
+  recorded only after the whole reconnect loop had finished — on one path not
+  at all — so every block the loop connected, including the one that becomes
+  the tip, was validated against the losing branch's timestamps at those
+  heights. MTP gates BIP 113 locktimes and BIP 68 sequence locks, so a wrong
+  median can accept or reject a transaction Bitcoin Core would not. Timestamps
+  are now recorded as each block connects, the cache holds at most one entry
+  per height, and an aborted reorg rebuilds it from the restored tip's own
+  ancestry by parent pointer rather than leaving it to refill from the height
+  index.
+- Fixed, consensus: the pipelined connect path used a median-time-past computed
+  when the block was prefetched, derived from the height→hash index at that
+  moment. It re-derived every other chain-dependent input on the connect
+  thread but carried this one across unchecked, so a block buffered while a
+  height row named a since-replaced block connected against a median containing
+  that block's timestamp. It is now computed on the connect thread, which also
+  brings the bulk of IBD under the guarantee above.
 - Internal: a chainstate consistency check that reads the last N blocks of the
   active chain back and verifies the UTXO set, height index, txindex and
   cumulative transaction counts against them, rather than against each other.
