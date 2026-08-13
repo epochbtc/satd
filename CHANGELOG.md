@@ -41,6 +41,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain. Reads now consult the pending batch before the inner store.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
+- Internal: a chainstate consistency check that reads the last N blocks of the
+  active chain back and verifies the UTXO set, height index, txindex and
+  cumulative transaction counts against them, rather than against each other.
+  Used as a test oracle for reorg scenarios; also the basis for an offline
+  audit of a suspect datadir.
 - Fixed: after `invalidateblock`, the block connector could pin itself to the
   branch that had just been invalidated and stall indefinitely — it selected
   the next block through the height→hash index, which is "best known block at
