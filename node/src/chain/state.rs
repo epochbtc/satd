@@ -6056,9 +6056,29 @@ impl ChainState {
         let tip = self.tip_hash();
         let row = self.store.get_block_hash_by_height(next_height)?;
 
+        // Only the two statuses the connector can actually make progress on.
+        // `HeaderOnly` is deliberately included: the block is not downloaded
+        // yet and the caller waits for it, which is correct. The three
+        // exclusions each have teeth:
+        //
+        // - `Invalid`: the case this function was written for.
+        // - `Pruned`: the block was connected once and its data removed, so
+        //   `has_block_data` is false and the caller parks on "waiting for
+        //   block data" forever. Reachable when a reorg moves the tip below a
+        //   block that had already been pruned. Falling through to the scan
+        //   finds the connectable child on the winning branch instead.
+        // - `Valid`: already connected in this chainstate — a reorg displaced
+        //   it and `disconnect_block` writes no status, so the marker sticks.
+        //   `connect_stored_block` rejects it with `Duplicate`, which the
+        //   caller treats as harmless and retries with no sleep and no retry
+        //   counter: a silent hot spin. Reaching such a block is a reorg, not
+        //   a sequential connect.
         if let Some(entry) = self.store.get_block_index(&row)
             && entry.header.prev_blockhash == tip
-            && entry.status != BlockStatus::Invalid
+            && matches!(
+                entry.status,
+                BlockStatus::HeaderOnly | BlockStatus::DataStored
+            )
         {
             return Some(row);
         }
@@ -10736,6 +10756,55 @@ pub(crate) mod tests {
             "a not-yet-downloaded header must still be selected, not skipped"
         );
         assert!(!cs.has_block_data(&next.block_hash()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Pruned` row at the next height must not pin the connector.
+    ///
+    /// `Pruned` means the block was connected once and its data discarded, so
+    /// `has_block_data` is false and the caller's "waiting for block data"
+    /// branch sleeps a second and loops — forever, with no retry counter and no
+    /// path to the fork handoff. Reachable when a reorg moves the tip below a
+    /// block that had already been pruned. The fast path must decline it and
+    /// let the scan find the connectable child instead.
+    #[test]
+    fn connector_selection_skips_a_pruned_row_for_the_connectable_child() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        // Two children of the tip: one pruned (data gone), one with data.
+        let pruned = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&pruned.header).unwrap();
+        cs.store_block(&pruned).unwrap();
+        force_status(&cs, &pruned.block_hash(), BlockStatus::Pruned);
+
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        assert_eq!(
+            cs.get_block_index(&canonical.block_hash()).unwrap().status,
+            BlockStatus::DataStored
+        );
+
+        // The row names the pruned block — a block the connector cannot use.
+        pollute_height_hash(&cs, 4, pruned.block_hash());
+        assert!(
+            !cs.has_block_data(&pruned.block_hash()),
+            "precondition — a pruned block carries no data to connect"
+        );
+
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("a connectable child of the tip exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "a pruned row must not be handed back as the block to connect"
+        );
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
