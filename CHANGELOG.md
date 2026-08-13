@@ -41,6 +41,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain. Reads now consult the pending batch before the inner store.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
+- Fixed, consensus: median-time-past could be computed from the timestamps of a
+  branch a reorg had already displaced. The MTP cache was updated only for the
+  block that triggered a reorg, never for the blocks the reorg reconnected, so
+  it kept the losing branch's timestamps at those heights and served them until
+  they aged out of the window. MTP gates BIP 113 locktimes and BIP 68 sequence
+  locks, so a wrong median can accept or reject a transaction Bitcoin Core would
+  not. The cache now records every reconnected block and holds at most one entry
+  per height.
 - Internal: a chainstate consistency check that reads the last N blocks of the
   active chain back and verifies the UTXO set, height index, txindex and
   cumulative transaction counts against them, rather than against each other.

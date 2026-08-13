@@ -536,8 +536,25 @@ impl Store for CoinCache {
                     .fetch_add(coin.amount as i64, Ordering::Relaxed);
                 self.count_delta.fetch_add(1, Ordering::Relaxed);
                 clean.pop(&outpoint);
-                // Mark as fresh if this coin doesn't exist in the backing store
-                // (not already in dirty map as a non-fresh entry)
+                // `fresh` means "absent from the backing store", which is what
+                // licenses eliding a later spend: if the store never had it,
+                // create-then-spend inside one window needs no write at all.
+                //
+                // The test below is not that, though — it is "no dirty entry
+                // for this outpoint". The two agree only because of an
+                // invariant on the callers, which is worth stating since
+                // nothing enforces it: a `coin_put` is only ever issued for an
+                // outpoint the store does not hold. Connection creates outputs
+                // under txids that have never existed, and disconnection
+                // re-adds only coins it is simultaneously removing from the
+                // store's view. So "not in dirty" implies "not in the store":
+                // an outpoint the store holds and that was spent in this
+                // window is in `dirty` as `Spent`, giving `fresh = false` and
+                // a real remove at flush.
+                //
+                // Break that invariant and the failure is a phantom UTXO — an
+                // elided remove leaving a spent coin in the store — not a lost
+                // one. Worth knowing which direction it fails in.
                 let fresh = !dirty.contains_key(&outpoint);
                 dirty.insert(outpoint, DirtyEntry::Present { coin, fresh });
             }
@@ -686,6 +703,25 @@ impl Store for CoinCache {
                 }
             };
 
+        // A batch with no coins goes straight to the backing store, bypassing
+        // both the flush-exclusion and `discard_uncommitted`. That looks
+        // alarming next to the reorg atomicity `discard_uncommitted` promises,
+        // so it is worth writing down why it is not a hole.
+        //
+        // The routing is per batch, not global. Everything a reorg writes
+        // tentatively — every disconnect, every reconnect — carries coins, so
+        // `coin_dirty > 0` and it is buffered and therefore discardable. What
+        // takes this branch is writes that are not part of the reorg's
+        // tentative state and must not be rolled back with it: `store_block`
+        // recording an arriving block, `accept_header(s)`, `mark_subtree_invalid`
+        // stamping an invalidation. Those are durable facts about blocks, not
+        // about which chain is active, and a reorg aborting should not undo
+        // them.
+        //
+        // The one thing to preserve when touching this: nothing that a failed
+        // reorg must be able to retract may reach here. The `coin_dirty == 0`
+        // test is what enforces that, and it holds only because connection and
+        // disconnection always move coins.
         if has_non_coin {
             if coin_dirty == 0 {
                 let pass_through = StoreBatch {
@@ -1471,6 +1507,70 @@ mod tests {
             data_pos: 0,
             chainwork: work_for_bits(CompactTarget::from_consensus(0x207fffff)),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // 0. FRESH elision: the two sides of the invariant it depends on
+    // ---------------------------------------------------------------
+
+    /// A coin created and spent inside one flush window must not be in the
+    /// store afterwards.
+    ///
+    /// This pins the observable contract, not the elision. Skipping the write
+    /// pair entirely and writing both then removing both reach the same end
+    /// state, which is exactly why the `fresh` flag is safe to have — it is an
+    /// optimisation underneath a contract, not the contract itself. What would
+    /// break the contract is eliding a remove for a coin the store *does*
+    /// hold, which is the next test.
+    #[test]
+    fn fresh_coin_created_and_spent_in_one_window_never_reaches_the_store() {
+        let cache = make_cache(10);
+        let op = make_outpoint(0x5a, 0);
+
+        let mut put = StoreBatch::default();
+        put.coin_puts.push((op, make_coin(7_000, 9)));
+        cache.write_batch(put).unwrap();
+
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((op, 7_000, 9));
+        cache.write_batch(spend).unwrap();
+
+        cache.flush().unwrap();
+        cache.discard_uncommitted(); // drop overlays; read the store itself
+
+        assert!(
+            cache.get_coin(&op).is_none(),
+            "the coin must not be in the store"
+        );
+    }
+
+    /// The other side, and the one that matters: spending a coin the store
+    /// already holds must remove it. `fresh` must be false here — were the
+    /// caller invariant in `write_batch_mode` ever broken so that it were
+    /// true, the remove would be elided and the store would keep a spent coin.
+    /// A phantom UTXO rather than a lost one.
+    #[test]
+    fn spending_a_store_resident_coin_emits_a_real_remove() {
+        let inner = InMemoryStore::new();
+        let op = make_outpoint(0x5b, 0);
+        let mut seed = StoreBatch::default();
+        seed.coin_puts.push((op, make_coin(4_200, 3)));
+        inner.write_batch(seed).unwrap();
+        let cache = CoinCache::new(Box::new(inner), 10);
+
+        assert!(cache.get_coin(&op).is_some(), "seeded into the store");
+
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((op, 4_200, 3));
+        cache.write_batch(spend).unwrap();
+
+        cache.flush().unwrap();
+        cache.discard_uncommitted();
+
+        assert!(
+            cache.get_coin(&op).is_none(),
+            "a spend of a store-resident coin must not be elided"
+        );
     }
 
     // ---------------------------------------------------------------

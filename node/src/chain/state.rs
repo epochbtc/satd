@@ -2343,8 +2343,22 @@ impl ChainState {
     }
 
     /// Push a block's timestamp into the MTP cache after connection.
+    /// Record a connected block's timestamp for the MTP window.
+    ///
+    /// At most one entry per height, and it is the most recent writer's.
+    /// `get_median_time_past` resolves a height with `find`, which returns the
+    /// first match, so without this dedup a reorg leaves the displaced
+    /// branch's timestamp sitting ahead of the replacement's and every lookup
+    /// resolves to the branch that lost. Eviction is from the front, and the
+    /// displaced entries are never at the front — the trunk's are — so they
+    /// survive long enough to be consulted once the cache covers a full window
+    /// again.
+    ///
+    /// That is a consensus fault, not a cosmetic one: MTP gates BIP 113
+    /// locktimes and BIP 68 sequence locks.
     pub fn push_mtp_cache(&self, height: u32, timestamp: u32) {
         let mut cache = self.mtp_cache.lock();
+        cache.retain(|(h, _)| *h != height);
         cache.push((height, timestamp));
         // Keep only the last 12 entries
         if cache.len() > 12 {
@@ -5646,6 +5660,17 @@ impl ChainState {
                     hash: side_block.block_hash(),
                     height: *side_height,
                 });
+                // The MTP cache has to learn about the blocks a reorg
+                // reconnected, not just the one that triggered it. Without
+                // this it keeps the DISPLACED branch's timestamps at those
+                // heights — the push below only covers `new_height` — and
+                // `get_median_time_past` serves them for as long as they stay
+                // in the window. The invalidate/reconsider reorg path has
+                // always done this; this path did not.
+                //
+                // Consensus-relevant: MTP gates BIP 113 locktimes and BIP 68
+                // sequence locks.
+                self.push_mtp_cache(*side_height, side_block.header.time);
             }
 
             if let Some(log) = self.reorg_log.get() {
@@ -10893,6 +10918,125 @@ pub(crate) mod tests {
             report.describe()
         );
         assert_eq!(cs.get_block_hash_by_height(102), Some(b102_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MTP cache must hold at most one entry per height, and it must be
+    /// the most recent writer's.
+    ///
+    /// `get_median_time_past` resolves a height with `find`, which returns the
+    /// FIRST match, so a duplicate height silently shadows the newer value.
+    /// Whether that shadowing is ever observed depends on how quickly eviction
+    /// from the front happens to remove the stale entry — timing-dependent
+    /// reasoning of exactly the kind that produced the reorg bug below. This
+    /// makes the invariant structural instead.
+    #[test]
+    fn mtp_cache_keeps_only_the_newest_entry_per_height() {
+        let (cs, dir) = make_chain_state();
+
+        cs.push_mtp_cache(7, 1_111);
+        cs.push_mtp_cache(8, 2_222);
+        cs.push_mtp_cache(7, 3_333);
+
+        let cache = cs.mtp_cache.lock().clone();
+        let at_seven: Vec<u32> = cache
+            .iter()
+            .filter(|(h, _)| *h == 7)
+            .map(|(_, ts)| *ts)
+            .collect();
+        assert_eq!(
+            at_seven,
+            vec![3_333],
+            "one entry per height, and it is the newest: {cache:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MTP gates BIP 113 locktimes and BIP 68 sequence locks, so a wrong
+    /// median is a consensus fault, not a cosmetic one.
+    ///
+    /// `mtp_cache` is a `Vec<(height, timestamp)>` that `get_median_time_past`
+    /// searches with `find`, which returns the FIRST match. Disconnection never
+    /// removed the entries it invalidated — `pop_mtp_cache` exists and has no
+    /// callers — so after a reorg the cache holds the displaced branch's
+    /// timestamp for a height ahead of the replacement's, and the displaced one
+    /// is what every lookup resolves to.
+    #[test]
+    fn median_time_past_is_not_served_from_the_displaced_branch() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // A common trunk, then two branches whose timestamps differ widely.
+        let mut parent = genesis_hash;
+        for h in 1..=10u32 {
+            let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept trunk");
+        }
+        let fork_point = parent;
+
+        // Branch A: three blocks, timestamps far in the future.
+        let mut a_parent = fork_point;
+        for h in 11..=13u32 {
+            let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
+            a_parent = cs.accept_block(&b).expect("accept A");
+        }
+        assert_eq!(cs.tip_height(), 13);
+
+        // Branch B: four blocks with much earlier timestamps, so it wins on
+        // work and the two branches cannot be confused for one another.
+        let mut b_parent = fork_point;
+        let mut b_times = Vec::new();
+        for h in 11..=14u32 {
+            let ts = 1_600_010_000 + h * 600;
+            let b = build_test_block(b_parent, h, ts);
+            b_parent = cs.accept_block(&b).expect("accept B");
+            b_times.push((h, ts));
+        }
+        assert_eq!(cs.tip_height(), 14, "B must have won");
+
+        // Keep extending. Immediately after the reorg the cache is missing the
+        // low end of the window, so lookups fall through to the store and are
+        // correct. The stale entries only start winning once enough blocks have
+        // been pushed for the cache to cover a full window again — the entries
+        // it evicts first are the trunk's, not the displaced branch's.
+        let mut parent = cs.tip_hash();
+        for h in 15..=24u32 {
+            let b = build_test_block(parent, h, 1_600_010_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept extension");
+        }
+
+        // Recompute each MTP straight from the active chain, by parent pointer,
+        // consulting nothing a reorg can leave stale.
+        let mtp_from_chain = |cs: &ChainState, height: u32| -> u32 {
+            let start = height.saturating_sub(11);
+            let mut times = Vec::new();
+            let mut cursor = cs.tip_hash();
+            let mut h = cs.tip_height();
+            while h >= start {
+                let e = cs.get_block_index(&cursor).expect("ancestor entry");
+                if h < height {
+                    times.push(e.header.time);
+                }
+                if h == 0 {
+                    break;
+                }
+                cursor = e.header.prev_blockhash;
+                h -= 1;
+            }
+            times.sort_unstable();
+            times[times.len() / 2]
+        };
+
+        for height in 15..=25u32 {
+            assert_eq!(
+                cs.get_median_time_past(height),
+                mtp_from_chain(&cs, height),
+                "MTP at {height} must come from the active chain, not the branch it \
+                 displaced (branch B times: {b_times:?})"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
