@@ -46,8 +46,13 @@ use node::storage::rocksdb_store::RocksDbStore;
                   should exist and do not, spent coins still present, height-index rows naming \
                   the wrong block, txindex rows pointing at the wrong block, and cumulative \
                   transaction counts that do not follow from their parent.\n\n\
-                  Read-only — it never writes to the datadir — but it takes the RocksDB lock, \
-                  so the node MUST be stopped.\n\n\
+                  Takes the RocksDB lock, so the node MUST be stopped.\n\n\
+                  This issues no writes of its own, but it is NOT non-mutating: opening the \
+                  chainstate opens RocksDB read-write, which replays and truncates the WAL, \
+                  may flush and compact, rewrites the MANIFEST, deletes obsolete files, \
+                  creates any missing column family and stamps the schema version. Opening \
+                  the block files creates xor.dat if absent. If the datadir is evidence — the \
+                  case this tool exists for — copy it and audit the copy.\n\n\
                   Exit status: 0 consistent, 1 could not run, 2 inconsistencies found."
 )]
 struct Args {
