@@ -137,7 +137,7 @@ impl ChainState {
             tip_hash,
             tip_height,
             window,
-            self.background().map(|bg| bg.snapshot_hash()),
+            self.background().map(|bg| bg.snapshot_height()),
         );
 
         let mut report = ChainstateReport {
@@ -196,14 +196,33 @@ impl ChainState {
                                 spent.insert(input.previous_output);
                             }
                         }
-                        // The genesis coinbase is not in the UTXO set and
-                        // never was — Bitcoin Core does not add it, and satd
-                        // matches. Counting its output as created would make
-                        // every full-depth walk report one phantom missing
-                        // coin.
+                        // Only outputs that actually enter the UTXO set count
+                        // as created. Two exclusions, both mirroring
+                        // `connect_block`:
+                        //
+                        // - Unspendable outputs (OP_RETURN, or a script over
+                        //   the size limit) are never written. Every
+                        //   post-segwit coinbase carries the
+                        //   witness-commitment OP_RETURN, so without this
+                        //   every block contributes at least one phantom
+                        //   missing coin — and far more in practice:
+                        //   `connect_block` puts unspendables at ~24% of all
+                        //   outputs at height 840000. A default-window run on
+                        //   mainnet would have reported millions of them and
+                        //   called a healthy node corrupt.
+                        // - The genesis coinbase, which Core does not add to
+                        //   the UTXO set and satd matches.
                         if height > 0 {
-                            for vout in 0..tx.output.len() as u32 {
-                                created.push(OutPoint { txid, vout });
+                            for (vout, output) in tx.output.iter().enumerate() {
+                                if crate::chain::connect::is_unspendable(
+                                    &output.script_pubkey,
+                                ) {
+                                    continue;
+                                }
+                                created.push(OutPoint {
+                                    txid,
+                                    vout: vout as u32,
+                                });
                             }
                         }
                     }
@@ -221,20 +240,30 @@ impl ChainState {
         }
 
         // An output created and spent inside the window must be gone; one
-        // created and not spent must be present. Provably exhaustive over the
-        // window without needing to know anything about the chain below it.
-        for op in &created {
-            if spent.contains(op) {
-                continue;
+        // created and not spent must be present. Provably exhaustive over
+        // the window without needing to know anything about the chain below
+        // it — but only if every block in it was read. A block we could not
+        // read contributes neither its creates nor its spends, so a coin it
+        // spent still looks created-and-unspent and would be reported
+        // missing. Not hypothetical: a pruned node has no block data for
+        // most of a 2016-block window, and would otherwise be told it had
+        // lost thousands of coins. Withhold the coin verdicts rather than
+        // emit ones we know are unsound; `unreadable` is itself reported,
+        // so nothing is hidden.
+        if report.unreadable.is_empty() {
+            for op in &created {
+                if spent.contains(op) {
+                    continue;
+                }
+                if self.get_coin(op).is_none() {
+                    report.missing_coins.push(*op);
+                }
             }
-            if self.get_coin(op).is_none() {
-                report.missing_coins.push(*op);
-            }
-        }
-        // Every spend must have removed its coin, wherever the coin came from.
-        for op in &spent {
-            if self.get_coin(op).is_some() {
-                report.unspent_spends.push(*op);
+            // Every spend must have removed its coin, wherever the coin came from.
+            for op in &spent {
+                if self.get_coin(op).is_some() {
+                    report.unspent_spends.push(*op);
+                }
             }
         }
 

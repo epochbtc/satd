@@ -7077,6 +7077,15 @@ pub(crate) mod tests {
     /// Safe as a pure cache drop only because the flush comes first: with the
     /// dirty map and pending batch already drained, `discard_uncommitted` has
     /// nothing to discard but the overlays.
+    /// Flush, then drop the in-memory index overlays so subsequent reads go to
+    /// the store.
+    ///
+    /// Note what this does *not* do: `discard_uncommitted` deliberately keeps
+    /// the clean coin LRU, and `flush` promotes every coin it writes into that
+    /// LRU. So the height, txindex and chain_tx dimensions genuinely read cold
+    /// afterwards, and the coin dimension does not — `get_coin` still answers
+    /// from memory. A test relying on this to prove a coin reached disk is
+    /// proving nothing; it takes a fresh `ChainState` over the same datadir.
     fn flush_and_drop_caches(cs: &ChainState) {
         cs.store_ref().flush().expect("flush");
         cs.store_ref().discard_uncommitted();
@@ -10822,8 +10831,10 @@ pub(crate) mod tests {
         let b104_hash = cs.accept_block(&b104).expect("accept B104");
         assert_eq!(cs.tip_hash(), b104_hash, "B must have won");
 
-        // Read cold: what survived in memory proves nothing about what
-        // persisted. See `flush_and_drop_caches`.
+        // Drop the index overlays so the height/txindex/chain_tx dimensions —
+        // where #564's damage lands, and what this test actually gates — are
+        // read from the store rather than from the writer's own memory. The
+        // coin dimension is NOT read cold by this; see `flush_and_drop_caches`.
         flush_and_drop_caches(&cs);
 
         let report = cs.verify_chainstate_default();
