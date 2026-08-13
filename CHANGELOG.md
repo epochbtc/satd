@@ -41,6 +41,16 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain. Reads now consult the pending batch before the inner store.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
+- New: `satd-chainstate-audit`, an offline read-only tool that checks a stopped
+  node's UTXO set, height index, txindex and cumulative transaction counts
+  against the blocks on its active chain, and names every outpoint, height and
+  txid that disagrees. Exits 0 consistent / 1 could not run / 2 inconsistent.
+  Diagnoses only; repair is `-reindex-chainstate` or `satd-chainstate-repair`.
+- The connector's persistent-failure log line said "giving up" and then did not
+  give up — breaking the loop exits the connector, not the process, and IBD
+  restarts within seconds and fails at the same block. On a mainnet node that
+  printed every thirty seconds for five and a half hours. It now says what
+  actually happens.
 - Fixed, consensus: median-time-past could be computed from the timestamps of a
   branch a reorg had already displaced. The blocks a reorg reconnects were
   recorded only after the whole reconnect loop had finished — on one path not

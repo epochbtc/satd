@@ -186,6 +186,23 @@ A reindex on a synced mainnet node runs for hours. The shipped `systemd` unit
 handles this without tripping the start timeout; see "Reindex resilience" in
 [Packaging](packaging.md).
 
+### Driving a reorg by hand
+
+`invalidateblock` and `reconsiderblock` work as in Bitcoin Core, and reach the
+node through `sat-cli`'s raw-RPC passthrough:
+
+```sh
+sat-cli invalidateblock <blockhash>
+sat-cli reconsiderblock <blockhash>
+```
+
+They are not listed in `sat-cli --help` — any method `--help` does not name is
+forwarded verbatim, which is how Core-compatible tooling keeps working. That
+makes them easy to miss when they are the tool you need.
+
+Invalidating drives a reorg away from the named block and everything descended
+from it. `reconsiderblock` clears the mark and re-activates the best chain.
+
 ### Startup integrity checks
 
 Before serving RPC or connecting to peers, satd checks two things about the
@@ -243,6 +260,34 @@ repair them, or resync.
 On an AssumeUTXO node the history below the snapshot base is legitimately
 unvalidated until the background chainstate reaches it. That is recognised and
 logged at `INFO`, not treated as damage.
+
+### Auditing a suspect datadir offline
+
+`satd-chainstate-audit` answers the question the startup checks cannot afford
+to: does the UTXO set actually agree with the blocks on the active chain? It
+walks the tip's ancestry, reads each block back from the flat files, and reports
+every disagreement — coins that should exist and do not, spent coins still
+present, height-index rows naming the wrong block, txindex rows pointing at the
+wrong block, cumulative transaction counts that do not follow from their parent.
+
+```sh
+satd-chainstate-audit --datadir /path/to/datadir --txindex true
+satd-chainstate-audit --datadir /path/to/datadir --window 20000 --verbose
+```
+
+Read-only — it never writes to the datadir — but it takes the RocksDB lock, so
+**the node must be stopped**.
+
+Exit status is `0` when consistent, `1` when it could not run, `2` when it found
+inconsistencies, so it scripts cleanly.
+
+It diagnoses and does not repair. A missing coin is recoverable only by
+replaying the block that created it: `-reindex-chainstate`, or
+`satd-chainstate-repair` for a single block's lost delta.
+
+Pass `--txindex` to match the node's configuration. With `--txindex true` on a
+node that runs without it, every transaction is reported as having no index
+row — correct, but noise.
 
 ## Differences from Bitcoin Core at a glance
 

@@ -170,6 +170,213 @@ impl ChainstateReport {
     }
 }
 
+/// The blocks-and-store form of the check, usable without a running node.
+///
+/// `read_block` is handed each ancestor's hash and index entry and returns the
+/// block, or `None` if it cannot be read. A live node resolves it through the
+/// chain state; an offline audit reads the flat files directly.
+pub fn verify_chainstate_with(
+    store: &dyn crate::storage::Store,
+    read_block: &mut dyn FnMut(&BlockHash, &crate::storage::blockindex::BlockIndexEntry) -> Option<bitcoin::Block>,
+    tip_hash: BlockHash,
+    tip_height: u32,
+    window: u32,
+    snapshot_height: Option<u32>,
+) -> ChainstateReport {
+    let ancestry = crate::chain::tip_ancestry::audit_tip_ancestry(
+        store,
+        tip_hash,
+        tip_height,
+        window,
+        snapshot_height,
+    );
+
+    let mut report = ChainstateReport {
+        lowest_height: tip_height,
+        ancestry,
+        // Ask the datadir, not the caller. `has_txindex()` alone is just the
+        // flag the store was opened with — an offline tool pointed at someone
+        // else's datadir can pass the wrong one in either direction, and the
+        // node's own default (off) disagrees with what an auditor would
+        // naturally assume. `tx_index_complete()` is persisted in the datadir
+        // and maintained atomically with the batches that would invalidate it,
+        // so it is the half that cannot be got wrong from the command line.
+        txindex_expected: store.has_txindex() && store.tx_index_complete(),
+        txindex_incomplete: store.has_txindex() && !store.tx_index_complete(),
+        ..Default::default()
+    };
+
+    // Walk the ancestry by parent pointer, newest first, collecting what each
+    // block creates and spends. Never consult the height index for navigation —
+    // it is one of the things under test.
+    // Keyed by height: a block that could not be read only invalidates
+    // verdicts at or below its own height (see the coin checks below).
+    let mut created: Vec<(u32, OutPoint)> = Vec::new();
+    let mut spent: HashSet<OutPoint> = HashSet::new();
+    let mut unread_ceiling: Option<u32> = None;
+    let mut cursor = tip_hash;
+    let mut height = tip_height;
+    let stop = tip_height.saturating_sub(window.saturating_sub(1));
+
+    loop {
+        let Some(entry) = store.get_block_index(&cursor) else {
+            break;
+        };
+
+        if store.get_block_hash_by_height(height) != Some(cursor) {
+            report.height_mismatches.push(height);
+        }
+
+        // `chain_tx[b]` is written as `chain_tx[parent] + num_tx`. It is what
+        // proved the mainnet blocks HAD connected, after the status and undo
+        // artifacts both said they had not.
+        //
+        // Only when the rows are all supposed to be there. `chain_tx` is a
+        // backfilled column family: opening a datadir that predates it creates
+        // it empty and marks the backfill incomplete, and the fill only runs
+        // while the node runs. Auditing a copy taken before that happened would
+        // otherwise report a full window of faults on a datadir whose UTXO set
+        // is perfect.
+        let parent_hash = entry.header.prev_blockhash;
+        if store.chain_tx_backfill_complete() {
+            match store.get_cumulative_tx_count(&cursor) {
+                Some(mine) => {
+                    // Checked: `theirs` comes off disk, from the artifact under
+                    // audit. A corrupt row near u64::MAX would panic in debug
+                    // and wrap in release — and a wrap could land on `mine` and
+                    // hide the very fault being looked for.
+                    if let Some(theirs) = store.get_cumulative_tx_count(&parent_hash)
+                        && theirs
+                            .checked_add(entry.num_tx as u64)
+                            .is_none_or(|expected| mine != expected)
+                    {
+                        report.chain_tx_faults.push((height, cursor));
+                    }
+                }
+                None if height > 0 => report.chain_tx_faults.push((height, cursor)),
+                None => {}
+            }
+        }
+
+        match read_block(&cursor, &entry) {
+            Some(block) => {
+                for tx in &block.txdata {
+                    let txid = tx.compute_txid();
+                    match store.get_tx_location(&txid) {
+                        Some(loc) if loc != cursor => {
+                            report.tx_index_wrong.push((txid, loc));
+                        }
+                        Some(_) => {}
+                        None => report.tx_index_absent += 1,
+                    }
+                    if !tx.is_coinbase() {
+                        for input in &tx.input {
+                            spent.insert(input.previous_output);
+                        }
+                    }
+                    // Only outputs that actually enter the UTXO set count as
+                    // created. Two exclusions, both mirroring `connect_block`:
+                    //
+                    // - Unspendable outputs (OP_RETURN, or a script over the
+                    //   size limit) are never written. Every post-segwit
+                    //   coinbase carries the witness-commitment OP_RETURN, so
+                    //   without this every block contributes at least one
+                    //   phantom missing coin — and far more in practice:
+                    //   `connect_block` puts unspendables at ~24% of all
+                    //   outputs at height 840000. A default-window run on
+                    //   mainnet would have reported millions of them and
+                    //   called a healthy node corrupt.
+                    // - The genesis coinbase, which Core does not add to the
+                    //   UTXO set and satd matches.
+                    if height > 0 {
+                        for (vout, output) in tx.output.iter().enumerate() {
+                            if crate::chain::connect::is_unspendable(&output.script_pubkey) {
+                                continue;
+                            }
+                            created.push((
+                                height,
+                                OutPoint {
+                                    txid,
+                                    vout: vout as u32,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                // A pruned block is *supposed* to be unreadable. Counting it
+                // as a fault fails every healthy pruned node, at the default
+                // window for most of the range. It still blocks the coin
+                // verdicts below, because it contributes neither its creates
+                // nor its spends — but it is not damage.
+                if entry.status == crate::storage::blockindex::BlockStatus::Pruned {
+                    report.pruned += 1;
+                } else {
+                    report.unreadable.push(cursor);
+                }
+                unread_ceiling = Some(unread_ceiling.map_or(height, |h: u32| h.max(height)));
+            }
+        }
+
+        report.blocks_checked += 1;
+        report.lowest_height = height;
+        if height == 0 || height == stop {
+            break;
+        }
+        cursor = parent_hash;
+        height -= 1;
+    }
+
+    // An output created and not spent inside the window must be present. That
+    // is only sound where the *spends* are fully known: a block we could not
+    // read contributes neither its creates nor its spends, so a coin it spent
+    // still looks created-and-unspent and would be reported missing. A pruned
+    // node has no data for most of a default window and would otherwise be told
+    // it had lost thousands of coins.
+    //
+    // But the walk is newest-first, and a coin created at height H can only be
+    // spent at a height >= H. So for every create strictly above the highest
+    // unreadable block, the spend set is complete and the verdict is sound.
+    // Only creates at or below that ceiling are dropped. Withholding the whole
+    // window instead — as this did — means one truncated block anywhere in it
+    // hides every missing coin above it, which is precisely the pair of defects
+    // this node has already seen: repair the one bad block, re-run, get
+    // "consistent", and the UTXO hole the tool exists to find is never
+    // reported.
+    for (h, op) in &created {
+        if unread_ceiling.is_some_and(|ceiling| *h <= ceiling) {
+            continue;
+        }
+        if spent.contains(op) {
+            continue;
+        }
+        if store.get_coin(op).is_none() {
+            report.missing_coins.push(*op);
+        }
+    }
+    // Every spend must have removed its coin, wherever it came from.
+    //
+    // Unconditional: `spent` is populated only from blocks that WERE read, and
+    // the coin those blocks spent had to be gone regardless of what any
+    // unreadable block contained. The only way an unreadable block could make
+    // this wrong is by re-creating the same outpoint, which is a BIP30
+    // duplicate and impossible above height 227931. So the double-spendable-coin
+    // detector stays live on a pruned node, where the previous blanket
+    // suppression disabled it permanently.
+    for op in &spent {
+        if store.get_coin(op).is_some() {
+            report.unspent_spends.push(*op);
+        }
+    }
+
+    report.missing_coins.sort_unstable();
+    report.unspent_spends.sort_unstable();
+    report.height_mismatches.sort_unstable();
+    report.chain_tx_faults.sort_unstable();
+    report
+}
+
 impl ChainState {
     /// Read the last `window` blocks of the active chain back and check the
     /// UTXO set, height index, txindex and cumulative counts against them.
@@ -182,204 +389,14 @@ impl ChainState {
         // immediately, and every height row in the coin walk is off by one —
         // up to a full window of spurious faults on a healthy node.
         let (tip_hash, tip_height) = self.tip_snapshot();
-
-        let ancestry = crate::chain::tip_ancestry::audit_tip_ancestry(
+        verify_chainstate_with(
             &**self.store_ref(),
+            &mut |hash, _entry| self.get_block(hash),
             tip_hash,
             tip_height,
             window,
             self.background().map(|bg| bg.snapshot_height()),
-        );
-
-        let mut report = ChainstateReport {
-            lowest_height: tip_height,
-            ancestry,
-            // Ask the datadir, not the caller. `has_txindex()` alone is just
-            // the flag the store was opened with, and the node's own default
-            // (off) disagrees with what an auditor would naturally assume.
-            // `tx_index_complete()` is persisted in the datadir and maintained
-            // atomically with the batches that would invalidate it, so it is
-            // the half that cannot be got wrong from outside.
-            txindex_expected: crate::storage::Store::has_txindex(&**self.store_ref())
-                && crate::storage::Store::tx_index_complete(&**self.store_ref()),
-            txindex_incomplete: crate::storage::Store::has_txindex(&**self.store_ref())
-                && !crate::storage::Store::tx_index_complete(&**self.store_ref()),
-            ..Default::default()
-        };
-
-        // Walk the ancestry by parent pointer, newest first, collecting what
-        // each block creates and spends. Never consult the height index for
-        // navigation — it is one of the things under test.
-        // Keyed by height: a block that could not be read only invalidates
-        // verdicts at or below its own height (see the coin checks below).
-        let mut created: Vec<(u32, OutPoint)> = Vec::new();
-        let mut spent: HashSet<OutPoint> = HashSet::new();
-        let mut unread_ceiling: Option<u32> = None;
-        let mut cursor = tip_hash;
-        let mut height = tip_height;
-        let stop = tip_height.saturating_sub(window.saturating_sub(1));
-
-        loop {
-            let Some(entry) = self.get_block_index(&cursor) else {
-                break;
-            };
-
-            if self.get_block_hash_by_height(height) != Some(cursor) {
-                report.height_mismatches.push(height);
-            }
-
-            // `chain_tx[b]` is written as `chain_tx[parent] + num_tx`. It is
-            // what proved the mainnet blocks HAD connected, after the status
-            // and undo artifacts both said they had not.
-            //
-            // Only when the rows are all supposed to be there. `chain_tx` is a
-            // backfilled column family: opening a datadir that predates it
-            // creates it empty and marks the backfill incomplete, and the fill
-            // only runs while the node runs. Auditing a copy taken before that
-            // happened would otherwise report a full window of faults on a
-            // datadir whose UTXO set is perfect.
-            let parent_hash = entry.header.prev_blockhash;
-            if crate::storage::Store::chain_tx_backfill_complete(&**self.store_ref()) {
-                match self.cumulative_tx_count(&cursor) {
-                    Some(mine) => {
-                        // Checked: `theirs` comes off disk, from the artifact
-                        // under audit. A corrupt row near u64::MAX would panic
-                        // in debug and wrap in release — and a wrap could land
-                        // on `mine` and hide the very fault being looked for.
-                        if let Some(theirs) = self.cumulative_tx_count(&parent_hash)
-                            && theirs
-                                .checked_add(entry.num_tx as u64)
-                                .is_none_or(|expected| mine != expected)
-                        {
-                            report.chain_tx_faults.push((height, cursor));
-                        }
-                    }
-                    None if height > 0 => report.chain_tx_faults.push((height, cursor)),
-                    None => {}
-                }
-            }
-
-            match self.get_block(&cursor) {
-                Some(block) => {
-                    for tx in &block.txdata {
-                        let txid = tx.compute_txid();
-                        match self.get_tx_location(&txid) {
-                            Some(loc) if loc != cursor => {
-                                report.tx_index_wrong.push((txid, loc));
-                            }
-                            Some(_) => {}
-                            None => report.tx_index_absent += 1,
-                        }
-                        if !tx.is_coinbase() {
-                            for input in &tx.input {
-                                spent.insert(input.previous_output);
-                            }
-                        }
-                        // Only outputs that actually enter the UTXO set count
-                        // as created. Two exclusions, both mirroring
-                        // `connect_block`:
-                        //
-                        // - Unspendable outputs (OP_RETURN, or a script over
-                        //   the size limit) are never written. Every
-                        //   post-segwit coinbase carries the
-                        //   witness-commitment OP_RETURN, so without this
-                        //   every block contributes at least one phantom
-                        //   missing coin — and far more in practice:
-                        //   `connect_block` puts unspendables at ~24% of all
-                        //   outputs at height 840000. A default-window run on
-                        //   mainnet would have reported millions of them and
-                        //   called a healthy node corrupt.
-                        // - The genesis coinbase, which Core does not add to
-                        //   the UTXO set and satd matches.
-                        if height > 0 {
-                            for (vout, output) in tx.output.iter().enumerate() {
-                                if crate::chain::connect::is_unspendable(
-                                    &output.script_pubkey,
-                                ) {
-                                    continue;
-                                }
-                                created.push((
-                                    height,
-                                    OutPoint {
-                                        txid,
-                                        vout: vout as u32,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // A pruned block is *supposed* to be unreadable. Counting
-                    // it as a fault fails every healthy pruned node, at the
-                    // default window for most of the range. It still blocks
-                    // the coin verdicts below, because it contributes neither
-                    // its creates nor its spends — but it is not damage.
-                    if entry.status == crate::storage::blockindex::BlockStatus::Pruned {
-                        report.pruned += 1;
-                    } else {
-                        report.unreadable.push(cursor);
-                    }
-                    unread_ceiling = Some(unread_ceiling.map_or(height, |h: u32| h.max(height)));
-                }
-            }
-
-            report.blocks_checked += 1;
-            report.lowest_height = height;
-            if height == 0 || height == stop {
-                break;
-            }
-            cursor = parent_hash;
-            height -= 1;
-        }
-
-        // An output created and not spent inside the window must be present.
-        // That is only sound where the *spends* are fully known: a block we
-        // could not read contributes neither its creates nor its spends, so a
-        // coin it spent still looks created-and-unspent and would be reported
-        // missing. A pruned node has no data for most of a default window and
-        // would otherwise be told it had lost thousands of coins.
-        //
-        // But the walk is newest-first, and a coin created at height H can
-        // only be spent at a height >= H. So for every create strictly above
-        // the highest unreadable block, the spend set is complete and the
-        // verdict is sound. Only creates at or below that ceiling are dropped.
-        // Withholding the whole window instead — as this did — means one
-        // truncated block anywhere in it hides every missing coin above it,
-        // which is precisely the pair of defects this node has already seen:
-        // repair the one bad block, re-run, get "consistent", and the UTXO
-        // hole the tool exists to find is never reported.
-        for (h, op) in &created {
-            if unread_ceiling.is_some_and(|ceiling| *h <= ceiling) {
-                continue;
-            }
-            if spent.contains(op) {
-                continue;
-            }
-            if self.get_coin(op).is_none() {
-                report.missing_coins.push(*op);
-            }
-        }
-        // Every spend must have removed its coin, wherever the coin came from.
-        //
-        // Unconditional: `spent` is populated only from blocks that WERE read,
-        // and the coin those blocks spent had to be gone regardless of what
-        // any unreadable block contained. The only way an unreadable block
-        // could make this wrong is by re-creating the same outpoint, which is
-        // a BIP30 duplicate and impossible above height 227931. So the
-        // double-spendable-coin detector stays live on a pruned node, where
-        // the previous blanket suppression disabled it permanently.
-        for op in &spent {
-            if self.get_coin(op).is_some() {
-                report.unspent_spends.push(*op);
-            }
-        }
-
-        report.missing_coins.sort_unstable();
-        report.unspent_spends.sort_unstable();
-        report.height_mismatches.sort_unstable();
-        report.chain_tx_faults.sort_unstable();
-        report
+        )
     }
 
     /// [`Self::verify_chainstate`] over the default ancestry window.

@@ -4018,15 +4018,27 @@ impl PeerManager {
                                 *ibd.write() = None;
                                 break;
                             }
+                            // "Giving up" is what this used to say, and it was
+                            // not true. Breaking exits the connector loop, not
+                            // the process; the run loop sees `has_ibd` and
+                            // starts a fresh IBD within seconds, which fails
+                            // at the same height and arrives back here. An
+                            // operator watching a mainnet node read "giving
+                            // up" every thirty seconds for five and a half
+                            // hours while the node did anything but.
                             tracing::error!(
                                 height = next_height, %hash, retries = retry_count,
-                                "Persistent connect failure, giving up: {}", e
+                                "Persistent connect failure after {} retries; restarting IBD, \
+                                 which will retry the same block: {}",
+                                retry_count, e
                             );
                             chain_state.warnings().record(
                                 "connect.persistent_failure",
                                 crate::warnings::Severity::Error,
                                 format!(
-                                    "block {} ({}) failed to connect after {} retries: {}",
+                                    "block {} ({}) failed to connect after {} retries: {}. \
+                                     IBD will restart and retry the same block; this repeats \
+                                     until the cause is fixed",
                                     next_height, hash, retry_count, e
                                 ),
                                 serde_json::json!({
@@ -4036,7 +4048,13 @@ impl PeerManager {
                                     "error": e.to_string(),
                                 }),
                             );
-                            // Force a restart by breaking the loop — systemd will restart us
+                            // Exit the connector loop. NOT the process: the run
+                            // loop restarts IBD from scratch, which is the
+                            // point (a fresh scheduler can pick different
+                            // peers, and a transient cause clears). systemd is
+                            // not involved — the comment here used to claim it
+                            // was, which is why the log line above claimed to
+                            // be giving up.
                             break;
                         }
                         if retry_count.is_multiple_of(10) {
