@@ -41,6 +41,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain. Reads now consult the pending batch before the inner store.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
+- Fixed: after `invalidateblock`, the block connector could pin itself to the
+  branch that had just been invalidated and stall indefinitely — it selected
+  the next block through the height→hash index, which is "best known block at
+  this height" rather than an active-chain oracle and which nothing rewrites
+  when a branch is invalidated. On a mainnet node this logged `Connector stuck
+  waiting for block data` once a second for five and a half hours while the
+  canonical block at that height sat on disk. The connector now rejects a
+  height row naming a block that cannot extend the active chain and connects
+  the tip's best connectable child instead.
 
 - Fixed, Core compatibility: `confirmations` was computed from a block's height
   alone, with no check that the block is actually on the active chain. A valid

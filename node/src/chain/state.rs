@@ -5986,6 +5986,80 @@ impl ChainState {
         Ok(children)
     }
 
+    /// The block the sequential connector should attempt at `next_height`
+    /// (always `tip_height + 1`).
+    ///
+    /// The connector used to read `height → hash` directly. That index is
+    /// "best known block at this height", not an active-chain oracle, and
+    /// nothing rewrites it when a branch is invalidated — so after
+    /// `invalidateblock` truncated the chain to the fork point, the rows above
+    /// the new tip still named the branch that had just been marked `Invalid`.
+    /// The connector asked for the next height, got a dead block, found no
+    /// usable data for it and logged `Connector stuck waiting for block data`
+    /// once a second for five and a half hours, while the canonical block at
+    /// that same height sat on disk as `DataStored`. The operator's only way
+    /// out was another manual RPC.
+    ///
+    /// Note the row was not obviously wrong: the invalidated block's parent
+    /// *is* the fork point, so it is a genuine child of the tip. What
+    /// disqualifies it is its status.
+    ///
+    /// Fast path is unchanged from before — one point lookup, and a row naming
+    /// a block whose parent is the tip is taken as-is, including a header whose
+    /// block has not been downloaded yet (the caller waits for the data). The
+    /// scan below runs only when the row names something that cannot extend
+    /// this chain, which cannot happen on a healthy node and is bounded by the
+    /// length of the dead branch when it does: each block connected rewrites
+    /// its own height row, so a height is only ever repaired once.
+    pub fn next_block_to_connect(&self, next_height: u32) -> Option<BlockHash> {
+        let tip = self.tip_hash();
+        let row = self.store.get_block_hash_by_height(next_height)?;
+
+        if let Some(entry) = self.store.get_block_index(&row)
+            && entry.header.prev_blockhash == tip
+            && entry.status != BlockStatus::Invalid
+        {
+            return Some(row);
+        }
+
+        // Ask the chain instead of the index: the block to connect is a child
+        // of the tip that carries data and has not been invalidated. Highest
+        // chainwork wins, ties broken by hash so the choice is deterministic.
+        let children = self.block_index_children().ok()?;
+        let mut best: Option<BlockIndexEntry> = None;
+        for child in children.get(&tip)? {
+            let Some(e) = self.store.get_block_index(child) else {
+                continue;
+            };
+            if e.status != BlockStatus::DataStored {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some(b) => match compare_u256(&e.chainwork, &b.chainwork) {
+                    1 => true,
+                    -1 => false,
+                    _ => *child < b.header.block_hash(),
+                },
+            };
+            if better {
+                best = Some(e);
+            }
+        }
+
+        let found = best?;
+        let hash = found.header.block_hash();
+        tracing::warn!(
+            height = next_height,
+            row = %row,
+            chosen = %hash,
+            tip = %tip,
+            "height index names a block that cannot extend the active chain; \
+             connecting the tip's child instead"
+        );
+        Some(hash)
+    }
+
     /// Mark `root` and all of its descendants `Invalid` (Core's
     /// FAILED_VALID + FAILED_CHILD). `Pruned` descendants are left alone.
     fn mark_subtree_invalid(&self, root: BlockHash) -> Result<(), ChainError> {
@@ -10487,6 +10561,114 @@ pub(crate) mod tests {
         );
         assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After `invalidateblock` truncates to the fork point, the height rows
+    /// above the new tip still name the branch that was just invalidated. The
+    /// connector asked for the next height, got a dead block, and logged
+    /// `Connector stuck waiting for block data` once a second for five and a
+    /// half hours while the canonical block at that height sat on disk.
+    ///
+    /// Note the dead block is a genuine child of the tip — its parent *is* the
+    /// fork point — so nothing about the parent link disqualifies it. Only its
+    /// status does.
+    #[test]
+    fn connector_skips_an_invalidated_branch_for_the_canonical_block() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let fork_point = blocks[2].block_hash();
+
+        // A branch on top of the fork point, connected, then invalidated.
+        let branch = build_test_block(fork_point, 4, 1_300_000_004);
+        cs.accept_header(&branch.header).unwrap();
+        cs.store_block(&branch).unwrap();
+        cs.connect_stored_block(&branch.block_hash()).unwrap();
+        assert_eq!(cs.tip_height(), 4);
+
+        // The canonical competitor's header is known, but the block has not
+        // arrived yet — so invalidation has no connectable alternative and
+        // truncates rather than reorging. This ordering is the incident's:
+        // the operator invalidated first, and the canonical blocks came down
+        // afterwards.
+        let canonical = build_test_block(fork_point, 4, 1_300_000_009);
+        assert_ne!(canonical.block_hash(), branch.block_hash());
+        cs.accept_header(&canonical.header).unwrap();
+
+        cs.invalidate_block(branch.block_hash()).unwrap();
+        assert_eq!(cs.tip_height(), 3, "invalidation truncates to the fork point");
+
+        // Now the block arrives and is stored. Storing does not connect.
+        cs.store_block(&canonical).unwrap();
+
+        // The wedge, injected directly. Nothing rewrites a height row when the
+        // block it names is invalidated, so on the mainnet node these rows
+        // still resolved to the dead branch — the connector logged
+        // `block_index_status=Some(Invalid) has_height_to_hash=true` at three
+        // separate heights. Reaching that state through the writers depends on
+        // download timing that is not reproducible in a unit test; the state
+        // itself is what the guard has to survive.
+        pollute_height_hash(&cs, 4, branch.block_hash());
+        assert_eq!(
+            cs.get_block_hash_by_height(4),
+            Some(branch.block_hash()),
+            "precondition — the height row names the invalidated branch"
+        );
+        assert_eq!(
+            cs.get_block_index(&branch.block_hash()).unwrap().status,
+            BlockStatus::Invalid
+        );
+
+        // The connector must reach the canonical block anyway, and connect it.
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("a connectable child of the tip exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "the connector must not be pinned to the invalidated branch"
+        );
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        // Connecting rewrites the row, so the height is repaired once.
+        assert_eq!(cs.get_block_hash_by_height(4), Some(canonical.block_hash()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback must not fire on a healthy node: a height whose block has
+    /// not been downloaded yet still returns that block, so the caller waits
+    /// for data rather than paying for a block-index scan every second.
+    #[test]
+    fn connector_selection_takes_the_height_row_when_it_names_the_tips_child() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+
+        // Header accepted, block never stored: the ordinary IBD frontier.
+        let next = build_test_block(cs.tip_hash(), 4, 1_300_000_004);
+        cs.accept_header(&next.header).unwrap();
+        assert_eq!(
+            cs.get_block_index(&next.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        assert_eq!(
+            cs.next_block_to_connect(4),
+            Some(next.block_hash()),
+            "a not-yet-downloaded header must still be selected, not skipped"
+        );
+        assert!(!cs.has_block_data(&next.block_hash()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No header at all for the next height: nothing to connect, and no scan.
+    #[test]
+    fn connector_selection_is_none_when_the_height_has_no_row() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        assert_eq!(cs.next_block_to_connect(4), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

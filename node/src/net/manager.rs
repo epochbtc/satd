@@ -3791,7 +3791,7 @@ impl PeerManager {
                 break;
             }
 
-            let hash = match chain_state.get_block_hash_by_height(next_height) {
+            let hash = match chain_state.next_block_to_connect(next_height) {
                 Some(h) => h,
                 None => {
                     // No header for this height yet — wait
