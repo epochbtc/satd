@@ -6160,20 +6160,41 @@ impl ChainState {
             }
         });
         // A scan that failed partway saw an unknown subset of the index, so
-        // its `best` is not "the best child" — it is "the best of whatever was
-        // reached before the error". Acting on that could connect a lower-work
-        // sibling; ignoring the error entirely would leave the connector
-        // wedged on the poisoned row with the underlying storage failure never
-        // surfacing anywhere, which is the same class of silent stall this
-        // whole function exists to end. Discard the partial result, say so, and
-        // fall back to the row.
+        // `best` is not "the best child" but "the best of whatever was reached
+        // before the error". Surface the failure — swallowing it leaves the
+        // connector wedged with the storage fault invisible, the exact silent
+        // stall this function exists to end — but still *prefer* the partial
+        // candidate over the row.
+        //
+        // The asymmetry is the whole point. Everything the closure admitted
+        // has already passed `prev == tip && DataStored && height ==
+        // next_height`, which is precisely what `connect_stored_block`
+        // requires, so a partial candidate is connectable by construction. The
+        // row carries no such guarantee — it is the poisoned height index this
+        // recovery path exists because of. Preferring the row costs a
+        // permanent wedge to avoid a transient suboptimality:
+        //
+        // - Partial candidate, higher-work sibling missed: the connector
+        //   connects a fully-validated child of the tip and moves forward. The
+        //   sibling is picked up afterwards by the ordinary reorg path.
+        // - Row, when the row is poisoned: `connect_stored_block` rejects it
+        //   with `Duplicate`, which the caller's fork-handoff gate does *not*
+        //   match (it tests `BadPrevBlock` specifically), so the retry counter
+        //   runs to 30, the run loop restarts IBD, and the next scan hits the
+        //   same persistent storage fault. The node never advances again.
+        //
+        // Decode failures are counted in `BlockIndexScanStats` rather than
+        // returned, so an `Err` here means a real iterator/IO fault — the
+        // persistent kind.
         if let Err(e) = scan {
+            let fallback = best.map(|(_, e)| e.header.block_hash()).unwrap_or(row);
             tracing::error!(
                 height = next_height,
                 tip = %tip,
+                fallback = %fallback,
                 error = %e,
                 "connector recovery scan of the block index failed; falling back to the \
-                 height row, which may name a block that cannot extend the active chain"
+                 best candidate seen before the error, or to the height row if none"
             );
             self.warnings().record(
                 "connect.recovery_scan_failed",
@@ -6182,8 +6203,15 @@ impl ChainState {
                  stall until this is resolved",
                 serde_json::json!({ "height": next_height, "error": e.to_string() }),
             );
-            return Some(row);
+            return Some(fallback);
         }
+        // The scan completed, so whatever the previous failure was, it is not
+        // current. An `Error`-severity entry that nothing clears pins
+        // `getwarnings`, holds `has_errors()` true for the life of the process
+        // and keeps the TUI's blocking modal up — describing a condition that
+        // resolved seconds ago. Every sibling connector warning is cleared on
+        // forward progress the same way.
+        self.warnings().clear("connect.recovery_scan_failed");
         let best = best.map(|(_, e)| e);
 
         let Some(found) = best else {
@@ -6995,6 +7023,15 @@ pub(crate) mod tests {
     use crate::storage::flatfile::FlatFileManager;
 
     pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
+        make_chain_state_with_store(Box::new(InMemoryStore::new()))
+    }
+
+    /// [`make_chain_state`] over a caller-supplied store, for tests that need
+    /// to control what the storage layer answers rather than only what it
+    /// holds.
+    pub(crate) fn make_chain_state_with_store(
+        store: Box<dyn crate::storage::Store>,
+    ) -> (ChainState, std::path::PathBuf) {
         // A process-wide counter guarantees a unique datadir per call: two
         // tests running on parallel threads can otherwise hit the same
         // `subsec_nanos()` and share a `blocks/` dir, corrupting each other's
@@ -7010,7 +7047,6 @@ pub(crate) mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let blocks_dir = dir.join("blocks");
-        let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
         let cs = ChainState::new(
             store,
@@ -10860,6 +10896,123 @@ pub(crate) mod tests {
         );
         cs.connect_stored_block(&next).unwrap();
         assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed recovery scan must still prefer a candidate it did reach over
+    /// the height row.
+    ///
+    /// Everything the scan admits has already passed `prev == tip &&
+    /// DataStored && height == next_height` — exactly what
+    /// `connect_stored_block` requires — so a partial candidate is connectable
+    /// by construction. The row is not: it is the poisoned height index this
+    /// recovery path exists because of. Handing back the row on a scan error
+    /// trades a transient suboptimality (a lower-work sibling, which the reorg
+    /// path corrects afterwards) for a permanent wedge: the row is rejected
+    /// with `Duplicate`, the caller's fork-handoff gate tests `BadPrevBlock`
+    /// specifically and so never fires, and the next scan hits the same
+    /// persistent storage fault.
+    #[test]
+    fn connector_selection_prefers_a_reached_candidate_when_the_scan_fails() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        // A connectable child of the tip, and a row naming a block that cannot
+        // extend the chain.
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        let dead = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&dead.header).unwrap();
+        cs.store_block(&dead).unwrap();
+        force_status(&cs, &dead.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 4, dead.block_hash());
+
+        controls.fail_block_index_scans(true);
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("never None while the height row exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "a scan that failed after reaching a connectable child must hand back that \
+             child, not the row it exists to route around"
+        );
+        // And it connects — the property the row does not have.
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        assert!(
+            cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "the storage fault must surface somewhere the operator can see it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan-failure warning must clear once a scan succeeds.
+    ///
+    /// `NodeWarnings` entries stay active until the call site clears them, so
+    /// an `Error` nothing clears pins `getwarnings`, holds `has_errors()` true
+    /// for the life of the process and keeps the TUI's blocking modal up —
+    /// describing a transient fault that resolved seconds earlier. Every
+    /// sibling connector warning is cleared on forward progress.
+    #[test]
+    fn connector_scan_warning_clears_once_the_scan_succeeds() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        let dead = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&dead.header).unwrap();
+        cs.store_block(&dead).unwrap();
+        force_status(&cs, &dead.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 4, dead.block_hash());
+
+        controls.fail_block_index_scans(true);
+        cs.next_block_to_connect(4).unwrap();
+        assert!(
+            cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "precondition — the fault was recorded"
+        );
+
+        // The fault clears. The scan is throttled per (tip, height), so move
+        // the height on rather than fighting the timer: progress re-arms it.
+        controls.fail_block_index_scans(false);
+        cs.connect_stored_block(&canonical.block_hash()).unwrap();
+        let follow = build_test_block(cs.tip_hash(), 5, 1_300_000_006);
+        cs.accept_header(&follow.header).unwrap();
+        cs.store_block(&follow).unwrap();
+        let dead5 = build_test_block(cs.tip_hash(), 5, 1_300_000_007);
+        cs.accept_header(&dead5.header).unwrap();
+        cs.store_block(&dead5).unwrap();
+        force_status(&cs, &dead5.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 5, dead5.block_hash());
+        cs.next_block_to_connect(5).unwrap();
+
+        assert!(
+            !cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "a completed scan means the storage fault is not current; leaving the warning \
+             standing pins has_errors() for the life of the process"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

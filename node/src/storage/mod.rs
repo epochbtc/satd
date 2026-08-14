@@ -8,6 +8,8 @@ pub mod flatfile;
 pub mod profile;
 pub mod rocksdb_store;
 pub mod split_store;
+#[cfg(test)]
+pub(crate) mod test_store;
 pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
