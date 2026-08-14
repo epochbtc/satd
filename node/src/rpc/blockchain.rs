@@ -1082,6 +1082,27 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
 
+    /// A partial `invalidateblock` keeps Core's error *code* and changes only
+    /// the message. Operators and client libraries branch on the code, so a
+    /// clearer explanation must not arrive as a different error.
+    #[test]
+    fn a_partial_invalidateblock_keeps_the_generic_error_code() {
+        use crate::chain::state::ChainError;
+        let (code, msg) = map_invalidate_err(ChainError::ReactivationFailed(
+            "bad-txns-inputs-missingorspent".to_string(),
+        ));
+        assert_eq!(code, -1);
+        assert!(msg.contains("bad-txns-inputs-missingorspent"), "{msg}");
+        assert!(msg.contains("block index updated"), "{msg}");
+
+        // The two codes Core distinguishes are untouched.
+        assert_eq!(map_invalidate_err(ChainError::BlockNotFound).0, -5);
+        assert_eq!(
+            map_invalidate_err(ChainError::InvalidArgument("x".into())).0,
+            -8
+        );
+    }
+
     use crate::chain::state::{AssumeValid, ChainState};
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;

@@ -3836,7 +3836,7 @@ impl PeerManager {
                         chain_state.bump_connect_heartbeat();
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
-                        chain_state.warnings().clear("connect.persistent_failure");
+                        chain_state.warnings().clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                         chain_state.warnings().clear("connect.retry");
                         // Update scheduler connect cursor
                         {
@@ -4033,7 +4033,7 @@ impl PeerManager {
                                 retry_count, e
                             );
                             chain_state.warnings().record(
-                                "connect.persistent_failure",
+                                crate::warnings::CONNECT_PERSISTENT_FAILURE,
                                 crate::warnings::Severity::Error,
                                 format!(
                                     "block {} ({}) failed to connect after {} retries: {}. \

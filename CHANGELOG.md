@@ -33,6 +33,18 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   against that chainstate's reorgs — interleaving with the one buffer a reorg
   rollback reasons about. Those writes now take the same lock, held only for
   the write itself.
+- A reorg now logs the branch it is activating, each block its reconnect loop
+  connects, and — at error level, naming the block and the cause — the fact
+  that it aborted. On the operator-driven `invalidateblock`/`reconsiderblock`
+  path a failed reorg previously left no log line at all.
+- `invalidateblock` and `reconsiderblock` now report a failed re-activation as
+  the partial success it is: the block index was updated and the tip was not
+  moved, with `reconsiderblock` named as the way back. JSON-RPC error codes are
+  unchanged.
+- `/readyz` now returns 503 while a standing `connect.persistent_failure`
+  warning says the block connector cannot make progress. Chain lag alone missed
+  a node wedged at its own tip. `/healthz` is unchanged — it remains a plain
+  liveness probe.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

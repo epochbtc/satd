@@ -155,6 +155,12 @@ const MAX_ACTIVE_WARNINGS: usize = 256;
 /// [`MAX_ACTIVE_WARNINGS`].
 const OVERFLOW_WARNING_ID: &str = "warnings.truncated";
 
+/// The connector has exhausted its retries on a block and cannot extend the
+/// chain. Shared so the site that raises it and the readiness probe that
+/// reads it cannot drift apart — a typo in either would silently turn the
+/// probe off, which is the failure mode it was added to fix.
+pub const CONNECT_PERSISTENT_FAILURE: &str = "connect.persistent_failure";
+
 impl NodeWarnings {
     pub fn new() -> Self {
         Self {
