@@ -6140,7 +6140,7 @@ impl ChainState {
         // loop running on a node that is already short of memory. Same O(N)
         // time, O(1) space.
         let mut best: Option<(BlockHash, BlockIndexEntry)> = None;
-        let _ = self.store.for_each_block_index(&mut |child, e| {
+        let scan = self.store.for_each_block_index(&mut |child, e| {
             if e.header.prev_blockhash != tip
                 || e.status != BlockStatus::DataStored
                 || e.height != next_height
@@ -6159,6 +6159,31 @@ impl ChainState {
                 best = Some((child, e));
             }
         });
+        // A scan that failed partway saw an unknown subset of the index, so
+        // its `best` is not "the best child" — it is "the best of whatever was
+        // reached before the error". Acting on that could connect a lower-work
+        // sibling; ignoring the error entirely would leave the connector
+        // wedged on the poisoned row with the underlying storage failure never
+        // surfacing anywhere, which is the same class of silent stall this
+        // whole function exists to end. Discard the partial result, say so, and
+        // fall back to the row.
+        if let Err(e) = scan {
+            tracing::error!(
+                height = next_height,
+                tip = %tip,
+                error = %e,
+                "connector recovery scan of the block index failed; falling back to the \
+                 height row, which may name a block that cannot extend the active chain"
+            );
+            self.warnings().record(
+                "connect.recovery_scan_failed",
+                crate::warnings::Severity::Error,
+                "Could not scan the block index for a connectable block; the connector may \
+                 stall until this is resolved",
+                serde_json::json!({ "height": next_height, "error": e.to_string() }),
+            );
+            return Some(row);
+        }
         let best = best.map(|(_, e)| e);
 
         let Some(found) = best else {
