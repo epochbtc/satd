@@ -60,18 +60,34 @@ pub struct ChainstateReport {
     pub tx_index_wrong: Vec<(Txid, BlockHash)>,
     /// Transactions in the walked blocks with no `tx_index` row at all.
     ///
-    /// Whether this is a fault depends on [`Self::txindex_expected`]: with the
-    /// index off, absent rows are the correct state; with it on, they are a
-    /// broken index. Counted rather than listed because on a healthy
-    /// non-txindex node it is every transaction in the window.
+    /// Whether this is a fault depends on [`Self::txindex_expected`]: only a
+    /// store that runs the index *and* whose index is known complete should
+    /// have a row for every transaction. Counted rather than listed because on
+    /// a node without a complete index it is every transaction in the window.
     pub tx_index_absent: usize,
-    /// Whether the store this report was built from has `-txindex` enabled.
+    /// Whether every walked transaction should have a `tx_index` row —
+    /// `has_txindex() && tx_index_complete()`.
     ///
-    /// Without it, [`Self::tx_index_absent`] cannot be judged — and judging it
-    /// as always-informational made the audit answer "consistent" and exit 0
-    /// on a node whose txindex was genuinely broken, which is the one answer a
-    /// diagnostic tool must never give wrongly.
+    /// Both halves are load-bearing. Without the first, absent rows are the
+    /// correct state and judging them as faults calls a healthy node damaged.
+    /// Without the second, so is flipping `-txindex=1` onto a datadir synced
+    /// without it: the flag is now on, the historical rows were never written,
+    /// and every block in the window legitimately lacks one. This mirrors the
+    /// `chain_tx` check below, which gates on its own backfill marker for
+    /// exactly the same reason.
+    ///
+    /// The completeness marker does not weaken the fault it exists to catch:
+    /// it is cleared only by connecting a block with the index off, never by
+    /// row loss, so a complete-but-corrupted index still fails the verdict.
     pub txindex_expected: bool,
+    /// The store runs `-txindex` but its index is known incomplete, so absent
+    /// rows could not be judged either way.
+    ///
+    /// Reported rather than silently dropped: "not checked" and "checked and
+    /// clean" are different answers, and a diagnostic that conflates them is
+    /// how the audit came to print `consistent` about an index it had never
+    /// actually looked at.
+    pub txindex_incomplete: bool,
     /// Blocks whose cumulative transaction count is absent, or disagrees with
     /// `parent + num_tx`.
     pub chain_tx_faults: Vec<(u32, BlockHash)>,
@@ -93,8 +109,12 @@ pub struct ChainstateReport {
 }
 
 impl ChainstateReport {
-    /// True when nothing disagreed. `tx_index_absent` is excluded — see its
-    /// docs.
+    /// True when nothing disagreed.
+    ///
+    /// `tx_index_absent` counts only when [`Self::txindex_expected`] — the
+    /// store both runs the index and has a complete one. On any other store
+    /// absent rows are the correct state, and treating them as damage calls a
+    /// healthy node broken; see that field.
     pub fn is_consistent(&self) -> bool {
         !(self.txindex_expected && self.tx_index_absent > 0)
             && self.ancestry.is_intact()
@@ -174,9 +194,16 @@ impl ChainState {
         let mut report = ChainstateReport {
             lowest_height: tip_height,
             ancestry,
-            // The store knows whether it was opened with the index, so the
-            // caller does not have to remember to say so.
-            txindex_expected: crate::storage::Store::has_txindex(&**self.store_ref()),
+            // Ask the datadir, not the caller. `has_txindex()` alone is just
+            // the flag the store was opened with, and the node's own default
+            // (off) disagrees with what an auditor would naturally assume.
+            // `tx_index_complete()` is persisted in the datadir and maintained
+            // atomically with the batches that would invalidate it, so it is
+            // the half that cannot be got wrong from outside.
+            txindex_expected: crate::storage::Store::has_txindex(&**self.store_ref())
+                && crate::storage::Store::tx_index_complete(&**self.store_ref()),
+            txindex_incomplete: crate::storage::Store::has_txindex(&**self.store_ref())
+                && !crate::storage::Store::tx_index_complete(&**self.store_ref()),
             ..Default::default()
         };
 

@@ -51,6 +51,17 @@ impl StoreControls {
     pub(crate) fn fail_block_index_scans(&self, yes: bool) {
         self.fail_block_index_scan.store(yes, Ordering::SeqCst);
     }
+
+    /// Set what the store reports for `-txindex` and for whether that index was
+    /// ever fully built. `InMemoryStore` hardcodes the first to true and
+    /// inherits the trait default `true` for the second, so without this no
+    /// test can build a report for a node that runs no index, or one whose
+    /// index is known incomplete — the two shapes that must not be reported as
+    /// damage.
+    pub(crate) fn set_txindex(&self, enabled: bool, complete: bool) {
+        self.txindex.store(enabled, Ordering::SeqCst);
+        self.txindex_complete.store(complete, Ordering::SeqCst);
+    }
 }
 
 /// An [`InMemoryStore`] whose failure modes and index configuration can be set

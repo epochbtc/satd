@@ -11070,6 +11070,72 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The other direction: absent rows must NOT be a fault on a node that
+    /// does not run the index, or whose index is known incomplete.
+    ///
+    /// This is the guard, and it was the one covered by nothing —
+    /// `InMemoryStore` hardcodes `has_txindex()` to true and inherits
+    /// `tx_index_complete() == true`, so no test could build a report for
+    /// either shape. Deleting the guard left the whole suite green while
+    /// making the default audit of a healthy node report millions of faults
+    /// and advise a reindex.
+    ///
+    /// Both halves matter. `-txindex` off is the common case — it is satd's
+    /// default. A complete-index marker that is false is the operator who
+    /// flipped `-txindex=1` onto a datadir synced without it: the flag is on,
+    /// the historical rows were never written, and no block in the window was
+    /// ever going to have one.
+    #[test]
+    fn verify_chainstate_does_not_call_an_absent_txindex_row_damage_when_none_is_expected() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let blocks = build_and_connect_chain(&cs, 3);
+        flush_and_drop_caches(&cs);
+
+        // Take a row away, exactly as the fault-direction test does.
+        let victim = blocks[1].txdata[0].compute_txid();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.tx_index_removes.push(victim);
+        cs.store.write_batch(batch).unwrap();
+        flush_and_drop_caches(&cs);
+
+        // Index off: absent rows are the correct state.
+        controls.set_txindex(false, false);
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1, "the row is genuinely gone");
+        assert!(!report.txindex_expected);
+        assert!(!report.txindex_incomplete);
+        assert!(
+            report.is_consistent(),
+            "a node that does not run -txindex must not be reported as damaged for rows it \
+             was never going to write"
+        );
+        assert!(!report.describe().contains("txindex row(s) absent"));
+
+        // Index on but known incomplete: not checked, and not a fault.
+        controls.set_txindex(true, false);
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1);
+        assert!(!report.txindex_expected);
+        assert!(
+            report.txindex_incomplete,
+            "the report must say the index went unchecked rather than silently dropping it"
+        );
+        assert!(
+            report.is_consistent(),
+            "-txindex switched on after syncing without it leaves historical rows absent by \
+             construction; that is not chainstate damage"
+        );
+
+        // And the fault direction still fires, so the gate did not just
+        // disable the check.
+        controls.set_txindex(true, true);
+        assert!(!cs.verify_chainstate_default().is_consistent());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A pruned block is not damage, and must not fail the whole report.
     ///
     /// Pruned blocks are unreadable by construction — that is what pruning is
