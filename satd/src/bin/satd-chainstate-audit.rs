@@ -295,11 +295,21 @@ fn main() -> ExitCode {
             println!("  height {height} {hash}");
         }
     }
-    if args.txindex && report.tx_index_absent > 0 {
-        println!(
-            "txindex rows absent: {} (expected only when the node runs without -txindex)",
-            report.tx_index_absent
-        );
+    if report.tx_index_absent > 0 {
+        if report.txindex_expected {
+            // A fault, and counted as one in the verdict: --txindex says this
+            // node runs the index, so rows that are not there are missing.
+            println!(
+                "txindex rows absent: {} — this node was audited with --txindex true, so \
+                 these rows should exist. Pass --txindex false if it does not run one.",
+                report.tx_index_absent
+            );
+        } else {
+            println!(
+                "txindex rows absent: {} (expected — audited with --txindex false)",
+                report.tx_index_absent
+            );
+        }
     }
 
     if report.is_consistent() {

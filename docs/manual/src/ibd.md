@@ -308,8 +308,10 @@ far as the search needs.
 Pass `--txindex` to match the node's configuration. It defaults to `true`, while
 satd's own `-txindex` defaults to off, so **pass `--txindex false` for a node
 that does not run one** — otherwise every transaction in the window is reported
-as having no index row, which is correct but pure noise, and the read-write open
-also creates the empty column family.
+as a missing index row and the audit exits 2, and the read-write open also
+creates the empty column family. The flag is not cosmetic: with it true, absent
+rows are a *fault*, because the node is claiming to keep an index it does not
+have. With it false they are the expected state and are only counted.
 
 Two states are reported but are not faults. Blocks the node **pruned** are
 counted separately from blocks that could not be read: pruning deletes block
