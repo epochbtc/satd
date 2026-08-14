@@ -101,6 +101,10 @@ WatchdogSec=120s
 Restart=always
 RestartSec=5s
 
+# Exit 3 (startup chainstate audit failed) never heals by restarting. Same
+# rationale as the non-instance unit.
+RestartPreventExitStatus=3
+
 User=satd
 Group=satd
 

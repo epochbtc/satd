@@ -123,6 +123,16 @@ WatchdogSec=120s
 Restart=always
 RestartSec=5s
 
+# The one exit `Restart=always` must not paper over. satd exits 3 when the
+# startup audit finds its UTXO set does not match the chain its tip claims;
+# that never heals by restarting, and the remedy is an operator-run reindex.
+# Without this the unit restarts every 5s forever, each cycle re-opening
+# RocksDB and re-running the scans, and `systemctl is-failed` never reports
+# a failure because the unit never settles — so the distinct exit code buys
+# nothing. With it, the unit stops in `failed` state and normal unit-state
+# alerting fires.
+RestartPreventExitStatus=3
+
 User=satd
 Group=satd
 

@@ -11,6 +11,37 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed: satd could advance its chain tip onto blocks it had never connected,
+  serving a UTXO set silently missing every output those blocks created while
+  reporting a healthy synced tip. Every connect path — both sequential (IBD)
+  paths and the steady-state `accept_block` a synced node uses — now requires
+  the parent to be a block this chainstate actually connected, not merely one
+  whose hash matches; `connect_preprocessed_block` additionally checks that the
+  block, the index entry authorising it and the hash the tip is set to all
+  agree, the identity check its flat-file counterpart already had. At startup
+  satd walks the tip's ancestry and refuses to start when it finds a block it
+  never connected, rather than serving wrong `gettxout` answers, exiting with
+  status 3 and naming `satd-chainstate-audit`; a broken parent pointer is
+  reported separately, with `-reindex` as its remedy — both faults can occur at
+  once and both are now printed. The audit runs again after a `-reindex` or
+  `-reindex-chainstate`, so a replay that stops short or rebuilds the same hole
+  fails in that run rather than serving until the next restart. On a pruned
+  node, where no remedy can replay deleted blocks, satd says so instead of
+  naming one that cannot work. An AssumeUTXO snapshot's unvalidated history is
+  recognised and is not an error.
+- The shipped systemd units set `RestartPreventExitStatus=3` so a node that
+  refuses to start on a damaged chainstate stops in `failed` state rather than
+  restarting every five seconds forever — without it the unit never settles and
+  unit-state alerting never fires, which defeats the distinct exit status.
+- Fixed: an unflushed block-index write lived only in a size-bounded LRU, so
+  eviction — cheap to cause, since every `headers` message puts up to 2000
+  entries into the same cache — made `get_block_index` fall through to the
+  inner store and report a connected block's *pre-connect* status. That turned
+  the new parent check into a false positive that refused to extend a healthy
+  chain. Reads now consult the pending batch before the inner store.
+- `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
+  height. The reject reason on the wire is unchanged.
+
 - Fixed, Core compatibility: `confirmations` was computed from a block's height
   alone, with no check that the block is actually on the active chain. A valid
   block on a losing branch therefore reported the depth its height implied —

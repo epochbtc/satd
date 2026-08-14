@@ -28,6 +28,12 @@ use node::validation::script::{ConsensusVerifier, RustVerifier, ScriptVerifier, 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Exit status for "the chainstate on disk is damaged and I will not serve it".
+/// Startup uses a bare `exit(1)` for the ordinary refusals — bad config, an
+/// unwritable datadir — and this condition needs a different response from an
+/// operator (stop, audit, reindex) than those do, so it gets its own code.
+const EXIT_CHAINSTATE_DAMAGED: i32 = 3;
+
 /// Watchdog probe over the shared chain state. Uses `is_responsive`
 /// (non-blocking try_read on the tip lock) so a wedged writer in
 /// connect/disconnect-block suppresses watchdog pings — systemd kills
@@ -67,6 +73,85 @@ impl Drop for ApiRuntimeGuard {
             .join();
         }
     }
+}
+
+
+/// Print the operator-facing FATAL block for a tip whose ancestry the
+/// chainstate never fully connected. Split out because it is needed twice:
+/// once before the reindex replay and once after it, so a replay that
+/// rebuilds a hole is caught in the same run rather than on the next start.
+fn report_ancestry_damage(
+    audit: &node::chain::tip_ancestry::TipAncestryAudit,
+    prune_mb: u64,
+    net_datadir: &std::path::Path,
+) {
+    const SHOW: usize = 16;
+        // The two faults are not mutually exclusive — the walk can
+        // classify holes and then hit a broken pointer below them — and
+        // they do not have the same remedy. Report each one that is
+        // present, then give a single remedy, because the stronger fault
+        // dictates it: -reindex-chainstate trusts the block index, so a
+        // broken pointer makes it a multi-hour replay that ends where it
+        // started.
+        eprintln!(
+            "FATAL: this node's UTXO set does not agree with the chain its tip claims.\n"
+        );
+        if let Some(broken) = &audit.broken {
+            eprintln!(
+                "  * The tip's ancestry could not be walked: {:?}\n    \
+                 The block index disagrees with itself, so this node cannot establish\n    \
+                 which blocks its UTXO set was built from.\n    \
+                 Walked {} block(s) down to height {} before stopping.\n",
+                broken, audit.blocks_checked, audit.lowest_height,
+            );
+        }
+        if !audit.holes.is_empty() {
+            eprintln!(
+                "  * The tip stands on {} block(s) that were never connected.\n    \
+                 The UTXO set is missing every output those blocks created, so this\n    \
+                 node would answer gettxout and every wallet-facing index incorrectly\n    \
+                 while reporting a healthy synced tip.\n    \
+                 Affected heights: {:?}{}\n",
+                audit.holes.len(),
+                audit.holes.iter().take(SHOW).map(|a| a.height).collect::<Vec<_>>(),
+                if audit.holes.len() > SHOW { " (truncated)" } else { "" },
+            );
+        }
+        if audit.broken.is_some() {
+            eprintln!(
+                "Refusing to start. Rebuild the block index with -reindex.\n\
+                 -reindex-chainstate will NOT fix this: it trusts the same block index."
+            );
+        } else {
+            eprintln!("Refusing to start. Rebuild the UTXO set with -reindex-chainstate.");
+        }
+        if prune_mb > 0 {
+            // Every remedy above replays blocks from the flat files, and a
+            // pruned node has deleted them. -reindex-chainstate refuses
+            // outright (its replay plan skips Pruned entries), -reindex
+            // rebuilds a truncated chain from what is left, and the audit
+            // tool cannot read blocks that are gone.
+            eprintln!(
+                "\n\
+                 This node is pruned (-prune={}), so none of the above can replay the\n\
+                 missing blocks — their data has been deleted. Fetch the affected\n\
+                 heights back from a peer with getblockfrompeer and repair them, or\n\
+                 resync from scratch.",
+                prune_mb,
+            );
+        } else {
+            eprintln!(
+                "\n\
+                 Before reindexing, you can see exactly what disagrees without starting\n\
+                 the node — it reads the blocks back and checks them against the UTXO set:\n\
+                 \n\
+                 \x20   satd-chainstate-audit --datadir {}\n\
+                 \n\
+                 A small hole may be cheaper to repair with satd-chainstate-repair than to\n\
+                 reindex. Both tools require the node to be stopped.",
+                net_datadir.display(),
+            );
+        }
 }
 
 #[tokio::main]
@@ -777,6 +862,53 @@ async fn main() {
         }
     }
 
+    // Check that the tip is standing on blocks this chainstate actually
+    // connected. Unlike the height index above, this is not derived state that
+    // can be rewritten: a hole means the UTXO set is missing those blocks'
+    // deltas, and the only remedy is to replay them. So this refuses to serve
+    // rather than repairing.
+    //
+    // It runs after the AssumeUTXO resume above, so a node with a pending
+    // snapshot has its background chainstate attached and its base is
+    // recognised rather than mistaken for damage.
+    {
+        let audit = chain_state.audit_tip_ancestry();
+        const SHOW: usize = 16;
+        if !audit.is_intact() {
+            if let Some(broken) = &audit.broken {
+                tracing::error!(
+                    ?broken,
+                    checked = audit.blocks_checked,
+                    "Tip ancestry walk hit a broken parent pointer"
+                );
+            }
+            if !audit.holes.is_empty() {
+                let heights: Vec<u32> =
+                    audit.holes.iter().take(SHOW).map(|a| a.height).collect();
+                tracing::error!(
+                    holes = audit.holes.len(),
+                    heights = ?heights,
+                    lowest_checked = audit.lowest_height,
+                    "Tip is standing on blocks this node never connected"
+                );
+            }
+            report_ancestry_damage(&audit, config.prune, &net_datadir);
+            auth.cleanup();
+            // Distinct from the generic exit(1) used throughout startup, so an
+            // operator's alerting can tell "chainstate is damaged" apart from
+            // "the config file has a typo" without scraping stderr.
+            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+        }
+        if !audit.unvalidated_floor.is_empty() {
+            // Normal on an AssumeUTXO node: history below the snapshot base
+            // that the background chainstate has not reached yet.
+            tracing::info!(
+                count = audit.unvalidated_floor.len(),
+                "Tip ancestry includes blocks not yet validated by this chainstate"
+            );
+        }
+    }
+
     // Repair any HeaderOnly block-index entries above tip whose data is
     // actually present in the flat files. Idempotent: when there are no
     // holes (the healthy case) it's just one cheap index walk over
@@ -925,6 +1057,30 @@ async fn main() {
     // below, so the pointer is never left behind the active chain.
     if config.reindex || config.reindex_chainstate {
         chain_state.refresh_best_header_to_tip();
+
+        // Re-run the ancestry audit on what the replay actually rebuilt, for
+        // the same reason -checkblockindex runs after a reindex rather than
+        // before: the pre-replay run passed trivially (clear_chainstate drops
+        // the tip pointer, so it walked a one-block chain), and a replay that
+        // stopped short or rebuilt a chain with a hole in it would otherwise
+        // serve for a full uptime before the next startup caught it. This is
+        // the operator's remedy failing silently, which is the worst time not
+        // to say so.
+        let audit = chain_state.audit_tip_ancestry();
+        if !audit.is_intact() {
+            tracing::error!(
+                holes = audit.holes.len(),
+                broken = ?audit.broken,
+                "Reindex finished but the rebuilt tip's ancestry is still incomplete"
+            );
+            eprintln!(
+                "The reindex completed, but the chain it rebuilt is still not one this\n\
+                 node connected end to end.\n"
+            );
+            report_ancestry_damage(&audit, config.prune, &net_datadir);
+            auth.cleanup();
+            std::process::exit(EXIT_CHAINSTATE_DAMAGED);
+        }
     }
 
     // Structural block-index audit (-checkblockindex): on every startup when
