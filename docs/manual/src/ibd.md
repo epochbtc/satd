@@ -271,7 +271,7 @@ present, height-index rows naming the wrong block, txindex rows pointing at the
 wrong block, cumulative transaction counts that do not follow from their parent.
 
 ```sh
-satd-chainstate-audit --datadir /path/to/datadir --txindex true
+satd-chainstate-audit --datadir /path/to/datadir
 satd-chainstate-audit --datadir /path/to/datadir --window 20000 --verbose
 ```
 
@@ -305,13 +305,23 @@ until the end, so the default already runs to roughly a gigabyte on mainnet and
 tens of thousands of blocks runs to many. Start at the default and widen only as
 far as the search needs.
 
-Pass `--txindex` to match the node's configuration. It defaults to `true`, while
-satd's own `-txindex` defaults to off, so **pass `--txindex false` for a node
-that does not run one** — otherwise every transaction in the window is reported
-as a missing index row and the audit exits 2, and the read-write open also
-creates the empty column family. The flag is not cosmetic: with it true, absent
-rows are a *fault*, because the node is claiming to keep an index it does not
-have. With it false they are the expected state and are only counted.
+There is no `--txindex` flag: the tool reads the answer out of the datadir. An
+absent txindex row counts as a fault only when the chainstate's own completeness
+marker says the index was fully built, which rules out both shapes that would
+otherwise produce a false alarm — a node that does not run `-txindex` at all
+(satd's default), and one where `-txindex=1` was switched on after the chain had
+already synced without it, leaving every historical block without a row it was
+never going to have. In that second case the audit says the rows went
+*unchecked* rather than counting them clean, because "not looked at" and
+"looked at and fine" are different answers.
+
+This used to be a flag, and it was wrong in both directions. It defaulted to
+`true` while satd's `-txindex` defaults to off, so the invocation the node
+itself prints reported every transaction in the window as a missing row and
+exited 2 against a perfectly healthy node; and passing `false` silently disabled
+the txindex checks altogether, so a genuinely broken index came back
+`consistent`. An auditor cannot be expected to know a stranger's `-txindex`
+setting, and now does not have to.
 
 Two states are reported but are not faults. Blocks the node **pruned** are
 counted separately from blocks that could not be read: pruning deletes block

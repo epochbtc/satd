@@ -91,6 +91,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   txindex was reported as consistent. Rows missing from an index that was never
   fully built (no `-txindex`, or `-txindex` switched on after syncing without
   it) are reported as unchecked rather than as damage.
+- Changed: `satd-chainstate-audit` no longer takes `--txindex`; it reads whether
+  the index is complete from the datadir. The flag defaulted to `true` while
+  satd's `-txindex` defaults to off, so the documented invocation reported every
+  transaction in the window as a missing row and exited 2 against a healthy
+  node, and passing `false` silently disabled the txindex checks entirely.
 - Fixed: after `invalidateblock`, the block connector could pin itself to the
   branch that had just been invalidated and stall indefinitely — it selected
   the next block through the height→hash index, which is "best known block at

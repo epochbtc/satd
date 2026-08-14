@@ -60,6 +60,11 @@ use node::storage::rocksdb_store::RocksDbStore;
                   Coin verdicts are withheld for any height at or below a block that could \
                   not be read, since such a block's spends are unknown. Blocks this node \
                   pruned are reported separately and are not faults.\n\n\
+                  There is no -txindex flag: absent txindex rows count as faults only when \
+                  the datadir's own completeness marker says the index was fully built, so a \
+                  node that does not run one, or that had -txindex switched on after syncing \
+                  without it, is not reported as damaged for rows it was never going to \
+                  have.\n\n\
                   Exit status: 0 consistent, 1 could not run, 2 inconsistencies found."
 )]
 struct Args {
@@ -71,17 +76,6 @@ struct Args {
     /// Block-files directory. Defaults to `<datadir>/blocks`.
     #[arg(long)]
     blocksdir: Option<PathBuf>,
-
-    /// Whether the node runs with -txindex. When false, absent txindex rows
-    /// are the correct state and are not reported as faults.
-    ///
-    /// Defaults to true, while satd's own -txindex defaults to off — so pass
-    /// `--txindex false` for a node that does not run it, or every transaction
-    /// in the window is counted as a missing row. The open is read-write, so
-    /// leaving this true against a non-txindex datadir also creates the empty
-    /// column family.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    txindex: bool,
 
     /// How many blocks below the tip to check. The default matches the window
     /// the node itself audits at startup.
@@ -129,7 +123,19 @@ fn run(args: &Args) -> Result<node::chain::consistency::ChainstateReport, String
     // nothing, and `max_open_files = -1` (unlimited) is the setting
     // `rocksdb_store` blames for wedging a multi-gigabyte process during a
     // mainnet IBD. An audit runs on a box that is already having a bad day.
-    let store = RocksDbStore::open(&args.datadir, args.txindex, 256, false, 1000)
+    // Always open with the txindex enabled, and let the datadir say whether
+    // its rows mean anything. This used to be a `--txindex` flag, which was
+    // wrong in both directions: it defaulted to true while satd's own
+    // `-txindex` defaults to off, so the invocation the node itself prints
+    // counted every transaction in the window as a missing row and called a
+    // healthy node damaged — and passing false silently disabled the txindex
+    // checks altogether, because `get_tx_location` short-circuits to `None`
+    // before it reads the column family, so a genuinely broken index came back
+    // `consistent`. An auditor cannot be expected to know a stranger's
+    // `-txindex` setting, and the persisted completeness marker means they do
+    // not have to. `CF_TX_INDEX` is in the descriptor list unconditionally, so
+    // opening with it on creates nothing that was not there already.
+    let store = RocksDbStore::open(&args.datadir, true, 256, false, 1000)
         .map_err(|e| format!("cannot open chainstate (is the node stopped?): {e}"))?;
 
     let tip_hash = store
@@ -297,16 +303,26 @@ fn main() -> ExitCode {
     }
     if report.tx_index_absent > 0 {
         if report.txindex_expected {
-            // A fault, and counted as one in the verdict: --txindex says this
-            // node runs the index, so rows that are not there are missing.
+            // A fault, and counted as one in the verdict: this datadir's own
+            // marker says the index is complete, so rows that are not there
+            // are missing rows.
             println!(
-                "txindex rows absent: {} — this node was audited with --txindex true, so \
-                 these rows should exist. Pass --txindex false if it does not run one.",
+                "txindex rows absent: {} — this datadir records a complete txindex, so \
+                 these rows should exist",
+                report.tx_index_absent
+            );
+        } else if report.txindex_incomplete {
+            // Neither clean nor damaged: not checked. Saying so is the point —
+            // reporting it as "expected" would claim the index was looked at.
+            println!(
+                "txindex rows absent: {} (not checked — this datadir records an incomplete \
+                 txindex, from having been synced with -txindex off; -reindex-chainstate \
+                 rebuilds it)",
                 report.tx_index_absent
             );
         } else {
             println!(
-                "txindex rows absent: {} (expected — audited with --txindex false)",
+                "txindex rows absent: {} (expected — this node does not run -txindex)",
                 report.tx_index_absent
             );
         }
@@ -317,11 +333,30 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         println!("INCONSISTENT: {}", report.describe());
-        println!(
-            "This tool does not repair. A missing coin is recoverable only by replaying the \
-             block that created it: -reindex-chainstate, or satd-chainstate-repair for a \
-             single block."
-        );
+        // Name the remedy for what was actually found. Printing the
+        // missing-coin sentence unconditionally handed an operator whose only
+        // fault was an index row a paragraph about replaying blocks to recover
+        // coins they had not lost.
+        if report.missing_coins.is_empty()
+            && report.unspent_spends.is_empty()
+            && !report.ancestry.is_intact()
+        {
+            println!(
+                "This tool does not repair. The ancestry holes above are the fault to chase; \
+                 the UTXO set itself agreed with every block that was read."
+            );
+        } else if report.missing_coins.is_empty() && report.unspent_spends.is_empty() {
+            println!(
+                "This tool does not repair. No coin disagreed with the blocks — the faults \
+                 above are index rows, which -reindex-chainstate rebuilds."
+            );
+        } else {
+            println!(
+                "This tool does not repair. A missing coin is recoverable only by replaying \
+                 the block that created it: -reindex-chainstate, or satd-chainstate-repair \
+                 for a single block."
+            );
+        }
         ExitCode::from(2)
     }
 }
