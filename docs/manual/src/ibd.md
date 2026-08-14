@@ -186,6 +186,23 @@ A reindex on a synced mainnet node runs for hours. The shipped `systemd` unit
 handles this without tripping the start timeout; see "Reindex resilience" in
 [Packaging](packaging.md).
 
+### Driving a reorg by hand
+
+`invalidateblock` and `reconsiderblock` work as in Bitcoin Core, and reach the
+node through `sat-cli`'s raw-RPC passthrough:
+
+```sh
+sat-cli invalidateblock <blockhash>
+sat-cli reconsiderblock <blockhash>
+```
+
+They are not listed in `sat-cli --help` — any method `--help` does not name is
+forwarded verbatim, which is how Core-compatible tooling keeps working. That
+makes them easy to miss when they are the tool you need.
+
+Invalidating drives a reorg away from the named block and everything descended
+from it. `reconsiderblock` clears the mark and re-activates the best chain.
+
 ### Startup integrity checks
 
 Before serving RPC or connecting to peers, satd checks two things about the
@@ -243,6 +260,82 @@ repair them, or resync.
 On an AssumeUTXO node the history below the snapshot base is legitimately
 unvalidated until the background chainstate reaches it. That is recognised and
 logged at `INFO`, not treated as damage.
+
+### Auditing a suspect datadir offline
+
+`satd-chainstate-audit` answers the question the startup checks cannot afford
+to: does the UTXO set actually agree with the blocks on the active chain? It
+walks the tip's ancestry, reads each block back from the flat files, and reports
+every disagreement — coins that should exist and do not, spent coins still
+present, height-index rows naming the wrong block, txindex rows pointing at the
+wrong block, cumulative transaction counts that do not follow from their parent.
+
+```sh
+satd-chainstate-audit --datadir /path/to/datadir
+satd-chainstate-audit --datadir /path/to/datadir --window 20000 --verbose
+```
+
+It takes the RocksDB lock, so **the node must be stopped**.
+
+It issues no writes of its own, but it is not non-mutating: opening the
+chainstate opens RocksDB read-write, so the WAL is replayed and truncated,
+memtables may flush and compact, the MANIFEST is rewritten, obsolete files are
+deleted, any missing column family is created, the legacy address-history
+column families are **dropped**, and the schema version is stamped — after which
+an older satd will no longer open that datadir. Opening the block files creates
+`xor.dat` if absent. **If the datadir
+is evidence — which is the case this tool exists for — copy it and audit the
+copy.** The tool prints this warning on every run.
+
+Note also that it is not included in the release tarballs or the Docker image;
+build it from source (`cargo build --release --bin satd-chainstate-audit`).
+
+Exit status is `0` when consistent, `1` when it could not run, `2` when it found
+inconsistencies, so it scripts cleanly.
+
+It diagnoses and does not repair. A missing coin is recoverable only by
+replaying the block that created it: `-reindex-chainstate`, or
+`satd-chainstate-repair` for a single block's lost delta. A broken parent
+pointer is a *block index* fault and needs `-reindex` — `-reindex-chainstate`
+trusts the same block index and cannot fix it.
+
+`--window` bounds the walk, and its cost is not only one block read per height:
+every output the window creates and every outpoint it spends is held in memory
+until the end, so the default already runs to roughly a gigabyte on mainnet and
+tens of thousands of blocks runs to many. Start at the default and widen only as
+far as the search needs.
+
+There is no `--txindex` flag: the tool reads the answer out of the datadir. An
+absent txindex row counts as a fault only when the chainstate's own completeness
+marker says the index was fully built, which rules out both shapes that would
+otherwise produce a false alarm — a node that does not run `-txindex` at all
+(satd's default), and one where `-txindex=1` was switched on after the chain had
+already synced without it, leaving every historical block without a row it was
+never going to have. In that second case the audit says the rows went
+*unchecked* rather than counting them clean, because "not looked at" and
+"looked at and fine" are different answers.
+
+This used to be a flag, and it was wrong in both directions. It defaulted to
+`true` while satd's `-txindex` defaults to off, so the invocation the node
+itself prints reported every transaction in the window as a missing row and
+exited 2 against a perfectly healthy node; and passing `false` silently disabled
+the txindex checks altogether, so a genuinely broken index came back
+`consistent`. An auditor cannot be expected to know a stranger's `-txindex`
+setting, and now does not have to.
+
+Two states are reported but are not faults. Blocks the node **pruned** are
+counted separately from blocks that could not be read: pruning deletes block
+data deliberately, and treating that as damage would fail every healthy pruned
+node — at the default window, for most of the range — and then recommend
+`-reindex-chainstate`, which a pruned node refuses outright. On an **AssumeUTXO**
+node the snapshot base is read from the background chainstate's marker, so
+history below it is reported as not-yet-validated rather than as a hole.
+
+Where a block could not be read, for either reason, **the coin checks are
+skipped at and below that height** — its spends are unknown, so a coin it spent
+would otherwise look missing. The tool prints a note when this applies. Verdicts
+above that height are unaffected: the walk runs newest-first, and a coin created
+at height H can only be spent at or above H.
 
 ## Differences from Bitcoin Core at a glance
 
