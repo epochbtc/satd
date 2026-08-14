@@ -3,6 +3,7 @@ pub mod background;
 pub mod checkpoints;
 pub mod connect;
 pub mod connect_phase;
+pub mod consistency;
 pub mod disconnect;
 pub mod events;
 pub mod height_index_repair;

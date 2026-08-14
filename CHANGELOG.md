@@ -41,6 +41,21 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   chain. Reads now consult the pending batch before the inner store.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
   height. The reject reason on the wire is unchanged.
+- Internal: a chainstate consistency check that reads the last N blocks of the
+  active chain back and verifies the UTXO set, height index, txindex and
+  cumulative transaction counts against them, rather than against each other.
+  Used as a test oracle for reorg scenarios; also the basis for an offline
+  audit of a suspect datadir. Blocks the node pruned are reported separately
+  from blocks it could not read, so a healthy pruned node is not called
+  damaged; a block that could not be read now only withholds coin verdicts at
+  or below its own height, rather than for the whole window; and the
+  cumulative-count check is skipped when the backfill that populates those rows
+  has not run, which would otherwise fail a datadir whose UTXO set is perfect.
+  Absent txindex rows are now a fault when the datadir records a complete
+  txindex — previously they were always informational, so a genuinely broken
+  txindex was reported as consistent. Rows missing from an index that was never
+  fully built (no `-txindex`, or `-txindex` switched on after syncing without
+  it) are reported as unchecked rather than as damage.
 - Fixed: after `invalidateblock`, the block connector could pin itself to the
   branch that had just been invalidated and stall indefinitely — it selected
   the next block through the height→hash index, which is "best known block at

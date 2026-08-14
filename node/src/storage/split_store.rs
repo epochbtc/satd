@@ -105,6 +105,16 @@ impl Store for SplitStore {
         self.block_store.has_txindex()
     }
 
+    /// Delegated for the same reason as `has_txindex` above: `tx_index_puts`
+    /// and `tx_index_removes` are routed to the block store, so its marker is
+    /// the one describing the rows this store actually reads. The trait
+    /// default is `true` ("non-Rocks backends are freshly built"), which is
+    /// the fail-open answer here — it would tell a consistency audit that a
+    /// known-incomplete index is complete.
+    fn tx_index_complete(&self) -> bool {
+        self.block_store.tx_index_complete()
+    }
+
     fn for_each_block_index(
         &self,
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),

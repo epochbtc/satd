@@ -7064,6 +7064,33 @@ pub(crate) mod tests {
         (cs, dir)
     }
 
+    /// Flush, then drop every read-through overlay, so subsequent reads
+    /// resolve against what actually persisted — exactly what a restart does.
+    ///
+    /// This is not a detail. The caches receive each operation in per-call
+    /// order and stay correct no matter what the batch layer wrote, so a
+    /// running node answers `getblockhash` and `getrawtransaction` correctly
+    /// on top of a persisted index that is already damaged. #564 was invisible
+    /// for precisely this reason, and a test that checks a hot node cannot see
+    /// it either.
+    ///
+    /// Safe as a pure cache drop only because the flush comes first: with the
+    /// dirty map and pending batch already drained, `discard_uncommitted` has
+    /// nothing to discard but the overlays.
+    /// Flush, then drop the in-memory index overlays so subsequent reads go to
+    /// the store.
+    ///
+    /// Note what this does *not* do: `discard_uncommitted` deliberately keeps
+    /// the clean coin LRU, and `flush` promotes every coin it writes into that
+    /// LRU. So the height, txindex and chain_tx dimensions genuinely read cold
+    /// afterwards, and the coin dimension does not — `get_coin` still answers
+    /// from memory. A test relying on this to prove a coin reached disk is
+    /// proving nothing; it takes a fresh `ChainState` over the same datadir.
+    fn flush_and_drop_caches(cs: &ChainState) {
+        cs.store_ref().flush().expect("flush");
+        cs.store_ref().discard_uncommitted();
+    }
+
     /// Force `height_hash[height] = hash`, simulating a polluted index. Used by
     /// tests that verify consumers stay immune to a `height_hash` that
     /// disagrees with the active chain. (The writers — accept_header(s) and
@@ -10748,6 +10775,433 @@ pub(crate) mod tests {
             "connecting onto an unconnected parent must be refused, got {result:?}"
         );
         assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reorg whose branches re-mine the same transaction, checked against
+    /// the blocks themselves rather than against a proxy.
+    ///
+    /// This is the shape that produced #564: the displaced block emits a
+    /// `tx_index` remove for a txid and the replacement emits a put for the
+    /// same txid, in two `write_batch` calls with no durable flush between
+    /// them, so both coalesce into one batch — and a batch applies every put
+    /// before every remove. A reorg routinely re-mines the transactions it
+    /// displaces, so this is the common case, not a corner.
+    ///
+    /// The assertion is deliberately the whole chainstate and not the one row
+    /// the known defect touched. Four separate on-disk artifacts were needed
+    /// to work out what had happened on mainnet, and each of the first three
+    /// supported a conclusion the fourth overturned; a test that checks one
+    /// artifact would have passed throughout.
+    #[test]
+    fn reorg_with_transaction_overlap_leaves_a_consistent_utxo_set() {
+        let (cs, dir) = make_chain_state();
+
+        // Coinbase maturity is 100, so mine past it to get something spendable.
+        let base = build_and_connect_chain(&cs, 101);
+        let mature = OutPoint {
+            txid: base[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        assert!(cs.get_coin(&mature).is_some(), "the coinbase must be spendable");
+        let fork_point = cs.tip_hash();
+
+        // Branch A spends it, and the delta is made durable.
+        let a102 = build_test_block_spending(fork_point, 102, 1_300_000_200, mature);
+        cs.accept_block(&a102).expect("accept A102");
+        cs.store_ref().flush().expect("flush A");
+        assert!(cs.get_coin(&mature).is_none(), "A spent the coinbase");
+
+        // Branch B re-mines the same spend — byte-identical, so the same txid —
+        // and outweighs A.
+        let b102 = build_test_block_spending(fork_point, 102, 1_300_000_300, mature);
+        let spend_txid = a102.txdata[1].compute_txid();
+        assert_eq!(
+            spend_txid,
+            b102.txdata[1].compute_txid(),
+            "test premise: both branches carry the same transaction"
+        );
+        assert_ne!(a102.block_hash(), b102.block_hash());
+
+        let b102_hash = cs.accept_block(&b102).expect("accept B102");
+        let b103 = build_test_block(b102_hash, 103, 1_300_000_301);
+        let b103_hash = cs.accept_block(&b103).expect("accept B103");
+        let b104 = build_test_block(b103_hash, 104, 1_300_000_302);
+        let b104_hash = cs.accept_block(&b104).expect("accept B104");
+        assert_eq!(cs.tip_hash(), b104_hash, "B must have won");
+
+        // Drop the index overlays so the height/txindex/chain_tx dimensions —
+        // where #564's damage lands, and what this test actually gates — are
+        // read from the store rather than from the writer's own memory. The
+        // coin dimension is NOT read cold by this; see `flush_and_drop_caches`.
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert!(
+            report.is_consistent(),
+            "chainstate disagrees with its own blocks after the reorg: {}\n{report:#?}",
+            report.describe()
+        );
+
+        // Spelled out, so a regression names the artifact rather than a count.
+        assert!(cs.get_coin(&mature).is_none(), "the coinbase is still spent on B");
+        assert_eq!(cs.get_block_hash_by_height(102), Some(b102_hash));
+        assert_eq!(cs.tip_height(), 104);
+        if let Some(loc) = cs.get_tx_location(&spend_txid) {
+            assert_eq!(
+                loc, b102_hash,
+                "the re-mined transaction must resolve to the block that won"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same reorg with no flush between the branches, so the disconnect
+    /// and the reconnect coalesce into a single batch in the coin cache. This
+    /// is the interleaving #564 actually failed on; the flushed variant above
+    /// cannot reach it.
+    #[test]
+    fn reorg_with_transaction_overlap_is_consistent_without_an_intervening_flush() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 101);
+        let mature = OutPoint {
+            txid: base[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let fork_point = cs.tip_hash();
+
+        let a102 = build_test_block_spending(fork_point, 102, 1_300_000_200, mature);
+        cs.accept_block(&a102).expect("accept A102");
+        // No flush here: A's writes are still in the cache when B displaces
+        // them, so both land in one batch.
+
+        let b102 = build_test_block_spending(fork_point, 102, 1_300_000_300, mature);
+        let b102_hash = cs.accept_block(&b102).expect("accept B102");
+        let b103 = build_test_block(b102_hash, 103, 1_300_000_301);
+        let b103_hash = cs.accept_block(&b103).expect("accept B103");
+        let b104 = build_test_block(b103_hash, 104, 1_300_000_302);
+        cs.accept_block(&b104).expect("accept B104");
+
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert!(
+            report.is_consistent(),
+            "chainstate disagrees with its own blocks: {}\n{report:#?}",
+            report.describe()
+        );
+        assert_eq!(cs.get_block_hash_by_height(102), Some(b102_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A randomised sweep over reorg depth, transaction overlap and flush
+    /// placement, checked against the same oracle.
+    ///
+    /// The two deterministic tests above pin two interleavings. The mainnet
+    /// coin loss has not been explained, so the specific interleaving that
+    /// causes it is not known — which makes a sweep the only honest way to
+    /// look for it. Deterministically seeded so a failure is reproducible from
+    /// the printed seed rather than being a flake.
+    ///
+    /// `#[ignore]` by design: this is an exploratory search, not a gate. Run it
+    /// with `cargo test -p node --lib -- --ignored reorg_interleaving_sweep
+    /// --nocapture`. If it ever fires, the right response is to freeze that
+    /// seed's schedule into a named deterministic test, not to leave the sweep
+    /// in the loop.
+    ///
+    /// **It has been run and has found nothing** — 600 seeds, clean. A passing
+    /// run is therefore not evidence of correctness, and the space it covers is
+    /// narrower than the space the bug lives in. In particular it cannot reach
+    /// a flush landing *inside* `reorg_to`, between the disconnect and the
+    /// reconnect. That is the prime suspect: `discard_uncommitted`'s own
+    /// contract says "an in-memory discard cannot undo an on-disk write", and
+    /// the IBD connector flushes on its own thread without holding
+    /// `accept_lock`, which is the only thing serialising it against a reorg
+    /// driven from an RPC thread. Reaching it needs a fault-injection hook
+    /// inside the reorg, which this does not have.
+    #[test]
+    #[ignore = "exploratory sweep, not a gate — see the doc comment"]
+    fn reorg_interleaving_sweep() {
+        // xorshift, so the schedule is fully determined by the seed and no
+        // dependency is needed.
+        fn next(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        // Widen the search without editing code:
+        //   SATD_SWEEP_SEEDS=2000 cargo test ... -- --ignored reorg_interleaving_sweep
+        let seeds: u64 = std::env::var("SATD_SWEEP_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+
+        for seed in 1u64..=seeds {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let (cs, dir) = make_chain_state();
+            let base = build_and_connect_chain(&cs, 101);
+            let mature = OutPoint {
+                txid: base[0].txdata[0].compute_txid(),
+                vout: 0,
+            };
+            let fork_point = cs.tip_hash();
+
+            let a_len = 1 + (next(&mut rng) % 3) as u32; // 1..=3
+            let b_len = a_len + 1 + (next(&mut rng) % 3) as u32; // strictly longer
+            let overlap = next(&mut rng).is_multiple_of(2);
+            let flush_after_a = next(&mut rng).is_multiple_of(2);
+            let flush_mid_b = next(&mut rng).is_multiple_of(2);
+
+            // Branch A, optionally spending the mature coinbase in its first
+            // block.
+            let mut parent = fork_point;
+            for i in 0..a_len {
+                let h = 102 + i;
+                let block = if i == 0 {
+                    build_test_block_spending(parent, h, 1_300_001_000 + h, mature)
+                } else {
+                    build_test_block(parent, h, 1_300_001_000 + h)
+                };
+                parent = cs.accept_block(&block).expect("accept A");
+            }
+            if flush_after_a {
+                cs.store_ref().flush().expect("flush A");
+            }
+
+            // Branch B. With `overlap`, its first block re-mines the identical
+            // spend, so put and remove collide on one txid.
+            let mut parent = fork_point;
+            for i in 0..b_len {
+                let h = 102 + i;
+                let block = if i == 0 && overlap {
+                    build_test_block_spending(parent, h, 1_300_002_000 + h, mature)
+                } else {
+                    build_test_block(parent, h, 1_300_002_000 + h)
+                };
+                parent = cs.accept_block(&block).expect("accept B");
+                if flush_mid_b && i == b_len / 2 {
+                    cs.store_ref().flush().expect("flush mid-B");
+                }
+            }
+
+            flush_and_drop_caches(&cs);
+            let report = cs.verify_chainstate_default();
+            assert!(
+                report.is_consistent(),
+                "seed {seed} (a_len={a_len} b_len={b_len} overlap={overlap} \
+                 flush_after_a={flush_after_a} flush_mid_b={flush_mid_b}): {}\n{report:#?}",
+                report.describe()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The oracle has to be able to fail, or the two tests above prove
+    /// nothing. Remove a coin the active chain created and it must be named.
+    #[test]
+    fn verify_chainstate_reports_a_coin_the_active_chain_created() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert!(cs.verify_chainstate_default().is_consistent());
+
+        let victim = OutPoint {
+            txid: blocks[3].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let coin = cs.get_coin(&victim).expect("the coin exists before removal");
+        let mut batch = crate::storage::StoreBatch::default();
+        batch
+            .coin_removes
+            .push((victim, coin.amount, coin.height));
+        cs.store.write_batch(batch).unwrap();
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert!(!report.is_consistent());
+        assert_eq!(report.missing_coins, vec![victim]);
+        assert!(report.describe().contains("1 coin(s) missing"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A broken txindex must not be reported as "consistent".
+    ///
+    /// Absent `tx_index` rows are the *correct* state on a node running
+    /// without `-txindex`, which is why they were counted rather than listed.
+    /// But excluding them from the verdict unconditionally meant a node whose
+    /// txindex was genuinely broken got "consistent" and exit 0 — the one
+    /// answer a diagnostic tool must never give wrongly. The report now
+    /// carries whether the store has the index, so it can tell the two apart.
+    #[test]
+    fn verify_chainstate_reports_an_absent_txindex_row_when_the_index_is_on() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        // Land the connect batches first. They carry coins, so they are
+        // buffered; a coin-less remove issued before the flush goes straight
+        // to the inner store and is then overwritten when the buffered put
+        // replays.
+        flush_and_drop_caches(&cs);
+        let clean = cs.verify_chainstate_default();
+        assert!(clean.txindex_expected, "the test store runs with the index");
+        assert!(clean.is_consistent());
+
+        let victim = blocks[1].txdata[0].compute_txid();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.tx_index_removes.push(victim);
+        cs.store.write_batch(batch).unwrap();
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1);
+        assert!(
+            !report.is_consistent(),
+            "a missing txindex row on a node that runs the index is a fault"
+        );
+        assert!(report.describe().contains("txindex row(s) absent"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: absent rows must NOT be a fault on a node that
+    /// does not run the index, or whose index is known incomplete.
+    ///
+    /// This is the guard, and it was the one covered by nothing —
+    /// `InMemoryStore` hardcodes `has_txindex()` to true and inherits
+    /// `tx_index_complete() == true`, so no test could build a report for
+    /// either shape. Deleting the guard left the whole suite green while
+    /// making the default audit of a healthy node report millions of faults
+    /// and advise a reindex.
+    ///
+    /// Both halves matter. `-txindex` off is the common case — it is satd's
+    /// default. A complete-index marker that is false is the operator who
+    /// flipped `-txindex=1` onto a datadir synced without it: the flag is on,
+    /// the historical rows were never written, and no block in the window was
+    /// ever going to have one.
+    #[test]
+    fn verify_chainstate_does_not_call_an_absent_txindex_row_damage_when_none_is_expected() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        let blocks = build_and_connect_chain(&cs, 3);
+        flush_and_drop_caches(&cs);
+
+        // Take a row away, exactly as the fault-direction test does.
+        let victim = blocks[1].txdata[0].compute_txid();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.tx_index_removes.push(victim);
+        cs.store.write_batch(batch).unwrap();
+        flush_and_drop_caches(&cs);
+
+        // Index off: absent rows are the correct state.
+        controls.set_txindex(false, false);
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1, "the row is genuinely gone");
+        assert!(!report.txindex_expected);
+        assert!(!report.txindex_incomplete);
+        assert!(
+            report.is_consistent(),
+            "a node that does not run -txindex must not be reported as damaged for rows it \
+             was never going to write"
+        );
+        assert!(!report.describe().contains("txindex row(s) absent"));
+
+        // Index on but known incomplete: not checked, and not a fault.
+        controls.set_txindex(true, false);
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1);
+        assert!(!report.txindex_expected);
+        assert!(
+            report.txindex_incomplete,
+            "the report must say the index went unchecked rather than silently dropping it"
+        );
+        assert!(
+            report.is_consistent(),
+            "-txindex switched on after syncing without it leaves historical rows absent by \
+             construction; that is not chainstate damage"
+        );
+
+        // And the fault direction still fires, so the gate did not just
+        // disable the check.
+        controls.set_txindex(true, true);
+        assert!(!cs.verify_chainstate_default().is_consistent());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pruned block is not damage, and must not fail the whole report.
+    ///
+    /// Pruned blocks are unreadable by construction — that is what pruning is
+    /// — so counting them alongside genuinely unreadable ones failed every
+    /// healthy pruned node. At the default window a `-prune=550` node has no
+    /// data for most of the range, so it would report a four-figure fault count
+    /// and then be advised to run `-reindex-chainstate`, which a pruned node
+    /// refuses outright. The spends and creates of a pruned block are still
+    /// unknown, so it still bounds the coin verdicts below it.
+    #[test]
+    fn verify_chainstate_does_not_call_a_pruned_block_damage() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        assert!(cs.verify_chainstate_default().is_consistent());
+
+        force_status(&cs, &blocks[2].block_hash(), BlockStatus::Pruned);
+
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.pruned, 1, "the pruned block should be counted as pruned");
+        assert!(
+            report.unreadable.is_empty(),
+            "a deliberately pruned block is not an unreadable one"
+        );
+        assert!(
+            report.is_consistent(),
+            "a healthy pruned node was reported damaged: {}",
+            report.describe()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The oracle must not count outputs the UTXO set never holds.
+    ///
+    /// `connect_block` never writes an unspendable output — an OP_RETURN, or a
+    /// script over the size limit — so counting one as "created" reports a coin
+    /// missing that was never meant to exist. Every post-segwit coinbase
+    /// carries a witness-commitment OP_RETURN and unspendables run at roughly a
+    /// quarter of all outputs at height 840000, so on mainnet this was millions
+    /// of phantom faults and a healthy node called corrupt.
+    ///
+    /// No other test in the suite builds a block with an unspendable output, so
+    /// without this one the exclusion is proven by nothing.
+    #[test]
+    fn verify_chainstate_ignores_outputs_the_utxo_set_never_holds() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        assert!(cs.verify_chainstate_default().is_consistent());
+
+        let mut block = build_test_block(cs.tip_hash(), 4, 1_300_000_010);
+        block.txdata[0].output.push(bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::script::Builder::new()
+                .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                .into_script(),
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        cs.accept_block(&block).expect("accept a block with an OP_RETURN output");
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert!(
+            report.is_consistent(),
+            "an unspendable output was counted as a coin the UTXO set should hold: {}",
+            report.describe()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
