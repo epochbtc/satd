@@ -374,6 +374,17 @@ pub struct ChainState {
     /// - `accept_header`'s two height-row commits, `store_block`'s height-row
     ///   commit
     /// - `invalidate_block`, `reconsider_block`, `reconcile_invalid_tip`
+    /// - `repair_block_data` (whole body)
+    /// - `prune_blocks`' mutation section (file deletes + `Pruned` batch;
+    ///   its height walk is read-only and conservatively stale-safe)
+    ///
+    /// Known unlocked mutators, deliberate and bounded: `backfill_chain_tx_counts`
+    /// and `repair_block_index_holes` run at startup before P2P and RPC exist,
+    /// so no second mutator can be live. `load_utxo_snapshot` streams for
+    /// minutes from an RPC thread, so it cannot hold this lock for its
+    /// duration; its only guard today is a fresh-chainstate precondition
+    /// checked without the lock — a known TOCTOU gap against a live
+    /// connector, tracked to be closed by a snapshot-load guard flag.
     ///
     /// Lock order where it composes with the cache's flush exclusion:
     /// `accept_lock` first, then `CoinCache::lock_flush_exclusion` (the
@@ -3762,9 +3773,10 @@ impl ChainState {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let block = self
-            .read_block_direct(&flat_pos)
-            .ok_or(ChainError::FlatFile("failed to read stored block".to_string()))?;
+        let Some(block) = self.read_block_direct(&flat_pos) else {
+            phases.enter(ConnectPhase::Idle);
+            return Err(ChainError::FlatFile("failed to read stored block".to_string()));
+        };
         // Verify the record is the block the entry claims, exactly as
         // `get_block` and the reindex paths (`require_planned_block`) do. A
         // mis-recorded offset lands on another record's *start*, not on
@@ -3782,16 +3794,17 @@ impl ChainState {
                 data_pos = flat_pos.data_pos,
                 "block index entry points at a different block's record"
             );
+            phases.enter(ConnectPhase::Idle);
             return Err(ChainError::FlatFile(format!(
                 "block {hash}: stored record holds {} instead",
                 block.block_hash()
             )));
         }
 
-        let parent = self
-            .store
-            .get_block_index(&entry.header.prev_blockhash)
-            .ok_or(ChainError::BadPrevBlock)?;
+        let Some(parent) = self.store.get_block_index(&entry.header.prev_blockhash) else {
+            phases.enter(ConnectPhase::Idle);
+            return Err(ChainError::BadPrevBlock);
+        };
         // Matching the prev hash pins the chain's shape but not that the
         // parent's coins were ever applied. See `require_connected_parent`.
         // Return the tracker to Idle like the other early exits: the connector
@@ -6860,6 +6873,13 @@ impl ChainState {
         }
 
         let mut deleted = 0u32;
+        // The walk above is read-only and conservatively stale-safe (a tip
+        // advancing under it only shrinks what is pruneable), but the
+        // mutation below — deleting block files and stamping `Pruned` — must
+        // not interleave with a reorg reading old blocks or with any other
+        // chain mutator. Hold `accept_lock` for the mutation section, and
+        // take it before `flat_files` to match the connector's lock order.
+        let _accept_guard = self.accept_lock.lock();
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
 
@@ -8485,6 +8505,41 @@ pub(crate) mod tests {
             "the connect completes once the lock is free"
         );
         assert_eq!(cs.tip_hash(), b4.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `prune_blocks`' mutation section (file deletes + `Pruned` stamps) must
+    /// wait for `accept_lock` — a prune that interleaves with a reorg can
+    /// delete a block file the reorg is about to read back. Deleting the
+    /// acquisition in `prune_blocks` makes this fail: the prune completes
+    /// while the lock is held.
+    #[test]
+    fn prune_blocks_mutation_waits_for_the_accept_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 5);
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+            s.spawn(|| {
+                // Nothing is actually deletable (all blocks share file 0);
+                // what matters is that the mutation section is entered, and
+                // that requires the lock.
+                cs.prune_blocks(2);
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "prune_blocks reached its mutation section while accept_lock was held"
+            );
+            drop(guard);
+        });
+        assert!(done.load(Ordering::SeqCst), "prune completes once the lock is free");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
