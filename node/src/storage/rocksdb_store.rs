@@ -1248,60 +1248,12 @@ impl RocksDbStore {
     }
 }
 
-impl Store for RocksDbStore {
-    fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
-        let cf = self.cf(CF_BLOCK_INDEX);
-        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        bincode::deserialize(&value).ok()
-    }
-
-    fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
-        let cf = self.cf(CF_COINS);
-        let key = outpoint_to_key(outpoint);
-        let value = self.db.get_cf(&cf, key).ok()??;
-        let coin = Coin::deserialize_compact(&value);
-        if coin.is_none() {
-            tracing::error!(
-                "corrupt coin: failed to deserialize {} bytes for {}:{}",
-                value.len(),
-                outpoint.txid,
-                outpoint.vout
-            );
-        }
-        coin
-    }
-
-    fn has_coin(&self, outpoint: &OutPoint) -> bool {
-        let cf = self.cf(CF_COINS);
-        let key = outpoint_to_key(outpoint);
-        matches!(self.db.get_pinned_cf(&cf, key), Ok(Some(_)))
-    }
-
-    fn get_tip(&self) -> Option<BlockHash> {
-        let cf = self.cf(CF_METADATA);
-        let value = self.db.get_cf(&cf, TIP_KEY).ok()??;
-        hash_from_bytes(&value)
-    }
-
-    fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
-        let cf = self.cf(CF_HEIGHT_INDEX);
-        let key = height.to_le_bytes();
-        let value = self.db.get_cf(&cf, key).ok()??;
-        hash_from_bytes(&value)
-    }
-
-    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
-        let cf = self.cf(CF_CHAIN_TX);
-        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
-        let arr: [u8; 8] = value.as_slice().try_into().ok()?;
-        Some(u64::from_le_bytes(arr))
-    }
-
-    fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        self.write_batch_mode(batch, WriteMode::Normal)
-    }
-
-    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+impl RocksDbStore {
+    /// The whole batch write, reading `batch` rather than consuming it —
+    /// which is what lets `write_batch_recoverable` hand it back when the
+    /// write fails. Nothing here ever needed ownership: rows are
+    /// serialized into a RocksDB `WriteBatch`, never moved out.
+    fn write_batch_inner(&self, batch: &StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
         let mut wb = WriteBatch::default();
 
         let cf_bi = self.cf(CF_BLOCK_INDEX);
@@ -1816,6 +1768,77 @@ impl Store for RocksDbStore {
             crate::index::silent_payments::stats::add_row_removes(sp_remove_count);
         }
         Ok(())
+    }
+}
+
+impl Store for RocksDbStore {
+    fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
+        let cf = self.cf(CF_BLOCK_INDEX);
+        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
+        bincode::deserialize(&value).ok()
+    }
+
+    fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        let cf = self.cf(CF_COINS);
+        let key = outpoint_to_key(outpoint);
+        let value = self.db.get_cf(&cf, key).ok()??;
+        let coin = Coin::deserialize_compact(&value);
+        if coin.is_none() {
+            tracing::error!(
+                "corrupt coin: failed to deserialize {} bytes for {}:{}",
+                value.len(),
+                outpoint.txid,
+                outpoint.vout
+            );
+        }
+        coin
+    }
+
+    fn has_coin(&self, outpoint: &OutPoint) -> bool {
+        let cf = self.cf(CF_COINS);
+        let key = outpoint_to_key(outpoint);
+        matches!(self.db.get_pinned_cf(&cf, key), Ok(Some(_)))
+    }
+
+    fn get_tip(&self) -> Option<BlockHash> {
+        let cf = self.cf(CF_METADATA);
+        let value = self.db.get_cf(&cf, TIP_KEY).ok()??;
+        hash_from_bytes(&value)
+    }
+
+    fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
+        let cf = self.cf(CF_HEIGHT_INDEX);
+        let key = height.to_le_bytes();
+        let value = self.db.get_cf(&cf, key).ok()??;
+        hash_from_bytes(&value)
+    }
+
+    fn get_cumulative_tx_count(&self, hash: &BlockHash) -> Option<u64> {
+        let cf = self.cf(CF_CHAIN_TX);
+        let value = self.db.get_cf(&cf, hash_bytes(hash)).ok()??;
+        let arr: [u8; 8] = value.as_slice().try_into().ok()?;
+        Some(u64::from_le_bytes(arr))
+    }
+
+    fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        self.write_batch_mode(batch, WriteMode::Normal)
+    }
+
+    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+        self.write_batch_inner(&batch, mode)
+    }
+
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        match self.write_batch_inner(&batch, mode) {
+            Ok(()) => Ok(()),
+            // RocksDB applies a `WriteBatch` atomically, so a failure here
+            // left nothing behind and the batch can be replayed whole.
+            Err(e) => Err((Some(Box::new(batch)), e)),
+        }
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {

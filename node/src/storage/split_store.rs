@@ -90,6 +90,13 @@ impl SplitStore {
     /// secondary-index rows, which the background never emits because it
     /// runs with those indexes disabled) stays in the original batch and
     /// goes to the coins store.
+    /// Inverse of [`Self::split_batch`]: fold the block half back into the
+    /// coins half so a failed write can hand the caller one batch again.
+    fn rejoin(block_batch: StoreBatch, mut coins_batch: StoreBatch) -> StoreBatch {
+        coins_batch.merge(block_batch);
+        coins_batch
+    }
+
     fn split_batch(mut batch: StoreBatch) -> (StoreBatch, StoreBatch) {
         let block_batch = StoreBatch {
             block_index_puts: std::mem::take(&mut batch.block_index_puts),
@@ -226,6 +233,34 @@ impl Store for SplitStore {
         self.write_block_batch(block_batch)?;
         self.coins_store.write_batch_mode(coins_batch, mode)?;
         Ok(())
+    }
+
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        let (block_batch, coins_batch) = Self::split_batch(batch);
+        // A batch here spans two backing stores and is not atomic across
+        // them — it never was; see the ordering note in `write_batch`. So
+        // recoverability depends on which half failed.
+        //
+        // Block half first: nothing has been applied yet, so the two halves
+        // can be reassembled and handed back whole.
+        if let Err((returned, e)) =
+            self.block_store.write_batch_recoverable(block_batch, WriteMode::Normal)
+        {
+            return Err((
+                returned.map(|b| Box::new(Self::rejoin(*b, coins_batch))),
+                e,
+            ));
+        }
+        // Coins half: the block half is already in. Handing the batch back
+        // would invite a replay that applies those rows twice, so this
+        // reports "partially applied, do not restore" instead.
+        self.coins_store
+            .write_batch_recoverable(coins_batch, mode)
+            .map_err(|(_, e)| (None, e))
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {

@@ -477,6 +477,34 @@ pub trait Store: Send + Sync {
     fn write_batch_mode(&self, batch: StoreBatch, _mode: WriteMode) -> Result<(), StoreError> {
         self.write_batch(batch)
     }
+    /// Write a batch, handing it back if the write fails.
+    ///
+    /// `write_batch`'s contract says nothing about the batch on error, and
+    /// every implementation consumes it. That is fine for a caller that still
+    /// owns the state the batch describes, and wrong for `CoinCache::flush`,
+    /// which drains its dirty map, its buffered non-coin rows and its pending
+    /// tip to *build* one: a transient write error there destroys the whole
+    /// delta with nothing left to retry from. This is the variant it uses.
+    ///
+    /// Implementations must not consume any part of `batch` unless the write
+    /// succeeds — in practice none of them need to; a batch is read from and
+    /// serialized out of, not moved from.
+    ///
+    /// `Err((None, e))` means the write may be **partially applied** and must
+    /// not be replayed. Only `SplitStore`, which spans two backing stores,
+    /// can report that. The batch is boxed so the error variant stays small
+    /// on the success path, which is every call but the failing one.
+    ///
+    /// Deliberately without a default implementation. A default would have to
+    /// either consume the batch (turning every non-overriding store's caller
+    /// restore path into a silent no-op — the exact shape of bug this method
+    /// exists to prevent) or clone it (a per-flush copy of the UTXO delta).
+    /// Neither is a reasonable thing to inherit by omission.
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)>;
     /// Force any in-memory state to durable storage. Used after a run of
     /// `BulkLoad` writes to ensure crash recovery is bounded.
     /// Default: no-op (in-memory or always-synchronous backends).
