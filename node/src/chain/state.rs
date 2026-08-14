@@ -342,8 +342,8 @@ pub struct ChainState {
     /// is derived from it. `None` for all other networks and for the
     /// default signet (which satd does not solution-check today).
     signet_challenge: Option<Vec<u8>>,
-    /// Serializes the entire `accept_block` critical section so that at
-    /// most one thread mutates this (primary) chainstate at a time.
+    /// Serializes every mutation of this (primary) chainstate so that at
+    /// most one thread writes the `CoinCache` and `tip` at a time.
     ///
     /// The P2P side already has a single-writer invariant: every network
     /// block funnels through one `block_processor` thread. But
@@ -355,10 +355,35 @@ pub struct ChainState {
     /// concurrent writer, distinct from the flush-vs-reorg race that
     /// #268's `flush_guard` already closed).
     ///
+    /// **Every mutator must hold it, including the connector.** The
+    /// original lock covered `accept_block` and the two height-row commits
+    /// but not `connect_stored_block` / `connect_preprocessed_block`, on
+    /// the reasoning that the connector *is* the single P2P writer. That is
+    /// true of the P2P side and false of the whole system: an
+    /// `invalidateblock` reorg is a second writer, and issue #567 is what
+    /// the two of them did to a mainnet UTXO set. "Single writer by
+    /// construction" is not an invariant unless something enforces it.
+    ///
+    /// Holders — this list is the deadlock argument, keep it current.
+    /// Nothing reachable from inside one of these may acquire the lock
+    /// again: `parking_lot::Mutex` is not reentrant and a nested acquire
+    /// wedges the thread silently.
+    ///
+    /// - `accept_block` (whole body, including its reorg and trailing flush)
+    /// - `connect_stored_block`, `connect_preprocessed_block` (whole body)
+    /// - `accept_header`'s two height-row commits, `store_block`'s height-row
+    ///   commit
+    /// - `invalidate_block`, `reconsider_block`, `reconcile_invalid_tip`
+    ///
+    /// Lock order where it composes with the cache's flush exclusion:
+    /// `accept_lock` first, then `CoinCache::lock_flush_exclusion` (the
+    /// reorg paths in `accept_block` and `reorg_to` are the only places both
+    /// are held). No path takes them in the other order.
+    ///
     /// Uncontended on the IBD, reindex, and steady-state P2P paths (each
-    /// drives `accept_block` from a single thread), so the cost there is a
-    /// single uncontended lock/unlock. It contends only in exactly the
-    /// racing case it exists to prevent. Scoped to the primary chainstate;
+    /// drives one mutator from one thread), so the cost there is a single
+    /// uncontended lock/unlock per block. It contends only in exactly the
+    /// racing cases it exists to prevent. Scoped to the primary chainstate;
     /// the AssumeUTXO background catch-up mutates a *separate* `ChainState`
     /// and neither needs nor touches this lock.
     accept_lock: Mutex<()>,
@@ -3010,7 +3035,18 @@ impl ChainState {
             block = %pre.entry.header.block_hash()
         )
         .entered();
-        // Verify parent is current tip (same check as connect_stored_block)
+
+        // Serialize against every other chain mutator — see the twin
+        // acquisition in `connect_stored_block` for why the connector needs
+        // this and what it costs.
+        phases.enter(ConnectPhase::WaitingForAcceptLock);
+        let _accept_guard = self.accept_lock.lock();
+        phases.enter(ConnectPhase::EnterConnect);
+
+        // Verify parent is current tip (same check as connect_stored_block).
+        // Read under the lock: a reorg that finished while this call waited
+        // moved the tip, and everything below is decided against the tip we
+        // read here.
         let current_tip = self.tip_hash();
         if pre.entry.header.prev_blockhash != current_tip {
             phases.enter(ConnectPhase::Idle);
@@ -3660,13 +3696,46 @@ impl ChainState {
     ///
     /// Returns the block hash on success.
     pub fn connect_stored_block(&self, hash: &BlockHash) -> Result<BlockHash, ChainError> {
-        let entry = self
-            .store
-            .get_block_index(hash)
-            .ok_or(ChainError::BadPrevBlock)?;
         use crate::chain::connect_phase::ConnectPhase;
         let phases = &*self.connect_phases;
+
+        // Serialize the connector against every other chain mutator, for the
+        // whole call: the status/tip/parent checks below, `connect_block`,
+        // the `write_batch` commit and the `tip` write are one indivisible
+        // mutation of this chainstate, and they were not.
+        //
+        // Issue #567: an operator `invalidateblock` holds this lock across
+        // its reorg, whose reconnect loop walks the canonical branch
+        // block-by-block; the connector — the one chain mutator that took no
+        // lock — walked the same branch at the same time. Both connected the
+        // same blocks into the same `CoinCache`; the loser found the winner's
+        // inputs already spent, and the reorg it belonged to aborted into
+        // `discard_uncommitted`, which threw away the *other* thread's
+        // committed blocks along with its own. Eight blocks of UTXOs were
+        // destroyed and the node wedged.
+        //
+        // Cost: uncontended in steady-state IBD and on the reindex path
+        // (single connector thread). It contends only against `submitblock` /
+        // internal mining, header-acceptance height commits, and
+        // invalidate/reconsider — for the last of which the wait can be tens
+        // of seconds on a large block index, matching what Core's `cs_main`
+        // does to its own block-connection thread. Taken here rather than in
+        // the manager loop so every caller is covered, and so the loop's
+        // prefetch/scheduler work stays outside the critical section.
+        //
+        // Deadlock safety: nothing reachable from this function acquires
+        // `accept_lock` (parking_lot mutexes are not reentrant) — see the
+        // holder list on the `accept_lock` field doc.
+        phases.enter(ConnectPhase::WaitingForAcceptLock);
+        let _accept_guard = self.accept_lock.lock();
         phases.enter(ConnectPhase::EnterConnect);
+
+        // Read under the lock. A reorg that ran while this call waited may
+        // have changed both this entry's status and the tip.
+        let Some(entry) = self.store.get_block_index(hash) else {
+            phases.enter(ConnectPhase::Idle);
+            return Err(ChainError::BadPrevBlock);
+        };
         let trace_id = rand::random::<u32>();
         let _span = tracing::info_span!(
             "connect_stored",
@@ -8160,6 +8229,263 @@ pub(crate) mod tests {
                 BlockStatus::Valid
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 2026-08-12 mainnet incident (#567): an operator `invalidateblock`
+    /// and the block connector mutating the chain at the same time.
+    ///
+    /// What happened. `invalidate_block` holds `accept_lock` across its reorg,
+    /// which disconnects the invalidated branch in cache and then walks the
+    /// replacement branch block-by-block. The connector held no lock, so it
+    /// walked the same branch at the same time. Both connected the same
+    /// blocks into the same `CoinCache`; the thread that lost the race found
+    /// its inputs already spent (`bad-txns-inputs-missingorspent` — what the
+    /// operator's RPC returned) and the reorg that lost aborted into
+    /// `discard_uncommitted`, which throws away *everything* unflushed: its
+    /// own tentative delta and the other thread's committed blocks alike.
+    /// Eight blocks' worth of UTXOs were destroyed, the coins the invalidated
+    /// branch had spent came back as phantoms, and the node wedged for hours
+    /// re-failing the next connect.
+    ///
+    /// What this test pins. The connector now takes `accept_lock`, so the two
+    /// cannot interleave at all. The reorg is parked mid-reconnect (a
+    /// test-store gate on the coin read that resolves the first replacement
+    /// block's input) and the connector is turned loose on exactly the blocks
+    /// the reorg is in the middle of connecting:
+    ///
+    /// - the connector makes no progress while the reorg holds the lock;
+    /// - `invalidateblock` returns `Ok`, not a connect error;
+    /// - the connector's calls come back `Ok`/`Duplicate` — never a
+    ///   double-connect failure;
+    /// - the end state is the healthy one, and survives a flush.
+    ///
+    /// Delete either `accept_lock` acquisition in the connect path and this
+    /// test reproduces the incident instead: `X` and `Y` read unspent again,
+    /// `c1`/`c2`'s coinbase coins are gone, their status is back to
+    /// `DataStored` with no undo, and the tip points at an `Invalid` block.
+    /// (On regtest the losing connect dies on BIP30 rather than
+    /// `missingorspent` — BIP30 is buried by height on mainnet — but it is
+    /// the same abort and the same damage.)
+    #[test]
+    fn invalidateblock_serializes_with_a_concurrent_connector() {
+        use crate::storage::test_store::ControllableStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+
+        // Base chain long enough that height-1/2 coinbase outputs are mature
+        // when spent at heights 103/104.
+        let base = build_and_connect_chain(&cs, 102);
+        let base_tip = base[101].block_hash();
+        let x = OutPoint {
+            txid: base[0].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let y = OutPoint {
+            txid: base[1].txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let z = OutPoint {
+            txid: base[2].txdata[0].compute_txid(),
+            vout: 0,
+        };
+
+        // The branch the operator will invalidate (mainnet: the stale fork).
+        let f1 = build_test_block(base_tip, 103, 1_600_000_003);
+        cs.accept_block(&f1).unwrap();
+        let f2 = build_test_block(f1.block_hash(), 104, 1_600_000_004);
+        cs.accept_block(&f2).unwrap();
+        assert_eq!(cs.tip_hash(), f2.block_hash());
+
+        // The competing branch (mainnet: the canonical chain), stored over
+        // P2P but not connected. c1 spends X, c2 spends Y.
+        let c1 = build_test_block_spending(base_tip, 103, 1_600_000_013, x);
+        cs.accept_header(&c1.header).unwrap();
+        cs.store_block(&c1).unwrap();
+        let c2 = build_test_block_spending(c1.block_hash(), 104, 1_600_000_014, y);
+        cs.accept_header(&c2.header).unwrap();
+        cs.store_block(&c2).unwrap();
+        let c1_cb = OutPoint {
+            txid: c1.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let c2_cb = OutPoint {
+            txid: c2.txdata[0].compute_txid(),
+            vout: 0,
+        };
+
+        // Route the reorg thread's read of X through the (gateable) inner
+        // store: flush the cache, shrink the clean LRU to one slot and
+        // displace it, so nothing serves X above the gate.
+        cs.flush_coin_cache().unwrap();
+        cs.store_ref().resize_clean(1);
+        let _ = cs.get_coin(&z);
+        let gate = controls.arm_coin_gate(x);
+
+        // 0 = not started, 1 = about to connect, 2 = both connects returned.
+        let connector = AtomicUsize::new(0);
+
+        let (r1, r2) = std::thread::scope(|s| {
+            // The "operator" thread: invalidateblock(f1). Holds accept_lock
+            // for its whole body; its reorg disconnects f2/f1, then parks at
+            // the reconnect loop's input resolution of c1 (the read of X).
+            let r = s.spawn(|| cs.invalidate_block(f1.block_hash()));
+            gate.wait_entered();
+            assert_eq!(
+                cs.tip_hash(),
+                base_tip,
+                "the reorg disconnected the invalidated branch before parking"
+            );
+
+            // The connector, on the blocks the parked reorg is in the middle
+            // of connecting. This is the incident's interleaving.
+            let c = s.spawn(|| {
+                connector.store(1, Ordering::SeqCst);
+                let a = cs.connect_stored_block(&c1.block_hash());
+                let b = cs.connect_stored_block(&c2.block_hash());
+                connector.store(2, Ordering::SeqCst);
+                (a, b)
+            });
+
+            // Wait for the connector thread to be running, then give it room
+            // to finish if it can. It cannot: `accept_lock` is held by the
+            // parked reorg. (The end-state assertions below are the
+            // timing-free proof; this one localises the failure.)
+            while connector.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            assert_ne!(
+                connector.load(Ordering::SeqCst),
+                2,
+                "the connector mutated the chain while a reorg held accept_lock"
+            );
+
+            gate.release();
+            r.join()
+                .unwrap()
+                .expect("invalidateblock completes its reorg");
+            c.join().unwrap()
+        });
+
+        // The connector's calls are harmless whichever order they land in:
+        // the reorg connected c1/c2 first, so both are `Duplicate` (already
+        // Valid); had the connector gone first they would be `Ok`. What must
+        // never happen is a double-connect failure.
+        for (r, name) in [(&r1, "c1"), (&r2, "c2")] {
+            match r {
+                Ok(_) | Err(ChainError::Duplicate) => {}
+                Err(e) => panic!("connector's {name} connect failed: {e}"),
+            }
+        }
+
+        // The healthy end state: the replacement branch is the active chain,
+        // connected exactly once.
+        assert_eq!(cs.tip_hash(), c2.block_hash());
+        assert_eq!(cs.tip_height(), 104);
+        for b in [&c1, &c2] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Valid,
+                "the replacement branch is connected"
+            );
+            assert!(
+                cs.store_ref().get_undo(&b.block_hash()).is_some(),
+                "a connected block has undo data"
+            );
+        }
+        for b in [&f1, &f2] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid,
+                "the invalidated branch stays invalidated"
+            );
+        }
+        assert!(cs.get_coin(&c1_cb).is_some(), "c1's coinbase coin exists");
+        assert!(cs.get_coin(&c2_cb).is_some(), "c2's coinbase coin exists");
+        assert!(cs.get_coin(&x).is_none(), "X is spent by c1");
+        assert!(cs.get_coin(&y).is_none(), "Y is spent by c2");
+
+        // And it is the state that reaches disk.
+        cs.flush_coin_cache().unwrap();
+        assert!(cs.get_coin(&c1_cb).is_some());
+        assert!(cs.get_coin(&c2_cb).is_some());
+        assert!(cs.get_coin(&x).is_none());
+        assert!(cs.get_coin(&y).is_none());
+        assert_eq!(cs.tip_hash(), c2.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prefetch connect path takes `accept_lock` too. Same proof shape as
+    /// `accept_header_height_commit_serializes_under_accept_lock`: hold the
+    /// lock (standing in for an in-progress reorg or `submitblock`) and the
+    /// call cannot complete, no matter how far its thread has progressed,
+    /// because its commit needs the lock.
+    ///
+    /// `connect_preprocessed_block` is the path IBD actually uses whenever the
+    /// prefetcher has the block ready — which is most of them — so a guard on
+    /// `connect_stored_block` alone would leave the incident's race wide open
+    /// on the common path.
+    #[test]
+    fn connect_preprocessed_block_serializes_under_accept_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let b4 = build_test_block(blocks[2].block_hash(), 4, 1_600_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        cs.store_block(&b4).unwrap();
+
+        let entry = cs.get_block_index(&b4.block_hash()).unwrap();
+        let parent = cs.get_block_index(&blocks[2].block_hash()).unwrap();
+        let pre = crate::chain::prefetch::PreprocessedBlock {
+            height: 4,
+            hash: b4.block_hash(),
+            block: b4.clone(),
+            flat_pos: FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            },
+            mtp: 0,
+            txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
+            script_verified_txs: Default::default(),
+            context_free_checked: true,
+            entry,
+            parent,
+        };
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+            s.spawn(|| {
+                cs.connect_preprocessed_block(pre).expect("connect B4");
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "connect_preprocessed_block committed a block while accept_lock was held"
+            );
+            assert_eq!(
+                cs.tip_hash(),
+                blocks[2].block_hash(),
+                "and the tip did not move"
+            );
+            drop(guard);
+        });
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the connect completes once the lock is free"
+        );
+        assert_eq!(cs.tip_hash(), b4.block_hash());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
