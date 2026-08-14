@@ -11032,6 +11032,44 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A broken txindex must not be reported as "consistent".
+    ///
+    /// Absent `tx_index` rows are the *correct* state on a node running
+    /// without `-txindex`, which is why they were counted rather than listed.
+    /// But excluding them from the verdict unconditionally meant a node whose
+    /// txindex was genuinely broken got "consistent" and exit 0 — the one
+    /// answer a diagnostic tool must never give wrongly. The report now
+    /// carries whether the store has the index, so it can tell the two apart.
+    #[test]
+    fn verify_chainstate_reports_an_absent_txindex_row_when_the_index_is_on() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        // Land the connect batches first. They carry coins, so they are
+        // buffered; a coin-less remove issued before the flush goes straight
+        // to the inner store and is then overwritten when the buffered put
+        // replays.
+        flush_and_drop_caches(&cs);
+        let clean = cs.verify_chainstate_default();
+        assert!(clean.txindex_expected, "the test store runs with the index");
+        assert!(clean.is_consistent());
+
+        let victim = blocks[1].txdata[0].compute_txid();
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.tx_index_removes.push(victim);
+        cs.store.write_batch(batch).unwrap();
+        flush_and_drop_caches(&cs);
+
+        let report = cs.verify_chainstate_default();
+        assert_eq!(report.tx_index_absent, 1);
+        assert!(
+            !report.is_consistent(),
+            "a missing txindex row on a node that runs the index is a fault"
+        );
+        assert!(report.describe().contains("txindex row(s) absent"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A pruned block is not damage, and must not fail the whole report.
     ///
     /// Pruned blocks are unreadable by construction — that is what pruning is

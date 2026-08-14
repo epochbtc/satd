@@ -59,9 +59,19 @@ pub struct ChainstateReport {
     /// rather than by which came last.
     pub tx_index_wrong: Vec<(Txid, BlockHash)>,
     /// Transactions in the walked blocks with no `tx_index` row at all.
-    /// Informational: this is the correct state when `-txindex` is off, so it
-    /// is counted rather than treated as a fault.
+    ///
+    /// Whether this is a fault depends on [`Self::txindex_expected`]: with the
+    /// index off, absent rows are the correct state; with it on, they are a
+    /// broken index. Counted rather than listed because on a healthy
+    /// non-txindex node it is every transaction in the window.
     pub tx_index_absent: usize,
+    /// Whether the store this report was built from has `-txindex` enabled.
+    ///
+    /// Without it, [`Self::tx_index_absent`] cannot be judged — and judging it
+    /// as always-informational made the audit answer "consistent" and exit 0
+    /// on a node whose txindex was genuinely broken, which is the one answer a
+    /// diagnostic tool must never give wrongly.
+    pub txindex_expected: bool,
     /// Blocks whose cumulative transaction count is absent, or disagrees with
     /// `parent + num_tx`.
     pub chain_tx_faults: Vec<(u32, BlockHash)>,
@@ -86,7 +96,8 @@ impl ChainstateReport {
     /// True when nothing disagreed. `tx_index_absent` is excluded — see its
     /// docs.
     pub fn is_consistent(&self) -> bool {
-        self.ancestry.is_intact()
+        !(self.txindex_expected && self.tx_index_absent > 0)
+            && self.ancestry.is_intact()
             && self.missing_coins.is_empty()
             && self.unspent_spends.is_empty()
             && self.height_mismatches.is_empty()
@@ -132,6 +143,9 @@ impl ChainstateReport {
         if !self.unreadable.is_empty() {
             parts.push(format!("{} block(s) unreadable", self.unreadable.len()));
         }
+        if self.txindex_expected && self.tx_index_absent > 0 {
+            parts.push(format!("{} txindex row(s) absent", self.tx_index_absent));
+        }
         parts.join("; ")
     }
 }
@@ -160,6 +174,9 @@ impl ChainState {
         let mut report = ChainstateReport {
             lowest_height: tip_height,
             ancestry,
+            // The store knows whether it was opened with the index, so the
+            // caller does not have to remember to say so.
+            txindex_expected: crate::storage::Store::has_txindex(&**self.store_ref()),
             ..Default::default()
         };
 

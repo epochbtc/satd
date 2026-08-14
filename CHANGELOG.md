@@ -51,6 +51,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   or below its own height, rather than for the whole window; and the
   cumulative-count check is skipped when the backfill that populates those rows
   has not run, which would otherwise fail a datadir whose UTXO set is perfect.
+  Absent txindex rows are now a fault when the store has `-txindex` enabled —
+  previously they were always informational, so a genuinely broken txindex was
+  reported as consistent.
 - Fixed: after `invalidateblock`, the block connector could pin itself to the
   branch that had just been invalidated and stall indefinitely — it selected
   the next block through the height→hash index, which is "best known block at
