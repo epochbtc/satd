@@ -3791,7 +3791,7 @@ impl PeerManager {
                 break;
             }
 
-            let hash = match chain_state.get_block_hash_by_height(next_height) {
+            let hash = match chain_state.next_block_to_connect(next_height) {
                 Some(h) => h,
                 None => {
                     // No header for this height yet — wait
@@ -3966,10 +3966,17 @@ impl PeerManager {
                         }
                         continue; // Immediately try next block
                     }
-                    Err(crate::chain::state::ChainError::Duplicate) => {
-                        // Already connected (shouldn't happen but harmless)
-                        continue;
-                    }
+                    // `Duplicate` deliberately falls through to the generic
+                    // error arm rather than retrying immediately. It means the
+                    // block offered at tip+1 is one this chainstate already
+                    // connected, which `connect_stored_block` rejects before it
+                    // does any work — so `continue` here re-offers the same
+                    // block with no sleep and no retry counter, spinning a core
+                    // for as long as the condition lasts. It is reachable
+                    // whenever a height row names a `Valid` block: a reorg
+                    // displaced it and `disconnect_block` writes no status, so
+                    // the marker sticks. Counting it toward the retry limit
+                    // lets the existing recovery run instead of spinning.
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= 30 {

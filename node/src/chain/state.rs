@@ -264,6 +264,10 @@ pub struct ChainState {
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
+    /// When [`Self::next_block_to_connect`] last ran its full block-index scan,
+    /// and for which `(tip, height)`. The scan is O(index); the connector polls
+    /// once a second. See the throttle in `next_block_to_connect`.
+    connector_scan_last: Mutex<Option<(BlockHash, u32, std::time::Instant)>>,
     /// Number of threads for parallel script verification.
     num_threads: usize,
     /// Address-history index runtime config. Threaded into every
@@ -476,6 +480,7 @@ impl ChainState {
                     headers_tip_height: AtomicU32::new(htip),
                     best_header: RwLock::new(best_header),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
+                    connector_scan_last: Mutex::new(None),
                     num_threads,
                     address_index,
                     sp_index,
@@ -582,6 +587,7 @@ impl ChainState {
             headers_tip_height: AtomicU32::new(0),
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
+            connector_scan_last: Mutex::new(None),
             num_threads,
             address_index,
             sp_index,
@@ -5986,6 +5992,254 @@ impl ChainState {
         Ok(children)
     }
 
+    /// How often [`Self::next_block_to_connect`] may run its full block-index
+    /// scan for the same stuck `(tip, height)`. Long enough that a wedged
+    /// connector costs one scan per thirty seconds rather than one per poll;
+    /// short enough that a block arriving mid-wedge is picked up promptly.
+    ///
+    /// Note the key is `(tip, height)`, so a *run* of poisoned rows is not
+    /// throttled: each connected block moves the tip and re-arms the scan.
+    /// That is the intended trade — the scan is what repairs each height — but
+    /// it is why the scan itself must stay O(1) in memory.
+    const CONNECTOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Whether the fallback scan may run now. Always true when the tip or the
+    /// height has moved — progress means the previous answer is stale — and
+    /// otherwise only once per [`Self::CONNECTOR_SCAN_INTERVAL`].
+    fn connector_scan_due(&self, tip: BlockHash, next_height: u32) -> bool {
+        let now = std::time::Instant::now();
+        let mut last = self.connector_scan_last.lock();
+        match *last {
+            Some((t, h, when))
+                if t == tip
+                    && h == next_height
+                    && now.duration_since(when) < Self::CONNECTOR_SCAN_INTERVAL =>
+            {
+                false
+            }
+            _ => {
+                *last = Some((tip, next_height, now));
+                true
+            }
+        }
+    }
+
+    /// The block the sequential connector should attempt at `next_height`
+    /// (always `tip_height + 1`).
+    ///
+    /// The connector used to read `height → hash` directly. That index is
+    /// "best known block at this height", not an active-chain oracle, and
+    /// nothing rewrites it when a branch is invalidated — so after
+    /// `invalidateblock` truncated the chain to the fork point, the rows above
+    /// the new tip still named the branch that had just been marked `Invalid`.
+    /// The connector asked for the next height, got a dead block, found no
+    /// usable data for it and logged `Connector stuck waiting for block data`
+    /// every minute — the line is throttled per stuck height — for five and a
+    /// half hours, while the canonical block at that same height sat on disk
+    /// as `DataStored`. The operator's only way out was another manual RPC.
+    ///
+    /// Note the row was not obviously wrong: the invalidated block's parent
+    /// *is* the fork point, so it is a genuine child of the tip. What
+    /// disqualifies it is its status.
+    ///
+    /// Fast path is two point lookups — the height row, then its entry, since
+    /// the status is the whole point — and a row naming a block whose parent is
+    /// the tip is taken as-is, including a header whose block has not been
+    /// downloaded yet (the caller waits for the data). The connector read one
+    /// lookup before this function existed; the second is what distinguishes a
+    /// live frontier from an invalidated branch.
+    ///
+    /// **This never returns `None` when the height row exists.** When the scan
+    /// finds no better candidate it hands back the row unchanged, which is
+    /// precisely what the connector read before this function existed. That
+    /// matters because the connector's recovery from a fork-blocked frontier is
+    /// reached only *through a connect error*: `connect_stored_block` returns
+    /// `BadPrevBlock`, the caller counts to 30, and if a competing higher-work
+    /// header chain exists it tears down the IBD scheduler and hands off to the
+    /// reorg-capable steady-state path. Returning `None` here would instead
+    /// park the connector on its "waiting for header" branch, which sleeps a
+    /// second and loops without incrementing that counter — trading a
+    /// thirty-second self-heal for an unbounded silent stall.
+    pub fn next_block_to_connect(&self, next_height: u32) -> Option<BlockHash> {
+        // One acquisition, not two. The caller derived `next_height` from its
+        // own `tip_height()` read; taking the hash from a second read lets a
+        // concurrent `submitblock` or mined block land in between, after which
+        // `next_height` is the *new* tip's own height. The fast path then fails
+        // (the new tip's parent is the old tip), the scan finds no child at
+        // that height, and the fallthrough hands back the new tip itself —
+        // `Duplicate`, one wasted iteration, and a full index scan to pay for
+        // it.
+        let (tip, tip_height) = self.tip_snapshot();
+        let row = self.store.get_block_hash_by_height(next_height)?;
+        if tip_height + 1 != next_height {
+            // The tip moved under the caller. Answering for a height that is
+            // no longer the frontier would be answering a stale question, and
+            // burning a full index scan on it is worse than useless. Hand back
+            // the row — the caller re-reads the tip on its next iteration.
+            return Some(row);
+        }
+
+        // Only the two statuses the connector can actually make progress on.
+        // `HeaderOnly` is deliberately included: the block is not downloaded
+        // yet and the caller waits for it, which is correct. The three
+        // exclusions each have teeth:
+        //
+        // - `Invalid`: the case this function was written for.
+        // - `Pruned`: the block was connected once and its data removed, so
+        //   `has_block_data` is false and the caller parks on "waiting for
+        //   block data" forever. Reachable when a reorg moves the tip below a
+        //   block that had already been pruned. Falling through to the scan
+        //   finds the connectable child on the winning branch instead.
+        // - `Valid`: already connected in this chainstate — a reorg displaced
+        //   it and `disconnect_block` writes no status, so the marker sticks.
+        //   `connect_stored_block` rejects it with `Duplicate`. Reaching such
+        //   a block is a reorg, not a sequential connect. (The caller used to
+        //   treat `Duplicate` as harmless and retry with no sleep and no retry
+        //   counter — a silent hot spin whenever the fallthrough below handed
+        //   back such a row. It now counts toward the retry limit like any
+        //   other error, so the fork-handoff recovery runs instead.)
+        if let Some(entry) = self.store.get_block_index(&row)
+            && entry.header.prev_blockhash == tip
+            && matches!(
+                entry.status,
+                BlockStatus::HeaderOnly | BlockStatus::DataStored
+            )
+        {
+            return Some(row);
+        }
+
+        // The scan below is O(block index) — a full iterate-and-deserialize,
+        // ~1M rows on mainnet — and the connector polls this once a second. On
+        // the path that motivated it that is fine: it finds the canonical
+        // child, connecting rewrites that height's row, and each poisoned
+        // height is repaired once. But when no connectable child exists the
+        // connector polls forever, and scanning the whole index every second
+        // would burn a core on a node that is already in trouble. Rate-limit
+        // it; between scans fall back to the row, which is what the connector
+        // read before this function existed.
+        if !self.connector_scan_due(tip, next_height) {
+            return Some(row);
+        }
+
+        // Ask the chain instead of the index: the block to connect is a child
+        // of the tip that carries data and has not been invalidated. Highest
+        // chainwork wins, ties broken by hash so the choice is deterministic.
+        //
+        // `DataStored` exactly, not `DataStored | Valid` as elsewhere in this
+        // file: `connect_stored_block` refuses anything else, so returning a
+        // `Valid` child (one a reorg displaced — `disconnect_block` writes no
+        // status, so displaced blocks keep the marker) would hand the caller a
+        // block it cannot connect. Reaching such a child is a reorg, not a
+        // sequential connect, and the fallthrough below routes it there.
+        // Filter during the scan rather than building an adjacency map of the
+        // whole index and then reading one key out of it.
+        // `block_index_children` materialises a HashMap over every row — ~1M
+        // entries and a transient allocation in the hundreds of megabytes on
+        // mainnet — which is defensible for the rare operator-driven
+        // invalidate/reconsider paths it was written for, but not for a poll
+        // loop running on a node that is already short of memory. Same O(N)
+        // time, O(1) space.
+        let mut best: Option<(BlockHash, BlockIndexEntry)> = None;
+        let scan = self.store.for_each_block_index(&mut |child, e| {
+            if e.header.prev_blockhash != tip
+                || e.status != BlockStatus::DataStored
+                || e.height != next_height
+            {
+                return;
+            }
+            let better = match &best {
+                None => true,
+                Some((bh, b)) => match compare_u256(&e.chainwork, &b.chainwork) {
+                    1 => true,
+                    -1 => false,
+                    _ => child < *bh,
+                },
+            };
+            if better {
+                best = Some((child, e));
+            }
+        });
+        // A scan that failed partway saw an unknown subset of the index, so
+        // `best` is not "the best child" but "the best of whatever was reached
+        // before the error". Surface the failure — swallowing it leaves the
+        // connector wedged with the storage fault invisible, the exact silent
+        // stall this function exists to end — but still *prefer* the partial
+        // candidate over the row.
+        //
+        // The asymmetry is the whole point. Everything the closure admitted
+        // has already passed `prev == tip && DataStored && height ==
+        // next_height`, which is precisely what `connect_stored_block`
+        // requires, so a partial candidate is connectable by construction. The
+        // row carries no such guarantee — it is the poisoned height index this
+        // recovery path exists because of. Preferring the row costs a
+        // permanent wedge to avoid a transient suboptimality:
+        //
+        // - Partial candidate, higher-work sibling missed: the connector
+        //   connects a fully-validated child of the tip and moves forward. The
+        //   sibling is picked up afterwards by the ordinary reorg path.
+        // - Row, when the row is poisoned: `connect_stored_block` rejects it
+        //   with `Duplicate`, which the caller's fork-handoff gate does *not*
+        //   match (it tests `BadPrevBlock` specifically), so the retry counter
+        //   runs to 30, the run loop restarts IBD, and the next scan hits the
+        //   same persistent storage fault. The node never advances again.
+        //
+        // Decode failures are counted in `BlockIndexScanStats` rather than
+        // returned, so an `Err` here means a real iterator/IO fault — the
+        // persistent kind.
+        if let Err(e) = scan {
+            let fallback = best.map(|(_, e)| e.header.block_hash()).unwrap_or(row);
+            tracing::error!(
+                height = next_height,
+                tip = %tip,
+                fallback = %fallback,
+                error = %e,
+                "connector recovery scan of the block index failed; falling back to the \
+                 best candidate seen before the error, or to the height row if none"
+            );
+            self.warnings().record(
+                "connect.recovery_scan_failed",
+                crate::warnings::Severity::Error,
+                "Could not scan the block index for a connectable block; the connector may \
+                 stall until this is resolved",
+                serde_json::json!({ "height": next_height, "error": e.to_string() }),
+            );
+            return Some(fallback);
+        }
+        // The scan completed, so whatever the previous failure was, it is not
+        // current. An `Error`-severity entry that nothing clears pins
+        // `getwarnings`, holds `has_errors()` true for the life of the process
+        // and keeps the TUI's blocking modal up — describing a condition that
+        // resolved seconds ago. Every sibling connector warning is cleared on
+        // forward progress the same way.
+        self.warnings().clear("connect.recovery_scan_failed");
+        let best = best.map(|(_, e)| e);
+
+        let Some(found) = best else {
+            // Nothing better to offer. Hand back the row so the caller's
+            // existing BadPrevBlock -> retry -> fork-handoff recovery still
+            // runs, and so its "stuck waiting for block data" diagnostic —
+            // which is what made this class of stall debuggable — still fires.
+            tracing::debug!(
+                height = next_height,
+                row = %row,
+                tip = %tip,
+                "height row does not extend the tip and no connectable child \
+                 exists; leaving the row for the caller's stall handling"
+            );
+            return Some(row);
+        };
+        let hash = found.header.block_hash();
+        tracing::warn!(
+            height = next_height,
+            row = %row,
+            chosen = %hash,
+            tip = %tip,
+            "height index names a block that cannot extend the active chain; \
+             connecting the tip's child instead"
+        );
+        Some(hash)
+    }
+
     /// Mark `root` and all of its descendants `Invalid` (Core's
     /// FAILED_VALID + FAILED_CHILD). `Pruned` descendants are left alone.
     fn mark_subtree_invalid(&self, root: BlockHash) -> Result<(), ChainError> {
@@ -6769,6 +7023,15 @@ pub(crate) mod tests {
     use crate::storage::flatfile::FlatFileManager;
 
     pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
+        make_chain_state_with_store(Box::new(InMemoryStore::new()))
+    }
+
+    /// [`make_chain_state`] over a caller-supplied store, for tests that need
+    /// to control what the storage layer answers rather than only what it
+    /// holds.
+    pub(crate) fn make_chain_state_with_store(
+        store: Box<dyn crate::storage::Store>,
+    ) -> (ChainState, std::path::PathBuf) {
         // A process-wide counter guarantees a unique datadir per call: two
         // tests running on parallel threads can otherwise hit the same
         // `subsec_nanos()` and share a `blocks/` dir, corrupting each other's
@@ -6784,7 +7047,6 @@ pub(crate) mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let blocks_dir = dir.join("blocks");
-        let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&blocks_dir).unwrap();
         let cs = ChainState::new(
             store,
@@ -10487,6 +10749,280 @@ pub(crate) mod tests {
         );
         assert_eq!(cs.tip_height(), 5, "the tip must not have moved");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After `invalidateblock` truncates to the fork point, the height rows
+    /// above the new tip still name the branch that was just invalidated. The
+    /// connector asked for the next height, got a dead block, and logged
+    /// `Connector stuck waiting for block data` every minute for five and a
+    /// half hours while the canonical block at that height sat on disk.
+    ///
+    /// Note the dead block is a genuine child of the tip — its parent *is* the
+    /// fork point — so nothing about the parent link disqualifies it. Only its
+    /// status does.
+    #[test]
+    fn connector_skips_an_invalidated_branch_for_the_canonical_block() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let fork_point = blocks[2].block_hash();
+
+        // A branch on top of the fork point, connected, then invalidated.
+        let branch = build_test_block(fork_point, 4, 1_300_000_004);
+        cs.accept_header(&branch.header).unwrap();
+        cs.store_block(&branch).unwrap();
+        cs.connect_stored_block(&branch.block_hash()).unwrap();
+        assert_eq!(cs.tip_height(), 4);
+
+        // The canonical competitor's header is known, but the block has not
+        // arrived yet — so invalidation has no connectable alternative and
+        // truncates rather than reorging. This ordering is the incident's:
+        // the operator invalidated first, and the canonical blocks came down
+        // afterwards.
+        let canonical = build_test_block(fork_point, 4, 1_300_000_009);
+        assert_ne!(canonical.block_hash(), branch.block_hash());
+        cs.accept_header(&canonical.header).unwrap();
+
+        cs.invalidate_block(branch.block_hash()).unwrap();
+        assert_eq!(cs.tip_height(), 3, "invalidation truncates to the fork point");
+
+        // Now the block arrives and is stored. Storing does not connect.
+        cs.store_block(&canonical).unwrap();
+
+        // The wedge, injected directly. Nothing rewrites a height row when the
+        // block it names is invalidated, so on the mainnet node these rows
+        // still resolved to the dead branch — the connector logged
+        // `block_index_status=Some(Invalid) has_height_to_hash=true` at three
+        // separate heights. Reaching that state through the writers depends on
+        // download timing that is not reproducible in a unit test; the state
+        // itself is what the guard has to survive.
+        pollute_height_hash(&cs, 4, branch.block_hash());
+        assert_eq!(
+            cs.get_block_hash_by_height(4),
+            Some(branch.block_hash()),
+            "precondition — the height row names the invalidated branch"
+        );
+        assert_eq!(
+            cs.get_block_index(&branch.block_hash()).unwrap().status,
+            BlockStatus::Invalid
+        );
+
+        // The connector must reach the canonical block anyway, and connect it.
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("a connectable child of the tip exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "the connector must not be pinned to the invalidated branch"
+        );
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        // Connecting rewrites the row, so the height is repaired once.
+        assert_eq!(cs.get_block_hash_by_height(4), Some(canonical.block_hash()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback must not fire on a healthy node: a height whose block has
+    /// not been downloaded yet still returns that block, so the caller waits
+    /// for data rather than paying for a block-index scan every second.
+    #[test]
+    fn connector_selection_takes_the_height_row_when_it_names_the_tips_child() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+
+        // Header accepted, block never stored: the ordinary IBD frontier.
+        let next = build_test_block(cs.tip_hash(), 4, 1_300_000_004);
+        cs.accept_header(&next.header).unwrap();
+        assert_eq!(
+            cs.get_block_index(&next.block_hash()).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        assert_eq!(
+            cs.next_block_to_connect(4),
+            Some(next.block_hash()),
+            "a not-yet-downloaded header must still be selected, not skipped"
+        );
+        assert!(!cs.has_block_data(&next.block_hash()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Pruned` row at the next height must not pin the connector.
+    ///
+    /// `Pruned` means the block was connected once and its data discarded, so
+    /// `has_block_data` is false and the caller's "waiting for block data"
+    /// branch sleeps a second and loops — forever, with no retry counter and no
+    /// path to the fork handoff. Reachable when a reorg moves the tip below a
+    /// block that had already been pruned. The fast path must decline it and
+    /// let the scan find the connectable child instead.
+    #[test]
+    fn connector_selection_skips_a_pruned_row_for_the_connectable_child() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        // Two children of the tip: one pruned (data gone), one with data.
+        let pruned = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&pruned.header).unwrap();
+        cs.store_block(&pruned).unwrap();
+        force_status(&cs, &pruned.block_hash(), BlockStatus::Pruned);
+
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        assert_eq!(
+            cs.get_block_index(&canonical.block_hash()).unwrap().status,
+            BlockStatus::DataStored
+        );
+
+        // The row names the pruned block — a block the connector cannot use.
+        pollute_height_hash(&cs, 4, pruned.block_hash());
+        assert!(
+            !cs.has_block_data(&pruned.block_hash()),
+            "precondition — a pruned block carries no data to connect"
+        );
+
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("a connectable child of the tip exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "a pruned row must not be handed back as the block to connect"
+        );
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed recovery scan must still prefer a candidate it did reach over
+    /// the height row.
+    ///
+    /// Everything the scan admits has already passed `prev == tip &&
+    /// DataStored && height == next_height` — exactly what
+    /// `connect_stored_block` requires — so a partial candidate is connectable
+    /// by construction. The row is not: it is the poisoned height index this
+    /// recovery path exists because of. Handing back the row on a scan error
+    /// trades a transient suboptimality (a lower-work sibling, which the reorg
+    /// path corrects afterwards) for a permanent wedge: the row is rejected
+    /// with `Duplicate`, the caller's fork-handoff gate tests `BadPrevBlock`
+    /// specifically and so never fires, and the next scan hits the same
+    /// persistent storage fault.
+    #[test]
+    fn connector_selection_prefers_a_reached_candidate_when_the_scan_fails() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        // A connectable child of the tip, and a row naming a block that cannot
+        // extend the chain.
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        let dead = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&dead.header).unwrap();
+        cs.store_block(&dead).unwrap();
+        force_status(&cs, &dead.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 4, dead.block_hash());
+
+        controls.fail_block_index_scans(true);
+        let next = cs
+            .next_block_to_connect(4)
+            .expect("never None while the height row exists");
+        assert_eq!(
+            next,
+            canonical.block_hash(),
+            "a scan that failed after reaching a connectable child must hand back that \
+             child, not the row it exists to route around"
+        );
+        // And it connects — the property the row does not have.
+        cs.connect_stored_block(&next).unwrap();
+        assert_eq!(cs.tip_hash(), canonical.block_hash());
+
+        assert!(
+            cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "the storage fault must surface somewhere the operator can see it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan-failure warning must clear once a scan succeeds.
+    ///
+    /// `NodeWarnings` entries stay active until the call site clears them, so
+    /// an `Error` nothing clears pins `getwarnings`, holds `has_errors()` true
+    /// for the life of the process and keeps the TUI's blocking modal up —
+    /// describing a transient fault that resolved seconds earlier. Every
+    /// sibling connector warning is cleared on forward progress.
+    #[test]
+    fn connector_scan_warning_clears_once_the_scan_succeeds() {
+        let store = crate::storage::test_store::ControllableStore::new();
+        let controls = store.controls();
+        let (cs, dir) = make_chain_state_with_store(Box::new(store));
+        build_and_connect_chain(&cs, 3);
+        let tip = cs.tip_hash();
+
+        let canonical = build_test_block(tip, 4, 1_300_000_005);
+        cs.accept_header(&canonical.header).unwrap();
+        cs.store_block(&canonical).unwrap();
+        let dead = build_test_block(tip, 4, 1_300_000_004);
+        cs.accept_header(&dead.header).unwrap();
+        cs.store_block(&dead).unwrap();
+        force_status(&cs, &dead.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 4, dead.block_hash());
+
+        controls.fail_block_index_scans(true);
+        cs.next_block_to_connect(4).unwrap();
+        assert!(
+            cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "precondition — the fault was recorded"
+        );
+
+        // The fault clears. The scan is throttled per (tip, height), so move
+        // the height on rather than fighting the timer: progress re-arms it.
+        controls.fail_block_index_scans(false);
+        cs.connect_stored_block(&canonical.block_hash()).unwrap();
+        let follow = build_test_block(cs.tip_hash(), 5, 1_300_000_006);
+        cs.accept_header(&follow.header).unwrap();
+        cs.store_block(&follow).unwrap();
+        let dead5 = build_test_block(cs.tip_hash(), 5, 1_300_000_007);
+        cs.accept_header(&dead5.header).unwrap();
+        cs.store_block(&dead5).unwrap();
+        force_status(&cs, &dead5.block_hash(), BlockStatus::Pruned);
+        pollute_height_hash(&cs, 5, dead5.block_hash());
+        cs.next_block_to_connect(5).unwrap();
+
+        assert!(
+            !cs.warnings()
+                .list()
+                .iter()
+                .any(|w| w.id == "connect.recovery_scan_failed"),
+            "a completed scan means the storage fault is not current; leaving the warning \
+             standing pins has_errors() for the life of the process"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No header at all for the next height: nothing to connect, and no scan.
+    #[test]
+    fn connector_selection_is_none_when_the_height_has_no_row() {
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 3);
+        assert_eq!(cs.next_block_to_connect(4), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
