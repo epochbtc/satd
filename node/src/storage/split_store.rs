@@ -41,14 +41,42 @@ pub struct SplitStore {
     /// Private coins store: coins, undo, tip. A separate RocksDB
     /// (`chainstate_background/`) that is discarded after handoff.
     coins_store: Arc<dyn Store>,
+    /// The snapshot chainstate's `accept_lock`, held around every write to
+    /// the *shared* block store.
+    ///
+    /// The block store is that chainstate's `CoinCache`, so the background
+    /// catch-up thread is a second writer into a cache the snapshot
+    /// chainstate reorgs. A reorg holds `accept_lock` from its checkpoint
+    /// flush through to its commit or abort, so taking it here is enough to
+    /// keep a background write from landing *inside* that window — where an
+    /// abort's `discard_uncommitted` would throw the rows away, leaving holes
+    /// in a shared block index the background will never revisit. It does not
+    /// need to be held across the background's own validation work, which
+    /// touches only the private store, so the contention is one write's worth
+    /// per background block.
+    ///
+    /// `None` for a `SplitStore` with no chainstate above it (tests).
+    block_store_lock: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl SplitStore {
-    pub fn new(block_store: Arc<dyn Store>, coins_store: Arc<dyn Store>) -> Self {
+    pub fn new(
+        block_store: Arc<dyn Store>,
+        coins_store: Arc<dyn Store>,
+        block_store_lock: Option<Arc<parking_lot::Mutex<()>>>,
+    ) -> Self {
         Self {
             block_store,
             coins_store,
+            block_store_lock,
         }
+    }
+
+    /// Write the shared half under the snapshot chainstate's `accept_lock`.
+    /// See [`Self::block_store_lock`].
+    fn write_block_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        let _guard = self.block_store_lock.as_ref().map(|l| l.lock());
+        self.block_store.write_batch(batch)
     }
 
     /// Partition a batch into `(block-store mutations, coins-store
@@ -181,7 +209,7 @@ impl Store for SplitStore {
         // re-connecting that block on restart is idempotent (same
         // block-index put, coins re-applied). The reverse order could
         // strand a tip pointing at a block whose index never landed.
-        self.block_store.write_batch(block_batch)?;
+        self.write_block_batch(block_batch)?;
         self.coins_store.write_batch(coins_batch)?;
         Ok(())
     }
@@ -190,7 +218,7 @@ impl Store for SplitStore {
         let (block_batch, coins_batch) = Self::split_batch(batch);
         // Block index stays durable; only the heavy coins writes honor
         // BulkLoad during the background catch-up IBD.
-        self.block_store.write_batch(block_batch)?;
+        self.write_block_batch(block_batch)?;
         self.coins_store.write_batch_mode(coins_batch, mode)?;
         Ok(())
     }
@@ -257,13 +285,59 @@ mod tests {
         (g.block_hash(), entry)
     }
 
+    /// The background catch-up thread writes block-index rows into the
+    /// *snapshot* chainstate's coin cache, which that chainstate reorgs. A
+    /// reorg holds `accept_lock` from its checkpoint flush through to its
+    /// commit or abort, so holding the same lock around this write is what
+    /// keeps a background row from landing inside that window — where the
+    /// abort's `discard_uncommitted` would throw it away, leaving a hole in a
+    /// shared block index the background has already moved past. Same defect
+    /// as #567, on the AssumeUTXO path.
+    ///
+    /// Proof shape: while the lock is held, the write cannot complete no
+    /// matter how far its thread has progressed, because it needs the lock.
+    #[test]
+    fn a_shared_block_store_write_waits_for_the_chainstates_accept_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let bdir = tempfile::tempdir().unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let block_store = store(bdir.path());
+        let coins_store = store(cdir.path());
+        let lock = Arc::new(parking_lot::Mutex::new(()));
+        let split = SplitStore::new(block_store.clone(), coins_store.clone(), Some(lock.clone()));
+
+        let (hash, entry) = genesis_entry();
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let guard = lock.lock();
+            s.spawn(|| {
+                split.write_batch(batch).unwrap();
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "the shared block store was written while the chainstate lock was held"
+            );
+            assert!(block_store.get_block_index(&hash).is_none());
+            drop(guard);
+        });
+
+        assert!(done.load(Ordering::SeqCst), "and completes once it is free");
+        assert!(block_store.get_block_index(&hash).is_some());
+    }
+
     #[test]
     fn write_batch_routes_block_index_to_block_store_and_coins_to_coins_store() {
         let bdir = tempfile::tempdir().unwrap();
         let cdir = tempfile::tempdir().unwrap();
         let block_store = store(bdir.path());
         let coins_store = store(cdir.path());
-        let split = SplitStore::new(block_store.clone(), coins_store.clone());
+        let split = SplitStore::new(block_store.clone(), coins_store.clone(), None);
 
         let (hash, entry) = genesis_entry();
         let op = outpoint(0xAB);
@@ -307,7 +381,7 @@ mod tests {
         let block_flushes = block_store.flush_durable_counter();
         let coins_flushes = coins_store.flush_durable_counter();
 
-        let split = SplitStore::new(Arc::new(block_store), Arc::new(coins_store));
+        let split = SplitStore::new(Arc::new(block_store), Arc::new(coins_store), None);
         split.flush_durable().unwrap();
 
         assert_eq!(block_flushes.load(std::sync::atomic::Ordering::Relaxed), 1);

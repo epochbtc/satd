@@ -377,6 +377,10 @@ pub struct ChainState {
     /// - `repair_block_data` (whole body)
     /// - `prune_blocks`' mutation section (file deletes + `Pruned` batch;
     ///   its height walk is read-only and conservatively stale-safe)
+    /// - the AssumeUTXO background catch-up, for its writes to the *shared*
+    ///   block store — which is this chainstate's coin cache. It holds the
+    ///   lock only around that write, not across its own validation work,
+    ///   which touches a private store. See `SplitStore::block_store_lock`.
     ///
     /// Known unlocked mutators, deliberate and bounded: `backfill_chain_tx_counts`
     /// and `repair_block_index_holes` run at startup before P2P and RPC exist,
@@ -397,7 +401,7 @@ pub struct ChainState {
     /// racing cases it exists to prevent. Scoped to the primary chainstate;
     /// the AssumeUTXO background catch-up mutates a *separate* `ChainState`
     /// and neither needs nor touches this lock.
-    accept_lock: Mutex<()>,
+    accept_lock: std::sync::Arc<Mutex<()>>,
 }
 
 impl ChainState {
@@ -533,7 +537,7 @@ impl ChainState {
                     ),
                     background: RwLock::new(None),
                     signet_challenge: None,
-                    accept_lock: Mutex::new(()),
+                    accept_lock: std::sync::Arc::new(Mutex::new(())),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -640,7 +644,7 @@ impl ChainState {
             ),
             background: RwLock::new(None),
             signet_challenge: None,
-            accept_lock: Mutex::new(()),
+            accept_lock: std::sync::Arc::new(Mutex::new(())),
         })
     }
 
@@ -735,6 +739,10 @@ impl ChainState {
             target_utxo_hash,
             dbcache_mb,
             max_open_files,
+            // The background writes block-index rows into *this*
+            // chainstate's coin cache; it must not do so while a reorg here
+            // owns that cache. See `SplitStore::block_store_lock`.
+            Some(self.accept_lock.clone()),
         )?;
         // Persist the anchor identity so a restart before handoff can
         // re-attach the background (the primary tip may have advanced past
@@ -5468,7 +5476,7 @@ impl ChainState {
                         .get_block_index(&current_tip)
                         .map(|en| en.height)
                         .unwrap_or(tip_entry.height);
-                    self.abort_reorg(current_tip, old_height);
+                    self.abort_reorg(reorg_excl.as_ref(), current_tip, old_height);
                     return Err(e);
                 }
             };
@@ -5604,7 +5612,11 @@ impl ChainState {
                 // Atomic rollback (#262): drop the entire in-cache reorg
                 // delta and restore the tip to the pre-reorg checkpoint.
                 // Cannot fail — no block-body replay.
-                self.abort_reorg(disconnect_info.old_tip, disconnect_info.old_height);
+                self.abort_reorg(
+                    reorg_excl.as_ref(),
+                    disconnect_info.old_tip,
+                    disconnect_info.old_height,
+                );
                 return Err(e);
             }
 
@@ -5652,7 +5664,7 @@ impl ChainState {
                     error = %e,
                     "Reorg triggering block sits on an unconnected parent; discarding the cache delta and restoring the pre-reorg tip"
                 );
-                self.abort_reorg(pending.old_tip, pending.old_height);
+                self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
             }
             return Err(e);
         }
@@ -5695,7 +5707,7 @@ impl ChainState {
                         error = %e,
                         "Reorg triggering block validation failed; discarding the cache delta and restoring the pre-reorg tip"
                     );
-                    self.abort_reorg(pending.old_tip, pending.old_height);
+                    self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
                 }
                 return Err(e.into());
             }
@@ -5707,7 +5719,7 @@ impl ChainState {
                     error = %e,
                     "Reorg triggering block commit failed; discarding the cache delta and restoring the pre-reorg tip"
                 );
-                self.abort_reorg(pending.old_tip, pending.old_height);
+                self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
             }
             return Err(e.into());
         }
@@ -5917,8 +5929,30 @@ impl ChainState {
     /// dropped FRESH coins (a rollback reconnect that itself errored with
     /// "block data missing", leaving disconnected-but-FRESH coins elided)
     /// is structurally impossible here.
-    fn abort_reorg(&self, old_tip: BlockHash, old_height: u32) {
-        self.store.discard_uncommitted();
+    ///
+    /// `excl` is the reorg's flush exclusion, which is also its claim to be
+    /// the only thread mutating the coin cache. Discarding the cache is only
+    /// safe if that claim holds, so it is checked here rather than assumed;
+    /// see `fail_stop_on_unsafe_discard` for what happens when it does not.
+    /// The argument is an `Option` because the call sites hold the exclusion
+    /// in one, and losing it before an abort is itself a contract breach
+    /// worth catching rather than a case to paper over.
+    fn abort_reorg(
+        &self,
+        excl: Option<&crate::storage::coin_cache::FlushExclusion<'_>>,
+        old_tip: BlockHash,
+        old_height: u32,
+    ) {
+        let Some(excl) = excl else {
+            self.fail_stop_on_unsafe_discard(
+                "the reorg no longer holds the cache's flush exclusion",
+                old_tip,
+                old_height,
+            );
+        };
+        if let Err(refusal) = self.store.discard_uncommitted(excl) {
+            self.fail_stop_on_unsafe_discard(&refusal.to_string(), old_tip, old_height);
+        }
         // The reconnect loop stages each block's timestamp as it goes, so that
         // the next block up validates against the branch being reconnected
         // rather than the one being displaced. An abort makes those entries
@@ -5941,6 +5975,52 @@ impl ChainState {
         let mut tip = self.tip.write();
         tip.hash = old_tip;
         tip.height = old_height;
+    }
+
+    /// A reorg needs to roll back and the coin cache cannot be attributed to
+    /// it. Stop the process without writing anything.
+    ///
+    /// There is no safe continuation. Discarding would destroy whatever the
+    /// other writer committed — that is issue #567, and the whole reason this
+    /// check exists. Not discarding leaves the cache holding a half-applied
+    /// reorg mixed with someone else's blocks, under a tip that belongs to
+    /// neither; continuing from there writes that to disk at the next flush.
+    ///
+    /// So: abort. Nothing has been flushed since the reorg's checkpoint —
+    /// the exclusion held throughout is what guarantees that — so the disk
+    /// still holds the consistent pre-reorg chainstate, and `abort()` rather
+    /// than `exit()` is deliberate: no destructor runs, no shutdown flush
+    /// gets the chance to persist the poisoned cache. The node restarts onto
+    /// the checkpoint and redoes the work.
+    ///
+    /// Reaching this means a chain mutator is running without `accept_lock`.
+    /// The operator gets the audit command for the same reason the startup
+    /// ancestry check prints it: if this fires, the datadir deserves a look
+    /// even though it should be intact.
+    fn fail_stop_on_unsafe_discard(&self, reason: &str, old_tip: BlockHash, old_height: u32) -> ! {
+        tracing::error!(
+            reason,
+            restore_tip = %old_tip,
+            restore_height = old_height,
+            tip = %self.tip_hash(),
+            tip_height = self.tip_height(),
+            "FATAL: refusing to roll back a reorg over another thread's writes. \
+             Stopping the node without flushing; the on-disk chainstate is the \
+             pre-reorg checkpoint. Verify it with satd-chainstate-audit before \
+             restarting."
+        );
+        eprintln!(
+            "FATAL: refusing to roll back a reorg over another thread's writes \
+             ({reason}). Stopping without flushing — the on-disk chainstate is \
+             the last consistent checkpoint. Check it with satd-chainstate-audit."
+        );
+        // A test build panics instead, so the guard is reachable from a test
+        // (`abort_reorg_fail_stops_rather_than_discarding_a_foreign_write`)
+        // without taking the harness down with it.
+        #[cfg(test)]
+        panic!("fail_stop_on_unsafe_discard: {reason}");
+        #[cfg(not(test))]
+        std::process::abort()
     }
 
     /// Disconnect blocks from current tip down to the fork point (parent of the new chain).
@@ -6678,7 +6758,7 @@ impl ChainState {
         let disconnect_info = match self.perform_reorg(&fork_entry, current_tip) {
             Ok(info) => info,
             Err(e) => {
-                self.abort_reorg(current_tip, tip_entry.height);
+                self.abort_reorg(reorg_excl.as_ref(), current_tip, tip_entry.height);
                 return Err(e);
             }
         };
@@ -6758,7 +6838,11 @@ impl ChainState {
             Ok(())
         })();
         if let Err(e) = reconnect {
-            self.abort_reorg(disconnect_info.old_tip, disconnect_info.old_height);
+            self.abort_reorg(
+                reorg_excl.as_ref(),
+                disconnect_info.old_tip,
+                disconnect_info.old_height,
+            );
             return Err(e);
         }
 
@@ -7320,21 +7404,18 @@ pub(crate) mod tests {
     /// for precisely this reason, and a test that checks a hot node cannot see
     /// it either.
     ///
-    /// Safe as a pure cache drop only because the flush comes first: with the
-    /// dirty map and pending batch already drained, `discard_uncommitted` has
-    /// nothing to discard but the overlays.
     /// Flush, then drop the in-memory index overlays so subsequent reads go to
     /// the store.
     ///
-    /// Note what this does *not* do: `discard_uncommitted` deliberately keeps
-    /// the clean coin LRU, and `flush` promotes every coin it writes into that
-    /// LRU. So the height, txindex and chain_tx dimensions genuinely read cold
-    /// afterwards, and the coin dimension does not — `get_coin` still answers
-    /// from memory. A test relying on this to prove a coin reached disk is
-    /// proving nothing; it takes a fresh `ChainState` over the same datadir.
+    /// Note what this does *not* do: it deliberately keeps the clean coin LRU,
+    /// and `flush` promotes every coin it writes into that LRU. So the height,
+    /// txindex and chain_tx dimensions genuinely read cold afterwards, and the
+    /// coin dimension does not — `get_coin` still answers from memory. A test
+    /// relying on this to prove a coin reached disk is proving nothing; it
+    /// takes a fresh `ChainState` over the same datadir.
     fn flush_and_drop_caches(cs: &ChainState) {
         cs.store_ref().flush().expect("flush");
-        cs.store_ref().discard_uncommitted();
+        cs.store_ref().drop_read_overlays();
     }
 
     /// Force `height_hash[height] = hash`, simulating a polluted index. Used by
@@ -8481,6 +8562,91 @@ pub(crate) mod tests {
         assert!(cs.get_coin(&x).is_none());
         assert!(cs.get_coin(&y).is_none());
         assert_eq!(cs.tip_hash(), c2.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The message `fail_stop_on_unsafe_discard` panicked with in a test
+    /// build. Panics if the closure did not panic at all — "it stopped" is
+    /// not enough; the tests below assert *why* it stopped, so that a plain
+    /// `unwrap` somewhere on the path cannot pass for the guard.
+    fn fail_stop_reason(r: std::thread::Result<()>) -> String {
+        let payload = r.expect_err("expected a fail-stop, but the call returned");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with("fail_stop_on_unsafe_discard:"),
+            "panicked, but not through the fail-stop: {msg}"
+        );
+        msg
+    }
+
+    /// A reorg that cannot attribute the cache to itself stops the node
+    /// instead of rolling back over another thread's blocks.
+    ///
+    /// This is the last line of defence behind
+    /// `invalidateblock_serializes_with_a_concurrent_connector`: with the
+    /// lock in place the condition is unreachable, so the test constructs it
+    /// directly — take the exclusion, have another thread write, then abort.
+    /// If a future chain mutator is added without `accept_lock`, this is what
+    /// it hits: a stopped node with a consistent checkpoint on disk, rather
+    /// than the silent UTXO loss of #567. In a test build the fail-stop
+    /// panics rather than aborting the process.
+    #[test]
+    fn abort_reorg_fail_stops_rather_than_discarding_a_foreign_write() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        cs.flush_coin_cache().unwrap();
+
+        let panicked = {
+            let excl = cs.store_ref().lock_flush_exclusion();
+
+            // Someone else mutates the cache inside the reorg's window.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut b = crate::storage::StoreBatch::default();
+                    b.height_hash_puts.push((99, tip));
+                    cs.store.write_batch(b).unwrap();
+                });
+            });
+
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cs.abort_reorg(Some(&excl), tip, 3);
+            }))
+        };
+        assert!(
+            fail_stop_reason(panicked).contains("mutated the coin cache"),
+            "the abort must fail-stop on the foreign write, not discard"
+        );
+
+        // Nothing was discarded: the foreign write is still there, and so is
+        // the chain it was made against.
+        assert_eq!(cs.get_block_hash_by_height(99), Some(tip));
+        assert_eq!(cs.tip_hash(), tip);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Losing the flush exclusion before aborting is the same class of
+    /// breach: without it an external flush may already have persisted half
+    /// the reorg, and an in-memory discard cannot undo an on-disk write.
+    #[test]
+    fn abort_reorg_fail_stops_without_the_flush_exclusion() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cs.abort_reorg(None, tip, 3);
+        }));
+        assert!(
+            fail_stop_reason(panicked).contains("no longer holds the cache's flush exclusion"),
+            "an abort without the exclusion must fail-stop"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
