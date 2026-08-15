@@ -3,8 +3,9 @@
 //! Exposes three HTTP endpoints on a separate unauthenticated listener:
 //! - `GET /metrics`  — Prometheus text-format metrics (scrape target)
 //! - `GET /healthz`  — 200 if the process is up (Docker/k8s liveness)
-//! - `GET /readyz`   — 200 when chain is within READY_LAG_BLOCKS of known
-//!   headers tip, 503 otherwise (Docker/k8s readiness)
+//! - `GET /readyz`   — 200 when the chain is within READY_LAG_BLOCKS of the
+//!   known headers tip and the connector is making progress, 503 otherwise
+//!   (Docker/k8s readiness)
 //!
 //! The listener is intentionally unauthenticated: these are operator-only
 //! signals, and adding auth would break the Prometheus scrape and k8s probe
@@ -444,18 +445,49 @@ impl MetricsContext {
     }
 
     /// Render the `/readyz` decision: `Ok` if ready, `Err(reason)` otherwise.
+    ///
+    /// Note this is readiness, not liveness. `/healthz` stays a plain
+    /// process-is-up probe on purpose: a restart loop is a worse answer to a
+    /// wedged connector than a node that keeps running and says it is not
+    /// ready.
     pub fn is_ready(&self) -> Result<(), String> {
-        let tip = self.chain_state.tip_height();
-        let headers_tip = self.chain_state.headers_tip_height().max(tip);
-        let lag = headers_tip.saturating_sub(tip);
-        if lag > READY_LAG_BLOCKS {
-            Err(format!(
-                "chain lag {} blocks exceeds ready threshold {}",
-                lag, READY_LAG_BLOCKS
-            ))
-        } else {
-            Ok(())
-        }
+        readiness(
+            self.chain_state.warnings(),
+            self.chain_state.tip_height(),
+            self.chain_state.headers_tip_height(),
+        )
+    }
+}
+
+/// The `/readyz` decision, separated from the state it reads so it can be
+/// tested without standing up a live node.
+fn readiness(
+    warnings: &crate::warnings::NodeWarnings,
+    tip: u32,
+    headers_tip: u32,
+) -> Result<(), String> {
+    // A connector that has given up cannot extend the chain, and lag alone
+    // does not always catch that — a node wedged at its own tip has no lag to
+    // show, and one wedged mid-IBD stops advancing the headers tip too once
+    // its peers run out of new ones. On the node that produced #567 the
+    // condition stood for five and a half hours while every health surface
+    // said fine.
+    if warnings
+        .list()
+        .iter()
+        .any(|w| w.id == crate::warnings::CONNECT_PERSISTENT_FAILURE)
+    {
+        return Err("the block connector cannot make progress".to_string());
+    }
+    let headers_tip = headers_tip.max(tip);
+    let lag = headers_tip.saturating_sub(tip);
+    if lag > READY_LAG_BLOCKS {
+        Err(format!(
+            "chain lag {} blocks exceeds ready threshold {}",
+            lag, READY_LAG_BLOCKS
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -982,6 +1014,44 @@ mod tests {
         assert_eq!(escape_label("with \"quote\""), "with \\\"quote\\\"");
         assert_eq!(escape_label("back\\slash"), "back\\\\slash");
         assert_eq!(escape_label("line\nbreak"), "line\\nbreak");
+    }
+
+    /// A wedged connector must fail readiness even when the chain lag looks
+    /// fine. Lag was the only input, and the mainnet node behind #567 sat at
+    /// its own tip failing every connect for five and a half hours while
+    /// `/readyz` returned 200 throughout.
+    #[test]
+    fn a_wedged_connector_is_not_ready() {
+        let warnings = crate::warnings::NodeWarnings::new();
+        assert_eq!(readiness(&warnings, 100, 100), Ok(()));
+
+        warnings.record(
+            crate::warnings::CONNECT_PERSISTENT_FAILURE,
+            crate::warnings::Severity::Error,
+            "cannot connect block 101".to_string(),
+            serde_json::Value::Null,
+        );
+        let reason = readiness(&warnings, 100, 100).expect_err("not ready while wedged");
+        assert!(reason.contains("connector"), "reason was: {reason}");
+
+        // And recovers when the connector does.
+        warnings.clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
+        assert_eq!(readiness(&warnings, 100, 100), Ok(()));
+    }
+
+    /// An unrelated standing warning must not hold readiness down — a probe
+    /// that fails on anything in the registry is a probe operators turn off.
+    #[test]
+    fn an_unrelated_warning_does_not_affect_readiness() {
+        let warnings = crate::warnings::NodeWarnings::new();
+        warnings.record(
+            "storage.flush_coin_cache_failed",
+            crate::warnings::Severity::Error,
+            "transient".to_string(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(readiness(&warnings, 100, 100), Ok(()));
+        assert!(readiness(&warnings, 100, 100 + READY_LAG_BLOCKS + 1).is_err());
     }
 
     #[test]

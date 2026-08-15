@@ -115,6 +115,17 @@ pub enum ChainError {
     BlockNotFound,
     #[error("{0}")]
     InvalidArgument(String),
+    /// `invalidateblock`/`reconsiderblock` durably changed the block index but
+    /// could not re-activate a best chain afterwards. The two halves are
+    /// deliberately not atomic (see `invalidate_block`), so the caller has to
+    /// be told that the first half took effect — a bare connect error reads as
+    /// "nothing happened", which is how an operator ends up re-running the
+    /// command against a chain that has already been marked.
+    /// The remedy differs by call site (`invalidateblock` is undone by
+    /// `reconsiderblock`; a failed `reconsiderblock` is retried by running
+    /// it again), so the wrapped string carries it rather than this text.
+    #[error("block index updated, but re-activating the best chain failed: {0}")]
+    ReactivationFailed(String),
 }
 
 /// Outcome of [`ChainState::resume_pending_snapshot`] at startup.
@@ -5476,7 +5487,7 @@ impl ChainState {
                         .get_block_index(&current_tip)
                         .map(|en| en.height)
                         .unwrap_or(tip_entry.height);
-                    self.abort_reorg(reorg_excl.as_ref(), current_tip, old_height);
+                    self.abort_reorg(reorg_excl.as_ref(), current_tip, old_height, &e, None);
                     return Err(e);
                 }
             };
@@ -5493,6 +5504,11 @@ impl ChainState {
             let mut reconnected_hashes: Vec<BlockHash> = Vec::new();
             let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> = Vec::new();
 
+            // The block the reconnect loop was working on when it failed,
+            // for the abort log. Cleared at the top of every iteration so a
+            // failure before the block is identified reports "unknown"
+            // rather than the previous block's identity.
+            let mut side_failed_at: Option<(BlockHash, u32)> = None;
             let side_result: Result<(), ChainError> = (|| {
                 // Collect side-chain blocks fork+1..=prev, forward order.
                 let mut to_connect = Vec::new();
@@ -5510,15 +5526,22 @@ impl ChainState {
                     to_connect.reverse();
                 }
                 for side_hash in &to_connect {
+                    side_failed_at = None;
+                    // A hash the walk above just resolved has no entry now:
+                    // index corruption, not an unknown parent. Return the
+                    // `FlatFile` variant `get_block`'s index-first read used
+                    // to produce here — `BadPrevBlock` escapes `accept_block`
+                    // to P2P handlers that read it as "parent unknown, no
+                    // penalty", which this is not.
+                    let side_entry = self.store.get_block_index(side_hash).ok_or_else(|| {
+                        ChainError::FlatFile("block index entry missing for reorg connect".into())
+                    })?;
+                    side_failed_at = Some((*side_hash, side_entry.height));
                     let side_block = self
                         .get_block(side_hash)
                         .ok_or(ChainError::FlatFile(
                             "block data missing for reorg connect".to_string(),
                         ))?;
-                    let side_entry = self
-                        .store
-                        .get_block_index(side_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
                     let parent_entry = self
                         .store
                         .get_block_index(&side_entry.header.prev_blockhash)
@@ -5600,6 +5623,14 @@ impl ChainState {
                         hash = %side_hash,
                         "Reorg: block connected"
                     );
+                    // Forward progress the stall watchdog can see: a deep
+                    // reorg holds `accept_lock` for its whole run, parking
+                    // the connector (and any manager-loop mutator behind
+                    // it), which flattens both heartbeats. Without this, a
+                    // legitimate multi-minute reconnect reads as a wedge and
+                    // gets the node SIGTERM'd mid-reorg; with it, only a
+                    // reorg that stops making per-block progress does.
+                    self.bump_connect_heartbeat();
                 }
                 Ok(())
             })();
@@ -5616,6 +5647,8 @@ impl ChainState {
                     reorg_excl.as_ref(),
                     disconnect_info.old_tip,
                     disconnect_info.old_height,
+                    &e,
+                    side_failed_at,
                 );
                 return Err(e);
             }
@@ -5664,7 +5697,13 @@ impl ChainState {
                     error = %e,
                     "Reorg triggering block sits on an unconnected parent; discarding the cache delta and restoring the pre-reorg tip"
                 );
-                self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
+                self.abort_reorg(
+                    reorg_excl.as_ref(),
+                    pending.old_tip,
+                    pending.old_height,
+                    &e,
+                    Some((block_hash, new_height)),
+                );
             }
             return Err(e);
         }
@@ -5707,7 +5746,13 @@ impl ChainState {
                         error = %e,
                         "Reorg triggering block validation failed; discarding the cache delta and restoring the pre-reorg tip"
                     );
-                    self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
+                    self.abort_reorg(
+                        reorg_excl.as_ref(),
+                        pending.old_tip,
+                        pending.old_height,
+                        &e,
+                        Some((block_hash, new_height)),
+                    );
                 }
                 return Err(e.into());
             }
@@ -5719,7 +5764,13 @@ impl ChainState {
                     error = %e,
                     "Reorg triggering block commit failed; discarding the cache delta and restoring the pre-reorg tip"
                 );
-                self.abort_reorg(reorg_excl.as_ref(), pending.old_tip, pending.old_height);
+                self.abort_reorg(
+                    reorg_excl.as_ref(),
+                    pending.old_tip,
+                    pending.old_height,
+                    &e,
+                    Some((block_hash, new_height)),
+                );
             }
             return Err(e.into());
         }
@@ -5937,12 +5988,30 @@ impl ChainState {
     /// The argument is an `Option` because the call sites hold the exclusion
     /// in one, and losing it before an abort is itself a contract breach
     /// worth catching rather than a case to paper over.
+    ///
+    /// `cause` is what made the reorg fail and `failed_at` the block it failed
+    /// on, when the caller knows it. Both are logged: an aborted reorg used to
+    /// leave nothing behind at all, so the only evidence that a mainnet node
+    /// had rolled one back over eight committed blocks was the error string
+    /// the RPC caller happened to see (#567).
     fn abort_reorg(
         &self,
         excl: Option<&crate::storage::coin_cache::FlushExclusion<'_>>,
         old_tip: BlockHash,
         old_height: u32,
+        cause: &dyn std::fmt::Display,
+        failed_at: Option<(BlockHash, u32)>,
     ) {
+        tracing::error!(
+            error = %cause,
+            failed_block = failed_at.map(|(h, _)| h.to_string()),
+            failed_height = failed_at.map(|(_, h)| h),
+            abandoned_tip = %self.tip_hash(),
+            abandoned_height = self.tip_height(),
+            restore_tip = %old_tip,
+            restore_height = old_height,
+            "Reorg aborted; discarding the whole cache delta and restoring the pre-reorg tip"
+        );
         let Some(excl) = excl else {
             self.fail_stop_on_unsafe_discard(
                 "the reorg no longer holds the cache's flush exclusion",
@@ -6100,6 +6169,9 @@ impl ChainState {
             disconnected_txs_by_block.push(block_txs);
 
             disconnected_hashes.push(current);
+            // Disconnects are per-block reorg progress too — a deep
+            // disconnect leg can run for minutes before the first reconnect.
+            self.bump_connect_heartbeat();
             disconnected_with_height.push((current, entry.height));
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
@@ -6215,7 +6287,37 @@ impl ChainState {
         // the parent, or onto a competing side chain that now carries more
         // work. If `hash` was only on a side chain the active tip stays best
         // and this is a no-op.
-        self.activate_best_chain()
+        //
+        // A failure here is a *partial* success, and saying so is the point.
+        // The marks above are already durable and stay that way — that is
+        // Core's behaviour and this file's deliberate crash-ordering — so
+        // returning the bare connect error tells the operator the command
+        // failed when half of it did not. On the node that produced #567 the
+        // whole visible trace of a reorg that destroyed eight blocks was a
+        // one-line `bad-txns-inputs-missingorspent` from this call.
+        self.activate_best_chain().map_err(|e| {
+            tracing::error!(
+                %hash,
+                height = entry.height,
+                error = %e,
+                "invalidateblock: the branch is marked invalid, but re-activating \
+                 the best valid chain failed"
+            );
+            match e {
+                // A deliberate refusal with its own actionable message — the
+                // AssumeUTXO reorg-depth guard is the reachable case — keeps
+                // its variant (and its -8 at the RPC boundary) rather than
+                // being buried in a generic activation failure. The partial-
+                // success context still needs saying: the marks are durable.
+                ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
+                    "{msg} — the invalidation marks are in place; reconsiderblock undoes them"
+                )),
+                e => ChainError::ReactivationFailed(format!(
+                    "{e}. The node will retry activation as blocks arrive; \
+                     reconsiderblock undoes the invalidation."
+                )),
+            }
+        })
     }
 
     /// Clear the `Invalid` mark on `hash` and its descendants, then
@@ -6235,7 +6337,29 @@ impl ChainState {
         self.store.flush()?;
 
         self.clear_subtree_invalid(hash)?;
-        self.activate_best_chain()
+        // Same partial-success shape as `invalidate_block`: the marks are
+        // already cleared durably when activation fails.
+        self.activate_best_chain().map_err(|e| {
+            tracing::error!(
+                %hash,
+                error = %e,
+                "reconsiderblock: the invalid marks are cleared, but re-activating \
+                 the best valid chain failed"
+            );
+            match e {
+                // See `invalidate_block`: a deliberate refusal keeps its
+                // variant and RPC code, with the partial-success context
+                // appended. "Undo" here is meaningless (the marks are already
+                // cleared) — re-running is the retry.
+                ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
+                    "{msg} — the invalid marks remain cleared; re-run reconsiderblock to retry"
+                )),
+                e => ChainError::ReactivationFailed(format!(
+                    "{e}. The invalid marks remain cleared; re-run reconsiderblock \
+                     to retry activation."
+                )),
+            }
+        })
     }
 
     /// Self-heal an active tip that is durably marked `Invalid` — the state a
@@ -6753,6 +6877,23 @@ impl ChainState {
             )));
         }
 
+        // Announce the shape of the reorg before doing any of it. On the
+        // operator-driven paths this is the only line that says what was
+        // decided: `perform_reorg` logs each disconnect but nothing logs the
+        // target, so a reorg that failed mid-reconnect left no record of
+        // where it had been trying to go.
+        tracing::info!(
+            from = %current_tip,
+            from_height = tip_entry.height,
+            to = %target_hash,
+            to_height = target.height,
+            fork = %fork_hash,
+            fork_height = fork_entry.height,
+            disconnect = tip_entry.height - fork_entry.height,
+            reconnect = target.height - fork_entry.height,
+            "Reorg: activating a new best chain"
+        );
+
         // Atomic-reorg durable checkpoint (#262): flush the pre-reorg chain so
         // it is the exact rollback target, then hold the flush-exclusion for
         // the whole reorg so no external flush can persist a partial state.
@@ -6764,7 +6905,7 @@ impl ChainState {
         let disconnect_info = match self.perform_reorg(&fork_entry, current_tip) {
             Ok(info) => info,
             Err(e) => {
-                self.abort_reorg(reorg_excl.as_ref(), current_tip, tip_entry.height);
+                self.abort_reorg(reorg_excl.as_ref(), current_tip, tip_entry.height, &e, None);
                 return Err(e);
             }
         };
@@ -6774,6 +6915,10 @@ impl ChainState {
         // routed through `abort_reorg` rather than stranding a partial chain.
         let mut reconnected_hashes: Vec<BlockHash> = Vec::new();
         let mut reconnected_blocks: Vec<(bitcoin::Block, u32)> = Vec::new();
+        // See `side_failed_at` in `accept_block`: names the block the loop
+        // died on in the abort log, and is `None` when the loop failed before
+        // identifying one.
+        let mut reconnect_failed_at: Option<(BlockHash, u32)> = None;
         let reconnect: Result<(), ChainError> = (|| {
             let mut to_connect = Vec::new();
             let mut hash = target_hash;
@@ -6787,13 +6932,17 @@ impl ChainState {
             }
             to_connect.reverse();
             for h in &to_connect {
+                reconnect_failed_at = None;
+                // See the twin comment in `accept_block`'s side loop: a
+                // just-resolved hash with no entry is index corruption, and
+                // the error must keep `get_block`'s `FlatFile` shape.
+                let e = self.store.get_block_index(h).ok_or_else(|| {
+                    ChainError::FlatFile("block index entry missing for reorg connect".into())
+                })?;
+                reconnect_failed_at = Some((*h, e.height));
                 let block = self.get_block(h).ok_or(ChainError::FlatFile(
                     "block data missing for reorg connect".to_string(),
                 ))?;
-                let e = self
-                    .store
-                    .get_block_index(h)
-                    .ok_or(ChainError::BadPrevBlock)?;
                 let parent_entry = self
                     .store
                     .get_block_index(&e.header.prev_blockhash)
@@ -6840,6 +6989,11 @@ impl ChainState {
                 self.push_mtp_cache(e.height, block.header.time);
                 reconnected_hashes.push(*h);
                 reconnected_blocks.push((block, e.height));
+                tracing::info!(height = e.height, hash = %h, "Reorg: block connected");
+                // See the twin bump in `accept_block`'s side loop: per-block
+                // progress a deep reorg makes under `accept_lock` must reach
+                // the watchdog, or the reorg reads as a wedge.
+                self.bump_connect_heartbeat();
             }
             Ok(())
         })();
@@ -6848,6 +7002,8 @@ impl ChainState {
                 reorg_excl.as_ref(),
                 disconnect_info.old_tip,
                 disconnect_info.old_height,
+                &e,
+                reconnect_failed_at,
             );
             return Err(e);
         }
@@ -8590,6 +8746,73 @@ pub(crate) mod tests {
         msg
     }
 
+    /// `invalidateblock` half-succeeds by design, and must say so.
+    ///
+    /// The `Invalid` marks are persisted before the chain is re-activated, on
+    /// purpose: a crash between the two must not leave a truncated tip whose
+    /// disconnected block still reads `Valid`. So an activation failure means
+    /// the branch *is* invalidated and the tip is not where the operator
+    /// asked for it — two facts a bare connect error conveys neither of. On
+    /// the node behind #567 the whole visible trace of a reorg that destroyed
+    /// eight blocks was `bad-txns-inputs-missingorspent` on this call.
+    ///
+    /// Here the activation is made to fail by removing the replacement
+    /// branch's block data, which is what `reorg_to`'s reconnect loop reads.
+    #[test]
+    fn invalidateblock_reports_a_failed_reactivation_as_a_partial_success() {
+        let (cs, dir) = make_chain_state();
+        let base = build_and_connect_chain(&cs, 3);
+        let base_tip = base[2].block_hash();
+
+        // Two blocks on the active chain, to be invalidated at the first.
+        let a1 = build_test_block(base_tip, 4, 1_600_000_004);
+        cs.accept_block(&a1).unwrap();
+        let a2 = build_test_block(a1.block_hash(), 5, 1_600_000_005);
+        cs.accept_block(&a2).unwrap();
+
+        // A heavier competing branch, stored but not connected, that the
+        // re-activation will try and fail to connect: its index entry points
+        // at a flat-file offset holding nothing.
+        let b1 = build_test_block(base_tip, 4, 1_600_000_014);
+        cs.accept_header(&b1.header).unwrap();
+        cs.store_block(&b1).unwrap();
+        let b2 = build_test_block(b1.block_hash(), 5, 1_600_000_015);
+        cs.accept_header(&b2.header).unwrap();
+        cs.store_block(&b2).unwrap();
+        let b3 = build_test_block(b2.block_hash(), 6, 1_600_000_016);
+        cs.accept_header(&b3.header).unwrap();
+        cs.store_block(&b3).unwrap();
+
+        let mut broken = cs.get_block_index(&b1.block_hash()).unwrap();
+        broken.data_pos = u32::MAX / 2;
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.block_index_puts.push((b1.block_hash(), broken));
+        cs.store.write_batch(batch).unwrap();
+
+        let err = cs
+            .invalidate_block(a1.block_hash())
+            .expect_err("re-activation cannot read the replacement branch");
+        assert!(
+            matches!(err, ChainError::ReactivationFailed(_)),
+            "expected a partial-success error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("block index updated") && msg.contains("reconsiderblock"),
+            "the error must say the marks took effect and how to undo them: {msg}"
+        );
+
+        // And the marks did take effect, which is what makes the wording true.
+        for b in [&a1, &a2] {
+            assert_eq!(
+                cs.get_block_index(&b.block_hash()).unwrap().status,
+                BlockStatus::Invalid
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A reorg that cannot attribute the cache to itself stops the node
     /// instead of rolling back over another thread's blocks.
     ///
@@ -8637,7 +8860,7 @@ pub(crate) mod tests {
             });
 
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                cs.abort_reorg(Some(&excl), tip, 3);
+                cs.abort_reorg(Some(&excl), tip, 3, &"test", None);
             }))
         };
         assert!(
@@ -8663,7 +8886,7 @@ pub(crate) mod tests {
         let tip = blocks[2].block_hash();
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cs.abort_reorg(None, tip, 3);
+            cs.abort_reorg(None, tip, 3, &"test", None);
         }));
         assert!(
             fail_stop_reason(panicked).contains("no longer holds the cache's flush exclusion"),
@@ -11889,6 +12112,143 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Median-time-past recomputed straight from the active chain by parent
+    /// pointer, consulting nothing a reorg can leave stale. The oracle the MTP
+    /// regression tests check `get_median_time_past` against.
+    fn mtp_from_active_chain(cs: &ChainState, height: u32) -> u32 {
+        let start = height.saturating_sub(11);
+        let mut times = Vec::new();
+        let mut cursor = cs.tip_hash();
+        let mut h = cs.tip_height();
+        while h >= start {
+            let e = cs.get_block_index(&cursor).expect("ancestor entry");
+            if h < height {
+                times.push(e.header.time);
+            }
+            if h == 0 {
+                break;
+            }
+            cursor = e.header.prev_blockhash;
+            h -= 1;
+        }
+        times.sort_unstable();
+        times[times.len() / 2]
+    }
+
+    /// The same guarantee on the operator-driven reorg path.
+    ///
+    /// `median_time_past_is_not_served_from_the_displaced_branch` covers the
+    /// reorg inside `accept_block`, which a new block triggers. `reorg_to` is
+    /// the other one — `invalidateblock`, `reconsiderblock`, and startup
+    /// re-activation reach it directly — and it has its own reconnect loop
+    /// with its own timestamp staging. Both loops must leave the cache
+    /// describing the branch the node ended up on.
+    ///
+    /// The two branches here are timestamped ~28 hours apart, which is far
+    /// more than a median can absorb: if any lookup resolved to the branch
+    /// that lost, the assertion below could not pass by luck.
+    /// A deep reorg holds `accept_lock` end to end, flattening the
+    /// connector's normal heartbeat — so the reorg loops must bump it
+    /// themselves, or the stall watchdog reads a legitimate multi-minute
+    /// reorg as a wedge and SIGTERMs the node mid-reorg. Deleting the
+    /// `bump_connect_heartbeat` calls in the disconnect or reconnect loops
+    /// makes this fail.
+    #[test]
+    fn a_reorg_bumps_the_connect_heartbeat() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept trunk");
+        }
+        let fork_point = parent;
+
+        // Active branch A (2 blocks), replacement B (1 block, stored only).
+        let mut a_parent = fork_point;
+        let mut a_first = None;
+        for h in 4..=5u32 {
+            let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
+            a_parent = cs.accept_block(&b).expect("accept A");
+            a_first.get_or_insert(b.block_hash());
+        }
+        let b4 = build_test_block(fork_point, 4, 1_600_010_000);
+        cs.accept_header(&b4.header).unwrap();
+        cs.store_block(&b4).unwrap();
+
+        let before = cs.connect_heartbeat();
+        cs.invalidate_block(a_first.unwrap())
+            .expect("re-activation onto the replacement branch");
+        let after = cs.connect_heartbeat();
+        // 2 disconnects + 1 reconnect: at least 3 bumps.
+        assert!(
+            after >= before + 3,
+            "a reorg must register per-block progress with the watchdog \
+             (heartbeat went {before} -> {after}, expected +3 or more)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidateblock_leaves_median_time_past_on_the_branch_it_activated() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        for h in 1..=10u32 {
+            let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept trunk");
+        }
+        let fork_point = parent;
+
+        // The branch the operator will invalidate: the active chain, with
+        // timestamps a day ahead of the trunk.
+        let mut a_parent = fork_point;
+        let mut a_blocks = Vec::new();
+        for h in 11..=14u32 {
+            let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
+            a_parent = cs.accept_block(&b).expect("accept A");
+            a_blocks.push(b);
+        }
+        assert_eq!(cs.tip_height(), 14);
+
+        // The replacement: stored, shorter, and only becomes best once A is
+        // invalidated — so it is `reorg_to` that connects it, not accept_block.
+        let mut b_parent = fork_point;
+        for h in 11..=13u32 {
+            let b = build_test_block(b_parent, h, 1_600_010_000 + h * 600);
+            cs.accept_header(&b.header).unwrap();
+            cs.store_block(&b).unwrap();
+            b_parent = b.block_hash();
+        }
+
+        cs.invalidate_block(a_blocks[0].block_hash())
+            .expect("re-activation onto the replacement branch");
+        assert_eq!(cs.tip_hash(), b_parent, "the replacement is the active tip");
+        assert_eq!(cs.tip_height(), 13);
+
+        // Extend far enough that the cache covers a full window again — the
+        // stale entries only start winning once it does.
+        let mut parent = cs.tip_hash();
+        for h in 14..=24u32 {
+            let b = build_test_block(parent, h, 1_600_010_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept extension");
+        }
+
+        for height in 12..=25u32 {
+            assert_eq!(
+                cs.get_median_time_past(height),
+                mtp_from_active_chain(&cs, height),
+                "MTP at {height} must come from the branch invalidateblock \
+                 activated, not the one it displaced"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MTP gates BIP 113 locktimes and BIP 68 sequence locks, so a wrong
     /// median is a consensus fault, not a cosmetic one.
     ///
@@ -11942,32 +12302,10 @@ pub(crate) mod tests {
             parent = cs.accept_block(&b).expect("accept extension");
         }
 
-        // Recompute each MTP straight from the active chain, by parent pointer,
-        // consulting nothing a reorg can leave stale.
-        let mtp_from_chain = |cs: &ChainState, height: u32| -> u32 {
-            let start = height.saturating_sub(11);
-            let mut times = Vec::new();
-            let mut cursor = cs.tip_hash();
-            let mut h = cs.tip_height();
-            while h >= start {
-                let e = cs.get_block_index(&cursor).expect("ancestor entry");
-                if h < height {
-                    times.push(e.header.time);
-                }
-                if h == 0 {
-                    break;
-                }
-                cursor = e.header.prev_blockhash;
-                h -= 1;
-            }
-            times.sort_unstable();
-            times[times.len() / 2]
-        };
-
         for height in 15..=25u32 {
             assert_eq!(
                 cs.get_median_time_past(height),
-                mtp_from_chain(&cs, height),
+                mtp_from_active_chain(&cs, height),
                 "MTP at {height} must come from the active chain, not the branch it \
                  displaced (branch B times: {b_times:?})"
             );

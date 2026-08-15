@@ -3507,6 +3507,14 @@ impl PeerManager {
                 match chain_state.accept_block(&block) {
                     Ok(_) => {
                         chain_state.bump_connect_heartbeat();
+                        // A successful steady-state connect disproves "the
+                        // connector cannot make progress" no matter which
+                        // path raised it — without this, a warning recorded
+                        // by the (now torn-down) IBD connector would gate
+                        // `/readyz` forever on a healthy node.
+                        chain_state
+                            .warnings()
+                            .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                         fee_estimator.record_block(&fees);
                         mempool.remove_for_block(&block, chain_state.tip_height());
                         reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
@@ -3836,7 +3844,7 @@ impl PeerManager {
                         chain_state.bump_connect_heartbeat();
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
-                        chain_state.warnings().clear("connect.persistent_failure");
+                        chain_state.warnings().clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                         chain_state.warnings().clear("connect.retry");
                         // Update scheduler connect cursor
                         {
@@ -4014,6 +4022,18 @@ impl PeerManager {
                                 );
                                 // Resolve the retry warning — we are now
                                 // handling this via the reorg path, not looping.
+                                // And clear any standing persistent-failure
+                                // warning for the same reason: its only other
+                                // clear site is this connector's own success
+                                // branch, and this branch tears the connector
+                                // down. Left standing, the warning holds
+                                // `/readyz` at 503 forever on a node the
+                                // steady-state reorg path is about to heal —
+                                // the IBD connector never runs again once the
+                                // tip tracks the headers.
+                                chain_state
+                                    .warnings()
+                                    .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                                 chain_state.warnings().clear("connect.retry");
                                 *ibd.write() = None;
                                 break;
@@ -4033,7 +4053,7 @@ impl PeerManager {
                                 retry_count, e
                             );
                             chain_state.warnings().record(
-                                "connect.persistent_failure",
+                                crate::warnings::CONNECT_PERSISTENT_FAILURE,
                                 crate::warnings::Severity::Error,
                                 format!(
                                     "block {} ({}) failed to connect after {} retries: {}. \
