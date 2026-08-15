@@ -59,6 +59,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   `accept_lock`, and every chain mutator refuses with
   `SnapshotLoadInProgress` for the load's duration; the IBD connector parks
   quietly instead of counting the refusal against its retry budget.
+- Fixed: a failed UTXO-cache flush destroyed the in-memory delta. The flush
+  drained the dirty coins, the buffered index rows and the pending tip to build
+  its batch before handing it to the backing store, so any write error — a full
+  disk being the obvious one — silently discarded a whole flush window and the
+  node continued as if it had been written. The batch is now handed back on
+  failure and the cache is restored to exactly its pre-flush state, with the
+  next flush writing the complete delta. On an AssumeUTXO background flush,
+  where the batch spans the shared block store and the private coins store, a
+  coins-side failure now hands back exactly the unapplied coins half — the
+  already-durable block rows are not replayed, and the delta is no longer
+  written off as unrecoverable.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

@@ -8,7 +8,7 @@ use crate::index::filter::FilterKey;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
-use crate::storage::{Store, StoreBatch, StoreError};
+use crate::storage::{Store, StoreBatch, StoreError, WriteMode};
 use node_index::SpendingRef;
 
 /// In-memory storage backend for testing.
@@ -143,6 +143,18 @@ impl Store for InMemoryStore {
     fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
         *self.chain_tx_backfill_complete.write() = true;
         Ok(())
+    }
+
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        // Infallible: every operation below is a map insert or removal, so
+        // the error arm is unreachable and there is never a batch to hand
+        // back. Written this way rather than `unreachable!()` so a future
+        // fallible operation degrades to "cannot restore" rather than a panic.
+        self.write_batch_mode(batch, mode).map_err(|e| (None, e))
     }
 
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {

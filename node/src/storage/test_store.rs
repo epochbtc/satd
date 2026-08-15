@@ -44,6 +44,7 @@ pub(crate) struct StoreControls {
     txindex: Arc<AtomicBool>,
     txindex_complete: Arc<AtomicBool>,
     coin_gate: Arc<std::sync::Mutex<Option<ArmedCoinGate>>>,
+    fail_next_write: Arc<AtomicBool>,
 }
 
 /// A one-shot rendezvous armed on a specific outpoint: the first coin read
@@ -115,6 +116,18 @@ impl StoreControls {
             release: release_tx,
         }
     }
+
+    /// Make the next batch write fail, once, standing in for a transient
+    /// backing-store fault (ENOSPC, an IO error). One-shot so a test can arm
+    /// it, observe the failure, and then let the retry through without
+    /// racing a second disarm.
+    ///
+    /// The write is refused before anything is applied, so the store is left
+    /// exactly as it was — which is what the real backends do too, RocksDB
+    /// applying a `WriteBatch` atomically.
+    pub(crate) fn fail_next_write(&self) {
+        self.fail_next_write.store(true, Ordering::SeqCst);
+    }
 }
 
 /// An [`InMemoryStore`] whose failure modes and index configuration can be set
@@ -152,6 +165,7 @@ impl ControllableStore {
                 txindex: Arc::new(AtomicBool::new(true)),
                 txindex_complete: Arc::new(AtomicBool::new(true)),
                 coin_gate: Arc::new(std::sync::Mutex::new(None)),
+                fail_next_write: Arc::new(AtomicBool::new(false)),
             },
         }
     }
@@ -223,7 +237,24 @@ impl Store for ControllableStore {
         self.inner.mark_chain_tx_backfill_complete()
     }
     fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        self.inner.write_batch(batch)
+        self.write_batch_recoverable(batch, crate::storage::WriteMode::Normal)
+            .map_err(|(_, e)| e)
+    }
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: crate::storage::WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        if self.controls.fail_next_write.swap(false, Ordering::SeqCst) {
+            // Refused before anything is applied, so the batch comes back
+            // whole — the contract the real backends meet by writing
+            // atomically.
+            return Err((
+                Some(Box::new(batch)),
+                StoreError::Database("injected write fault".into()),
+            ));
+        }
+        self.inner.write_batch_recoverable(batch, mode)
     }
     fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
         self.inner.get_undo(hash)

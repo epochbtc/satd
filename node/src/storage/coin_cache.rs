@@ -485,7 +485,23 @@ impl CoinCache {
                 ?mode,
                 "Flushing write cache to disk"
             );
-            self.inner.write_batch_mode(batch, mode)?;
+            if let Err((returned, e)) = self.inner.write_batch_recoverable(batch, mode) {
+                match returned {
+                    Some(batch) => self.restore_after_failed_flush(*batch),
+                    // The inner store cannot say what it applied, so replaying
+                    // could double-apply. Nothing to do but say so: the delta
+                    // is gone and the caller's error is the only signal.
+                    None => tracing::error!(
+                        error = %e,
+                        coin_puts = puts,
+                        coin_removes = removes,
+                        "Flush failed and the backing store could not return the \
+                         batch; the in-memory delta is lost and this chainstate \
+                         must be rebuilt"
+                    ),
+                }
+                return Err(e);
+            }
         }
 
         // Move flushed coins to clean LRU (cache warming)
@@ -498,6 +514,100 @@ impl CoinCache {
 
         self.flush_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Put back what [`Self::flush_inner`] drained to build a batch the
+    /// backing store then refused to write.
+    ///
+    /// `flush_inner` empties the dirty map, takes the buffered non-coin rows
+    /// and the pending tip, and zeroes the counters *before* the inner write,
+    /// so that readers are not held behind a multi-second RocksDB call. That
+    /// is fine when the write succeeds and silent data loss when it does not:
+    /// a transient ENOSPC or I/O error would discard an entire flush window's
+    /// UTXO delta — the shape of #567 with no reorg involved.
+    ///
+    /// Two deliberate imprecisions, both safe:
+    ///
+    /// - Restored coins come back with `fresh: false` regardless of what they
+    ///   were. `fresh` means "absent from the backing store", which licenses
+    ///   eliding a later spend; after a failed write that is exactly what we
+    ///   can no longer be sure of for anything in the batch, and `false` is
+    ///   the conservative direction. The cost is that a later spend of such a
+    ///   coin emits a real remove for a key the store may not hold — a RocksDB
+    ///   delete of a missing key, which is a no-op.
+    /// - Coins created *and* spent inside the failed window were elided from
+    ///   the batch entirely, so they are not restored, and that is correct:
+    ///   they have no row in the backing store (the write failed, and it would
+    ///   not have written them anyway), none in `clean` (`write_batch_mode`
+    ///   pops every outpoint it touches), and none in `dirty`. Every read
+    ///   misses, which is the truth — the coin was created and spent. Their
+    ///   contribution to the counters is likewise zero, restored or not.
+    ///
+    /// Entries written by another thread between the drain and here win:
+    /// their value is newer. The counters are additive rather than restored
+    /// wholesale for the same reason.
+    fn restore_after_failed_flush(&self, mut batch: StoreBatch) {
+        let coin_puts = std::mem::take(&mut batch.coin_puts);
+        let coin_removes = std::mem::take(&mut batch.coin_removes);
+        let tip = batch.tip.take();
+
+        // `dirty_count` mirrors the map's population, so only ops actually
+        // inserted may count — an entry re-dirtied since the drain was
+        // already counted by its newer writer, and adding it again drifts
+        // the gauge high, triggering premature flushes. The value deltas
+        // below are different: they are per-op linear sums, correct to add
+        // unconditionally even on a collision (the newer writer's delta and
+        // this op's delta both describe real not-yet-on-disk movement).
+        let mut restored = 0u32;
+        let mut count_delta = 0i64;
+        let mut amount_delta = 0i64;
+        {
+            use std::collections::hash_map::Entry;
+            let mut dirty = self.dirty.write();
+            for (outpoint, coin) in coin_puts {
+                count_delta += 1;
+                amount_delta += coin.amount as i64;
+                if let Entry::Vacant(slot) = dirty.entry(outpoint) {
+                    slot.insert(DirtyEntry::Present { coin, fresh: false });
+                    restored += 1;
+                }
+            }
+            for (outpoint, amount, height) in coin_removes {
+                count_delta -= 1;
+                amount_delta -= amount as i64;
+                if let Entry::Vacant(slot) = dirty.entry(outpoint) {
+                    slot.insert(DirtyEntry::Spent {
+                        amount,
+                        height,
+                        fresh: false,
+                    });
+                    restored += 1;
+                }
+            }
+        }
+        self.dirty_count.fetch_add(restored, Ordering::Relaxed);
+        self.count_delta.fetch_add(count_delta, Ordering::Relaxed);
+        self.amount_delta.fetch_add(amount_delta, Ordering::Relaxed);
+
+        if let Some(tip) = tip {
+            let mut pending = self.pending_tip.lock();
+            if pending.is_none() {
+                *pending = Some(tip);
+            }
+        }
+
+        // Non-coin rows go back into the pending batch *underneath* anything
+        // buffered since the drain, so a newer write still wins.
+        let mut pending = self.pending_batch.lock();
+        let newer = std::mem::take(&mut *pending);
+        batch.merge(newer);
+        *pending = batch;
+
+        tracing::error!(
+            restored_coins = restored,
+            "Flush to the backing store failed; the in-memory delta has been \
+             restored and will be retried on the next flush"
+        );
     }
 
     /// Number of dirty entries pending flush.
@@ -640,66 +750,30 @@ impl CoinCache {
     }
 }
 
-impl Store for CoinCache {
-    fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
-        // 1. Check dirty map
-        {
-            let dirty = self.dirty.read();
-            if let Some(entry) = dirty.get(outpoint) {
-                return match entry {
-                    DirtyEntry::Present { coin, .. } => Some(coin.clone()),
-                    DirtyEntry::Spent { .. } => None,
-                };
-            }
-        }
-
-        // 2. Check clean LRU
-        {
-            let mut clean = self.clean.lock();
-            if let Some(coin) = clean.get(outpoint) {
-                return Some(coin.clone());
-            }
-        }
-
-        // 3. Cache miss — read from backing store, populate LRU (auto-evicts if full)
-        let coin = self.inner.get_coin(outpoint)?;
-        self.clean.lock().put(*outpoint, coin.clone());
-        Some(coin)
-    }
-
-    fn has_coin(&self, outpoint: &OutPoint) -> bool {
-        {
-            let dirty = self.dirty.read();
-            if let Some(entry) = dirty.get(outpoint) {
-                return matches!(entry, DirtyEntry::Present { .. });
-            }
-        }
-        {
-            let mut clean = self.clean.lock();
-            if clean.get(outpoint).is_some() {
-                return true;
-            }
-        }
-        self.inner.has_coin(outpoint)
-    }
-
-    fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        // Use the cache's currently-configured mode; the explicit-mode
-        // path runs through `write_batch_mode` instead.
-        self.write_batch_mode(batch, self.current_write_mode())
-    }
-
-    fn write_batch_mode(&self, mut batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
-        // Every chainstate mutation funnels through here (`write_batch`
-        // delegates), so this is the one place that can notice a writer
-        // trespassing on a reorg's exclusive window. But only a batch that
-        // touches the *discardable delta* — coins staged into the dirty
-        // map, a buffered tip — counts as trespassing. A coin-free,
-        // tip-less batch takes the pass-through branch below, straight
-        // into the inner store, where `discard_uncommitted` cannot touch
-        // it: an index backfill or a prune running beside a reorg is not a
-        // hole in the reorg's rollback, and flagging it would turn a safe
-        // discard into a spurious process fail-stop.
+impl CoinCache {
+    /// Absorb a batch into the cache, forwarding to the inner store only
+    /// what does not belong to a reorg's retractable state.
+    ///
+    /// The recoverable form is the primitive because the only failure point —
+    /// the pass-through forward below — can hand its rows back, and a caller
+    /// that drained state to build the batch needs them. See
+    /// `Store::write_batch_recoverable`.
+    fn absorb_batch(
+        &self,
+        mut batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        // Every chainstate mutation funnels through here — `write_batch`,
+        // `write_batch_mode` and `write_batch_recoverable` all delegate to
+        // this one function — so this is the one place that can notice a
+        // writer trespassing on a reorg's exclusive window. But only a batch
+        // that touches the *discardable delta* — coins staged into the dirty
+        // map, a buffered tip — counts as trespassing. A coin-free, tip-less
+        // batch takes the pass-through branch below, straight into the inner
+        // store, where `discard_uncommitted` cannot touch it: an index
+        // backfill or a prune running beside a reorg is not a hole in the
+        // reorg's rollback, and flagging it would turn a safe discard into a
+        // spurious process fail-stop.
         let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 || batch.tip.is_some() {
             self.note_mutation();
@@ -974,7 +1048,7 @@ impl Store for CoinCache {
                         .block_index_puts
                         .retain(|(h, _)| !superseded.contains(h));
                 }
-                self.inner.write_batch_mode(pass_through, mode)?;
+                self.inner.write_batch_recoverable(pass_through, mode)?;
             } else {
                 let mut pending = self.pending_batch.lock();
                 pending.block_index_puts.extend(batch.block_index_puts);
@@ -1018,6 +1092,76 @@ impl Store for CoinCache {
         }
 
         Ok(())
+    }
+}
+
+impl Store for CoinCache {
+    fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        // 1. Check dirty map
+        {
+            let dirty = self.dirty.read();
+            if let Some(entry) = dirty.get(outpoint) {
+                return match entry {
+                    DirtyEntry::Present { coin, .. } => Some(coin.clone()),
+                    DirtyEntry::Spent { .. } => None,
+                };
+            }
+        }
+
+        // 2. Check clean LRU
+        {
+            let mut clean = self.clean.lock();
+            if let Some(coin) = clean.get(outpoint) {
+                return Some(coin.clone());
+            }
+        }
+
+        // 3. Cache miss — read from backing store, populate LRU (auto-evicts if full)
+        let coin = self.inner.get_coin(outpoint)?;
+        self.clean.lock().put(*outpoint, coin.clone());
+        Some(coin)
+    }
+
+    fn has_coin(&self, outpoint: &OutPoint) -> bool {
+        {
+            let dirty = self.dirty.read();
+            if let Some(entry) = dirty.get(outpoint) {
+                return matches!(entry, DirtyEntry::Present { .. });
+            }
+        }
+        {
+            let mut clean = self.clean.lock();
+            if clean.get(outpoint).is_some() {
+                return true;
+            }
+        }
+        self.inner.has_coin(outpoint)
+    }
+
+    fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+        // Use the cache's currently-configured mode; the explicit-mode
+        // path runs through `write_batch_mode` instead.
+        self.write_batch_mode(batch, self.current_write_mode())
+    }
+
+    fn write_batch_mode(&self, batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
+        self.absorb_batch(batch, mode).map_err(|(_, e)| e)
+    }
+
+    /// Layered-store caveat (see the trait doc): on a pass-through failure
+    /// the returned batch is the *filtered pass-through remainder*, not the
+    /// caller's original — coins and the tip were already absorbed into the
+    /// cache (where they are safe: the failure did not touch them), overlay
+    /// LRUs were updated, dominated entries were filtered out, and
+    /// superseded pending rows were cleared. Replaying the returned batch
+    /// restores the correct final state; comparing it to the input does
+    /// not.
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+        self.absorb_batch(batch, mode)
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {
@@ -3181,6 +3325,208 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // flush failure atomicity
+    // ---------------------------------------------------------------
+
+    /// A flush that the backing store refuses must lose nothing.
+    ///
+    /// `flush_inner` drains the dirty map, takes the buffered non-coin rows
+    /// and the pending tip, and zeroes the counters before calling the inner
+    /// store, so readers are not held behind a multi-second RocksDB write.
+    /// That made a transient write fault — ENOSPC, an IO error — destroy the
+    /// whole flush window's delta: the same silent UTXO loss as #567 with no
+    /// reorg involved, and with the node carrying on as if nothing had
+    /// happened.
+    ///
+    /// Every read must answer as it did before the attempt, and the retry
+    /// must write the complete delta.
+    #[test]
+    fn a_failed_flush_leaves_the_cache_exactly_as_it_was() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        // Committed baseline: X on disk.
+        let x = make_outpoint(0xF0, 0);
+        let mut base = StoreBatch::default();
+        base.coin_puts.push((x, make_coin(5_000, 1)));
+        base.tip = Some(make_block_hash(0x01));
+        cache.write_batch(base).unwrap();
+        cache.flush().unwrap();
+        let base_count = cache.coin_count();
+        let base_amount = cache.coin_total_amount();
+
+        // An unflushed window: create Y, spend X, create and spend Z (the
+        // FRESH-elision case), plus non-coin rows and a new tip.
+        let y = make_outpoint(0xF1, 0);
+        let z = make_outpoint(0xF2, 0);
+        let block = make_block_hash(0x02);
+        let mut delta = StoreBatch::default();
+        delta.coin_puts.push((y, make_coin(7_000, 2)));
+        delta.coin_puts.push((z, make_coin(1_000, 2)));
+        delta.coin_removes.push((x, 5_000, 1));
+        delta.block_index_puts.push((block, make_test_entry(2)));
+        delta.height_hash_puts.push((2, block));
+        delta.undo_puts.push((block, UndoData::default()));
+        delta.chain_tx_puts.push((block, 42));
+        delta.tip = Some(block);
+        cache.write_batch(delta).unwrap();
+        let mut spend_z = StoreBatch::default();
+        spend_z.coin_removes.push((z, 1_000, 2));
+        cache.write_batch(spend_z).unwrap();
+
+        let expect_cache_state = |cache: &CoinCache, when: &str| {
+            assert!(cache.get_coin(&y).is_some(), "Y unspent {when}");
+            assert!(cache.get_coin(&x).is_none(), "X spent {when}");
+            assert!(cache.get_coin(&z).is_none(), "Z created and spent {when}");
+            assert_eq!(cache.get_tip(), Some(block), "tip {when}");
+            assert!(cache.get_block_index(&block).is_some(), "index row {when}");
+            assert_eq!(cache.get_block_hash_by_height(2), Some(block), "height row {when}");
+            assert!(cache.get_undo(&block).is_some(), "undo {when}");
+            assert_eq!(cache.get_cumulative_tx_count(&block), Some(42), "chain_tx {when}");
+            assert_eq!(cache.coin_count(), base_count, "coin_count {when}");
+            assert_eq!(
+                cache.coin_total_amount(),
+                base_amount - 5_000 + 7_000,
+                "total amount {when}"
+            );
+        };
+        expect_cache_state(&cache, "before the flush");
+
+        controls.fail_next_write();
+        let err = cache.flush().expect_err("the injected fault must surface");
+        assert!(err.to_string().contains("injected write fault"), "{err}");
+
+        expect_cache_state(&cache, "after the failed flush");
+        assert!(
+            cache.dirty_count() > 0,
+            "the delta is still pending, not silently dropped"
+        );
+
+        // The retry writes everything, and the state survives being read cold.
+        cache.flush().expect("retry succeeds");
+        expect_cache_state(&cache, "after the successful retry");
+        // Drop the read-through overlays so the checks below hit the store.
+        // Safe as a pure overlay drop because the flush above already drained
+        // the dirty map and pending batch. The exclusion is taken here purely
+        // to satisfy the discard's caller contract; no foreign write can have
+        // landed inside a window this test opens and closes in one statement.
+        let excl = cache.lock_flush_exclusion();
+        assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
+        drop(excl);
+        assert!(cache.get_block_index(&block).is_some(), "index row reached disk");
+        assert_eq!(cache.get_block_hash_by_height(2), Some(block));
+        assert!(cache.get_undo(&block).is_some());
+        assert_eq!(cache.get_cumulative_tx_count(&block), Some(42));
+    }
+
+    /// The restore must not overwrite a write that arrived while the failed
+    /// flush was in flight — that write is newer, and the whole reason the
+    /// dirty lock is dropped before the inner call is to let it happen.
+    #[test]
+    fn a_failed_flush_does_not_clobber_writes_made_since_the_drain() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let controls = store.controls();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let y = make_outpoint(0xF3, 0);
+        let mut delta = StoreBatch::default();
+        delta.coin_puts.push((y, make_coin(7_000, 2)));
+        cache.write_batch(delta).unwrap();
+
+        // Simulate the interleaving directly: the batch the flush drained is
+        // handed back after a newer spend of the same coin has landed.
+        let mut drained = StoreBatch::default();
+        drained.coin_puts.push((y, make_coin(7_000, 2)));
+        let mut spend = StoreBatch::default();
+        spend.coin_removes.push((y, 7_000, 2));
+        cache.write_batch(spend).unwrap();
+        let gauge_before = cache.dirty_count();
+        cache.restore_after_failed_flush(drained);
+
+        assert!(
+            cache.get_coin(&y).is_none(),
+            "the newer spend wins over the restored create"
+        );
+        // The restored put collided with the newer spend's entry and was not
+        // inserted, so it must not move the population gauge either — an
+        // unconditional add here drifts it high and triggers premature
+        // flushes. (The gauge itself counts absorb ops, not map entries, so
+        // only the delta across the restore is meaningful.)
+        assert_eq!(
+            cache.dirty_count(),
+            gauge_before,
+            "a fully-colliding restore must leave dirty_count unchanged"
+        );
+        let _ = controls;
+    }
+
+    /// Pins the load-bearing merge polarity in `restore_after_failed_flush`:
+    /// the restored (older) batch must sit *under* rows buffered since the
+    /// drain, and the pending tip must keep its newer value. Reversing
+    /// either — `newer.merge(older)`, or an unconditional pending-tip
+    /// overwrite — resurrects stale height/index rows on the next flush,
+    /// the #564 shape, and this test fails.
+    #[test]
+    fn a_restored_batch_sits_under_newer_noncoin_rows_not_over_them() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let hash_a = make_block_hash(0xA1);
+        let hash_b = make_block_hash(0xB1);
+        let hash_c = make_block_hash(0xC1);
+        let tip_new = make_block_hash(0xEE);
+        let tip_old = make_block_hash(0xDD);
+
+        // Newer state, written "since the drain": height 2 -> B, height 3 -> C,
+        // and a new tip. The coin makes the batch buffer (coin-free batches
+        // pass through and would not model the pending-batch collision).
+        let mut newer = StoreBatch::default();
+        newer.coin_puts.push((make_outpoint(0xF4, 0), make_coin(1_000, 2)));
+        newer.height_hash_puts.push((2, hash_b));
+        newer.height_hash_puts.push((3, hash_c));
+        newer.tip = Some(tip_new);
+        cache.write_batch(newer).unwrap();
+
+        // The drained (older) batch handed back by a failed flush: a stale
+        // height 2 -> A put, a stale remove of height 3, and the old tip.
+        let mut older = StoreBatch::default();
+        older.height_hash_puts.push((2, hash_a));
+        older.height_hash_removes.push(3);
+        older.tip = Some(tip_old);
+        cache.restore_after_failed_flush(older);
+
+        // Newer values win immediately...
+        assert_eq!(cache.get_block_hash_by_height(2), Some(hash_b));
+        assert_eq!(cache.get_tip(), Some(tip_new));
+
+        // ...and, decisively, in what the next flush writes to the store.
+        cache.flush().unwrap();
+        // Pure overlay drop after a full flush; see the note on the same
+        // pattern above for why an exclusion is taken around it.
+        let excl = cache.lock_flush_exclusion();
+        assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
+        drop(excl);
+        assert_eq!(
+            cache.get_block_hash_by_height(2),
+            Some(hash_b),
+            "the newer height row must reach the store, not the restored stale one"
+        );
+        assert_eq!(
+            cache.get_block_hash_by_height(3),
+            Some(hash_c),
+            "the newer put must survive the restored stale remove"
+        );
+        assert_eq!(cache.get_tip(), Some(tip_new), "the newer tip must win");
+    }
+
+    // ---------------------------------------------------------------
     // discard_uncommitted: the atomic-reorg rollback primitive (#262)
     // ---------------------------------------------------------------
     #[test]
@@ -3383,6 +3729,47 @@ mod tests {
             cache.discard_uncommitted(&excl),
             Err(DiscardRefused::ForeignWrite),
             "a foreign tip write is discardable state and must be flagged"
+        );
+    }
+
+    /// `write_batch_recoverable` is a second public door into the cache, and
+    /// it must be as guarded as `write_batch`. Both delegate to
+    /// `absorb_batch`, which is where the flag is raised — so this is a
+    /// regression pin on that placement: move the `note_mutation` gate up
+    /// into `write_batch_mode` (where it originally lived, before the
+    /// recoverable path existed) and a foreign write arriving through the
+    /// recoverable door becomes invisible to the discard, which is the
+    /// silent-destruction shape the guard exists to stop.
+    #[test]
+    fn a_foreign_recoverable_write_trips_the_discard_guard() {
+        let cache = make_cache(10);
+
+        // A reorg takes the exclusion and stages its own delta.
+        let excl = cache.lock_flush_exclusion();
+        let mut delta = StoreBatch::default();
+        delta
+            .coin_puts
+            .push((make_outpoint(0xD9, 0), make_coin(7_000, 3)));
+        cache.write_batch(delta).unwrap();
+
+        // Another thread writes discardable state through the *recoverable*
+        // door — the door `SplitStore` and the flush-restore path use.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut b = StoreBatch::default();
+                b.coin_puts
+                    .push((make_outpoint(0xD9, 1), make_coin(8_000, 3)));
+                cache
+                    .write_batch_recoverable(b, WriteMode::Normal)
+                    .map_err(|(_, e)| e)
+                    .expect("the foreign write itself succeeds");
+            });
+        });
+
+        assert_eq!(
+            cache.discard_uncommitted(&excl),
+            Err(DiscardRefused::ForeignWrite),
+            "a foreign write through write_batch_recoverable must be flagged"
         );
     }
 

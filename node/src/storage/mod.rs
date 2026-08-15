@@ -477,6 +477,43 @@ pub trait Store: Send + Sync {
     fn write_batch_mode(&self, batch: StoreBatch, _mode: WriteMode) -> Result<(), StoreError> {
         self.write_batch(batch)
     }
+    /// Write a batch, handing it back if the write fails.
+    ///
+    /// `write_batch`'s contract says nothing about the batch on error, and
+    /// every implementation consumes it. That is fine for a caller that still
+    /// owns the state the batch describes, and wrong for `CoinCache::flush`,
+    /// which drains its dirty map, its buffered non-coin rows and its pending
+    /// tip to *build* one: a transient write error there destroys the whole
+    /// delta with nothing left to retry from. This is the variant it uses.
+    ///
+    /// On failure, `Err((Some(returned), e))` hands back the **unapplied
+    /// remainder**: replaying `returned` (plus anything written since)
+    /// produces the correct final state. For a single-store backend that is
+    /// the whole batch, untouched — the write either landed atomically or
+    /// not at all. A layered store may return less than it was given when
+    /// part of the batch *did* land durably and must not be replayed:
+    /// `SplitStore` returns only the coins half when its block half is
+    /// already in, and `CoinCache` absorbs what it buffers before passing
+    /// the rest through, so its returned batch is the filtered pass-through
+    /// remainder, not the caller's original. Callers restore state from the
+    /// returned batch; they must not assume it is byte-identical to what
+    /// they passed in.
+    ///
+    /// `Err((None, e))` means the write may be **partially applied** in a
+    /// way that cannot be described for replay, and nothing may be
+    /// restored. The batch is boxed so the error variant stays small on the
+    /// success path, which is every call but the failing one.
+    ///
+    /// Deliberately without a default implementation. A default would have to
+    /// either consume the batch (turning every non-overriding store's caller
+    /// restore path into a silent no-op — the exact shape of bug this method
+    /// exists to prevent) or clone it (a per-flush copy of the UTXO delta).
+    /// Neither is a reasonable thing to inherit by omission.
+    fn write_batch_recoverable(
+        &self,
+        batch: StoreBatch,
+        mode: WriteMode,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)>;
     /// Force any in-memory state to durable storage. Used after a run of
     /// `BulkLoad` writes to ensure crash recovery is bounded.
     /// Default: no-op (in-memory or always-synchronous backends).
