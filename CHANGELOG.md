@@ -65,7 +65,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   disk being the obvious one — silently discarded a whole flush window and the
   node continued as if it had been written. The batch is now handed back on
   failure and the cache is restored to exactly its pre-flush state, with the
-  next flush writing the complete delta.
+  next flush writing the complete delta. On an AssumeUTXO background flush,
+  where the batch spans the shared block store and the private coins store, a
+  coins-side failure now hands back exactly the unapplied coins half — the
+  already-durable block rows are not replayed, and the delta is no longer
+  written off as unrecoverable.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

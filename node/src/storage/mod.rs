@@ -486,14 +486,23 @@ pub trait Store: Send + Sync {
     /// tip to *build* one: a transient write error there destroys the whole
     /// delta with nothing left to retry from. This is the variant it uses.
     ///
-    /// Implementations must not consume any part of `batch` unless the write
-    /// succeeds — in practice none of them need to; a batch is read from and
-    /// serialized out of, not moved from.
+    /// On failure, `Err((Some(returned), e))` hands back the **unapplied
+    /// remainder**: replaying `returned` (plus anything written since)
+    /// produces the correct final state. For a single-store backend that is
+    /// the whole batch, untouched — the write either landed atomically or
+    /// not at all. A layered store may return less than it was given when
+    /// part of the batch *did* land durably and must not be replayed:
+    /// `SplitStore` returns only the coins half when its block half is
+    /// already in, and `CoinCache` absorbs what it buffers before passing
+    /// the rest through, so its returned batch is the filtered pass-through
+    /// remainder, not the caller's original. Callers restore state from the
+    /// returned batch; they must not assume it is byte-identical to what
+    /// they passed in.
     ///
-    /// `Err((None, e))` means the write may be **partially applied** and must
-    /// not be replayed. Only `SplitStore`, which spans two backing stores,
-    /// can report that. The batch is boxed so the error variant stays small
-    /// on the success path, which is every call but the failing one.
+    /// `Err((None, e))` means the write may be **partially applied** in a
+    /// way that cannot be described for replay, and nothing may be
+    /// restored. The batch is boxed so the error variant stays small on the
+    /// success path, which is every call but the failing one.
     ///
     /// Deliberately without a default implementation. A default would have to
     /// either consume the batch (turning every non-overriding store's caller

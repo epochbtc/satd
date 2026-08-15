@@ -77,11 +77,30 @@ impl SplitStore {
         }
     }
 
-    /// Write the shared half under the snapshot chainstate's `accept_lock`.
-    /// See [`Self::block_store_lock`].
-    fn write_block_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+    /// The single door for writes into the *shared* block store. Every
+    /// path — `write_batch`, `write_batch_mode`, `write_batch_recoverable` —
+    /// must route its block half through here: the shared store belongs to
+    /// the snapshot chainstate, and any serialization that chainstate
+    /// imposes on shared writes has to cover all of the doors or it covers
+    /// none. This function is the merge of two earlier half-measures — one
+    /// that took the lock, one that returned the recoverable shape — and it
+    /// must keep doing both; splitting them again reintroduces a door that
+    /// only one of the two properties covers.
+    ///
+    /// The write runs under the snapshot chainstate's `accept_lock` (see
+    /// [`Self::block_store_lock`]), so a background catch-up write cannot
+    /// interleave with that chainstate's own mutations.
+    ///
+    /// Block-half writes are always `WriteMode::Normal`: the block index
+    /// stays durable even while the heavy coins writes run BulkLoad during
+    /// the background catch-up.
+    fn write_block_half(
+        &self,
+        batch: StoreBatch,
+    ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
         let _guard = self.block_store_lock.as_ref().map(|l| l.lock());
-        self.block_store.write_batch(batch)
+        self.block_store
+            .write_batch_recoverable(batch, WriteMode::Normal)
     }
 
     /// Partition a batch into `(block-store mutations, coins-store
@@ -221,7 +240,7 @@ impl Store for SplitStore {
         // re-connecting that block on restart is idempotent (same
         // block-index put, coins re-applied). The reverse order could
         // strand a tip pointing at a block whose index never landed.
-        self.write_block_batch(block_batch)?;
+        self.write_block_half(block_batch).map_err(|(_, e)| e)?;
         self.coins_store.write_batch(coins_batch)?;
         Ok(())
     }
@@ -230,7 +249,7 @@ impl Store for SplitStore {
         let (block_batch, coins_batch) = Self::split_batch(batch);
         // Block index stays durable; only the heavy coins writes honor
         // BulkLoad during the background catch-up IBD.
-        self.write_block_batch(block_batch)?;
+        self.write_block_half(block_batch).map_err(|(_, e)| e)?;
         self.coins_store.write_batch_mode(coins_batch, mode)?;
         Ok(())
     }
@@ -247,20 +266,22 @@ impl Store for SplitStore {
         //
         // Block half first: nothing has been applied yet, so the two halves
         // can be reassembled and handed back whole.
-        if let Err((returned, e)) =
-            self.block_store.write_batch_recoverable(block_batch, WriteMode::Normal)
-        {
+        if let Err((returned, e)) = self.write_block_half(block_batch) {
             return Err((
                 returned.map(|b| Box::new(Self::rejoin(*b, coins_batch))),
                 e,
             ));
         }
-        // Coins half: the block half is already in. Handing the batch back
-        // would invite a replay that applies those rows twice, so this
-        // reports "partially applied, do not restore" instead.
-        self.coins_store
-            .write_batch_recoverable(coins_batch, mode)
-            .map_err(|(_, e)| (None, e))
+        // Coins half: the block half is already in, and it must NOT come
+        // back for replay — its rows are absolute index/height/txindex
+        // puts, and replaying them later could resurrect a status a newer
+        // writer has since retired (#322's shape). The coins store's own
+        // returned batch is exactly the unapplied remainder: hand that back
+        // as-is, and a restore preserves the coins delta (and the tip that
+        // rides with it) while the durable block rows stay put. Restoring
+        // only the remainder is what the trait contract asks for — see
+        // `Store::write_batch_recoverable`.
+        self.coins_store.write_batch_recoverable(coins_batch, mode)
     }
 
     fn flush_durable(&self) -> Result<(), StoreError> {
@@ -369,6 +390,81 @@ mod tests {
 
         assert!(done.load(Ordering::SeqCst), "and completes once it is free");
         assert!(block_store.get_block_index(&hash).is_some());
+    }
+
+    /// Block half fails first: nothing has been applied anywhere, so the
+    /// caller gets the whole batch back, rejoined — both halves, tip
+    /// included — and either store reads as untouched.
+    #[test]
+    fn recoverable_block_half_failure_returns_the_whole_batch() {
+        use crate::storage::test_store::ControllableStore;
+
+        let block_store = ControllableStore::new();
+        let block_controls = block_store.controls();
+        let cdir = tempfile::tempdir().unwrap();
+        let split = SplitStore::new(Arc::new(block_store), store(cdir.path()), None);
+
+        let (hash, entry) = genesis_entry();
+        let op = outpoint(0x11);
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.coin_puts.push((op, coin(1_000)));
+        batch.tip = Some(hash);
+
+        block_controls.fail_next_write();
+        let (returned, _e) = split
+            .write_batch_recoverable(batch, WriteMode::Normal)
+            .expect_err("the injected block-half fault must surface");
+        let returned = *returned.expect("nothing was applied, so the batch comes back");
+        assert_eq!(returned.block_index_puts.len(), 1, "block half returned");
+        assert_eq!(returned.coin_puts.len(), 1, "coins half returned");
+        assert_eq!(returned.tip, Some(hash), "tip returned");
+        assert!(split.get_block_index(&hash).is_none(), "block store untouched");
+        assert!(split.get_coin(&op).is_none(), "coins store untouched");
+    }
+
+    /// Coins half fails after the block half landed: the caller gets back
+    /// exactly the unapplied remainder — the coins half, tip included, with
+    /// the block rows absent — so a restore replays nothing that is already
+    /// durable. Returning the full rejoined batch here would re-put block
+    /// rows later and could resurrect a status a newer writer retired;
+    /// returning `None` (as this once did) needlessly threw the coins delta
+    /// away.
+    #[test]
+    fn recoverable_coins_half_failure_returns_only_the_unapplied_remainder() {
+        use crate::storage::test_store::ControllableStore;
+
+        let bdir = tempfile::tempdir().unwrap();
+        let coins_store = ControllableStore::new();
+        let coins_controls = coins_store.controls();
+        let split = SplitStore::new(store(bdir.path()), Arc::new(coins_store), None);
+
+        let (hash, entry) = genesis_entry();
+        let op = outpoint(0x12);
+        let mut batch = StoreBatch::default();
+        batch.block_index_puts.push((hash, entry));
+        batch.height_hash_puts.push((0, hash));
+        batch.coin_puts.push((op, coin(2_000)));
+        batch.tip = Some(hash);
+
+        coins_controls.fail_next_write();
+        let (returned, _e) = split
+            .write_batch_recoverable(batch, WriteMode::Normal)
+            .expect_err("the injected coins-half fault must surface");
+        let returned = *returned.expect("the coins half is recoverable");
+        assert_eq!(
+            returned.block_index_puts.len(),
+            0,
+            "the applied block half must NOT come back for replay"
+        );
+        assert_eq!(returned.height_hash_puts.len(), 0, "height rows are block-half");
+        assert_eq!(returned.coin_puts.len(), 1, "the unapplied coins half comes back");
+        assert_eq!(returned.tip, Some(hash), "the tip rides with the coins half");
+        assert!(
+            split.get_block_index(&hash).is_some(),
+            "the block half landed durably before the fault"
+        );
+        assert!(split.get_coin(&op).is_none(), "the coins store applied nothing");
     }
 
     #[test]

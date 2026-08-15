@@ -551,26 +551,38 @@ impl CoinCache {
         let coin_removes = std::mem::take(&mut batch.coin_removes);
         let tip = batch.tip.take();
 
-        let restored = (coin_puts.len() + coin_removes.len()) as u32;
+        // `dirty_count` mirrors the map's population, so only ops actually
+        // inserted may count — an entry re-dirtied since the drain was
+        // already counted by its newer writer, and adding it again drifts
+        // the gauge high, triggering premature flushes. The value deltas
+        // below are different: they are per-op linear sums, correct to add
+        // unconditionally even on a collision (the newer writer's delta and
+        // this op's delta both describe real not-yet-on-disk movement).
+        let mut restored = 0u32;
         let mut count_delta = 0i64;
         let mut amount_delta = 0i64;
         {
+            use std::collections::hash_map::Entry;
             let mut dirty = self.dirty.write();
             for (outpoint, coin) in coin_puts {
                 count_delta += 1;
                 amount_delta += coin.amount as i64;
-                dirty
-                    .entry(outpoint)
-                    .or_insert(DirtyEntry::Present { coin, fresh: false });
+                if let Entry::Vacant(slot) = dirty.entry(outpoint) {
+                    slot.insert(DirtyEntry::Present { coin, fresh: false });
+                    restored += 1;
+                }
             }
             for (outpoint, amount, height) in coin_removes {
                 count_delta -= 1;
                 amount_delta -= amount as i64;
-                dirty.entry(outpoint).or_insert(DirtyEntry::Spent {
-                    amount,
-                    height,
-                    fresh: false,
-                });
+                if let Entry::Vacant(slot) = dirty.entry(outpoint) {
+                    slot.insert(DirtyEntry::Spent {
+                        amount,
+                        height,
+                        fresh: false,
+                    });
+                    restored += 1;
+                }
             }
         }
         self.dirty_count.fetch_add(restored, Ordering::Relaxed);
@@ -1136,6 +1148,14 @@ impl Store for CoinCache {
         self.absorb_batch(batch, mode).map_err(|(_, e)| e)
     }
 
+    /// Layered-store caveat (see the trait doc): on a pass-through failure
+    /// the returned batch is the *filtered pass-through remainder*, not the
+    /// caller's original — coins and the tip were already absorbed into the
+    /// cache (where they are safe: the failure did not touch them), overlay
+    /// LRUs were updated, dominated entries were filtered out, and
+    /// superseded pending rows were cleared. Replaying the returned batch
+    /// restores the correct final state; comparing it to the input does
+    /// not.
     fn write_batch_recoverable(
         &self,
         batch: StoreBatch,
@@ -3421,13 +3441,81 @@ mod tests {
         let mut spend = StoreBatch::default();
         spend.coin_removes.push((y, 7_000, 2));
         cache.write_batch(spend).unwrap();
+        let gauge_before = cache.dirty_count();
         cache.restore_after_failed_flush(drained);
 
         assert!(
             cache.get_coin(&y).is_none(),
             "the newer spend wins over the restored create"
         );
+        // The restored put collided with the newer spend's entry and was not
+        // inserted, so it must not move the population gauge either — an
+        // unconditional add here drifts it high and triggers premature
+        // flushes. (The gauge itself counts absorb ops, not map entries, so
+        // only the delta across the restore is meaningful.)
+        assert_eq!(
+            cache.dirty_count(),
+            gauge_before,
+            "a fully-colliding restore must leave dirty_count unchanged"
+        );
         let _ = controls;
+    }
+
+    /// Pins the load-bearing merge polarity in `restore_after_failed_flush`:
+    /// the restored (older) batch must sit *under* rows buffered since the
+    /// drain, and the pending tip must keep its newer value. Reversing
+    /// either — `newer.merge(older)`, or an unconditional pending-tip
+    /// overwrite — resurrects stale height/index rows on the next flush,
+    /// the #564 shape, and this test fails.
+    #[test]
+    fn a_restored_batch_sits_under_newer_noncoin_rows_not_over_them() {
+        use crate::storage::test_store::ControllableStore;
+
+        let store = ControllableStore::new();
+        let cache = CoinCache::new(Box::new(store), 10);
+
+        let hash_a = make_block_hash(0xA1);
+        let hash_b = make_block_hash(0xB1);
+        let hash_c = make_block_hash(0xC1);
+        let tip_new = make_block_hash(0xEE);
+        let tip_old = make_block_hash(0xDD);
+
+        // Newer state, written "since the drain": height 2 -> B, height 3 -> C,
+        // and a new tip. The coin makes the batch buffer (coin-free batches
+        // pass through and would not model the pending-batch collision).
+        let mut newer = StoreBatch::default();
+        newer.coin_puts.push((make_outpoint(0xF4, 0), make_coin(1_000, 2)));
+        newer.height_hash_puts.push((2, hash_b));
+        newer.height_hash_puts.push((3, hash_c));
+        newer.tip = Some(tip_new);
+        cache.write_batch(newer).unwrap();
+
+        // The drained (older) batch handed back by a failed flush: a stale
+        // height 2 -> A put, a stale remove of height 3, and the old tip.
+        let mut older = StoreBatch::default();
+        older.height_hash_puts.push((2, hash_a));
+        older.height_hash_removes.push(3);
+        older.tip = Some(tip_old);
+        cache.restore_after_failed_flush(older);
+
+        // Newer values win immediately...
+        assert_eq!(cache.get_block_hash_by_height(2), Some(hash_b));
+        assert_eq!(cache.get_tip(), Some(tip_new));
+
+        // ...and, decisively, in what the next flush writes to the store.
+        cache.flush().unwrap();
+        cache.discard_uncommitted(); // pure overlay drop after a full flush
+        assert_eq!(
+            cache.get_block_hash_by_height(2),
+            Some(hash_b),
+            "the newer height row must reach the store, not the restored stale one"
+        );
+        assert_eq!(
+            cache.get_block_hash_by_height(3),
+            Some(hash_c),
+            "the newer put must survive the restored stale remove"
+        );
+        assert_eq!(cache.get_tip(), Some(tip_new), "the newer tip must win");
     }
 
     // ---------------------------------------------------------------
