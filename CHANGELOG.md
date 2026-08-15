@@ -11,6 +11,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed: the block connector mutated the UTXO cache and the chain tip without
+  holding `accept_lock`, the lock every other chain mutator takes, so an
+  `invalidateblock` reorg and the connector could connect the same blocks
+  concurrently. The reorg then failed on inputs the connector had already
+  spent and rolled back by discarding the whole coin cache — destroying eight
+  blocks' worth of committed UTXOs, resurrecting the invalidated branch's
+  spent coins, and wedging the node. Both connect paths now hold the lock for
+  their whole body; a connector waiting on it is reported as
+  `phase=waiting_for_accept_lock`.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

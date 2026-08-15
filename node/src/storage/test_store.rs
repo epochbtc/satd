@@ -43,6 +43,44 @@ pub(crate) struct StoreControls {
     fail_block_index_scan: Arc<AtomicBool>,
     txindex: Arc<AtomicBool>,
     txindex_complete: Arc<AtomicBool>,
+    coin_gate: Arc<std::sync::Mutex<Option<ArmedCoinGate>>>,
+}
+
+/// A one-shot rendezvous armed on a specific outpoint: the first coin read
+/// that reaches this store and covers the outpoint signals `entered` and then
+/// blocks until released. This is how a test holds one thread *inside* a read
+/// (e.g. a reorg's input resolution) while another thread mutates the same
+/// chain — the only way to make a cross-thread interleaving deterministic.
+///
+/// Note the store this fires in is the *inner* store: reads served by the
+/// `CoinCache`'s dirty map or clean LRU never get here. A test that needs the
+/// gate to fire must first arrange for the read to miss the cache (flush, then
+/// shrink/displace the clean LRU).
+struct ArmedCoinGate {
+    outpoint: OutPoint,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Test-side handle for an armed coin gate.
+pub(crate) struct CoinGateHandle {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::SyncSender<()>,
+}
+
+impl CoinGateHandle {
+    /// Block until the gated thread reaches the read. Panics after 30s so a
+    /// test where the thread never gets there fails instead of hanging.
+    pub(crate) fn wait_entered(&self) {
+        self.entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("gated thread never reached the armed coin read");
+    }
+
+    /// Let the parked thread continue.
+    pub(crate) fn release(&self) {
+        let _ = self.release.send(());
+    }
 }
 
 impl StoreControls {
@@ -62,6 +100,21 @@ impl StoreControls {
         self.txindex.store(enabled, Ordering::SeqCst);
         self.txindex_complete.store(complete, Ordering::SeqCst);
     }
+
+    /// Arm the one-shot coin gate on `outpoint`. See [`ArmedCoinGate`].
+    pub(crate) fn arm_coin_gate(&self, outpoint: OutPoint) -> CoinGateHandle {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.coin_gate.lock().unwrap() = Some(ArmedCoinGate {
+            outpoint,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        CoinGateHandle {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
 }
 
 /// An [`InMemoryStore`] whose failure modes and index configuration can be set
@@ -72,6 +125,23 @@ pub(crate) struct ControllableStore {
 }
 
 impl ControllableStore {
+    /// Park the calling thread if the coin gate is armed for any of
+    /// `outpoints`. One-shot: the gate is disarmed before parking, so the
+    /// releasing thread's own reads of the same outpoint pass through.
+    fn maybe_park(&self, outpoints: &[OutPoint]) {
+        let armed = {
+            let mut slot = self.controls.coin_gate.lock().unwrap();
+            match slot.as_ref() {
+                Some(g) if outpoints.contains(&g.outpoint) => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(g) = armed {
+            let _ = g.entered.send(());
+            let _ = g.release.recv_timeout(std::time::Duration::from_secs(30));
+        }
+    }
+
     /// A store that behaves exactly like [`InMemoryStore`] until told otherwise
     /// — including its hardcoded "the index is on and complete".
     pub(crate) fn new() -> Self {
@@ -81,6 +151,7 @@ impl ControllableStore {
                 fail_block_index_scan: Arc::new(AtomicBool::new(false)),
                 txindex: Arc::new(AtomicBool::new(true)),
                 txindex_complete: Arc::new(AtomicBool::new(true)),
+                coin_gate: Arc::new(std::sync::Mutex::new(None)),
             },
         }
     }
@@ -128,6 +199,9 @@ impl Store for ControllableStore {
         self.inner.get_block_index(hash)
     }
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        // Covers `get_coins_batch` too: the trait default resolves a batch
+        // through per-outpoint `get_coin` calls.
+        self.maybe_park(std::slice::from_ref(outpoint));
         self.inner.get_coin(outpoint)
     }
     fn has_coin(&self, outpoint: &OutPoint) -> bool {

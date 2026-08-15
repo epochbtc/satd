@@ -70,6 +70,14 @@ pub enum ConnectPhase {
     FlushingCoinCache = 13,
     /// block_processor: durable flush at IBD completion (RocksDB sync).
     FlushDurable = 14,
+    /// Blocked acquiring `accept_lock` at the top of a connect call —
+    /// another thread is mutating the chain (`submitblock`,
+    /// `invalidateblock`/`reconsiderblock`, header acceptance). Normally
+    /// microseconds; an `invalidateblock` on a large block index holds the
+    /// lock for tens of seconds, and a wedged reorg holds it indefinitely.
+    /// Named so the watchdog says which, instead of dumping 95 thread
+    /// states for the operator to read.
+    WaitingForAcceptLock = 15,
 }
 
 impl ConnectPhase {
@@ -91,6 +99,7 @@ impl ConnectPhase {
             Self::CondvarWait => "condvar_wait",
             Self::FlushingCoinCache => "flushing_coin_cache",
             Self::FlushDurable => "flush_durable",
+            Self::WaitingForAcceptLock => "waiting_for_accept_lock",
         }
     }
 
@@ -114,12 +123,13 @@ impl ConnectPhase {
             12 => Self::CondvarWait,
             13 => Self::FlushingCoinCache,
             14 => Self::FlushDurable,
+            15 => Self::WaitingForAcceptLock,
             _ => Self::Idle,
         }
     }
 
     /// Total number of phase variants — used to size the counts array.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 16;
 }
 
 /// Lock-free tracker for the connector's current phase. Held by an
