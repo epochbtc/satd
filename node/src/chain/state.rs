@@ -121,11 +121,10 @@ pub enum ChainError {
     /// be told that the first half took effect — a bare connect error reads as
     /// "nothing happened", which is how an operator ends up re-running the
     /// command against a chain that has already been marked.
-    #[error(
-        "block index updated, but re-activating the best chain failed: {0}. \
-         The node will retry activation as blocks arrive; reconsiderblock \
-         undoes the invalidation."
-    )]
+    /// The remedy differs by call site (`invalidateblock` is undone by
+    /// `reconsiderblock`; a failed `reconsiderblock` is retried by running
+    /// it again), so the wrapped string carries it rather than this text.
+    #[error("block index updated, but re-activating the best chain failed: {0}")]
     ReactivationFailed(String),
 }
 
@@ -5528,10 +5527,15 @@ impl ChainState {
                 }
                 for side_hash in &to_connect {
                     side_failed_at = None;
-                    let side_entry = self
-                        .store
-                        .get_block_index(side_hash)
-                        .ok_or(ChainError::BadPrevBlock)?;
+                    // A hash the walk above just resolved has no entry now:
+                    // index corruption, not an unknown parent. Return the
+                    // `FlatFile` variant `get_block`'s index-first read used
+                    // to produce here — `BadPrevBlock` escapes `accept_block`
+                    // to P2P handlers that read it as "parent unknown, no
+                    // penalty", which this is not.
+                    let side_entry = self.store.get_block_index(side_hash).ok_or_else(|| {
+                        ChainError::FlatFile("block index entry missing for reorg connect".into())
+                    })?;
                     side_failed_at = Some((*side_hash, side_entry.height));
                     let side_block = self
                         .get_block(side_hash)
@@ -5619,6 +5623,14 @@ impl ChainState {
                         hash = %side_hash,
                         "Reorg: block connected"
                     );
+                    // Forward progress the stall watchdog can see: a deep
+                    // reorg holds `accept_lock` for its whole run, parking
+                    // the connector (and any manager-loop mutator behind
+                    // it), which flattens both heartbeats. Without this, a
+                    // legitimate multi-minute reconnect reads as a wedge and
+                    // gets the node SIGTERM'd mid-reorg; with it, only a
+                    // reorg that stops making per-block progress does.
+                    self.bump_connect_heartbeat();
                 }
                 Ok(())
             })();
@@ -6157,6 +6169,9 @@ impl ChainState {
             disconnected_txs_by_block.push(block_txs);
 
             disconnected_hashes.push(current);
+            // Disconnects are per-block reorg progress too — a deep
+            // disconnect leg can run for minutes before the first reconnect.
+            self.bump_connect_heartbeat();
             disconnected_with_height.push((current, entry.height));
             tracing::info!(height = entry.height, hash = %current, "Block disconnected");
             current = prev_hash;
@@ -6288,7 +6303,20 @@ impl ChainState {
                 "invalidateblock: the branch is marked invalid, but re-activating \
                  the best valid chain failed"
             );
-            ChainError::ReactivationFailed(e.to_string())
+            match e {
+                // A deliberate refusal with its own actionable message — the
+                // AssumeUTXO reorg-depth guard is the reachable case — keeps
+                // its variant (and its -8 at the RPC boundary) rather than
+                // being buried in a generic activation failure. The partial-
+                // success context still needs saying: the marks are durable.
+                ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
+                    "{msg} — the invalidation marks are in place; reconsiderblock undoes them"
+                )),
+                e => ChainError::ReactivationFailed(format!(
+                    "{e}. The node will retry activation as blocks arrive; \
+                     reconsiderblock undoes the invalidation."
+                )),
+            }
         })
     }
 
@@ -6318,7 +6346,19 @@ impl ChainState {
                 "reconsiderblock: the invalid marks are cleared, but re-activating \
                  the best valid chain failed"
             );
-            ChainError::ReactivationFailed(e.to_string())
+            match e {
+                // See `invalidate_block`: a deliberate refusal keeps its
+                // variant and RPC code, with the partial-success context
+                // appended. "Undo" here is meaningless (the marks are already
+                // cleared) — re-running is the retry.
+                ChainError::InvalidArgument(msg) => ChainError::InvalidArgument(format!(
+                    "{msg} — the invalid marks remain cleared; re-run reconsiderblock to retry"
+                )),
+                e => ChainError::ReactivationFailed(format!(
+                    "{e}. The invalid marks remain cleared; re-run reconsiderblock \
+                     to retry activation."
+                )),
+            }
         })
     }
 
@@ -6893,10 +6933,12 @@ impl ChainState {
             to_connect.reverse();
             for h in &to_connect {
                 reconnect_failed_at = None;
-                let e = self
-                    .store
-                    .get_block_index(h)
-                    .ok_or(ChainError::BadPrevBlock)?;
+                // See the twin comment in `accept_block`'s side loop: a
+                // just-resolved hash with no entry is index corruption, and
+                // the error must keep `get_block`'s `FlatFile` shape.
+                let e = self.store.get_block_index(h).ok_or_else(|| {
+                    ChainError::FlatFile("block index entry missing for reorg connect".into())
+                })?;
                 reconnect_failed_at = Some((*h, e.height));
                 let block = self.get_block(h).ok_or(ChainError::FlatFile(
                     "block data missing for reorg connect".to_string(),
@@ -6948,6 +6990,10 @@ impl ChainState {
                 reconnected_hashes.push(*h);
                 reconnected_blocks.push((block, e.height));
                 tracing::info!(height = e.height, hash = %h, "Reorg: block connected");
+                // See the twin bump in `accept_block`'s side loop: per-block
+                // progress a deep reorg makes under `accept_lock` must reach
+                // the watchdog, or the reorg reads as a wedge.
+                self.bump_connect_heartbeat();
             }
             Ok(())
         })();
@@ -12101,6 +12147,50 @@ pub(crate) mod tests {
     /// The two branches here are timestamped ~28 hours apart, which is far
     /// more than a median can absorb: if any lookup resolved to the branch
     /// that lost, the assertion below could not pass by luck.
+    /// A deep reorg holds `accept_lock` end to end, flattening the
+    /// connector's normal heartbeat — so the reorg loops must bump it
+    /// themselves, or the stall watchdog reads a legitimate multi-minute
+    /// reorg as a wedge and SIGTERMs the node mid-reorg. Deleting the
+    /// `bump_connect_heartbeat` calls in the disconnect or reconnect loops
+    /// makes this fail.
+    #[test]
+    fn a_reorg_bumps_the_connect_heartbeat() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let mut parent = genesis_hash;
+        for h in 1..=3u32 {
+            let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
+            parent = cs.accept_block(&b).expect("accept trunk");
+        }
+        let fork_point = parent;
+
+        // Active branch A (2 blocks), replacement B (1 block, stored only).
+        let mut a_parent = fork_point;
+        let mut a_first = None;
+        for h in 4..=5u32 {
+            let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
+            a_parent = cs.accept_block(&b).expect("accept A");
+            a_first.get_or_insert(b.block_hash());
+        }
+        let b4 = build_test_block(fork_point, 4, 1_600_010_000);
+        cs.accept_header(&b4.header).unwrap();
+        cs.store_block(&b4).unwrap();
+
+        let before = cs.connect_heartbeat();
+        cs.invalidate_block(a_first.unwrap())
+            .expect("re-activation onto the replacement branch");
+        let after = cs.connect_heartbeat();
+        // 2 disconnects + 1 reconnect: at least 3 bumps.
+        assert!(
+            after >= before + 3,
+            "a reorg must register per-block progress with the watchdog \
+             (heartbeat went {before} -> {after}, expected +3 or more)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn invalidateblock_leaves_median_time_past_on_the_branch_it_activated() {
         let (cs, dir) = make_chain_state();
