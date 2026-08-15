@@ -51,6 +51,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   connect — not only the IBD connector's own success, so readiness recovers
   with the node instead of sticking at 503 until a restart. `/healthz` is
   unchanged — it remains a plain liveness probe.
+- Fixed: `loadtxoutset` checked its fresh-chainstate precondition once and
+  then streamed coins for minutes with no protection against a live block
+  connector — a connector advancing the tip mid-stream could have its
+  committed work wiped by the load's rollback, or the load's tip adoption
+  could clobber the advanced tip. The load now claims the chainstate under
+  `accept_lock`, and every chain mutator refuses with
+  `SnapshotLoadInProgress` for the load's duration; the IBD connector parks
+  quietly instead of counting the refusal against its retry budget.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

@@ -111,6 +111,13 @@ pub enum ChainError {
     Disconnect(#[from] disconnect::DisconnectError),
     #[error("snapshot load failed: {0}")]
     Snapshot(String),
+    /// A `loadtxoutset` stream is in flight and the chainstate is
+    /// deliberately frozen: every chain mutator refuses rather than
+    /// interleave with the multi-minute coin stream. Transient — clears
+    /// when the load completes or fails. The connector parks quietly on
+    /// this instead of burning its retry budget.
+    #[error("a UTXO snapshot load is in progress; chain mutation is paused until it completes")]
+    SnapshotLoadInProgress,
     #[error("block not found")]
     BlockNotFound,
     #[error("{0}")]
@@ -397,9 +404,9 @@ pub struct ChainState {
     /// and `repair_block_index_holes` run at startup before P2P and RPC exist,
     /// so no second mutator can be live. `load_utxo_snapshot` streams for
     /// minutes from an RPC thread, so it cannot hold this lock for its
-    /// duration; its only guard today is a fresh-chainstate precondition
-    /// checked without the lock — a known TOCTOU gap against a live
-    /// connector, tracked to be closed by a snapshot-load guard flag.
+    /// duration; it is serialized against every holder above by
+    /// `snapshot_load_active` instead — set under this lock, checked by
+    /// every coin/tip mutator immediately after acquiring it.
     ///
     /// Lock order where it composes with the cache's flush exclusion:
     /// `accept_lock` first, then `CoinCache::lock_flush_exclusion` (the
@@ -413,6 +420,37 @@ pub struct ChainState {
     /// the AssumeUTXO background catch-up mutates a *separate* `ChainState`
     /// and neither needs nor touches this lock.
     accept_lock: std::sync::Arc<Mutex<()>>,
+    /// True while [`Self::load_utxo_snapshot`] is streaming coins in.
+    ///
+    /// The snapshot load runs for minutes on an RPC thread, so it cannot
+    /// hold `accept_lock` for its duration. Instead it is serialized
+    /// against every holder of that lock by this flag: it is **set under
+    /// `accept_lock`** (so no mutator can be mid-body when it flips on),
+    /// and every chain mutator checks it immediately after acquiring the
+    /// lock, refusing with [`ChainError::SnapshotLoadInProgress`] while a
+    /// load is active. It is cleared by an RAII guard once the load has
+    /// finished mutating — a bare store is safe on that side, because a
+    /// mutator observing `false` proceeds against a settled chainstate.
+    /// Without this, the fresh-chainstate precondition is a TOCTOU read:
+    /// a live IBD connector can connect block 1 during the stream, after
+    /// which either the load's rollback wipes the connector's committed
+    /// work or its adoption clobbers the advanced tip — the #567 shape.
+    snapshot_load_active: std::sync::atomic::AtomicBool,
+}
+
+/// RAII clear for [`ChainState::snapshot_load_active`]. The flag must drop
+/// on every exit from `load_utxo_snapshot` — success, stream error, hash
+/// mismatch, rollback — or the chainstate stays frozen forever. Clearing
+/// without `accept_lock` is safe on this side: mutators read the flag after
+/// acquiring the lock, and by the time this drops the load has finished all
+/// of its mutation, so a mutator observing `false` proceeds against a
+/// settled chainstate. (The *set* side must hold the lock; see the field.)
+struct SnapshotLoadActive<'a>(&'a ChainState);
+
+impl Drop for SnapshotLoadActive<'_> {
+    fn drop(&mut self) {
+        self.0.snapshot_load_active.store(false, Ordering::SeqCst);
+    }
 }
 
 impl ChainState {
@@ -549,6 +587,7 @@ impl ChainState {
                     background: RwLock::new(None),
                     signet_challenge: None,
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
+                    snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
                 // invalidateblock (no-op in the normal case).
@@ -656,6 +695,7 @@ impl ChainState {
             background: RwLock::new(None),
             signet_challenge: None,
             accept_lock: std::sync::Arc::new(Mutex::new(())),
+            snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1165,11 +1205,29 @@ impl ChainState {
                 base_entry.height, anchor.height
             )));
         }
-        if self.tip_height() != 0 {
-            return Err(ChainError::Snapshot(
-                "loadtxoutset requires a fresh chainstate (tip at genesis)".into(),
-            ));
-        }
+        // 2b. Claim the chainstate. The fresh-chainstate check and the
+        //    guard-flag set happen under `accept_lock`, so they cannot race
+        //    a mutator mid-body: any in-flight connect finishes before the
+        //    claim, and every later mutator sees the flag and refuses until
+        //    the load is over. Without this the precondition is a TOCTOU
+        //    read — a live IBD connector can connect block 1 during the
+        //    multi-minute coin stream, after which the rollback below would
+        //    wipe its committed work (the #567 shape) or the adoption would
+        //    clobber the advanced tip.
+        let _load_guard = {
+            let _accept = self.accept_lock.lock();
+            if self.tip_height() != 0 {
+                return Err(ChainError::Snapshot(
+                    "loadtxoutset requires a fresh chainstate (tip at genesis)".into(),
+                ));
+            }
+            if self.snapshot_load_active.swap(true, Ordering::SeqCst) {
+                return Err(ChainError::Snapshot(
+                    "another snapshot load is already in progress".into(),
+                ));
+            }
+            SnapshotLoadActive(self)
+        };
 
         // 3. Attach the background validator BEFORE mutating the active
         //    chainstate. Opening the background DB is the failure-prone
@@ -1309,6 +1367,18 @@ impl ChainState {
 
     pub fn tip_hash(&self) -> BlockHash {
         self.tip.read().hash
+    }
+
+    /// Refuse chain mutation while a `loadtxoutset` stream is in flight.
+    /// Called by every `accept_lock` holder that mutates coins or the tip,
+    /// immediately after acquiring the lock — the flag is only *set* under
+    /// that lock, so the check cannot race the load's start, and a `false`
+    /// here means the load has finished all of its mutation.
+    fn check_no_snapshot_load(&self) -> Result<(), ChainError> {
+        if self.snapshot_load_active.load(Ordering::SeqCst) {
+            return Err(ChainError::SnapshotLoadInProgress);
+        }
+        Ok(())
     }
 
     pub fn tip_height(&self) -> u32 {
@@ -3073,6 +3143,11 @@ impl ChainState {
         let _accept_guard = self.accept_lock.lock();
         phases.enter(ConnectPhase::EnterConnect);
 
+        if let Err(e) = self.check_no_snapshot_load() {
+            phases.enter(ConnectPhase::Idle);
+            return Err(e);
+        }
+
         // Verify parent is current tip (same check as connect_stored_block).
         // Read under the lock: a reorg that finished while this call waited
         // moved the tip, and everything below is decided against the tip we
@@ -3773,6 +3848,11 @@ impl ChainState {
         phases.enter(ConnectPhase::WaitingForAcceptLock);
         let _accept_guard = self.accept_lock.lock();
         phases.enter(ConnectPhase::EnterConnect);
+
+        if let Err(e) = self.check_no_snapshot_load() {
+            phases.enter(ConnectPhase::Idle);
+            return Err(e);
+        }
 
         // Read under the lock. A reorg that ran while this call waited may
         // have changed both this entry's status and the tip.
@@ -5226,6 +5306,7 @@ impl ChainState {
         // writers. Uncontended on IBD/reindex/normal-P2P (single writer);
         // see the `accept_lock` field doc.
         let _accept_guard = self.accept_lock.lock();
+        self.check_no_snapshot_load()?;
 
         let block_hash = block.block_hash();
         let trace_id = rand::random::<u32>();
@@ -6237,6 +6318,7 @@ impl ChainState {
     /// [`ChainError::InvalidArgument`] when asked to invalidate genesis.
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), ChainError> {
         let _accept_guard = self.accept_lock.lock();
+        self.check_no_snapshot_load()?;
 
         let entry = self
             .store
@@ -6327,6 +6409,7 @@ impl ChainState {
     /// Reconsidering a block that was never invalidated is a no-op success.
     pub fn reconsider_block(&self, hash: BlockHash) -> Result<(), ChainError> {
         let _accept_guard = self.accept_lock.lock();
+        self.check_no_snapshot_load()?;
 
         if self.store.get_block_index(&hash).is_none() {
             return Err(ChainError::BlockNotFound);
@@ -9728,6 +9811,116 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// A failed load must drop the `snapshot_load_active` claim — deleting
+    /// the RAII guard's clear makes this fail: the post-failure connect
+    /// refuses with `SnapshotLoadInProgress` forever.
+    #[test]
+    fn a_failed_snapshot_load_releases_the_chainstate() {
+        use crate::chain::assumeutxo::AssumeUtxoData;
+
+        let (src, src_dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&src, 4);
+        let snap_hash = src.tip_hash();
+        let snap_path = src_dir.join("snap.dat");
+        let _dump = src.dump_utxo_snapshot(&snap_path).unwrap();
+        let bad_anchor = AssumeUtxoData {
+            height: 4,
+            blockhash: snap_hash,
+            nchaintx: 0,
+            hash_serialized_3: [0x42u8; 32],
+        };
+
+        let (dst, dst_dir) = make_chain_state();
+        for b in &blocks {
+            dst.accept_header(&b.header).unwrap();
+        }
+        let bg_dir = dst_dir.join("chainstate_background");
+        let mut f = std::fs::File::open(&snap_path).unwrap();
+        dst.load_utxo_snapshot(&mut f, bad_anchor, bg_dir, 64, -1)
+            .expect_err("a hash mismatch must be rejected");
+
+        // The claim is released: the chainstate accepts blocks again.
+        assert!(!dst.snapshot_load_active.load(Ordering::SeqCst));
+        dst.accept_block(&blocks[0])
+            .expect("a failed load must not leave the chainstate frozen");
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    /// While a snapshot load is streaming, every coin/tip mutator refuses
+    /// with `SnapshotLoadInProgress` — this is what makes the load's
+    /// fresh-chainstate precondition hold for its whole duration instead of
+    /// only at the instant it was checked. Deleting any one of the
+    /// `check_no_snapshot_load` calls makes the matching assertion fail.
+    #[test]
+    fn chain_mutators_refuse_while_a_snapshot_load_is_active() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 2);
+        let b3 = build_test_block(blocks[1].block_hash(), 3, 1_600_000_003);
+        cs.accept_header(&b3.header).unwrap();
+        cs.store_block(&b3).unwrap();
+
+        cs.snapshot_load_active.store(true, Ordering::SeqCst);
+
+        assert!(
+            matches!(cs.accept_block(&b3), Err(ChainError::SnapshotLoadInProgress)),
+            "accept_block must refuse during a snapshot load"
+        );
+        assert!(
+            matches!(
+                cs.connect_stored_block(&b3.block_hash()),
+                Err(ChainError::SnapshotLoadInProgress)
+            ),
+            "connect_stored_block must refuse during a snapshot load"
+        );
+        let entry = cs.get_block_index(&b3.block_hash()).unwrap();
+        let parent = cs.get_block_index(&blocks[1].block_hash()).unwrap();
+        let pre = crate::chain::prefetch::PreprocessedBlock {
+            height: 3,
+            hash: b3.block_hash(),
+            block: b3.clone(),
+            flat_pos: FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            },
+            mtp: 0,
+            txids: b3.txdata.iter().map(|t| t.compute_txid()).collect(),
+            script_verified_txs: Default::default(),
+            context_free_checked: true,
+            entry,
+            parent,
+        };
+        assert!(
+            matches!(
+                cs.connect_preprocessed_block(pre),
+                Err(ChainError::SnapshotLoadInProgress)
+            ),
+            "connect_preprocessed_block must refuse during a snapshot load"
+        );
+        assert!(
+            matches!(
+                cs.invalidate_block(blocks[1].block_hash()),
+                Err(ChainError::SnapshotLoadInProgress)
+            ),
+            "invalidate_block must refuse during a snapshot load"
+        );
+        assert!(
+            matches!(
+                cs.reconsider_block(blocks[1].block_hash()),
+                Err(ChainError::SnapshotLoadInProgress)
+            ),
+            "reconsider_block must refuse during a snapshot load"
+        );
+        // The refusals came from the flag, not something else: clearing it
+        // lets the same block connect.
+        cs.snapshot_load_active.store(false, Ordering::SeqCst);
+        cs.connect_stored_block(&b3.block_hash())
+            .expect("the same block connects once the load is over");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3974,6 +3974,18 @@ impl PeerManager {
                         }
                         continue; // Immediately try next block
                     }
+                    // An operator `loadtxoutset` is streaming and the
+                    // chainstate is deliberately frozen. Park without burning
+                    // the retry budget — this is not a failing block, and 30
+                    // retries of it must not raise the persistent-failure
+                    // warning (and fail `/readyz` recovery) while the node is
+                    // doing exactly what it was told. The heartbeat keeps
+                    // ticking via the manager loop, so the stall watchdog
+                    // stays quiet too.
+                    Err(crate::chain::state::ChainError::SnapshotLoadInProgress) => {
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
                     // `Duplicate` deliberately falls through to the generic
                     // error arm rather than retrying immediately. It means the
                     // block offered at tip+1 is one this chainstate already
