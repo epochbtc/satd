@@ -3410,8 +3410,12 @@ mod tests {
         expect_cache_state(&cache, "after the successful retry");
         // Drop the read-through overlays so the checks below hit the store.
         // Safe as a pure overlay drop because the flush above already drained
-        // the dirty map and pending batch.
-        cache.discard_uncommitted();
+        // the dirty map and pending batch. The exclusion is taken here purely
+        // to satisfy the discard's caller contract; no foreign write can have
+        // landed inside a window this test opens and closes in one statement.
+        let excl = cache.lock_flush_exclusion();
+        assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
+        drop(excl);
         assert!(cache.get_block_index(&block).is_some(), "index row reached disk");
         assert_eq!(cache.get_block_hash_by_height(2), Some(block));
         assert!(cache.get_undo(&block).is_some());
@@ -3504,7 +3508,11 @@ mod tests {
 
         // ...and, decisively, in what the next flush writes to the store.
         cache.flush().unwrap();
-        cache.discard_uncommitted(); // pure overlay drop after a full flush
+        // Pure overlay drop after a full flush; see the note on the same
+        // pattern above for why an exclusion is taken around it.
+        let excl = cache.lock_flush_exclusion();
+        assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
+        drop(excl);
         assert_eq!(
             cache.get_block_hash_by_height(2),
             Some(hash_b),
@@ -3721,6 +3729,47 @@ mod tests {
             cache.discard_uncommitted(&excl),
             Err(DiscardRefused::ForeignWrite),
             "a foreign tip write is discardable state and must be flagged"
+        );
+    }
+
+    /// `write_batch_recoverable` is a second public door into the cache, and
+    /// it must be as guarded as `write_batch`. Both delegate to
+    /// `absorb_batch`, which is where the flag is raised — so this is a
+    /// regression pin on that placement: move the `note_mutation` gate up
+    /// into `write_batch_mode` (where it originally lived, before the
+    /// recoverable path existed) and a foreign write arriving through the
+    /// recoverable door becomes invisible to the discard, which is the
+    /// silent-destruction shape the guard exists to stop.
+    #[test]
+    fn a_foreign_recoverable_write_trips_the_discard_guard() {
+        let cache = make_cache(10);
+
+        // A reorg takes the exclusion and stages its own delta.
+        let excl = cache.lock_flush_exclusion();
+        let mut delta = StoreBatch::default();
+        delta
+            .coin_puts
+            .push((make_outpoint(0xD9, 0), make_coin(7_000, 3)));
+        cache.write_batch(delta).unwrap();
+
+        // Another thread writes discardable state through the *recoverable*
+        // door — the door `SplitStore` and the flush-restore path use.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut b = StoreBatch::default();
+                b.coin_puts
+                    .push((make_outpoint(0xD9, 1), make_coin(8_000, 3)));
+                cache
+                    .write_batch_recoverable(b, WriteMode::Normal)
+                    .map_err(|(_, e)| e)
+                    .expect("the foreign write itself succeeds");
+            });
+        });
+
+        assert_eq!(
+            cache.discard_uncommitted(&excl),
+            Err(DiscardRefused::ForeignWrite),
+            "a foreign write through write_batch_recoverable must be flagged"
         );
     }
 
