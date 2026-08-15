@@ -808,11 +808,16 @@ async fn main() {
             // log line is not a data dump.
             const SHOW: usize = 16;
             if audit.skipped_bulk {
-                tracing::info!(
+                // Most of the range absent is a rebuild, not a repair, and a
+                // startup pass does not undertake one unasked. Report the
+                // count against the range so the scale is legible without
+                // guessing at a cause.
+                tracing::warn!(
                     missing = audit.missing.len(),
-                    "Height index is missing most heights at or below the tip; \
-                     declining to rewrite it. Expected while an AssumeUTXO \
-                     snapshot's history is still being validated"
+                    of_heights = audit.tip_height as u64 + 1,
+                    "Height index is missing most heights at or below the tip. \
+                     Rebuilding it wholesale is not this pass's job; \
+                     getblockhash will fail at those heights until a -reindex"
                 );
             } else if !audit.is_clean() {
                 if !audit.repaired.is_empty() {

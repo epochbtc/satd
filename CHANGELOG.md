@@ -201,6 +201,15 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   validated are reported separately from real damage, so an AssumeUTXO node
   mid-validation is not told to reindex. Gaps it cannot rederive are logged as
   errors instead of passing silently.
+- Fixed: the startup height-index repair gave up above a fixed thousand gaps,
+  which measured neither its cost nor its risk — the walk is one read per
+  height between the tip and the *lowest* gap, and refusing to write a row for
+  a block this chainstate has not validated is a per-height check that never
+  consulted the count. A node on a chain that reorgs often accumulated a few
+  thousand gaps in its recent history and was declined on every restart, told
+  in the log that an AssumeUTXO snapshot it had never loaded was the likely
+  cause. The threshold is now a share of the range, so damage is repaired at
+  any scale and only an index that would have to be rebuilt is declined.
 - Fixed: a reorg could delete the height→hash and txindex rows the replacement
   block had just written. Disconnecting the displaced block and connecting the
   replacement coalesce into one write batch, which applies every put before
