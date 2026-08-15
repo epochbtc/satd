@@ -558,9 +558,15 @@ impl CoinCache {
     /// non-coin read-through overlays is sufficient and exact: every
     /// subsequent read resolves to the inner store's pre-reorg state.
     ///
-    /// Caller contract, now enforced rather than assumed: the aborting reorg
-    /// must hold this cache's [`FlushExclusion`], and no other thread may
-    /// have mutated the cache since it took that exclusion. The atomicity
+    /// Caller contract, now checked at the boundaries rather than assumed:
+    /// the aborting reorg must hold this cache's [`FlushExclusion`], and no
+    /// other thread may have mutated the discardable delta since it took
+    /// that exclusion. "Checked", not "proved": `note_mutation` is
+    /// check-then-act, so a foreign write that straddles the exclusion's
+    /// start or this discard can escape the flag. What the check does
+    /// deliver is detection of any *repeat* writer — the #567 connector
+    /// wrote eight blocks into the window — and a second look at the flag
+    /// after the clears below narrows the far boundary too. The atomicity
     /// relies on both — on no flush landing the partial reorg on disk (an
     /// in-memory discard cannot undo an on-disk write), and on everything
     /// buffered belonging to the reorg doing the discarding.
@@ -610,6 +616,17 @@ impl CoinCache {
         self.undo_cache.lock().clear();
         self.tx_index_cache.lock().clear();
         self.chain_tx_cache.lock().clear();
+        // Second look: a foreign writer whose `note_mutation` check
+        // interleaved the start of this discard can have landed (and
+        // flagged) mid-clear. Its write is already destroyed — that cannot
+        // be helped from here — but returning refused turns silent
+        // destruction into the caller's fail-stop, which is the contract.
+        if self
+            .foreign_write_during_exclusion
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DiscardRefused::ForeignWrite);
+        }
         // The clean coin LRU is deliberately NOT cleared. During a reorg
         // it only ever loses entries — `write_batch_mode` pops every coin
         // it touches — and gains none with a reorg-tentative value (coins
@@ -674,16 +691,25 @@ impl Store for CoinCache {
 
     fn write_batch_mode(&self, mut batch: StoreBatch, mode: WriteMode) -> Result<(), StoreError> {
         // Every chainstate mutation funnels through here (`write_batch`
-        // delegates), so this is the one place that has to notice a writer
-        // trespassing on a reorg's exclusive window.
-        self.note_mutation();
+        // delegates), so this is the one place that can notice a writer
+        // trespassing on a reorg's exclusive window. But only a batch that
+        // touches the *discardable delta* — coins staged into the dirty
+        // map, a buffered tip — counts as trespassing. A coin-free,
+        // tip-less batch takes the pass-through branch below, straight
+        // into the inner store, where `discard_uncommitted` cannot touch
+        // it: an index backfill or a prune running beside a reorg is not a
+        // hole in the reorg's rollback, and flagging it would turn a safe
+        // discard into a spurious process fail-stop.
+        let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
+        if coin_dirty > 0 || batch.tip.is_some() {
+            self.note_mutation();
+        }
         // Honor the caller's explicit mode for the inner-store call.
         // The default trait impl ignores `mode` and delegates to
         // `write_batch`, which would then use `current_write_mode()`
         // — defeating the backfill runner's intent of forcing
         // WriteMode::Normal mid-IBD. See PR #93 review finding #4.
         // Absorb coin operations into dirty map
-        let coin_dirty = batch.coin_puts.len() + batch.coin_removes.len();
         if coin_dirty > 0 {
             let mut dirty = self.dirty.write();
             let mut clean = self.clean.lock();
@@ -3296,6 +3322,68 @@ mod tests {
         }
         assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
         assert_eq!(cache.dirty_count(), 0);
+    }
+
+    /// A coin-free, tip-less batch — an index backfill's rows, a prune's
+    /// status stamps, `store_block` recording an arrival — takes the
+    /// pass-through branch straight into the inner store, where
+    /// `discard_uncommitted` cannot touch it. It is therefore not a foreign
+    /// write, and must not turn an aborted reorg into a process fail-stop:
+    /// a multi-hour address backfill beside an operator `invalidateblock`
+    /// is a supported combination, not corruption. Removing the
+    /// discardable-content gate on the `note_mutation` call makes this
+    /// fail.
+    #[test]
+    fn a_coin_free_pass_through_write_is_not_a_foreign_write() {
+        let cache = make_cache(10);
+
+        // A reorg takes the exclusion and stages a delta of its own.
+        let excl = cache.lock_flush_exclusion();
+        let mine = make_outpoint(0xD7, 0);
+        let mut delta = StoreBatch::default();
+        delta.coin_puts.push((mine, make_coin(6_000, 2)));
+        cache.write_batch(delta).unwrap();
+
+        // Another thread lands a coin-free pass-through write mid-window —
+        // the shape of every backfill and prune batch.
+        let entry = make_test_entry(9);
+        let hash = entry.header.block_hash();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut b = StoreBatch::default();
+                b.block_index_puts.push((hash, entry));
+                cache.write_batch(b).unwrap();
+            });
+        });
+
+        // The discard is refused by nothing: the pass-through write is not
+        // part of the discardable delta.
+        assert_eq!(cache.discard_uncommitted(&excl), Ok(()));
+        // And it survived the discard — it was never in the delta.
+        assert!(
+            cache.get_block_index(&hash).is_some(),
+            "the pass-through row must survive a discard untouched"
+        );
+        // A tip-carrying batch, by contrast, IS discardable state and does
+        // trip the guard even with no coins aboard. (Drop the first
+        // exclusion before taking the second: shadowing would run the
+        // non-reentrant acquisition while the old guard is still alive.)
+        drop(excl);
+        let excl = cache.lock_flush_exclusion();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let b = StoreBatch {
+                    tip: Some(bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash()),
+                    ..Default::default()
+                };
+                cache.write_batch(b).unwrap();
+            });
+        });
+        assert_eq!(
+            cache.discard_uncommitted(&excl),
+            Err(DiscardRefused::ForeignWrite),
+            "a foreign tip write is discardable state and must be flagged"
+        );
     }
 
     /// The guard is scoped to the exclusion, not to the life of the process:

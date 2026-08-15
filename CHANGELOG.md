@@ -22,13 +22,17 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   `phase=waiting_for_accept_lock`.
 - The reorg rollback no longer trusts that the coin cache holds only its own
   work: a rollback that would discard another thread's writes refuses and
-  stops the node without flushing, leaving the last consistent chainstate on
-  disk, rather than silently destroying the other writer's blocks.
+  stops the node without flushing, leaving a consistent chainstate on disk,
+  rather than silently destroying the other writer's blocks. Only writes the
+  rollback could actually destroy count — coin-free index writes (backfills,
+  prune stamps, arriving blocks) pass straight through to disk and are
+  exempt, so a backfill running beside an operator reorg is not misread as
+  corruption.
 - Fixed: on an AssumeUTXO node, the background chainstate wrote block-index and
   height rows into the snapshot chainstate's coin cache without serialising
-  against that chainstate's reorgs, so a failed reorg could discard rows the
-  background had already committed and moved past. Those writes now take the
-  same lock, held only for the write itself.
+  against that chainstate's reorgs — interleaving with the one buffer a reorg
+  rollback reasons about. Those writes now take the same lock, held only for
+  the write itself.
 - Fixed: satd could advance its chain tip onto blocks it had never connected,
   serving a UTXO set silently missing every output those blocks created while
   reporting a healthy synced tip. Every connect path — both sequential (IBD)

@@ -46,14 +46,19 @@ pub struct SplitStore {
     ///
     /// The block store is that chainstate's `CoinCache`, so the background
     /// catch-up thread is a second writer into a cache the snapshot
-    /// chainstate reorgs. A reorg holds `accept_lock` from its checkpoint
-    /// flush through to its commit or abort, so taking it here is enough to
-    /// keep a background write from landing *inside* that window — where an
-    /// abort's `discard_uncommitted` would throw the rows away, leaving holes
-    /// in a shared block index the background will never revisit. It does not
-    /// need to be held across the background's own validation work, which
-    /// touches only the private store, so the contention is one write's worth
-    /// per background block.
+    /// chainstate reorgs. The background's batches are coin-free, which
+    /// means they take the cache's pass-through branch — a discard cannot
+    /// destroy them — but the pass-through is not free of shared state: it
+    /// prunes superseded entries out of the cache's pending batch on the
+    /// way through, a mutation that must not interleave with a reorg
+    /// staging entries into that same buffer. A reorg holds `accept_lock`
+    /// from its checkpoint flush through to its commit or abort, so taking
+    /// it here serializes the background write against the whole window
+    /// and keeps the holder list's claim — one chain mutator at a time —
+    /// true on the AssumeUTXO path too. It does not need to be held across
+    /// the background's own validation work, which touches only the
+    /// private store, so the contention is one write's worth per
+    /// background block.
     ///
     /// `None` for a `SplitStore` with no chainstate above it (tests).
     block_store_lock: Option<Arc<parking_lot::Mutex<()>>>,
@@ -286,13 +291,13 @@ mod tests {
     }
 
     /// The background catch-up thread writes block-index rows into the
-    /// *snapshot* chainstate's coin cache, which that chainstate reorgs. A
-    /// reorg holds `accept_lock` from its checkpoint flush through to its
-    /// commit or abort, so holding the same lock around this write is what
-    /// keeps a background row from landing inside that window — where the
-    /// abort's `discard_uncommitted` would throw it away, leaving a hole in a
-    /// shared block index the background has already moved past. Same defect
-    /// as #567, on the AssumeUTXO path.
+    /// *snapshot* chainstate's coin cache, which that chainstate reorgs.
+    /// Holding the chainstate's `accept_lock` around the write serializes
+    /// it against a reorg's whole window — the write mutates the cache's
+    /// shared pending batch on its way through (see `block_store_lock`), so
+    /// letting it land mid-reorg would interleave two writers in the one
+    /// buffer the rollback reasons about. The unserialized version of this
+    /// is the #567 defect shape, on the AssumeUTXO path.
     ///
     /// Proof shape: while the lock is held, the write cannot complete no
     /// matter how far its thread has progressed, because it needs the lock.

@@ -5988,10 +5988,15 @@ impl ChainState {
     ///
     /// So: abort. Nothing has been flushed since the reorg's checkpoint —
     /// the exclusion held throughout is what guarantees that — so the disk
-    /// still holds the consistent pre-reorg chainstate, and `abort()` rather
-    /// than `exit()` is deliberate: no destructor runs, no shutdown flush
-    /// gets the chance to persist the poisoned cache. The node restarts onto
-    /// the checkpoint and redoes the work.
+    /// holds a consistent chainstate at (or, in bulk-load mode, before) the
+    /// pre-reorg checkpoint: with the WAL disabled the checkpoint flush may
+    /// still be sitting in RocksDB memtables that an `abort()` forfeits, in
+    /// which case the disk regresses to the last SST flush and startup
+    /// replays the difference from the block files, exactly as after any
+    /// bulk-load crash. `abort()` rather than `exit()` is deliberate: no
+    /// destructor runs, no shutdown flush gets the chance to persist the
+    /// poisoned cache. The node restarts onto a consistent state and redoes
+    /// the work.
     ///
     /// Reaching this means a chain mutator is running without `accept_lock`.
     /// The operator gets the audit command for the same reason the startup
@@ -6005,14 +6010,15 @@ impl ChainState {
             tip = %self.tip_hash(),
             tip_height = self.tip_height(),
             "FATAL: refusing to roll back a reorg over another thread's writes. \
-             Stopping the node without flushing; the on-disk chainstate is the \
-             pre-reorg checkpoint. Verify it with satd-chainstate-audit before \
-             restarting."
+             Stopping the node without flushing; the on-disk chainstate is \
+             consistent at or before the pre-reorg checkpoint. Verify it with \
+             satd-chainstate-audit before restarting."
         );
         eprintln!(
             "FATAL: refusing to roll back a reorg over another thread's writes \
              ({reason}). Stopping without flushing — the on-disk chainstate is \
-             the last consistent checkpoint. Check it with satd-chainstate-audit."
+             consistent at or before the last checkpoint. Check it with \
+             satd-chainstate-audit."
         );
         // A test build panics instead, so the guard is reachable from a test
         // (`abort_reorg_fail_stops_rather_than_discarding_a_foreign_write`)
@@ -8605,10 +8611,26 @@ pub(crate) mod tests {
         let panicked = {
             let excl = cs.store_ref().lock_flush_exclusion();
 
-            // Someone else mutates the cache inside the reorg's window.
+            // Someone else mutates the discardable delta inside the reorg's
+            // window — a coin-carrying batch with its height row, the shape
+            // of the #567 connector's writes. (A coin-free batch would take
+            // the pass-through and be exempt by design; see
+            // `a_coin_free_pass_through_write_is_not_a_foreign_write`.)
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let mut b = crate::storage::StoreBatch::default();
+                    b.coin_puts.push((
+                        OutPoint {
+                            txid: blocks[1].txdata[0].compute_txid(),
+                            vout: 7,
+                        },
+                        crate::storage::coinview::Coin {
+                            amount: 1_000,
+                            script_pubkey: bitcoin::ScriptBuf::from(vec![0x51u8]),
+                            height: 99,
+                            coinbase: false,
+                        },
+                    ));
                     b.height_hash_puts.push((99, tip));
                     cs.store.write_batch(b).unwrap();
                 });
