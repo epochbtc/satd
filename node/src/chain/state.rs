@@ -3064,10 +3064,24 @@ impl ChainState {
             return Err(ChainError::BadPrevBlock);
         }
 
-        // Block must be in DataStored state
-        if pre.entry.status != BlockStatus::DataStored {
-            phases.enter(ConnectPhase::Idle);
-            return Err(ChainError::Duplicate);
+        // Block must be in DataStored state — judged on the entry re-read
+        // under the lock, never on the prefetched copy. `pre.entry` was
+        // captured before the lock wait, and the one mutation the prev==tip
+        // check above cannot see is a status change on this block itself: an
+        // `invalidateblock` of a stored-but-unconnected child of the tip
+        // marks it `Invalid` without moving the tip, so connecting from the
+        // stale copy would write `Valid` straight over the operator's mark.
+        // (`connect_stored_block` re-reads its entry for the same reason.)
+        match self.store.get_block_index(&pre.hash) {
+            Some(entry) if entry.status == BlockStatus::DataStored => {}
+            Some(_) => {
+                phases.enter(ConnectPhase::Idle);
+                return Err(ChainError::Duplicate);
+            }
+            None => {
+                phases.enter(ConnectPhase::Idle);
+                return Err(ChainError::BadPrevBlock);
+            }
         }
 
         // The tip must be a block whose coins were actually applied, not just
@@ -6841,7 +6855,13 @@ impl ChainState {
     /// `keep_blocks` is the number of recent blocks to keep data for.
     /// Returns the number of files deleted.
     pub fn prune_blocks(&self, keep_blocks: u32) -> u32 {
-        let tip_height = self.tip_height();
+        // One consistent snapshot of the tip the plan below is computed
+        // against. The mutation section revalidates this exact (hash,
+        // height) pair under `accept_lock` before acting on the plan.
+        let (planned_tip, tip_height) = {
+            let tip = self.tip.read();
+            (tip.hash, tip.height)
+        };
         if tip_height <= keep_blocks {
             return 0;
         }
@@ -6873,13 +6893,37 @@ impl ChainState {
         }
 
         let mut deleted = 0u32;
-        // The walk above is read-only and conservatively stale-safe (a tip
-        // advancing under it only shrinks what is pruneable), but the
-        // mutation below — deleting block files and stamping `Pruned` — must
-        // not interleave with a reorg reading old blocks or with any other
-        // chain mutator. Hold `accept_lock` for the mutation section, and
-        // take it before `flat_files` to match the connector's lock order.
+        // The walk above is read-only and ran unlocked, so by the time the
+        // mutation below — deleting block files and stamping `Pruned` — gets
+        // the lock, the plan can be stale. Hold `accept_lock` for the whole
+        // mutation section so it cannot interleave with a reorg reading old
+        // blocks or with any other chain mutator. Lock nesting here is
+        // `accept_lock` → `flat_files`, the only nesting order in this file:
+        // `store_block` and `repair_block_data` both release the flat-file
+        // mutex (inside `write_block_durable`) before taking `accept_lock`,
+        // so no path ever holds `flat_files` while waiting on `accept_lock`.
         let _accept_guard = self.accept_lock.lock();
+
+        // Revalidate the plan now that the chain can no longer move. A tip
+        // that *advanced* along the same chain keeps the plan conservative —
+        // new blocks land at heights above the walk's range, in the current
+        // append file (which `delete_file` refuses) or a newer one that is in
+        // neither list. But a reorg that *retreated* the tip while the walk
+        // ran — an `invalidateblock` deeper than `keep_blocks` — falsifies
+        // `keep_files`: the new, shorter chain's recent blocks can sit in
+        // `pruneable_files`, and executing the plan would delete the active
+        // chain's own files and stamp its blocks `Pruned`. The planned tip
+        // still sitting at its planned height on the active chain proves the
+        // whole ancestry the plan was computed from is unchanged (a block
+        // hash pins every ancestor below it); anything else means the plan
+        // is stale — skip this round and let the next prune cycle re-plan.
+        if self.store.get_block_hash_by_height(tip_height) != Some(planned_tip) {
+            tracing::info!(
+                planned_height = tip_height,
+                "prune plan is stale (the chain reorganized during the walk); skipping this round"
+            );
+            return 0;
+        }
         let mut flat_files = self.flat_files.lock();
         let mut batch = crate::storage::StoreBatch::default();
 
@@ -8540,6 +8584,126 @@ pub(crate) mod tests {
             drop(guard);
         });
         assert!(done.load(Ordering::SeqCst), "prune completes once the lock is free");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prune plan computed against a tip that then retreats (a reorg
+    /// finishing while the prune waited on `accept_lock`) must be thrown
+    /// away, not executed: its `keep_files` no longer protects the active
+    /// chain, so the stale plan would delete the new chain's block files and
+    /// stamp its blocks `Pruned`. Deleting the planned-tip revalidation in
+    /// `prune_blocks`' mutation section makes this fail: the stale plan runs
+    /// and file 0 — still holding active-chain blocks — is deleted.
+    #[test]
+    fn a_stale_prune_plan_is_skipped_not_executed() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        // Blocks 1..=6 land in flat file 0.
+        let mut parent = genesis_hash;
+        let mut hashes = vec![genesis_hash];
+        for i in 1..=6u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).unwrap();
+            hashes.push(parent);
+        }
+
+        // Rotate the append file the way a restart after rotation would:
+        // `FlatFileManager::new` adopts the highest-numbered file present.
+        // Blocks 7..=8 then land in file 1, leaving file 0 deletable.
+        std::fs::write(cs.blocks_dir().join("blk00001.dat"), b"").unwrap();
+        *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
+        for i in 7..=8u32 {
+            let block = build_test_block(parent, i, 1_300_000_000 + i);
+            parent = cs.accept_block(&block).unwrap();
+            hashes.push(parent);
+        }
+        assert_eq!(cs.tip_height(), 8);
+
+        // Simulate the reorg the plan cannot see: the active chain retreats
+        // below the planned tip, so the height rows the plan was computed
+        // from no longer describe heights 6..=8. (The in-memory tip snapshot
+        // `prune_blocks` takes still says height 8 — exactly the stale pair
+        // the revalidation must catch.)
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_removes.extend([6u32, 7, 8]);
+        cs.store.write_batch(batch).unwrap();
+
+        let deleted = cs.prune_blocks(2);
+        assert_eq!(deleted, 0, "a stale plan must be skipped, not executed");
+        assert!(
+            cs.flat_files.lock().file_exists(0),
+            "file 0 still holds active-chain blocks and must survive"
+        );
+        assert!(
+            cs.get_block(&hashes[3]).is_some(),
+            "blocks planned as pruneable stay readable"
+        );
+        assert_ne!(
+            cs.get_block_index(&hashes[3]).unwrap().status,
+            BlockStatus::Pruned,
+            "no Pruned stamp lands from a stale plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `connect_preprocessed_block` must judge the block's status on the
+    /// entry as it stands under `accept_lock`, not on the prefetched copy.
+    /// An `invalidateblock` of a stored-but-unconnected child of the tip
+    /// marks it `Invalid` without moving the tip, so the prev==tip re-check
+    /// cannot catch it — only re-reading the entry can. Deleting the
+    /// under-lock status re-read makes this fail: the connect writes `Valid`
+    /// over the operator's `Invalid` mark.
+    #[test]
+    fn connect_preprocessed_block_rereads_the_status_under_the_lock() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let b4 = build_test_block(blocks[2].block_hash(), 4, 1_600_000_004);
+        cs.accept_header(&b4.header).unwrap();
+        cs.store_block(&b4).unwrap();
+
+        // The prefetcher captures the entry while it is still DataStored.
+        let entry = cs.get_block_index(&b4.block_hash()).unwrap();
+        assert_eq!(entry.status, BlockStatus::DataStored);
+        let parent = cs.get_block_index(&blocks[2].block_hash()).unwrap();
+        let pre = crate::chain::prefetch::PreprocessedBlock {
+            height: 4,
+            hash: b4.block_hash(),
+            block: b4.clone(),
+            flat_pos: FlatFilePos {
+                file_number: entry.file_number,
+                data_pos: entry.data_pos,
+            },
+            mtp: 0,
+            txids: b4.txdata.iter().map(|t| t.compute_txid()).collect(),
+            script_verified_txs: Default::default(),
+            context_free_checked: true,
+            entry,
+            parent,
+        };
+
+        // The operator invalidates the stored-but-unconnected block: the tip
+        // does not move, only the status changes.
+        cs.invalidate_block(b4.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), blocks[2].block_hash());
+        assert_eq!(
+            cs.get_block_index(&b4.block_hash()).unwrap().status,
+            BlockStatus::Invalid
+        );
+
+        let err = cs.connect_preprocessed_block(pre).unwrap_err();
+        assert!(
+            matches!(err, ChainError::Duplicate),
+            "the stale DataStored prefetch must be refused, got {err:?}"
+        );
+        assert_eq!(
+            cs.get_block_index(&b4.block_hash()).unwrap().status,
+            BlockStatus::Invalid,
+            "the operator's Invalid mark survives the connector"
+        );
+        assert_eq!(cs.tip_hash(), blocks[2].block_hash(), "the tip did not move");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
