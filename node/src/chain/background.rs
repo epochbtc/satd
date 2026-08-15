@@ -149,6 +149,7 @@ impl BackgroundChainState {
         target_utxo_hash: [u8; 32],
         dbcache_mb: u64,
         max_open_files: i32,
+        block_store_lock: Option<Arc<parking_lot::Mutex<()>>>,
     ) -> Result<Self, ChainError> {
         let bg_db = RocksDbStore::open_at(
             &bg_dir,
@@ -177,6 +178,7 @@ impl BackgroundChainState {
         let split = Arc::new(SplitStore::new(
             block_store,
             coins.clone() as Arc<dyn Store>,
+            block_store_lock,
         ));
 
         Ok(Self {
