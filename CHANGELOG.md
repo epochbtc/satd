@@ -11,6 +11,12 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed (#583): three insert-after-invalidate races let the coin cache's
+  clean LRU resurrect a coin a concurrent disconnect had just retired — an
+  in-memory phantom UTXO over a correct disk, observed as a multi-day
+  `bad-txns-BIP30` connect wedge that a restart cleared. The LRU now carries
+  an invalidation generation and the read-through/promotion inserts decline
+  when it moves.
 - Fixed (consensus, #581): transaction finality now matches Core exactly. The
   coinbase is subject to the finality check like every other transaction, and
   the locktime cutoff is strict — a locktime equal to the connecting height
