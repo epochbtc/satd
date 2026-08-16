@@ -4266,6 +4266,11 @@ impl PeerManager {
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
             | MempoolError::TooLongMempoolChain
+            // Non-final for the *next* block is tip-relative, not misbehavior:
+            // a peer one block behind (or ahead) legitimately relays these.
+            // Core classes them TX_PREMATURE_SPEND, which it does not score.
+            | MempoolError::NonFinal
+            | MempoolError::NonBip68Final
             // Local-submission-only refusal (§6.1); P2P traffic never produces it
             // and it is never peer misbehavior.
             | MempoolError::Quarantined(_) => 0,

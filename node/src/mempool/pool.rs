@@ -62,6 +62,14 @@ pub enum MempoolError {
     BadAmounts,
     #[error("bad-txns-premature-spend-of-coinbase")]
     PrematureCoinbaseSpend,
+    /// The transaction's absolute locktime is not satisfied for the next
+    /// block (#588). Core's mempool reject string.
+    #[error("non-final")]
+    NonFinal,
+    /// A BIP 68 relative locktime is not satisfied for the next block
+    /// (#588). Core's mempool reject string.
+    #[error("non-BIP68-final")]
+    NonBip68Final,
     #[error("TX decode failed")]
     DecodeFailed,
     #[error("dust")]
@@ -1654,6 +1662,45 @@ impl Mempool {
     }
 
     /// Accept a transaction into the mempool after full validation.
+    /// BIP 68 (#588): is `seq`'s relative lock satisfied for a prevout
+    /// confirming at `prev_height`, spent by a transaction in a block at
+    /// `next_height` whose MTP context is `tip_mtp`? Mirrors the consensus
+    /// arithmetic in `chain::connect`: the disable flag (bit 31, which
+    /// SEQUENCE_FINAL also carries) skips enforcement; the type flag
+    /// (bit 22) selects 512-second units anchored at the prevout block's
+    /// MTP context — `get_median_time_past(h)` is the median over the 11
+    /// blocks strictly below `h`, i.e. Core's
+    /// `GetAncestor(h-1)->GetMedianTimePast()`.
+    pub(crate) fn bip68_satisfied(
+        chain_state: &ChainState,
+        seq: u32,
+        prev_height: u32,
+        next_height: u32,
+        tip_mtp: u32,
+    ) -> bool {
+        const DISABLE_FLAG: u32 = 1 << 31;
+        const TYPE_FLAG: u32 = 1 << 22;
+        const MASK: u32 = 0x0000_ffff;
+        if seq & DISABLE_FLAG != 0 {
+            return true;
+        }
+        if seq & TYPE_FLAG != 0 {
+            let required_seconds = ((seq & MASK) as u64) << 9;
+            let prev_mtp = chain_state.get_median_time_past(prev_height) as u64;
+            (tip_mtp as u64).saturating_sub(prev_mtp) >= required_seconds
+        } else {
+            next_height.saturating_sub(prev_height) >= (seq & MASK)
+        }
+    }
+
+    /// Every txid currently in the mempool, regardless of quarantine
+    /// scope. Template assembly uses this to distinguish "input is a
+    /// confirmed coin" from "input depends on another mempool
+    /// transaction" (#589).
+    pub fn all_txids(&self) -> std::collections::HashSet<Txid> {
+        self.inner.read().entries.keys().copied().collect()
+    }
+
     pub fn accept_transaction(
         &self,
         tx: Transaction,
@@ -1689,6 +1736,39 @@ impl Mempool {
                 "coinbase not accepted in mempool".to_string(),
             ));
         }
+
+        // Absolute finality with next-block semantics (#588; Core:
+        // `CheckFinalTxAtTip` → `IsFinalTx(tx, tip_height + 1, tip MTP)`).
+        // A transaction the next block cannot legally include would flow
+        // straight into `getblocktemplate` and mine an invalid block.
+        // Final iff the locktime is zero, the locktime is *strictly* below
+        // the cutoff — the next block's height for height locktimes, the
+        // tip's MTP for time locktimes (BIP 113 semantics, which the
+        // policy layer applies unconditionally as Core does) — or every
+        // input's sequence is SEQUENCE_FINAL.
+        let next_height = chain_state.tip_height() + 1;
+        let locktime = tx.lock_time.to_consensus_u32();
+        if locktime > 0
+            && !tx
+                .input
+                .iter()
+                .all(|i| i.sequence == bitcoin::Sequence::MAX)
+        {
+            let cutoff = if locktime < 500_000_000 {
+                next_height
+            } else {
+                chain_state.get_median_time_past(next_height)
+            };
+            if locktime >= cutoff {
+                return Err(MempoolError::NonFinal);
+            }
+        }
+
+        // BIP 68 gate for the per-input checks during resolution below.
+        // The version comparison is unsigned, as in Core's
+        // `static_cast<uint32_t>(tx.nVersion) >= 2`.
+        let bip68_enforced = (tx.version.0 as u32) >= 2;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
 
         // Standardness relay checks (oversize, dust, OP_RETURN/datacarrier,
         // non-standard output scripts). Bitcoin Core's `-acceptnonstdtxn`
@@ -1760,6 +1840,19 @@ impl Mempool {
                 if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
                     return Err(MempoolError::PrematureCoinbaseSpend);
                 }
+                // BIP 68 (#588): a confirmed prevout anchors its relative
+                // lock at its real confirmation height / MTP context.
+                if bip68_enforced
+                    && !Self::bip68_satisfied(
+                        chain_state,
+                        input.sequence.0,
+                        coin.height,
+                        next_height,
+                        tip_mtp,
+                    )
+                {
+                    return Err(MempoolError::NonBip68Final);
+                }
                 sum_inputs += coin.amount;
                 prev_outputs.push(TxOut {
                     value: bitcoin::Amount::from_sat(coin.amount),
@@ -1775,6 +1868,22 @@ impl Mempool {
             if let Some(parent) = inner.entries.get(&parent_txid)
                 && let Some(output) = parent.tx.output.get(parent_vout)
             {
+                // BIP 68 (#588): an unconfirmed parent is treated as
+                // confirming at `tip + 1` (Core's mempool-height
+                // convention), which makes any nonzero height-based
+                // relative lock on it unsatisfiable — the property CPFP
+                // composition relies on.
+                if bip68_enforced
+                    && !Self::bip68_satisfied(
+                        chain_state,
+                        input.sequence.0,
+                        next_height,
+                        next_height,
+                        tip_mtp,
+                    )
+                {
+                    return Err(MempoolError::NonBip68Final);
+                }
                 ancestors.insert(parent_txid);
                 sum_inputs += output.value.to_sat();
                 prev_outputs.push(output.clone());
@@ -3141,6 +3250,45 @@ impl Mempool {
         );
         inner.unbroadcast.entry(txid).or_default();
         self.sync_unbroadcast_len(&inner);
+    }
+
+    /// Test-only: insert a fully-formed entry for `tx` with the given fee,
+    /// weight and quarantine `scope`, bypassing admission. Template tests
+    /// use this to stage shapes admission would refuse (#588) or fee-rate
+    /// inversions between dependent transactions (#589).
+    pub(crate) fn insert_tx_weighted_for_test(
+        &self,
+        tx: Transaction,
+        fee: u64,
+        weight: usize,
+        scope: QuarantineScope,
+    ) -> Txid {
+        let txid = tx.compute_txid();
+        let fee_rate = fee * 1000 / weight.max(1) as u64;
+        let mut inner = self.inner.write();
+        for input in &tx.input {
+            inner.spends.insert(input.previous_output, txid);
+        }
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee,
+                weight,
+                fee_rate,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                source: TxSource::Rpc,
+                scope,
+                quarantine_rule: None,
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
+                sp_tweak: None,
+            },
+        );
+        txid
     }
 
     /// Test-only: insert a minimal entry with an explicit quarantine `scope`,
@@ -6210,5 +6358,175 @@ mod tests {
         for t in mp.get_all_entries().into_iter().map(|(t, _)| t) {
             assert_eq!(mp.get_descendants(&t), brute_descendants(&mp, &t));
         }
+    }
+
+    // ───────────── Finality & BIP 68 at admission (#588) ─────────────
+    //
+    // Environment facts these lean on: `make_funded_env` sits at the
+    // regtest genesis (tip 0, next block height 1), so the tip's MTP is
+    // the genesis timestamp, and `get_median_time_past(0)` — an empty
+    // window — is 0.
+
+    /// `spend` with explicit version / sequence / locktime.
+    fn spend_with(
+        prev: OutPoint,
+        out_value: u64,
+        out_tag: u8,
+        version: i32,
+        sequence: u32,
+        locktime: u32,
+    ) -> Transaction {
+        let mut tx = spend(prev, out_value, out_tag);
+        tx.version = bitcoin::transaction::Version(version);
+        tx.lock_time = bitcoin::absolute::LockTime::from_consensus(locktime);
+        tx.input[0].sequence = bitcoin::Sequence(sequence);
+        tx
+    }
+
+    fn coin_at(amount: u64, height: u32) -> Coin {
+        Coin {
+            amount,
+            script_pubkey: p2wpkh_spk(0x11),
+            height,
+            coinbase: false,
+        }
+    }
+
+    #[test]
+    fn a_locktime_the_next_block_cannot_satisfy_is_nonfinal() {
+        // locktime == next height (strict cutoff: not final), non-final
+        // sequence → rejected `non-final`, Core's mempool verdict.
+        let op = outpoint(0xE1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let tx = spend_with(op, 40_000, 0x21, 2, 0, 1);
+        let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonFinal)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_final_sequence_makes_any_locktime_final() {
+        // Same unsatisfied locktime, but SEQUENCE_FINAL on every input
+        // disables locktime entirely (Core's IsFinalTx escape hatch).
+        let op = outpoint(0xE2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let tx = spend_with(op, 40_000, 0x22, 2, 0xffff_ffff, 1_000_000);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("final-sequence tx admits despite its locktime");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_time_locktime_at_the_tip_mtp_is_nonfinal() {
+        // Time locktimes cut off at the tip's MTP, strictly: equal is
+        // non-final, one below is final.
+        let op = outpoint(0xE3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let tip_mtp = cs.get_median_time_past(1);
+        assert!(tip_mtp >= 500_000_000, "regtest genesis time is a time-locktime");
+
+        let at = spend_with(op, 40_000, 0x23, 2, 0, tip_mtp);
+        let r = mp.accept_transaction(at, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonFinal)), "{r:?}");
+
+        let below = spend_with(op, 40_000, 0x23, 2, 0, tip_mtp - 1);
+        mp.accept_transaction(below, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("locktime strictly below the tip MTP is final");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unmet_bip68_height_lock_is_rejected() {
+        // Coin confirmed at height 1, spend evaluated at height 1: zero
+        // blocks elapsed, so a 1-block relative lock is unmet. The same
+        // lock on a coin from height 0 has 1 block elapsed and admits.
+        let op = outpoint(0xE4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let tx = spend_with(op, 40_000, 0x24, 2, 1, 0);
+        let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let op2 = outpoint(0xE5);
+        let (cs, mp, dir) = make_funded_env(&[(op2, coin_at(50_000, 0))]);
+        let tx = spend_with(op2, 40_000, 0x25, 2, 1, 0);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("1-block lock on a height-0 coin is met at height 1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unmet_bip68_time_lock_is_rejected() {
+        // Coin at height 1: its MTP anchor equals the tip's MTP, so zero
+        // seconds have elapsed and one 512s unit is unmet. A coin at
+        // height 0 anchors at MTP 0 (empty window), so the whole genesis
+        // timestamp has "elapsed" and the same lock is met.
+        let op = outpoint(0xE6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let seq_time_1 = (1u32 << 22) | 1;
+        let tx = spend_with(op, 40_000, 0x26, 2, seq_time_1, 0);
+        let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let op2 = outpoint(0xE7);
+        let (cs, mp, dir) = make_funded_env(&[(op2, coin_at(50_000, 0))]);
+        let tx = spend_with(op2, 40_000, 0x27, 2, seq_time_1, 0);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("time lock anchored at an empty MTP window is met");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bip68_disable_flag_and_v1_both_skip_enforcement() {
+        // Disable flag set → no enforcement even with a lock value.
+        let op = outpoint(0xE8);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let tx = spend_with(op, 40_000, 0x28, 2, (1 << 31) | 5, 0);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("disable flag skips BIP 68");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Version 1 → BIP 68 does not apply.
+        let op2 = outpoint(0xE9);
+        let (cs, mp, dir) = make_funded_env(&[(op2, coin_at(50_000, 1))]);
+        let tx = spend_with(op2, 40_000, 0x29, 1, 1, 0);
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("version-1 tx skips BIP 68");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_high_bit_version_still_enforces_bip68_at_admission() {
+        // Core's version gate is unsigned; 0x80000002 enforces.
+        let op = outpoint(0xEA);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let tx = spend_with(op, 40_000, 0x2A, 0x8000_0002u32 as i32, 1, 0);
+        let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_height_lock_on_an_unconfirmed_parent_is_unsatisfiable() {
+        // A mempool parent is treated as confirming at tip+1, so any
+        // nonzero height-based relative lock on it is unmet — the CPFP
+        // property. The same spend with a zero lock value admits.
+        let op = outpoint(0xEB);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let parent = spend(op, 40_000, 0x2B);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent admits");
+
+        let child_prev = OutPoint { txid: parent_txid, vout: 0 };
+        let locked_child = spend_with(child_prev, 30_000, 0x2C, 2, 1, 0);
+        let r = mp.accept_transaction(locked_child, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
+
+        let free_child = spend_with(child_prev, 30_000, 0x2C, 2, 0, 0);
+        mp.accept_transaction(free_child, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("zero lock value on a mempool parent admits");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
