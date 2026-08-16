@@ -27,6 +27,10 @@ pub struct McpContext {
     /// `get_metrics_snapshot` tool must report the same `satd_spindex_enabled`
     /// value as the HTTP scrape, not a hardcoded zero.
     pub sp_enabled: bool,
+    /// Whether the BIP 158 block-filter index is enabled at runtime.
+    /// Mirrors `MetricsContext::filter_enabled` (#558) for the same
+    /// reason as the other two `enabled` bits.
+    pub filter_enabled: bool,
     /// Subscription registry handle for the active-subscribers gauge.
     /// `None` in tests that bypass main.rs.
     pub addr_subs: Option<Arc<node::index::address::SubscriptionRegistry>>,

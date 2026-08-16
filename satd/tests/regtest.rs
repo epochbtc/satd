@@ -3531,6 +3531,16 @@ fn test_metrics_and_health_endpoints() {
         // the property alerting rules depend on.
         "satd_spindex_backfill_state{state=\"failed\"} 0",
         "satd_spindex_backfill_state{state=\"idle\"} 1",
+        // Address- and filter-index readiness (#558): the same
+        // alertability guarantee as the silent-payment family — a dropped
+        // emission must fail here, not just orphan an alert rule.
+        "satd_addrindex_synced",
+        "satd_addrindex_backfill_state{state=\"failed\"} 0",
+        "satd_addrindex_backfill_state{state=\"idle\"} 1",
+        "satd_filterindex_enabled",
+        "satd_filterindex_synced",
+        "satd_filterindex_backfill_state{state=\"failed\"} 0",
+        "satd_filterindex_backfill_state{state=\"idle\"} 1",
     ] {
         assert!(
             body.contains(required),

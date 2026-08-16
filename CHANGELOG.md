@@ -11,6 +11,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Added (#558): index-readiness metrics for the address and block-filter
+  indexes — `satd_addrindex_synced` + `satd_addrindex_backfill_state`, and
+  `satd_filterindex_enabled`/`_synced`/`_backfill_state` — mirroring the
+  silent-payment family, so a failed or stuck backfill is visible to
+  Prometheus on all three DB-backed indexes.
 - Fixed (#555): the coin cache did not forward the filter-index backfill
   cursor reads to the backing store, so a paused or interrupted filter
   backfill read back as `idle` after a restart and never auto-resumed, its

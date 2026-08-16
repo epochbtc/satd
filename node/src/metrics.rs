@@ -53,6 +53,12 @@ pub struct MetricsContext {
     /// the same reason as `addr_enabled`: without it, a `0.0` backfill-progress
     /// reading cannot be told apart from the index being switched off.
     pub sp_enabled: bool,
+    /// Block-filter-index runtime config (`-blockfilterindex=basic`),
+    /// exported as an `enabled` gauge (#558). Plain bool even when the
+    /// `block-filter-index` cargo feature is compiled out, so constructors
+    /// don't need cfg-gating; the filter metric family itself is only
+    /// rendered when the feature is on.
+    pub filter_enabled: bool,
     /// Live readings from the health detectors. `None` in test backends and
     /// anywhere the detector task was not spawned, in which case the health
     /// gauges are omitted entirely rather than reported as zeros (a zero
@@ -305,6 +311,90 @@ impl MetricsContext {
                 &[],
                 subs.active_count() as u64,
             );
+        }
+
+        // Address-index readiness (#558). The `enabled` gauge above reports
+        // the config bit; these report whether the address surfaces will
+        // actually serve. Same shape as the silent-payment family below
+        // (#535/#554): `synced` matches `getindexinfo`'s `address.synced`
+        // predicate (enabled AND no backfill mid-flight), and the state
+        // family always emits every series so an alert on `state="failed"`
+        // can be written before it has ever fired.
+        let addr_cursor = self.chain_state.store_ref().read_backfill_cursor();
+        let addr_synced = self.addr_enabled
+            && matches!(
+                addr_cursor.state,
+                crate::index::address::cursor::BackfillState::Idle
+                    | crate::index::address::cursor::BackfillState::Completed
+            );
+        metric(
+            &mut out,
+            "satd_addrindex_synced",
+            "1 if the address index is enabled and has no backfill in flight - i.e. the Electrum / Esplora address surfaces will serve. Matches getindexinfo's address.synced.",
+            "gauge",
+            &[],
+            u64::from(addr_synced),
+        );
+        metric_header(
+            &mut out,
+            "satd_addrindex_backfill_state",
+            "Current state of the address-index deferred backfill: exactly one series is 1, the rest are 0.",
+            "gauge",
+        );
+        for state in crate::index::address::cursor::BackfillState::ALL {
+            metric_sample(
+                &mut out,
+                "satd_addrindex_backfill_state",
+                &[("state", state.label())],
+                u64::from(state == addr_cursor.state),
+            );
+        }
+
+        // BIP 158 filter-index readiness (#558). Previously the filter index
+        // exported no metric of any kind, so a failed backfill — which takes
+        // the BIP 157 P2P service and `getblockfilter` offline — was
+        // invisible to Prometheus.
+        #[cfg(feature = "block-filter-index")]
+        {
+            use crate::index::filter::cursor::BackfillState as FilterBackfillState;
+            let filter_complete = self.chain_state.store_ref().block_filter_index_complete();
+            let filter_cursor = self.chain_state.store_ref().read_filter_backfill_cursor();
+            metric(
+                &mut out,
+                "satd_filterindex_enabled",
+                "1 if the BIP 158 block-filter index is enabled at runtime, 0 otherwise.",
+                "gauge",
+                &[],
+                u64::from(self.filter_enabled),
+            );
+            let filter_synced = self.filter_enabled
+                && filter_complete
+                && matches!(
+                    filter_cursor.state,
+                    FilterBackfillState::Idle | FilterBackfillState::Completed
+                );
+            metric(
+                &mut out,
+                "satd_filterindex_synced",
+                "1 if the block-filter index is enabled, marked complete on disk, and has no backfill in flight - i.e. BIP 157 peers and getblockfilter will be served. Matches getindexinfo's 'basic block filter index'.synced.",
+                "gauge",
+                &[],
+                u64::from(filter_synced),
+            );
+            metric_header(
+                &mut out,
+                "satd_filterindex_backfill_state",
+                "Current state of the block-filter-index deferred backfill: exactly one series is 1, the rest are 0.",
+                "gauge",
+            );
+            for state in FilterBackfillState::ALL {
+                metric_sample(
+                    &mut out,
+                    "satd_filterindex_backfill_state",
+                    &[("state", state.label())],
+                    u64::from(state == filter_cursor.state),
+                );
+            }
         }
 
         // BIP 352 silent-payment tweak index. Row counters are process-
@@ -1126,6 +1216,100 @@ mod tests {
                 1,
                 "exactly one series must be hot"
             );
+        }
+    }
+
+    /// Same guarantee as the silent-payment test above, for the address
+    /// and filter families added by #558: every state series is always
+    /// present (an absent series makes an alert on `state="failed"`
+    /// silently never fire), exactly one is hot, and the label set is
+    /// asserted against an independent expectation rather than `ALL`.
+    #[test]
+    fn addr_backfill_state_series_is_exhaustive_and_one_hot() {
+        use crate::index::address::cursor::BackfillState;
+
+        const EXPECTED: [&str; 7] = [
+            "idle",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "rejected",
+            "failed",
+        ];
+
+        for current in BackfillState::ALL {
+            let mut out = String::new();
+            metric_header(&mut out, "satd_addrindex_backfill_state", "help", "gauge");
+            for state in BackfillState::ALL {
+                metric_sample(
+                    &mut out,
+                    "satd_addrindex_backfill_state",
+                    &[("state", state.label())],
+                    u64::from(state == current),
+                );
+            }
+            assert_eq!(out.matches("# HELP").count(), 1);
+            assert_eq!(out.matches("# TYPE").count(), 1);
+            for label in EXPECTED {
+                let expected = u64::from(label == current.label());
+                let line =
+                    format!("satd_addrindex_backfill_state{{state=\"{label}\"}} {expected}\n");
+                assert!(
+                    out.contains(&line),
+                    "missing or wrong series for state={label:?} while current is {current:?}:\n{out}"
+                );
+            }
+            assert_eq!(
+                out.lines().filter(|l| l.starts_with("satd_")).count(),
+                EXPECTED.len(),
+            );
+            assert_eq!(out.lines().filter(|l| l.ends_with(" 1")).count(), 1);
+        }
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn filter_backfill_state_series_is_exhaustive_and_one_hot() {
+        use crate::index::filter::cursor::BackfillState;
+
+        const EXPECTED: [&str; 7] = [
+            "idle",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "rejected",
+            "failed",
+        ];
+
+        for current in BackfillState::ALL {
+            let mut out = String::new();
+            metric_header(&mut out, "satd_filterindex_backfill_state", "help", "gauge");
+            for state in BackfillState::ALL {
+                metric_sample(
+                    &mut out,
+                    "satd_filterindex_backfill_state",
+                    &[("state", state.label())],
+                    u64::from(state == current),
+                );
+            }
+            assert_eq!(out.matches("# HELP").count(), 1);
+            assert_eq!(out.matches("# TYPE").count(), 1);
+            for label in EXPECTED {
+                let expected = u64::from(label == current.label());
+                let line =
+                    format!("satd_filterindex_backfill_state{{state=\"{label}\"}} {expected}\n");
+                assert!(
+                    out.contains(&line),
+                    "missing or wrong series for state={label:?} while current is {current:?}:\n{out}"
+                );
+            }
+            assert_eq!(
+                out.lines().filter(|l| l.starts_with("satd_")).count(),
+                EXPECTED.len(),
+            );
+            assert_eq!(out.lines().filter(|l| l.ends_with(" 1")).count(), 1);
         }
     }
 
