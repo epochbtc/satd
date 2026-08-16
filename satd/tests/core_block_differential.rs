@@ -662,11 +662,45 @@ fn c_locktime_not_final(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
 }
 
+fn c_coinbase_nonfinal(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    // The coinbase is subject to finality like any other transaction —
+    // Core's ContextualCheckBlock loops over all of block.vtx. A future
+    // height locktime plus a non-final sequence → bad-txns-nonfinal.
+    // Found live by the block-differential fuzzer (issue #581): satd
+    // exempted the coinbase from the finality check entirely.
+    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    cb.lock_time = LockTime::from_consensus(1_000_000);
+    cb.input[0].sequence = Sequence(0);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
+fn c_locktime_equal_height(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
+    let coin = ctx.take_mature_coinbase(used);
+    // Finality's cutoff is *strict* (Core: `nLockTime < nBlockHeight`): a
+    // locktime equal to the block's own height is non-final. satd's
+    // pre-fix comparison accepted the equality (issue #581).
+    let h = ctx.candidate_height();
+    let s = spend(coin.outpoint, coin.amount, 2, 0, h, op_true());
+    Submission::Block(valid_block(ctx.tip_hash, h, ctx.candidate_time(), vec![s]))
+}
+
 fn c_bip68_sequence_not_met(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // Spend a low-confirmation NON-coinbase coin (from the funding block) with
     // a v2 relative-locktime requiring more blocks than have elapsed.
     let coin = ctx.nc_coins[0].clone();
     let s = spend(coin.outpoint, coin.amount, 2, 16, 0, op_true()); // require 16 blocks
+    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+}
+
+fn c_bip68_high_bit_version(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    // Same unmet relative lock, but with transaction version 0x80000002.
+    // Core's BIP 68 gate is *unsigned* (`static_cast<uint32_t>(nVersion) >= 2`),
+    // so the high-bit version still enforces; satd compared the i32 and
+    // skipped enforcement, accepting a block Core rejects (issue #581
+    // follow-up found auditing the finality fix).
+    let coin = ctx.nc_coins[1].clone();
+    let s = spend(coin.outpoint, coin.amount, 0x8000_0002u32 as i32, 16, 0, op_true());
     Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
 }
 
@@ -788,6 +822,8 @@ fn cases() -> Vec<Case> {
         case("inputs_below_outputs", "contextual", Some("bad-txns-in-belowout"), c_inputs_below_outputs),
         case("immature_coinbase_spend", "contextual", Some("bad-txns-premature-spend-of-coinbase"), c_immature_coinbase_spend),
         case("locktime_not_final", "contextual", Some("bad-txns-nonfinal"), c_locktime_not_final),
+        case("coinbase_nonfinal", "contextual", Some("bad-txns-nonfinal"), c_coinbase_nonfinal),
+        case("locktime_equal_height", "contextual", Some("bad-txns-nonfinal"), c_locktime_equal_height),
         // BIP68 relative-locktime violation: BOTH reject (consensus agrees the
         // tx is invalid), but in block context Core labels it `bad-txns-nonfinal`
         // where satd emits the more specific `bad-txns-nonBIP68-final`. Pinned
@@ -798,6 +834,16 @@ fn cases() -> Vec<Case> {
             matrix_reason: Some("bad-txns-nonBIP68-final"),
             core_reason_differs: Some("bad-txns-nonfinal"),
             build: c_bip68_sequence_not_met,
+        },
+        // Same unmet lock through a high-bit (negative-as-i32) tx version:
+        // Core's unsigned gate still enforces BIP68. Same documented label
+        // gap as above.
+        Case {
+            name: "bip68_high_bit_version",
+            category: "contextual",
+            matrix_reason: Some("bad-txns-nonBIP68-final"),
+            core_reason_differs: Some("bad-txns-nonfinal"),
+            build: c_bip68_high_bit_version,
         },
         // accept cases (advance the tip — must run last)
         case("valid_block", "accept", None, c_valid_block),
