@@ -40,6 +40,27 @@ pub struct CoinCache {
     inner: Box<dyn Store>,
     dirty: RwLock<HashMap<OutPoint, DirtyEntry>>,
     clean: Mutex<LruCache<OutPoint, Coin>>,
+    /// Invalidation generation for the clean-coin LRU (issue #583).
+    /// Bumped — under the `clean` lock — by every batch absorption that
+    /// touches coins. The paths that insert into `clean` from data read
+    /// *outside* that lock (the read-through populate in
+    /// `get_coin`/`get_coins_batch`, and `flush_inner`'s promotion of
+    /// drained coins after the inner write) snapshot this counter before
+    /// their unlocked read and skip the insert if it has moved: their
+    /// data may predate a disconnect's `clean.pop` + dirty `Spent`, and
+    /// inserting it would silently resurrect a coin. The dirty `Spent`
+    /// entry masks such a resurrected entry only until the next flush
+    /// drains it — after that the stale coin answers reads until eviction
+    /// or restart (the in-memory phantom-UTXO shape of #583, observed as
+    /// a multi-day `bad-txns-BIP30` wedge). A skipped insert costs only
+    /// cache warmth; the caller still gets its result.
+    ///
+    /// Ordering: `Relaxed` is sufficient — every decisive load happens
+    /// while holding the `clean` mutex, and every bump happens while
+    /// holding it too, so the mutex orders bump against check. The
+    /// out-of-lock snapshot can only read a value ≤ the current one,
+    /// which fails the comparison in the safe (skip) direction.
+    clean_gen: AtomicU64,
     dirty_count: AtomicU32,
     pending_tip: Mutex<Option<BlockHash>>,
     count_delta: AtomicI64,
@@ -205,6 +226,7 @@ impl CoinCache {
             inner,
             dirty: RwLock::new(HashMap::new()),
             clean: Mutex::new(lru(clean_cap.max(1))),
+            clean_gen: AtomicU64::new(0),
             dirty_count: AtomicU32::new(0),
             pending_tip: Mutex::new(None),
             count_delta: AtomicI64::new(0),
@@ -434,6 +456,12 @@ impl CoinCache {
         let index_puts = batch.block_index_puts.len();
         let undo_puts = batch.undo_puts.len();
 
+        // Snapshot the clean-LRU invalidation generation while the dirty
+        // write lock is still held: `absorb_batch` needs that lock, so no
+        // bump can be mid-flight here. Any bump observed at promotion time
+        // below therefore happened strictly after this drain (issue #583).
+        let generation = self.clean_gen.load(Ordering::Relaxed);
+
         drop(dirty);
         self.dirty_count.store(0, Ordering::Relaxed);
         self.count_delta.store(0, Ordering::Relaxed);
@@ -504,11 +532,21 @@ impl CoinCache {
             }
         }
 
-        // Move flushed coins to clean LRU (cache warming)
+        // Move flushed coins to clean LRU (cache warming) — unless a batch
+        // was absorbed while the inner write ran. The drained coins were
+        // read under the dirty lock, but the promotion happens after a
+        // window spanning an entire backing-store write; a batch absorbed
+        // in that window may have re-spent any of these coins (popping
+        // `clean` and staging a new `Spent`), and promoting the drained
+        // copy would resurrect it once that `Spent` in turn flushes
+        // (issue #583). Promotion is only warming: skipping it costs a
+        // few store re-reads, never correctness.
         if !promote.is_empty() {
             let mut clean = self.clean.lock();
-            for (outpoint, coin) in promote {
-                clean.put(outpoint, coin);
+            if self.clean_gen.load(Ordering::Relaxed) == generation {
+                for (outpoint, coin) in promote {
+                    clean.put(outpoint, coin);
+                }
             }
         }
 
@@ -787,6 +825,15 @@ impl CoinCache {
         if coin_dirty > 0 {
             let mut dirty = self.dirty.write();
             let mut clean = self.clean.lock();
+
+            // Invalidate in-flight clean-LRU populates (issue #583): a
+            // reader that missed `clean` before this batch's pops must not
+            // insert its result afterwards — it may have read the inner
+            // store before the disconnect this batch carries, and the
+            // insert would resurrect a coin the pops below are retiring.
+            // Bumped under the `clean` lock so a guarded insert cannot
+            // interleave between this bump and the pops.
+            self.clean_gen.fetch_add(1, Ordering::Relaxed);
 
             for (outpoint, coin) in batch.coin_puts {
                 self.amount_delta
@@ -1097,6 +1144,11 @@ impl CoinCache {
 
 impl Store for CoinCache {
     fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        // Snapshot the invalidation generation BEFORE the dirty check: if
+        // a batch pops this outpoint from `clean` after this load, the
+        // guarded populate below must notice and skip (issue #583).
+        let generation = self.clean_gen.load(Ordering::Relaxed);
+
         // 1. Check dirty map
         {
             let dirty = self.dirty.read();
@@ -1116,9 +1168,19 @@ impl Store for CoinCache {
             }
         }
 
-        // 3. Cache miss — read from backing store, populate LRU (auto-evicts if full)
+        // 3. Cache miss — read from backing store, populate LRU (auto-evicts
+        // if full). The populate is guarded: if any coin batch was absorbed
+        // since the snapshot, this read may predate a disconnect's
+        // invalidation of exactly this outpoint, and caching it would
+        // resurrect a retired coin (#583). The caller still gets the value
+        // it read — only the cache insert is skipped.
         let coin = self.inner.get_coin(outpoint)?;
-        self.clean.lock().put(*outpoint, coin.clone());
+        {
+            let mut clean = self.clean.lock();
+            if self.clean_gen.load(Ordering::Relaxed) == generation {
+                clean.put(*outpoint, coin.clone());
+            }
+        }
         Some(coin)
     }
 
@@ -1377,6 +1439,10 @@ impl Store for CoinCache {
         let mut results: Vec<Option<Coin>> = vec![None; outpoints.len()];
         let mut misses: Vec<(usize, OutPoint)> = Vec::new();
 
+        // Same populate guard as `get_coin` (issue #583); the window here
+        // spans an entire batched inner-store read, so it is wider.
+        let generation = self.clean_gen.load(Ordering::Relaxed);
+
         // 1. Check dirty map (single lock acquisition for all keys)
         {
             let dirty = self.dirty.read();
@@ -1404,8 +1470,9 @@ impl Store for CoinCache {
             let miss_outpoints: Vec<OutPoint> = misses.iter().map(|(_, op)| *op).collect();
             let fetched = self.inner.get_coins_batch(&miss_outpoints);
             let mut clean = self.clean.lock();
+            let cacheable = self.clean_gen.load(Ordering::Relaxed) == generation;
             for ((idx, outpoint), coin_opt) in misses.into_iter().zip(fetched) {
-                if let Some(coin) = &coin_opt {
+                if cacheable && let Some(coin) = &coin_opt {
                     clean.put(outpoint, coin.clone());
                 }
                 results[idx] = coin_opt;
@@ -3994,6 +4061,240 @@ mod tests {
         assert_eq!(
             cache.read_filter_backfill_last_error().as_deref(),
             Some("undo data missing at height 12345")
+        );
+    }
+
+    // ── Clean-LRU resurrection races (issue #583) ─────────────────────
+    //
+    // Three paths insert into the clean LRU from data read outside the
+    // `clean` lock: `get_coin`'s populate, `get_coins_batch`'s populate,
+    // and `flush_inner`'s promotion. Each can interleave with a batch
+    // absorption that is retiring the same coin, re-inserting it after
+    // the absorption's `clean.pop` — an in-memory phantom UTXO that
+    // answers reads until eviction or restart. The tests below drive
+    // each interleaving deterministically with a store wrapper that
+    // pauses inside the unlocked window.
+
+    use super::super::CoinSnapshotBase;
+    use std::sync::Arc;
+
+    /// Rendezvous control for [`GateStore`]. `arm()` before spawning the
+    /// gated thread; `open()` from the test thread once the mutation has
+    /// been interleaved. `pause()` disarms on release so later calls
+    /// pass through.
+    struct GateCtl {
+        armed: std::sync::atomic::AtomicBool,
+        enter: std::sync::Barrier,
+        exit: std::sync::Barrier,
+    }
+
+    impl GateCtl {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                enter: std::sync::Barrier::new(2),
+                exit: std::sync::Barrier::new(2),
+            })
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        /// Called by the gated thread. Blocks until the test opens the gate.
+        fn pause(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.enter.wait();
+                self.exit.wait();
+            }
+        }
+
+        /// Called by the test thread: wait for the gated thread to arrive,
+        /// run `mutate` while it is parked in the window, then release it.
+        fn open_after(&self, mutate: impl FnOnce()) {
+            self.enter.wait();
+            mutate();
+            self.exit.wait();
+        }
+    }
+
+    /// A `Store` that delegates to an `InMemoryStore` but can pause at the
+    /// top of `get_coin` / `get_coins_batch` / `write_batch_recoverable`,
+    /// exactly inside the windows the CoinCache holds no lock across.
+    struct GateStore {
+        inner: InMemoryStore,
+        read_gate: Arc<GateCtl>,
+        write_gate: Arc<GateCtl>,
+    }
+
+    impl Store for GateStore {
+        fn get_block_index(&self, hash: &BlockHash) -> Option<BlockIndexEntry> {
+            self.inner.get_block_index(hash)
+        }
+        fn get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+            self.read_gate.pause();
+            self.inner.get_coin(outpoint)
+        }
+        fn get_coins_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+            self.read_gate.pause();
+            self.inner.get_coins_batch(outpoints)
+        }
+        fn has_coin(&self, outpoint: &OutPoint) -> bool {
+            self.inner.has_coin(outpoint)
+        }
+        fn get_tip(&self) -> Option<BlockHash> {
+            self.inner.get_tip()
+        }
+        fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
+            self.inner.get_block_hash_by_height(height)
+        }
+        fn write_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
+            self.inner.write_batch(batch)
+        }
+        fn write_batch_recoverable(
+            &self,
+            batch: StoreBatch,
+            mode: WriteMode,
+        ) -> Result<(), (Option<Box<StoreBatch>>, StoreError)> {
+            self.write_gate.pause();
+            self.inner.write_batch_recoverable(batch, mode)
+        }
+        fn get_undo(&self, hash: &BlockHash) -> Option<UndoData> {
+            self.inner.get_undo(hash)
+        }
+        fn coin_count(&self) -> u64 {
+            self.inner.coin_count()
+        }
+        fn coin_total_amount(&self) -> u64 {
+            self.inner.coin_total_amount()
+        }
+        fn utxo_height_hist(&self) -> Vec<u64> {
+            self.inner.utxo_height_hist()
+        }
+        fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
+            self.inner.get_tx_location(txid)
+        }
+        fn has_txindex(&self) -> bool {
+            self.inner.has_txindex()
+        }
+        fn clear_chainstate(&self) -> Result<(), StoreError> {
+            self.inner.clear_chainstate()
+        }
+        fn clear_all(&self) -> Result<(), StoreError> {
+            self.inner.clear_all()
+        }
+        fn for_each_coin_snapshot(
+            &self,
+            f: &mut dyn FnMut(&OutPoint, &Coin) -> Result<(), StoreError>,
+        ) -> Result<CoinSnapshotBase, StoreError> {
+            self.inner.for_each_coin_snapshot(f)
+        }
+    }
+
+    /// A cache over a gated store whose inner store already holds `op`.
+    fn gated_cache_with_coin(op: OutPoint) -> (Arc<CoinCache>, Arc<GateCtl>, Arc<GateCtl>) {
+        let read_gate = GateCtl::new();
+        let write_gate = GateCtl::new();
+        let store = GateStore {
+            inner: InMemoryStore::new(),
+            read_gate: read_gate.clone(),
+            write_gate: write_gate.clone(),
+        };
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(9_000, 7)));
+        store.inner.write_batch(batch).unwrap();
+        let cache = Arc::new(CoinCache::new(Box::new(store), 10));
+        (cache, read_gate, write_gate)
+    }
+
+    /// Absorb a batch that spends `op`, the way a disconnect retires a
+    /// coin: pops the clean LRU, stages a dirty `Spent`.
+    fn absorb_spend(cache: &CoinCache, op: OutPoint) {
+        let mut batch = StoreBatch::default();
+        batch.coin_removes.push((op, 9_000, 7));
+        cache.write_batch(batch).unwrap();
+    }
+
+    #[test]
+    fn a_read_through_populate_cannot_resurrect_a_spent_coin() {
+        let op = make_outpoint(0xD1, 0);
+        let (cache, read_gate, _wg) = gated_cache_with_coin(op);
+
+        // Reader misses dirty and clean, and parks inside the unlocked
+        // read-through window.
+        read_gate.arm();
+        let reader = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.get_coin(&op))
+        };
+        // While it is parked: a batch spends the coin. The pop finds
+        // nothing in clean; the reader's populate is what must not land.
+        read_gate.open_after(|| absorb_spend(&cache, op));
+        // The reader's answer predates the spend — that ordering is fine.
+        assert_eq!(reader.join().unwrap().unwrap().amount, 9_000);
+
+        // Flush drains the Spent entry (the mask) to the store.
+        cache.flush().unwrap();
+
+        // Without the populate guard the clean LRU still holds the coin
+        // here, and it answers reads forever: the #583 phantom.
+        assert!(
+            cache.get_coin(&op).is_none(),
+            "a coin spent during the read-through window must not survive in the clean LRU"
+        );
+    }
+
+    #[test]
+    fn a_batched_populate_cannot_resurrect_a_spent_coin() {
+        let op = make_outpoint(0xD2, 0);
+        let (cache, read_gate, _wg) = gated_cache_with_coin(op);
+
+        read_gate.arm();
+        let reader = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.get_coins_batch(&[op]))
+        };
+        read_gate.open_after(|| absorb_spend(&cache, op));
+        assert_eq!(reader.join().unwrap()[0].as_ref().unwrap().amount, 9_000);
+
+        cache.flush().unwrap();
+        assert!(
+            cache.get_coin(&op).is_none(),
+            "a coin spent during the batched read-through window must not survive in the clean LRU"
+        );
+    }
+
+    #[test]
+    fn flush_promotion_cannot_resurrect_a_coin_spent_during_the_write() {
+        let op = make_outpoint(0xD3, 0);
+        let (cache, _rg, write_gate) = gated_cache_with_coin(op);
+
+        // Stage a fresh version of the coin in the dirty map so the flush
+        // has something to drain and promote. (Spend the stored copy and
+        // re-create it, as a reorg's reconnect would.)
+        absorb_spend(&cache, op);
+        let mut batch = StoreBatch::default();
+        batch.coin_puts.push((op, make_coin(9_000, 7)));
+        cache.write_batch(batch).unwrap();
+
+        // Flush drains the Present entry and parks inside the inner
+        // write — after dropping the dirty lock, before promotion.
+        write_gate.arm();
+        let flusher = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.flush().unwrap())
+        };
+        // While it is parked: a batch spends the coin. Its `clean.pop`
+        // finds nothing; the flush's promotion is what must not land.
+        write_gate.open_after(|| absorb_spend(&cache, op));
+        flusher.join().unwrap();
+
+        // Drain the Spent entry (the mask) to the store.
+        cache.flush().unwrap();
+
+        assert!(
+            cache.get_coin(&op).is_none(),
+            "a coin spent during the flush's inner write must not be promoted into the clean LRU"
         );
     }
 }
