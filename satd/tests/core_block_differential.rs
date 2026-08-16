@@ -662,6 +662,29 @@ fn c_locktime_not_final(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
 }
 
+fn c_coinbase_nonfinal(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    // The coinbase is subject to finality like any other transaction —
+    // Core's ContextualCheckBlock loops over all of block.vtx. A future
+    // height locktime plus a non-final sequence → bad-txns-nonfinal.
+    // Found live by the block-differential fuzzer (issue #581): satd
+    // exempted the coinbase from the finality check entirely.
+    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    cb.lock_time = LockTime::from_consensus(1_000_000);
+    cb.input[0].sequence = Sequence(0);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
+fn c_locktime_equal_height(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
+    let coin = ctx.take_mature_coinbase(used);
+    // Finality's cutoff is *strict* (Core: `nLockTime < nBlockHeight`): a
+    // locktime equal to the block's own height is non-final. satd's
+    // pre-fix comparison accepted the equality (issue #581).
+    let h = ctx.candidate_height();
+    let s = spend(coin.outpoint, coin.amount, 2, 0, h, op_true());
+    Submission::Block(valid_block(ctx.tip_hash, h, ctx.candidate_time(), vec![s]))
+}
+
 fn c_bip68_sequence_not_met(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // Spend a low-confirmation NON-coinbase coin (from the funding block) with
     // a v2 relative-locktime requiring more blocks than have elapsed.
@@ -788,6 +811,8 @@ fn cases() -> Vec<Case> {
         case("inputs_below_outputs", "contextual", Some("bad-txns-in-belowout"), c_inputs_below_outputs),
         case("immature_coinbase_spend", "contextual", Some("bad-txns-premature-spend-of-coinbase"), c_immature_coinbase_spend),
         case("locktime_not_final", "contextual", Some("bad-txns-nonfinal"), c_locktime_not_final),
+        case("coinbase_nonfinal", "contextual", Some("bad-txns-nonfinal"), c_coinbase_nonfinal),
+        case("locktime_equal_height", "contextual", Some("bad-txns-nonfinal"), c_locktime_equal_height),
         // BIP68 relative-locktime violation: BOTH reject (consensus agrees the
         // tx is invalid), but in block context Core labels it `bad-txns-nonfinal`
         // where satd emits the more specific `bad-txns-nonBIP68-final`. Pinned

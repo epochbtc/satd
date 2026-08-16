@@ -505,29 +505,37 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         // Context-free transaction checks
         check_transaction(tx)?;
 
-        // Locktime validation
-        // Before BIP 113 activation: time-based locktimes compare against block timestamp.
-        // After BIP 113: time-based locktimes compare against MTP.
-        if !is_coinbase {
-            let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
-            if !is_final {
-                let locktime = tx.lock_time.to_consensus_u32();
-                if locktime > 0 {
-                    if locktime < 500_000_000 {
-                        // Height-based locktime
-                        if height < locktime {
-                            return Err(ConnectError::LocktimeNotFinal);
-                        }
+        // Finality (Core: `ContextualCheckBlock` → `IsFinalTx`). Applies to
+        // every transaction in the block — the coinbase included; Core's
+        // loop runs over all of `block.vtx`, and a coinbase with an
+        // unsatisfied locktime and a non-final sequence is a consensus
+        // reject (`bad-txns-nonfinal`). A transaction is final iff its
+        // locktime is zero, its locktime is *strictly* below the cutoff —
+        // the block's own height for height locktimes; MTP (or, before
+        // BIP 113 activation, the block's timestamp) for time locktimes —
+        // or every input's sequence is SEQUENCE_FINAL, which disables
+        // locktime entirely. Both inequalities are strict in Core
+        // (`nLockTime < nBlockHeight` / `< nBlockTime`): a locktime equal
+        // to the cutoff is NOT final.
+        let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
+        if !is_final {
+            let locktime = tx.lock_time.to_consensus_u32();
+            if locktime > 0 {
+                if locktime < 500_000_000 {
+                    // Height-based locktime: final only strictly below the
+                    // connecting height.
+                    if locktime >= height {
+                        return Err(ConnectError::LocktimeNotFinal);
+                    }
+                } else {
+                    // Time-based locktime
+                    let time_threshold = if height >= bip113_activation_height(network) {
+                        median_time_past
                     } else {
-                        // Time-based locktime
-                        let time_threshold = if height >= bip113_activation_height(network) {
-                            median_time_past
-                        } else {
-                            block.header.time
-                        };
-                        if time_threshold < locktime {
-                            return Err(ConnectError::LocktimeNotFinal);
-                        }
+                        block.header.time
+                    };
+                    if locktime >= time_threshold {
+                        return Err(ConnectError::LocktimeNotFinal);
                     }
                 }
             }
@@ -1635,6 +1643,128 @@ mod tests {
             phase_tracker: None,
         });
         assert!(result.is_ok());
+    }
+
+    // ── Finality: the coinbase, and the strict cutoff (issue #581) ────
+
+    /// A coinbase-only block at `height` whose coinbase carries the given
+    /// sequence and locktime.
+    fn make_coinbase_only_block(height: u32, sequence: u32, locktime: u32) -> Block {
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::from_consensus(locktime),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence(sequence),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    fn connect_simple(
+        store: &InMemoryStore,
+        block: &Block,
+        height: u32,
+        mtp: u32,
+    ) -> Result<StoreBatch, ConnectError> {
+        connect_block(&ConnectParams {
+            replay_plan: None,
+            store,
+            block,
+            height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: mtp,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        })
+    }
+
+    #[test]
+    fn the_coinbase_is_subject_to_finality() {
+        // The exact shape the block-differential fuzzer found (issue #581):
+        // a height-1 coinbase with height locktime 196607 (0x2ffff) and
+        // sequence 0x64000000. Core's ContextualCheckBlock runs IsFinalTx
+        // over every transaction in the block, the coinbase included, and
+        // rejects this bad-txns-nonfinal; satd exempted the coinbase from
+        // the finality check and accepted it.
+        let store = InMemoryStore::new();
+        let block = make_coinbase_only_block(1, 0x6400_0000, 0x2_ffff);
+        let result = connect_simple(&store, &block, 1, 0);
+        assert!(matches!(result, Err(ConnectError::LocktimeNotFinal)));
+    }
+
+    #[test]
+    fn a_coinbase_with_final_sequence_ignores_its_locktime() {
+        // Same locktime as above, but SEQUENCE_FINAL on the (only) input
+        // disables locktime entirely — final in Core, and every real
+        // coinbase ever mined has this shape.
+        let store = InMemoryStore::new();
+        let block = make_coinbase_only_block(1, 0xffff_ffff, 0x2_ffff);
+        assert!(connect_simple(&store, &block, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn a_locktime_equal_to_the_height_is_not_final() {
+        // Core's cutoff is strict (`nLockTime < nBlockHeight`): a locktime
+        // equal to the connecting height is non-final; one below is final.
+        // satd's pre-fix comparison accepted the equality.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let equal = make_block_spending(outpoint, 50, 2, 0, 50);
+        assert!(matches!(
+            connect_simple(&store, &equal, 50, 0),
+            Err(ConnectError::LocktimeNotFinal)
+        ));
+
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let below = make_block_spending(outpoint, 50, 2, 0, 49);
+        assert!(connect_simple(&store, &below, 50, 0).is_ok());
+    }
+
+    #[test]
+    fn a_time_locktime_equal_to_the_mtp_is_not_final() {
+        // The time branch has the same strict cutoff: locktime == MTP is
+        // non-final; MTP one second past it is final.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let block = make_block_spending(outpoint, 60, 2, 0, 500_000_100);
+        assert!(matches!(
+            connect_simple(&store, &block, 60, 500_000_100),
+            Err(ConnectError::LocktimeNotFinal)
+        ));
+
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let block = make_block_spending(outpoint, 60, 2, 0, 500_000_100);
+        assert!(connect_simple(&store, &block, 60, 500_000_101).is_ok());
     }
 
     // ── UTXO / amount tests ──────────────────────────────────────────
