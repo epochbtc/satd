@@ -584,9 +584,15 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                     return Err(ConnectError::PrematureCoinbaseSpend);
                 }
 
-                // BIP 68 sequence lock validation (tx version >= 2, only after activation)
+                // BIP 68 sequence lock validation (tx version >= 2, only after
+                // activation). The version comparison is UNSIGNED, as in Core
+                // (`static_cast<uint32_t>(tx.nVersion) >= 2`, so since v28
+                // `tx.version >= 2` on a uint32): a version with the high bit
+                // set — negative as the i32 rust-bitcoin exposes — still
+                // enforces BIP 68. Compared as i32, 0x80000002 would skip
+                // enforcement and accept a block Core rejects.
                 if height >= bip113_activation_height(network)
-                    && tx.version.0 >= 2 && input.sequence != bitcoin::Sequence::MAX {
+                    && (tx.version.0 as u32) >= 2 && input.sequence != bitcoin::Sequence::MAX {
                     let seq = input.sequence.0;
                     let disable_flag = 1u32 << 31;
                     if seq & disable_flag == 0 {
@@ -1708,6 +1714,22 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
         })
+    }
+
+    #[test]
+    fn a_high_bit_version_still_enforces_bip68() {
+        // Core's gate has always been unsigned
+        // (`static_cast<uint32_t>(tx.nVersion) >= 2`), so version 0x80000002
+        // — negative as the i32 rust-bitcoin exposes — is BIP 68-enforced.
+        // A signed comparison skipped enforcement and accepted a block Core
+        // rejects. Same shape as test_bip68_height_lock_not_met: coin at
+        // height 50, 10-block lock, spend at 55 → unmet.
+        let (store, outpoint, _) = make_test_store_with_coin(50, false);
+        let block = make_block_spending(outpoint, 55, 0x8000_0002u32 as i32, 10, 0);
+        assert!(matches!(
+            connect_simple(&store, &block, 55, 0),
+            Err(ConnectError::SequenceLockNotMet)
+        ));
     }
 
     #[test]

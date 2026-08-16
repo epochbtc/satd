@@ -15,7 +15,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   coinbase is subject to the finality check like every other transaction, and
   the locktime cutoff is strict — a locktime equal to the connecting height
   (or the MTP) is non-final. Both laxnesses accepted blocks Core rejects
-  `bad-txns-nonfinal`; found live by the block-differential fuzzer.
+  `bad-txns-nonfinal`; found live by the block-differential fuzzer. The same
+  audit fixed BIP 68's version gate to compare unsigned as Core does, so a
+  high-bit transaction version no longer skips sequence-lock enforcement.
 - Added (#558): index-readiness metrics for the address and block-filter
   indexes — `satd_addrindex_synced` + `satd_addrindex_backfill_state`, and
   `satd_filterindex_enabled`/`_synced`/`_backfill_state` — mirroring the

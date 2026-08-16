@@ -693,6 +693,17 @@ fn c_bip68_sequence_not_met(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
 }
 
+fn c_bip68_high_bit_version(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    // Same unmet relative lock, but with transaction version 0x80000002.
+    // Core's BIP 68 gate is *unsigned* (`static_cast<uint32_t>(nVersion) >= 2`),
+    // so the high-bit version still enforces; satd compared the i32 and
+    // skipped enforcement, accepting a block Core rejects (issue #581
+    // follow-up found auditing the finality fix).
+    let coin = ctx.nc_coins[1].clone();
+    let s = spend(coin.outpoint, coin.amount, 0x8000_0002u32 as i32, 16, 0, op_true());
+    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+}
+
 // -- accept cases (advance the tip) --
 
 fn c_valid_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -823,6 +834,16 @@ fn cases() -> Vec<Case> {
             matrix_reason: Some("bad-txns-nonBIP68-final"),
             core_reason_differs: Some("bad-txns-nonfinal"),
             build: c_bip68_sequence_not_met,
+        },
+        // Same unmet lock through a high-bit (negative-as-i32) tx version:
+        // Core's unsigned gate still enforces BIP68. Same documented label
+        // gap as above.
+        Case {
+            name: "bip68_high_bit_version",
+            category: "contextual",
+            matrix_reason: Some("bad-txns-nonBIP68-final"),
+            core_reason_differs: Some("bad-txns-nonfinal"),
+            build: c_bip68_high_bit_version,
         },
         // accept cases (advance the tip — must run last)
         case("valid_block", "accept", None, c_valid_block),
