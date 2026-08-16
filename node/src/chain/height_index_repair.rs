@@ -38,6 +38,11 @@
 //! One sequential scan of the height index — the cheap direction, versus a
 //! point lookup per height. On a clean node it allocates a presence bitmap,
 //! finds nothing, and writes nothing.
+//!
+//! When there is damage, the walk adds one block-index read per height between
+//! the tip and the *lowest* gap. That is set by where the damage reaches, not
+//! by how much of it there is: a thousand gaps clustered under the tip are
+//! cheaper to repair than one gap near genesis.
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,14 +57,46 @@ use crate::storage::{HeightHashScanStats, Store, StoreBatch, StoreError};
 /// is roughly two centuries of mainnet.
 const MAX_PLAUSIBLE_TIP_HEIGHT: u32 = 10_000_000;
 
-/// Above this many gaps the pass reports and does nothing.
+/// Above this share of the heights at or below the tip being absent, the pass
+/// reports and does nothing — unless the count is at or under
+/// [`ALWAYS_REPAIR_UP_TO`].
 ///
-/// Isolated gaps are the damage this understands. Wholesale absence means
-/// something structural — an AssumeUTXO snapshot chainstate whose history has
-/// not been validated yet, a reindex partway through — where the heights are
-/// legitimately not there and rewriting them would be asserting a chain the
-/// node has not built.
-const MAX_REPAIRABLE_GAPS: usize = 1_000;
+/// This is a **scope** decision — is the operation still a repair, or has it
+/// become a rebuild? — and nothing more. It does not bound cost: the walk is
+/// one block-index read per height between the tip and the *lowest* gap, so a
+/// single gap far down costs more than ten thousand clustered near the tip,
+/// and no gap-counting threshold of any kind can see that. It does not bound
+/// risk: a row is written only for a block the walk reached along the tip's
+/// own ancestry whose status is `Valid` or `Pruned`, a per-height check that
+/// never consults this number, so a chainstate that has not validated its
+/// history writes nothing however this is set.
+///
+/// What it decides is that a pass which runs on every start should not
+/// quietly rebuild an index that is mostly gone — *more* than half absent
+/// declines; exactly half still repairs. This used to be an absolute count of
+/// a thousand gaps, which drew the repair/rebuild line in a place that meant
+/// nothing: a node on a reorg-heavy chain accumulated 3009 derivable gaps
+/// confined to its top 10k heights — two percent of the range, a sub-second
+/// walk — and was declined on every restart while the log blamed an
+/// AssumeUTXO snapshot the node had never loaded. Any reorg-heavy node
+/// crosses a fixed count eventually and silently stops self-healing.
+///
+/// Overflow: both products are bounded by `MAX_PLAUSIBLE_TIP_HEIGHT`, which
+/// is checked before the guard runs — at most ~1.0e9, inside even a 32-bit
+/// `usize`. That bound holds only while the plausibility check stays upstream
+/// of this one.
+const MAX_MISSING_PERCENT: usize = 50;
+
+/// At or under this many gaps the pass always repairs, whatever the share.
+///
+/// The proportional test alone misfires at tiny tips: a chain whose tip is
+/// genesis with its one row lost is "100% absent", yet the repair costs
+/// nothing — the caller-supplied tip hash covers it without a single lookup —
+/// and a short regtest chain with most rows lost is likewise a trivial walk.
+/// A floor only ever *permits* repairs, so unlike the old absolute ceiling it
+/// cannot decline real damage; and the per-height status check above still
+/// decides what actually gets written.
+const ALWAYS_REPAIR_UP_TO: usize = 1_000;
 
 /// Result of one audit pass.
 #[derive(Debug, Clone, Default)]
@@ -86,10 +123,14 @@ pub struct HeightIndexAudit {
     pub pending_validation: Vec<u32>,
     /// Corrupt rows surfaced by the scan.
     pub scan_stats: HeightHashScanStats,
-    /// Set when the gap count exceeded [`MAX_REPAIRABLE_GAPS`] and the pass
-    /// declined to write anything. `missing` is still populated, so the
+    /// Set when the missing share exceeded [`MAX_MISSING_PERCENT`] and the
+    /// pass declined to write anything. `missing` is still populated, so the
     /// condition is reported rather than hidden.
     pub skipped_bulk: bool,
+    /// The tip the audit ran against — the top of the range `missing` was
+    /// computed over. Carried so a caller can report a gap count in
+    /// proportion without redoing the arithmetic.
+    pub tip_height: u32,
     pub elapsed_secs: u64,
 }
 
@@ -146,6 +187,7 @@ pub fn audit_and_repair_height_index(
         rows_scanned,
         missing: missing.clone(),
         scan_stats,
+        tip_height,
         ..Default::default()
     };
 
@@ -154,7 +196,13 @@ pub fn audit_and_repair_height_index(
         return Ok(audit);
     }
 
-    if missing.len() > MAX_REPAIRABLE_GAPS {
+    // Proportional above a small floor, never an absolute ceiling — see
+    // `MAX_MISSING_PERCENT` for why a count measures neither the cost nor
+    // the risk it appeared to.
+    let heights_in_range = tip_height as usize + 1;
+    if missing.len() > ALWAYS_REPAIR_UP_TO
+        && missing.len() * 100 > heights_in_range * MAX_MISSING_PERCENT
+    {
         audit.skipped_bulk = true;
         audit.elapsed_secs = started.elapsed().as_secs();
         return Ok(audit);
@@ -316,6 +364,14 @@ mod tests {
     fn punch_gap(store: &InMemoryStore, height: u32) {
         let batch = StoreBatch {
             height_hash_removes: vec![height],
+            ..Default::default()
+        };
+        store.write_batch(batch).unwrap();
+    }
+
+    fn punch_gaps(store: &InMemoryStore, heights: std::ops::Range<u32>) {
+        let batch = StoreBatch {
+            height_hash_removes: heights.collect(),
             ..Default::default()
         };
         store.write_batch(batch).unwrap();
@@ -518,19 +574,14 @@ mod tests {
         }
     }
 
-    /// Wholesale absence is not this pass's damage. An AssumeUTXO snapshot
-    /// chainstate has a tip far above the history it has validated, so most
-    /// heights are legitimately rowless — rewriting them would assert a chain
-    /// the node has not built. Report and decline.
+    /// Wholesale absence is not this pass's damage. An index that has to be
+    /// *built* rather than repaired is a reindex, and a pass that runs on
+    /// every start does not undertake one unasked. Report and decline.
     #[test]
     fn wholesale_absence_is_reported_and_not_repaired() {
         let store = InMemoryStore::new();
         let hashes = seed_chain(&store, 2_000);
-        let mut removes = StoreBatch::default();
-        for h in 0..1_500u32 {
-            removes.height_hash_removes.push(h);
-        }
-        store.write_batch(removes).unwrap();
+        punch_gaps(&store, 0..1_500);
 
         let audit = audit_and_repair_height_index(&store, hashes[1_999], 1_999).unwrap();
         assert!(audit.skipped_bulk, "must decline en-masse rewriting");
@@ -541,6 +592,170 @@ mod tests {
             None,
             "nothing may be written when the pass declines"
         );
+    }
+
+    /// The threshold is a *share* of the range, not a count of gaps.
+    ///
+    /// Both halves punch exactly 3000 gaps and reach opposite verdicts, which
+    /// is the whole claim: 30% of a long chain is damage worth repairing, 75%
+    /// of a short one is a rebuild. An absolute count — the thousand-gap
+    /// constant this replaced — cannot tell them apart, and got the first one
+    /// wrong on a real node for months, declining a sub-second repair on every
+    /// restart because a chain that reorgs often had accumulated 3009 gaps.
+    #[test]
+    fn the_skip_threshold_is_proportional_not_an_absolute_count() {
+        // 3000 gaps in 10_000 heights: 30%, repairable.
+        let long = InMemoryStore::new();
+        let long_hashes = seed_chain(&long, 10_000);
+        punch_gaps(&long, 6_500..9_500);
+
+        let audit = audit_and_repair_height_index(&long, long_hashes[9_999], 9_999).unwrap();
+        assert!(
+            !audit.skipped_bulk,
+            "3000 gaps in 10k heights is damage, not a rebuild"
+        );
+        assert_eq!(audit.repaired.len(), 3_000);
+        assert!(audit.unrepairable.is_empty());
+        assert!(audit.mismatched.is_empty());
+        for h in [6_500usize, 8_000, 9_499] {
+            assert_eq!(
+                long.get_block_hash_by_height(h as u32),
+                Some(long_hashes[h]),
+                "height {h}"
+            );
+        }
+
+        // The same 3000 gaps in 4_000 heights: 75%, declined.
+        let short = InMemoryStore::new();
+        let short_hashes = seed_chain(&short, 4_000);
+        punch_gaps(&short, 500..3_500);
+
+        let audit = audit_and_repair_height_index(&short, short_hashes[3_999], 3_999).unwrap();
+        assert!(
+            audit.skipped_bulk,
+            "the identical gap count is a rebuild on a short chain"
+        );
+        assert!(audit.repaired.is_empty());
+        assert_eq!(short.get_block_hash_by_height(500), None);
+    }
+
+    /// The share's denominator is the heights at or below the tip — not the
+    /// rows the scan happened to see.
+    ///
+    /// Header rows above the tip are legitimate (headers run ahead of blocks
+    /// during IBD) and are scanned, so `rows_scanned` is the tempting wrong
+    /// denominator a refactor would reach for. Here 2400 of 4000 in-range
+    /// heights are missing (60% — decline) while 4000 header rows sit above
+    /// the tip (2400 of 5600 scanned rows = 43% — a rows_scanned
+    /// implementation would repair). The verdict must not shift with the
+    /// depth of the header runway.
+    #[test]
+    fn the_share_is_over_the_tip_range_not_over_rows_scanned() {
+        let store = InMemoryStore::new();
+        let hashes = seed_chain(&store, 8_000);
+        punch_gaps(&store, 500..2_900);
+
+        // Tip at 3_999; heights 4_000..7_999 are the header runway.
+        let audit = audit_and_repair_height_index(&store, hashes[3_999], 3_999).unwrap();
+        assert!(
+            audit.skipped_bulk,
+            "60% of the range is absent; rows above the tip must not dilute that"
+        );
+        assert!(audit.repaired.is_empty());
+        assert_eq!(store.get_block_hash_by_height(500), None);
+    }
+
+    /// Exactly half the range absent still repairs; one more gap declines.
+    ///
+    /// This pins all three constants at once — the comparator (strict `>`,
+    /// not `>=`), the percentage (50, not anything looser or tighter), and
+    /// the denominator's `+ 1` (4000 heights for tip 3999). Every one of
+    /// those was mutated during review and survived the previous suite;
+    /// this boundary pair kills each.
+    #[test]
+    fn exactly_half_absent_repairs_and_one_more_gap_declines() {
+        let at_half = InMemoryStore::new();
+        let hashes = seed_chain(&at_half, 4_000);
+        punch_gaps(&at_half, 1_000..3_000);
+
+        let audit = audit_and_repair_height_index(&at_half, hashes[3_999], 3_999).unwrap();
+        assert!(!audit.skipped_bulk, "exactly half is still a repair");
+        assert_eq!(audit.repaired.len(), 2_000);
+        assert_eq!(at_half.get_block_hash_by_height(1_000), Some(hashes[1_000]));
+
+        let past_half = InMemoryStore::new();
+        let hashes = seed_chain(&past_half, 4_000);
+        punch_gaps(&past_half, 1_000..3_001);
+
+        let audit = audit_and_repair_height_index(&past_half, hashes[3_999], 3_999).unwrap();
+        assert!(audit.skipped_bulk, "2001 of 4000 is past half");
+        assert!(audit.repaired.is_empty());
+        assert_eq!(past_half.get_block_hash_by_height(1_000), None);
+    }
+
+    /// A small count of gaps repairs whatever share of the range it is.
+    ///
+    /// The proportional test alone misfires at tiny tips: a tip-at-genesis
+    /// chain whose one row is lost is "100% absent" yet costs nothing to fix
+    /// (the caller-supplied tip hash covers it), and a short chain with most
+    /// rows lost is a trivial walk. Both were repaired under the old absolute
+    /// threshold, and dropping either would be a regression, not a
+    /// simplification.
+    #[test]
+    fn a_small_gap_count_repairs_regardless_of_share() {
+        // Tip at genesis, its one row missing: 1 of 1 = 100%.
+        let store = InMemoryStore::new();
+        let hashes = seed_chain(&store, 1);
+        punch_gap(&store, 0);
+
+        let audit = audit_and_repair_height_index(&store, hashes[0], 0).unwrap();
+        assert!(!audit.skipped_bulk, "one row of one is not a rebuild");
+        assert_eq!(audit.repaired, vec![0]);
+        assert_eq!(store.get_block_hash_by_height(0), Some(hashes[0]));
+
+        // A short chain with 80% of its rows lost: 80 of 100.
+        let store = InMemoryStore::new();
+        let hashes = seed_chain(&store, 100);
+        punch_gaps(&store, 10..90);
+
+        let audit = audit_and_repair_height_index(&store, hashes[99], 99).unwrap();
+        assert!(!audit.skipped_bulk, "80 gaps is under the floor, share or no");
+        assert_eq!(audit.repaired.len(), 80);
+        assert_eq!(store.get_block_hash_by_height(50), Some(hashes[50]));
+    }
+
+    /// Safety does not ride on the skip threshold, and must not start to.
+    ///
+    /// A long run of unvalidated history sits well under the share that would
+    /// trip the guard, so the pass proceeds and reaches every one of those
+    /// heights — and still writes nothing, because the decision is made per
+    /// height on `BlockStatus`. That is what makes it safe to let the guard
+    /// pass thousands of gaps through.
+    #[test]
+    fn bulk_unvalidated_history_is_never_written_however_the_guard_is_set() {
+        let store = InMemoryStore::new();
+        let hashes = seed_chain(&store, 2_000);
+        punch_gaps(&store, 1_800..1_900);
+
+        // Same headers — only the status changes, so the walk still traverses
+        // them and the refusal has to come from the status check alone.
+        let mut demote = StoreBatch::default();
+        for h in 1_800..1_900usize {
+            let header = header_with(hashes[h - 1], h as u32);
+            demote
+                .block_index_puts
+                .push((hashes[h], entry(header, h as u32, BlockStatus::DataStored)));
+        }
+        store.write_batch(demote).unwrap();
+
+        let audit = audit_and_repair_height_index(&store, hashes[1_999], 1_999).unwrap();
+        assert!(!audit.skipped_bulk, "5% of the range does not trip the guard");
+        assert_eq!(audit.pending_validation.len(), 100);
+        assert!(audit.repaired.is_empty(), "not one row may be written");
+        assert!(audit.unrepairable.is_empty(), "unvalidated is not a fault");
+        for h in [1_800u32, 1_850, 1_899] {
+            assert_eq!(store.get_block_hash_by_height(h), None, "height {h}");
+        }
     }
 
     /// An implausible tip height must not turn a startup audit into a

@@ -802,18 +802,44 @@ async fn main() {
     // deliberately NOT ordered against `repair_block_index_holes` below —
     // that pass only inspects heights strictly above the tip, and this one
     // only writes heights at or below it, so the two ranges are disjoint.
+    //
+    // Announced before it runs: on a damaged index the ancestry walk can be
+    // deep, and a walk this early in startup with no line in the journal
+    // reads as a wedged node.
+    tracing::info!("Auditing the height index for gaps below the tip");
     match chain_state.repair_height_index() {
         Ok(audit) => {
             // Cap what we print: these can carry thousands of heights and a
             // log line is not a data dump.
             const SHOW: usize = 16;
             if audit.skipped_bulk {
-                tracing::info!(
-                    missing = audit.missing.len(),
-                    "Height index is missing most heights at or below the tip; \
-                     declining to rewrite it. Expected while an AssumeUTXO \
-                     snapshot's history is still being validated"
-                );
+                // Most of the range absent is a rebuild, not a repair, and a
+                // startup pass does not undertake one unasked. Whether that
+                // is damage depends on state this function CAN know: with a
+                // background snapshot chainstate attached, wholesale absence
+                // is the expected shape of unvalidated history and the
+                // validator fills the rows itself — advising a -reindex
+                // there would cost the operator the snapshot's entire
+                // benefit, on a healthy node, at every restart.
+                if chain_state.background().is_some() {
+                    tracing::info!(
+                        missing = audit.missing.len(),
+                        of_heights = audit.tip_height as u64 + 1,
+                        "Height index is missing most heights at or below the \
+                         tip; expected while the AssumeUTXO snapshot's history \
+                         is validated — the background validator writes these \
+                         rows itself"
+                    );
+                } else {
+                    tracing::warn!(
+                        missing = audit.missing.len(),
+                        of_heights = audit.tip_height as u64 + 1,
+                        "Height index is missing most heights at or below the \
+                         tip. Rebuilding it wholesale is not this pass's job; \
+                         getblockhash will fail at those heights until a \
+                         -reindex"
+                    );
+                }
             } else if !audit.is_clean() {
                 if !audit.repaired.is_empty() {
                     tracing::warn!(
