@@ -85,6 +85,23 @@ impl BackfillState {
         self as u8
     }
 
+    /// Every variant, for surfaces that must emit one series per state
+    /// (the Prometheus `satd_filterindex_backfill_state` family). Kept
+    /// adjacent to the enum on purpose: the array is not
+    /// exhaustiveness-checked, so a new variant left out of here would
+    /// compile clean and simply never be exported, and every alerting
+    /// rule over this family would keep evaluating against a state set
+    /// that silently no longer matches reality.
+    pub const ALL: [Self; 7] = [
+        Self::Idle,
+        Self::Running,
+        Self::Paused,
+        Self::Completed,
+        Self::Cancelled,
+        Self::Rejected,
+        Self::Failed,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",

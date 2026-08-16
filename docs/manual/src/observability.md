@@ -47,8 +47,8 @@ labels) and does not consume an RPC worker on every scrape.
 
 ### Index readiness
 
-The silent-payment index exports whether it is switched on, whether it is ready
-to serve, and what its deferred backfill is doing:
+Each DB-backed index exports whether it is switched on, whether it is ready to
+serve, and what its deferred backfill is doing. The silent-payment family:
 
 | Metric | Meaning |
 |---|---|
@@ -57,10 +57,16 @@ to serve, and what its deferred backfill is doing:
 | `satd_spindex_backfill_state{state="…"}` | one series per lifecycle state, exactly one of them 1 |
 | `satd_spindex_backfill_progress_ratio` | fraction of the deferred backfill walked, over `[taproot activation, snapshot]` |
 
-The address index exports `satd_addrindex_enabled` and row counters but has no
-readiness or backfill gauges; the block-filter index exports none at all. Both
-have deferred backfills, so a failed one is currently invisible to Prometheus —
-check `getindexinfo` for those two.
+The address and block-filter indexes export the same readiness shape —
+`satd_addrindex_synced` / `satd_addrindex_backfill_state{state="…"}`
+(alongside the existing `satd_addrindex_enabled` and row counters), and
+`satd_filterindex_enabled` / `satd_filterindex_synced` /
+`satd_filterindex_backfill_state{state="…"}`. `synced` matches the
+corresponding `getindexinfo` predicate in each case: for the address index it
+means the Electrum / Esplora address surfaces will serve; for the filter index
+it means BIP 157 peers and `getblockfilter` will be served. A failed or stuck
+backfill on any of the three is alertable with the same rules shown below —
+substitute the family prefix.
 
 **Do not alert on the progress ratio alone.** `0.0` is not an error signal: it
 covers an index that is switched off, one built inline from a genesis sync (which
