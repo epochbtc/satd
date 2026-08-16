@@ -84,7 +84,7 @@ jobs:
       # when tests fail, so iterating on a red PR doesn't pay the full rebuild
       # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           # Match the `seed-cache` job's `tests` key so a fresh branch's first
@@ -251,7 +251,7 @@ jobs:
       # when tests fail, so iterating on a red PR doesn't pay the full rebuild
       # each push. SHA-pinned (v2.9.1) for supply-chain hygiene.
       - name: Cache Rust dependencies & target dir
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
           # Match the `seed-cache` job's `lint` key (see the test job). The
@@ -409,7 +409,7 @@ jobs:
       # rust-cache's default save-if persists only on success, so a failed
       # compile never poisons the seed cache (hence no cache-on-failure here).
       - name: Cache Rust dependencies & target dir
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ matrix.leg }}
 
