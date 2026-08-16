@@ -67,8 +67,9 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
     // is includable only when it is final for this block (Core's miner
     // re-checks `IsFinalTx` exactly like this — admission normally
     // guarantees it, but a reorg can lower the tip after admission, and a
-    // persisted mempool may predate the admission check) and every input
-    // is either a confirmed coin or an output of a transaction already
+    // persisted mempool may predate the admission check), its sequence
+    // locks are satisfiable at this (height, MTP), and every input
+    // resolves to a confirmed coin or an output of a transaction already
     // included. Greedy by effective fee rate over the ready set; a child
     // deferred behind its parent lands in a later pass, which is what
     // yields parent-before-child order in the emitted list. A child whose
@@ -89,11 +90,52 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
             if !tx_is_final_at(&entry.tx, height, template_mtp) {
                 continue; // never includable in this block
             }
-            let deps_settled = entry.tx.input.iter().all(|i| {
-                let parent = i.previous_output.txid;
-                !in_mempool.contains(&parent) || included.contains(&parent)
-            });
-            if !deps_settled {
+            // Resolve every input against the UTXO set, not mempool
+            // membership: a parent evicted after this child was admitted
+            // (expiry, RBF, block-connect conflict) is in neither the
+            // mempool nor the UTXO set, and treating "not in mempool" as
+            // "confirmed" would mine the orphaned child →
+            // bad-txns-inputs-missingorspent. An input creates one of
+            // four cases: already included in this template (the coin is
+            // born at `height`), a confirmed coin, a mempool parent that
+            // may still be included (defer to a later pass), or nothing
+            // anywhere (drop — unminable). Resolved coin heights feed the
+            // BIP 68 re-check, which mirrors the absolute one above: a
+            // reorg or persisted mempool can hold sequence-locked
+            // transactions admission never re-judged.
+            let bip68_enforced = (entry.tx.version.0 as u32) >= 2;
+            let mut awaits_parent = false;
+            let mut minable = true;
+            for input in &entry.tx.input {
+                let parent = input.previous_output.txid;
+                let prev_height = if included.contains(&parent) {
+                    height
+                } else if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                    coin.height
+                } else if in_mempool.contains(&parent) {
+                    awaits_parent = true;
+                    continue;
+                } else {
+                    minable = false;
+                    break;
+                };
+                if bip68_enforced
+                    && !Mempool::bip68_satisfied(
+                        chain_state,
+                        input.sequence.0,
+                        prev_height,
+                        height,
+                        template_mtp,
+                    )
+                {
+                    minable = false;
+                    break;
+                }
+            }
+            if !minable {
+                continue; // never includable in this block
+            }
+            if awaits_parent {
                 deferred.push((txid, entry));
                 continue;
             }
@@ -235,6 +277,13 @@ mod tests {
     }
 
     fn make_template_env() -> (ChainState, Mempool, std::path::PathBuf) {
+        make_funded_template_env(&[])
+    }
+
+    fn make_funded_template_env(
+        coins: &[(bitcoin::OutPoint, crate::storage::coinview::Coin)],
+    ) -> (ChainState, Mempool, std::path::PathBuf) {
+        use crate::storage::Store as _;
         let dir = std::env::temp_dir().join(format!(
             "satd-template-test-{}-{}",
             std::process::id(),
@@ -244,6 +293,13 @@ mod tests {
                 .subsec_nanos()
         ));
         let store = Box::new(InMemoryStore::new());
+        if !coins.is_empty() {
+            let mut batch = crate::storage::StoreBatch::default();
+            for (op, c) in coins {
+                batch.coin_puts.push((*op, c.clone()));
+            }
+            store.write_batch(batch).unwrap();
+        }
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(
             store,
@@ -349,13 +405,22 @@ mod tests {
         }
     }
 
+    fn coin_at(height: u32) -> crate::storage::coinview::Coin {
+        crate::storage::coinview::Coin {
+            amount: 100_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height,
+            coinbase: false,
+        }
+    }
+
     #[test]
     fn a_cpfp_child_is_emitted_after_its_parent() {
         // The child pays a far higher fee rate — that is what CPFP means —
         // so pure fee-rate order put it *before* its parent and the mined
         // block was invalid (#589).
         use crate::mempool::pool::QuarantineScope;
-        let (cs, mp, dir) = make_template_env();
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xA1), coin_at(0))]);
 
         let parent = tx_spending(confirmed_prev(0xA1), 50_000, 0x31, 0xffff_ffff, 0);
         let parent_txid =
@@ -392,7 +457,7 @@ mod tests {
         // the child alone spends an output that exists nowhere in the
         // block or the chain (#589).
         use crate::mempool::pool::QuarantineScope;
-        let (cs, mp, dir) = make_template_env();
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xA2), coin_at(0))]);
 
         let parent = tx_spending(confirmed_prev(0xA2), 50_000, 0x33, 0xffff_ffff, 0);
         let parent_txid = mp.insert_tx_weighted_for_test(
@@ -432,7 +497,10 @@ mod tests {
         // tip after admission and a persisted mempool can predate the
         // check — the template must filter regardless.
         use crate::mempool::pool::QuarantineScope;
-        let (cs, mp, dir) = make_template_env();
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xA3), coin_at(0)),
+            (confirmed_prev(0xA4), coin_at(0)),
+        ]);
 
         let nonfinal = tx_spending(confirmed_prev(0xA3), 50_000, 0x35, 0, 1_000_000);
         let nonfinal_txid =
@@ -452,6 +520,112 @@ mod tests {
             "a non-final transaction would make the mined block invalid"
         );
         assert!(mined.contains(&fine_txid), "the final one is unaffected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_child_of_an_evicted_parent_is_dropped() {
+        // The parent was evicted after the child was admitted (expiry,
+        // RBF, block-connect conflict): its txid is in neither the
+        // mempool nor the UTXO set. "Not in mempool" must not be read as
+        // "confirmed" — mining the orphan makes the block invalid with
+        // bad-txns-inputs-missingorspent.
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xA6), coin_at(0))]);
+
+        let orphan = tx_spending(confirmed_prev(0xA5), 50_000, 0x37, 0xffff_ffff, 0);
+        let orphan_txid =
+            mp.insert_tx_weighted_for_test(orphan, 50_000, 400, QuarantineScope::acting());
+        let fine = tx_spending(confirmed_prev(0xA6), 50_000, 0x38, 0xffff_ffff, 0);
+        let fine_txid = mp.insert_tx_weighted_for_test(fine, 100, 400, QuarantineScope::acting());
+
+        let template = create_template(&cs, &mp);
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert!(
+            !mined.contains(&orphan_txid),
+            "a spend of a nonexistent coin must never be templated"
+        );
+        assert!(mined.contains(&fine_txid), "the resolvable one is unaffected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsatisfied_sequence_lock_is_never_templated() {
+        // Both spend a coin confirmed at height 0; the template is for
+        // height 1, so one block has elapsed. A 10-block sequence lock is
+        // unsatisfied — mining it yields a SequenceLockNotMet block. Like
+        // the absolute-finality re-check, admission (#588) normally
+        // prevents this, but a reorg-lowered tip or a persisted mempool
+        // does not re-run admission.
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xA7), coin_at(0)),
+            (confirmed_prev(0xA8), coin_at(0)),
+        ]);
+
+        let locked = tx_spending(confirmed_prev(0xA7), 50_000, 0x39, 10, 0);
+        let locked_txid =
+            mp.insert_tx_weighted_for_test(locked, 50_000, 400, QuarantineScope::acting());
+        let elapsed = tx_spending(confirmed_prev(0xA8), 50_000, 0x3A, 1, 0);
+        let elapsed_txid =
+            mp.insert_tx_weighted_for_test(elapsed, 100, 400, QuarantineScope::acting());
+
+        let template = create_template(&cs, &mp);
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert!(
+            !mined.contains(&locked_txid),
+            "an unsatisfied BIP 68 lock would make the mined block invalid"
+        );
+        assert!(
+            mined.contains(&elapsed_txid),
+            "a one-block lock on a height-0 coin is satisfied at height 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sequence_lock_counted_from_an_in_template_parent_is_unsatisfiable() {
+        // The child's coin would be born in this very block, so zero
+        // blocks have elapsed — any nonzero height lock fails. The parent
+        // itself is unaffected.
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xA9), coin_at(0))]);
+
+        let parent = tx_spending(confirmed_prev(0xA9), 50_000, 0x3B, 0xffff_ffff, 0);
+        let parent_txid =
+            mp.insert_tx_weighted_for_test(parent, 100, 400, QuarantineScope::acting());
+        let child = tx_spending(
+            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            40_000,
+            0x3C,
+            1,
+            0,
+        );
+        let child_txid =
+            mp.insert_tx_weighted_for_test(child, 50_000, 400, QuarantineScope::acting());
+
+        let template = create_template(&cs, &mp);
+        let mined: std::collections::HashSet<_> = template
+            .transactions
+            .iter()
+            .map(|t| t.tx.compute_txid())
+            .collect();
+        assert!(mined.contains(&parent_txid), "the parent is mineable");
+        assert!(
+            !mined.contains(&child_txid),
+            "a nonzero lock on a same-block parent can never be satisfied"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

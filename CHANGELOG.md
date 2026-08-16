@@ -16,9 +16,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
   next-block semantics; previously a time-locked transaction was admitted,
   relayed, and included in `getblocktemplate` — mining an invalid block.
 - Fixed (#589): `getblocktemplate` selection is now dependency- and
-  finality-aware — CPFP children are emitted after the parents that fund
-  them (never without them), and non-final transactions are filtered at
-  assembly.
+  finality-aware — inputs resolve against the UTXO set, CPFP children are
+  emitted after the parents that fund them (never without them, and never
+  after the parent's eviction), and transactions failing absolute finality
+  or BIP 68 at the template tip are filtered at assembly.
 - Fixed (#583): three insert-after-invalidate races let the coin cache's
   clean LRU resurrect a coin a concurrent disconnect had just retired — an
   in-memory phantom UTXO over a correct disk, observed as a multi-day

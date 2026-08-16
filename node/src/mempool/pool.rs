@@ -1671,7 +1671,7 @@ impl Mempool {
     /// MTP context — `get_median_time_past(h)` is the median over the 11
     /// blocks strictly below `h`, i.e. Core's
     /// `GetAncestor(h-1)->GetMedianTimePast()`.
-    fn bip68_satisfied(
+    pub(crate) fn bip68_satisfied(
         chain_state: &ChainState,
         seq: u32,
         prev_height: u32,
