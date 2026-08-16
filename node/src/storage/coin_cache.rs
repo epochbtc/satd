@@ -1623,6 +1623,27 @@ impl Store for CoinCache {
         self.inner.write_backfill_last_error(msg)
     }
 
+    // Filter-index backfill cursor forwarders (issue #555). Production
+    // reads all go through the CoinCache layer; without these, the trait
+    // defaults win (`idle()` / `None` / `Err`), so a paused or interrupted
+    // filter backfill never auto-resumed after a restart, its failure
+    // reason was silently dropped, and `getindexinfo` never showed a
+    // `last_error` for the filter index.
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_cursor(&self) -> node_filter_index::cursor::BackfillCursor {
+        self.inner.read_filter_backfill_cursor()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn read_filter_backfill_last_error(&self) -> Option<String> {
+        self.inner.read_filter_backfill_last_error()
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    fn write_filter_backfill_last_error(&self, msg: &str) -> Result<(), StoreError> {
+        self.inner.write_filter_backfill_last_error(msg)
+    }
+
     // Index-completeness marker forwarders. Without these, the
     // trait defaults (return `true`) leak through and mask the
     // upgrade-gap detection done at store-open time.
@@ -3918,5 +3939,61 @@ mod tests {
         cache.set_write_mode(WriteMode::Normal);
         cache.set_write_mode(WriteMode::BulkLoad);
         assert_eq!(durable_flushes.load(Ordering::Relaxed), 1);
+    }
+
+    // ── Filter-backfill cursor forwarding (issue #555) ────────────────
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn the_filter_backfill_cursor_reads_through_the_cache() {
+        // Production reads the cursor through the CoinCache layer only;
+        // tests that read `InMemoryStore` directly exercised a different
+        // path, which is what hid the missing forwarders: the trait
+        // defaults won and a paused backfill decayed to `idle()` on
+        // restart, never resuming. Write the cursor the way the backfill
+        // does (bundled into a StoreBatch) and read it back through the
+        // cache.
+        use node_filter_index::cursor::BackfillState;
+
+        let cache = make_cache(10);
+
+        let batch = StoreBatch {
+            filter_backfill_cursor_advance: Some(crate::storage::FilterBackfillCursorWrite {
+                state: BackfillState::Paused,
+                cursor_height: 400_000,
+                snapshot_height: 500_000,
+                started_at_unix: 1_700_000_000,
+                snapshot_tip_hash: [0xab; 32],
+            }),
+            ..Default::default()
+        };
+        cache.write_batch(batch).unwrap();
+
+        let cur = cache.read_filter_backfill_cursor();
+        assert_eq!(
+            cur.state,
+            BackfillState::Paused,
+            "the persisted cursor must not decay to idle through the cache"
+        );
+        assert_eq!(cur.cursor_height, 400_000);
+        assert_eq!(cur.snapshot_height, 500_000);
+        assert_eq!(cur.snapshot_tip_hash, [0xab; 32]);
+    }
+
+    #[cfg(feature = "block-filter-index")]
+    #[test]
+    fn the_filter_backfill_last_error_round_trips_through_the_cache() {
+        // The failure path does `let _ = store.write_filter_backfill_last_error(..)`,
+        // so the default `Err` was silently swallowed and `getindexinfo`
+        // never showed a `last_error` for the filter index.
+        let cache = make_cache(10);
+        assert_eq!(cache.read_filter_backfill_last_error(), None);
+        cache
+            .write_filter_backfill_last_error("undo data missing at height 12345")
+            .unwrap();
+        assert_eq!(
+            cache.read_filter_backfill_last_error().as_deref(),
+            Some("undo data missing at height 12345")
+        );
     }
 }
