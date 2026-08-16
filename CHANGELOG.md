@@ -11,6 +11,11 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed (#555): the coin cache did not forward the filter-index backfill
+  cursor reads to the backing store, so a paused or interrupted filter
+  backfill read back as `idle` after a restart and never auto-resumed, its
+  failure reason was never persisted, and `getindexinfo` never showed a
+  `last_error` for the filter index.
 - Fixed: the block connector mutated the UTXO cache and the chain tip without
   holding `accept_lock`, the lock every other chain mutator takes, so an
   `invalidateblock` reorg and the connector could connect the same blocks
