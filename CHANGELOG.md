@@ -11,6 +11,14 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed (#588): mempool admission now enforces transaction finality
+  (`non-final`) and BIP 68 sequence locks (`non-BIP68-final`) with Core's
+  next-block semantics; previously a time-locked transaction was admitted,
+  relayed, and included in `getblocktemplate` — mining an invalid block.
+- Fixed (#589): `getblocktemplate` selection is now dependency- and
+  finality-aware — CPFP children are emitted after the parents that fund
+  them (never without them), and non-final transactions are filtered at
+  assembly.
 - Fixed (#583): three insert-after-invalidate races let the coin cache's
   clean LRU resurrect a coin a concurrent disconnect had just retired — an
   in-memory phantom UTXO over a correct disk, observed as a multi-day
