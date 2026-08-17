@@ -3528,6 +3528,14 @@ impl PeerManager {
             *ready = false;
             // Wait up to 500ms — will be woken immediately if a block is stored
             let _ = cvar.wait_for(&mut ready, Duration::from_millis(500));
+            // Release the signal mutex before doing any connect work. The
+            // flag is edge-triggered with the 500ms timeout as backstop, so
+            // holding the guard buys nothing — while every notifier blocks
+            // on it: `maybe_start_ibd` runs on the tokio run loop, so
+            // holding this across a long drain would freeze all P2P
+            // maintenance (and park peer tasks in `handle_block_ibd`) for
+            // the duration.
+            drop(ready);
 
             // Drain all available blocks from the channel
             while let Ok(block) = rx.try_recv() {
@@ -3612,8 +3620,9 @@ impl PeerManager {
     }
 
     /// Connect blocks that are already stored on disk and extend the tip,
-    /// walking the best-header-chain frontier until data runs out or a
-    /// block fails to connect. Returns the number of blocks connected.
+    /// walking the best-header-chain frontier until data runs out, a
+    /// block fails to connect, or the per-wakeup cap is hit. Returns the
+    /// number of blocks connected.
     ///
     /// This is the steady-state counterpart of the IBD connect loop's
     /// stored-block walk: it exists so a tail downloaded by a scheduler
@@ -3621,20 +3630,51 @@ impl PeerManager {
     /// network event. Idle cost is one height-index lookup per wakeup —
     /// at the tip there is no row above the frontier and the loop exits
     /// immediately.
+    ///
+    /// The cap equals the scheduler-creation threshold on purpose: a
+    /// stored tail longer than 24 coincides with `headers_tip > tip + 24`,
+    /// so the run loop's `maybe_start_ibd` poll re-arms within one
+    /// fallback tick and the IBD connect loop — which flushes on the
+    /// dirty-cache threshold, prunes, and skips per-block fee recording —
+    /// takes the bulk over. This drain only needs to cover what that gate
+    /// can leave behind. The cap is also what bounds the caller's
+    /// latency: the block processor must return to its loop top promptly
+    /// to notice a newly-armed scheduler and to keep servicing the
+    /// channel.
     fn connect_stored_tail(
         chain_state: &Arc<ChainState>,
         fee_estimator: &FeeEstimator,
         mempool: &Arc<Mempool>,
         orphanage: &Arc<TxOrphanage>,
     ) -> u32 {
+        const MAX_PER_WAKEUP: u32 = 24;
         let mut connected = 0u32;
-        loop {
+        while connected < MAX_PER_WAKEUP {
+            // Cost gates, not the guard — `connect_stored_block` re-checks
+            // every fact under the accept lock. A post-handoff fork-blocked
+            // frontier is a routine wait state for this loop's caller, and
+            // without these two checks each 500ms wakeup would pay a full
+            // block read plus a per-input fee computation (and admit
+            // `next_block_to_connect`'s rate-limited full-index scan) just
+            // to have the connect reject the row. The frontier check is
+            // two point lookups and short-circuits all of that; the
+            // DataStored check below catches the reorg-displaced `Valid`
+            // row the frontier check cannot see.
+            if !chain_state.frontier_connects_to_tip() {
+                break;
+            }
             let next_height = chain_state.tip_height() + 1;
             let Some(hash) = chain_state.next_block_to_connect(next_height) else {
                 break;
             };
             if !chain_state.has_block_data(&hash) {
                 break;
+            }
+            match chain_state.get_block_index(&hash) {
+                Some(entry)
+                    if entry.status == crate::storage::blockindex::BlockStatus::DataStored
+                        && entry.header.prev_blockhash == chain_state.tip_hash() => {}
+                _ => break,
             }
             // The block bytes are needed regardless of outcome: fee rates
             // must be computed against the pre-connect UTXO view, and the
@@ -6690,6 +6730,179 @@ mod tests {
             Some(30),
             "the fallback tick must re-create the scheduler for the known headers tip"
         );
+        // Tear the leaked machinery down: scheduler-cleared is a documented
+        // ibd_connect_loop exit path, and taking it also stops the
+        // prefetch dispatcher the loop spawned — otherwise both poll for
+        // the life of the test binary.
+        *pm.ibd.write() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The drain must return to its caller after a bounded batch. The
+    /// block processor is single-threaded: while the drain walks, it
+    /// cannot notice a newly-armed scheduler, service the block channel,
+    /// or observe shutdown — and a fork-blocked handoff can strand a tail
+    /// up to `maxahead` (default 50,000) blocks that becomes connectable
+    /// all at once after the reorg. Anything longer than the cap
+    /// coincides with a headers gap over 24, which the run loop's poll
+    /// hands to the IBD connect loop and its flush/backpressure rails.
+    #[test]
+    fn the_stored_tail_drain_is_capped_per_wakeup() {
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, store_block_without_connecting,
+        };
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let mut parent = cs.accept_block(&b1).expect("connect block 1");
+        let mut headers = Vec::new();
+        let mut tail = Vec::new();
+        for h in 2..=31u32 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+            tail.push((b, h));
+        }
+        let (accepted, err) = cs.accept_headers(&headers);
+        assert_eq!(accepted, 30, "fixture: headers must be accepted ({err:?})");
+        for (b, h) in &tail {
+            store_block_without_connecting(&cs, b, *h);
+        }
+        assert_eq!(cs.tip_height(), 1, "fixture: 30-block tail stored, none connected");
+
+        let chain_state = Arc::new(cs);
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = FeeEstimator::new();
+        let orphanage = Arc::new(TxOrphanage::with_defaults());
+
+        let first = PeerManager::connect_stored_tail(
+            &chain_state,
+            &fee_estimator,
+            &mempool,
+            &orphanage,
+        );
+        assert_eq!(first, 24, "one wakeup must connect exactly the cap");
+        assert_eq!(chain_state.tip_height(), 25, "tip must stop at the cap boundary");
+
+        let second = PeerManager::connect_stored_tail(
+            &chain_state,
+            &fee_estimator,
+            &mempool,
+            &orphanage,
+        );
+        assert_eq!(second, 6, "the next wakeup must finish the remainder");
+        assert_eq!(chain_state.tip_height(), 31, "the whole tail must connect across wakeups");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The re-arm gate must refuse to (re)create a scheduler while the
+    /// connect frontier is fork-blocked — the linear connector cannot
+    /// reorg, so arming it there re-wedges on `bad-prevblk`, and with the
+    /// gate now polled every ~5s a regression means continuous
+    /// teardown↔re-create oscillation that starves the reorg-capable
+    /// steady-state path, not a once-per-headers-batch mistake.
+    #[test]
+    fn a_fork_blocked_frontier_never_re_arms_ibd() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        // Chain A: one connected block — the tip.
+        let a1 = build_test_block(genesis, 1, 1_707_000_000);
+        cs.accept_block(&a1).expect("connect chain A block 1");
+        // Construct at tip == headers tip so the startup resume path
+        // (which deliberately does not check the frontier) arms nothing.
+        let chain_state = Arc::new(cs);
+        let pm = peer_manager_over(chain_state.clone());
+        assert!(pm.ibd.read().is_none(), "fixture: no scheduler at construction");
+
+        // Chain B: a 30-header competing branch forking at genesis. More
+        // work than A, so it becomes the best header chain and owns the
+        // height rows — but block 2's parent is B's block 1, not the tip:
+        // the frontier is fork-blocked until the reorg path moves the tip.
+        let mut headers = Vec::new();
+        let mut parent = genesis;
+        for h in 1..=30u32 {
+            let b = build_test_block(parent, h, 1_707_100_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+        }
+        let (accepted, err) = chain_state.accept_headers(&headers);
+        assert_eq!(accepted, 30, "fixture: fork headers must be accepted ({err:?})");
+        assert!(
+            !chain_state.frontier_connects_to_tip(),
+            "fixture: the frontier must actually be fork-blocked"
+        );
+        assert!(
+            chain_state.headers_tip_height() > chain_state.tip_height() + 24,
+            "fixture: the gap alone must pass the creation threshold"
+        );
+        assert!(
+            !pm.maybe_start_ibd(),
+            "a fork-blocked frontier must not arm the linear IBD scheduler"
+        );
+        assert!(pm.ibd.read().is_none(), "no scheduler may exist afterwards");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A headers batch arriving while a scheduler is live must extend it,
+    /// not replace it. Two guards are load-bearing in the refactored
+    /// control flow: `maybe_start_ibd`'s is-some re-entry check (without
+    /// it every mid-IBD batch clobbers the live scheduler, losing its
+    /// in-flight assignments) and `handle_headers`' extension arm
+    /// (without it a late batch strands the new headers' blocks — the
+    /// wedge documented at the call site). In-flight state surviving with
+    /// the raised target proves extension; a fresh scheduler would carry
+    /// the target but empty assignments.
+    #[test]
+    fn a_headers_batch_extends_a_live_scheduler_instead_of_replacing_it() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+        let (cs, dir) = make_chain_state();
+        let chain_state = Arc::new(cs);
+        let pm = peer_manager_over(chain_state.clone());
+
+        let mut headers = Vec::new();
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let mut all_blocks = Vec::new();
+        for h in 1..=60u32 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+            all_blocks.push(b);
+        }
+        let (accepted, err) = chain_state.accept_headers(&headers[..30]);
+        assert_eq!(accepted, 30, "fixture: first batch must be accepted ({err:?})");
+        assert!(pm.maybe_start_ibd(), "fixture: the first batch must arm a scheduler");
+
+        // Give the live scheduler observable state a replacement would lose.
+        let assigned = {
+            let mut ibd = pm.ibd.write();
+            let sched = ibd.as_mut().expect("scheduler just armed");
+            assert_eq!(sched.target_height(), 30);
+            sched.register_peer(1);
+            sched.assign_blocks(1)
+        };
+        assert!(!assigned.is_empty(), "fixture: peer 1 must hold assignments");
+
+        // Second batch through the real headers handler (no peer 7 exists;
+        // outbound sends are best-effort no-ops).
+        pm.handle_headers(7, headers[30..].to_vec());
+
+        let (target, inflight) = {
+            let ibd = pm.ibd.read();
+            let sched = ibd.as_ref().expect("scheduler must still exist");
+            (sched.target_height(), sched.peer_inflight_count(1))
+        };
+        assert_eq!(target, 60, "the live scheduler must extend to the new headers tip");
+        assert_eq!(
+            inflight,
+            assigned.len(),
+            "in-flight assignments must survive — a fresh scheduler here means \
+             the batch replaced the live one instead of extending it"
+        );
+        *pm.ibd.write() = None;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
