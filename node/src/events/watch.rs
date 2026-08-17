@@ -5147,4 +5147,734 @@ mod tests {
             "wrong stored tweak ⇒ no false-positive match",
         );
     }
+
+    // ---- BIP 352 golden-vector parity for the Tier-2 matcher -------------
+    //
+    // The kernel has its own vector-parity suite
+    // (node-sp-index/tests/vectors.rs); these tests drive the SAME vendored
+    // corpus through the *matcher pipeline* instead — `SpWatchTarget`
+    // registration, the confirmed-block scan (undo slicing + tweak
+    // recompute), the mempool scan, and the D4 rescan fast path — so a
+    // matcher-layer defect (undo alignment, label registration, output
+    // back-mapping, k/label attribution) cannot hide behind kernel-level
+    // parity. Everything asserted comes from the vectors, never from our own
+    // implementation: the expected output sets and tweaks are the JSON's,
+    // the mempool and fast-path legs are fed the VECTOR's tweak (the kernel's
+    // `compute_tweak` never runs on those legs), and each `priv_key_tweak`
+    // is re-derived from the emitted `(T, k, label)` with the test-local
+    // BIP 352 derivation (`sp_tagged`), then checked against the JSON —
+    // parity, not self-consistency.
+
+    const SP_VECTORS: &str =
+        include_str!("../../../node-sp-index/tests/vectors/send_and_receive_test_vectors.json");
+
+    /// Channel capacity for vector scans: the K_max case emits 2323 matches,
+    /// which must not be dropped by a full live channel.
+    const SP_VECTOR_CHANNEL: usize = 4096;
+
+    /// Deterministic per-vout output value, distinct per vout, so the
+    /// vout/amount back-map assertion is discriminating (a transposed
+    /// pairing fails).
+    fn sp_vector_value(vout: usize) -> u64 {
+        1_000 + 7 * vout as u64
+    }
+
+    struct SpVectorCase {
+        comment: String,
+        tx: Transaction,
+        undo: UndoData,
+        target: SpWatchTarget,
+        b_scan: SecretKey,
+        scan_id: [u8; 33],
+        /// The vector's expected public tweak `T` — `None` for an ineligible
+        /// (null-tweak) case.
+        tweak: Option<PublicKey>,
+        /// Expected `(pub_key, priv_key_tweak)` hex pairs, when enumerated.
+        expected: Option<Vec<(String, String)>>,
+        /// Expected match count for the K_max case (outputs not enumerated).
+        n_outputs: Option<u64>,
+        labeled: bool,
+    }
+
+    /// Parse every receiving entry of the vendored corpus into a
+    /// matcher-ready case: a real transaction (inputs with their
+    /// scriptSig/witness, taproot outputs), block-undo coins carrying the
+    /// spent prevout scripts, and a registered-shape watch target built from
+    /// the vector's key material and labels.
+    fn sp_vector_cases() -> Vec<SpVectorCase> {
+        use std::str::FromStr;
+        let secp = Secp256k1::new();
+        let hexb = |v: &serde_json::Value| hex::decode(v.as_str().unwrap()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(SP_VECTORS).unwrap();
+        let mut cases = Vec::new();
+        for case in json.as_array().unwrap() {
+            let comment = case["comment"].as_str().unwrap().to_string();
+            for recv in case["receiving"].as_array().unwrap() {
+                let given = &recv["given"];
+                let expected = &recv["expected"];
+
+                let mut input = Vec::new();
+                let mut spent_coins = Vec::new();
+                for vin in given["vin"].as_array().unwrap() {
+                    let wit_bytes = hexb(&vin["txinwitness"]);
+                    let witness: Witness = if wit_bytes.is_empty() {
+                        Witness::new()
+                    } else {
+                        bitcoin::consensus::deserialize(&wit_bytes).unwrap()
+                    };
+                    input.push(TxIn {
+                        previous_output: OutPoint {
+                            txid: Txid::from_str(vin["txid"].as_str().unwrap()).unwrap(),
+                            vout: vin["vout"].as_u64().unwrap() as u32,
+                        },
+                        script_sig: ScriptBuf::from_bytes(hexb(&vin["scriptSig"])),
+                        sequence: Sequence::MAX,
+                        witness,
+                    });
+                    // The corpus's prevout carries only the scriptPubKey; the
+                    // other coin fields are fabricated — the SP scan consumes
+                    // only `script_pubkey` (see scan_block_sp).
+                    spent_coins.push(crate::storage::coinview::Coin {
+                        amount: 50_000,
+                        script_pubkey: ScriptBuf::from_bytes(hexb(
+                            &vin["prevout"]["scriptPubKey"]["hex"],
+                        )),
+                        height: 1,
+                        coinbase: false,
+                    });
+                }
+                let output: Vec<TxOut> = given["outputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .map(|(vout, o)| {
+                        // Raw `OP_1 <32-byte x-only>` from the vector bytes —
+                        // deliberately NOT parsed as a point here: one corpus
+                        // case carries an all-zeros (off-curve) output key, and
+                        // deciding key validity is the matcher's job.
+                        let mut spk = vec![0x51, 0x20];
+                        spk.extend_from_slice(&hexb(o));
+                        TxOut {
+                            value: Amount::from_sat(sp_vector_value(vout)),
+                            script_pubkey: ScriptBuf::from_bytes(spk),
+                        }
+                    })
+                    .collect();
+                let tx = Transaction {
+                    version: Version::TWO,
+                    lock_time: LockTime::ZERO,
+                    input,
+                    output,
+                };
+
+                let b_scan =
+                    SecretKey::from_slice(&hexb(&given["key_material"]["scan_priv_key"])).unwrap();
+                let b_spend =
+                    SecretKey::from_slice(&hexb(&given["key_material"]["spend_priv_key"])).unwrap();
+                let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+                let labels: Vec<u32> = given["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l.as_u64().unwrap() as u32)
+                    .collect();
+                let labeled = !labels.is_empty();
+                let target =
+                    SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), labels)
+                        .unwrap();
+                let scan_id = target.scan_pubkey();
+
+                let tweak = expected["tweak"]
+                    .as_str()
+                    .map(|t| PublicKey::from_slice(&hex::decode(t).unwrap()).unwrap());
+                let expected_outputs = expected
+                    .get("outputs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|o| {
+                                (
+                                    o["pub_key"].as_str().unwrap().to_string(),
+                                    o["priv_key_tweak"].as_str().unwrap().to_string(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                let n_outputs = expected.get("n_outputs").and_then(|v| v.as_u64());
+
+                cases.push(SpVectorCase {
+                    comment: comment.clone(),
+                    tx,
+                    undo: UndoData { spent_coins },
+                    target,
+                    b_scan,
+                    scan_id,
+                    tweak,
+                    expected: expected_outputs,
+                    n_outputs,
+                    labeled,
+                });
+            }
+        }
+        // Pin the vendored corpus exactly: the per-class floors in the tests
+        // are deliberately loose, so a silent corpus swap must at least trip
+        // this (update both on a deliberate re-vendor).
+        assert_eq!(cases.len(), 29, "vendored corpus changed: receiving entries");
+        cases
+    }
+
+    /// Independent BIP 352 re-derivation of the per-output private-key tweak
+    /// a wallet computes from an emitted match: `t_k = H_shared(b_scan·T ||
+    /// k)`, plus the label scalar `H_label(b_scan || m)` when the match came
+    /// via a label. Built on the test-local `sp_tagged`, not the kernel.
+    fn sp_priv_tweak(
+        b_scan: &SecretKey,
+        tweak: &PublicKey,
+        k: u32,
+        label: Option<u32>,
+    ) -> [u8; 32] {
+        use bitcoin::secp256k1::Scalar;
+        let secp = Secp256k1::new();
+        let ecdh = tweak
+            .mul_tweak(&secp, &Scalar::from_be_bytes(b_scan.secret_bytes()).unwrap())
+            .unwrap();
+        let mut buf = ecdh.serialize().to_vec();
+        buf.extend_from_slice(&k.to_be_bytes());
+        let t_k = sp_tagged(b"BIP0352/SharedSecret", &buf);
+        match label {
+            None => t_k,
+            Some(m) => {
+                let mut lb = b_scan.secret_bytes().to_vec();
+                lb.extend_from_slice(&m.to_be_bytes());
+                let label_scalar = Scalar::from_be_bytes(sp_tagged(b"BIP0352/Label", &lb)).unwrap();
+                SecretKey::from_slice(&t_k)
+                    .unwrap()
+                    .add_tweak(&label_scalar)
+                    .unwrap()
+                    .secret_bytes()
+            }
+        }
+    }
+
+    #[test]
+    fn bip352_vectors_match_through_the_confirmed_block_matcher() {
+        use std::collections::BTreeSet;
+        let mut eligible = 0usize;
+        let mut null = 0usize;
+        let mut labeled = 0usize;
+        let mut kmax = 0usize;
+        let mut no_match = 0usize;
+        for case in sp_vector_cases() {
+            let c = &case.comment;
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(SP_VECTOR_CHANNEL);
+            assert_eq!(
+                handle.add_silent_payments(std::slice::from_ref(&case.target)),
+                1,
+                "[{c}] target registration"
+            );
+
+            let block = block_with(vec![coinbase_tx(), case.tx.clone()]);
+            reg.scan_block(&block, 777, Some(&case.undo));
+
+            let mut matches = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                matches.push(m);
+            }
+
+            let Some(exp_tweak) = case.tweak else {
+                assert!(
+                    matches.is_empty(),
+                    "[{c}] ineligible (null-tweak) case must not match: {matches:?}"
+                );
+                null += 1;
+                continue;
+            };
+            eligible += 1;
+            if case.labeled {
+                labeled += 1;
+            }
+
+            // Every emitted match must carry the VECTOR's tweak, correct
+            // attribution and height, and a vout/amount back-map onto the tx.
+            let mut got: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut got_ks: BTreeSet<u32> = BTreeSet::new();
+            for m in &matches {
+                let WatchMatch::SilentPaymentMatched {
+                    scan_pubkey,
+                    txid,
+                    vout,
+                    output_pubkey,
+                    amount,
+                    tweak,
+                    k,
+                    label,
+                    confirmed,
+                    height,
+                    raw_tx,
+                } = m
+                else {
+                    panic!("[{c}] unexpected non-SP match: {m:?}");
+                };
+                assert_eq!(*scan_pubkey, case.scan_id, "[{c}] attribution");
+                assert_eq!(*txid, case.tx.compute_txid(), "[{c}] txid");
+                assert_eq!(*tweak, exp_tweak, "[{c}] emitted tweak != vector tweak");
+                assert!(*confirmed, "[{c}] block match must be confirmed");
+                assert_eq!(*height, Some(777), "[{c}] height");
+                assert!(raw_tx.is_none(), "[{c}] nobody opted into raw_tx");
+                let out = &case.tx.output[*vout as usize];
+                assert_eq!(
+                    out.script_pubkey,
+                    p2tr_spk(*output_pubkey),
+                    "[{c}] vout back-map"
+                );
+                assert_eq!(
+                    *amount,
+                    sp_vector_value(*vout as usize),
+                    "[{c}] amount back-map"
+                );
+                got.insert((
+                    hex::encode(output_pubkey.serialize()),
+                    hex::encode(sp_priv_tweak(&case.b_scan, tweak, *k, *label)),
+                ));
+                got_ks.insert(*k);
+            }
+
+            if let Some(expected) = &case.expected {
+                assert_eq!(matches.len(), expected.len(), "[{c}] match count");
+                let want: BTreeSet<(String, String)> = expected.iter().cloned().collect();
+                assert_eq!(got, want, "[{c}] matched (pub_key, priv_key_tweak) set");
+                if expected.is_empty() {
+                    no_match += 1;
+                }
+            } else if let Some(n) = case.n_outputs {
+                assert_eq!(matches.len() as u64, n, "[{c}] K_max match count");
+                // The JSON gives only a count here, so guard against
+                // duplicate-masking (the same match emitted n times would
+                // collapse in the set) and against k mis-attribution: the
+                // scanner increments k per hit, so n matches must carry
+                // exactly the distinct counters 0..n.
+                assert_eq!(got.len() as u64, n, "[{c}] K_max distinct match set");
+                let want_ks: BTreeSet<u32> = (0..n as u32).collect();
+                assert_eq!(got_ks, want_ks, "[{c}] K_max k coverage");
+                kmax += 1;
+            } else {
+                panic!("[{c}] receiving expected has neither outputs nor n_outputs");
+            }
+        }
+        // Guard that the suite exercised the corpus classes it claims to —
+        // a silently-empty run would otherwise pass (the corpus is static).
+        assert!(eligible >= 20, "too few eligible cases checked: {eligible}");
+        assert!(null >= 2, "null-tweak cases not exercised: {null}");
+        assert!(labeled >= 3, "labeled cases not exercised: {labeled}");
+        assert!(kmax >= 1, "K_max case not exercised");
+        assert!(no_match >= 1, "eligible-but-unrelated-outputs case not exercised");
+    }
+
+    #[test]
+    fn bip352_vectors_match_through_the_mempool_matcher_on_the_vector_tweak() {
+        use std::collections::BTreeSet;
+        // The mempool path never recomputes the tweak — it trusts the entry
+        // cached at admission. Feed it the VECTOR's tweak, so this leg runs
+        // zero kernel tweak derivation: corpus in, matches out.
+        let mut checked = 0usize;
+        for case in sp_vector_cases() {
+            let Some(exp_tweak) = case.tweak else { continue };
+            let c = &case.comment;
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, mut rx) = reg.register(SP_VECTOR_CHANNEL);
+            assert_eq!(
+                handle.add_silent_payments(std::slice::from_ref(&case.target)),
+                1,
+                "[{c}] target registration"
+            );
+
+            // max_taproot_value / taproot_outputs are unused by this path
+            // (the taproot table is rebuilt from the tx); only txid + tweak
+            // feed the scan.
+            let entry = TweakEntry {
+                txid: case.tx.compute_txid(),
+                tweak: exp_tweak,
+                max_taproot_value: Amount::from_sat(1),
+                taproot_outputs: Vec::new(),
+            };
+            reg.scan_mempool_sp(&case.tx, Some(&entry));
+
+            let mut count = 0usize;
+            let mut got: BTreeSet<(String, String)> = BTreeSet::new();
+            while let Ok(m) = rx.try_recv() {
+                count += 1;
+                let WatchMatch::SilentPaymentMatched {
+                    scan_pubkey,
+                    txid,
+                    vout,
+                    output_pubkey,
+                    amount,
+                    tweak,
+                    k,
+                    label,
+                    confirmed,
+                    height,
+                    raw_tx,
+                } = &m
+                else {
+                    panic!("[{c}] unexpected non-SP match: {m:?}");
+                };
+                assert_eq!(*scan_pubkey, case.scan_id, "[{c}] attribution");
+                assert_eq!(*txid, case.tx.compute_txid(), "[{c}] txid");
+                assert!(!confirmed, "[{c}] mempool match is unconfirmed");
+                assert_eq!(*height, None, "[{c}] mempool match has no height");
+                assert_eq!(*tweak, exp_tweak, "[{c}] emitted tweak != vector tweak");
+                assert!(raw_tx.is_none(), "[{c}] nobody opted into raw_tx");
+                let out = &case.tx.output[*vout as usize];
+                let mut spk = vec![0x51, 0x20];
+                spk.extend_from_slice(&output_pubkey.serialize());
+                assert_eq!(
+                    out.script_pubkey.as_bytes(),
+                    spk.as_slice(),
+                    "[{c}] vout back-map"
+                );
+                assert_eq!(
+                    *amount,
+                    sp_vector_value(*vout as usize),
+                    "[{c}] amount back-map"
+                );
+                got.insert((
+                    hex::encode(output_pubkey.serialize()),
+                    hex::encode(sp_priv_tweak(&case.b_scan, tweak, *k, *label)),
+                ));
+            }
+
+            if let Some(expected) = &case.expected {
+                assert_eq!(count, expected.len(), "[{c}] mempool match count");
+                let want: BTreeSet<(String, String)> = expected.iter().cloned().collect();
+                assert_eq!(got, want, "[{c}] mempool (pub_key, priv_key_tweak) set");
+            } else if let Some(n) = case.n_outputs {
+                assert_eq!(count as u64, n, "[{c}] K_max mempool match count");
+                assert_eq!(got.len() as u64, n, "[{c}] K_max distinct mempool set");
+            } else {
+                panic!("[{c}] receiving expected has neither outputs nor n_outputs");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "too few eligible cases checked: {checked}");
+    }
+
+    #[test]
+    fn bip352_vectors_rescan_fast_path_equals_recompute() {
+        // D4 acceleration differential over the whole corpus: for every
+        // eligible case, the index-accelerated path (VECTOR tweak, no undo)
+        // and the recompute path (undo, no stored tweak) must produce
+        // identical matches — and the vector's expected count.
+        let mut checked = 0usize;
+        for case in sp_vector_cases() {
+            let Some(exp_tweak) = case.tweak else { continue };
+            let c = &case.comment;
+            let reg = Arc::new(WatchRegistry::new());
+            let (handle, _rx) = reg.register(SP_VECTOR_CHANNEL);
+            assert_eq!(
+                handle.add_silent_payments(std::slice::from_ref(&case.target)),
+                1,
+                "[{c}] target registration"
+            );
+            let eph = reg
+                .clone_for_rescan(handle.sub_id())
+                .expect("non-empty watch-set");
+
+            let block = block_with(vec![coinbase_tx(), case.tx.clone()]);
+            let recompute = eph.scan_block_collect(&block, 9, Some(&case.undo));
+            // max_taproot_value / taproot_outputs unused by the fast path;
+            // only txid + tweak feed the scan.
+            let entry = TweakEntry {
+                txid: case.tx.compute_txid(),
+                tweak: exp_tweak,
+                max_taproot_value: Amount::from_sat(1),
+                taproot_outputs: Vec::new(),
+            };
+            let accel = eph.scan_block_collect_accel(&block, 9, None, Some(&[entry]));
+            assert_eq!(accel, recompute, "[{c}] fast path != recompute");
+            let n = case
+                .expected
+                .as_ref()
+                .map(|e| e.len() as u64)
+                .or(case.n_outputs)
+                .unwrap();
+            assert_eq!(recompute.len() as u64, n, "[{c}] match count");
+            checked += 1;
+        }
+        assert!(checked >= 20, "too few eligible cases checked: {checked}");
+    }
+
+    // ---- SP matcher coverage the corpus cannot provide -------------------
+    //
+    // The vendored vectors are one transaction per case, one target per
+    // scan, and all-taproot outputs — so several matcher behaviors are
+    // invisible to them (adversarial mutation review verified each mutant
+    // named below survives the vector suite AND every pre-existing SP
+    // test). These synthetic tests pin them.
+
+    /// A non-taproot (P2WPKH-shaped) scriptPubKey for filler prevouts.
+    fn non_taproot_spk() -> ScriptBuf {
+        let mut v = vec![0x00, 0x14];
+        v.extend_from_slice(&[0xab; 20]);
+        ScriptBuf::from(v)
+    }
+
+    #[test]
+    fn sp_block_scan_aligns_undo_across_transactions() {
+        // Block [coinbase, filler, payment]: the SP undo cursor must advance
+        // past the filler's spent coin, or the payment tx is fed the wrong
+        // prevout script and derives no (or a wrong) tweak. Mutant killed:
+        // deleting `undo_idx += n_in` in scan_block_sp.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, p0_xonly, _t) = sp_payment(&b_scan, &b_spend_pub, 12_345);
+
+        let filler = spending_tx(outpoint(0x55, 1));
+        let spent_coins = vec![coin_with_spk(non_taproot_spk()), undo.spent_coins[0].clone()];
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_silent_payments(&[
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+        ]);
+
+        let block = block_with(vec![coinbase_tx(), filler, tx]);
+        reg.scan_block(&block, 42, Some(&UndoData { spent_coins }));
+
+        match rx.try_recv().expect("payment in the SECOND non-coinbase tx matches") {
+            WatchMatch::SilentPaymentMatched {
+                output_pubkey,
+                vout,
+                amount,
+                height,
+                ..
+            } => {
+                assert_eq!(output_pubkey, p0_xonly);
+                assert_eq!(vout, 0);
+                assert_eq!(amount, 12_345);
+                assert_eq!(height, Some(42));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one match");
+    }
+
+    #[test]
+    fn sp_matches_attribute_to_the_right_target_and_subscriber() {
+        // Two subscribers; the first registers TWO targets in one call (the
+        // return must count both); a block pays the first subscriber's
+        // second target and the second subscriber's target. Each match must
+        // route only to the owning subscriber's channel and carry the
+        // matched target's scan_pubkey. Mutants killed: attributing or
+        // emitting via work[0] instead of the matched row in
+        // sp_scan_tx_outputs (a cross-connection privacy leak); registering
+        // only the first element of the slice in add_silent_payments.
+        let secp = Secp256k1::new();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let scan_a = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let scan_b = SecretKey::from_slice(&[0x66u8; 32]).unwrap();
+        let scan_c = SecretKey::from_slice(&[0x77u8; 32]).unwrap();
+        let id_b = PublicKey::from_secret_key(&secp, &scan_b).serialize();
+        let id_c = PublicKey::from_secret_key(&secp, &scan_c).serialize();
+
+        let (tx_b, undo_b, p0_b, _) = sp_payment(&scan_b, &b_spend_pub, 1_111);
+        let (tx_c, undo_c, p0_c, _) = sp_payment(&scan_c, &b_spend_pub, 2_222);
+        let txid_b = tx_b.compute_txid();
+        let txid_c = tx_c.compute_txid();
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (h1, mut rx1) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let (h2, mut rx2) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let t_a =
+            SpWatchTarget::new(scan_a.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        let t_b =
+            SpWatchTarget::new(scan_b.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        let t_c =
+            SpWatchTarget::new(scan_c.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap();
+        assert_eq!(
+            h1.add_silent_payments(&[t_a, t_b]),
+            2,
+            "both targets of one call register"
+        );
+        assert_eq!(h2.add_silent_payments(std::slice::from_ref(&t_c)), 1);
+
+        let spent_coins = vec![undo_b.spent_coins[0].clone(), undo_c.spent_coins[0].clone()];
+        let block = block_with(vec![coinbase_tx(), tx_b, tx_c]);
+        reg.scan_block(&block, 5, Some(&UndoData { spent_coins }));
+
+        match rx1.try_recv().expect("subscriber 1 gets its target's match") {
+            WatchMatch::SilentPaymentMatched {
+                scan_pubkey,
+                txid,
+                output_pubkey,
+                amount,
+                ..
+            } => {
+                assert_eq!(scan_pubkey, id_b, "attributed to the MATCHED target");
+                assert_eq!(txid, txid_b);
+                assert_eq!(output_pubkey, p0_b);
+                assert_eq!(amount, 1_111);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx1.try_recv().is_err(), "subscriber 1 sees nothing else");
+
+        match rx2.try_recv().expect("subscriber 2 gets its own match") {
+            WatchMatch::SilentPaymentMatched {
+                scan_pubkey,
+                txid,
+                output_pubkey,
+                amount,
+                ..
+            } => {
+                assert_eq!(scan_pubkey, id_c, "attributed to the MATCHED target");
+                assert_eq!(txid, txid_c);
+                assert_eq!(output_pubkey, p0_c);
+                assert_eq!(amount, 2_222);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx2.try_recv().is_err(), "subscriber 2 sees nothing else");
+    }
+
+    #[test]
+    fn sp_vout_backmap_skips_non_taproot_outputs() {
+        // An OP_RETURN at vout 0 pushes the payment to vout 1: the emitted
+        // vout must name the real output index, not the taproot-table index
+        // (the corpus can't test this — its outputs are all taproot).
+        // Mutant killed: building the tap table with tap.len() as the vout.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (mut tx, undo, p0_xonly, _t) = sp_payment(&b_scan, &b_spend_pub, 9_999);
+        // The tweak depends only on inputs, so inserting an output leaves
+        // the derived payment key valid — now at vout 1.
+        tx.output.insert(
+            0,
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from(vec![0x6a]),
+            },
+        );
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_silent_payments(&[
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+        ]);
+        reg.scan_block(&block_with(vec![coinbase_tx(), tx]), 6, Some(&undo));
+
+        match rx.try_recv().expect("payment behind the OP_RETURN matches") {
+            WatchMatch::SilentPaymentMatched {
+                output_pubkey,
+                vout,
+                amount,
+                ..
+            } => {
+                assert_eq!(output_pubkey, p0_xonly);
+                assert_eq!(vout, 1, "vout is the real output index");
+                assert_eq!(amount, 9_999);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one match");
+    }
+
+    #[test]
+    fn sp_short_undo_truncates_matches_without_panic() {
+        // Undo shorter than the block's non-coinbase inputs: the fully
+        // covered first tx still matches; the second is truncated (warn +
+        // break), never a panic and never a mis-aligned scan. Mutant killed:
+        // deleting the short-undo guard in scan_block_sp (the slice would
+        // index out of range).
+        let secp = Secp256k1::new();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let scan_a = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let scan_b = SecretKey::from_slice(&[0x66u8; 32]).unwrap();
+        let id_a = PublicKey::from_secret_key(&secp, &scan_a).serialize();
+
+        let (tx_a, undo_a, _p0_a, _) = sp_payment(&scan_a, &b_spend_pub, 3_333);
+        let (tx_b, _undo_b, _p0_b, _) = sp_payment(&scan_b, &b_spend_pub, 4_444);
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_silent_payments(&[
+            SpWatchTarget::new(scan_a.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+            SpWatchTarget::new(scan_b.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+        ]);
+
+        // Undo covers only tx_a's input.
+        let block = block_with(vec![coinbase_tx(), tx_a, tx_b]);
+        reg.scan_block(&block, 8, Some(&UndoData { spent_coins: undo_a.spent_coins }));
+
+        match rx.try_recv().expect("covered tx still matches") {
+            WatchMatch::SilentPaymentMatched { scan_pubkey, amount, .. } => {
+                assert_eq!(scan_pubkey, id_a);
+                assert_eq!(amount, 3_333);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "truncated tx yields no match");
+    }
+
+    #[test]
+    fn sp_raw_tx_opt_in_carries_the_matching_tx() {
+        // The raw-tx opt-in must inline the consensus-serialized tx on SP
+        // matches on both the block and mempool paths (previously asserted
+        // only for ScriptMatched). Mutant killed: `raw_tx: None` (or a
+        // dropped wants_raw) in sp_scan_tx_outputs.
+        let secp = Secp256k1::new();
+        let b_scan = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let b_spend = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let b_spend_pub = PublicKey::from_secret_key(&secp, &b_spend);
+        let (tx, undo, _p0, _t) = sp_payment(&b_scan, &b_spend_pub, 5_555);
+        let serialized = bitcoin::consensus::serialize(&tx);
+
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        handle.add_silent_payments(&[
+            SpWatchTarget::new(b_scan.secret_bytes(), &b_spend_pub.serialize(), vec![]).unwrap(),
+        ]);
+        handle.set_raw_tx(true);
+
+        // Block path.
+        reg.scan_block(&block_with(vec![coinbase_tx(), tx.clone()]), 3, Some(&undo));
+        match rx.try_recv().expect("confirmed SP match") {
+            WatchMatch::SilentPaymentMatched { raw_tx, .. } => {
+                assert_eq!(
+                    raw_tx.expect("opt-in → raw_tx present").as_ref(),
+                    serialized.as_slice(),
+                    "raw_tx is the consensus-serialized matching tx"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Mempool path (tweak cached at admission, as production does).
+        let prev_scripts: Vec<ScriptBuf> = undo
+            .spent_coins
+            .iter()
+            .map(|c| c.script_pubkey.clone())
+            .collect();
+        let cached = compute_tweak(&tx, &prev_scripts).expect("eligible tx yields a tweak");
+        reg.scan_mempool_sp(&tx, Some(&cached));
+        match rx.try_recv().expect("unconfirmed SP match") {
+            WatchMatch::SilentPaymentMatched { raw_tx, confirmed, .. } => {
+                assert!(!confirmed);
+                assert_eq!(
+                    raw_tx.expect("opt-in → raw_tx present").as_ref(),
+                    serialized.as_slice(),
+                    "mempool raw_tx is the consensus-serialized matching tx"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }
