@@ -205,13 +205,17 @@ jobs:
       #
       # Serialized like the Rust E2E suite, and for the same reason: each test
       # binds RPC/P2P/gRPC ports on one hosted runner. SATD_E2E_TIMEOUT_MULT
-      # matches the Rust step's headroom.
+      # matches the Rust step's headroom — and the package -timeout must scale
+      # with it: the suite runs ~2 min locally, so tripled internal timeouts
+      # on a slow or cold-cache runner can push the whole package past Go's
+      # default 10m cap (observed as a spurious suite-wide panic while every
+      # test was passing).
       - name: Run Go SDK E2E suite
         working-directory: clients/go/e2e
         env:
           SATD_BIN: ${{ github.workspace }}/target/debug/satd
           SATD_E2E_TIMEOUT_MULT: "3"
-        run: go test -tags e2e -count=1 -p 1 ./...
+        run: go test -tags e2e -count=1 -p 1 -timeout 30m ./...
 
   lint:
     name: "Lint"
