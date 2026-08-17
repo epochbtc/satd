@@ -1847,15 +1847,23 @@ impl PeerManager {
             // Request blocks: immediately on tip advance, or every 10 ticks as fallback
             // Skip during IBD swarming — the scheduler handles block requests
             if !has_ibd && (tip_advanced || ticks.is_multiple_of(10)) {
-                let peer_ids: Vec<PeerId> = {
-                    let peers = self.peers.read();
-                    peers.iter()
-                        .filter(|(_, h)| h.info.state == PeerState::Connected)
-                        .map(|(id, _)| *id)
-                        .collect()
-                };
-                for pid in &peer_ids {
-                    self.request_missing_blocks(*pid);
+                // First chance to re-arm bulk IBD without an inbound headers
+                // message (issue #582): if the connector tore down short of
+                // headers we already hold, re-create the scheduler here
+                // instead of parking until a peer announces the next block.
+                // When it fires, the scheduler owns block requests; the
+                // per-peer fallback below is for the steady-state gap.
+                if !self.maybe_start_ibd() {
+                    let peer_ids: Vec<PeerId> = {
+                        let peers = self.peers.read();
+                        peers.iter()
+                            .filter(|(_, h)| h.info.state == PeerState::Connected)
+                            .map(|(id, _)| *id)
+                            .collect()
+                    };
+                    for pid in &peer_ids {
+                        self.request_missing_blocks(*pid);
+                    }
                 }
             }
 
@@ -2555,50 +2563,21 @@ impl PeerManager {
             // forever because request_missing_blocks (the non-IBD path)
             // only runs inside handle_headers and never sees another
             // batch trigger it.
-            let tip = self.chain_state.tip_height();
             let headers_tip = htip as u32;
-            {
+            if !self.maybe_start_ibd() {
+                // Extension path. The write lock is scoped to this block —
+                // holding it through the `self.ibd.read()` below deadlocked
+                // handle_headers and wedged every test that depends on
+                // block propagation (test_block_propagation,
+                // test_block_sync_between_nodes, the p2p_orphan suite).
                 let mut ibd = self.ibd.write();
-                // Don't (re)create the linear IBD scheduler while the connect
-                // frontier is fork-blocked — it can't reorg and would re-wedge
-                // on `bad-prevblk` (and, for a deep competing reorg arriving
-                // mid-IBD, oscillate teardown↔re-create forever). Leave the
-                // reorg-capable steady-state path to move the tip onto the
-                // better chain first; once it does, the frontier links to the
-                // new tip and bulk IBD resumes on the next headers batch.
-                if ibd.is_none()
-                    && headers_tip > tip + 24
-                    && self.chain_state.frontier_connects_to_tip()
-                {
-                    let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
-                    let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
-                    let (_, _, pending, target) = sched.progress();
-                    tracing::info!(
-                        target_height = target,
-                        blocks_to_download = pending,
-                        "Starting parallel block download"
-                    );
-                    *ibd = Some(sched);
-                    drop(ibd);
-                    // Wake the block processor thread so it enters IBD mode
-                    let (lock, cvar) = &*self.connect_signal;
-                    *lock.lock() = true;
-                    cvar.notify_one();
-                    // Assign work to all connected peers
-                    self.assign_all_peers();
-                } else if let Some(scheduler) = ibd.as_mut()
+                if let Some(scheduler) = ibd.as_mut()
                     && headers_tip > scheduler.target_height()
                 {
                     scheduler.extend_target(headers_tip, &self.chain_state);
                     drop(ibd);
                     self.assign_all_peers();
                 }
-                // Scope ends here — write lock dropped before the read
-                // lock below. Without the scope, the no-branch path held
-                // the write lock through `self.ibd.read()`, deadlocking
-                // handle_headers and wedging every test that depends on
-                // block propagation (test_block_propagation,
-                // test_block_sync_between_nodes, the p2p_orphan suite).
             }
 
             // Request blocks (legacy path for non-IBD or fallback)
@@ -2607,6 +2586,57 @@ impl PeerManager {
                 self.request_missing_blocks(id);
             }
         }
+    }
+
+    /// (Re)create the parallel IBD scheduler if headers have run ahead of
+    /// the tip by more than the creation threshold. Returns whether a
+    /// scheduler was created.
+    ///
+    /// Called from two places: `handle_headers` (the event-driven path) and
+    /// the run loop's periodic non-IBD fallback. The fallback call is what
+    /// re-arms a node whose connector tore down short of the headers tip
+    /// (issue #582): a fork-blocked handoff, or a headers batch accepted
+    /// between the connector's completion check and its teardown, leaves
+    /// `tip < headers_tip` with no scheduler — and with creation gated
+    /// solely on inbound headers, the node parks until a peer happens to
+    /// announce the next block, an interval that is unbounded on a chain
+    /// with slow or irregular block production. Polling the same gate from
+    /// the run loop bounds the parked interval at one fallback tick.
+    fn maybe_start_ibd(&self) -> bool {
+        let tip = self.chain_state.tip_height();
+        let headers_tip = self.chain_state.headers_tip_height();
+        // Don't (re)create the linear IBD scheduler while the connect
+        // frontier is fork-blocked — it can't reorg and would re-wedge
+        // on `bad-prevblk` (and, for a deep competing reorg arriving
+        // mid-IBD, oscillate teardown↔re-create forever). Leave the
+        // reorg-capable steady-state path to move the tip onto the
+        // better chain first; once it does, the frontier links to the
+        // new tip and bulk IBD resumes on the next gate evaluation.
+        if headers_tip <= tip + 24 || !self.chain_state.frontier_connects_to_tip() {
+            return false;
+        }
+        {
+            let mut ibd = self.ibd.write();
+            if ibd.is_some() {
+                return false;
+            }
+            let effective_max_ahead = Self::resolve_max_ahead(self.max_ahead, headers_tip, tip);
+            let sched = IbdScheduler::new(headers_tip, tip, &self.chain_state, effective_max_ahead);
+            let (_, _, pending, target) = sched.progress();
+            tracing::info!(
+                target_height = target,
+                blocks_to_download = pending,
+                "Starting parallel block download"
+            );
+            *ibd = Some(sched);
+        }
+        // Wake the block processor thread so it enters IBD mode
+        let (lock, cvar) = &*self.connect_signal;
+        *lock.lock() = true;
+        cvar.notify_one();
+        // Assign work to all connected peers
+        self.assign_all_peers();
+        true
     }
 
     /// Assign download work to all connected peers during IBD.
@@ -3569,7 +3599,77 @@ impl PeerManager {
                     }
                 }
             }
+
+            // Drain any stored-but-unconnected tail on the best header chain
+            // (issue #582). A torn-down IBD connector can leave blocks it
+            // downloaded but never connected sitting on disk; nothing else
+            // in steady state can reach them — `request_missing_blocks`
+            // skips them (data present), and a re-sent copy dies in
+            // `accept_block` as `Duplicate` (status is already DataStored),
+            // so the channel above cannot carry them either.
+            Self::connect_stored_tail(&chain_state, &fee_estimator, &mempool, &orphanage);
         }
+    }
+
+    /// Connect blocks that are already stored on disk and extend the tip,
+    /// walking the best-header-chain frontier until data runs out or a
+    /// block fails to connect. Returns the number of blocks connected.
+    ///
+    /// This is the steady-state counterpart of the IBD connect loop's
+    /// stored-block walk: it exists so a tail downloaded by a scheduler
+    /// that tore down before connecting it (issue #582) drains without a
+    /// network event. Idle cost is one height-index lookup per wakeup —
+    /// at the tip there is no row above the frontier and the loop exits
+    /// immediately.
+    fn connect_stored_tail(
+        chain_state: &Arc<ChainState>,
+        fee_estimator: &FeeEstimator,
+        mempool: &Arc<Mempool>,
+        orphanage: &Arc<TxOrphanage>,
+    ) -> u32 {
+        let mut connected = 0u32;
+        loop {
+            let next_height = chain_state.tip_height() + 1;
+            let Some(hash) = chain_state.next_block_to_connect(next_height) else {
+                break;
+            };
+            if !chain_state.has_block_data(&hash) {
+                break;
+            }
+            // The block bytes are needed regardless of outcome: fee rates
+            // must be computed against the pre-connect UTXO view, and the
+            // mempool/orphanage bookkeeping below needs the transactions.
+            let Some(block) = chain_state.get_block(&hash) else {
+                break;
+            };
+            let fees = Self::compute_block_fee_rates(&block, chain_state);
+            match chain_state.connect_stored_block(&hash) {
+                Ok(_) => {
+                    chain_state.bump_connect_heartbeat();
+                    chain_state
+                        .warnings()
+                        .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
+                    fee_estimator.record_block(&fees);
+                    mempool.remove_for_block(&block, chain_state.tip_height());
+                    reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
+                    connected += 1;
+                }
+                // Any failure parks the walk for this wakeup: `Duplicate`
+                // means the tip moved under us, `BadPrevBlock` means the
+                // frontier row is fork-blocked and the reorg-capable paths
+                // own it. Either way the next wakeup re-evaluates.
+                Err(_) => break,
+            }
+        }
+        if connected > 0 {
+            tracing::info!(
+                connected,
+                height = chain_state.tip_height(),
+                "Connected stored blocks left behind by a torn-down IBD scheduler"
+            );
+            let _ = chain_state.flush_coin_cache();
+        }
+        connected
     }
 
     /// IBD connect loop: sequentially connect stored blocks from tip forward.
@@ -6482,6 +6582,115 @@ mod tests {
         // Leak the TempDir so the blocks dir outlives the manager for the test.
         std::mem::forget(dir);
         PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    }
+
+    /// A real PeerManager over a caller-supplied chain state — spawns the
+    /// real block_processor thread. No peers are ever attached, so any
+    /// chain progress observed by these tests is self-driven.
+    fn peer_manager_over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Leak the sender so the channel stays open for the manager's life.
+        std::mem::forget(shutdown_tx);
+        PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    }
+
+    /// Issue #582, stored-tail half: a connector that tears down leaving
+    /// downloaded-but-unconnected blocks on disk must have that tail
+    /// drained by the steady-state block processor without any network
+    /// event. Nothing else can reach those blocks — the header-driven
+    /// scheduler gate needs a gap over 24, `request_missing_blocks` skips
+    /// them (data present), and a re-sent copy dies in `accept_block` as
+    /// `Duplicate` because the index status is already DataStored.
+    #[test]
+    fn a_stored_but_unconnected_tail_is_drained_without_a_network_event() {
+        use crate::chain::state::tests::{
+            build_test_block, make_chain_state, store_block_without_connecting,
+        };
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let h1 = cs.accept_block(&b1).expect("connect block 1");
+        let b2 = build_test_block(h1, 2, 1_707_000_001);
+        let b3 = build_test_block(b2.block_hash(), 3, 1_707_000_002);
+        // Exactly what a torn-down IBD scheduler leaves behind: headers
+        // accepted (height rows exist), block data stored, tip parked below.
+        let (accepted, err) = cs.accept_headers(&[b2.header, b3.header]);
+        assert_eq!(accepted, 2, "fixture: headers must be accepted ({err:?})");
+        store_block_without_connecting(&cs, &b2, 2);
+        store_block_without_connecting(&cs, &b3, 3);
+        assert_eq!(cs.tip_height(), 1, "fixture: the tail must start unconnected");
+        assert_eq!(
+            cs.next_block_to_connect(2),
+            Some(b2.block_hash()),
+            "fixture: the frontier must name the stored block"
+        );
+        assert!(cs.has_block_data(&b2.block_hash()), "fixture: data must be stored");
+
+        // Gap of 2 is far under the +24 scheduler-creation threshold, so
+        // only the steady-state drain can connect these.
+        let chain_state = Arc::new(cs);
+        let _pm = peer_manager_over(chain_state.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while chain_state.tip_height() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            chain_state.tip_height(),
+            3,
+            "the stored tail must connect without a network event"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #582, re-arm half: a node holding headers more than 24 past
+    /// its tip with no live scheduler must re-create one from the run
+    /// loop's periodic fallback. Before the fix, scheduler creation ran
+    /// only inside `handle_headers`, so this state — reachable when the
+    /// connector tears down after a late headers batch, or exits via the
+    /// fork-blocked handoff — parked until a peer volunteered the *next*
+    /// headers announcement, an unbounded wait on a slow chain. No peers
+    /// exist in this test, so only the poll path can arm it.
+    #[tokio::test]
+    async fn the_run_loop_re_arms_ibd_without_an_inbound_headers_message() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+        let (cs, dir) = make_chain_state();
+        let chain_state = Arc::new(cs);
+        // Constructed at tip == headers tip, so the startup resume path
+        // arms nothing — the parked state is created after construction.
+        let pm = peer_manager_over(chain_state.clone());
+        assert!(pm.ibd.read().is_none(), "fixture: no scheduler at construction");
+
+        let mut headers = Vec::new();
+        let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        for h in 1..=30u32 {
+            let b = build_test_block(parent, h, 1_707_000_000 + h);
+            parent = b.block_hash();
+            headers.push(b.header);
+        }
+        let (accepted, err) = chain_state.accept_headers(&headers);
+        assert_eq!(accepted, 30, "fixture: headers must be accepted ({err:?})");
+        assert!(pm.ibd.read().is_none(), "fixture: accepting headers directly must not arm");
+
+        let pm_run = pm.clone();
+        let run = tokio::spawn(async move { pm_run.run().await });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pm.ibd.read().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let target = pm.ibd.read().as_ref().map(|s| s.target_height());
+        run.abort();
+        assert_eq!(
+            target,
+            Some(30),
+            "the fallback tick must re-create the scheduler for the known headers tip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn nth_txid(n: u32) -> bitcoin::Txid {

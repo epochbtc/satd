@@ -14347,7 +14347,7 @@ pub(crate) mod tests {
 
     /// Put a block on disk and in the block index without connecting it — the
     /// state a reindex finds for every block above the chainstate's tip.
-    fn store_block_without_connecting(cs: &ChainState, block: &Block, height: u32) {
+    pub(crate) fn store_block_without_connecting(cs: &ChainState, block: &Block, height: u32) {
         use crate::storage::blockindex::{BlockIndexEntry, BlockStatus, add_u256, work_for_bits};
         let pos = cs
             .flat_files
