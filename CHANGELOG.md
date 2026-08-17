@@ -11,6 +11,13 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+- Fixed (#582): IBD re-arm is no longer exclusively headers-driven. A block
+  connector that tore down short of the headers tip left the node parked —
+  tip stationary, better headers already known — until the next inbound
+  headers message, unbounded on a chain with slow or irregular blocks. The
+  scheduler-creation gate is now also polled from the P2P run loop, and the
+  steady-state block processor drains stored-but-unconnected blocks a
+  torn-down connector left on disk.
 - Fixed (#588): mempool admission now enforces transaction finality
   (`non-final`) and BIP 68 sequence locks (`non-BIP68-final`) with Core's
   next-block semantics; previously a time-locked transaction was admitted,
