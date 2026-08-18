@@ -11,629 +11,249 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
-_Terse bullets below; full detail accumulates in the in-development
-[`docs/release-notes/0.5.0-pre.md`](docs/release-notes/0.5.0-pre.md)._
+Bound for **0.5.0**, the wallet-backend release. This is an index: every item
+below is written up in full — with the reasoning, the observed symptom, and the
+upgrade impact — in the in-development
+[`docs/release-notes/0.5.0-pre.md`](docs/release-notes/0.5.0-pre.md).
 
-- Fixed (#582): IBD re-arm is no longer exclusively headers-driven. A block
-  connector that tore down short of the headers tip left the node parked —
-  tip stationary, better headers already known — until the next inbound
-  headers message, unbounded on a chain with slow or irregular blocks. The
-  scheduler-creation gate is now also polled from the P2P run loop, and the
-  steady-state block processor drains stored-but-unconnected blocks a
-  torn-down connector left on disk.
-- Fixed (#588): mempool admission now enforces transaction finality
-  (`non-final`) and BIP 68 sequence locks (`non-BIP68-final`) with Core's
-  next-block semantics; previously a time-locked transaction was admitted,
-  relayed, and included in `getblocktemplate` — mining an invalid block.
-- Fixed (#589): `getblocktemplate` selection is now dependency- and
-  finality-aware — inputs resolve against the UTXO set, CPFP children are
-  emitted after the parents that fund them (never without them, and never
-  after the parent's eviction), and transactions failing absolute finality
-  or BIP 68 at the template tip are filtered at assembly.
-- Fixed (#583): three insert-after-invalidate races let the coin cache's
-  clean LRU resurrect a coin a concurrent disconnect had just retired — an
-  in-memory phantom UTXO over a correct disk, observed as a multi-day
-  `bad-txns-BIP30` connect wedge that a restart cleared. The LRU now carries
-  an invalidation generation and the read-through/promotion inserts decline
-  when it moves.
-- Fixed (consensus, #581): transaction finality now matches Core exactly. The
-  coinbase is subject to the finality check like every other transaction, and
-  the locktime cutoff is strict — a locktime equal to the connecting height
-  (or the MTP) is non-final. Both laxnesses accepted blocks Core rejects
-  `bad-txns-nonfinal`; found live by the block-differential fuzzer. The same
-  audit fixed BIP 68's version gate to compare unsigned as Core does, so a
-  high-bit transaction version no longer skips sequence-lock enforcement.
-- Added (#558): index-readiness metrics for the address and block-filter
-  indexes — `satd_addrindex_synced` + `satd_addrindex_backfill_state`, and
-  `satd_filterindex_enabled`/`_synced`/`_backfill_state` — mirroring the
-  silent-payment family, so a failed or stuck backfill is visible to
-  Prometheus on all three DB-backed indexes.
-- Fixed (#555): the coin cache did not forward the filter-index backfill
-  cursor reads to the backing store, so a paused or interrupted filter
-  backfill read back as `idle` after a restart and never auto-resumed, its
-  failure reason was never persisted, and `getindexinfo` never showed a
-  `last_error` for the filter index.
-- Fixed: the block connector mutated the UTXO cache and the chain tip without
-  holding `accept_lock`, the lock every other chain mutator takes, so an
-  `invalidateblock` reorg and the connector could connect the same blocks
-  concurrently. The reorg then failed on inputs the connector had already
-  spent and rolled back by discarding the whole coin cache — destroying eight
-  blocks' worth of committed UTXOs, resurrecting the invalidated branch's
-  spent coins, and wedging the node. Both connect paths now hold the lock for
-  their whole body; a connector waiting on it is reported as
-  `phase=waiting_for_accept_lock`.
-- The reorg rollback no longer trusts that the coin cache holds only its own
-  work: a rollback that would discard another thread's writes refuses and
-  stops the node without flushing, leaving a consistent chainstate on disk,
-  rather than silently destroying the other writer's blocks. Only writes the
-  rollback could actually destroy count — coin-free index writes (backfills,
-  prune stamps, arriving blocks) pass straight through to disk and are
-  exempt, so a backfill running beside an operator reorg is not misread as
-  corruption.
-- Fixed: on an AssumeUTXO node, the background chainstate wrote block-index and
-  height rows into the snapshot chainstate's coin cache without serialising
-  against that chainstate's reorgs — interleaving with the one buffer a reorg
-  rollback reasons about. Those writes now take the same lock, held only for
-  the write itself.
-- A reorg now logs the branch it is activating, each block its reconnect loop
-  connects, and — at error level, naming the block and the cause — the fact
-  that it aborted. On the operator-driven `invalidateblock`/`reconsiderblock`
-  path a failed reorg previously left no log line at all. Each disconnected
-  and reconnected block also registers progress with the stall watchdog, so a
-  legitimately deep reorg — which holds the chain lock and flattens the
-  normal heartbeats — is no longer at risk of being killed as a stall.
-- `invalidateblock` and `reconsiderblock` now report a failed re-activation as
-  the partial success it is: the block index was updated and the tip was not
-  moved, with `reconsiderblock` named as the way back. JSON-RPC error codes are
-  unchanged.
-- `/readyz` now returns 503 while a standing `connect.persistent_failure`
-  warning says the block connector cannot make progress. Chain lag alone missed
-  a node wedged at its own tip. The warning now also clears on every path out
-  of the wedge — the fork-handoff recovery and any successful steady-state
-  connect — not only the IBD connector's own success, so readiness recovers
-  with the node instead of sticking at 503 until a restart. `/healthz` is
-  unchanged — it remains a plain liveness probe.
-- Fixed: `loadtxoutset` checked its fresh-chainstate precondition once and
-  then streamed coins for minutes with no protection against a live block
-  connector — a connector advancing the tip mid-stream could have its
-  committed work wiped by the load's rollback, or the load's tip adoption
-  could clobber the advanced tip. The load now claims the chainstate under
-  `accept_lock`, and every chain mutator refuses with
-  `SnapshotLoadInProgress` for the load's duration; the IBD connector parks
-  quietly instead of counting the refusal against its retry budget.
-- Fixed: a failed UTXO-cache flush destroyed the in-memory delta. The flush
-  drained the dirty coins, the buffered index rows and the pending tip to build
-  its batch before handing it to the backing store, so any write error — a full
-  disk being the obvious one — silently discarded a whole flush window and the
-  node continued as if it had been written. The batch is now handed back on
-  failure and the cache is restored to exactly its pre-flush state, with the
-  next flush writing the complete delta. On an AssumeUTXO background flush,
-  where the batch spans the shared block store and the private coins store, a
-  coins-side failure now hands back exactly the unapplied coins half — the
-  already-durable block rows are not replayed, and the delta is no longer
-  written off as unrecoverable.
-- Fixed: satd could advance its chain tip onto blocks it had never connected,
-  serving a UTXO set silently missing every output those blocks created while
-  reporting a healthy synced tip. Every connect path — both sequential (IBD)
-  paths and the steady-state `accept_block` a synced node uses — now requires
-  the parent to be a block this chainstate actually connected, not merely one
-  whose hash matches; `connect_preprocessed_block` additionally checks that the
-  block, the index entry authorising it and the hash the tip is set to all
-  agree, the identity check its flat-file counterpart already had. At startup
-  satd walks the tip's ancestry and refuses to start when it finds a block it
-  never connected, rather than serving wrong `gettxout` answers, exiting with
-  status 3 and naming `satd-chainstate-audit`; a broken parent pointer is
-  reported separately, with `-reindex` as its remedy — both faults can occur at
-  once and both are now printed. The audit runs again after a `-reindex` or
-  `-reindex-chainstate`, so a replay that stops short or rebuilds the same hole
-  fails in that run rather than serving until the next restart. On a pruned
-  node, where no remedy can replay deleted blocks, satd says so instead of
-  naming one that cannot work. An AssumeUTXO snapshot's unvalidated history is
-  recognised and is not an error.
-- The shipped systemd units set `RestartPreventExitStatus=3` so a node that
-  refuses to start on a damaged chainstate stops in `failed` state rather than
-  restarting every five seconds forever — without it the unit never settles and
-  unit-state alerting never fires, which defeats the distinct exit status.
-- Fixed: an unflushed block-index write lived only in a size-bounded LRU, so
-  eviction — cheap to cause, since every `headers` message puts up to 2000
-  entries into the same cache — made `get_block_index` fall through to the
-  inner store and report a connected block's *pre-connect* status. That turned
-  the new parent check into a false positive that refused to extend a healthy
-  chain. Reads now consult the pending batch before the inner store.
+### Added
+
+**Silent payments (BIP 352)** — receive-side support end to end, opt-in at every
+layer; a node that enables nothing behaves exactly as 0.4.0 did.
+
+- `silentpaymentindex=1`: one self-authenticating tweak row per block, committed
+  atomically with the chainstate, removed on reorg, rebuilt by
+  `-reindex-chainstate`. Shared BIP 352 kernel in a new `node-sp-index` crate.
+- Deferred backfill for existing datadirs — `backfillindex silentpayment`
+  (anchored, resumable) with `pauseindex`/`resumeindex`/`cancelindex`,
+  a `getindexinfo` section, and progress/state metrics.
+- **Tier 1** (zero custody): `tweaks` firehose category with cursor replay and
+  taproot-activation cold sync, per-subscription `tweak_dust_limit` /
+  `tweaks_only` / `tweak_outputs` filters, plus a `getsilentpaymentblockdata`
+  RPC fallback. The scan key never leaves the client.
+- **Tier 1.5**: mempool-time tweak firehose (`MempoolTweak`) — detection at
+  mempool latency, still without uploading a scan key. Best-effort, no replay.
+- **Tier 2** (scan key registered): server-side matching for confirmed *and*
+  unconfirmed payments, emitting `SilentPaymentMatched` with the public tweak
+  `T` and counter `k`. Scan secrets are per-connection, in memory only, and
+  zeroized on drop. `RescanBlocks` is index-accelerated when the index is
+  complete, falling back per block otherwise.
+- Both SDKs expose all of it, and the Tier 2 matcher is proven against the
+  BIP 352 reference vectors over the whole corpus (#592).
+
+**Alerting & node health**
+
+- Six detectors about the node itself — tip stall, low disk, congested mempool,
+  peer floor, IBD completion, deep reorg — each reported through three surfaces
+  at once: a `status` streaming event (bit 16, explicit-request only),
+  `getwarnings` (which fires the Core-compatible `-alertnotify`), and a
+  `satd_alert_active{kind}` gauge. Level-triggered with hysteresis; five
+  hot-reloadable thresholds. `deep_reorg` reads depth and fork height from the
+  durable reorg log.
+- `alertfile=<path>`: any number of signed outbound webhooks, filtered by
+  category/kind/severity. The HMAC covers the timestamp, delivery id and hook id
+  as well as the body; delivery is serial and in-order per hook, retried with
+  backoff, bounded, and never follows a redirect. Best-effort by design — the
+  Streaming Consumption API remains the guaranteed surface. Contract:
+  [`docs/api/webhooks.md`](docs/api/webhooks.md).
+- `reorgwebhook=` keeps its payload and headers but now rides the same
+  dispatcher, which also moves that outbound HTTP off the consensus runtime.
+
+**Go SDK** — `clients/go` (`satdevents`), an independently versioned module at
+full parity with `satd-events-client`: firehose, every watch kind, durable
+cursors, reconnect, rescan, watch-set loaders, prefix re-filtering. Dependency
+graph is gRPC and protobuf only; thirteen runnable examples; new
+[Go SDK](https://epochbtc.github.io/satd/go-sdk.html) manual chapter.
+
+**Rust SDK** — typed support for everything above (`Categories::STATUS` /
+`TWEAKS`, `Event::Status`, `Event::BlockTweaks`, `Event::MempoolTweak`,
+`Event::SilentPaymentMatched`, scan-key watch helpers that re-register on
+reconnect) and two silent-payment examples covering both consumption modes.
+
+**Tools & compatibility**
+
+- `satd-chainstate-audit`: offline check of a stopped node's UTXO set, height
+  index, txindex and cumulative counts against the blocks on its active chain.
+  Diagnoses only. Opens RocksDB read-write — audit a *copy*. Not in the release
+  tarballs or Docker image; build from source.
+- `getblockfrompeer` (Core-compatible): re-fetch one block from one peer and
+  repair its stored copy in place, instead of a full resync. Also replaces a
+  stored copy that parses but is not the canonical block.
+- Read (and optionally write) Bitcoin Core v28+ XOR-obfuscated block files —
+  `blocks/xor.dat` is honored automatically, so the documented "reuse a Core
+  `blocks/` directory" migration works against modern datadirs. Fresh satd dirs
+  stay plaintext.
+
+**Observability** — index-readiness metrics for all three DB-backed indexes
+(#558), `satd_tip_last_connect_age_seconds`, `satd_disk_free_bytes` (sampled
+even with the disk alert off), and per-hook `satd_alertwebhook_*` counters.
+
+### Fixed
+
+**Consensus parity with Bitcoin Core.** Each of these accepted or rejected a
+block Core does not, i.e. a chain split with satd on the losing side.
+
+- Three BIP 141 witness rules brought to exact Core parity — malformed coinbase
+  witness nonce, witness data in a block committing to none, and a commitment
+  never verified because no other transaction carries witness data.
+- Transaction finality now matches Core exactly: the coinbase is subject to the
+  check like any other transaction, and the locktime cutoff is strict. BIP 68's
+  version gate compares unsigned, as Core does (#581).
+- Median-time-past could be taken from a branch a reorg had already displaced,
+  on both reorg paths and on the pipelined connect path. MTP gates BIP 113 and
+  BIP 68, so the median decided transactions Core would have judged differently.
+- The block-ingress mutation gate now ports Core's `IsBlockMutated` rule for
+  rule — it gained the witness half and a merkle-root check, and stopped
+  rejecting two shapes Core accepts (which, on a gate that bans at 100 points,
+  was a way to ban honest peers).
+
+**Chain safety, storage durability and recovery.** The bulk of this cycle. Each
+of these could serve wrong answers, lose committed data, or wedge a node.
+
+- The tip could advance onto blocks that were never connected, serving a UTXO
+  set silently missing their outputs while reporting a healthy synced tip. Every
+  connect path now requires a parent this chainstate actually connected, and
+  startup walks the tip's ancestry and refuses to start (exit 3) on a hole.
+- A reorg and the block connector could connect the same blocks concurrently;
+  the reorg's rollback then discarded eight blocks of committed UTXOs. Both
+  connect paths now hold `accept_lock`, and a rollback that would discard
+  another writer's work refuses and stops the node with a consistent chainstate.
+- A failed UTXO-cache flush destroyed the in-memory delta — a full disk silently
+  discarded a whole flush window while the node continued. The batch is now
+  handed back and the cache restored exactly.
+- A crash could leave a `block_index` entry pointing at block bytes that never
+  reached disk; block records are now fsync'd before the entry referencing them
+  is committed. A torn flat-file record is truncated rather than appended past,
+  and `getblock` verifies the block hash on read rather than serving whatever
+  record an entry's offset happens to land on.
+- A reorg could delete the height→hash and txindex rows the replacement block
+  had just written (put-before-remove coalescing), surfacing as
+  `getrawtransaction` reporting a confirmed transaction as unknown. satd now
+  audits and rebuilds the height index at startup by walking the tip's ancestry.
+- Three insert-after-invalidate races let the coin cache resurrect a coin a
+  concurrent disconnect had retired — an in-memory phantom UTXO over a correct
+  disk, observed as a multi-day `bad-txns-BIP30` wedge that a restart cleared
+  (#583).
+- `invalidateblock` could strand the connector on the branch it had just
+  invalidated, and a stale height row could spin it with no sleep and no retry
+  counter. IBD re-arm is no longer exclusively headers-driven, so a connector
+  that tore down short of the headers tip no longer parks indefinitely (#582).
+- `loadtxoutset` checked its precondition once and then streamed for minutes
+  with a live connector free to advance the tip; it now claims the chainstate
+  for its duration.
+- On an AssumeUTXO node, background-chainstate index writes raced the snapshot
+  chainstate's reorgs, and a background *validation* failure stopped the
+  catch-up thread while `getchainstates` still reported the snapshot as fine.
+- Missing or unreadable block data behind a live index entry is now reported as
+  local corruption naming `getblockfrompeer`, instead of being indistinguishable
+  from a pruned block.
+
+**Reindex.** Any datadir that has been live through a reorg has fork blocks on
+disk, so these were reachable in normal operation.
+
+- Both replay paths selected the wrong chain: `-reindex` connected every block
+  reachable from genesis as if it extended the tip, and `-reindex-chainstate`
+  replayed whatever the height→hash index named. Both now select the most-work
+  fully-connectable branch, recomputing chainwork and height from the stored
+  headers; side-chain blocks are indexed but never connected.
+- Neither path validated what it read — no proof-of-work check before a header
+  influenced branch selection, and no `CheckBlock` on the bytes, so a single
+  flipped bit could produce a header claiming astronomical work or a corrupt
+  block connected as valid. Both now validate.
+- `-reindex` no longer aborts permanently on a block it cannot replay (which
+  left the node with no chain at all, failing identically on every retry) — it
+  stops at that height, keeps everything below, and lets sync re-fetch the rest.
+- `-reindex-chainstate` refuses to run when the block index cannot reach the
+  height the chainstate was already at, instead of reporting success over a
+  truncated UTXO set — which a pruned datadir hit every time.
+- A chainstate reindex no longer takes consensus input from the height index it
+  exists to distrust, and an exact chainwork tie keeps the branch the node is on.
+
+**Mempool & mining**
+
+- Mempool admission enforces transaction finality and BIP 68 sequence locks with
+  Core's next-block semantics; a time-locked transaction was previously
+  admitted, relayed, and mined into an invalid block (#588).
+- `getblocktemplate` selection is now dependency- and finality-aware: inputs
+  resolve against the UTXO set, CPFP children follow the parents that fund them,
+  and non-final transactions are filtered at assembly (#589).
+
+**RPC / Core compatibility**
+
+- `confirmations` no longer ignores whether a block is on the active chain — a
+  stale block 60,000 deep claimed 60,000 confirmations where Core reports `-1`
+  (`getblock`, `getblockheader`, `getrawtransaction`). `nextblockhash` is no
+  longer resolved through the height index for off-chain blocks.
+- `mediantime` is now a real median-time-past walked through parent pointers,
+  not the block's own timestamp (`getblock`, `getblockheader`, `getblockstats`,
+  `getblockchaininfo`).
+- `getindexinfo`'s `estimated_remaining_seconds` counted idle time as work; all
+  three backfills now measure over time actually spent walking. Backfill cursors
+  are read under a snapshot, so a reader can no longer pair one run's cursor
+  with the next run's snapshot height — and the filter-index cursor is read
+  through to the store, so a paused filter backfill no longer reads back as
+  `idle` and never resumes (#555).
+- `invalidateblock`/`reconsiderblock` report a failed re-activation as the
+  partial success it is, and a failed reorg now logs the branch, each block, and
+  the abort cause.
+
+**Streaming SDKs**
+
+- Four defects found by the Go SDK review were present in the Rust original and
+  are fixed there too: a failed cursor-store write reported success on retry (an
+  at-least-once violation), an auto-resumed lag re-subscribed unboundedly,
+  prefix watches leaked bits below the declared bucket width, and
+  `FileCursorStore` did not fsync.
+- An *unset* protobuf field and a value this build does not *recognize* are now
+  distinct variants on every open enum.
+
+**Operational**
+
+- `/readyz` returns 503 while the connector cannot make progress (chain lag
+  alone missed a node wedged at its own tip), and the warning clears on every
+  path out of the wedge.
+- `-alertnotify` for edge events is rate-limited per event id, and the window
+  reports the *worst* occurrence rather than the first — a shallow reorg can no
+  longer claim the window and reduce a deep one to a counter.
+- The active-warnings set is capped at 256 ids; a `alertfile=` path change is
+  reported as restart-required instead of silently reloading the old file.
+- The shipped systemd units set `RestartPreventExitStatus=3`, so a node
+  refusing to start on a damaged chainstate settles in `failed` state rather
+  than restarting forever.
 - `bad-txns-inputs-missingorspent` now logs the outpoint, txid, input index and
-  height. The reject reason on the wire is unchanged.
-- New: `satd-chainstate-audit`, an offline tool that checks a stopped node's
-  UTXO set, height index, txindex and cumulative transaction counts against the
-  blocks on its active chain, and names every outpoint, height and txid that
-  disagrees. Exits 0 consistent / 1 could not run / 2 inconsistent. Diagnoses
-  only; repair is `-reindex-chainstate` or `satd-chainstate-repair`. Blocks the
-  node pruned, and an AssumeUTXO node's unvalidated history below the snapshot
-  base (read from the background chainstate's marker), are reported but are not
-  faults. It issues no writes of its own but opens RocksDB read-write — which
-  also drops the legacy address-history column families and stamps the schema
-  version — so audit a *copy* of a datadir you need to preserve; it warns about
-  this on every run. Not included
-  in the release tarballs or Docker image — build from source.
-- The connector's persistent-failure log line said "giving up" and then did not
-  give up — breaking the loop exits the connector, not the process, and IBD
-  restarts within seconds and fails at the same block. On a mainnet node that
-  printed every thirty seconds for five and a half hours. It now says what
-  actually happens.
-- Fixed, consensus: median-time-past could be computed from the timestamps of a
-  branch a reorg had already displaced. The blocks a reorg reconnects were
-  recorded only after the whole reconnect loop had finished — on one path not
-  at all — so every block the loop connected, including the one that becomes
-  the tip, was validated against the losing branch's timestamps at those
-  heights. MTP gates BIP 113 locktimes and BIP 68 sequence locks, so a wrong
-  median can accept or reject a transaction Bitcoin Core would not. Timestamps
-  are now recorded as each block connects, the cache holds at most one entry
-  per height, and an aborted reorg rebuilds it from the restored tip's own
-  ancestry by parent pointer rather than leaving it to refill from the height
-  index.
-- Fixed, consensus: the pipelined connect path used a median-time-past computed
-  when the block was prefetched, derived from the height→hash index at that
-  moment. It re-derived every other chain-dependent input on the connect
-  thread but carried this one across unchecked, so a block buffered while a
-  height row named a since-replaced block connected against a median containing
-  that block's timestamp. It is now computed on the connect thread, which also
-  brings the bulk of IBD under the guarantee above.
-- Internal: a chainstate consistency check that reads the last N blocks of the
-  active chain back and verifies the UTXO set, height index, txindex and
-  cumulative transaction counts against them, rather than against each other.
-  Used as a test oracle for reorg scenarios; also the basis for an offline
-  audit of a suspect datadir. Blocks the node pruned are reported separately
-  from blocks it could not read, so a healthy pruned node is not called
-  damaged; a block that could not be read now only withholds coin verdicts at
-  or below its own height, rather than for the whole window; and the
-  cumulative-count check is skipped when the backfill that populates those rows
-  has not run, which would otherwise fail a datadir whose UTXO set is perfect.
-  Absent txindex rows are now a fault when the datadir records a complete
-  txindex — previously they were always informational, so a genuinely broken
-  txindex was reported as consistent. Rows missing from an index that was never
-  fully built (no `-txindex`, or `-txindex` switched on after syncing without
-  it) are reported as unchecked rather than as damage.
-- Changed: `satd-chainstate-audit` no longer takes `--txindex`; it reads whether
-  the index is complete from the datadir. The flag defaulted to `true` while
-  satd's `-txindex` defaults to off, so the documented invocation reported every
-  transaction in the window as a missing row and exited 2 against a healthy
-  node, and passing `false` silently disabled the txindex checks entirely.
-- Fixed: after `invalidateblock`, the block connector could pin itself to the
-  branch that had just been invalidated and stall indefinitely — it selected
-  the next block through the height→hash index, which is "best known block at
-  this height" rather than an active-chain oracle and which nothing rewrites
-  when a branch is invalidated. On a mainnet node this logged `Connector stuck
-  waiting for block data` every minute for five and a half hours while the
-  canonical block at that height sat on disk. The connector now rejects a
-  height row naming a block that cannot extend the active chain and connects
-  the tip's best connectable child instead. The fallback scan filters as it
-  iterates rather than materialising an adjacency map of the whole block index,
-  and is rate-limited per stuck height.
-- Fixed: a height row naming a block this chainstate had already connected — a
-  reorg displaces it and no status is rewritten — made the connector retry
-  immediately with no sleep and no retry counter, spinning a core silently.
-  `Duplicate` now counts toward the retry limit like any other connect error,
-  so the existing fork-handoff recovery runs.
+  height. The wire reject reason is unchanged.
 
-- Fixed, Core compatibility: `confirmations` was computed from a block's height
-  alone, with no check that the block is actually on the active chain. A valid
-  block on a losing branch therefore reported the depth its height implied —
-  one buried 60,000 deep claimed 60,000 confirmations — where Core reports
-  `-1`. `getblock`, `getblockheader` and `getrawtransaction` are all corrected
-  (`getrawtransaction` reports `0` for an off-chain block, matching Core's
-  different convention there). `nextblockhash` was likewise resolved through
-  the height index, handing an off-chain block the *active* chain's successor;
-  it is now reported only for blocks on the active chain. Together these made a
-  stale block and the canonical block at the same height indistinguishable
-  through satd's own RPC, which actively impeded a fork investigation.
-- Fixed: `mediantime` returned the block's own timestamp rather than the median
-  of the block and its ten ancestors, on `getblock`, `getblockheader`,
-  `getblockstats` and `getblockchaininfo`. It is now a real median-time-past,
-  walked through parent pointers so a block off the active chain is measured
-  against its own ancestry.
+### Changed
 
-- satd now audits the height→hash index at startup and rebuilds missing rows
-  by walking the tip's ancestry, so a gap left by the reorg batching defect
-  below no longer needs a `-reindex` to clear. The height index is derived
-  state: the active chain is the tip's ancestry by definition, so no other
-  index row is consulted. One sequential scan; a clean node writes nothing.
-  The pass only *adds* rows for heights that have none, and never overwrites
-  one that is present — correcting a wrong row means choosing between branches
-  by chainwork, which it does not do; rows it walks past that disagree with the
-  tip's ancestry are logged. Heights whose blocks this chainstate has not
-  validated are reported separately from real damage, so an AssumeUTXO node
-  mid-validation is not told to reindex. Gaps it cannot rederive are logged as
-  errors instead of passing silently.
-- Fixed: the startup height-index repair gave up above a fixed thousand gaps,
-  which measured neither its cost nor its risk — the walk is one read per
-  height between the tip and the *lowest* gap, and refusing to write a row for
-  a block this chainstate has not validated is a per-height check that never
-  consulted the count. A node on a chain that reorgs often accumulated a few
-  thousand gaps in its recent history and was declined on every restart, told
-  in the log that an AssumeUTXO snapshot it had never loaded was the likely
-  cause. The threshold is now a share of the range — with a floor under which
-  a small gap count always repairs, whatever share of a short chain it is —
-  so damage is repaired at any scale and only an index that would have to be
-  rebuilt is declined. When the pass does decline, the log now distinguishes
-  the one healthy cause it can see (an attached AssumeUTXO background
-  validator, whose unvalidated history is legitimately rowless) from real
-  damage, and only the latter is advised toward a `-reindex`.
-- Fixed: a reorg could delete the height→hash and txindex rows the replacement
-  block had just written. Disconnecting the displaced block and connecting the
-  replacement coalesce into one write batch, which applies every put before
-  every remove — so the remove of height H ran after the put of height H and
-  won, though the put was the later operation. The other indexes were already
-  deduplicated by key for this sequence; these two were not. `getblockhash`
-  reports `Block height out of range` for a height in the middle of the active
-  chain, but only after a restart — the height cache is sized to cover the
-  whole chain, so a running node keeps answering correctly. The likelier and
-  worse case needs no restart at all: a reorg routinely re-mines the
-  transactions it displaces, and the txindex cache holds only a few hundred
-  thousand entries, so within roughly a day of normal operation the evicted
-  row surfaces as `getrawtransaction` reporting a transaction that is in the
-  chain as unknown. A missing height row inside the
-  eleven-block MTP window can also shift the median that gates BIP 113 and BIP
-  68, which needs a restart within eleven blocks of the reorg to reach.
-  Reindex and index backfills are not exposed; `-reindex` repairs existing
-  damage.
-- **Breaking, security:** both SDKs refused nothing when a bearer token was
-  paired with an unencrypted connection — the credential, and any BIP 352 scan
-  key registered over the same stream, went out in cleartext with no error and
-  no warning. `Dial` / `connect()` now fail closed; `WithInsecureBearerToken` /
-  `insecure_bearer_token` accept the risk explicitly for loopback and tests.
-  The node closes the same hole from its end: `-eventsgrpcallowremote` with
-  `-eventsgrpcauth` now requires `-eventsgrpctlscert`/`-eventsgrpctlskey`,
-  matching the rule `-mcpallowremote` already enforces. mTLS satisfies it.
-- Fixed: `getindexinfo`'s `estimated_remaining_seconds` counted idle time as
-  work. It measured wall-clock since the backfill was *first* started, so a
-  paused or restarted job extrapolated the downtime — pausing 48 hours at 10%
-  projected 20 days against ~54 hours of real work left. All three backfills
-  (address, filter, silent payments) now measure the rate over the span the
-  runner has actually been walking, and report `0` (no estimate) for the first
-  few seconds after a start, resume, or restart.
-- The silent-payment backfill is now alertable. `satd_spindex_backfill_progress_ratio`
-  alone could not distinguish a failed backfill from a disabled index or from a
-  node that never needed one; three new gauges —
-  `satd_spindex_enabled`, `satd_spindex_synced`, and
-  `satd_spindex_backfill_state{state=...}` — separate those cases.
-- Fixed: an AssumeUTXO background validation failure stopped the catch-up thread
-  permanently while `getchainstates` still reported the snapshot as not
-  rejected, with only a log line to show for it. It now raises a standing
-  warning, so it reaches `getwarnings` and `-alertnotify`.
-- Fixed: the silent-payment, filter and address backfill cursors are read under
-  a RocksDB snapshot, so a reader can no longer pair one run's `cursor_height`
-  with the next run's `snapshot_height` and report a just-restarted backfill as
-  most of the way done. Only the silent-payment cursor is read by a metrics
-  scrape today; the other two are read by `getindexinfo` and at startup.
-- Fixed: changing `alertfile=` and sending SIGHUP reloaded the **old** file and
-  logged success naming a path that was no longer configured. A path change is
-  now reported as restart-required; editing the file's contents stays live.
-- Fixed: the webhook plaintext-HTTP gate waived IPv4 link-local, so a hook URL
-  of `http://169.254.169.254/...` was accepted without `allow_insecure_http`.
-  Now only loopback and RFC1918 are waived, matching the IPv6 arm and the spec.
-  **Breaking:** a node with a link-local hook URL will not start until the URL
-  moves to `https://` or the stanza sets `allow_insecure_http = true`.
-- `-alertnotify` for edge events (currently `deep_reorg`) is rate-limited to one
-  exec per minute per event id, and the window reports the **worst** occurrence
-  in it rather than the first — a shallow reorg can no longer claim the window
-  and reduce a deep one to a counter. A strictly worse occurrence escalates
-  immediately (once per window), the rest are held and paged when the window
-  closes, and a burst that stops is drained by the health poll.
-- Fixed: the active-warnings set is capped at 256 distinct ids, with the
-  overflow counted in one `warnings.truncated` row. Ids that embed an
-  identifier (one per corrupt block) could previously grow it without bound.
+- Per-transaction mempool-acceptance lines moved from `info` to `debug`, and
+  ANSI color is suppressed when stdout is not a terminal or `NO_COLOR` is set.
+- `-reindex-chainstate` no longer resumes a partially replayed chainstate — it
+  starts at genesis or refuses. Unchanged in practice (the daemon already
+  cleared the UTXO set first); it makes the replay's verification inductive.
+- `satd-chainstate-audit` no longer takes `--txindex`; it reads whether the
+  index is complete from the datadir.
+- Operator Manual style pass (house style in `docs/manual/STYLE.md`);
+  `CORE_DIFFERENCES.md` gains node-health alerts and the webhook surface.
+- CI: every third-party action is pinned by commit SHA. A differential parity
+  harness drives both SDKs through one node and diffs their events on every PR,
+  alongside the Go unit tests, an example build, and the Go E2E suite.
 
-- **P2P hardening:** the block-ingress mutation gate now ports Core's
-  `IsBlockMutated` rule for rule. It gained the witness half — a witness-mutated
-  block (same hash, same merkle root) is rejected at ingress instead of one
-  layer later — and a merkle-root mismatch. It also *stops* rejecting two shapes
-  Core accepts: a block containing a 64-byte transaction when a coinbase is
-  present, and any block whose parent is unknown. Both were stricter than Core
-  on a gate that bans at 100 points, i.e. a way to ban honest peers.
-- Fixed: `-reindex` no longer aborts permanently on a block it cannot replay.
-  Because the chainstate is wiped before the replay begins, that abort left the
-  node with no chain at all and failed identically on every retry. It now stops
-  at that height, keeps everything below it, says so loudly, and lets normal
-  sync re-fetch the rest from peers.
-- Fixed: block data that is missing or unreadable behind a live `block_index`
-  entry is now reported as local corruption — an error log and a standing
-  warning naming `getblockfrompeer` — instead of being indistinguishable from a
-  pruned block.
-- CI: every third-party action is pinned by commit SHA; none run from a mutable
-  branch ref. The fuzz job's pinned nightly now has a single source of truth.
-- **Consensus fix:** the BIP 141 witness rules are now enforced exactly as
-  Bitcoin Core enforces them. satd previously accepted three classes of block
-  Core rejects — a malformed coinbase witness nonce, witness data hung off the
-  coinbase in a block that commits to none, and a commitment that is never
-  verified because no other transaction carries witness data. Each was a
-  potential chain split with satd on the losing side.
-- Fixed: a crash could leave a block's `block_index` entry pointing at block
-  bytes that never reached disk. Block records are now fsync'd before the entry
-  referencing them is committed, on every write path including IBD.
-- Fixed: a torn flat-file record (ENOSPC mid-write) is truncated rather than
-  appended past, so `-reindex` no longer silently skips the rest of that file;
-  new `blk*.dat` files get a directory fsync.
-- New `getblockfrompeer` RPC (Core-compatible) re-fetches one block from one
-  peer and repairs its stored copy in place, so a lost block body no longer
-  requires a full resync. It also replaces a stored copy that parses but is not
-  the canonical block — a non-canonical witness leaves the block hash intact,
-  so nothing else surfaces it.
-- Fixed: `getblock` no longer serves a different block when an index entry's
-  offset lands on another record; the block hash is verified on read.
-- New **Go SDK** (`satdevents`) for the streaming API, at `clients/go/` as an
-  independently versioned module (`clients/go/vX.Y.Z` tags): full parity with
-  `satd-events-client` — firehose, all watch kinds, durable cursors, reconnect,
-  rescan, watch-set loaders, prefix re-filtering — in Go idiom, with a published
-  dependency graph of gRPC and protobuf only. Thirteen runnable examples; new
-  [Go SDK](https://epochbtc.github.io/satd/go-sdk.html) manual chapter.
-- CI: a **differential parity harness** drives both SDKs through an identical
-  watch spec against one node and diffs their rendered events line by line, so
-  Go/Rust parity is checked on every PR rather than asserted. Also PR-gating:
-  the Go unit tests, a build of every example, and the Go E2E suite against the
-  freshly built `satd` binary.
-- SDK (`satd-events-client`): four defects found by the Go SDK review were
-  present in the Rust original and are fixed — a failed cursor-store write no
-  longer reports success on retry (an at-least-once violation on the
-  commit-before-shutdown path), an auto-resumed lag now backs off instead of
-  re-subscribing immediately and unboundedly, prefix watches mask the bits below
-  the declared bucket width instead of leaking them, and `FileCursorStore`
-  fsyncs the temp file and its directory.
-- SDK (`satd-events-client`): an **unset** protobuf field and a value this build
-  does not **recognize** are now different variants on every open enum
-  (`StatusSeverity`, `StatusKind`, `StatusState`, `EvictReason`) — proto3's zero
-  value decodes to `Unspecified`, anything unrecognized to `Unknown(i32)`.
-  Behaviour change for `EvictReason`, which shipped in 0.4.0 routing *every*
-  unrecognized value into `Unspecified` and leaving its `Unknown` variant
-  unconstructible: an eviction reason added by a newer node was reported as
-  "unspecified". `docs/api/streaming.md` now states the severity ranking
-  normatively (`Unspecified` < `Info` < `Warning` < `Critical` < unrecognized).
+### Breaking
 
-- Silent payments (BIP 352): new workspace-internal `node-sp-index` crate — the
-  shared BIP 352 kernel (input extraction, public tweak `T = input_hash · A`,
-  scan loop) plus the `sp_tweaks` row/key codec, backfill cursor, read trait,
-  and config. Validated against the BIP 352 v1.1.0 test vectors. Foundation
-  only; not yet wired into the daemon.
-- Silent payments (BIP 352): index write path. New `silentpaymentindex=1`
-  runtime flag (default off, always compiled) makes `connect_block` stamp one
-  self-authenticating tweak row per block at/above taproot activation (present
-  even when empty), committed atomically with the chainstate; reorg disconnects
-  remove it. `-reindex-chainstate` rebuilds it. New `satd_spindex_rows_total` /
-  `satd_spindex_row_removes_total` metrics. Off ⇒ defaults byte-identical to
-  0.4.0. Serving surfaces land in a later change.
-- Silent payments (BIP 352): deferred backfill for enabling the index on an
-  existing datadir. `backfillindex silentpayment` walks every block from taproot
-  activation to the tip (undo-based, anchored, resumable across restart) and
-  stamps a completeness marker; `pauseindex`/`resumeindex`/`cancelindex
-  silentpayment` control it. `getindexinfo` gains a `silentpayments` section
-  (synced + backfill progress) and a `satd_spindex_backfill_progress_ratio`
-  gauge is exported; both measure progress across the walked span
-  `[taproot activation, snapshot]` rather than the whole chain, and the ETA is
-  reported only while a backfill is actually running and enabled. Until a backfill
-  completes (or the sync ran from genesis
-  with the index on), the index reports not-synced so tweak-serving surfaces
-  refuse rather than return holes.
-- Silent payments (BIP 352): streaming-API wire schema (`satd-events-proto`) for
-  both consumption modes. Tier 1 adds a `tweaks` firehose category (bit 8 —
-  explicit-request only, not part of the `categories=0` default) with per-block
-  `BlockTweaks`/`TweakEntry` bodies and `tweak_dust_limit`/`tweaks_only`
-  subscription knobs; Tier 2 adds a scan-key watch kind
-  (`AddSilentPayments`/`RemoveSilentPayments`, `SetWatchSet.silent_payments`) and
-  a `SilentPaymentMatched` body. Additive — the schema version does not bump and
-  existing subscribers are unaffected. Emit, serving, and matching land in
-  later changes; this is the schema pass both SDKs build on.
-- Silent payments (BIP 352): Tier 1 serving. The node now emits a `BlockTweaks`
-  event per connected block on the gRPC `Subscribe` firehose (only while a
-  `tweaks` subscriber is attached) and replays it by index on `from_cursor`
-  resume — a tweaks-only subscription cold-syncs from taproot activation in one
-  subscription, exempt from the replay clamp because rows are self-authenticating
-  and the exemption is gated on index completeness; a mixed-category subscription
-  keeps the clamp. Per-subscription `tweak_dust_limit`/`tweaks_only` filters
-  apply on live and replayed events. A `tweaks` subscription against a disabled
-  or still-backfilling index is rejected in-band. New read-only JSON-RPC
-  `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` serves the
-  same bytes as a fallback. WS/SSE and the typed SDK helpers land later.
-- Silent payments (BIP 352): Tier 2 scan-key watch (confirmed path). A `Watch`
-  client can register scan credentials (`AddSilentPayments` /
-  `SetWatchSet.silent_payments`; up to 16/connection) and the node matches
-  BIP 352 payments server-side, emitting a `SilentPaymentMatched` per matched
-  output as blocks connect — including the public tweak `T` and output counter
-  `k` so a light client re-derives the output key offline. Matching recomputes
-  from the block + undo data (works with the index off) and does zero extra work
-  when no target is registered. Scan secrets are held in-memory per connection,
-  wrapped in a zeroize-on-drop buffer, and never persisted or logged. Mirrored on
-  the WS/SSE surface. The typed SDK helpers land later.
-- Silent payments (BIP 352): Tier 2 scan-key watch — mempool (unconfirmed)
-  matching. A registered SP watch now also matches payments in accepted-but-
-  unconfirmed transactions, emitting `SilentPaymentMatched` with
-  `confirmed = false`; the block-connect scan re-emits the same match
-  `confirmed = true` when it confirms (mirroring `ScriptMatched` mempool
-  semantics). To classify inputs the mempool matcher needs the resolved prevout
-  scripts, so while any SP watch is live the mempool retains them on each entry
-  (a shared gate — the same counter the watch registry maintains); with no SP
-  watch registered nothing extra is retained and the mempool event path is
-  byte-identical to before. Best-effort like every mempool watch: a target
-  registered after a tx was admitted matches it only once it confirms.
-- Silent payments (BIP 352): index-accelerated rescan (D4). A `RescanBlocks`
-  over a scan-key watch-set now takes the stored tweaks straight from the
-  `sp_tweaks` index when it is enabled and complete — skipping the undo read and
-  per-tx tweak recomputation on each block — gated per block on the row's
-  embedded `block_hash` matching the block being scanned; a missing or
-  mismatched row (or a disabled/incomplete index) transparently falls back to
-  recomputing that block. Both paths run the same kernel, so acceleration never
-  changes which payments a rescan finds. No new surface or config; a scan-key
-  cold-sync just gets faster when the index is on.
-- docs: Operator Manual style pass: controlled glossary, shorter sentences, standardized callouts (house style in `docs/manual/STYLE.md`); fixed stale `par`, `debug.log`, and release-target statements
-- **Storage / Core compat**: read (and optionally write) Bitcoin Core v28+
-  XOR-obfuscated block files — the `blocks/xor.dat` key is honored
-  automatically, making the documented "reuse a Core `blocks/` directory"
-  migration work against modern Core datadirs; `blocksxor` is now a real
-  option (fresh satd dirs stay plaintext by default).
-- Log hygiene: per-transaction mempool-acceptance lines are now logged at `debug` instead of `info` (they no longer flood the log during normal operation), and ANSI color is auto-detected — escapes are suppressed when stdout is not a terminal or when `NO_COLOR` is set, so piped/`journald`-captured logs stay clean.
-- Silent payments (BIP 352): Rust SDK (`satd-events-client`) support for both
-  consumption modes. Typed `Event::BlockTweaks` (Tier 1) and
-  `Event::SilentPaymentMatched` (Tier 2); a `Categories::TWEAKS` bit and
-  `SubscribeOptions::tweak_dust_limit` / `tweaks_only`; `WatchHandle` and
-  `ResilientWatch` / `WatchSetBuilder` `add_silent_payments` /
-  `remove_silent_payments` helpers (scan keys re-register on reconnect); and two
-  runnable examples — `sp_light_scan.rs` (client-side scan off the tweaks
-  firehose, scan key never sent) and `sp_wallet.rs` (scan-key watch, deriving
-  each match's spending key offline from `tweak` + `k`).
-- Silent payments (BIP 352): mempool-time tweak firehose ("Tier 1.5"). The node
-  computes the public tweak `T = input_hash·A` at mempool admission and emits it
-  as a `MempoolTweak` on the gRPC streaming firehose, so a zero-custody (Tier 1)
-  client detects payments to it at mempool latency without uploading a scan key.
-  Opt-in per subscription (`mempool_tweaks`, requires the `TWEAKS` category bit);
-  best-effort and ephemeral — no cursor/replay, no retraction on RBF or eviction.
-  The SDK exposes it as `SubscribeOptions::mempool_tweaks` and typed
-  `Event::MempoolTweak`. Off by default: a node with no tweak-firehose subscriber
-  does no extra work, and the mempool event path is byte-identical to before.
-- Silent payments (BIP 352): tweak events can now carry the transaction's
-  taproot outputs (`TweakEntry.taproot_outputs` — each `vout`, 32-byte x-only
-  key, value), so a client confirms a derived output key against the actual
-  on-chain output without fetching the transaction. Always populated on a
-  `MempoolTweak` (there is no block to fall back to, and a `getrawtransaction`
-  for an unconfirmed tx races eviction); opt-in per subscription for
-  `BlockTweaks` via `tweak_outputs` (the confirmed firehose stays lean by
-  default — the block is the fallback). The outputs are dropped by the on-disk
-  index (no size increase, no reindex) and re-derived at serve time. SDK:
-  `TweakEntry::taproot_outputs` and `SubscribeOptions::tweak_outputs`.
-- Alerting: node-health events on the streaming API. A new `status` category
-  (bit 16 — explicit-request only, so a `categories=0` subscriber is unaffected)
-  carries `StatusEvent` bodies describing the node itself (`ibd_complete`,
-  `tip_stall`, `disk_low`, `mempool_congested`, `peer_floor`, `deep_reorg`),
-  level-triggered with paired `raised`/`cleared` states and an additive
-  `details` string map. Served on gRPC and WS/SSE; **not** on the ZMQ
-  `nodeevent` topic, which has no per-subscriber category mask (use `alertfile`
-  webhooks or `-alertnotify` for health over ZMQ). Requires **`rpc:read` as well
-  as `stream:subscribe`** where `-authfile` is in use — the bodies carry host
-  telemetry (disk, peers, mempool occupancy, tip height) that the same
-  capability gates on the RPC surface. Not replayable (no cursor —
-  detectors re-raise standing conditions after a restart). Wire schema only in
-  this change; the detectors that emit them land next.
-- Alerting: node-health detectors. satd now watches six conditions about itself
-  — stalled tip, low disk, congested mempool, peer starvation, IBD completion,
-  deep reorg — and reports each through three surfaces at once: a `status`
-  streaming event, an entry in `getwarnings` (which fires the Core-compatible
-  `alertnotify` hook), and a `satd_alert_active{kind}` gauge. Standing
-  conditions raise once and clear once, with hysteresis so a value sitting on
-  the threshold does not flap. The one-shot events (`ibd_complete`,
-  `deep_reorg`) fire `alertnotify` and the streaming event but deliberately do
-  **not** enter `getwarnings` — nothing would ever clear them, and on chains
-  where multi-block reorgs are routine that would wedge
-  `getblockchaininfo.warnings` and the TUI modal permanently. Five new hot-reloadable thresholds
-  (`alerttipstallseconds=3600` — `0` on regtest, `alertdiskfreemb=10240`,
-  `alertmempoolfullpct=90`, `alertpeerfloor=3` — `0` on regtest, and capped by
-  the number of `-connect=` peers when that is set —
-  `alertreorgdepth=3` — `10` on test networks, `0` on regtest); `0` disables a
-  detector. `deep_reorg` depth, fork
-  height and new tip are read from the durable reorg log, so they are exact
-  regardless of chain-event lag. Two new gauges close longstanding observability gaps
-  independently of alerting: `satd_tip_last_connect_age_seconds` and
-  `satd_disk_free_bytes`, the latter sampled even when `alertdiskfreemb=0`. The
-  free-space probe is bounded and carried across polls, so a `blocksdir` on an
-  unresponsive network mount stalls only the disk alert — never the other
-  detectors — and strands at most one blocking thread rather than one per poll.
-- Alerting: outbound webhooks. `alertfile=<path>` configures any number of
-  signed HTTP hooks, each filtered by category/kind/severity. Bodies are
-  byte-identical to the streaming API's JSON for the same event; delivery
-  metadata rides in headers (`X-Satd-Signature`, `X-Satd-Timestamp`,
-  `X-Satd-Delivery`, `X-Satd-Hook`, `X-Satd-Attempt`). The signature covers the
-  timestamp, delivery id, and hook id as well as the body, so the idempotency
-  key a receiver deduplicates on cannot be forged and a captured delivery is not
-  a permanent replay token. Delivery is serial and in-order per hook,
-  retried with exponential backoff on transient failures and skipped on a
-  permanent 4xx. The per-hook queue is bounded and overflow **drops silently**
-  — there is no in-band gap notice; the record is
-  `satd_alertwebhook_dropped_total` and a log line. Redirects are never followed — a 3xx is a permanent drop, so a
-  signed body cannot be steered to a host the alertfile never named. Delivery is
-  **best-effort**: nothing is persisted, a hook that was down resumes at the
-  live head, and drops are counted in `satd_alertwebhook_dropped_total`. The
-  Streaming Consumption API remains the surface for guaranteed, resumable
-  consumption. Hooks reload on SIGHUP
-  (keep-last-good on error); per-hook counters are exported as
-  `satd_alertwebhook_*`. The existing `reorgwebhook=` keys keep working with
-  their original payload, headers, and retry schedule, now delivered by the same
-  dispatcher — which also moves that outbound HTTP off the consensus runtime.
-  They keep reporting `X-Satd-Webhook-Version: 1`; alertfile hooks report `2`.
-  **Behavior change on `reorgwebhook=`:** redirects are no longer followed, so a
-  receiver answering `3xx` (an `http`→`https` proxy hop, a trailing-slash
-  redirect) must be repointed at its final URL — following one moves a signed
-  body to a host the operator never named.
-- docs: new `docs/api/webhooks.md` — the normative alert-webhook delivery
-  contract (headers, HMAC signature with test vectors, retry classes,
-  best-effort delivery semantics), linked from the streaming spec and the
-  Operator Manual; `CORE_DIFFERENCES.md` gains entries for node-health alerts
-  and the webhook surface.
-- Alerting: Rust SDK (`satd-events-client`) support for node-health events. New
-  `Categories::STATUS` bit and typed `Event::Status { kind, state, severity,
-  message, details }` with open `StatusKind` / `StatusState` / `StatusSeverity`
-  enums — an unrecognized value from a newer node surfaces as `Unknown(i32)`
-  rather than an error, and `StatusSeverity` is ordered by severity rank
-  (`Unspecified` < `Info` < `Warning` < `Critical` < `Unknown`) so a client
-  filters with a comparison. All three are `#[non_exhaustive]`, so a condition added
-  node-side stays additive for downstream consumers. New runnable
-  `examples/health_watch.rs`.
-- Fixed: `-reindex` mis-handled fork points in the block files. Block files hold
-  every block the node fully received, including ones a later reorg orphaned, so
-  any datadir that has been live through a reorg has forks on disk. The replay
-  connected *every* block reachable from genesis as if it extended the tip
-  instead of selecting the most-work branch — aborting with
-  `bad-txns-inputs-missingorspent` when the two branches double-spent, and
-  otherwise applying the losing branch's UTXO delta on top of the winning chain
-  and reporting success over a corrupt UTXO set. The replay now selects by
-  cumulative chainwork and connects only that branch; side-chain blocks are
-  indexed (`DataStored`, addressable by hash) but never connected. Duplicate
-  block records on disk are collapsed.
-- Fixed: `-reindex-chainstate` no longer replays whatever chain the height→hash
-  index names. That index is derived state and has been observed polluted with a
-  fork block, which made the replay splice one branch onto another and report a
-  completed reindex over a UTXO set built from both. The replay now selects the
-  most-work fully-connectable branch of the block index, recomputing chainwork
-  and height from the stored headers rather than trusting the index's own
-  fields, and refuses to resume a partial chainstate that sits on a different
-  branch. `invalidateblock` and header-only gaps are honored during selection.
-- Fixed: both reindex paths now validate proof of work before letting a header
-  influence branch selection. An 80-byte header always deserializes, so a single
-  flipped bit in a record's `nBits` exponent produced a well-formed header
-  claiming astronomical work — and since `connect_block` checks no PoW either,
-  it would have been selected and connected as the tip, wedging the node on a
-  branch it could never reorg away from.
-- Fixed: `-reindex-chainstate` now refuses to run when the block index cannot
-  produce a fully-connectable chain reaching the height the chainstate was
-  already at, instead of reporting success over a truncated or empty UTXO set. A
-  pruned datadir hit this every time: every block below the prune horizon is
-  ineligible, so the replay connected nothing and the node came up at height 0
-  with the tx and address indexes already stamped complete.
-- Fixed: an exact chainwork tie during a chainstate reindex now keeps the branch
-  the node was already on, rather than resolving by block hash — a node holding
-  an equal-work stale sibling at its tip could otherwise rebuild onto the orphan.
-- Fixed: side-chain blocks above the selected tip are no longer indexed by
-  `-reindex`. `accept_headers` restores a "missing" height→hash row for any
-  data-carrying entry whose height is vacant, so such an entry would have had one
-  written for it on the next headers message — putting a losing branch into the
-  active-chain index after all.
-- Fixed: all reindex paths now refuse to connect a block that does not extend
-  the chain being replayed — the invariant `connect_stored_block` has always
-  enforced on the IBD path, now applied to both reindex replays as a
-  belt-and-braces check behind the selection fixes above.
-- Fixed: every reindex path now runs full context-free block validation
-  (`CheckBlock`, as Core does) on the bytes it read. Flat-file records carry no
-  checksum, so a bit flipped inside a transaction payload left the 80-byte
-  header hashing correctly and the corrupted block was connected, its UTXO delta
-  applied, and the reindex reported success.
-- Changed: `-reindex-chainstate` no longer resumes a partially-replayed
-  chainstate — the replay starts at genesis or refuses. The daemon already
-  cleared the UTXO set before every run, so this is unchanged in practice; it
-  makes the replay's verification inductive rather than conditional on where it
-  started. Every block it connects is checked against the block files, so
-  starting above genesis would validate blocks against index entries below it
-  that nothing reconciled, and BIP68 (which reads a spent coin's MTP at that
-  coin's creation height, anywhere in history) makes that hole unbounded.
-- Fixed: a chainstate reindex no longer takes any consensus input from the
-  height→hash index it exists to distrust. Median time past — which gates BIP113
-  locktimes and, at the spent coin's height, BIP68 time-based sequence locks — is
-  now resolved through the branch being replayed. The block index's stored header
-  must also match the header in the block file before either replay path will use
-  its parent link, chainwork or timestamp.
+- **Security, both SDKs:** pairing a bearer token with an unencrypted connection
+  is now refused instead of sending the credential — and any scan key registered
+  over the same stream — in cleartext. `WithInsecureBearerToken` /
+  `insecure_bearer_token` accept the risk explicitly. Node-side,
+  `-eventsgrpcallowremote` with `-eventsgrpcauth` now requires TLS (mTLS
+  satisfies it).
+- **Webhooks:** the plaintext-HTTP gate no longer waives IPv4 link-local, so a
+  node with an `http://169.254.…` hook URL will not start until the URL moves to
+  `https://` or the stanza sets `allow_insecure_http = true`. Redirects are never
+  followed on *any* hook, including `reorgwebhook=` — a receiver answering `3xx`
+  must be repointed at its final URL.
+- **Rust SDK:** `EvictReason` routed every unrecognized value into
+  `Unspecified` in 0.4.0; an eviction reason added by a newer node now surfaces
+  as `Unknown(i32)`.
 
 ## Releases
 
