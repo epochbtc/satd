@@ -11,6 +11,9 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+_Terse bullets below; full detail accumulates in the in-development
+[`docs/release-notes/0.5.0-pre.md`](docs/release-notes/0.5.0-pre.md)._
+
 - Fixed (#582): IBD re-arm is no longer exclusively headers-driven. A block
   connector that tore down short of the headers tip left the node parked —
   tip stationary, better headers already known — until the next inbound

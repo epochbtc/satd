@@ -149,28 +149,29 @@ jobs:
       # `contrib/release/publish-sdk-crates.sh` already documents the same
       # limitation for the real publish; this encodes it.
       #
-      # So: packaging correctness is checked unconditionally (below), and the
-      # full build-against-the-registry check runs only when it *can* pass.
-      # It re-arms by itself the moment proto is published — no workflow edit —
-      # and it always runs at release time, since the publish script does proto
-      # first, then client.
-      - name: cargo package (satd-events-client)
-        run: cargo package -p satd-events-client --no-verify
-
-      # Two conditions must hold for the dry-run below to mean anything, and
-      # version equality alone is NOT one of them.
+      # So: each client check below runs exactly when it *can* pass, decided by
+      # the registry probe. Both re-arm by themselves the moment a matching
+      # proto is published — no workflow edit — and both run at release time,
+      # since the publish script does proto first, then client.
       #
-      #   1. The required proto version exists on crates.io — otherwise there is
-      #      nothing for cargo to resolve against.
-      #   2. The local proto is the SAME CODE that was published under that
-      #      version. The workspace version stays at the last release for the
-      #      whole development cycle, so `satd-events-proto = "=0.4.0"` keeps
-      #      resolving to a published 0.4.0 whose schema is months behind the
-      #      working tree. The version number matches while the code does not,
-      #      which is exactly the state that produced a permanently red job.
+      # Two conditions gate the two client steps, and version equality alone
+      # is NOT the second one.
+      #
+      #   1. `resolvable` — the required proto version exists on crates.io.
+      #      Without it there is nothing for cargo to resolve against, and even
+      #      `cargo package` fails at manifest preparation (the packaged
+      #      manifest drops the `path` and keeps only the registry `version`).
+      #      This is the normal state right after the workspace version bumps
+      #      to the next `-pre`: the pin names a version that ships later.
+      #   2. `publishable` — additionally, the local proto is the SAME CODE
+      #      that was published under that version. Before the version bump the
+      #      pin kept naming the previous release, so it resolved against a
+      #      published crate whose schema was months behind the working tree —
+      #      the version number matched while the code did not, which is
+      #      exactly the state that produced a permanently red dry-run.
       #
       # git answers (2) precisely: diff the crate against the release tag.
-      - name: Can the client dry-run resolve a matching proto?
+      - name: Can the client steps resolve a matching proto?
         id: proto
         run: |
           set -euo pipefail
@@ -189,24 +190,35 @@ jobs:
           echo "required=$want  published=$have"
 
           skip() {
-            echo "publishable=false" >> "$GITHUB_OUTPUT"
-            local tail="Packaging was still verified above. This step re-arms by itself, with no workflow edit, once a release publishes a matching satd-events-proto."
+            local tail="This re-arms by itself, with no workflow edit, once a release publishes a matching satd-events-proto."
             echo "::notice title=client publish dry-run skipped::$1 $tail"
             exit 0
           }
 
+          echo "resolvable=false" >> "$GITHUB_OUTPUT"
+          echo "publishable=false" >> "$GITHUB_OUTPUT"
+
           printf '%s\n' $have | grep -qxF "$want" \
-            || skip "satd-events-proto $want is not on crates.io (published: $have)."
+            || skip "satd-events-proto $want is not on crates.io (published: $have), so neither cargo package nor the dry-run can resolve the client's pin."
+
+          # The pin resolves: packaging is checkable even if the dry-run
+          # isn't. (A later write of the same output key overrides the
+          # default-false above.)
+          echo "resolvable=true" >> "$GITHUB_OUTPUT"
 
           git rev-parse -q --verify "refs/tags/v$want" >/dev/null \
-            || skip "no v$want tag in this checkout, so the published proto cannot be compared against the working tree."
+            || skip "no v$want tag in this checkout, so the published proto cannot be compared against the working tree. Packaging is still verified below."
 
           if git diff --quiet "v$want" HEAD -- satd-events-proto/; then
             echo "publishable=true" >> "$GITHUB_OUTPUT"
           else
             changed=$(git diff --stat "v$want" HEAD -- satd-events-proto/ | tail -1 | sed 's/^ *//')
-            skip "the local satd-events-proto has diverged from published $want ($changed), so cargo would build the client against a stale schema."
+            skip "the local satd-events-proto has diverged from published $want ($changed), so cargo would build the client against a stale schema. Packaging is still verified below."
           fi
+
+      - name: cargo package (satd-events-client)
+        if: steps.proto.outputs.resolvable == 'true'
+        run: cargo package -p satd-events-client --no-verify
 
       - name: cargo publish --dry-run (satd-events-client)
         if: steps.proto.outputs.publishable == 'true'
