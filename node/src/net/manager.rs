@@ -3627,9 +3627,17 @@ impl PeerManager {
     /// This is the steady-state counterpart of the IBD connect loop's
     /// stored-block walk: it exists so a tail downloaded by a scheduler
     /// that tore down before connecting it (issue #582) drains without a
-    /// network event. Idle cost is one height-index lookup per wakeup —
-    /// at the tip there is no row above the frontier and the loop exits
-    /// immediately.
+    /// network event. A failed branch activation is the other producer of
+    /// this state: `accept_block` stores the triggering block before the
+    /// reorg attempt, so when the activation aborts (an intermediate
+    /// block's data not yet stored — ordinary out-of-order delivery at
+    /// the tip), the block stays `DataStored` above the tip with nothing
+    /// on the network path able to reach it — `request_missing_blocks`
+    /// skips it (data present) and a re-sent copy dies as `Duplicate`.
+    /// Once the late parent connects, this drain is what picks it up.
+    ///
+    /// Idle cost is one height-index lookup per wakeup — at the tip there
+    /// is no row above the frontier and the loop exits immediately.
     ///
     /// The cap equals the scheduler-creation threshold on purpose: a
     /// stored tail longer than 24 coincides with `headers_tip > tip + 24`,
@@ -3705,7 +3713,7 @@ impl PeerManager {
             tracing::info!(
                 connected,
                 height = chain_state.tip_height(),
-                "Connected stored blocks left behind by a torn-down IBD scheduler"
+                "Drained stored-but-unconnected blocks at the tip"
             );
             let _ = chain_state.flush_coin_cache();
         }
@@ -6735,6 +6743,68 @@ mod tests {
         // prefetch dispatcher the loop spawned — otherwise both poll for
         // the life of the test binary.
         *pm.ibd.write() = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mainnet stall reached through the reorg door rather than a
+    /// torn-down scheduler: block N+2 arrives before N+1 — ordinary
+    /// out-of-order delivery at the tip. `accept_block` stores N+2,
+    /// attempts to activate its branch, finds N+1's data missing, and
+    /// aborts the reorg cleanly. Correct — but the caller sees an error,
+    /// and nothing queues N+2 for another attempt:
+    /// `request_missing_blocks` skips it forever after (data present)
+    /// and a re-sent copy dies in `accept_block` as `Duplicate`. When
+    /// N+1 then arrives and connects, only the steady-state drain can
+    /// pick N+2 back up. On a build without the drain, a synced mainnet
+    /// node was observed parked two blocks behind its headers tip for 21
+    /// minutes, in total silence, with 40+ peers connected.
+    #[test]
+    fn a_block_rejected_by_a_failed_reorg_connects_once_its_parent_arrives() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let h1 = cs.accept_block(&b1).expect("connect block 1");
+        let b2 = build_test_block(h1, 2, 1_707_000_001);
+        let b3 = build_test_block(b2.block_hash(), 3, 1_707_000_002);
+        // Headers for both are already known, as on the stalled node
+        // (`getblockheader` answered with confirmations -1 throughout).
+        let (accepted, err) = cs.accept_headers(&[b2.header, b3.header]);
+        assert_eq!(accepted, 2, "fixture: headers must be accepted ({err:?})");
+
+        // N+2 first. The side-chain branch stores it, the activation
+        // needs N+1's data, and the abort rails restore the old tip.
+        let e = cs
+            .accept_block(&b3)
+            .expect_err("activation must fail: N+1's data is missing");
+        assert!(
+            matches!(e, crate::chain::state::ChainError::FlatFile(_)),
+            "must fail the way the incident did (missing data, not bad-prevblk): {e:?}"
+        );
+        assert_eq!(cs.tip_height(), 1, "the abort must restore the pre-reorg tip");
+        assert!(
+            cs.has_block_data(&b3.block_hash()),
+            "the rejected block's stored data must survive the abort"
+        );
+
+        // N+1 arrives moments later and extends the tip normally.
+        cs.accept_block(&b2).expect("N+1 extends the tip");
+        assert_eq!(cs.tip_height(), 2);
+
+        // No further network events: only the block processor's stored-tail
+        // drain can finish the job.
+        let chain_state = Arc::new(cs);
+        let _pm = peer_manager_over(chain_state.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while chain_state.tip_height() < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            chain_state.tip_height(),
+            3,
+            "the drain must connect the once-rejected block without a network event"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
