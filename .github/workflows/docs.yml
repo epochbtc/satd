@@ -36,6 +36,7 @@ jobs:
   build:
     name: Build manual
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7
@@ -62,6 +63,7 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       pages: write
       id-token: write
