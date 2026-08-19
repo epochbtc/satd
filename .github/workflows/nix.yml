@@ -50,6 +50,7 @@ jobs:
   build-and-check:
     name: nix build / ${{ matrix.system }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +113,7 @@ jobs:
   reproducibility:
     name: nix repro / x86_64-linux pair
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -159,6 +161,7 @@ jobs:
     name: nix repro / compare
     needs: [reproducibility]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - name: Download replica A

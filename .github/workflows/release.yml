@@ -91,6 +91,7 @@ jobs:
   supply-chain-gate:
     name: supply-chain gate (cargo-deny)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -113,6 +114,7 @@ jobs:
   crates-io-dry-run:
     name: crates.io publish dry-run (satd-events-proto, satd-events-client)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -231,6 +233,7 @@ jobs:
     name: SBOM (CycloneDX)
     needs: [supply-chain-gate]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -316,6 +319,7 @@ jobs:
     name: tarball / ${{ matrix.target }}
     needs: [supply-chain-gate]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -634,6 +638,7 @@ jobs:
     name: docker / ${{ matrix.platform }}
     needs: [supply-chain-gate]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -749,6 +754,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build-docker-platform]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     permissions:
       contents: read
@@ -837,6 +843,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build-tarball, merge-docker, sbom]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     permissions:
       contents: write
