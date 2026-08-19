@@ -163,11 +163,64 @@ pub struct AllowlistRejection {
 /// policy. Validates that all paths actually parse before returning,
 /// so a startup-time misconfiguration becomes a hard error rather
 /// than a per-connection mystery later.
+///
+/// Advertises no ALPN protocols. A listener that must negotiate one —
+/// anything speaking gRPC, which is HTTP/2 and therefore needs `h2` —
+/// wants [`build_acceptor_with_alpn`] instead.
 pub fn build_acceptor(
     cert_path: &Path,
     key_path: &Path,
     client_auth: &ClientAuthPolicy,
 ) -> Result<TlsAcceptor, TlsConfigError> {
+    build_acceptor_with_alpn(cert_path, key_path, client_auth, &[])
+}
+
+/// [`build_acceptor`], plus an ALPN protocol list offered during the
+/// handshake.
+///
+/// Every mainstream gRPC client requires ALPN to reach an HTTP/2
+/// server: tonic's TLS connector offers exactly `h2` and treats
+/// "handshake completed, server selected nothing" as a hard error. A
+/// rustls server with no `alpn_protocols` does not *fail* that
+/// handshake — it completes it, selects nothing, and the client tears
+/// the connection down. The symptom is an opaque transport error on a
+/// connection whose certificate verified perfectly, which is a
+/// thoroughly miserable thing to diagnose from the client side.
+///
+/// Deliberately a separate entry point rather than a change to
+/// [`build_acceptor`]: the Esplora REST and JSON-RPC listeners speak
+/// HTTP/1.1, and advertising `h2` there would invite clients to
+/// negotiate a protocol those servers do not implement.
+pub fn build_acceptor_with_alpn(
+    cert_path: &Path,
+    key_path: &Path,
+    client_auth: &ClientAuthPolicy,
+    alpn_protocols: &[&[u8]],
+) -> Result<TlsAcceptor, TlsConfigError> {
+    let (server_config, resolver) =
+        build_server_config(cert_path, key_path, client_auth, alpn_protocols)?;
+    register_reloader(CertReloader {
+        cert_path: cert_path.to_path_buf(),
+        key_path: key_path.to_path_buf(),
+        resolver,
+    });
+    Ok(TlsAcceptor::from(server_config))
+}
+
+/// The `ServerConfig` half of [`build_acceptor_with_alpn`], split out
+/// so tests can inspect what was actually configured — `TlsAcceptor`
+/// exposes none of it — and so building a config does not register a
+/// cert reloader as a side effect.
+#[allow(clippy::type_complexity)]
+fn build_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    client_auth: &ClientAuthPolicy,
+    alpn_protocols: &[&[u8]],
+) -> Result<
+    (Arc<tokio_rustls::rustls::ServerConfig>, Arc<ReloadableCertResolver>),
+    TlsConfigError,
+> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     // Build the server cert behind a runtime-swappable resolver instead of
@@ -192,13 +245,9 @@ pub fn build_acceptor(
             builder.with_client_cert_verifier(verifier)
         }
     };
-    let server_config = builder.with_cert_resolver(resolver.clone());
-    register_reloader(CertReloader {
-        cert_path: cert_path.to_path_buf(),
-        key_path: key_path.to_path_buf(),
-        resolver,
-    });
-    Ok(TlsAcceptor::from(Arc::new(server_config)))
+    let mut server_config = builder.with_cert_resolver(resolver.clone());
+    server_config.alpn_protocols = alpn_protocols.iter().map(|p| p.to_vec()).collect();
+    Ok((Arc::new(server_config), resolver))
 }
 
 /// Build a rustls [`CertifiedKey`] from a parsed cert chain + private key,
@@ -525,6 +574,69 @@ mod tests {
         let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
         let acceptor = build_acceptor(&cert_path, &key_path, &ClientAuthPolicy::Disabled);
         assert!(acceptor.is_ok());
+    }
+
+    /// A gRPC listener must offer `h2`, or a tonic client completes the
+    /// TLS handshake, finds no negotiated protocol, and fails with an
+    /// opaque transport error on a connection whose certificate
+    /// verified perfectly.
+    #[test]
+    fn alpn_protocols_reach_the_server_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
+        let (cfg, _) = build_server_config(
+            &cert_path,
+            &key_path,
+            &ClientAuthPolicy::Disabled,
+            &[b"h2"],
+        )
+        .expect("valid cert/key");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec()],
+            "the configured ALPN list must reach rustls"
+        );
+    }
+
+    /// The HTTP/1.1 surfaces (Esplora REST, JSON-RPC) go through the
+    /// plain `build_acceptor`, and must not start advertising `h2` —
+    /// that would invite clients to negotiate a protocol those servers
+    /// do not implement.
+    #[test]
+    fn plain_build_acceptor_advertises_no_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
+        let (cfg, _) =
+            build_server_config(&cert_path, &key_path, &ClientAuthPolicy::Disabled, &[])
+                .expect("valid cert/key");
+        assert!(
+            cfg.alpn_protocols.is_empty(),
+            "HTTP/1.1 listeners must offer no ALPN, got {:?}",
+            cfg.alpn_protocols
+        );
+    }
+
+    /// Multiple protocols keep their order — rustls picks by *server*
+    /// preference, so the order the caller passes is the priority it
+    /// gets.
+    #[test]
+    fn alpn_preserves_caller_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = simple_cert();
+        let cert_path = write_pem(dir.path(), "cert.pem", &cert.cert.pem());
+        let key_path = write_pem(dir.path(), "key.pem", &cert.key_pair.serialize_pem());
+        let (cfg, _) = build_server_config(
+            &cert_path,
+            &key_path,
+            &ClientAuthPolicy::Disabled,
+            &[b"h2", b"http/1.1"],
+        )
+        .expect("valid cert/key");
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]

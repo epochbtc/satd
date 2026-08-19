@@ -278,9 +278,19 @@ impl GrpcEventSink {
                 } else {
                     tls_config::ClientAuthPolicy::Disabled
                 };
-                let acceptor =
-                    tls_config::build_acceptor(&params.cert_path, &params.key_path, &policy)
-                        .map_err(GrpcEventSinkError::TlsBuild)?;
+                // `h2` is not optional here: gRPC over TLS is HTTP/2 over
+                // TLS, and tonic — the Rust SDK's client, and every other
+                // mainstream gRPC client — refuses a connection on which
+                // the server selected no ALPN protocol. Without this the
+                // handshake succeeds and the certificate verifies, and the
+                // client still fails with an opaque transport error.
+                let acceptor = tls_config::build_acceptor_with_alpn(
+                    &params.cert_path,
+                    &params.key_path,
+                    &policy,
+                    &[b"h2"],
+                )
+                .map_err(GrpcEventSinkError::TlsBuild)?;
                 Some(TlsRuntime {
                     acceptor,
                     allow: tls_config::ClientAllowList::new(params.mtls_client_allow),
@@ -4095,6 +4105,69 @@ mod tests {
             handshake.is_ok(),
             "TLS handshake against the events listener failed: {:?}",
             handshake.err(),
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// The TLS listener must negotiate `h2` via ALPN.
+    ///
+    /// gRPC over TLS *is* HTTP/2 over TLS. tonic's TLS connector offers
+    /// exactly `h2` and rejects a connection on which the server
+    /// selected nothing — so a server that configures no ALPN completes
+    /// the handshake, presents a perfectly valid certificate, and the
+    /// client still fails with an opaque transport error. The sibling
+    /// test above cannot catch that: it never offers ALPN, so it passes
+    /// either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_with_tls_negotiates_h2_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, ck) = self_signed_to_files(dir.path());
+
+        let publisher = EventPublisher::new(edge(), 16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(GrpcTlsParams {
+                cert_path,
+                key_path,
+                mtls_enabled: false,
+                mtls_client_ca: None,
+                mtls_client_allow: vec![],
+                handshake_timeout: Duration::from_secs(5),
+            }),
+        )
+        .await
+        .expect("TLS bind should succeed");
+        let addr = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(ck.cert.der().clone()).unwrap();
+        let mut client_cfg = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // Exactly what tonic offers.
+        client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls = connector.connect(name, tcp).await.expect("TLS handshake");
+
+        let (_io, conn) = tls.get_ref();
+        assert_eq!(
+            conn.alpn_protocol(),
+            Some(b"h2".as_slice()),
+            "the events listener must select h2, or no gRPC client can reach it"
         );
 
         let _ = shutdown_tx.send(true);

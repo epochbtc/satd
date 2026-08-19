@@ -206,6 +206,11 @@ disk, so these were reachable in normal operation.
   `FileCursorStore` did not fsync.
 - An *unset* protobuf field and a value this build does not *recognize* are now
   distinct variants on every open enum.
+- The events-gRPC TLS listener advertised no ALPN protocol, so no standard gRPC
+  client could reach it: the handshake completed, the certificate verified, and
+  tonic then refused the connection because the server had selected nothing. It
+  now offers `h2`. The HTTP/1.1 surfaces are unchanged and still advertise
+  nothing.
 
 **Operational**
 
