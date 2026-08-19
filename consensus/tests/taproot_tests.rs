@@ -211,6 +211,29 @@ impl TaprootTestEnv {
 
         (ScriptBuf::from_bytes(spk), control)
     }
+
+    /// Like [`build_taproot_output`] but committing to a single leaf with a
+    /// caller-chosen leaf version, for exercising unknown (non-tapscript)
+    /// versions. `leaf_version` must be even (the low bit encodes output-key
+    /// parity in the control block).
+    fn build_taproot_output_versioned(
+        &self,
+        leaf_script: &[u8],
+        leaf_version: u8,
+    ) -> (ScriptBuf, Vec<u8>) {
+        let tapleaf_hash = compute_tapleaf_hash(leaf_version, leaf_script);
+        let merkle_root = tapleaf_hash; // single leaf
+        let tweak = compute_tap_tweak_hash(&self.internal_key.serialize(), &merkle_root);
+        let tweak_scalar = Scalar::from_be_bytes(tweak).unwrap();
+        let (tweaked_key, tweaked_parity) =
+            self.internal_key.add_tweak(&self.secp, &tweak_scalar).unwrap();
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&tweaked_key.serialize());
+        let parity_byte = leaf_version | if tweaked_parity == Parity::Odd { 1 } else { 0 };
+        let mut control = vec![parity_byte];
+        control.extend_from_slice(&self.internal_key.serialize());
+        (ScriptBuf::from_bytes(spk), control)
+    }
 }
 
 fn compute_tapleaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
@@ -309,6 +332,47 @@ fn test_tapscript_trivial_true() {
         &checker,
     );
     assert!(result.is_ok(), "tapscript OP_1 failed: {:?}", result.err());
+}
+
+/// An unknown Taproot leaf version (anything whose masked value is not the
+/// 0xc0 tapscript version) must be accepted as anyone-can-spend once the
+/// BIP341 commitment verifies. This is the soft-fork upgrade path: rejecting
+/// such a spend would fork the chain the moment a future leaf version
+/// activates and someone spends under it. With the discourage *policy* flag
+/// set it is rejected — but that flag is never part of consensus block flags.
+#[test]
+fn script_path_accepts_unknown_leaf_version() {
+    let env = TaprootTestEnv::new();
+    let leaf_version: u8 = 0xc2; // masked (& 0xfe) == 0xc2 != 0xc0 tapscript
+    let leaf_script = vec![0x51u8]; // never executed for an unknown version
+
+    let (spk, control) = env.build_taproot_output_versioned(&leaf_script, leaf_version);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &control, &[]);
+    let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
+    let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
+
+    // Consensus flags (no discourage bit): accepted, anyone-can-spend.
+    let consensus_flags = flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT;
+    let ok = verify_script(&[], spk.as_bytes(), &witness_stack, consensus_flags, &checker);
+    assert!(
+        ok.is_ok(),
+        "unknown leaf version must be anyone-can-spend under consensus flags: {:?}",
+        ok.err()
+    );
+
+    // Relay-policy discourage flag: now rejected. Proves the acceptance above
+    // is the version branch, not a blanket pass.
+    let discouraged = verify_script(
+        &[],
+        spk.as_bytes(),
+        &witness_stack,
+        consensus_flags | flags::VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+        &checker,
+    );
+    assert_eq!(
+        discouraged,
+        Err(ScriptError::DiscourageUpgradableTaprootVersion)
+    );
 }
 
 /// Tapscript: OP_0 (trivially false → should fail with EVAL_FALSE)

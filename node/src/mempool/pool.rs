@@ -6508,6 +6508,27 @@ mod tests {
     }
 
     #[test]
+    fn an_immature_coinbase_spend_is_rejected_at_admission() {
+        // Coinbase maturity is enforced at mempool admission, not only at
+        // block connect. Tip is at height 0, so a mempool tx would confirm at
+        // height 1; a coinbase coin from height 0 has 1 < 100 confirmations
+        // and must be refused. A final, BIP68-disabled spend (sequence MAX)
+        // isolates the maturity check.
+        let op = outpoint(0xEB);
+        let cb_coin = Coin {
+            amount: 50_000,
+            script_pubkey: p2wpkh_spk(0x11),
+            height: 0,
+            coinbase: true,
+        };
+        let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
+        let tx = spend_with(op, 40_000, 0x2B, 2, 0xffff_ffff, 0);
+        let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(matches!(r, Err(MempoolError::PrematureCoinbaseSpend)), "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_height_lock_on_an_unconfirmed_parent_is_unsatisfiable() {
         // A mempool parent is treated as confirming at tip+1, so any
         // nonzero height-based relative lock on it is unmet — the CPFP

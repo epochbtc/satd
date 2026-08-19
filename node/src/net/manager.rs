@@ -6518,6 +6518,68 @@ mod tests {
         assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
     }
 
+    /// A block that fails validation must not, on its own, get the relaying
+    /// peer banned or disconnected: an honest peer can forward a block that
+    /// does not connect (a stale tip, a reorg race), and banning for that
+    /// partitions the network. The normal-mode ingress path holds the peer id
+    /// but only forwards to the peer-less block connector, which warns rather
+    /// than bans. (A *mutated* block — same hash, different body — is the one
+    /// exception and is scored 100 by `reject_if_mutated`; this test uses a
+    /// well-formed block so that gate is not engaged.)
+    #[test]
+    fn an_invalid_block_from_a_peer_does_not_ban_or_drop_the_session() {
+        use crate::chain::state::AssumeValid;
+        use crate::storage::db::InMemoryStore;
+        use crate::storage::flatfile::FlatFileManager;
+        use crate::validation::script::NoopVerifier;
+        use bitcoin::hashes::Hash;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+        let chain_state = Arc::new(
+            ChainState::new(
+                store,
+                flat_files,
+                Network::Regtest,
+                Box::new(NoopVerifier),
+                AssumeValid::Disabled,
+                450,
+                4,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mempool = Arc::new(Mempool::new(1_000_000, 0));
+        let fee_estimator = Arc::new(FeeEstimator::new());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pm =
+            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        assert!(pm.ibd.read().is_none(), "test assumes IBD inactive (normal mode)");
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        pm.peers.write().insert(
+            1,
+            mk_handle(1, addr, Direction::Outbound, PeerState::Connected),
+        );
+
+        // Well-formed block (valid merkle root, no witness-commitment or
+        // 64-byte-tx malleation) with an unknown parent: it passes the
+        // mutation gate but cannot connect. The regtest genesis block reparented
+        // to an unknown hash is exactly such a block.
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.header.prev_blockhash =
+            bitcoin::BlockHash::from_byte_array([0x42u8; 32]);
+
+        pm.handle_block(1, block);
+
+        let peers = pm.peers.read();
+        let handle = peers.get(&1).expect("peer session must stay up");
+        assert_eq!(handle.info.ban_score, 0, "an unconnectable block must not be ban-scored");
+    }
+
     /// PR 5: the relay assist paths honor the quarantine scope bits. A
     /// relay-quarantined tx is never INV'd (`announce_tx`/`broadcast_inv`) and
     /// never served via `getdata` (the peer gets `NotFound`), while a tx

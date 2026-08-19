@@ -483,6 +483,18 @@ fn case_intra_block_spend_ok() -> Satd {
     connect(&store2, &block, 1, 0)
 }
 
+/// Spend an output created later in the same block (child before parent) — a
+/// non-topologically-ordered block, which Core rejects as a missing input.
+fn case_intra_block_child_before_parent() -> Satd {
+    let (store, op) = store_with_coin(50_000_000, 0, false);
+    let mid = spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0);
+    let mid_txid = mid.compute_txid();
+    let child = spending_tx(OutPoint { txid: mid_txid, vout: 0 }, 50_000_000, 2, 0xffff_ffff, 0);
+    // child placed before its parent `mid`.
+    let block = block_of(vec![coinbase(1, block_subsidy(1)), child, mid]);
+    connect(&store, &block, 1, 0)
+}
+
 // -- proof-of-work / difficulty / timestamp (pow.rs) --
 
 fn case_high_hash_bad_pow() -> Satd {
@@ -642,6 +654,7 @@ fn cases() -> Vec<Case> {
         Case { name: "locktime_not_final", core: Reject("bad-txns-nonfinal"), expect: Match, run: case_locktime_not_final },
         Case { name: "bip68_sequence_not_met", core: Reject("bad-txns-nonBIP68-final"), expect: Match, run: case_bip68_sequence_not_met },
         Case { name: "intra_block_spend_ok", core: Accept, expect: Match, run: case_intra_block_spend_ok },
+        Case { name: "intra_block_child_before_parent", core: Reject("bad-txns-inputs-missingorspent"), expect: Match, run: case_intra_block_child_before_parent },
         // proof-of-work / difficulty / timestamp
         Case { name: "high_hash_bad_pow", core: Reject("high-hash"), expect: Match, run: case_high_hash_bad_pow },
         Case { name: "bad_diffbits", core: Reject("bad-diffbits"), expect: Match, run: case_bad_diffbits },
