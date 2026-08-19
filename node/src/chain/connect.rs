@@ -2319,6 +2319,109 @@ mod tests {
     }
 
     #[test]
+    fn intra_block_child_before_parent_is_rejected() {
+        // The topological-order rule: a child that spends a same-block parent
+        // must appear *after* it. In-block coins become visible only at the end
+        // of the producing tx's iteration, so a child placed before its parent
+        // finds no coin and connect must reject with the missing-input error —
+        // exactly as Core rejects a non-topologically-ordered block. This is
+        // the reject direction of `test_intra_block_spending`.
+        let (store, outpoint, _) = make_test_store_with_coin(10, false);
+        let height = 101u32;
+
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Parent: consumes the store coin.
+        let parent = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let parent_txid = parent.compute_txid();
+
+        // Child: spends the parent's output.
+        let child = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Child placed BEFORE parent — non-topological.
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, child, parent],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let result = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        });
+        match result {
+            Err(ConnectError::MissingOrSpentInput { .. }) => {}
+            Err(e) => panic!("expected a missing-input rejection, got error {e:?}"),
+            Ok(_) => panic!("child-before-parent block must not connect"),
+        }
+    }
+
+    #[test]
     fn test_bip34_correct_height() {
         // Block at height 101 with correctly encoded BIP 34 height. Should pass.
         let (store, outpoint, _) = make_test_store_with_coin(10, false);

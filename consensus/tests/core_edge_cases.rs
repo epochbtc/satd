@@ -361,6 +361,76 @@ fn test_schnorr_explicit_default_hashtype_rejected() {
     assert_eq!(result, Err(ScriptError::SchnorrSigHashtype));
 }
 
+/// The BIP341 key path shares one Schnorr checker with tapscript, so the same
+/// rule holds there: a 65-byte signature whose trailing sighash byte is the
+/// explicit SIGHASH_DEFAULT (0x00) is rejected before any signature math. A
+/// single-element witness with no annex routes into the key-path branch. (The
+/// tapscript variant is `test_schnorr_explicit_default_hashtype_rejected`;
+/// this pins the key-path call site.)
+#[test]
+fn key_path_rejects_65_byte_sig_with_explicit_default_hashtype() {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&hex::decode(TEST_SECKEY).unwrap()).unwrap();
+    let kp = Keypair::from_secret_key(&secp, &sk);
+    let (output_key, _) = XOnlyPublicKey::from_keypair(&kp);
+
+    // P2TR scriptPubKey: OP_1 <32-byte output key>. Key-path spend; the output
+    // key need not be tweaked because the sig is rejected on its hashtype byte
+    // before verification is attempted.
+    let mut spk = vec![0x51, 0x20];
+    spk.extend_from_slice(&output_key.serialize());
+
+    let mut bad_sig = vec![0u8; 64];
+    bad_sig.push(0x00); // explicit DEFAULT — INVALID
+    let witness = vec![bad_sig]; // one element, no annex → key path
+
+    let c = credit_tx(&spk, 100_000);
+    let tx = spend_tx(&c, &[], &witness);
+    let prev = vec![c.output[0].clone()];
+    let checker = TxSignatureChecker::new(&tx, 0, prev[0].value, &prev);
+    let wit: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
+
+    let result = verify_script(
+        &[],
+        &spk,
+        &wit,
+        flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
+        &checker,
+    );
+    assert_eq!(result, Err(ScriptError::SchnorrSigHashtype));
+}
+
+/// A P2SH redeemScript pushed in the scriptSig that exceeds
+/// MAX_SCRIPT_ELEMENT_SIZE (520 bytes) must be rejected during scriptSig
+/// evaluation, before any P2SH logic runs. The redeemScript never executes, so
+/// its contents and the P2SH hash are irrelevant — only the oversized push
+/// matters.
+#[test]
+fn p2sh_scriptsig_push_over_520_bytes_is_rejected() {
+    let redeem = vec![0x51u8; 600]; // 600 > 520
+
+    // Well-formed P2SH scriptPubKey (OP_HASH160 <HASH160(redeem)> OP_EQUAL);
+    // never reached, but built honestly.
+    let redeem_hash = {
+        let sha = sha2::Sha256::digest(&redeem);
+        let mut hasher = ripemd::Ripemd160::new();
+        ripemd::Digest::update(&mut hasher, sha);
+        let h: [u8; 20] = ripemd::Digest::finalize(hasher).into();
+        h
+    };
+    let mut script_pubkey = vec![0xa9, 0x14];
+    script_pubkey.extend_from_slice(&redeem_hash);
+    script_pubkey.push(0x87);
+
+    // scriptSig: OP_PUSHDATA2 <len u16 LE> <redeem>. 600 bytes needs PUSHDATA2.
+    let mut script_sig = vec![0x4d];
+    script_sig.extend_from_slice(&(redeem.len() as u16).to_le_bytes());
+    script_sig.extend_from_slice(&redeem);
+
+    let result = verify_script(&script_sig, &script_pubkey, &[], flags::VERIFY_P2SH, &NoopChecker);
+    assert_eq!(result, Err(ScriptError::PushSize));
+}
+
 // =========================================================================
 // 6. Flags not covered by differential testing
 //
