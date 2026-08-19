@@ -106,6 +106,11 @@ block Core does not, i.e. a chain split with satd on the losing side.
   rule — it gained the witness half and a merkle-root check, and stopped
   rejecting two shapes Core accepts (which, on a gate that bans at 100 points,
   was a way to ban honest peers).
+- BIP 152 compact-block reconstruction no longer places one transaction in two
+  slots when a short ID is repeated or two mempool transactions collide on one
+  short ID; the affected slots are requested via `getblocktxn`, as Core does.
+  Previously the duplicated transaction mutated the block, tripped the mutation
+  gate, and banned the relaying peer.
 
 **Chain safety, storage durability and recovery.** The bulk of this cycle. Each
 of these could serve wrong answers, lose committed data, or wedge a node.

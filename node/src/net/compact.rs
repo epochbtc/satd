@@ -39,12 +39,36 @@ pub fn try_reconstruct(
     // scope here would silently reintroduce those round trips. Validating /
     // reconstructing someone else's block is consensus-only and never
     // consults policy (I1 corollary, design §3) — so do NOT filter here.
+    //
+    // A short ID is only 6 bytes, so two distinct mempool transactions can
+    // hash to the same short ID (crafted, or ~1-in-2^48 by chance). Using
+    // either one to fill a slot would be a guess: if it is the wrong tx the
+    // reconstructed block fails its merkle check and the honest relayer is
+    // banned, with no `getblocktxn` fallback. So a short ID that matches more
+    // than one mempool tx is marked ambiguous (`None`) and treated as
+    // unavailable — the slot is requested instead. This mirrors Bitcoin Core's
+    // `PartiallyDownloadedBlock::InitData`, which resets a slot when a second
+    // mempool tx collides on its short ID.
     let all_entries = mempool.get_all_entries();
-    let mut mempool_by_short_id: HashMap<ShortId, Transaction> = HashMap::new();
+    let mut mempool_by_short_id: HashMap<ShortId, Option<Transaction>> = HashMap::new();
     for (_txid, entry) in &all_entries {
         let wtxid = entry.tx.compute_wtxid();
         let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
-        mempool_by_short_id.insert(short_id, entry.tx.clone());
+        mempool_by_short_id
+            .entry(short_id)
+            .and_modify(|slot| *slot = None) // second match on this short ID: ambiguous
+            .or_insert_with(|| Some(entry.tx.clone()));
+    }
+
+    // Short IDs that the peer announced more than once. Two block slots sharing
+    // one short ID must never both be filled from the same mempool tx (that
+    // duplicates a transaction and mutates the block); request every such slot
+    // via `getblocktxn` so the peer supplies the real, distinct transactions.
+    // Core hard-fails reconstruction on this collision and re-requests; routing
+    // the individual slots is the same outcome with less bandwidth.
+    let mut short_id_counts: HashMap<ShortId, u32> = HashMap::new();
+    for short_id in &compact.short_ids {
+        *short_id_counts.entry(*short_id).or_insert(0) += 1;
     }
 
     // Total number of transactions in the block
@@ -75,10 +99,13 @@ pub fn try_reconstruct(
             continue; // Already prefilled
         }
         if let Some(short_id) = short_id_iter.next() {
-            if let Some(tx) = mempool_by_short_id.get(short_id) {
-                *slot = Some(tx.clone());
-            } else {
-                missing_indices.push(i as u64);
+            // A short ID the peer announced twice, or one matching two mempool
+            // txs, is not safe to fill locally — request it so we get the real
+            // transaction for this slot instead of duplicating one.
+            let ambiguous = short_id_counts.get(short_id).is_some_and(|&n| n > 1);
+            match mempool_by_short_id.get(short_id) {
+                Some(Some(tx)) if !ambiguous => *slot = Some(tx.clone()),
+                _ => missing_indices.push(i as u64),
             }
         }
     }
@@ -334,6 +361,61 @@ mod tests {
                 assert_eq!(reconstructed.txdata.len(), block.txdata.len());
             }
             Err(_) => panic!("quarantined tx must still be available for reconstruction"),
+        }
+    }
+
+    /// A peer that announces the same short ID for two different block slots
+    /// must not cause the same mempool transaction to be placed in both slots
+    /// (a duplicated tx mutates the block, fails its merkle check, and gets the
+    /// honest relayer banned with no re-request). Both colliding slots must be
+    /// routed to `getblocktxn` instead. Mirrors Bitcoin Core's
+    /// `PartiallyDownloadedBlock::InitData` collision handling.
+    #[test]
+    fn reconstruct_requests_a_duplicated_short_id_instead_of_duplicating_a_tx() {
+        use bitcoin::bip152::PrefilledTransaction;
+
+        let header = regtest_genesis().header;
+        let nonce: u64 = 0x0123_4567_89ab_cdef;
+        let keys = ShortId::calculate_siphash_keys(&header, nonce);
+
+        // One mempool tx; compute the short ID the peer would announce for it.
+        let mempool_tx = make_test_tx(4321);
+        let sid =
+            ShortId::with_siphash_keys(&mempool_tx.compute_wtxid().to_raw_hash(), keys);
+
+        // Coinbase prefilled at index 0, then the SAME short ID announced twice
+        // (slots 1 and 2). A valid block never repeats a transaction, so two
+        // slots sharing a short ID are two distinct txs colliding — neither may
+        // be filled from the single mempool match.
+        let coinbase = make_test_tx(5000);
+        let compact = HeaderAndShortIds {
+            header,
+            nonce,
+            prefilled_txs: vec![PrefilledTransaction { idx: 0, tx: coinbase.clone() }],
+            short_ids: vec![sid, sid],
+        };
+
+        let mempool = Mempool::new(300_000_000, 1_000);
+        mempool.insert_tx_scoped_for_test(
+            mempool_tx,
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
+
+        match try_reconstruct(&compact, &mempool) {
+            Ok(block) => panic!(
+                "must not reconstruct a block with a duplicated tx (txdata len {})",
+                block.txdata.len()
+            ),
+            Err(pending) => {
+                assert_eq!(
+                    pending.missing_indices,
+                    vec![1, 2],
+                    "both colliding slots must be requested via getblocktxn"
+                );
+                assert_eq!(pending.txs[0].as_ref(), Some(&coinbase));
+                assert!(pending.txs[1].is_none());
+                assert!(pending.txs[2].is_none());
+            }
         }
     }
 }
