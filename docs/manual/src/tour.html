@@ -1823,9 +1823,12 @@ pub struct Hook {</code></pre></div>
     return out;
   }
   function hlPlain(src) {
-    return esc(src)
-      .replace(/(^|\n)(#[^\n]*)/g, function (a, p, c) { return p + '<span class="tok-com">' + c + '</span>'; })
-      .replace(/"[^"\n]*"/g, function (s) { return '<span class="tok-str">' + s + '</span>'; });
+    // Line-by-line, single pass per line: a second regex pass over already-
+    // emitted HTML would match the quotes inside the injected span tags.
+    return src.split('\n').map(function (line) {
+      if (/^\s*#/.test(line)) return '<span class="tok-com">' + esc(line) + '</span>';
+      return esc(line).replace(/"[^"]*"/g, function (s) { return '<span class="tok-str">' + s + '</span>'; });
+    }).join('\n');
   }
   document.querySelectorAll('pre code').forEach(function (el) {
     var lang = el.className.match(/lang-(\w+)/);
