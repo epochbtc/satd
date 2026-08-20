@@ -94,8 +94,8 @@ pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 600;
 ///
 /// Unambiguous without escaping because every field before the body is
 /// constrained to a character set that excludes LF: the version is a literal,
-/// the timestamp is decimal digits, the delivery id is hex plus `-` and an
-/// optional `w`/`r` tag, and the hook id is restricted to `[A-Za-z0-9_-]` at
+/// the timestamp is decimal digits, the delivery id is hex and `-`, and the
+/// hook id is restricted to `[A-Za-z0-9_-]` at
 /// parse time. The body is last, so its content cannot be confused with a
 /// preceding field however it is shaped.
 pub fn v2_signing_string(timestamp: u64, delivery_id: &str, hook_id: &str, body: &[u8]) -> Vec<u8> {
@@ -121,8 +121,9 @@ pub fn v2_signing_string(timestamp: u64, delivery_id: &str, hook_id: &str, body:
 /// holding one valid `(body, signature)` pair could therefore replay it under
 /// forged future ids, filling a receiver's dedup cache so that the genuine
 /// alerts bearing those ids are discarded on arrival — while satd counts them
-/// delivered and advances its cursor. Signing the id closes that, and signing a
-/// timestamp bounds replay of the capture itself.
+/// delivered and moves on. Nothing is retained to notice the loss with, so the
+/// alerts are simply gone. Signing the id closes that, and signing a timestamp
+/// bounds replay of the capture itself.
 pub fn sign_v2(
     secret: &str,
     timestamp: u64,

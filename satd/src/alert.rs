@@ -1197,10 +1197,11 @@ heartbeat_interval_secs = 3600
     /// Editing one hook must not destroy another hook's pending deliveries.
     ///
     /// A reload used to retire the whole generation, taking every hook's queue
-    /// and retry backoff with it. For chain events that is survivable — the
-    /// durable cursor did not advance. A status event has no replay by design,
-    /// so one sitting in backoff for a hook the operator never touched is
-    /// simply lost, and the edge-triggered detector will not raise it again.
+    /// and retry backoff with it. Nothing is persisted per hook, so whatever a
+    /// retired generation was holding is gone. For chain and mempool events
+    /// that is the accepted best-effort cost. A status event is worse off: one
+    /// sitting in backoff for a hook the operator never touched is lost, and
+    /// the detector will not raise it again until the condition itself changes.
     ///
     /// Identity of the `mpsc::Sender` is the observable: a carried-over hook
     /// keeps the same channel, and therefore the same queue.

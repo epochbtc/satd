@@ -233,6 +233,42 @@ impl MockReceiver {
         }
     }
 
+    /// [`Self::wait_for`], ignoring the first `skip` accepted deliveries.
+    ///
+    /// `wait_for` returns the earliest match, which is wrong for any test that
+    /// makes the same condition happen twice: it hands back the delivery from
+    /// before the interesting event, and the assertion passes without the event
+    /// having occurred.
+    async fn wait_for_after(
+        &self,
+        skip: usize,
+        secs: u64,
+        pred: impl Fn(&Received) -> bool,
+    ) -> Received {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(r) = self
+                .inner
+                .lock()
+                .await
+                .received
+                .iter()
+                .skip(skip)
+                .find(|r| pred(r))
+                .cloned()
+            {
+                return r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a matching webhook delivery after the \
+                 first {skip}; got: {:?}",
+                self.inner.blocking_lock_bodies()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn attempts(&self) -> usize {
         self.inner.lock().await.seen
     }
@@ -314,8 +350,8 @@ const SECRET: &str = "an-operator-chosen-signing-secret";
 ///
 /// `nudge` exists so a test can produce a *materially different* file: the
 /// dispatcher deliberately treats a SIGHUP that did not change the alertfile as
-/// a no-op, so a test that needs a fresh generation — and therefore a fresh
-/// catch-up from the persisted cursor — has to actually change something. It
+/// a no-op, so a test that needs a fresh generation has to actually change
+/// something. It
 /// sets `allow_insecure_http`, which parses under every category and is a
 /// no-op for the loopback URLs these tests use, so it changes the parsed hook
 /// without changing behavior.
@@ -570,12 +606,14 @@ async fn webhook_retries_until_the_receiver_recovers() {
 ///
 /// `reload_from_sighup` calls `AlertReloader::apply()` on *every* SIGHUP,
 /// whatever key the operator actually edited, and retiring a generation drops
-/// everything queued in it. For chain events that is survivable — the cursor
-/// did not advance, so the next generation's catch-up re-queues them. A status
-/// event has no replay by design, and the detectors are edge-triggered against
-/// a `HealthState` that outlives the reload, so a `disk_low` sitting in retry
-/// backoff when the operator SIGHUPs to change `maxconnections` would be
-/// dropped, never replayed, and never re-raised. The page simply never arrives.
+/// everything queued in it. Nothing is persisted per hook, so a dropped
+/// delivery is not recoverable from anywhere: what a retired generation was
+/// holding is gone. That is the accepted cost for chain and mempool events,
+/// which are best-effort. A status event is worse off still: the detectors are
+/// level-triggered against a `HealthState` that outlives the reload, so a
+/// `disk_low` sitting in retry backoff when the operator SIGHUPs to change
+/// `maxconnections` would be dropped and not re-raised until the condition
+/// itself changes. The page simply never arrives.
 ///
 /// The receiver 503s the first two attempts, so the event is provably still
 /// in the dispatcher — mid-backoff — when the unrelated SIGHUP lands.
@@ -791,6 +829,93 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     receiver
         .wait_for(60, |r| r.json()["body"]["height"] == 6)
         .await;
+}
+
+/// **Release criterion: what a webhook *does* carry across a daemon restart.**
+///
+/// Webhooks are best-effort by design (D6). Nothing is persisted, so a hook
+/// that was down resumes at the live head and the events it missed are gone;
+/// [`a_hook_that_was_down_resumes_at_the_live_head`] asserts exactly that.
+///
+/// Health alerts are the one exception, and they get it from a different
+/// mechanism than delivery. The detectors are level-triggered: a new process
+/// re-evaluates every condition and raises whatever is still true, so a
+/// condition that outlives the daemon is announced again by its successor.
+/// That is a real durability property an operator relies on, since an alert
+/// must not go quiet merely because the node bounced. `health.rs` covers the
+/// in-process re-raise; nothing covered the part an operator actually sees,
+/// which is whether it reaches the hook.
+///
+/// The two delivery ids must differ. They derive from the publisher's
+/// per-process instance id, so a receiver deduplicating on `X-Satd-Delivery`
+/// (which the spec requires it to do) must not collapse the re-raise into the
+/// original and go on believing the condition was already handled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_still_true_condition_is_raised_again_after_a_restart() {
+    let receiver = MockReceiver::ok().await;
+
+    // Every self-scheduled detector quiet except `disk_low`, which this test
+    // drives. `quiet_detectors` cannot be used wholesale: it sets
+    // `--alertdiskfreemb=0` on the command line, a CLI value outranks the conf
+    // file, and the retunes below go through the conf. The threshold would
+    // never move and nothing would ever be raised.
+    let quiet_but_disk: Vec<String> = [
+        "--alerttipstallseconds=0",
+        "--alertmempoolfullpct=0",
+        "--alertpeerfloor=0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (sn, dir) = node_with_hook(&receiver, "ops", "\"status\"", quiet_but_disk).await;
+    let alertfile_arg = format!("--alertfile={}", dir.path().join("alertfile.toml").display());
+
+    // Clear first so the raise below is an edge on any host, then trip
+    // `disk_low` with a floor no filesystem can satisfy. Both go through the
+    // conf file, which is also what survives into the restarted process.
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=1\n").await;
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
+
+    let first = receiver
+        .wait_for(60, |r| {
+            r.json()["body"]["kind"] == "disk_low" && r.json()["body"]["state"] == "raised"
+        })
+        .await;
+    assert!(first.signature_valid(SECRET));
+    let first_id = first.header("x-satd-delivery");
+    assert!(!first_id.is_empty(), "a delivery always carries an id");
+
+    let before = receiver.all().await.len();
+
+    // Restart. The conf still carries the tripped threshold, so the condition
+    // is still true when the new process evaluates it. The alertfile has to be
+    // passed again: `restart_with` rebuilds the argument list from scratch, and
+    // a node restarted without it comes back with no hooks at all.
+    let sn = tokio::task::spawn_blocking(move || {
+        let mut sn = sn;
+        sn.restart_with(&[alertfile_arg.as_str()]);
+        sn
+    })
+    .await
+    .unwrap();
+
+    // Skip what the previous process delivered. Matching from the start of the
+    // log would return the original raise and pass whether or not the new
+    // process ever said anything.
+    let again = receiver
+        .wait_for_after(before, 60, |r| {
+            r.json()["body"]["kind"] == "disk_low" && r.json()["body"]["state"] == "raised"
+        })
+        .await;
+    assert!(again.signature_valid(SECRET));
+    assert_ne!(
+        again.header("x-satd-delivery"),
+        first_id,
+        "the re-raise must carry a fresh delivery id, or a conforming receiver \
+         deduplicates it away and never learns the condition is still standing"
+    );
+
+    drop(sn);
 }
 
 /// **Release criterion: a stalled webhook endpoint cannot affect consensus.**
