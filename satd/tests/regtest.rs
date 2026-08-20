@@ -5466,6 +5466,356 @@ fn test_sp_index_backfill_pause_resume() {
     node.stop();
 }
 
+/// Mine `count` blocks to `addr` and return the block hashes.
+fn sp_generate_to(node: &TestNode, count: u64, addr: &str) -> Vec<String> {
+    let resp = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(count), serde_json::json!(addr)],
+        )
+        .expect("generatetoaddress");
+    assert!(resp["error"].is_null(), "generatetoaddress: {resp}");
+    resp["result"]
+        .as_array()
+        .expect("array of hashes")
+        .iter()
+        .map(|v| v.as_str().expect("hash").to_string())
+        .collect()
+}
+
+/// A P2TR scriptPubKey derived from `seed`.
+///
+/// Any taproot output makes its transaction silent-payment eligible, which is
+/// what puts a real computed tweak in the block's `sp_tweaks` row. Without one,
+/// every row in the chain is an empty header and the parity assertion below
+/// would be satisfied by two indexes that agree only about nothing.
+fn sp_p2tr_script(seed: u8) -> bitcoin::ScriptBuf {
+    use bitcoin::key::TweakedPublicKey;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret");
+    let (xonly, _) = sk.public_key(&secp).x_only_public_key();
+    bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
+}
+
+/// For each height in `funding_heights`, spend that coinbase to a taproot
+/// output and mine the result into its own block.
+fn sp_mine_eligible_blocks(
+    node: &TestNode,
+    wallet: &DeterministicWallet,
+    addr: &str,
+    funding_heights: &[u64],
+    seed_base: u8,
+) {
+    for (i, h) in funding_heights.iter().enumerate() {
+        let (raw, _txid) = common::build_signed_p2wpkh_spend_of_coinbase(
+            node,
+            wallet,
+            *h,
+            sp_p2tr_script(seed_base.wrapping_add(i as u8)),
+            10_000,
+        );
+        let sent = node
+            .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw)])
+            .expect("sendrawtransaction");
+        assert!(sent["error"].is_null(), "sendrawtransaction: {sent}");
+        sp_generate_to(node, 1, addr);
+    }
+}
+
+/// Every block of `node`'s active chain as raw hex, heights 1..=tip.
+fn sp_active_chain_hex(node: &TestNode) -> Vec<String> {
+    let tip = get_rpc_u64(node, "getblockcount").expect("getblockcount");
+    (1..=tip)
+        .map(|h| {
+            let hash = node
+                .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+                .expect("getblockhash")["result"]
+                .as_str()
+                .expect("hash")
+                .to_string();
+            node.rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(hash), serde_json::json!(0)],
+            )
+            .expect("getblock")["result"]
+                .as_str()
+                .expect("raw hex")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Feed `chain` to `node` block by block and require every one to be accepted.
+/// `submitblock` reports a rejection in `result` as a reason string and leaves
+/// `error` null, so checking only `error` would let a silently-rejected chain
+/// through.
+fn sp_submit_chain(node: &TestNode, chain: &[String]) {
+    for (i, hex) in chain.iter().enumerate() {
+        let resp = node
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .expect("submitblock");
+        assert!(resp["error"].is_null(), "submitblock at index {i}: {resp}");
+        assert!(
+            resp["result"].is_null(),
+            "submitblock rejected the block at index {i}: {}",
+            resp["result"]
+        );
+    }
+}
+
+/// Total tweak entries the serving RPC reports across heights `[from, to]`.
+fn sp_entry_count(node: &TestNode, from: u64, to: u64) -> usize {
+    let mut total = 0;
+    for h in from..=to {
+        let hash = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+            .expect("getblockhash")["result"]
+            .as_str()
+            .expect("hash")
+            .to_string();
+        let resp = node
+            .rpc_call_with_params(
+                "getsilentpaymentblockdata",
+                vec![serde_json::json!(hash), serde_json::json!(1)],
+            )
+            .expect("getsilentpaymentblockdata");
+        assert!(
+            resp["error"].is_null(),
+            "getsilentpaymentblockdata at height {h}: {resp}"
+        );
+        total += resp["result"]["tweaks"]
+            .as_array()
+            .expect("tweaks array")
+            .len();
+    }
+    total
+}
+
+/// **Release criterion (0.5.0): the silent-payment tweak index a backfill
+/// rebuilds is byte-identical to the one the live connect path wrote, and a
+/// reorg does not perturb that.**
+///
+/// The two write paths are separate code. The live path builds a row inside
+/// `connect_block` from the block and the coins it spends, and removes the row
+/// again on disconnect. The backfill walks historical heights instead and
+/// reconstructs the same prev-output scripts from undo data. Nothing compared
+/// their output before this test: `index/silent_payments/runner.rs` asserts the
+/// byte-identity property in a comment, and `cleanup_stale_rows_after_reorg`
+/// had no coverage at all.
+///
+/// The comparison is over the whole column family, not a list of probed
+/// heights. A row left behind at a height the chain has since replaced is the
+/// specific damage a reorg can do, and the serving RPC can only answer for
+/// heights the caller already thought to ask about, so it cannot see one.
+///
+/// Shape:
+///   - Node A runs with the index on, builds a chain carrying real eligible
+///     transactions, and is then reorged onto a longer competing chain that
+///     carries its own. The fork is at genesis, so every row it holds is the
+///     product of connect, then disconnect, then connect again.
+///   - Node C takes the same winning chain with the index off, then turns it on
+///     and backfills, so its rows are the product of the walk alone.
+///   - The two column families must be equal byte for byte.
+#[test]
+fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
+    // Distinct coinbase addresses per chain. Mining the same template to the
+    // same address is deterministic, and identical blocks make `submitblock`
+    // answer "duplicate" instead of causing a reorg.
+    let wallet_a = DeterministicWallet::from_secret([0x11u8; 32]);
+    let wallet_b = DeterministicWallet::from_secret([0x33u8; 32]);
+    let addr_a = wallet_a.address.to_string();
+    let addr_b = wallet_b.address.to_string();
+
+    // --- Node A: the live write path, index on from genesis. ---
+    let mut node_a = TestNode::start(&["--silentpaymentindex=1"]);
+    sp_generate_to(&node_a, 101, &addr_a);
+    sp_mine_eligible_blocks(&node_a, &wallet_a, &addr_a, &[1, 2, 3], 0x40);
+    let tip_a = get_rpc_u64(&node_a, "getblockcount").expect("getblockcount");
+    assert_eq!(tip_a, 104, "101 empty blocks plus 3 carrying an eligible tx");
+
+    // Fail loudly if the fixture stopped producing eligible transactions: two
+    // empty indexes would otherwise compare equal and prove nothing.
+    let entries_before = sp_entry_count(&node_a, 1, tip_a);
+    assert!(
+        entries_before >= 3,
+        "expected at least one tweak per eligible transaction, got {entries_before}"
+    );
+
+    // --- The competing chain: longer, and carrying its own eligible txs. ---
+    let mut node_b = TestNode::start(&[]);
+    sp_generate_to(&node_b, 101, &addr_b);
+    sp_mine_eligible_blocks(&node_b, &wallet_b, &addr_b, &[1, 2, 3, 4, 5], 0x70);
+    let tip_b = get_rpc_u64(&node_b, "getblockcount").expect("getblockcount");
+    assert_eq!(tip_b, 106);
+    let winning_chain = sp_active_chain_hex(&node_b);
+    node_b.stop();
+
+    // --- Reorg node A onto it. ---
+    sp_submit_chain(&node_a, &winning_chain);
+    assert_eq!(
+        get_rpc_u64(&node_a, "getblockcount").expect("getblockcount"),
+        tip_b,
+        "node A must have adopted the longer chain"
+    );
+    let entries_after = sp_entry_count(&node_a, 1, tip_b);
+    assert!(
+        entries_after >= 5,
+        "the winning chain's eligible transactions must be indexed after the reorg, \
+         got {entries_after}"
+    );
+
+    // --- Node C: the backfill write path over the same winning chain. ---
+    let mut node_c = TestNode::start(&[]);
+    sp_submit_chain(&node_c, &winning_chain);
+    assert_eq!(
+        get_rpc_u64(&node_c, "getblockcount").expect("getblockcount"),
+        tip_b
+    );
+
+    node_c.restart_preserving_datadir(&["--silentpaymentindex=1"]);
+    let info = node_c.rpc_call("getindexinfo").expect("getindexinfo");
+    assert_eq!(
+        info["result"]["silentpayments"]["synced"].as_bool(),
+        Some(false),
+        "history that connected with the index off must report as not synced"
+    );
+    let started = node_c
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
+        .expect("backfillindex");
+    assert_eq!(
+        started["result"]["started"].as_bool(),
+        Some(true),
+        "backfillindex silentpayment: {started}"
+    );
+    // Accept `failed` as a terminal state too, so a backfill that aborts fails
+    // this test in a second with its `last_error` rather than after the full
+    // timeout with nothing to read.
+    let done = poll_sp_backfill_state(&node_c, &["completed", "failed"], test_timeout(120));
+    let sp = &done["result"]["silentpayments"];
+    assert_eq!(
+        sp["backfill"]["state"].as_str(),
+        Some("completed"),
+        "the backfill did not complete: {}",
+        sp["backfill"]
+    );
+    assert_eq!(
+        sp["synced"].as_bool(),
+        Some(true),
+        "a completed backfill must report synced"
+    );
+
+    // --- Compare the two column families. ---
+    let dir_a = node_a.datadir.clone();
+    let dir_c = node_c.datadir.clone();
+    node_a.stop();
+    node_c.stop();
+
+    let live = common::dump_sp_tweaks_cf(&dir_a);
+    let rebuilt = common::dump_sp_tweaks_cf(&dir_c);
+
+    // On regtest the index starts at height 1, so both sides describe the whole
+    // chain. An off-by-one in the walk start, or a stale row surviving the
+    // reorg, shows up as a length difference before any row is inspected.
+    assert_eq!(
+        live.len(),
+        tip_b as usize,
+        "the live index must hold exactly one row per block from the activation height"
+    );
+    assert_eq!(
+        rebuilt.len(),
+        live.len(),
+        "the backfill wrote {} rows where the live path wrote {}",
+        rebuilt.len(),
+        live.len()
+    );
+
+    let mut non_empty = 0;
+    for ((h_live, v_live), (h_rebuilt, v_rebuilt)) in live.iter().zip(rebuilt.iter()) {
+        assert_eq!(h_live, h_rebuilt, "row heights diverged");
+        assert_eq!(
+            v_live,
+            v_rebuilt,
+            "row at height {h_live} differs: live {} vs rebuilt {}",
+            hex::encode(v_live),
+            hex::encode(v_rebuilt)
+        );
+        // A row is `version || block_hash || count || entries`; anything longer
+        // than the 37-byte header carries at least one tweak.
+        if v_live.len() > 37 {
+            non_empty += 1;
+        }
+    }
+    assert!(
+        non_empty >= 5,
+        "the compared indexes must contain real tweaks, not only empty rows; \
+         found {non_empty} non-empty rows"
+    );
+}
+
+/// A block that leaves the active chain must take its tweak row with it.
+///
+/// This is the other half of the rebuild-parity criterion, and the parity test
+/// above structurally cannot reach it: there the winning chain is longer, so
+/// every disconnected height is immediately reconnected and a row that was
+/// never removed is overwritten before anyone looks. The damage a missing
+/// removal does only becomes visible at a height the chain no longer has, so
+/// this test rolls the tip back without replacing it.
+///
+/// A surviving row is worse than a missing one. Rows are self-authenticating,
+/// so a stale row at a height the chain later reuses is caught at serve time,
+/// but a stale row above the tip is served to a light client as though it
+/// described the chain.
+#[test]
+fn test_sp_index_drops_rows_for_blocks_that_leave_the_chain() {
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let addr = wallet.address.to_string();
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    sp_generate_to(&node, 101, &addr);
+    sp_mine_eligible_blocks(&node, &wallet, &addr, &[1, 2, 3], 0x40);
+    assert_eq!(
+        get_rpc_u64(&node, "getblockcount").expect("getblockcount"),
+        104
+    );
+    assert!(
+        sp_entry_count(&node, 102, 104) >= 3,
+        "the blocks about to be disconnected must carry real tweaks"
+    );
+
+    // Roll back to 101 by invalidating the first of the three.
+    let h102 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(102)])
+        .expect("getblockhash")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let resp = node
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(h102)])
+        .expect("invalidateblock");
+    assert!(resp["error"].is_null(), "invalidateblock: {resp}");
+    assert_eq!(
+        get_rpc_u64(&node, "getblockcount").expect("getblockcount"),
+        101,
+        "invalidating height 102 must roll the tip back to 101"
+    );
+
+    let dir = node.datadir.clone();
+    node.stop();
+    let rows = common::dump_sp_tweaks_cf(&dir);
+
+    let above: Vec<u32> = rows.iter().map(|(h, _)| *h).filter(|h| *h > 101).collect();
+    assert!(
+        above.is_empty(),
+        "rows survived at heights the chain no longer has: {above:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        101,
+        "the index must hold exactly one row per remaining block"
+    );
+}
+
 /// `backfillindex address` starts a real two-pass backfill on a
 /// non-AssumeUTXO datadir. Replaces the M7-era "no-op" test once the
 /// genesis→tip walk landed.

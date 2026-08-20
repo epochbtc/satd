@@ -14,8 +14,11 @@
 //!
 //! No BIP 352 output can be paid before taproot activated (§3.2), and the
 //! live connect path applies the same gate. Walking from activation makes
-//! the backfill produce byte-identical rows to a from-genesis sync (the
-//! PR-8 acceleration differential). On regtest taproot activates at
+//! the backfill produce byte-identical rows to a from-genesis sync. That
+//! is asserted, not assumed: `test_sp_index_backfill_rebuilds_live_rows_
+//! byte_identically` in `satd/tests/regtest.rs` compares the whole
+//! `sp_tweaks` column family a live node built across a reorg against the
+//! one a backfill rebuilt over the same chain. On regtest taproot activates at
 //! height 0, but genesis is never connected via `connect_block`, so the
 //! walk still starts at height 1 to match the live path.
 //!

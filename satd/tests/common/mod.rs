@@ -1246,6 +1246,121 @@ pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
     (raw_hex, txid_hex)
 }
 
+/// The display-hex txid of the coinbase at `height`.
+pub fn coinbase_txid_at<R: BlockingRpc>(node: &R, height: u64) -> String {
+    let hash = node
+        .rpc("getblockhash", vec![serde_json::json!(height)])
+        .expect("getblockhash")["result"]
+        .as_str()
+        .expect("hash string")
+        .to_string();
+    node.rpc("getblock", vec![serde_json::json!(hash), serde_json::json!(1)])
+        .expect("getblock")["result"]["tx"][0]
+        .as_str()
+        .expect("coinbase txid")
+        .to_string()
+}
+
+/// Build + sign a P2WPKH spend of the coinbase at `height` (vout 0) paying
+/// `dest_script`. Like [`build_signed_p2wpkh_spend_seq`], but able to pick a
+/// different funding coinbase each time, so a test can put an independent
+/// transaction in each of several blocks. `height` must be mature and must
+/// have been mined to `wallet.address`.
+pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    height: u64,
+    dest_script: bitcoin::ScriptBuf,
+    fee_sat: u64,
+) -> (String, String) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::str::FromStr;
+
+    let cb_txid = bitcoin::Txid::from_str(&coinbase_txid_at(node, height)).expect("txid parse");
+    // Regtest subsidy is 50 BTC until the first halving at height 150.
+    assert!(height < 150, "helper assumes the pre-halving regtest subsidy");
+    let cb_value_sat: u64 = 50 * 100_000_000;
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb_txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(0xffff_ffff),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_value_sat - fee_sat),
+            script_pubkey: dest_script,
+        }],
+    };
+
+    let secp = Secp256k1::new();
+    let src_script = wallet.address.script_pubkey();
+    let mut cache = SighashCache::new(&spend);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(cb_value_sat),
+            EcdsaSighashType::All,
+        )
+        .expect("sighash");
+    let msg = Message::from_digest(sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(wallet.pk.to_bytes());
+    spend.input[0].witness = witness;
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let txid_hex = spend.compute_txid().to_string();
+    (raw_hex, txid_hex)
+}
+
+/// Every row in the `sp_tweaks` column family, as raw `(height, value_bytes)`
+/// pairs in ascending height order.
+///
+/// This reads the database directly, which is the point: the silent-payment
+/// serving RPC can only answer for a height the caller already thought to ask
+/// about, so it cannot see a row that should not exist at all. A row left
+/// behind at a height the chain no longer has is exactly the failure a reorg
+/// can produce, so the rebuild-parity test compares whole column families
+/// rather than a list of probed heights.
+///
+/// The node must be stopped first: RocksDB holds an exclusive lock while it
+/// runs, and this opens a second handle on the same directory.
+pub fn dump_sp_tweaks_cf(datadir: &std::path::Path) -> Vec<(u32, Vec<u8>)> {
+    use rocksdb::{IteratorMode, Options, DB};
+
+    let path = datadir.join("regtest").join("chainstate");
+    let opts = Options::default();
+    let cfs = DB::list_cf(&opts, &path).expect("list column families");
+    let db = DB::open_cf_for_read_only(&opts, &path, &cfs, false).expect("open chainstate");
+    let cf = db
+        .cf_handle(node_sp_index::CF_SP_TWEAKS)
+        .expect("sp_tweaks column family");
+    let mut rows = Vec::new();
+    for item in db.iterator_cf(&cf, IteratorMode::Start) {
+        let (k, v) = item.expect("iterate sp_tweaks");
+        let height = node_sp_index::decode_sp_key(&k).expect("4-byte big-endian height key");
+        rows.push((height, v.to_vec()));
+    }
+    // Keys are big-endian heights, so iteration is already ascending. Sorting
+    // makes that a property of the helper rather than of the key encoding.
+    rows.sort_by_key(|(h, _)| *h);
+    rows
+}
+
 /// One `[[token]]` entry for [`write_authfile`].
 pub struct TokenSpec {
     pub id: &'static str,
