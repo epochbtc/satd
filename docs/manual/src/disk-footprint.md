@@ -13,24 +13,33 @@ Core's and carries none of the index column families below.
 
 satd keeps everything in one RocksDB with multiple column families (CFs). The
 indices are append-mostly: rows are added as blocks connect and removed only on
-disconnect during a reorg, so no tombstone debt accumulates over time. The
-figures below describe a fully-indexed mainnet node in mid-2026; your numbers
-will track the chain's growth.
+disconnect during a reorg, so no tombstone debt accumulates over time.
+
+The on-disk column is measured, not estimated. It comes from the per-CF SST
+totals of one fully-indexed mainnet node in August 2026, at height 963,000 with
+`txindex`, `addressindex` and `silentpaymentindex` all on. Your numbers track
+the chain's growth.
 
 | Column family | Role | Keyed by | Row size | Approx. on disk |
 |---|---|---|---|---|
-| `addr_funding_v2` | every output paying a script | `scripthash[16] ‖ height ‖ txid ‖ vout` | 64 B | ~200 GB |
-| `tx_index` | txid → containing block | `txid[32]` | 64 B | ~140 GB |
-| `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~140 GB |
-| `outpoint_spend` | UTXO → the input that spent it | `prev_txid[32] ‖ vout` | 76 B | ~100 GB |
-| `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB |
-| `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~4 GB |
-| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~28 B varint | ~tens of MB |
-| `undo` | per-block disconnect data | `block_hash[32]` | ~28 B / input | small (rolling) |
+| `addr_spending_v2` | every input spending a script | `scripthash[16] ‖ height ‖ txid ‖ vin` | 92 B | ~256 GB |
+| `outpoint_spend` | UTXO → the input that spent it | `prev_txid[32] ‖ vout` | 76 B | ~186 GB |
+| `addr_funding_v2` | every output paying a script | `scripthash[16] ‖ height ‖ txid ‖ vout` | 64 B | ~178 GB |
+| `tx_index` | txid → containing block | `txid[32]` | 64 B | ~79 GB |
+| `undo` | per-block disconnect data | `block_hash[32]` | ~28 B / input | ~74 GB |
+| `sp_tweaks` | BIP 352 tweaks, one row per block from taproot activation | `height` | 73 B/eligible tx | ~13 GB |
+| `coins` | the live UTXO set | `txid[32] ‖ vout` | ~28 B varint | ~10 GB |
+| `block_index` | header and status per block | `block_hash[32]` | ~100 B | ~120 MB |
+| `block_filter` / `_header` | BIP 158 compact filters | `type ‖ height` | ~30 KB / 37 B | ~30 GB (estimate) |
 
-The three address/txid indices plus `outpoint_spend` are the bulk. The UTXO set
-itself (`coins`) is small: it lives mostly in the in-memory coin cache and
-serializes to a few tens of MB on disk.
+The three address/txid indices plus `outpoint_spend` are the bulk. Two rows
+often surprise operators. `undo` is not a rolling window: satd keeps the
+disconnect data for every block, so it grows with the chain. `coins` is the
+live UTXO set, which is served from the in-memory coin cache but still
+serializes to several GB.
+
+The filter row is the one figure here that is still an estimate. The measured
+node does not run `blockfilterindex`.
 
 > **Note.** During a `-reindex` or `-reindex-chainstate`, RocksDB compaction
 > falls behind the write rate, so `tx_index` in particular can read much larger
@@ -174,9 +183,49 @@ This applies to all three backfills (`address`, `basic block filter index`,
 Until a backfill completes, the tweak-serving surfaces refuse a request rather
 than return a partial result.
 
-> **Note.** At roughly 4 GB on mainnet, `sp_tweaks` is small next to the
-> address indices. About 85% of tweaks describe dust outputs; a subscription
-> can drop them with a `tweak_dust_limit`.
+### Size and backfill time
+
+The figures here are measurements from a synced mainnet node, taken in August
+2026 over heights 709,632 to 962,151. That span is 252,520 blocks, holding
+187,015,795 tweak entries.
+
+| Measure | Value |
+|---|---|
+| Row content, full taproot era | ~13 GB |
+| Mean eligible transactions per block, whole era | ~740 |
+| Mean eligible transactions per block, recent blocks | ~260 |
+| Mean row | ~54 KB |
+| Growth at the recent rate | ~1 GB/year |
+| Backfill wall-clock for 252,520 blocks | 6 h 46 m (~10 blocks/s) |
+
+A transaction is eligible when it pays a taproot output and has at least one
+input whose public key the protocol can recover. Recoverable inputs are P2PKH,
+P2WPKH, P2SH-P2WPKH and key-path P2TR. A transaction funded only by P2WSH,
+bare multisig or script-path P2TR pays taproot and indexes nothing. Measured
+against the index, about 98% of taproot-paying transactions across the era are
+eligible.
+
+The era mean is far above the recent rate. Blocks from the 2023 and 2024
+inscription period average about a thousand eligible transactions, and the
+busiest carry several thousand. A return to that transaction pattern raises the
+growth rate again.
+
+The backfill ran while the node stayed at the tip and served its other
+surfaces. It is bound by CPU rather than by disk. The walk does one elliptic
+curve multiplication per eligible transaction. Its measured throughput tracks
+the eligible-transaction count, not the block size, and roughly 70% of that
+6 h 46 m was per-transaction work.
+
+> **Note.** A datadir where a backfill was interrupted and restarted can read
+> larger than the figure above until compaction reclaims the superseded rows.
+> The node measured here read about 15 GB for a 13 GB index for that reason.
+
+> **Note.** A `tweak_dust_limit` on a subscription drops entries whose largest
+> taproot output is below the limit. It filters less than its name suggests. At
+> 330 sat, the dust threshold for a taproot output, it removes nothing
+> measurable. At 546 sat it removes about 10%, and at 0.001 BTC about two
+> thirds. The limit reduces the bandwidth a subscription uses. It does not
+> reduce the index on disk.
 
 ## Repairing lost block data
 
