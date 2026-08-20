@@ -122,6 +122,17 @@ Canaries gate every PR merge (not just release candidates) and boot real downstr
 
 The canaries above run on `.github/workflows/canary.yml`, triggered on `pull_request`, weekly cron, and `workflow_dispatch`. They are marked as required status checks on the `master` branch protection.
 
+#### Running the fleet with the opt-in surfaces enabled
+
+By default every canary boots satd at stock defaults, which is what a downstream client actually meets and what PR gating should hold still. A separate question matters at release time: does *enabling* satd's opt-in surfaces perturb any downstream client? Dispatch the workflow with `features: on` to answer it — `scripts/canary/boot-satd.sh` then adds the silent-payment index, the events gRPC listener, the streaming WebSocket listener and an alert-webhook dispatcher to every node the fleet boots.
+
+The profile is fixed inside `boot-satd.sh` rather than passed per job, so that "the fleet is green with the features enabled" means one definite configuration. Two consequences worth knowing:
+
+- The two streaming listeners bind port `0` and nothing connects to them, and the webhook endpoint is the discard port. The surfaces are *running*, not *exercised*; what is under test is whether a node carrying that extra work still serves Esplora, Electrum, RPC and P2P identically.
+- The Bitcoin Core block-acceptance differential job does not use `boot-satd.sh` (it drives satd from a Rust integration test), so it runs at defaults regardless of the input.
+
+**Cutting a release requires one green `features: on` dispatch run** on the release commit, in addition to the PR-gating runs at defaults.
+
 ### Deferred
 
 Listed for traceability; each will enter PR-gating on the same terms when its prerequisites are met:

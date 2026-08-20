@@ -16,6 +16,14 @@
 # Cookie auth: written to "$datadir/regtest/.cookie" by satd; readable
 # back by `sat-cli --datadir=$datadir --regtest`.
 
+# SATD_CANARY_FEATURES=on additionally enables satd's 0.5.0 opt-in surfaces
+# (silent-payment index, events gRPC, streaming WebSocket, alert webhooks) on
+# every node this helper boots. The point is to prove the downstream clients
+# are unaffected by turning them on, so the profile is fixed here rather than
+# passed per job: "0.5.0 features enabled" has to mean one definite thing for
+# a green run to be evidence of anything. Default is off, which reproduces the
+# stock defaults byte for byte.
+
 set -euo pipefail
 
 SATD_PID=""
@@ -50,6 +58,39 @@ boot_satd() {
         return 1
     fi
 
+    # The 0.5.0 opt-in surfaces, when this run is exercising them. Only
+    # options no canary already passes appear here: clap rejects a repeated
+    # value flag, so a profile that overlapped a job's own arguments would
+    # fail to boot rather than run with both.
+    #
+    # The two streaming listeners bind port 0 on purpose. Nothing connects to
+    # them; what is under test is whether a node that is indexing tweaks,
+    # publishing to two carriers and dispatching webhooks still serves Esplora,
+    # Electrum, RPC and P2P exactly as a stock node does.
+    local feature_args=()
+    if [[ "${SATD_CANARY_FEATURES:-off}" == "on" ]]; then
+        local alertfile="$SATD_DATADIR/alerts.toml"
+        cat > "$alertfile" <<'ALERTS'
+version = 1
+
+[[webhook]]
+id = "canary"
+# Discard port: the dispatcher runs, signs and attempts delivery, and every
+# attempt fails fast. A node whose alerting is wedged still has to serve.
+url = "http://127.0.0.1:9/canary"
+secret = "canary-canary-canary-canary-canary-canary"
+categories = ["chain", "status"]
+ALERTS
+        chmod 600 "$alertfile"
+        feature_args=(
+            --silentpaymentindex=1
+            --events-grpc-bind=127.0.0.1:0
+            --streamws=127.0.0.1:0
+            --alertfile="$alertfile"
+        )
+        echo "boot_satd: 0.5.0 feature profile ON: ${feature_args[*]}"
+    fi
+
     "$satd_bin" \
         --regtest \
         --datadir="$SATD_DATADIR" \
@@ -57,6 +98,7 @@ boot_satd() {
         --port="$p2p_port" \
         --esplorabind="127.0.0.1:$ESPLORA_PORT" \
         --electrumbind="127.0.0.1:$ELECTRUM_PORT" \
+        ${feature_args[@]+"${feature_args[@]}"} \
         "$@" \
         > "$SATD_LOG" 2>&1 &
     SATD_PID=$!
