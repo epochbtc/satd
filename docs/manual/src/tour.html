@@ -1,0 +1,1896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A guided, code-level tour of the satd codebase: every major module with real source snippets, interfaces, tradeoffs, and Bitcoin Core comparisons.">
+<title>satd — A Guided Tour of the Codebase</title>
+</head>
+<body>
+<style>
+/* ============ tokens ============ */
+:root {
+  --bg: #faf8f4;
+  --bg-panel: #f2eee6;
+  --bg-code: #211f1c;
+  --bg-code-head: #2b2823;
+  --bg-inline: #ece7dd;
+  --ink: #26221d;
+  --ink-soft: #5c554b;
+  --ink-faint: #8a8174;
+  --line: #ddd5c8;
+  --copper: #b4551f;
+  --copper-ink: #b4551f;
+  --copper-soft: rgba(180,85,31,.12);
+  --slate: #41628a;
+  --slate-soft: rgba(65,98,138,.11);
+  --good: #3d7a4a;
+  --warn: #a06a12;
+  --code-ink: #d9d2c5;
+  --code-kw: #e0813f;
+  --code-ty: #8fb0d4;
+  --code-str: #a8bd72;
+  --code-com: #837b6e;
+  --code-mac: #c98ab8;
+  --code-num: #d4a95e;
+  --code-fn: #e3d5a1;
+  --code-path: #9a927f;
+  --shadow: 0 2px 14px rgba(40,30,15,.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #181613;
+    --bg-panel: #201d18;
+    --bg-code: #131110;
+    --bg-code-head: #1d1a16;
+    --bg-inline: #2a2721;
+    --ink: #e4ddd0;
+    --ink-soft: #ada589;
+    --ink-faint: #7d7566;
+    --line: #35312a;
+    --copper: #e0813f;
+    --copper-ink: #e89055;
+    --copper-soft: rgba(224,129,63,.15);
+    --slate: #8fb0d4;
+    --slate-soft: rgba(143,176,212,.13);
+    --good: #7fb98b;
+    --warn: #d4a95e;
+    --shadow: 0 2px 14px rgba(0,0,0,.45);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #181613;
+  --bg-panel: #201d18;
+  --bg-code: #131110;
+  --bg-code-head: #1d1a16;
+  --bg-inline: #2a2721;
+  --ink: #e4ddd0;
+  --ink-soft: #ada589;
+  --ink-faint: #7d7566;
+  --line: #35312a;
+  --copper: #e0813f;
+  --copper-ink: #e89055;
+  --copper-soft: rgba(224,129,63,.15);
+  --slate: #8fb0d4;
+  --slate-soft: rgba(143,176,212,.13);
+  --good: #7fb98b;
+  --warn: #d4a95e;
+  --shadow: 0 2px 14px rgba(0,0,0,.45);
+}
+:root[data-theme="light"] {
+  --bg: #faf8f4;
+  --bg-panel: #f2eee6;
+  --bg-code: #211f1c;
+  --bg-code-head: #2b2823;
+  --bg-inline: #ece7dd;
+  --ink: #26221d;
+  --ink-soft: #5c554b;
+  --ink-faint: #8a8174;
+  --line: #ddd5c8;
+  --copper: #b4551f;
+  --copper-ink: #b4551f;
+  --copper-soft: rgba(180,85,31,.12);
+  --slate: #41628a;
+  --slate-soft: rgba(65,98,138,.11);
+  --good: #3d7a4a;
+  --warn: #a06a12;
+  --shadow: 0 2px 14px rgba(40,30,15,.08);
+}
+
+/* ============ base ============ */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.55;
+}
+.mono, .eyebrow, h1, h2, h3, th, .kbd, .chip, .crate, .navbtn, .counter, code {
+  font-family: ui-monospace, 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* ============ deck chrome ============ */
+#progress {
+  position: fixed; top: 0; left: 0; height: 3px; width: 0;
+  background: var(--copper); z-index: 50; transition: width .25s ease;
+}
+#chrome {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 40;
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 18px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(6px);
+  border-top: 1px solid var(--line);
+  font-size: 13px; color: var(--ink-faint);
+}
+.counter { color: var(--ink-soft); min-width: 4.5em; }
+#slide-title-now { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace; }
+.navbtn {
+  background: none; border: 1px solid var(--line); color: var(--ink-soft);
+  border-radius: 4px; padding: 3px 10px; font-size: 13px; cursor: pointer;
+}
+.navbtn:hover { border-color: var(--copper); color: var(--copper-ink); }
+.navbtn:focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+.kbd-hint { display: none; }
+@media (min-width: 800px) { .kbd-hint { display: inline; } }
+.kbd {
+  border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px;
+  padding: 0 5px; font-size: 11px; color: var(--ink-soft);
+}
+
+/* ============ slides ============ */
+.slide {
+  display: none;
+  position: fixed; inset: 0; bottom: 44px;
+  overflow-y: auto;
+  padding: 48px 28px 40px;
+}
+.slide.active { display: block; }
+.slide-body { max-width: 1120px; margin: 0 auto; }
+.eyebrow {
+  font-size: 12.5px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--copper-ink); margin: 0 0 10px;
+}
+.eyebrow .sep { color: var(--ink-faint); }
+h1 { font-size: clamp(30px, 4.4vw, 46px); line-height: 1.12; margin: 0 0 14px; text-wrap: balance; font-weight: 700; }
+h2 { font-size: clamp(24px, 3.2vw, 33px); line-height: 1.15; margin: 0 0 16px; text-wrap: balance; font-weight: 700; }
+h3 { font-size: 17px; margin: 26px 0 8px; color: var(--ink); }
+p { max-width: 72ch; }
+.lede { font-size: 19px; color: var(--ink-soft); max-width: 68ch; }
+a { color: var(--copper-ink); }
+ul { padding-left: 1.2em; max-width: 78ch; }
+li { margin: 5px 0; }
+li::marker { color: var(--copper); }
+strong { font-weight: 700; }
+hr { border: none; border-top: 1px solid var(--line); margin: 26px 0; }
+
+/* two-column helper */
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; align-items: start; }
+@media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+/* ============ code panels ============ */
+.code {
+  background: var(--bg-code); border-radius: 8px; margin: 18px 0;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.code-head {
+  display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  background: var(--bg-code-head); padding: 7px 14px;
+  font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px; color: var(--code-path);
+}
+.code-head .path { color: #c8b98f; }
+.code pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto;
+  font-size: 13.5px; line-height: 1.5; color: var(--code-ink);
+  font-family: ui-monospace, 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+  tab-size: 4;
+}
+.tok-kw { color: var(--code-kw); }
+.tok-ty { color: var(--code-ty); }
+.tok-str { color: var(--code-str); }
+.tok-com { color: var(--code-com); font-style: italic; }
+.tok-mac { color: var(--code-mac); }
+.tok-num { color: var(--code-num); }
+.tok-fn { color: var(--code-fn); }
+.tok-lt { color: var(--code-num); }
+code:not(pre code) {
+  background: var(--bg-inline); border-radius: 4px; padding: 1px 5px;
+  font-size: .86em; color: var(--ink);
+}
+
+/* ============ tables ============ */
+.tablewrap { overflow-x: auto; margin: 18px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+th {
+  text-align: left; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-faint); font-weight: 600;
+  border-bottom: 2px solid var(--line); padding: 8px 12px 6px;
+}
+td { border-bottom: 1px solid var(--line); padding: 9px 12px; vertical-align: top; }
+td:first-child { white-space: nowrap; }
+.th-core, .core { color: var(--slate); }
+.th-satd, .satd { color: var(--copper-ink); }
+tr:hover td { background: var(--copper-soft); }
+
+/* ============ callouts & chips ============ */
+.tradeoff, .corebox {
+  border-left: 3px solid var(--copper); background: var(--copper-soft);
+  border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 18px 0;
+  max-width: 86ch; font-size: 15.5px;
+}
+.tradeoff .tag, .corebox .tag {
+  display: block; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; letter-spacing: .12em; text-transform: uppercase;
+  margin-bottom: 4px; color: var(--copper-ink);
+}
+.corebox { border-left-color: var(--slate); background: var(--slate-soft); }
+.corebox .tag { color: var(--slate); }
+.chip {
+  display: inline-block; font-size: 12px; border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 10px; margin: 2px 4px 2px 0; color: var(--ink-soft);
+  background: var(--bg-panel);
+}
+.chip.on { border-color: var(--copper); color: var(--copper-ink); }
+
+/* ============ crate map ============ */
+.crategrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; margin: 18px 0; }
+.crate {
+  background: var(--bg-panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-size: 13px;
+}
+.crate b { color: var(--copper-ink); font-weight: 600; display: block; font-size: 13.5px; }
+.crate .loc { float: right; color: var(--ink-faint); font-size: 11.5px; }
+.crate span { color: var(--ink-soft); font-family: Charter, Cambria, Georgia, serif; font-size: 13.5px; }
+
+/* ============ architecture diagram ============ */
+.arch { display: flex; flex-direction: column; gap: 8px; margin: 20px 0; }
+.arch-row { display: flex; gap: 8px; align-items: stretch; }
+.arch-box {
+  flex: 1; background: var(--bg-panel); border: 1px solid var(--line); border-radius: 7px;
+  padding: 8px 10px; text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px; color: var(--ink);
+}
+.arch-box small { display: block; color: var(--ink-faint); font-size: 10.5px; margin-top: 2px;
+  font-family: Charter, Cambria, Georgia, serif; font-size: 12px; }
+.arch-box.hot { border-color: var(--copper); background: var(--copper-soft); }
+.arch-label {
+  writing-mode: horizontal-tb; font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--ink-faint); align-self: center; min-width: 86px; text-align: right; padding-right: 6px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.arch-arrow { text-align: center; color: var(--ink-faint); font-size: 13px; line-height: 1; margin-left: 94px; }
+
+/* ============ TOC overlay ============ */
+#toc {
+  position: fixed; inset: 0; z-index: 60; display: none;
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  backdrop-filter: blur(8px); overflow-y: auto; padding: 40px 24px 60px;
+}
+#toc.open { display: block; }
+#toc .slide-body { max-width: 900px; }
+#toc h2 { margin-bottom: 20px; }
+#toc ol { columns: 2; gap: 40px; padding-left: 1.4em; font-size: 15px; }
+@media (max-width: 800px) { #toc ol { columns: 1; } }
+#toc li { margin: 4px 0; break-inside: avoid; }
+#toc a { text-decoration: none; color: var(--ink-soft); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13.5px; }
+#toc a:hover { color: var(--copper-ink); }
+#toc .part { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--copper-ink);
+  list-style: none; margin: 14px 0 4px -1.4em; font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+/* title slide */
+.title-slide { display: flex; flex-direction: column; justify-content: center; min-height: 82vh; }
+.title-slide h1 { font-size: clamp(44px, 7vw, 84px); letter-spacing: -.01em; }
+.title-slide .sub { font-size: clamp(18px, 2.2vw, 24px); color: var(--ink-soft); max-width: 60ch; }
+.title-rule { width: 72px; height: 4px; background: var(--copper); margin: 22px 0; border-radius: 2px; }
+.title-meta { color: var(--ink-faint); font-size: 14px; margin-top: 26px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+@media (prefers-reduced-motion: reduce) {
+  #progress { transition: none; }
+}
+</style>
+
+<div id="progress"></div>
+
+<div id="deck">
+
+<!-- ============================== PART 0: OPENING ============================== -->
+
+<section class="slide" data-part="" data-title="satd — a guided tour">
+  <div class="slide-body title-slide">
+    <p class="eyebrow">A guided tour of the codebase</p>
+    <h1>satd</h1>
+    <div class="title-rule"></div>
+    <p class="sub">A Bitcoin Core-compatible full node in Rust.<br>
+    One process. One RocksDB. One systemd unit.</p>
+    <p class="title-meta">~219,000 lines of Rust across 19 workspace crates · +24k lines of Go SDK<br>
+    Every code snippet is real, verbatim from master at <code>4874b537</code> (2026-08-19).<br>
+    Navigate with <span class="kbd">←</span> <span class="kbd">→</span> · press <span class="kbd">t</span> for the table of contents</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 1 · Orientation" data-title="The thesis">
+  <div class="slide-body">
+    <p class="eyebrow">Part 1 <span class="sep">·</span> Orientation</p>
+    <h2>The thesis: Core-compatible outside, different inside</h2>
+    <p class="lede">satd holds four surfaces byte-compatible with Bitcoin Core v30 — consensus rules, P2P wire format, JSON-RPC method shapes, and <code>bitcoin.conf</code> syntax — and treats any unlisted deviation as a bug. Inside that envelope, it deliberately ships more.</p>
+    <div class="cols">
+      <div>
+        <h3>Held compatible with Core</h3>
+        <ul>
+          <li><strong>Consensus</strong> — full parity through Taproot; mainnet shadow-validated against <code>libbitcoinconsensus</code> from genesis to ~945k blocks with zero divergence.</li>
+          <li><strong>P2P wire</strong> — BIP 152 compact blocks, BIP 155 addrv2, BIP 157/158 filters, BIP 339 wtxid relay, BIP 324 v2 transport.</li>
+          <li><strong>JSON-RPC</strong> — 80 Core-named methods; field names and types preserved by default; extensions opt-in per request.</li>
+          <li><strong>Config &amp; CLI</strong> — a Core <code>bitcoin.conf</code> starts satd unedited; unknown keys rejected as typos, recognized-but-unsupported keys warn.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Deliberately different</h3>
+        <ul>
+          <li><strong>Native serving surfaces</strong> — Esplora REST, Electrum, BIP 157/158 serving, Prometheus metrics, all in one process over one chainstate.</li>
+          <li><strong>Structured streaming API</strong> — replaces Core's raw ZMQ topics with a cursor-replayable event envelope + Rust/Go SDKs.</li>
+          <li><strong>Operator sovereignty</strong> — a total, cost-bounded relay-policy language; hot config reload on <code>SIGHUP</code>; native TLS everywhere.</li>
+          <li><strong>No wallet</strong> — keyless by charter; PSBT construction/analysis served, signing pushed client-side.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="tradeoff"><span class="tag">The organizing tradeoff</span>
+    Core optimizes for being the reference implementation: minimal surface, maximal caution. satd optimizes for the <em>operator running wallet infrastructure</em>: it spends disk (indexes), memory (RocksDB), and code (native surfaces) to collapse the <code>bitcoind + electrs + esplora + nginx + exporter</code> stack into one tip-consistent process.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 1 · Orientation" data-title="Workspace map">
+  <div class="slide-body">
+    <p class="eyebrow">Part 1 <span class="sep">·</span> Orientation</p>
+    <h2>The workspace: 19 crates, one library at the center</h2>
+    <p>Everything consensus- and node-shaped lives in the <code>node</code> library crate; <code>satd</code> and <code>sat-cli</code> are thin binaries over it. Protocol surfaces, indexes, and the policy language are separate crates so their dependencies stay out of the consensus build.</p>
+    <div class="crategrid">
+      <div class="crate"><b>node <span class="loc">105k loc</span></b><span>The node library: chain, storage, validation, net, mempool, mining, RPC, events, indexes.</span></div>
+      <div class="crate"><b>satd <span class="loc">45k loc</span></b><span>Daemon binary: config parsing, startup, SIGHUP reload, alert/notify hooks, integration tests.</span></div>
+      <div class="crate"><b>consensus <span class="loc">9.6k loc</span></b><span>Native Rust script-verification engine (the second engine beside bitcoinconsensus FFI).</span></div>
+      <div class="crate"><b>events <span class="loc">13k loc</span></b><span>Streaming Consumption API: gRPC/WebSocket/ZMQ carriers for the event envelope.</span></div>
+      <div class="crate"><b>satd-events-client <span class="loc">9.3k loc</span></b><span>Async Rust SDK: resilient reconnect, cursor replay, watch re-registration.</span></div>
+      <div class="crate"><b>clients/go <span class="loc">24k loc</span></b><span>Go SDK (satdevents) with a differential parity harness against the Rust SDK.</span></div>
+      <div class="crate"><b>satd-policy <span class="loc">6.6k loc</span></b><span>Relay-policy language: lexer, parser, typechecker, static cost model, fuel-metered evaluator.</span></div>
+      <div class="crate"><b>electrum-proto <span class="loc">5.4k loc</span></b><span>Electrum v1.4.5 protocol server, vendored from electrs, adapted to the AddressIndex trait.</span></div>
+      <div class="crate"><b>esplora-handlers <span class="loc">4.0k loc</span></b><span>Esplora REST wire-format handlers + SSE, parity with blockstream.info/mempool.space.</span></div>
+      <div class="crate"><b>sat-tui <span class="loc">6.3k loc</span></b><span>Ratatui ops TUI: IBD bitmap, per-peer stats, RPC explorer.</span></div>
+      <div class="crate"><b>mcp <span class="loc">2.8k loc</span></b><span>Model Context Protocol server exposing ops RPCs to AI agents over streamable HTTP(S).</span></div>
+      <div class="crate"><b>sat-cli <span class="loc">2.4k loc</span></b><span>Structured CLI (chain info, mempool top, psbt analyze…) + legacy raw-method passthrough.</span></div>
+      <div class="crate"><b>satd-auth <span class="loc">2.4k loc</span></b><span>Capability-scoped bearer tokens, TOML authfile, per-surface opt-in.</span></div>
+      <div class="crate"><b>node-index <span class="loc">1.5k loc</span></b><span>Address-history index: per-scripthash funding/spending over shared RocksDB.</span></div>
+      <div class="crate"><b>node-sp-index <span class="loc">1.5k loc</span></b><span>BIP 352 silent-payment tweak index; self-authenticating per-block rows.</span></div>
+      <div class="crate"><b>satd-alert <span class="loc">1.5k loc</span></b><span>Node-health detectors + signed outbound webhooks (alertfile TOML).</span></div>
+      <div class="crate"><b>tls-config <span class="loc">0.9k loc</span></b><span>Shared native TLS/mTLS config for RPC, Electrum, Esplora, events, MCP listeners.</span></div>
+      <div class="crate"><b>node-filter-index <span class="loc">0.5k loc</span></b><span>BIP 158 compact-filter index, built atomically with the chainstate.</span></div>
+      <div class="crate"><b>block-analyzer <span class="loc">0.5k loc</span></b><span>Offline block-file analysis tool.</span></div>
+    </div>
+    <p><code>fuzz/</code> is a separate cargo-fuzz workspace (nightly + sanitizers), kept out of the normal build. Toolchain pinned at Rust 1.93.0, edition 2024.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 1 · Orientation" data-title="Architecture at a glance">
+  <div class="slide-body">
+    <p class="eyebrow">Part 1 <span class="sep">·</span> Orientation</p>
+    <h2>Architecture at a glance</h2>
+    <p>The spine is the same as any full node — P2P feeds validation, validation feeds storage — but every read surface hangs off the <em>same</em> RocksDB instance and updates ride the <em>same</em> write batch as block connection, so no surface can observe an index out of sync with the tip.</p>
+    <div class="arch">
+      <div class="arch-row"><span class="arch-label">network</span>
+        <div class="arch-box">PeerManager<small>one tokio task per peer · BIP 324 v2 transport</small></div>
+        <div class="arch-box">AddrMan<small>tried/new buckets · SADR peers.dat</small></div>
+        <div class="arch-box">IBD scheduler<small>parallel download windows + prefetch</small></div>
+      </div>
+      <div class="arch-arrow">↓ NetworkMessage</div>
+      <div class="arch-row"><span class="arch-label">validation</span>
+        <div class="arch-box">Block/tx checks<small>PoW, witness commitment, MTP, BIP 34/68</small></div>
+        <div class="arch-box hot">ScriptVerifier<small>Rust engine + bitcoinconsensus FFI shadow</small></div>
+        <div class="arch-box">Mempool<small>RBF, CPFP ancestors, policy engine</small></div>
+      </div>
+      <div class="arch-arrow">↓ connect_block / disconnect_block</div>
+      <div class="arch-row"><span class="arch-label">state</span>
+        <div class="arch-box hot">ChainState<small>RwLock&lt;ChainTip&gt; · coordinator</small></div>
+        <div class="arch-box">Coin cache<small>FRESH/dirty semantics, batched flush</small></div>
+        <div class="arch-box">Indexes<small>address · tx · BIP 158 · SP tweaks · outpoint-spend</small></div>
+      </div>
+      <div class="arch-arrow">↓ one WriteBatch</div>
+      <div class="arch-row"><span class="arch-label">storage</span>
+        <div class="arch-box hot">RocksDB<small>12+ column families · zstd/lz4 · jemalloc</small></div>
+        <div class="arch-box">Flat block files<small>Core layout · optional XOR obfuscation</small></div>
+      </div>
+      <div class="arch-arrow">↑ reads</div>
+      <div class="arch-row"><span class="arch-label">surfaces</span>
+        <div class="arch-box">JSON-RPC<small>98 methods · jsonrpsee + tower</small></div>
+        <div class="arch-box">Esplora REST<small>+ SSE</small></div>
+        <div class="arch-box">Electrum<small>v1.4.5</small></div>
+        <div class="arch-box">Events<small>gRPC · WS · ZMQ</small></div>
+        <div class="arch-box">Ops<small>/metrics · MCP · TUI</small></div>
+      </div>
+    </div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's spine is <code>CConnman</code> → <code>PeerManagerImpl</code> → <code>ChainstateManager</code>/<code>CChainState</code> → LevelDB + flat files, with indexes (<code>TxIndex</code>, <code>BlockFilterIndex</code>, <code>CoinStatsIndex</code>) as <em>separate</em> LevelDB databases synced by background threads — an index can lag the tip. Esplora/Electrum/metrics are external processes with their own copies of the chain.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 2 · Storage" data-title="The Store trait">
+  <div class="slide-body">
+    <p class="eyebrow">Part 2 <span class="sep">·</span> Storage</p>
+    <h2>The Store trait: one abstraction, four backends</h2>
+    <p>All persistence flows through one trait. Four implementations: <code>RocksDbStore</code> (the durable backend), <code>CoinCache</code> (a write-back cache that is itself a <code>Store</code>), <code>SplitStore</code> (AssumeUTXO routing), and <code>InMemoryStore</code> (tests, and the reference implementation for the batch contract). Most of the ~60 methods have defaults so a minimal backend implements only the core dozen.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/mod.rs:457</span><span>the trait head</span></div>
+<pre><code class="lang-rust">/// Abstract storage backend for block index, UTXO set, and metadata.
+pub trait Store: Send + Sync {
+    fn get_block_index(&amp;self, hash: &amp;BlockHash) -&gt; Option&lt;BlockIndexEntry&gt;;
+    fn get_coin(&amp;self, outpoint: &amp;OutPoint) -&gt; Option&lt;Coin&gt;;
+    fn has_coin(&amp;self, outpoint: &amp;OutPoint) -&gt; bool;
+    fn get_tip(&amp;self) -&gt; Option&lt;BlockHash&gt;;
+    fn get_block_hash_by_height(&amp;self, height: u32) -&gt; Option&lt;BlockHash&gt;;
+    fn write_batch(&amp;self, batch: StoreBatch) -&gt; Result&lt;(), StoreError&gt;;
+    /// Write with the given durability mode. Default delegates to
+    /// `write_batch` (ignoring the mode) — concrete backends that can honor
+    /// `BulkLoad` should override.
+    fn write_batch_mode(&amp;self, batch: StoreBatch, _mode: WriteMode) -&gt; Result&lt;(), StoreError&gt; {
+        self.write_batch(batch)
+    }</code></pre></div>
+    <p>The unit of writing is <code>StoreBatch</code> — one atomic batch per block connection or disconnection, spanning every column family. Its one subtle invariant is spelled out at the definition:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/mod.rs:64</span><span>the remove-wins contract</span></div>
+<pre><code class="lang-rust">/// **Remove-wins contract:** if the same key appears in both a family's
+/// puts and removes within one batch, the key must end ABSENT. Both
+/// emitters rely on this: `connect_block` carries a put+remove pair for
+/// an output created and spent within the same block, and
+/// `disconnect_block` carries the mirror pair (undo-restore put +
+/// created-output remove) — in both shapes the correct final state is
+/// absent. Implementations must apply puts before removes (or net the
+/// pairs); regression tests pin this for `RocksDbStore` and
+/// `InMemoryStore`.
+#[derive(Default)]
+pub struct StoreBatch {
+    pub block_index_puts: Vec&lt;(BlockHash, BlockIndexEntry)&gt;,
+    pub coin_puts: Vec&lt;(OutPoint, Coin)&gt;,
+    /// (outpoint, spent_amount, spent_height) — carried for O(1) counter/histogram updates.
+    pub coin_removes: Vec&lt;(OutPoint, u64, u32)&gt;,
+    pub tip: Option&lt;BlockHash&gt;,
+    pub height_hash_puts: Vec&lt;(u32, BlockHash)&gt;,</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core layers <code>CCoinsView</code> → <code>CCoinsViewBacked</code> → <code>CCoinsViewCache</code> → <code>CCoinsViewDB</code> for coins, with a separate <code>CDBWrapper</code>/<code>CBlockTreeDB</code> for the block index. satd flattens this into one trait whose batch spans <em>all</em> families — the property the native indexes depend on. The tradeoff: Core's narrow views make it harder to accidentally couple subsystems; satd's single batch makes cross-family atomicity structural rather than conventional.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 2 · Storage" data-title="RocksDB engine">
+  <div class="slide-body">
+    <p class="eyebrow">Part 2 <span class="sep">·</span> Storage</p>
+    <h2>RocksDB: one instance, ~14 column families</h2>
+    <p>Chainstate, block index, undo data, and every index share one RocksDB. The CF list is the schema — and the comment explains why it must stay exhaustive:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/rocksdb_store.rs:64</span><span>the column-family schema</span></div>
+<pre><code class="lang-rust">/// Every column family this store can create, plus RocksDB's default CF.
+/// `flush_durable` flushes exactly this list (filtered to the CFs that
+/// exist on the open DB), so a CF missing here would silently lose its
+/// WAL-less (BulkLoad) writes on process exit. `open()` asserts every
+/// descriptor it creates is listed — add new CFs HERE first.
+const ALL_CFS: &amp;[&amp;str] = &amp;[
+    "default",
+    CF_COINS, CF_BLOCK_INDEX, CF_HEIGHT_INDEX, CF_UNDO,
+    CF_TX_INDEX, CF_METADATA, CF_CHAIN_TX,
+    CF_ADDR_FUNDING_V2, CF_ADDR_SPENDING_V2, CF_OUTPOINT_SPEND,
+    #[cfg(feature = "block-filter-index")] CF_FILTER,
+    #[cfg(feature = "block-filter-index")] CF_FILTER_HEADER,
+    CF_ADDR_BACKFILL_TEMP, CF_SP_TWEAKS,
+];</code></pre></div>
+    <div class="cols"><div>
+    <h3>Tiered compression</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/rocksdb_store.rs:365</span></div>
+<pre><code class="lang-rust">let compression_per_level = [
+    DBCompressionType::None, // L0
+    DBCompressionType::None, // L1
+    DBCompressionType::Lz4,  // L2
+    DBCompressionType::Lz4,  // L3
+    DBCompressionType::Lz4,  // L4
+    DBCompressionType::Lz4,  // L5
+    DBCompressionType::Zstd, // L6
+];</code></pre></div>
+    <p>Hot upper levels stay cheap to write; the bottom level, where data lives forever, pays for zstd once.</p>
+    </div><div>
+    <h3>WAL off during IBD</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/rocksdb_store.rs:1729</span></div>
+<pre><code class="lang-rust">// Atomic commit across all column families.
+// In BulkLoad mode we skip the WAL — the writer (connect loop during
+// IBD) is responsible for calling `flush_durable` periodically so the
+// amount of work lost on crash is bounded. `atomic_flush(true)` +
+// `DataStored`-vs-`Valid` block-index markers ensure recovery is
+// consistent: on restart any `DataStored` block not reflected in the
+// tip pointer simply gets re-connected.
+let mut wopts = WriteOptions::default();
+if mode == WriteMode::BulkLoad {
+    wopts.disable_wal(true);
+}</code></pre></div>
+    <p>~20–50% less write I/O during sync, bounded crash-replay via periodic durable flushes.</p>
+    </div></div>
+    <div class="tradeoff"><span class="tag">Tuning sized from real incidents</span>
+    <code>profile.rs</code> ships <code>--storage-profile=ssd|hdd</code> presets sized from a production failure: a fully-indexed mainnet sync once accumulated 13,037 SST files and ~370&nbsp;GB of pending compaction because <code>max_total_wal_size</code> (256&nbsp;MB) was smaller than total memtable capacity (~680&nbsp;MB). Likewise <code>max_open_files</code> is capped because RocksDB's default of −1 once wedged a 78&nbsp;GB process holding every SST open. The comments keep the incidents attached to the knobs.</div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core uses LevelDB — one DB for chainstate, plus a <em>separate</em> LevelDB per optional index (<code>-txindex</code>, <code>-blockfilterindex</code>, <code>-coinstatsindex</code>), each synced by a background thread that can lag the tip. No per-level compression control, no WAL-mode switching; Core instead batches state into <code>CCoinsViewCache</code> and writes rarely.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 2 · Storage" data-title="The coin cache">
+  <div class="slide-body">
+    <p class="eyebrow">Part 2 <span class="sep">·</span> Storage</p>
+    <h2>CoinCache: the write-back layer where correctness lives</h2>
+    <p>The UTXO working set sits in a two-tier cache — an unbounded <em>dirty</em> map of unflushed mutations plus a bounded <em>clean</em> LRU — wrapping the durable store and implementing the same <code>Store</code> trait. Budget defaults to Core's <code>-dbcache=450</code>.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/coin_cache.rs:16</span><span>FRESH semantics</span></div>
+<pre><code class="lang-rust">/// Dirty coin entry — must be flushed to backing store before eviction.
+enum DirtyEntry {
+    /// Coin exists in backing store and was modified/added. `fresh` = true means
+    /// the coin was created in this flush window (never written to backing store).
+    Present { coin: Coin, fresh: bool },
+    /// Coin was spent. Carries (amount, height) for counter/histogram updates.
+    /// If `fresh` = true, the coin was created and spent in the same flush window
+    /// and can be discarded without touching the backing store.
+    Spent { amount: u64, height: u32, fresh: bool },
+}</code></pre></div>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/coin_cache.rs:413</span><span>flush with FRESH elision</span></div>
+<pre><code class="lang-rust">/// Flush dirty coins to the backing store. Caller must hold the
+/// flush-exclusion lock (via `flush` or `FlushExclusion`).
+///
+/// Optimizations:
+/// - **FRESH elision**: coins created and spent in the same flush window never
+///   touch the backing store (Core PR #17487 insight).
+/// - **Move semantics**: flushed coins are moved (not cloned) to the clean LRU,
+///   avoiding the allocation burst that caused glibc malloc fragmentation.
+fn flush_inner(&amp;self) -&gt; Result&lt;(), StoreError&gt; {</code></pre></div>
+    <p>The cache is also the <strong>reorg rollback primitive</strong>: the reorg driver flushes the pre-reorg chain to disk first, applies the whole reorg (disconnect + reconnect) to the cache <em>only</em>, and on any failure discards the partial reorg wholesale:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/coin_cache.rs:694</span><span>discard_uncommitted</span></div>
+<pre><code class="lang-rust">/// Discard every uncommitted (un-flushed) cache mutation, returning the
+/// cache to exactly the last-flushed on-disk state held by the inner
+/// store. Does NOT touch the inner store.
+///
+/// This is the rollback primitive for the atomic-reorg path (issue
+/// #262). The reorg driver flushes the pre-reorg active chain to the
+/// inner store first, then applies the whole reorg (disconnect +
+/// reconnect + triggering connect) to this cache *only*. On any failure
+/// it calls this to drop the partial reorg wholesale — no block-body
+/// replay, and it cannot itself fail.</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>CCoinsViewCache</code> pioneered FRESH/DIRTY flags (satd's comment credits Core PR #17487 directly). The structural difference: Core's cache is a strict layered view flushed by <code>FlushStateToDisk</code>, while satd's is a concurrent shared structure — so it carries extra machinery Core doesn't need: a flush-exclusion lock, a foreign-writer <code>note_mutation</code> check that makes rollback refuse rather than corrupt (issue #567), and a generation counter preventing racy read-through inserts from resurrecting spent coins (issue #583).</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 2 · Storage" data-title="Block files, undo, snapshots">
+  <div class="slide-body">
+    <p class="eyebrow">Part 2 <span class="sep">·</span> Storage</p>
+    <h2>Block files stay Core-compatible; undo does not</h2>
+    <p>Block bodies live in Core's exact flat-file layout — <code>blk*.dat</code>, 128&nbsp;MB per file, <code>magic[4] || size_le[4]</code> record headers — including v28's XOR obfuscation. That's what lets a Core <code>blocks/</code> directory be adopted wholesale on migration.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/flatfile.rs:39</span><span>the XOR kernel</span></div>
+<pre><code class="lang-rust">/// XOR `data` in place against the repeating 8-byte `key`, where `data[0]`
+/// sits at absolute file offset `offset`. No-op for the zero key, so the
+/// plaintext path costs one comparison. Processes 8 bytes per step via a
+/// phase-rotated `u64` so full-file de-obfuscation during `-reindex` runs at
+/// memory bandwidth rather than byte-at-a-time.
+pub(crate) fn xor_in_place(data: &amp;mut [u8], key: &amp;[u8; 8], offset: u64) {
+    if *key == ZERO_XOR_KEY {
+        return;
+    }</code></pre></div>
+    <p>Undo data breaks with Core deliberately: no <code>rev*.dat</code> files. Spent-coin records live in RocksDB's <code>undo</code> CF, written in the same batch as the connect — and they don't store outpoints at all:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/undo.rs:1</span></div>
+<pre><code class="lang-rust">//! On-disk format: an 8-byte magic, a 1-byte version, a varint count,
+//! then back-to-back `Coin::serialize_compact` records. The outpoint
+//! for each spend is recoverable from the block's tx inputs (the
+//! connect-order invariant guarantees `undo.spent_coins[i]` belongs to
+//! the i-th non-coinbase input), so we don't store it. Per-spend cost
+//! is ~28 bytes for typical P2WPKH.</code></pre></div>
+    <div class="cols"><div>
+    <h3>Two coin codecs, on purpose</h3>
+    <p><code>coinview.rs</code> defines satd's internal compact codec for the live <code>coins</code> CF (~28 bytes for P2WPKH, 35% smaller than the previous bincode rows). <code>compressed_coin.rs</code> separately implements Core's exact <code>compressor.cpp</code> wire format — varint-with-increment, exponent-mantissa amounts, six special script types — used <em>only</em> for AssumeUTXO snapshot files, so satd reads Core-produced snapshots and writes snapshots Core can read.</p>
+    </div><div>
+    <h3>SplitStore: AssumeUTXO's router</h3>
+    <p>The AssumeUTXO background chainstate needs a private UTXO set but must share the block store, or historical block-index positions would be lost at handoff. <code>SplitStore</code> is a <code>Store</code> that routes: block index, height→hash, txindex to the <em>shared</em> half; coins, undo, tip to the <em>private</em> half.</p>
+    </div></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core stores undo in <code>rev*.dat</code> flat files parallel to <code>blk*.dat</code>, with outpoints included. satd's in-DB, outpoint-free form trades Core-file compatibility (those files are ignored on migration anyway) for atomicity with the connect batch and ~28 bytes per spend.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="ChainState">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>ChainState: one owner of chain mutation</h2>
+    <p><code>state.rs</code> is 15,431 lines and the single owner of chain mutation. It is deliberately lock-poor: one <code>RwLock&lt;ChainTip&gt;</code>, one mutex that serializes every mutator, and lock-free atomics that exist so the stall watchdog can observe the connector <em>without</em> taking the lock the connector might be wedged holding.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/state.rs:254</span></div>
+<pre><code class="lang-rust">/// Central chain state manager.
+pub struct ChainState {
+    store: std::sync::Arc&lt;CoinCache&gt;,
+    flat_files: Arc&lt;Mutex&lt;FlatFileManager&gt;&gt;,
+    /// Path to the blocks directory, for mutex-free reads.
+    blocks_dir: PathBuf,
+    tip: RwLock&lt;ChainTip&gt;,
+    pub network: Network,
+    script_verifier: Arc&lt;dyn ScriptVerifier&gt;,
+    assumevalid: AssumeValid,
+    checkpoints: Vec&lt;Checkpoint&gt;,
+    /// Lock-free monotonic counter bumped on every successful connect.
+    /// Read by the stall watchdog to detect connector wedges without
+    /// taking the `tip` RwLock, which is precisely the lock the wedge
+    /// might be holding.
+    connect_heartbeat: AtomicU64,</code></pre></div>
+    <p>The most important field carries its own postmortem. "Single writer by construction" was the original design; issue #567 — a mainnet UTXO corruption caused by an <code>invalidateblock</code> reorg racing the P2P connector — is why the lock now covers everything:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/state.rs:375</span><span>the accept_lock invariant</span></div>
+<pre><code class="lang-rust">/// **Every mutator must hold it, including the connector.** The
+/// original lock covered `accept_block` and the two height-row commits
+/// but not `connect_stored_block` / `connect_preprocessed_block`, on
+/// the reasoning that the connector *is* the single P2P writer. That is
+/// true of the P2P side and false of the whole system: an
+/// `invalidateblock` reorg is a second writer, and issue #567 is what
+/// the two of them did to a mainnet UTXO set. "Single writer by
+/// construction" is not an invariant unless something enforces it.
+accept_lock: std::sync::Arc&lt;Mutex&lt;()&gt;&gt;,</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core serializes everything under one recursive giant lock, <code>cs_main</code>, shared by validation, mempool, and net_processing. satd splits that role: <code>accept_lock</code> serializes chain mutation only, the mempool has its own lock, and readers go through the tip <code>RwLock</code> or lock-free snapshots. Finer-grained and non-recursive — at the price of needing explicit lock-order rules (documented in-file: <code>accept_lock</code> first, then the coin cache's flush exclusion, never the reverse).</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="The connect pipeline">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>connect_block: a phase-instrumented pipeline</h2>
+    <p><code>connect_block</code> is a pure function from <code>ConnectParams</code> to a <code>StoreBatch</code> — all contextual consensus rules (BIP 30/34/68/113, sigops, subsidy, script verification) run here, and nothing touches disk until the batch commits. Every stage is announced to a lock-free phase tracker, born from two production stalls where a 95-thread dump still couldn't pinpoint the wedge:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/connect_phase.rs:48</span><span>the pipeline, as an enum</span></div>
+<pre><code class="lang-rust">#[repr(u8)]
+pub enum ConnectPhase {
+    Idle = 0,
+    EnterConnect = 1,
+    PreResolveCoins = 2,
+    PerTxValidate = 3,
+    VerifyDispatch = 4,
+    VerifyJoin = 5,
+    ShadowDispatch = 6,
+    PostVerifyChecks = 7,
+    WriteBatch = 8,
+    TipWrite = 9,
+    /// block_processor: no header yet for next_height; waiting on
+    /// connect_signal condvar (1s timeout).
+    WaitingForHeader = 10,
+    WaitingForBlockData = 11,
+    CondvarWait = 12,
+    FlushingCoinCache = 13,
+    FlushDurable = 14,
+    WaitingForAcceptLock = 15,
+}</code></pre></div>
+    <p>Script verification fans out across scoped threads — and even the phase-marker placement encodes an incident:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/connect.rs:780</span><span>parallel verification</span></div>
+<pre><code class="lang-rust">let queue_ref = &amp;verify_queue;
+let chunk_size = verify_queue.len().div_ceil(num_threads);
+mark(crate::chain::connect_phase::ConnectPhase::VerifyDispatch);
+let errors: Vec&lt;ConnectError&gt; = std::thread::scope(|s| {
+    // ... one worker per chunk ...
+    // Joining the scope-spawned workers is the most common
+    // wedge site we've seen in practice (issue #178). Mark
+    // the phase transition before .join() so a stalled
+    // dump definitively pins the wedge to this step.
+    mark(crate::chain::connect_phase::ConnectPhase::VerifyJoin);</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>ConnectBlock</code> in <code>validation.cpp</code> does the same contextual work, parallelizing script checks <em>within</em> a block via <code>CCheckQueue</code>. It has no phase instrumentation — a wedged <code>ConnectTip</code> is diagnosed from thread dumps. satd additionally parallelizes <em>across</em> blocks (next slide's prefetch pipeline), which Core does not.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="Reorg atomicity">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>Reorgs: checkpoint, apply in cache, discard on failure</h2>
+    <p>The atomicity discipline (issue #262): flush a durable checkpoint of the pre-reorg chain, hold the cache's flush-exclusion for the whole reorg so nothing partial can reach disk, and apply every disconnect/reconnect to the in-memory cache only. Failure recovery is then <em>infallible</em> — drop the cache delta:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/state.rs:6980</span><span>the checkpoint</span></div>
+<pre><code class="lang-rust">// Atomic-reorg durable checkpoint (#262): flush the pre-reorg chain so
+// it is the exact rollback target, then hold the flush-exclusion for
+// the whole reorg so no external flush can persist a partial state.
+let excl = self.store.lock_flush_exclusion();
+excl.flush()?;
+let mut reorg_excl = Some(excl);
+
+// Disconnect from current tip down to the fork point.
+let disconnect_info = match self.perform_reorg(&amp;fork_entry, current_tip) {
+    Ok(info) =&gt; info,
+    Err(e) =&gt; {
+        self.abort_reorg(reorg_excl.as_ref(), current_tip, tip_entry.height, &amp;e, None);
+        return Err(e);
+    }
+};</code></pre></div>
+    <p>This replaced an older rollback that replayed block bodies and could itself fail — the root cause of a silent mainnet UTXO loss. And when rollback <em>can't</em> be proven safe, the node chooses the nuclear option:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/state.rs:6131</span><span>fail-stop over guessing</span></div>
+<pre><code class="lang-rust">/// A reorg needs to roll back and the coin cache cannot be attributed to
+/// it. Stop the process without writing anything.
+///
+/// There is no safe continuation. Discarding would destroy whatever the
+/// other writer committed — that is issue #567, and the whole reason this
+/// check exists. Not discarding leaves the cache holding a half-applied
+/// reorg mixed with someone else's blocks, under a tip that belongs to
+/// neither; continuing from there writes that to disk at the next flush.
+///
+/// So: abort. ... `abort()` rather than `exit()` is deliberate: no
+/// destructor runs, no shutdown flush gets the chance to persist the
+/// poisoned cache. The node restarts onto a consistent state and redoes
+/// the work.
+fn fail_stop_on_unsafe_discard(&amp;self, reason: &amp;str, ...) -&gt; ! {</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core reorgs block-by-block through <code>DisconnectTip</code>/<code>ConnectTip</code>, each step flushable, relying on <code>cs_main</code> exclusivity and per-block undo correctness; a mid-reorg crash recovers by replaying from disk state. satd's cache-only staging gives all-or-nothing semantics for the entire reorg — a stronger invariant, purchased with the flush-exclusion machinery and foreign-writer detection the previous slides showed.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="Dual script engines">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>Script verification: two engines, one authority</h2>
+    <p>One trait, four implementations: <code>ConsensusVerifier</code> (Bitcoin Core's <code>libbitcoinconsensus</code> via FFI), <code>RustVerifier</code> (the in-tree <code>consensus</code> crate — a drop-in API-compatible replacement), <code>NoopVerifier</code> (tests), and <code>ShadowVerifier</code> — a decorator that runs the primary in the hot path and cross-checks every script on background threads:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/validation/script.rs:287</span><span>the shadow queue</span></div>
+<pre><code class="lang-rust">/// Shadow verifier: runs the primary engine synchronously in the hot path,
+/// dispatches shadow verification to a background thread pool asynchronously.
+///
+/// The connect thread never blocks on shadow results. Mismatches are logged
+/// by the background workers. This makes shadow mode essentially free in
+/// wall-clock terms — shadow uses spare CPU but doesn't slow block connection.
+pub struct ShadowVerifier {
+    primary: Box&lt;dyn ScriptVerifier&gt;,
+    shadow_tx: crossbeam_channel::Sender&lt;ShadowWork&gt;,
+    queue_size: usize,
+    _workers: Vec&lt;std::thread::JoinHandle&lt;()&gt;&gt;,
+    /// Counts shadow txs dropped because the queue was full. Rate-limited
+    /// reporter (see `report_drop`) consumes this and logs an aggregated
+    /// WARN at most once per 5s — a per-drop WARN at IBD verify rates can
+    /// burn tens of percent of wall-clock on tracing+stdout alone.
+    dropped: std::sync::atomic::AtomicU64,</code></pre></div>
+    <p>Which engine is <em>authoritative</em> is an explicit, delegated property — because the prefetch pipeline's "script OK" lets the connect thread skip primary verification, and that verdict must come from the engine the user chose:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/validation/script.rs:9</span></div>
+<pre><code class="lang-rust">/// Identifies which concrete verifier backs the authoritative (primary)
+/// decision path. Used so components like the prefetch pipeline can match
+/// whichever engine the user's config selected as primary — otherwise a
+/// prefetch worker's "script OK" say-so (which lets the connect thread
+/// skip primary verify) would override the user's chosen authority.
+pub enum PrimaryEngine { Cpp, Rust }</code></pre></div>
+    <p>The native engine is the 9.6k-line <code>consensus</code> crate: a pure-Rust script interpreter whose error variants mirror <code>bitcoinconsensus::Error</code> exactly, with one tx-wide <code>SighashCache</code> shared across inputs (BIP 143's hashPrevouts/hashSequence/hashOutputs are per-transaction, so per-input recomputation is pure waste). It has been shadow-validated against the C++ engine over every mainnet script from genesis to ~945k blocks with zero divergence.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core has one interpreter — it <em>is</em> the definition of script validity. Every other implementation faces the consensus-bug abyss; satd's answer is to ship Core's own engine as a selectable primary and hold the Rust engine to it with runtime shadow validation, rather than asking users to trust a reimplementation outright.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="Block validation & PoW">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>Block checks: Core's split, deliberately fused</h2>
+    <p>Core validates a block in stages (<code>CheckBlock</code>, then <code>ContextualCheckBlock</code>) because it reaches them at different points. satd fuses the witness half into one function so no caller can accidentally get only one half — and makes the context explicit in the signature:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/validation/block.rs:13</span></div>
+<pre><code class="lang-rust">/// This is Bitcoin Core's `CheckBlock` (structure, merkle root, CVE-2012-2459
+/// mutation, weight) plus the witness half of `ContextualCheckBlock`
+/// ([`check_witness_rules`]). Core splits the two because it reaches them at
+/// different points; satd keeps them together so that *every* caller which
+/// validates a block gets both halves.
+///
+/// The witness rules are gated on segwit activation exactly as Core gates them
+/// on `DEPLOYMENT_SEGWIT`, which is why this is not context-free: it needs
+/// `network` and `height` to decide. Threading them through the signature
+/// rather than reading them from an optional argument is deliberate — the
+/// compiler makes a new caller supply the context instead of silently
+/// inheriting the laxer, context-free behaviour.
+pub fn check_block(block: &amp;Block, network: Network, height: u32)
+    -&gt; Result&lt;(), ValidationError&gt; {</code></pre></div>
+    <p>Where the check order differs from Core, the comment states the exact condition under which it would have to flip back — e.g. weight is checked <em>before</em> witness rules because satd never persists a verdict from this function, so a coinbase-witness-padded mutant can't poison the index against the honest block.</p>
+    <p>PoW validation handles four retarget regimes (mainnet, testnet3's 20-minute rule, BIP 94 testnet4 with the timewarp guard, signet) and is uniformly <strong>fail-closed</strong>:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/validation/pow.rs:102</span></div>
+<pre><code class="lang-rust">/// Calculate expected difficulty bits for mainnet.
+///
+/// Fails closed (`BadDifficulty`) if the retarget-period seed block cannot be
+/// found: a missing seed means we cannot compute the expected difficulty, so we
+/// must reject rather than substitute `prev`'s bits (which would let an
+/// under-difficulty block through at a retarget boundary on a damaged index).
+fn calculate_next_bits&lt;F&gt;(</code></pre></div>
+    <p>Consensus error strings are wire-compatible with Core verbatim — <code>bad-txns-inputs-missingorspent</code>, <code>bad-cb-height</code> — because they travel in reject reasons and RPC errors that downstream tooling matches on.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="Parallel IBD & AssumeUTXO">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>Cross-block prefetch and speculative verification</h2>
+    <p>During IBD, background workers pre-process blocks the connector hasn't reached yet — flat-file reads without the mutex, <code>check_block</code>, MTP, txid computation, batched UTXO warm-up, and <em>speculative script verification</em>. The connect thread skips primary verification for any transaction whose inputs still resolve (coins are immutable, so a found coin is provably the same data the worker used):</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/prefetch.rs:19</span></div>
+<pre><code class="lang-rust">/// A block that has been pre-read, deserialized, and partially validated
+/// by a background prefetch worker.
+pub struct PreprocessedBlock {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub block: Block,
+    pub mtp: u32,
+    /// Pre-computed txids (one per transaction in the block).
+    pub txids: Vec&lt;Txid&gt;,
+    /// Tx indices where all inputs were speculatively resolved AND scripts
+    /// were pre-verified successfully. Only populated in assumevalid mode.
+    pub script_verified_txs: HashSet&lt;usize&gt;,
+    /// `validation::block::check_block` already ran on `block`, off the connect
+    /// thread. Consumers must run it themselves when this is false — the
+    /// conservative default for anything not produced by a prefetch worker.
+    pub context_free_checked: bool,
+}</code></pre></div>
+    <p>The buffer is a plain height-keyed <code>HashMap</code> — a comment records that an earlier coordinator design produced 0% hit rates. Speculative coins are <em>hints</em>: each is re-verified against the authoritative store at connect time.</p>
+    <h3>AssumeUTXO: serve now, verify behind</h3>
+    <p><code>loadtxoutset</code> streams a Core-format UTXO snapshot in (validated against a hardcoded anchor table copied from Core's <code>m_assumeutxo_data</code>), then a <em>background chainstate</em> revalidates genesis→snapshot in a private RocksDB while the primary serves the tip. At the snapshot height, the background recomputes Core's <code>hash_serialized_3</code> over its own UTXO set and compares it against the anchor — a mismatch flags the snapshot rather than panicking, and the handoff is pinned fail-closed by test.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core parallelizes script checks within one block (<code>CCheckQueue</code>) but connects blocks strictly serially; satd pipelines across blocks. AssumeUTXO matches Core's design (Core invented it) including snapshot-file compatibility — satd reads Core-produced snapshots and writes snapshots Core can read, via the Core-wire codec in <code>compressed_coin.rs</code>.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 3 · Chain & Validation" data-title="Hard-won invariants">
+  <div class="slide-body">
+    <p class="eyebrow">Part 3 <span class="sep">·</span> Chain &amp; Validation</p>
+    <h2>The invariants the incidents taught</h2>
+    <p>A distinctive property of this codebase: design rules live as dated postmortems at the exact decision point. Three that recur everywhere:</p>
+    <h3>1 · The height index is not an active-chain oracle</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/connect.rs:128</span></div>
+<pre><code class="lang-rust">/// The single implementation behind every MTP the connect path uses. `plan` is
+/// `Some` only during a chainstate reindex, where the store's height→hash index
+/// must not be consulted: it is derived state that has been observed polluted
+/// with a fork block (#322), it describes the *pre-reindex* chain rather than
+/// the branch being replayed ... MTP gates BIP113 locktimes and BIP68 time-based
+/// sequence locks, so resolving it against the wrong branch is a consensus
+/// decision made about a chain the node is not building.</code></pre></div>
+    <h3>2 · Answer wrong rather than not at all is never acceptable</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/tip_ancestry.rs:1</span><span>the startup ancestry audit</span></div>
+<pre><code class="lang-rust">//! That is not hypothetical. On a synced mainnet node the persisted tip was
+//! eight blocks above the last block it had actually connected ... Every output
+//! created in that eight-block window was absent from the UTXO set. The node
+//! reported a healthy synced tip on a real canonical block,
+//! `getblockchaininfo` was self-consistent, and `/healthz` stayed green for
+//! five and a half hours. Nothing detected it ...
+//!
+//! This pass is the detector that was missing. It answers wrong rather than
+//! not at all: a node that fails it is refusing to serve, not quietly serving
+//! a truncated UTXO set.</code></pre></div>
+    <h3>3 · Report what disagreed, not a boolean</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/consistency.rs:1</span><span>the deep-audit module</span></div>
+<pre><code class="lang-rust">//! It exists because reasoning did not settle the mainnet incident behind #567
+//! and reading the on-disk artifacts did. Four independent artifacts —
+//! `coins`, `height_hash`, `undo`, `chain_tx` — each said something the others
+//! did not, and the fourth reversed the conclusion drawn from the first three.
+//! An assertion that "the tip is fine" is worth very little; an assertion that
+//! names the outpoint, the height and the artifact is worth a great deal.</code></pre></div>
+    <p>Supporting machinery follows the same philosophy: <code>height_index_repair.rs</code> only adds rows for heights that have none (a <em>wrong</em> row would require adjudication it refuses to do); <code>reorg_log.rs</code> drops-and-counts webhook events rather than ever blocking consensus on external HTTP; <code>disconnect.rs</code> surfaces corrupt undo data as an error that lands the operator on <code>-reindex-chainstate</code> instead of a panic.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 4 · P2P Networking" data-title="PeerManager actor model">
+  <div class="slide-body">
+    <p class="eyebrow">Part 4 <span class="sep">·</span> P2P Networking</p>
+    <h2>PeerManager: one actor, one channel, two tasks per peer</h2>
+    <p><code>manager.rs</code> (7,519 lines) is the single owning actor for all peer state. Peer tasks never touch chain or mempool state directly — they push <code>NetEvent</code>s onto one bounded mpsc channel, and one central <code>run()</code> loop drains them, so all mutation is serialized in one place:</p>
+    <div class="cols"><div>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/manager.rs:181</span></div>
+<pre><code class="lang-rust">/// Event sent from peer tasks to the central manager loop.
+pub enum NetEvent {
+    PeerConnected {
+        id: PeerId,
+        addr: SocketAddr,
+        version: VersionMessage,
+    },
+    PeerDisconnected { id: PeerId },
+    MessageReceived {
+        id: PeerId,
+        msg: NetworkMessage,
+    },
+}</code></pre></div>
+    </div><div>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/manager.rs:2103</span><span>the routing match</span></div>
+<pre><code class="lang-rust">fn handle_message(&amp;self, id: PeerId, msg: NetworkMessage) {
+    match msg {
+        NetworkMessage::Ping(nonce) =&gt; {
+            self.send_to_peer(id, NetworkMessage::Pong(nonce));
+        }
+        NetworkMessage::Inv(inventory) =&gt; self.handle_inv(id, inventory),
+        NetworkMessage::Headers(headers) =&gt; self.handle_headers(id, headers),
+        NetworkMessage::Block(block) =&gt; self.handle_block(id, block),
+        NetworkMessage::Tx(tx) =&gt; self.handle_tx(id, tx),
+        NetworkMessage::GetData(inv) =&gt; self.handle_getdata(id, inv),</code></pre></div>
+    </div></div>
+    <p>Each peer gets <em>two</em> tokio tasks — a never-cancelled reader plus a <code>select!</code>-driven write loop — and the reason is an async-Rust footgun worth knowing:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/manager.rs:5637</span></div>
+<pre><code class="lang-rust">// Split connection into read/write halves to avoid cancel-safety issues.
+// read_exact is not cancel-safe — if tokio::select! drops a recv() future
+// mid-read, consumed bytes are lost and the stream becomes misaligned.
+// By running the reader in a dedicated task, it is never cancelled.
+let (mut reader, mut writer) = conn.split();</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>CConnman</code> runs a small fixed set of threads (socket handler, message handler, opencon) multiplexing all peers over <code>select()</code>/poll with shared state under <code>cs_main</code> + per-node locks. satd's task-per-peer model trades a few KB of stack per peer for the absence of cross-peer head-of-line blocking and the shared-lock discipline. Notable P2P scope choices: BIP 37 bloom filters intentionally absent (BIP 157/158 served instead), and <code>peers.dat</code> is satd-native (magic <code>SADR</code>) rather than Core's bucketed serialization.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 4 · P2P Networking" data-title="BIP 324 v2 transport">
+  <div class="slide-body">
+    <p class="eyebrow">Part 4 <span class="sep">·</span> P2P Networking</p>
+    <h2>BIP 324: encrypted transport behind a seam</h2>
+    <p>satd wraps the rust-bitcoin <code>bip324</code> crate (ElligatorSwift ECDH + ChaCha20-Poly1305) rather than reimplementing the crypto, and ports its synchronous reference driver to tokio. The whole peer pipeline speaks <code>NetworkMessage</code> above a <code>Connection::{V1, V2}</code> seam and never learns which transport carries it. Detection is responder-side byte-sniffing, exactly as the BIP prescribes:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/manager.rs:5435</span><span>inbound detection + -v2only</span></div>
+<pre><code class="lang-rust">/// BIP 324 leaves v1/v2 detection to the responder: read the first
+/// bytes and, if they are the network magic, the peer is speaking
+/// plaintext v1 (a `version` message starts with the magic); otherwise
+/// treat the bytes as the front of the peer's ElligatorSwift key and
+/// run the v2 handshake. The detection bytes are consumed off the
+/// socket and replayed into whichever transport is built.
+async fn accept_transport(self: &amp;Arc&lt;Self&gt;, mut stream: TcpStream) -&gt; Result&lt;Connection, String&gt; {
+    // ...
+    if first == expected {
+        if self.v2_only() {
+            return Err("v2only: rejecting inbound v1 peer".to_string());
+        }
+        Ok(Connection::v1_with_leading(stream, magic, first.to_vec()))
+    } else {</code></pre></div>
+    <p>Outbound falls back to v1 by re-dialing a fresh socket, and remembers the downgrade so reconnects skip the wasted v2 round trip:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/manager.rs:387</span></div>
+<pre><code class="lang-rust">/// satd-specific `-v2only`: refuse peers that don't speak BIP 324 v2.
+/// Inbound v1 peers are dropped at detection; outbound v2 failures are
+/// not downgraded. Implies `v2_transport`. Defaults to false.
+v2_only: std::sync::atomic::AtomicBool,
+/// Outbound destinations whose v2 handshake failed this session, so we
+/// connect them straight as v1 instead of wasting a v2 round trip on
+/// every reconnect. Keyed by socket address (direct peers only).
+v2_downgraded: RwLock&lt;HashSet&lt;SocketAddr&gt;&gt;,</code></pre></div>
+    <div class="tradeoff"><span class="tag">The satd extension</span>
+    <code>-v2transport</code> matches Core (on by default, graceful fallback). <code>-v2only</code> is satd-only: an anti-surveillance lever that drops every v1 peer. As of 2026 most surveillance and DoS nodes don't speak v2, so this sheds essentially all of that traffic without banlists — at the cost of also dropping honest un-upgraded peers, which is why it stays opt-in.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 4 · P2P Networking" data-title="Swarm IBD">
+  <div class="slide-body">
+    <p class="eyebrow">Part 4 <span class="sep">·</span> P2P Networking</p>
+    <h2>IBD: a BitTorrent-style swarm, tuned by incident</h2>
+    <p>This is satd's biggest P2P divergence from Core. Instead of a sequential in-order download window, the whole remaining height range is shuffled into a pool and handed out randomly across peers — with a 256-block <em>priority zone</em> above the connect cursor so the sequential connector never starves:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/ibd.rs:37</span></div>
+<pre><code class="lang-rust">/// BitTorrent-style download coordinator for parallel IBD.
+///
+/// Assigns random blocks from across the chain to many peers simultaneously,
+/// maximizing download parallelism and avoiding the "slow peer bottleneck"
+/// that sequential range assignment creates.
+pub struct IbdScheduler {
+    phase: IbdPhase,
+    target_height: u32,
+    /// Global pool of block heights still needing download, shuffled randomly.
+    pending: VecDeque&lt;u32&gt;,
+    /// Heights currently assigned to a peer (in-flight).
+    in_flight: HashMap&lt;u32, PeerId&gt;,
+    /// Max blocks in-flight per peer.
+    per_peer_limit: u32,
+    /// Max total blocks downloaded ahead of connect cursor.
+    max_ahead: u32,</code></pre></div>
+    <p>The tuning constants read like a flight recorder. Where the swarm design conflicted with how stock Core peers behave, the evidence won:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/ibd.rs:130</span></div>
+<pre><code class="lang-rust">// Match Bitcoin Core's MAX_BLOCKS_IN_TRANSIT_PER_PEER (16). The
+// previous limit (128) packed our getdata to peers with batches
+// 8x larger than what stock peers expect to process. On the
+// mainnet 2026-05-13 wedge run, peers consistently disconnected
+// us after ~60s with most of their assignment unfulfilled — the
+// smaller batch lets peers cycle through requests faster and
+// reduces wasted in-flight assignments when a peer drops.
+per_peer_limit: 16,</code></pre></div>
+    <p>Stall handling is layered: coarse per-peer detection, per-height timeouts with a much shorter fuse near the cursor, and a per-(height, peer) anti-affinity cooldown — each traceable to a specific mainnet wedge (heights 783563, 785197, 945208 on one 2026-05-13 run):</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/ibd.rs:72</span></div>
+<pre><code class="lang-rust">/// Per-(height, peer) cooldown timestamp. When a height is released from
+/// a peer (timeout or notfound), that peer is barred from being re-issued
+/// the same height until `cooldown_until &gt; now`. Prevents the "silent
+/// peer keeps getting re-assigned the same height" wedge observed at
+/// height 785197 on the 2026-05-13 mainnet IBD run, where the 15s
+/// near-cursor timeout released a stuck height back to pending and the
+/// same peer immediately re-claimed it via its priority-zone scan.
+height_peer_cooldown: HashMap&lt;u32, HashMap&lt;PeerId, Instant&gt;&gt;,</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core downloads blocks through a strictly-ordered 1024-block moving window (<code>BLOCK_DOWNLOAD_WINDOW</code>) with 16 in-flight per peer, disconnecting the peer that stalls the window's leading edge. satd's shuffle keeps every peer saturated regardless of which heights they're slow on; the priority zone plus the per-height release machinery is the price of keeping the sequential connector fed under that randomness.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 4 · P2P Networking" data-title="AddrMan, compact blocks, Tor">
+  <div class="slide-body">
+    <p class="eyebrow">Part 4 <span class="sep">·</span> P2P Networking</p>
+    <h2>The supporting cast: addrman, compact blocks, Tor</h2>
+    <h3>Address manager — Core's model, simplified on purpose</h3>
+    <p>New/tried tables and network-group bucketing for eclipse resistance are kept (max 64 <em>new</em> entries per /16 or ASN, ~50/50 tried/new dial selection, 16,384-entry cap), but as one <code>HashMap</code> with a cached group key rather than Core's fixed 1024/256 bucket arrays. The group function is pluggable so <code>-asmap</code> swaps /16 for ASN bucketing — and <em>that</em> interpreter is a bit-exact port of Core's <code>util/asmap.cpp</code>, because real Core-produced asmap files must decode to the same ASNs. A study in choosing where to diverge and where to be byte-exact.</p>
+    <h3>Compact blocks — don't guess on collisions</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/net/compact.rs:42</span></div>
+<pre><code class="lang-rust">// A short ID is only 6 bytes, so two distinct mempool transactions can
+// hash to the same short ID (crafted, or ~1-in-2^48 by chance). Using
+// either one to fill a slot would be a guess: if it is the wrong tx the
+// reconstructed block fails its merkle check and the honest relayer is
+// banned, with no `getblocktxn` fallback. So a short ID that matches more
+// than one mempool tx is marked ambiguous (`None`) and treated as
+// unavailable — the slot is requested instead. This mirrors Bitcoin Core's
+// `PartiallyDownloadedBlock::InitData`, which resets a slot when a second
+// mempool tx collides on its short ID.</code></pre></div>
+    <p>For the other collision case — a peer announcing the same short ID for two slots — Core hard-fails reconstruction and re-requests the block; satd routes just the ambiguous slots through <code>getblocktxn</code>: "the same outcome with less bandwidth."</p>
+    <h3>Native Tor v3</h3>
+    <p>A hand-rolled control-port client covering exactly what hidden-service bring-up needs: <code>PROTOCOLINFO</code>, <code>AUTHENTICATE</code> (SAFECOOKIE by default — HMAC-SHA256 challenge/response with mutual proof), <code>ADD_ONION NEW:ED25519-V3</code>, <code>DEL_ONION</code>. The lifecycle subtlety is documented up front: an ephemeral onion service dies with its control connection, so dropping the controller at exit <em>is</em> the teardown. Outbound SOCKS dials get a fresh random credential pair per peer, so Tor's stream isolation gives each peer its own circuit — matching Core's <code>-proxyrandomize</code>.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 5 · Mempool & Mining" data-title="The two-class mempool">
+  <div class="slide-body">
+    <p class="eyebrow">Part 5 <span class="sep">·</span> Mempool &amp; Mining</p>
+    <h2>One pool, two classes: acting and quarantined</h2>
+    <p>The mempool is one physical pool — <code>FxHashMap&lt;Txid, MempoolEntry&gt;</code> plus a <code>spends: FxHashMap&lt;OutPoint, Txid&gt;</code> reverse index — split into two <em>logical classes</em> by a scope marker on every entry. Quarantined entries (held by the operator's policy) are withheld from relay and/or templates but never rejected; each class has its own byte budget and its own fee-rate eviction:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/mempool/pool.rs:140</span></div>
+<pre><code class="lang-rust">#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuarantineScope {
+    pub relay: bool,
+    pub template: bool,
+}
+
+impl QuarantineScope {
+    /// Acting entry — withheld from nothing.
+    pub const fn acting() -&gt; Self {
+        QuarantineScope { relay: false, template: false }
+    }
+    /// True for an acting (non-quarantined) entry.
+    pub fn is_acting(self) -&gt; bool { !self.relay &amp;&amp; !self.template }</code></pre></div>
+    <p>Ancestors and descendants are not materialized on the entry: parents come from <code>tx.input</code>, children from the <code>spends</code> reverse index, walked on demand. There is no incremental package bookkeeping to desync — at the cost of O(graph) walks on verbose RPC paths.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/mempool/pool.rs:1704</span><span>acceptance: snapshot config once</span></div>
+<pre><code class="lang-rust">pub fn accept_transaction(
+    &amp;self,
+    tx: Transaction,
+    chain_state: &amp;ChainState,
+    script_verifier: &amp;dyn ScriptVerifier,
+    source: TxSource,
+    allow_quarantined: bool,
+) -&gt; Result&lt;Txid, MempoolError&gt; {
+    let txid = tx.compute_txid();
+
+    // Snapshot the live policy once so the entire acceptance is judged
+    // against a single config version. A concurrent SIGHUP reload can swap
+    // `self.config` between calls but never mid-transaction.
+    let cfg = self.config.read().clone();</code></pre></div>
+    <p>The admission pipeline, in order: context-free checks → absolute finality at tip+1 (BIP 113 MTP) → BIP 68 → standardness (dust, datacarrier, standard scripts) → conflict detection → input resolution + CPFP ancestor limits → RBF → fee floor → policy DSL evaluation → two-class isolation → eviction/insert → events.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>CTxMemPool</code> maintains cached ancestor/descendant state per entry (and v31 replaces it with cluster mempool). satd matches Core's knobs (<code>-maxmempool</code>, <code>-mempoolexpiry</code>, ancestor/descendant counts, <code>-mempoolfullrbf</code> on) but implements simpler internals: RBF is BIP 125 rules 3+4 only (no "no new unconfirmed inputs", no 100-descendant eviction cap), eviction sorts by individual feerate rather than descendant-package feerate, and standardness is output-side only. Also unlike Core: <code>mempool.dat</code> shares the filename and re-validate-on-load behavior but is a satd-native format (magic <code>SMPL</code>) — the file is a hint, never a trusted input.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 5 · Mempool & Mining" data-title="Fee estimation">
+  <div class="slide-body">
+    <p class="eyebrow">Part 5 <span class="sep">·</span> Mempool &amp; Mining</p>
+    <h2>Two fee estimators, one blend</h2>
+    <p><code>estimatesmartfee</code> stays Core-shaped, backed by a percentile over recent confirmed-block feerates. The satd extension, <code>estimatefees</code>, simulates the next N block templates from the live mempool — ancestor-aggregate feerates so CPFP composes correctly — and never errors, always returning a confidence level (this closes Core issue #11500, open since 2017):</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/mempool/estimate.rs:1</span></div>
+<pre><code class="lang-rust">//! Mempool-based smart fee estimation.
+//!
+//! Simulates the next N block templates from the current mempool snapshot.
+//! For each simulated block we record the lowest admitted *ancestor
+//! feerate* — that is the fee level a new tx needs to land in block k.
+//! Ancestor feerate aggregation handles CPFP correctly: a low-fee parent
+//! + high-fee child are admitted together at the child's pull rate.
+//!
+//! This complements the historical-block `FeeEstimator` in `fee.rs`:
+//! historical data reacts to what miners *did* (slow to respond to sudden
+//! congestion), while mempool simulation reacts to what's queued *now*.
+//!
+//! The simulator is intentionally a pure function over an owned snapshot
+//! of `MempoolEntry`s — it does not hold any mempool locks while running.</code></pre></div>
+    <p>The estimate ladder is forced monotone — and the comment explains why a naive per-block floor isn't:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/mempool/estimate.rs:466</span></div>
+<pre><code class="lang-rust">/// Taking the running minimum is what makes the estimate **monotonically
+/// non-increasing** in `target`: confirming within N+k blocks can never
+/// cost more than confirming within N. A single per-block floor is *not*
+/// monotone — greedy packing under the weight/sigop caps can defer a
+/// high-feerate package past block 1, leaving a later block with a higher
+/// admission floor than an earlier one. Reading one block per target then
+/// produces a nonsensical ladder (e.g. next-block &lt; ~30-min). The running
+/// minimum collapses that to the honest answer: if a cheap tx made it into
+/// an early block, every deeper target is at least as cheap.</code></pre></div>
+    <div class="tradeoff"><span class="tag">Scope filtering is load-bearing</span>
+    The simulation runs over the <em>template-scoped</em> view — the same set <code>create_template</code> selects from. Simulating the full pool would pack blocks with transactions this node quarantined <code>on template</code> (ones it will never mine) and quote inflated fees to wallets through the public surfaces (Esplora <code>/fee-estimates</code>, Electrum <code>estimatefee</code>). The result is memoized with a TTL because an unauthenticated per-request simulation is a DoS amplifier.</div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>CBlockPolicyEstimator</code> is a decaying bucket tracker over confirmation history — sophisticated on the historical side, blind to the current queue, and errors out when it lacks data. satd's historical half is simpler (a percentile ring); its mempool half sees congestion the moment it forms.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 5 · Mempool & Mining" data-title="Block templates">
+  <div class="slide-body">
+    <p class="eyebrow">Part 5 <span class="sep">·</span> Mempool &amp; Mining</p>
+    <h2>Template building: greedy with dependency deferral</h2>
+    <p>Selection sorts once by individual effective feerate (including <code>prioritisetransaction</code> deltas), then loops: emit what's ready, defer what awaits a mempool parent, drop what's unminable. The deferral is what yields parent-before-child order — the comment records the invalid blocks produced before it existed. Finality and BIP 68 are re-checked here rather than trusted from admission, because a reorg or a persisted mempool can invalidate the earlier judgement:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/mining/template.rs:93</span><span>four-case input resolution</span></div>
+<pre><code class="lang-rust">// Resolve every input against the UTXO set, not mempool
+// membership: a parent evicted after this child was admitted
+// (expiry, RBF, block-connect conflict) is in neither the
+// mempool nor the UTXO set, and treating "not in mempool" as
+// "confirmed" would mine the orphaned child →
+// bad-txns-inputs-missingorspent. An input creates one of
+// four cases: already included in this template (the coin is
+// born at `height`), a confirmed coin, a mempool parent that
+// may still be included (defer to a later pass), or nothing
+// anywhere (drop — unminable).
+let bip68_enforced = (entry.tx.version.0 as u32) &gt;= 2;
+let mut awaits_parent = false;
+let mut minable = true;
+for input in &amp;entry.tx.input {
+    let parent = input.previous_output.txid;
+    let prev_height = if included.contains(&amp;parent) {
+        height
+    } else if let Some(coin) = chain_state.get_coin(&amp;input.previous_output) {
+        coin.height
+    } else if in_mempool.contains(&amp;parent) {
+        awaits_parent = true;
+        continue;
+    } else {
+        minable = false;
+        break;
+    };</code></pre></div>
+    <div class="tradeoff"><span class="tag">An honest asymmetry</span>
+    Core's miner (<code>addPackageTxs</code>) selects by ancestor score, so a low-fee parent bumped by a high-fee child is packed at the package rate. satd's template builder sorts by <em>individual</em> feerate and only defers children — a genuinely CPFP'd parent can sort to the bottom and miss the block, taking its child with it. Meanwhile the <em>fee simulator</em> on the previous slide does full ancestor-package packing: the estimator is currently smarter than the miner. The coinbase weight reserve (8,000 WU) matches Core v30's <code>DEFAULT_BLOCK_RESERVED_WEIGHT</code> exactly.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 5 · Mempool & Mining" data-title="The policy language">
+  <div class="slide-body">
+    <p class="eyebrow">Part 5 <span class="sep">·</span> Mempool &amp; Mining</p>
+    <h2>satd-policy: a total, cost-bounded relay-policy language</h2>
+    <p>Where Core's relay policy is a fixed C++ decision tree behind flags, satd ships a small statically-typed expression language (<code>policyfile=</code>) with which operators write arbitrary shape-based rules. The defining choice: <strong>quarantine, not reject</strong> — there is no <code>Reject</code> verdict in the type, so a ruleset can withhold from relay/templates but can never make the node refuse a transaction baseline policy would accept. Consensus is untouched by construction.</p>
+    <div class="code"><div class="code-head"><span class="path">contrib/policy/example.policy</span><span>real rules from the shipped example</span></div>
+<pre><code class="lang-plain"># Exception first: my own submissions are never filtered.
+allow own-submissions when tx.source == rpc or tx.source == mcp
+
+# Ordinals / BRC-20 inscriptions.
+quarantine ordinals on relay,template
+    when any inputs (in.leaf_script.contains_ops(script(OP_FALSE OP_IF push(0x6f7264))))
+
+# Cheap, oversized generic OP_RETURN.
+quarantine cheap-bulk-opreturn
+    when any outputs (out.script_type == op_return and out.op_return_size &gt; 83)
+         and tx.fee_rate &lt; node.min_relay_fee * 3
+
+# Mine-neutral big-witness: relay it, just don't mine it.
+quarantine no-mine-big-witness on template when tx.total_witness_size &gt; 100kb</code></pre></div>
+    <p>The pipeline is <code>parse → typecheck → cost → eval</code>, and the guarantees are named invariants: <strong>I4 totality</strong> — <code>eval</code> returns a value, never an error (saturating arithmetic, <code>x/0 == 0</code>, no indexing, no recursion); <strong>I5 cost bound</strong> — every compiled expression carries a worst-case static cost and the loader rejects rulesets over budget, backed by a runtime fuel meter (~100µs ceiling per tx) whose exhaustion fails <em>safe-restrictive</em>: quarantine, attributed to the implicit <code>__fuel</code> rule.</p>
+    <div class="code"><div class="code-head"><span class="path">satd-policy/src/ruleset.rs:95</span><span>first-match-wins with shared fuel</span></div>
+<pre><code class="lang-rust">pub fn evaluate&lt;'a&gt;(&amp;'a self, tx: &amp;'a TxView&lt;'a&gt;, ctx: &amp;Ctx) -&gt; Verdict {
+    let mut fuel = DEFAULT_FUEL;
+    for rule in &amp;self.rules {
+        let out = rule.cond.eval_metered(tx, ctx, fuel);
+        if out.fuel_exhausted {
+            return Verdict::fuel();
+        }
+        fuel = out.fuel_remaining;
+        if out.value.as_bool() {
+            return match rule.action {
+                Action::Quarantine =&gt; Verdict::Quarantine {
+                    rule: rule.name.clone(),
+                    scope: rule.scope,
+                },
+                Action::Allow =&gt; Verdict::Allow { rule: rule.name.clone() },
+            };
+        }
+    }
+    Verdict::Pass
+}</code></pre></div>
+    <p>Held transactions inherit their quarantined ancestors' scopes (mining a child whose parent you withhold would be incoherent), and a held submission can never RBF-evict an acting-class transaction. Every standard surface — <code>getrawmempool</code>, Electrum, Esplora — stays acting-class-only and byte-identical whether or not anything is quarantined; observability is a disjoint additive surface (<code>getpolicyinfo</code>, <code>listquarantine</code>, <code>policytest</code>).</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 5 · Mempool & Mining" data-title="The Lightning danger gate">
+  <div class="slide-body">
+    <p class="eyebrow">Part 5 <span class="sep">·</span> Mempool &amp; Mining</p>
+    <h2>The danger gate: policy vs. Lightning enforcement</h2>
+    <p>A relay-withholding rule that catches Lightning justice or HTLC transactions degrades L2 enforcement network-wide. Instead of a syntactic lint, satd runs the <em>whole ruleset</em>, under its real first-match-wins semantics, against synthetic transactions shaped like actual enforcement traffic — and blocks the load if any of them would be withheld from relay:</p>
+    <div class="code"><div class="code-head"><span class="path">satd-policy/src/danger.rs:16</span><span>detectability splits as the protocols do</span></div>
+<pre><code class="lang-rust">//! Detectability splits exactly as the protocols do:
+//! - **BOLT-3 (legacy / anchor)** enforcement scripts are spec-mandated, so a
+//!   faithful vector is an exact probe: commitment (force-close) with its anchor
+//!   outputs, the breach-remedy **justice** transaction (the time-critical E1
+//!   case) spending a revoked `to_local`, and second-stage HTLC timeout/success.
+//! - **Taproot-channel key-path force-closes** are *indistinguishable* from any
+//!   other P2TR key-path spend, so they cannot be detected directly. The probe
+//!   is instead a generic, healthy P2TR key-path spend: a rule that quarantines
+//!   it is structurally over-broad and necessarily sweeps TR force-closes with
+//!   it.
+//! - **Taproot-channel script-path enforcement** (justice / HTLC) reveals a
+//!   tapleaf and is partially recognizable.
+//!
+//! `allow` rules are never dangerous: they only widen relay, never withhold.</code></pre></div>
+    <div class="code"><div class="code-head"><span class="path">node/src/mempool/pool.rs:902</span><span>the refusal</span></div>
+<pre><code class="lang-rust">Err(format!(
+    "refusing policy: rule(s) [{}] would withhold relay for Lightning \
+     enforcement transactions, degrading L2 enforcement network-wide (E1). \
+     Narrow them, scope them `on template`, or set allowdangerousfilters=1 \
+     to override.", relay_rules.join(", ")))</code></pre></div>
+    <p>Eight probe shapes cover BOLT-3 commitment/anchor/justice/HTLC and the taproot cases. Template-only withholding logs a warning but loads — declining to <em>mine</em> enforcement traffic is the operator's call; declining to <em>relay</em> it needs the explicit override. <code>sat-cli policylint</code> runs the same analysis offline (exit 3) so a dangerous rule is caught before it's ever loaded. The manual is honest about the limit: the gate can't catch a rule that snags enforcement through an angle the probes don't model — it removes the most common operator mistake, not the critique.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    None. Core's answer to operator relay preferences is a fixed flag set; anything shape-based requires a source patch, with no guardrails at all around what that patch might do to L2 traffic.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 6 · RPC & Surfaces" data-title="The middleware stack">
+  <div class="slide-body">
+    <p class="eyebrow">Part 6 <span class="sep">·</span> RPC &amp; Surfaces</p>
+    <h2>JSON-RPC: jsonrpsee on a tower of middleware</h2>
+    <p>98 methods, registered in one place, served by <code>jsonrpsee</code> over a <code>tower</code> middleware chain — each cross-cutting concern an independently testable layer instead of inlined code in an HTTP callback. The ordering is deliberate and documented at the build site:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/server.rs:2275</span></div>
+<pre><code class="lang-rust">// AdmissionLayer is outermost so an over-budget request is shed (429)
+// before any auth/compat work. AuthLayer is next so an unauthenticated
+// request is rejected before the compat layer buffers its body;
+// JsonRpcCompatLayer then normalizes Core-style (`jsonrpc` 1.0/1.1/
+// absent) requests to 2.0 so jsonrpsee accepts them (see `compat.rs`).
+let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
+let tls_middleware = tower::ServiceBuilder::new()
+    .layer(AdmissionLayer::new(admission))
+    .layer(AuthLayer::new(auth, bearer))
+    .layer(JsonRpcCompatLayer::new());
+let rpc_svc = ServerBuilder::new()
+    .set_config(server_cfg)
+    .set_http_middleware(tls_middleware)
+    .set_rpc_middleware(
+        RpcServiceBuilder::new()
+            .option_layer(rpc_filter)
+            .option_layer(capability_filter),
+    )
+    .to_service_builder()
+    .build(methods, stop_handle.clone());</code></pre></div>
+    <p>Admission control reimplements Core's <code>-rpcthreads</code>/<code>-rpcworkqueue</code> contract on an async runtime — a semaphore bounds in-flight calls, a counter bounds the backlog, and everything past the budget is shed <em>before</em> auth or body buffering does any work. One documented divergence: satd sheds with HTTP 429 + <code>Retry-After</code> where Core returns 503.</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/access.rs:8</span><span>why the read-only listener exists</span></div>
+<pre><code class="lang-rust">//! The read-only listener runs on the same separate, bounded tokio runtime
+//! as the high-volume read surfaces (Esplora/Electrum/gRPC) so a flood of
+//! consumer RPC traffic can never starve block connection or mempool
+//! acceptance. But that isolation comes with a hard correctness constraint
+//! discovered while moving surfaces off the core runtime:
+//!
+//! &gt; A surface that **connects blocks** must not run on the API runtime.
+//! &gt; `connect_block` writes the address index inline and *then* broadcasts
+//! &gt; `ChainEvent::BlockConnected`; the address-index status notifier is an
+//! &gt; independent core-runtime consumer of that broadcast. When the
+//! &gt; broadcast originates from the API runtime, the cross-runtime wakeup
+//! &gt; can reorder the notifier ahead of the inline index write becoming
+//! &gt; visible, delivering a stale all-zeros status to SSE/Electrum
+//! &gt; subscribers.</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core serves RPC from a bespoke libevent HTTP stack, HTTP-only by design (TLS means a reverse-proxy sidecar), with a fixed worker-thread pool. satd terminates TLS/mTLS natively on every listener via the shared <code>tls-config</code> crate, and splits read traffic onto an isolated runtime (<code>--api-threads</code>) so consumer load can't contend with the threads that connect blocks.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 6 · RPC & Surfaces" data-title="Compat machinery">
+  <div class="slide-body">
+    <p class="eyebrow">Part 6 <span class="sep">·</span> RPC &amp; Surfaces</p>
+    <h2>Three modules that exist purely for Core byte-compatibility</h2>
+    <h3>compat.rs — accepting JSON-RPC 1.0, found by a canary</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/compat.rs:1</span></div>
+<pre><code class="lang-rust">//! Every Core-ecosystem client built on the canonical libraries sends
+//! the 1.0 form. NBitcoin (and therefore NBXplorer and BTCPayServer)
+//! sends `"jsonrpc":"1.0"`; `python-bitcoinrpc`, many shell scripts, and
+//! older tooling omit the member entirely. Against an unpatched
+//! jsonrpsee, *every* call from those clients fails — which is exactly
+//! the failure the NBXplorer compatibility canary surfaced (the indexer
+//! could open a P2P connection but every `getblockchaininfo` RPC came
+//! back `Invalid request`, so it never synced).
+//!
+//! This HTTP-level tower layer runs *before* jsonrpsee parses the body.</code></pre></div>
+    <h3>amounts.rs — the 8-decimal problem</h3>
+    <p>Core emits BTC amounts as <code>%d.%08d</code> — always <code>0.00001000</code>, never <code>0.00001</code>. Strict parsers (Core Lightning's <code>bcli</code>) reject the shortest form, so serde_json's <code>arbitrary_precision</code> feature is on workspace-wide and amounts are formatted from integer satoshis:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/amounts.rs:32</span></div>
+<pre><code class="lang-rust">/// Format an integer satoshi amount as a Bitcoin-Core-exact fixed
+/// 8-decimal BTC value (`&lt;whole&gt;.&lt;8-digit frac&gt;`) emitted as a JSON number
+/// literal. Integer arithmetic only — no `f64`, so exact for all amounts.
+fn btc_fixed_8dp(sats: u64) -&gt; Value {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    let literal = format!("{whole}.{frac:08}");
+    // Under `arbitrary_precision`, `Number: FromStr` preserves the exact
+    // source text, so this serializes as `0.00001000`, not `0.00001`.
+    Value::Number(literal.parse()
+        .expect("fixed 8-decimal literal is always a valid JSON number"))
+}</code></pre></div>
+    <p>The opt-in flip side: any request can ask for <code>"amounts": "sats"</code> and get exact integers — closing Core issue #3249, open since 2013 — verified by a <code>"units": "sats"</code> field in the response.</p>
+    <h3>error.rs — default-identical, opt-in structured</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/error.rs:43</span></div>
+<pre><code class="lang-rust">/// A structured RPC error. When rendered to a jsonrpsee `ErrorObjectOwned`:
+/// - With extended-errors disabled (default): emits only `code` + `message`
+///   (byte-identical to Bitcoin Core).
+/// - With extended-errors enabled: also populates `data` with
+///   `category`, `suggestion`, and `debug` when present.
+#[derive(Debug, Clone)]
+pub struct RpcError {
+    pub code: i32,
+    pub message: String,
+    /// Stable dashboard-friendly taxonomy. Examples:
+    /// - `mempool.policy.feerate`, `mempool.conflicts`
+    /// - `validation.consensus`, `rpc.input.parse`
+    /// - `storage.not_found`, `node.shutting_down`
+    pub category: &amp;'static str,
+    pub suggestion: Option&lt;String&gt;,
+    pub debug: Option&lt;Value&gt;,
+}</code></pre></div>
+    <p>The shared pattern across all three: the Core-shape default is byte-preserved, extensions are opt-in per request or per flag, and matching Core's leniency is a named Tier 1 obligation in <code>STABILITY_POLICY.md</code>.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 6 · RPC & Surfaces" data-title="Auth & capabilities">
+  <div class="slide-body">
+    <p class="eyebrow">Part 6 <span class="sep">·</span> RPC &amp; Surfaces</p>
+    <h2>satd-auth: one credential model for every surface</h2>
+    <p>Cookie, userpass, and <code>-rpcauth</code> HMAC stay Core-compatible and always resolve first (legacy clients see zero change, and the operator principal holds all capabilities so the filter is a no-op for them). The satd extension is opt-in bearer tokens — SHA-256-hashed in a reloadable TOML store, each carrying a capability set — factored into a transport-agnostic crate shared by JSON-RPC, Esplora, Electrum, MCP, and the events gRPC:</p>
+    <div class="cols"><div>
+    <div class="code"><div class="code-head"><span class="path">satd-auth/src/capability.rs:11</span></div>
+<pre><code class="lang-rust">pub enum Capability {
+    /// Read-only JSON-RPC methods.
+    RpcRead,
+    /// Mutating JSON-RPC (`sendrawtransaction`,
+    /// node/index control, mining).
+    RpcWrite,
+    /// Esplora REST / SSE.
+    EsploraRead,
+    /// Open a streaming subscription (gRPC events).
+    StreamSubscribe,
+    /// Register outpoint/script/descriptor watches
+    /// (gated by `watch_quota`).
+    StreamWatch,
+    /// MCP tool access (wildcard `mcp:*`).
+    McpAll,
+}</code></pre></div>
+    </div><div>
+    <div class="code"><div class="code-head"><span class="path">satd-auth/src/capability.rs:66</span><span>compile-time overflow guard</span></div>
+<pre><code class="lang-rust">// `CapabilitySet` is a `u16`, so the vocabulary must
+// stay ≤ 16 entries — a 17th would make `1u16 &lt;&lt; 16`
+// over-shift (debug panic / release wrap → two
+// capabilities aliasing one bit → silent privilege
+// grant). This fails the build the moment that
+// ceiling is crossed; widen `CapabilitySet` to `u32`
+// then.
+const _: () = assert!(
+    ALL_CAPS.len() &lt;= 16,
+    "CapabilitySet is u16: widen it before adding \
+     a 17th capability"
+);</code></pre></div>
+    </div></div>
+    <p>The per-method gate is fail-closed — an unclassified method requires the write capability, so a read-only token can never reach a method someone forgot to classify:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/rpc/capability.rs:41</span></div>
+<pre><code class="lang-rust">/// The capability a method requires. Read-classified methods need `rpc:read`;
+/// everything else — mempool-submit, control, block-connecting, AND unclassified
+/// (unknown) methods — needs `rpc:write`. Fail-closed: an unknown method can
+/// never be reached by a read-only token.
+fn required_capability(method: &amp;str) -&gt; Capability {
+    match classify(method) {
+        Some(RpcAccess::Read) =&gt; Capability::RpcRead,
+        _ =&gt; Capability::RpcWrite,
+    }
+}</code></pre></div>
+    <p>Small touches with the same posture: the cookie file's permission mode is applied at <code>open(2)</code> time so the secret is never briefly world-readable; token comparison is constant-time; per-principal rate limits shed with 429 inside the same layer.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core has cookie/userpass/rpcauth and a <code>-rpcwhitelist</code> per-user method list — no scoped tokens, no capability model, no shared auth across surfaces (each side-car brings its own).</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 6 · RPC & Surfaces" data-title="Esplora & Electrum">
+  <div class="slide-body">
+    <p class="eyebrow">Part 6 <span class="sep">·</span> RPC &amp; Surfaces</p>
+    <h2>Esplora and Electrum: two protocols, one chainstate</h2>
+    <p>Bitcoin Core operators run <code>electrs</code> or Fulcrum as a separate process that re-indexes the whole chain, plus an Esplora deployment for REST. satd serves both wire formats in-process, over the same <code>AddressIndex</code> trait against the shared RocksDB — no second copy, no parallel rescan, no reorg races between processes.</p>
+    <div class="cols"><div>
+    <h3>Esplora: 42 axum routes + SSE</h3>
+    <div class="code"><div class="code-head"><span class="path">esplora-handlers/src/handlers/chain.rs:21</span></div>
+<pre><code class="lang-rust">/// `/blocks/tip/hash`. Plain-text big-endian hex
+/// (matches upstream).
+pub async fn tip_hash(
+    State(state): State&lt;EsploraState&gt;,
+) -&gt; String {
+    state.chain.tip_hash().to_string()
+}</code></pre></div>
+    <p>Wire-shape parity with blockstream.info / mempool.space so BDK and the mempool.space SDK deserialize unchanged. SSE streams embed their concurrency permit <em>in the response stream</em> — tower's limit layer bounds request handling, not stream lifetime, so without it an attacker could pin sockets indefinitely.</p>
+    </div><div>
+    <h3>Electrum: v1.4.5, lineage from electrs</h3>
+    <div class="code"><div class="code-head"><span class="path">electrum-proto/src/handlers/blockchain.rs:195</span></div>
+<pre><code class="lang-rust">pub fn scripthash_get_balance(
+    state: &amp;ElectrumState, params: Value,
+) -&gt; Result&lt;Value, JsonRpcError&gt; {
+    let sh = parse_scripthash(&amp;params,
+        "blockchain.scripthash.get_balance")?;
+    let (confirmed, unconfirmed) = state
+        .address_index
+        .balance(&amp;sh.0)
+        .map_err(JsonRpcError::from_index)?;
+    Ok(serde_json::to_value(BalanceResponse {
+        confirmed, unconfirmed,
+    }).unwrap())
+}</code></pre></div>
+    <p>28 methods; the protocol shape (method names, status hashes, merkle encoding) follows <code>romanz/electrs</code> with MIT attribution vendored in-tree. The implementation is satd's, one process away from the consensus core.</p>
+    </div></div>
+    <div class="tradeoff"><span class="tag">Where a naive port bites</span>
+    <code>get_history</code> asks the index for at most <code>cap + 1</code> <em>distinct</em> <code>(height, txid)</code> entries: the index emits one row per matching output <em>and</em> input, so a fixed raw-row scan factor could truncate before reaching the cap and silently return partial history. The helper streams funding and spending in lockstep and dedupes inline — the kind of bug the review process caught before a wallet did.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 7 · Indexes" data-title="Five indexes, one WriteBatch">
+  <div class="slide-body">
+    <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
+    <h2>Five indexes, one commit point</h2>
+    <p>Address history, outpoint-spend, tx index, BIP 158 filters, and BIP 352 silent-payment tweaks all ride the same <code>StoreBatch</code> as the chainstate. There is no index-writer thread and no post-commit hook — emission happens inline in <code>connect_block</code>'s loop, right next to the coin mutation it describes:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/chain/connect.rs:643</span></div>
+<pre><code class="lang-rust">batch.coin_removes.push((outpoint, coin.amount, coin.height));
+
+// Address-history index: spending row, atomic with the
+// chainstate update via the same StoreBatch. No-op when
+// the index is disabled.
+crate::index::address::emit_spending(
+    &amp;mut batch, address_index, height, txid,
+    in_idx as u32, &amp;coin, outpoint,
+);
+
+// outpoint_spend index: keyed by the consumed outpoint
+// so Esplora outspend / gettxspendingprevout can answer
+// in O(1). Same flag, same atomic batch.
+crate::index::outpoint_spend::emit::emit_spend(
+    &amp;mut batch, address_index, height, txid,
+    in_idx as u32, outpoint,
+);</code></pre></div>
+    <p>The commit side states the guarantee — and even runs it in reverse: disabling an index while blocks connect clears its completeness marker <em>inside the same batch</em>, so the "this index is trustworthy" bit can't be lost to a crash window:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/storage/rocksdb_store.rs:1519</span></div>
+<pre><code class="lang-rust">// BIP 158 filter index. Filter blob and chained filter header
+// ride the same atomic batch as the chainstate update, so a
+// crash mid-write rolls everything back together — protocol
+// handlers can never observe a filter row whose chain segment
+// is partially committed. Empty-batch fast-path skips both CFs.</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's <code>BaseIndex</code> framework runs each index as a background thread consuming validation events into its own LevelDB, with its own "best block" pointer — an index can lag the tip, and callers must handle "index not synced". That design is <em>why</em> Core deliberately stays out of address indexing at scale, and why electrs exists. satd's single-batch design makes tip-consistency structural — the trade is that the connect path pays index write costs inline, and a fully-indexed node spends serious disk (the address index is ~120–180 GB compressed at mainnet tip, documented and opt-out via <code>--addressindex=0</code>).</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 7 · Indexes" data-title="Address index schema">
+  <div class="slide-body">
+    <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
+    <h2>The address index: the key layout is the query plan</h2>
+    <p>Two column families, one 56-byte key shape. Every field is big-endian and the scripthash prefix leads, so RocksDB's own byte ordering <em>is</em> <code>(height, txid, vout)</code> ascending for a fixed script — <code>get_history</code> is a straight prefix iteration with no sort:</p>
+    <div class="code"><div class="code-head"><span class="path">node-index/src/keys.rs:25</span></div>
+<pre><code class="lang-plain">addr_funding_v2  key: scripthash_prefix[16] || height_be[4] || txid[32] || vout_be[4]  (56 bytes)
+                 value: amount_sat_be[8]                                               (8 bytes)
+
+addr_spending_v2 key: scripthash_prefix[16] || height_be[4] || txid[32] || vin_be[4]   (56 bytes)
+                 value: prev_outpoint_txid[32] || prev_outpoint_vout_be[4]             (36 bytes)</code></pre></div>
+    <p>Truncating the scripthash to 16 bytes saves ~16 bytes per row — "the bulk of the disk-size delta against Bitcoin Core + electrs" — and the module doc defends the collision posture rather than hand-waving it:</p>
+    <div class="code"><div class="code-head"><span class="path">node-index/src/keys.rs:15</span></div>
+<pre><code class="lang-rust">//! ## Collision posture
+//!
+//! Scripthashes are `sha256(scriptPubKey)`. A 16-byte prefix gives
+//! 2^128 codomain; birthday collision probability at 2^32 entries is
+//! ~2^-64 — vanishingly small for honest workloads. A deliberate
+//! collision is feasible at ~2^64 hashing work, but the attack outcome
+//! is "querying scripthash X also returns events for scripthash Y" —
+//! both X and Y are public on-chain data, so no privacy or correctness
+//! violation results for the address-index use case.</code></pre></div>
+    <p>The portable half (trait, key codec, cursor types) lives in the leaf crate <code>node-index</code> so Electrum, Esplora, and SDK consumers depend on it without pulling in <code>ChainState</code>. The companion <code>outpoint_spend</code> CF answers the inverse question the UTXO set can't — "this output is gone, <em>what spent it?</em>" — keyed txid-first so <code>/tx/:txid/outspends</code> fans out in one seek. Its read adapter is fail-closed: a miss is only reported as "unspent" when the completeness marker covers the whole active chain; otherwise it returns <code>Incomplete</code> rather than a plausible lie.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 7 · Indexes" data-title="BIP 158 & BIP 352">
+  <div class="slide-body">
+    <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
+    <h2>Compact filters and silent-payment tweaks</h2>
+    <h3>BIP 158: free inputs, chained headers</h3>
+    <p>satd doesn't reimplement Golomb-coded sets — it feeds <code>bitcoin::bip158::BlockFilter</code> a resolver backed by the prev-output script map that <code>connect_block</code> already built for script verification, so the filter's element set ("this block's output scripts ∪ the scripts it spent") is computed from work the validator was doing anyway. The BIP 157 header chain is one hash step off the previous height's stored header, committed in the same batch — so a <code>getcfheaders</code> responder can never see a half-committed segment. With <code>--peerblockfilters=1</code> the node advertises <code>NODE_COMPACT_FILTERS</code> and serves the modern light-client path (Zeus-embedded, Blixt, Mutiny).</p>
+    <h3>BIP 352: server computes the tweak, client keeps the key</h3>
+    <p>One 33-byte public tweak per eligible transaction — <code>T = input_hash · A</code> — which is exactly what a scanning wallet needs and nothing it shouldn't have. The kernel is shared verbatim between the node's writer and the SDK's client-side scanner, so stored and recomputed tweaks are identical by construction:</p>
+    <div class="code"><div class="code-head"><span class="path">node-sp-index/src/compute.rs:263</span></div>
+<pre><code class="lang-rust">/// Compute the public tweak `T = input_hash · A` for a transaction, or
+/// `None` if it is not silent-payment eligible / must be skipped.
+///
+/// Skip conditions (facts 1–5): coinbase; no taproot output; spends a
+/// future-SegWit output; no contributing inputs; input pubkey sum is the
+/// point at infinity; `input_hash` is zero or ≥ the curve order.
+pub fn compute_tweak(tx: &amp;Transaction, prevout_spks: &amp;[ScriptBuf]) -&gt; Option&lt;TweakEntry&gt; {</code></pre></div>
+    <p>Each row is keyed by height but embeds the hash of the block it describes — self-authentication born directly from this codebase's height-index scars:</p>
+    <div class="code"><div class="code-head"><span class="path">node-sp-index/src/keys.rs:14</span></div>
+<pre><code class="lang-rust">//! The embedded `block_hash` makes each row **self-authenticating**: any
+//! reader (the D4 rescan fast path, streaming replay, the fallback RPC)
+//! verifies the row describes the block it expects without consulting the
+//! height→hash index — which this codebase has learned never to treat as
+//! truth (the #322 accept_header clobber, the testnet4 MTP wedge). A
+//! mid-read reorg surfaces as a hash mismatch and the reader falls back
+//! or rejects rather than trusting height alone.</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core implements BIP 157/158 indexing with a more limited P2P serving arm. It has no silent-payment index at all — SP wallets scanning against Core must download and process full blocks themselves. satd moves the one-ECDH-per-tx precomputation server-side while the scan key never leaves the client's device.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 7 · Indexes" data-title="Deferred backfill">
+  <div class="slide-body">
+    <p class="eyebrow">Part 7 <span class="sep">·</span> Indexes</p>
+    <h2>Backfill: turning on an index without a reindex</h2>
+    <p><code>backfillindex &lt;address|blockfilter|silentpayment&gt;</code> walks history <em>while the node keeps validating new blocks</em>. The safety argument is a height partition, stated identically in all three runners:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/index/address/runner.rs:38</span></div>
+<pre><code class="lang-rust">//! ## Concurrency with live `connect_block`
+//!
+//! - Backfill writes addr-CF rows for heights ≤ snapshot
+//! - Live writes addr-CF rows for heights &gt; snapshot
+//! - Disjoint height prefixes → no key collisions; an exact-key
+//!   duplicate via reorg-disconnect→reconnect at h ≤ snapshot is
+//!   caught by the per-batch reorg check above and aborts the run.</code></pre></div>
+    <p>The one way the partition breaks is a reorg dragging the anchor off the active chain — so the runner re-verifies the anchor by walking back from the live tip <em>before and after every single-block batch</em>, and the cursor advance rides the same batch as the rows it describes, making resume-after-<code>kill&nbsp;-9</code> exact. Pre-flight disk checks refuse to start under known mainnet footprints: 80 GB free for address (the temp CF peaks ~56 GB), 10 GB for filters (~6 GB of blobs), 6 GB for SP tweaks (~3.9 GB).</p>
+    <h3>stint.rs: an ETA that refuses to lie</h3>
+    <p>The shared rate meter behind <code>getindexinfo</code>'s time-remaining estimate is a bug story in module form — the old formula divided wall-clock-since-first-start by progress, so a 48-hour pause was extrapolated as if the walk had been grinding through it:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/index/stint.rs:23</span><span>why nothing is persisted</span></div>
+<pre><code class="lang-rust">//! ## Why nothing is persisted
+//!
+//! #546 suggested persisting an `elapsed_working_seconds` (or a resume
+//! height) in the cursor. This deliberately does not: an accumulator has
+//! to be flushed periodically or a `kill -9` loses it, and a persisted
+//! anchor goes stale across exactly the crash-and-restart case the fix
+//! exists for ... An in-memory anchor cannot survive the downtime by
+//! construction. The cost is a few seconds of "no estimate" after a
+//! restart while the new stint accumulates.</code></pre></div>
+    <div class="code"><div class="code-head"><span class="path">node/src/index/stint.rs:187</span><span>API design as bug prevention</span></div>
+<pre><code class="lang-rust">/// `#[must_use]` because binding it to `_` instead of a named `_stint`
+/// drops it immediately, clearing the anchor before the first block is
+/// walked and silently disabling every ETA. That is a one-character
+/// mistake with no other symptom.
+#[must_use = "the stint ends the moment this guard is dropped; bind it for the \
+              duration of the walk (`let _stint = ...`), not to `_`"]
+pub struct StintGuard(Arc&lt;StintMeter&gt;);</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core's indexes sync themselves from genesis when enabled — the same catch-up concept — but the sync <em>is</em> the index's normal operating mode (the background-thread design), whereas satd's backfill is a bounded, pausable, disk-checked repair operation on an otherwise tip-synchronous index.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 8 · Streaming & Ops" data-title="The event envelope">
+  <div class="slide-body">
+    <p class="eyebrow">Part 8 <span class="sep">·</span> Streaming &amp; Ops</p>
+    <h2>The Streaming Consumption API: one schema, three transports</h2>
+    <p>The spec (<code>docs/api/streaming.md</code>) names the three gaps every existing node API leaves — descriptor lifecycle, outpoint-level subscription, cursor-based replay — and builds one surface to close them, with <em>outpoint subscription as the base primitive</em>. Every event is a versioned, edge-stamped envelope carried identically over gRPC, WebSocket/SSE, and ZMQ:</p>
+    <div class="code"><div class="code-head"><span class="path">satd-events-proto/proto/satd/events/v1/events.proto:548</span></div>
+<pre><code class="lang-plain">message Cursor {
+  uint32 height      = 1; // block height of the last delivered confirmed item
+  uint32 tx_index    = 2; // index within that block of the last delivered tx
+  uint64 mempool_seq = 3; // best-effort mempool high-water (advisory)
+  // Per-process epoch nonce of the issuing publisher. node_id is stable
+  // across restarts, but mempool_seq resets to 0 each daemon start; on a
+  // from_cursor resume the server discards mempool_seq when this differs
+  // from the live instance (daemon restarted since the cursor was issued).
+  // Confirmed (height) replay is instance-independent and unaffected.
+  uint64 instance_id = 4;
+}
+
+// Per-event identity stamp applied at the publisher's bridge layer.
+message EdgeStamp {
+  bytes node_id = 1;          // 16 raw bytes (UUIDv4)
+  string region = 2;          // up to 8 ASCII bytes; empty = unset
+  uint64 edge_seen_at_ns = 3; // monotonic since publisher start
+  uint64 edge_wall_ns = 4;    // wall-clock ns since Unix epoch
+  uint64 seq = 5;             // monotonic per publisher, starts at 1
+}</code></pre></div>
+    <p>The <code>categories</code> bitmask encodes a compatibility promise: two categories are excluded from the <code>categories = 0</code> "all" default, so a pre-existing subscriber never starts receiving a new event type after a node upgrade:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/events/envelope.rs:349</span></div>
+<pre><code class="lang-rust">/// Categories excluded from the `categories = 0` ("all") default: opt-in,
+/// high-volume, or custody-adjacent streams a legacy subscriber must not begin
+/// receiving after a node upgrade.
+pub const EXPLICIT_ONLY_CATEGORIES: u32 = CATEGORY_TWEAKS | CATEGORY_STATUS;</code></pre></div>
+    <p>Replay reads the durable block store (there is no separate event log), resolves heights by walking <code>prev_blockhash</code> from the tip rather than the pollutable height index, caps spans at 10,000 blocks, and de-dups the replay→live seam by <code>(height, hash)</code> — keying on the hash is what makes a reorg at the seam correct.</p>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core ships <code>-zmqpub*</code>: one raw-bytes ZMQ topic per event type, no provenance, no ordering guarantee across topics, no replay — a missed message is simply gone, so every consumer rebuilds state by polling RPC. satd deliberately does not implement Core's topic scheme; the structured envelope replaces it, with a documented migration path.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 8 · Streaming & Ops" data-title="Watch streams">
+  <div class="slide-body">
+    <p class="eyebrow">Part 8 <span class="sep">·</span> Streaming &amp; Ops</p>
+    <h2>Watch streams: inverted indexes, zero cost when unused</h2>
+    <p>Each connection registers a watch-set — outpoints, scripthashes (with per-script value floors), txid lifecycles, depth alarms, privacy-preserving k-bit script prefixes, BIP 352 scan keys. Matching is O(1) per transaction via inverted indexes, and lock-free counters gate every expensive step so an unwatched node does no extra work at all:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/events/watch.rs:423</span></div>
+<pre><code class="lang-rust">/// Registry of per-subscriber outpoint/script watch-sets with O(1)
+/// matching. Cheap to consult when empty (a single atomic load).
+pub struct WatchRegistry {
+    inner: RwLock&lt;Inner&gt;,
+    next_id: AtomicU64,
+    /// Lock-free count of registered watch *items* (outpoints + scripts)
+    /// across all subscribers. The matcher checks this before re-reading a
+    /// block, so a node with no watchers does zero extra work.
+    watch_items: AtomicUsize,
+    /// Lock-free count of registered *script* items only. Gates the
+    /// input-side script match: the matcher fetches a block's undo data (to
+    /// recover spent prevout scriptPubKeys) only when some script is watched,
+    /// so an outpoint-only watch-set pays nothing extra.
+    script_items: AtomicUsize,</code></pre></div>
+    <p>Spend-side script matching is the subtle half: a spending transaction doesn't carry the prevout's script, so confirmed spend matches are recovered from the block's undo data — and mempool entries capture <code>sha256(scriptPubKey)</code> per input at admission so the matcher can match mempool spends without a UTXO lookup. Scan-key secrets are zeroize-on-drop, never persisted, never logged.</p>
+    <div class="tradeoff"><span class="tag">Per-connection by design</span>
+    The server holds no principal-keyed watch state: when a stream drops, its watch-set and quota leases die with it. That's a deliberate simplification — it means the <em>SDK</em> owns re-registration, which is exactly what the resilient clients on the next slide do.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 8 · Streaming & Ops" data-title="The SDKs">
+  <div class="slide-body">
+    <p class="eyebrow">Part 8 <span class="sep">·</span> Streaming &amp; Ops</p>
+    <h2>Two first-party SDKs, held at parity by a harness</h2>
+    <p>The Rust SDK (<code>satd-events-client</code>, 9.3k lines) and Go SDK (<code>clients/go</code>, package <code>satdevents</code>, 24k lines) are full peers: same resilient-client design, same twelve mirrored examples, and a differential parity harness (<code>clients/go/cmd/paritydump</code>) that drives both against one node and diffs rendered events. The Go E2E suite gates every satd PR.</p>
+    <div class="code"><div class="code-head"><span class="path">satd-events-client/src/resilient_watch.rs:1</span><span>why two recovery stories</span></div>
+<pre><code class="lang-rust">//! [`ResilientSubscription`](crate::ResilientSubscription) wraps the one-way
+//! `Subscribe` firehose; [`ResilientWatch`] is its twin for the bidirectional
+//! `Watch` stream. It exists because the two recovery stories differ:
+//!
+//! - **The watch-set is per-connection.** The server holds no principal-keyed
+//!   state — when a `Watch` stream drops, its server-side watch-set and quota
+//!   leases are torn down with it. A reconnect therefore starts blank, so the
+//!   SDK has to **mirror** every add/remove the caller makes and **re-register**
+//!   the whole set on the new stream before anything matches again.
+//! - **Re-anchor is in-band and deterministic (#439/#441).** Once the watch-set
+//!   is back, a single `set_cursor` replays confirmed history; the server
+//!   answers with exactly one [`Event::CursorAccepted`] ... or
+//!   [`Event::CursorRejected`]. [`ResilientWatch`] drives its catch-up off those
+//!   deterministic results instead of inferring a gap from the event flow.</code></pre></div>
+    <p>The SDKs earn their keep in the details — here's the Go client closing a race grpc-go leaves open:</p>
+    <div class="code"><div class="code-head"><span class="path">clients/go/client.go:470</span></div>
+<pre><code class="lang-plain">// Wait for the server's response headers before handing the stream back.
+//
+// grpc-go starts a server-streaming call without waiting for the server to
+// accept it, so without this Subscribe returns before the node has
+// registered the subscription - and anything the caller triggers in that
+// window (mining a block, broadcasting a transaction) is simply not on the
+// stream. That silent race is a bad default for an event API: "subscribe,
+// then do the thing" has to work.
+if _, err := sc.Header(); err != nil {</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core ships no client SDKs; the ecosystem builds its own (NBitcoin, python-bitcoinrpc, rust-bitcoincore-rpc) against the RPC/ZMQ surfaces, each solving reconnection and state recovery independently — or, commonly, not.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 8 · Streaming & Ops" data-title="Alerts & health">
+  <div class="slide-body">
+    <p class="eyebrow">Part 8 <span class="sep">·</span> Streaming &amp; Ops</p>
+    <h2>Health detectors and an -alertnotify that actually fires</h2>
+    <p>Six conditions the daemon detects about itself — tip stall, low disk, mempool congestion, peer starvation, IBD completion, deep reorg — each raised simultaneously as a streaming <code>status</code> event, a <code>getwarnings</code> entry (which drives Core's <code>-alertnotify</code>), and a Prometheus gauge, all from a single transition so the three surfaces can never disagree. Detectors are level-triggered with hysteresis gaps, because clearing at the raise threshold turns a hovering metric into a pager storm. One detector carries a sharp design note:</p>
+    <div class="code"><div class="code-head"><span class="path">node/src/events/status.rs:41</span></div>
+<pre><code class="lang-rust">/// No block connected for longer than the configured window. Clears when
+/// the next block connects.
+///
+/// Deliberately *not* suppressed during initial block download:
+/// `is_initial_block_download()` compares the tip header's timestamp
+/// against the wall clock rather than tracking sync progress, so a node
+/// that was caught up and then wedged re-enters it exactly when the
+/// operator most needs paging. A node that is genuinely syncing connects
+/// blocks continuously and never crosses the threshold on its own.
+TipStall,</code></pre></div>
+    <p>Outbound webhooks come from <code>alertfile=</code> — a TOML file because a hook has a secret and a filter, and Core's flat first-wins config can't express several of those. Every delivery is HMAC-signed over a versioned signing string (timestamp, delivery ID, hook ID, body) with idempotency and attempt headers; a misconfigured receiver's 404 is <em>dropped</em> after retries rather than pinning the queue — "skipping the event loses one delivery; retrying it forever loses all of them."</p>
+    <div class="code"><div class="code-head"><span class="path">satd-alert/src/config.rs:153</span><span>secrets posture, down to Debug</span></div>
+<pre><code class="lang-rust">/// One configured webhook.
+///
+/// `Debug` is hand-written: a derived one renders `secret` in full, and a
+/// single `tracing::debug!(?hook)` added later would put a signing key in the
+/// log. The crate already takes this posture for watch-set scan keys.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Hook {</code></pre></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core ships <code>-alertnotify</code> but raises almost nothing through it in practice — most operators have never seen it run. There is no native health model, no webhook surface, no metrics endpoint; the ecosystem answer is external exporters with inconsistent metric names.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 8 · Streaming & Ops" data-title="Ops tooling">
+  <div class="slide-body">
+    <p class="eyebrow">Part 8 <span class="sep">·</span> Streaming &amp; Ops</p>
+    <h2>The operator's toolbox: metrics, watchdog, TUI, CLI, MCP</h2>
+    <h3>/metrics as a stability contract</h3>
+    <p><code>--metricsbind</code> serves Prometheus text format plus <code>/healthz</code> and <code>/readyz</code> probes. The metric schema (<code>satd_*</code>, Prometheus suffix conventions) is a declared stability commitment, and the rendering layer encodes a parser landmine: a repeated <code># HELP</code> makes strict parsers discard the <em>entire page</em>, so headers and samples are separate functions and a test parses the rendered page to assert exactly one header per family.</p>
+    <h3>A watchdog that survives the runtime it watches</h3>
+    <div class="code"><div class="code-head"><span class="path">node/src/stall_watchdog.rs:3</span></div>
+<pre><code class="lang-rust">//! Two dedicated `std::thread`s — deliberately not tokio tasks. During the
+//! 2026-05 mainnet IBD wedge the entire tokio runtime parked itself (every
+//! worker in `futex_do_wait`, no progress for nine hours, RPC accept queue
+//! piled up to 3084 backlogged connections). A watchdog scheduled on the
+//! same runtime that froze would have frozen with it, so this module spawns
+//! its own OS threads.</code></pre></div>
+    <p>On stall it dumps per-thread kernel state from <code>/proc/self/task/*</code> for the post-mortem, then SIGTERMs itself — <code>abort()</code> only if the graceful path is also stuck.</p>
+    <div class="cols"><div>
+    <h3>sat-tui &amp; sat-cli</h3>
+    <p>The TUI adapts to what the node is doing — IBD bitmap view, steady-state, mempool, chain — plus panes for reorgs, warnings, and RPC failure. <code>sat-cli</code> is a two-level <code>noun verb</code> tree (<code>chain info</code>, <code>mempool top</code>, <code>debug blockfile-audit</code>) with pretty output by default and <code>-o json</code> for scripts; the legacy raw form (<code>sat-cli getblockchaininfo</code>) still works. PSBT signing is local-only: keys read from stdin, never sent over RPC.</p>
+    </div><div>
+    <h3>MCP server</h3>
+    <p>The Model Context Protocol listener re-exports the node's own RPC layer as typed tools for AI agents — each <code>#[tool]</code> is a one-line delegation into the same functions JSON-RPC calls, with schemas generated from the same Rust parameter structs the handlers destructure. No HTTP hop, no second implementation, and its metrics flags mirror the Prometheus context so both surfaces report identical state by construction.</p>
+    </div></div>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    <code>bitcoin-cli</code> plus <code>debug.log</code>. No TUI, no MCP, no native metrics; the watchdog role falls to systemd and the operator's own alerting.</div>
+  </div>
+</section>
+
+
+<!-- ============================== CLOSING ============================== -->
+
+<section class="slide" data-part="Part 9 · satd vs Core" data-title="Defaults that differ">
+  <div class="slide-body">
+    <p class="eyebrow">Part 9 <span class="sep">·</span> satd vs Core</p>
+    <h2>Behavioral defaults that intentionally differ</h2>
+    <p>Both behaviors sit inside the compatibility envelope; only the default differs. Operators who need Core's default set the corresponding flag.</p>
+    <div class="tablewrap"><table>
+      <tr><th>Default</th><th class="th-core">Bitcoin Core</th><th class="th-satd">satd</th><th>Reasoning</th></tr>
+      <tr><td>Esplora REST listener</td><td class="core">not present</td><td class="satd">on (loopback, unauth)</td><td>Native surface; loopback default keeps exposure safe. <code>--esplora=0</code> to disable.</td></tr>
+      <tr><td>Address index</td><td class="core">not present</td><td class="satd">on</td><td>Required by Esplora and Electrum. <code>--addressindex=0</code> on storage-constrained boxes.</td></tr>
+      <tr><td>/metrics server</td><td class="core">not present</td><td class="satd">off</td><td>Enable with <code>--metricsbind</code>.</td></tr>
+      <tr><td>Electrum server</td><td class="core">not present</td><td class="satd">off</td><td>Enable with <code>--electrum=1</code>.</td></tr>
+      <tr><td>Block-filter index</td><td class="core">off</td><td class="satd">off</td><td>Matches Core; <code>--blockfilterindex=basic</code>.</td></tr>
+      <tr><td><code>-mempoolfullrbf</code></td><td class="core">on (v28+)</td><td class="satd">on</td><td>Matches Core post-v28.</td></tr>
+      <tr><td><code>-v2transport</code></td><td class="core">on</td><td class="satd">on</td><td>Matches; satd adds opt-in <code>-v2only</code>.</td></tr>
+      <tr><td><code>-listenonion</code></td><td class="core">on (silent no-op without Tor)</td><td class="satd">off; on if <code>-torcontrol</code> set</td><td>Avoids dialing the Tor control port on every boot; explicit <code>-torcontrol</code> implies it on.</td></tr>
+      <tr><td>New blocks dir obfuscation</td><td class="core">XOR on (v28+)</td><td class="satd">plaintext unless <code>blocksxor=1</code></td><td>Either way the key lives in <code>blocks/xor.dat</code>, so each can read the other's directory.</td></tr>
+      <tr><td>Log destination</td><td class="core"><code>debug.log</code> + rotation</td><td class="satd">stdout only</td><td>Rotation delegated to journald/container runtime — which frees <code>SIGHUP</code> for config reload.</td></tr>
+    </table></div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 9 · satd vs Core" data-title="Intentional exclusions">
+  <div class="slide-body">
+    <p class="eyebrow">Part 9 <span class="sep">·</span> satd vs Core</p>
+    <h2>What satd will not ship</h2>
+    <p class="lede">Each exclusion is a scope decision, not a gap. The pattern: drop surfaces that are deprecated, privacy-hostile, or better served by the modern replacement satd ships natively.</p>
+    <div class="tablewrap"><table>
+      <tr><th>Excluded surface</th><th>Why</th><th class="th-satd">The satd answer</th></tr>
+      <tr><td>Wallet (BDB legacy, WIF-keyed RPCs, descriptor GUI)</td><td>Keyless daemon by charter — no private keys in the process, ever.</td><td class="satd">Full PSBT construction/decode/analyze/combine/finalize over RPC; <code>sat-cli signpsbtwithkey</code> signs <em>client-side</em>, key read from stdin, never traverses RPC.</td></tr>
+      <tr><td>BIP 37 bloom filters</td><td>Deprecated in Core since v0.19; privacy leak and DoS vector.</td><td class="satd">BIP 157/158 compact filters, indexed and served natively.</td></tr>
+      <tr><td><code>MemPool</code> P2P message</td><td>Rarely used outside bloom-filter clients.</td><td class="satd">The mempool subscription stream over RPC/WS.</td></tr>
+      <tr><td>Core-style <code>-zmqpub*</code> raw topics</td><td>One raw-bytes topic per event type; no provenance, no replay.</td><td class="satd">Structured event envelope (gRPC + ZMQ frames) with node identity, heartbeat, and cursor replay.</td></tr>
+      <tr><td>GPG release signing</td><td>Project-wide signing-stack decision.</td><td class="satd">minisign (artifacts) + cosign keyless (containers) + SSH signatures (git tags).</td></tr>
+    </table></div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 9 · satd vs Core" data-title="How parity is proven">
+  <div class="slide-body">
+    <p class="eyebrow">Part 9 <span class="sep">·</span> satd vs Core</p>
+    <h2>How Core parity is proven, not promised</h2>
+    <p>Compatibility claims are backed by machinery, running in CI on every PR:</p>
+    <ul>
+      <li><strong>Script shadow validation</strong> — every mainnet script from genesis through ~945k blocks executed on both the Rust engine and <code>libbitcoinconsensus</code>, asserting identical accept/reject. Zero divergence.</li>
+      <li><strong>Differential block-acceptance battery</strong> — static fixtures ported from Core's own block-acceptance tests, plus a generative fuzzer that dual-submits adversarial blocks to satd <em>and a live bitcoind</em> and asserts identical verdicts.</li>
+      <li><strong>Third-party client canaries (PR-gating)</strong> — BDK, Bitcoin Core interop, LND Neutrino, Electrum, Core Lightning, NBXplorer, BTCPay run against every PR. Each canary has caught real compatibility bugs before merge.</li>
+      <li><strong>Fuzzing</strong> — a standalone cargo-fuzz workspace under nightly + sanitizers, run on a schedule.</li>
+      <li><strong>Reproducible builds</strong> — Nix flake instead of Core's Guix; musl-static binaries so the tested artifact is the shipped artifact.</li>
+    </ul>
+    <div class="corebox"><span class="tag">Bitcoin Core equivalent</span>
+    Core <em>is</em> the reference, so its tests define behavior rather than check conformance to another implementation. satd inverts this: Core's observable behavior is the specification, and the test suite exists to detect any drift from it — the same posture btcd and libbitcoin take, but enforced with a live differential harness rather than ported unit tests alone.</div>
+  </div>
+</section>
+
+<section class="slide" data-part="Part 9 · satd vs Core" data-title="Migrating from Core">
+  <div class="slide-body">
+    <p class="eyebrow">Part 9 <span class="sep">·</span> satd vs Core</p>
+    <h2>Migration: config drops in, chainstate does not</h2>
+    <p>A Core datadir is <strong>not</strong> byte-compatible (LevelDB vs RocksDB), but the flat block files are — including Core v28's XOR obfuscation, whose key is read automatically from <code>blocks/xor.dat</code>.</p>
+    <ul>
+      <li>Stop <code>bitcoind</code>; keep <code>blocks/</code> to skip re-downloading the chain. Core's <code>rev*.dat</code> undo files and <code>blocks/index</code> are ignored — satd keeps undo data and the block index in RocksDB.</li>
+      <li>Move Core's <code>chainstate/</code>, <code>indexes/</code>, <code>wallets/</code> aside; satd doesn't read them.</li>
+      <li>Start satd with the same <code>bitcoin.conf</code>. <code>-reindex-chainstate</code> replays the flat files into RocksDB.</li>
+      <li>Optionally <code>backfillindex address</code> / <code>blockfilter</code> / <code>silentpayment</code> — backfills run concurrently with live validation, so the node serves correctly with partial history while they progress.</li>
+    </ul>
+    <p>One caveat: <code>peers.dat</code> shares Core's filename but uses a satd-native versioned format (magic <code>SADR</code>). An unrecognized file is silently discarded and the address set rebuilt from DNS seeds.</p>
+  </div>
+</section>
+
+<section class="slide" data-part="Closing" data-title="Where to go next">
+  <div class="slide-body title-slide">
+    <p class="eyebrow">Closing</p>
+    <h2>Where to go next</h2>
+    <div class="title-rule"></div>
+    <ul style="font-size:17px">
+      <li><strong>Operator Manual</strong> — <a href="https://epochbtc.github.io/satd/">epochbtc.github.io/satd</a>: configuration reference, disk footprint, streaming tutorial, packaging.</li>
+      <li><strong><code>CORE_DIFFERENCES.md</code></strong> — the authoritative catalog of every intentional deviation from Bitcoin Core.</li>
+      <li><strong><code>STABILITY_POLICY.md</code></strong> — the Tier 1/2/3 compatibility contract and deprecation staging.</li>
+      <li><strong><code>docs/api/streaming.md</code></strong> — the wire-level streaming API specification.</li>
+      <li><strong><code>MANIFESTO.md</code></strong> — why a second implementation, in the project's own words.</li>
+    </ul>
+    <p class="title-meta">Generated from satd master <code>4874b537</code> (2026-08-19) · every snippet verbatim from source</p>
+  </div>
+</section>
+
+</div>
+
+<!-- ============ chrome ============ -->
+<div id="toc" role="dialog" aria-label="Table of contents">
+  <div class="slide-body">
+    <h2>Contents</h2>
+    <ol id="toc-list"></ol>
+    <p style="color:var(--ink-faint);font-size:13.5px">Press <span class="kbd">t</span> or <span class="kbd">esc</span> to close.</p>
+  </div>
+</div>
+<div id="chrome">
+  <button class="navbtn" id="prev" aria-label="Previous slide">←</button>
+  <button class="navbtn" id="next" aria-label="Next slide">→</button>
+  <span class="counter" id="counter"></span>
+  <span id="slide-title-now"></span>
+  <button class="navbtn" id="tocbtn" aria-label="Table of contents">contents</button>
+  <a class="navbtn" href="./" style="text-decoration:none">manual</a>
+  <span class="kbd-hint"><span class="kbd">←</span><span class="kbd">→</span> navigate · <span class="kbd">t</span> contents</span>
+</div>
+
+<script>
+(function () {
+  /* ---------- tiny Rust/TOML syntax highlighter ---------- */
+  var KW = new Set(('pub fn let mut struct enum trait impl for in if else match while loop return use mod crate self Self super where async await move dyn ref static const type as break continue unsafe extern true false Some None Ok Err').split(' '));
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function hlRust(src) {
+    var out = '', i = 0, n = src.length;
+    while (i < n) {
+      var rest = src.slice(i), m;
+      if ((m = rest.match(/^\/\/[^\n]*/)))       { out += '<span class="tok-com">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) { out += '<span class="tok-com">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^r?"(?:\\.|[^"\\])*"/))) { out += '<span class="tok-str">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^'(?:\\.|[^'\\])'/)))  { out += '<span class="tok-str">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^'[a-z_][a-z0-9_]*/))) { out += '<span class="tok-lt">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^#!?\[[^\]]*\]/)))     { out += '<span class="tok-mac">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^[A-Za-z_][A-Za-z0-9_]*!/))) { out += '<span class="tok-mac">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^0x[0-9a-fA-F_]+|^\d[\d_]*(\.\d+)?([ui](8|16|32|64|128|size)|f32|f64)?/))) { out += '<span class="tok-num">' + esc(m[0]) + '</span>'; i += m[0].length; continue; }
+      if ((m = rest.match(/^[A-Za-z_][A-Za-z0-9_]*/))) {
+        var w = m[0], next = src.slice(i + w.length).match(/^\s*\(/);
+        if (KW.has(w))                 out += '<span class="tok-kw">' + w + '</span>';
+        else if (/^[A-Z]/.test(w))     out += '<span class="tok-ty">' + w + '</span>';
+        else if (next)                 out += '<span class="tok-fn">' + w + '</span>';
+        else                           out += w;
+        i += w.length; continue;
+      }
+      out += esc(src[i]); i++;
+    }
+    return out;
+  }
+  function hlPlain(src) {
+    return esc(src)
+      .replace(/(^|\n)(#[^\n]*)/g, function (a, p, c) { return p + '<span class="tok-com">' + c + '</span>'; })
+      .replace(/"[^"\n]*"/g, function (s) { return '<span class="tok-str">' + s + '</span>'; });
+  }
+  document.querySelectorAll('pre code').forEach(function (el) {
+    var lang = el.className.match(/lang-(\w+)/);
+    var src = el.textContent.replace(/^\n+|\s+$/g, '');
+    el.innerHTML = (lang && lang[1] === 'rust') ? hlRust(src) : hlPlain(src);
+  });
+
+  /* ---------- deck navigation ---------- */
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var idx = 0;
+  var counter = document.getElementById('counter');
+  var titleNow = document.getElementById('slide-title-now');
+  var progress = document.getElementById('progress');
+  var toc = document.getElementById('toc');
+
+  function show(i, push) {
+    idx = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach(function (s, j) { s.classList.toggle('active', j === idx); });
+    var s = slides[idx];
+    counter.textContent = (idx + 1) + ' / ' + slides.length;
+    titleNow.textContent = (s.dataset.part ? s.dataset.part + ' — ' : '') + s.dataset.title;
+    progress.style.width = ((idx + 1) / slides.length * 100) + '%';
+    s.scrollTop = 0;
+    if (push !== false) { try { history.replaceState(null, '', '#' + (idx + 1)); } catch (e) {} }
+  }
+  function nav(d) { show(idx + d); }
+
+  /* TOC */
+  var list = document.getElementById('toc-list');
+  var lastPart = null;
+  slides.forEach(function (s, i) {
+    if (s.dataset.part !== lastPart && s.dataset.part) {
+      lastPart = s.dataset.part;
+      var h = document.createElement('li');
+      h.className = 'part'; h.textContent = s.dataset.part;
+      list.appendChild(h);
+    }
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + (i + 1);
+    a.textContent = s.dataset.title;
+    a.onclick = function (e) { e.preventDefault(); toc.classList.remove('open'); show(i); };
+    li.appendChild(a); list.appendChild(li);
+  });
+  function toggleToc() { toc.classList.toggle('open'); }
+
+  document.getElementById('prev').onclick = function () { nav(-1); };
+  document.getElementById('next').onclick = function () { nav(1); };
+  document.getElementById('tocbtn').onclick = toggleToc;
+  document.addEventListener('keydown', function (e) {
+    if (e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (toc.classList.contains('open') && (e.key === 'Escape' || e.key === 't')) { toc.classList.remove('open'); e.preventDefault(); return; }
+    switch (e.key) {
+      case 'ArrowRight': case 'PageDown': case 'j': case ' ': nav(1); e.preventDefault(); break;
+      case 'ArrowLeft': case 'PageUp': case 'k': case 'Backspace': nav(-1); e.preventDefault(); break;
+      case 'Home': show(0); e.preventDefault(); break;
+      case 'End': show(slides.length - 1); e.preventDefault(); break;
+      case 't': toggleToc(); e.preventDefault(); break;
+    }
+  });
+
+  var h = parseInt((location.hash || '').slice(1), 10);
+  show(isNaN(h) ? 0 : h - 1, false);
+})();
+</script>
+
+</body>
+</html>

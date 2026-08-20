@@ -18,6 +18,7 @@
 
 <p>
   <a href="https://epochbtc.github.io/satd/"><b>Operator Manual</b></a> &nbsp;·&nbsp;
+  <a href="https://epochbtc.github.io/satd/tour.html">Code Tour</a> &nbsp;·&nbsp;
   <a href="MANIFESTO.md">Manifesto</a> &nbsp;·&nbsp;
   <a href="CORE_DIFFERENCES.md">Core Differences</a> &nbsp;·&nbsp;
   <a href="ROADMAP.md">Roadmap</a> &nbsp;·&nbsp;

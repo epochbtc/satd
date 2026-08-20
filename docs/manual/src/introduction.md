@@ -47,6 +47,9 @@ the scale-out trade-off.
   shared-chainstate subsystem of `satd` itself rather than as a companion
   process. The [Disk Footprint & Indices](disk-footprint.md) chapter covers
   what the single shared store costs and provides.
+- **Architecture**: the [guided code tour](code-tour.md), a slide deck that
+  walks the source module by module with verbatim snippets and Bitcoin Core
+  comparisons.
 - **Packaging & Deployment**: the authoritative [packaging
   contract](packaging.md) for downstream distributions. File layout, signals,
   ports, the release and signing pipeline, and reproducible builds.

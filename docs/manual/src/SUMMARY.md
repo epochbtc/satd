@@ -24,6 +24,10 @@
 - [Go SDK (`satdevents`)](go-sdk.md)
 - [MCP Server](mcp.md)
 
+# Architecture
+
+- [Guided Code Tour](code-tour.md)
+
 # Packaging & Deployment
 
 - [Packaging satd](packaging.md)
