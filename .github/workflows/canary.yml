@@ -48,6 +48,11 @@
 
 name: Canary
 
+# Records the feature mode in the run's title. STABILITY_POLICY.md makes a
+# green `features: on` run a release gate, and a gate you have to open a job
+# log to identify is one that gets mistaken for an ordinary run.
+run-name: Canary (features=${{ inputs.features || 'off' }})
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -67,10 +72,15 @@ on:
           - "off"
           - "on"
 
-# Cancel superseded PR runs — the same posture as ci.yml. Doesn't
-# apply to scheduled / dispatched runs (each is its own ref).
+# Cancel superseded PR runs — the same posture as ci.yml.
+#
+# The feature mode is part of the key. Without it a `features: on` dispatch
+# and the weekly cron on the same ref cancel each other, which would silently
+# destroy the very run a release is gated on. (The comment here used to claim
+# dispatched runs were each their own ref. They are not: two dispatches on
+# master share `refs/heads/master`.)
 concurrency:
-  group: canary-${{ github.ref }}
+  group: canary-${{ github.ref }}-${{ inputs.features || 'off' }}
   cancel-in-progress: true
 
 permissions:

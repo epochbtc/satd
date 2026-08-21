@@ -131,6 +131,10 @@ The profile is fixed inside `boot-satd.sh` rather than passed per job, so that "
 - The two streaming listeners bind port `0` and nothing connects to them, and the webhook endpoint is the discard port. The surfaces are *running*, not *exercised*; what is under test is whether a node carrying that extra work still serves Esplora, Electrum, RPC and P2P identically.
 - The Bitcoin Core block-acceptance differential job does not use `boot-satd.sh` (it drives satd from a Rust integration test), so it runs at defaults regardless of the input.
 
+A `features: on` run writes its mode into the run title (`Canary (features=on)`), and the feature mode is part of the concurrency key, so a dispatch cannot be cancelled by the weekly cron on the same ref.
+
+Expect retry noise in the log of a `features: on` run. The alert webhook points at the discard port, so every delivery attempt is refused and retried with backoff until it ages out. Lines like `webhook request failed; retrying` are the configuration working, not a fault to chase.
+
 **Cutting a release requires one green `features: on` dispatch run** on the release commit, in addition to the PR-gating runs at defaults.
 
 ### Deferred
