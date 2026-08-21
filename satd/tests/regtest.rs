@@ -5498,6 +5498,122 @@ fn sp_p2tr_script(seed: u8) -> bitcoin::ScriptBuf {
     bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
 }
 
+/// The keypair behind [`sp_p2tr_script`], for key-path spending one of those
+/// outputs back out again.
+fn sp_p2tr_keypair(seed: u8) -> bitcoin::secp256k1::Keypair {
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret");
+    Keypair::from_secret_key(&secp, &sk)
+}
+
+/// One transaction spending a P2WPKH coinbase AND a P2TR output, paying a
+/// taproot output.
+///
+/// The mixed input types are the whole point. `prev_output_scripts` feeds BIP
+/// 352 input *classification*: the tweak takes its pubkey from the witness for
+/// a P2WPKH input but from the output key for a P2TR one. A block whose spent
+/// outputs are all the same type cannot distinguish a correct undo walk from
+/// one that hands back the wrong coin, because the wrong coin classifies
+/// identically. With one of each, a misaligned walk extracts the wrong pubkey
+/// and the recomputed tweak changes.
+fn sp_build_mixed_input_spend(
+    node: &TestNode,
+    cb_height: u64,
+    cb_wallet: &DeterministicWallet,
+    p2tr_outpoint: bitcoin::OutPoint,
+    p2tr_value_sat: u64,
+    p2tr_seed: u8,
+    dest: bitcoin::ScriptBuf,
+    fee_sat: u64,
+) -> String {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::str::FromStr;
+
+    const CB_VALUE_SAT: u64 = 50 * 100_000_000;
+    let cb_txid = bitcoin::Txid::from_str(&common::coinbase_txid_at(node, cb_height))
+        .expect("txid parse");
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint { txid: cb_txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_ffff),
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: p2tr_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_ffff),
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(CB_VALUE_SAT + p2tr_value_sat - fee_sat),
+            script_pubkey: dest,
+        }],
+    };
+
+    let secp = Secp256k1::new();
+    let prevouts = [
+        TxOut {
+            value: Amount::from_sat(CB_VALUE_SAT),
+            script_pubkey: cb_wallet.address.script_pubkey(),
+        },
+        TxOut {
+            value: Amount::from_sat(p2tr_value_sat),
+            script_pubkey: sp_p2tr_script(p2tr_seed),
+        },
+    ];
+
+    let (ecdsa_sighash, taproot_sighash) = {
+        let mut cache = SighashCache::new(&spend);
+        let e = cache
+            .p2wpkh_signature_hash(
+                0,
+                &cb_wallet.address.script_pubkey(),
+                Amount::from_sat(CB_VALUE_SAT),
+                EcdsaSighashType::All,
+            )
+            .expect("p2wpkh sighash");
+        let t = cache
+            .taproot_key_spend_signature_hash(
+                1,
+                &Prevouts::All(&prevouts),
+                TapSighashType::Default,
+            )
+            .expect("taproot sighash");
+        (e, t)
+    };
+
+    let msg = Message::from_digest(ecdsa_sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &cb_wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut w0 = Witness::new();
+    w0.push(sig_bytes);
+    w0.push(cb_wallet.pk.to_bytes());
+    spend.input[0].witness = w0;
+
+    let kp = sp_p2tr_keypair(p2tr_seed);
+    let tmsg = Message::from_digest(taproot_sighash.to_byte_array());
+    let schnorr = secp.sign_schnorr_no_aux_rand(&tmsg, &kp);
+    let mut w1 = Witness::new();
+    w1.push(schnorr.as_ref());
+    spend.input[1].witness = w1;
+
+    hex::encode(bitcoin::consensus::serialize(&spend))
+}
+
 /// Broadcast `raw` and require the node to accept it.
 fn sp_send_raw(node: &TestNode, raw: &str) {
     let sent = node
@@ -5527,22 +5643,29 @@ fn sp_send_raw(node: &TestNode, raw: &str) {
 fn sp_build_eligible_fixture(
     node: &TestNode,
     wallet: &DeterministicWallet,
+    alt: &DeterministicWallet,
     addr: &str,
     extra_singles: &[u64],
     seed_base: u8,
 ) -> u64 {
-    // Two independent transactions, same block.
-    let (raw_a, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+    // Heights 1..=3 were mined to `alt`, 4.. to `wallet`, so the spends below
+    // draw on outputs with two DIFFERENT scriptPubKeys. Without that a walk
+    // that returns the wrong spent coin returns an identical script, the
+    // recomputed tweak is unchanged, and the comparison proves nothing.
+    //
+    // Two independent transactions, same block, different funding scripts.
+    let (raw_a, txid_a_hex) = common::build_signed_p2wpkh_spend_of_coinbase(
         node,
-        wallet,
+        alt,
         1,
         sp_p2tr_script(seed_base),
         10_000,
     );
+    let txid_a = <bitcoin::Txid as std::str::FromStr>::from_str(&txid_a_hex).expect("txid");
     let (raw_b, _) = common::build_signed_p2wpkh_spend_of_coinbase(
         node,
         wallet,
-        2,
+        4,
         sp_p2tr_script(seed_base.wrapping_add(1)),
         10_000,
     );
@@ -5550,18 +5673,19 @@ fn sp_build_eligible_fixture(
     sp_send_raw(node, &raw_b);
     sp_generate_to(node, 1, addr);
 
-    // One transaction, two inputs, two outputs.
-    let (raw_multi, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+    // One transaction spending two inputs of DIFFERENT types: the P2WPKH
+    // coinbase at height 2, and the P2TR output `raw_a` just created.
+    let raw_mixed = sp_build_mixed_input_spend(
         node,
-        wallet,
-        &[3, 4],
-        &[
-            sp_p2tr_script(seed_base.wrapping_add(2)),
-            sp_p2tr_script(seed_base.wrapping_add(3)),
-        ],
+        2,
+        alt,
+        bitcoin::OutPoint { txid: txid_a, vout: 0 },
+        50 * 100_000_000 - 10_000,
+        seed_base,
+        sp_p2tr_script(seed_base.wrapping_add(2)),
         10_000,
     );
-    sp_send_raw(node, &raw_multi);
+    sp_send_raw(node, &raw_mixed);
     sp_generate_to(node, 1, addr);
 
     // A plain single-input block, so the simple shape is covered too.
@@ -5696,13 +5820,18 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
     // answer "duplicate" instead of causing a reorg.
     let wallet_a = DeterministicWallet::from_secret([0x11u8; 32]);
     let wallet_b = DeterministicWallet::from_secret([0x33u8; 32]);
+    // A second funding identity per chain, so spent outputs do not all share
+    // one scriptPubKey. See `sp_build_eligible_fixture`.
+    let alt_a = DeterministicWallet::from_secret([0x22u8; 32]);
+    let alt_b = DeterministicWallet::from_secret([0x44u8; 32]);
     let addr_a = wallet_a.address.to_string();
     let addr_b = wallet_b.address.to_string();
 
     // --- Node A: the live write path, index on from genesis. ---
     let mut node_a = TestNode::start(&["--silentpaymentindex=1"]);
-    sp_generate_to(&node_a, 105, &addr_a);
-    let tip_a = sp_build_eligible_fixture(&node_a, &wallet_a, &addr_a, &[], 0x40);
+    sp_generate_to(&node_a, 3, &alt_a.address.to_string());
+    sp_generate_to(&node_a, 102, &addr_a);
+    let tip_a = sp_build_eligible_fixture(&node_a, &wallet_a, &alt_a, &addr_a, &[], 0x40);
     assert_eq!(tip_a, 108, "105 empty blocks plus 3 carrying eligible transactions");
 
     // Fail loudly if the fixture stopped producing eligible transactions: two
@@ -5722,8 +5851,9 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
 
     // --- The competing chain: longer, and carrying its own eligible txs. ---
     let mut node_b = TestNode::start(&[]);
-    sp_generate_to(&node_b, 105, &addr_b);
-    let tip_b = sp_build_eligible_fixture(&node_b, &wallet_b, &addr_b, &[6, 7], 0x70);
+    sp_generate_to(&node_b, 3, &alt_b.address.to_string());
+    sp_generate_to(&node_b, 102, &addr_b);
+    let tip_b = sp_build_eligible_fixture(&node_b, &wallet_b, &alt_b, &addr_b, &[7, 8], 0x70);
     assert_eq!(tip_b, 110);
     let winning_chain = sp_active_chain_hex(&node_b);
     node_b.stop();
@@ -5860,11 +5990,13 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
 #[test]
 fn test_sp_index_drops_rows_for_blocks_that_leave_the_chain() {
     let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let alt = DeterministicWallet::from_secret([0x22u8; 32]);
     let addr = wallet.address.to_string();
 
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
-    sp_generate_to(&node, 105, &addr);
-    let tip = sp_build_eligible_fixture(&node, &wallet, &addr, &[], 0x40);
+    sp_generate_to(&node, 3, &alt.address.to_string());
+    sp_generate_to(&node, 102, &addr);
+    let tip = sp_build_eligible_fixture(&node, &wallet, &alt, &addr, &[], 0x40);
     assert_eq!(tip, 108);
     assert!(
         sp_entry_count(&node, 106, 108) >= 4,

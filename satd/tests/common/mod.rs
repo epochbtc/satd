@@ -1342,12 +1342,16 @@ pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
 /// only exercised past its first step when a block holds more than one spending
 /// transaction, or a transaction holds more than one input.
 ///
+/// Each input names its own wallet, so a single transaction can spend coinbases
+/// paying **different** scripts. That matters: if every spent output carries
+/// the same `scriptPubKey`, a walk that returns the wrong coin returns an
+/// identical script and no assertion downstream can tell.
+///
 /// Same preconditions as [`build_signed_p2wpkh_spend_of_coinbase`], for every
 /// height listed.
 pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
     node: &R,
-    wallet: &DeterministicWallet,
-    heights: &[u64],
+    funding: &[(u64, &DeterministicWallet)],
     dest_scripts: &[bitcoin::ScriptBuf],
     fee_sat: u64,
 ) -> (String, String) {
@@ -1360,13 +1364,13 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
     };
     use std::str::FromStr;
 
-    assert!(!heights.is_empty(), "need at least one funding coinbase");
+    assert!(!funding.is_empty(), "need at least one funding coinbase");
     assert!(!dest_scripts.is_empty(), "need at least one output");
     const CB_VALUE_SAT: u64 = 50 * 100_000_000;
 
-    let input: Vec<TxIn> = heights
+    let input: Vec<TxIn> = funding
         .iter()
-        .map(|h| {
+        .map(|(h, _)| {
             assert!(*h < 150, "helper assumes the pre-halving regtest subsidy");
             let txid =
                 bitcoin::Txid::from_str(&coinbase_txid_at(node, *h)).expect("txid parse");
@@ -1379,7 +1383,7 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
         })
         .collect();
 
-    let total_in = CB_VALUE_SAT * heights.len() as u64;
+    let total_in = CB_VALUE_SAT * funding.len() as u64;
     let per_output = (total_in - fee_sat) / dest_scripts.len() as u64;
     let mut output: Vec<TxOut> = dest_scripts
         .iter()
@@ -1401,15 +1405,16 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
     };
 
     let secp = Secp256k1::new();
-    let src_script = wallet.address.script_pubkey();
     let sighashes: Vec<_> = {
         let mut cache = SighashCache::new(&spend);
-        (0..heights.len())
-            .map(|i| {
+        funding
+            .iter()
+            .enumerate()
+            .map(|(i, (_, w))| {
                 cache
                     .p2wpkh_signature_hash(
                         i,
-                        &src_script,
+                        &w.address.script_pubkey(),
                         Amount::from_sat(CB_VALUE_SAT),
                         EcdsaSighashType::All,
                     )
@@ -1418,13 +1423,14 @@ pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
             .collect()
     };
     for (i, sighash) in sighashes.into_iter().enumerate() {
+        let w = funding[i].1;
         let msg = Message::from_digest(sighash.to_byte_array());
-        let sig = secp.sign_ecdsa(&msg, &wallet.sk);
+        let sig = secp.sign_ecdsa(&msg, &w.sk);
         let mut sig_bytes = sig.serialize_der().to_vec();
         sig_bytes.push(EcdsaSighashType::All as u8);
         let mut witness = Witness::new();
         witness.push(sig_bytes);
-        witness.push(wallet.pk.to_bytes());
+        witness.push(w.pk.to_bytes());
         spend.input[i].witness = witness;
     }
 
