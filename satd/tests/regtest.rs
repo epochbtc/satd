@@ -5517,16 +5517,31 @@ fn sp_p2tr_keypair(seed: u8) -> bitcoin::secp256k1::Keypair {
 /// one that hands back the wrong coin, because the wrong coin classifies
 /// identically. With one of each, a misaligned walk extracts the wrong pubkey
 /// and the recomputed tweak changes.
-fn sp_build_mixed_input_spend(
-    node: &TestNode,
+struct SpMixedSpend<'a> {
     cb_height: u64,
-    cb_wallet: &DeterministicWallet,
+    cb_wallet: &'a DeterministicWallet,
     p2tr_outpoint: bitcoin::OutPoint,
     p2tr_value_sat: u64,
     p2tr_seed: u8,
     dest: bitcoin::ScriptBuf,
     fee_sat: u64,
-) -> String {
+}
+
+fn sp_build_mixed_input_spend(node: &TestNode, spec: &SpMixedSpend<'_>) -> String {
+    let SpMixedSpend {
+        cb_height,
+        cb_wallet,
+        p2tr_outpoint,
+        p2tr_value_sat,
+        p2tr_seed,
+        dest,
+        fee_sat,
+    } = spec;
+    let (cb_height, p2tr_value_sat, p2tr_seed, fee_sat) =
+        (*cb_height, *p2tr_value_sat, *p2tr_seed, *fee_sat);
+    let p2tr_outpoint = *p2tr_outpoint;
+    let dest = dest.clone();
+
     use bitcoin::hashes::Hash as _;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
@@ -5677,13 +5692,15 @@ fn sp_build_eligible_fixture(
     // coinbase at height 2, and the P2TR output `raw_a` just created.
     let raw_mixed = sp_build_mixed_input_spend(
         node,
-        2,
-        alt,
-        bitcoin::OutPoint { txid: txid_a, vout: 0 },
-        50 * 100_000_000 - 10_000,
-        seed_base,
-        sp_p2tr_script(seed_base.wrapping_add(2)),
-        10_000,
+        &SpMixedSpend {
+            cb_height: 2,
+            cb_wallet: alt,
+            p2tr_outpoint: bitcoin::OutPoint { txid: txid_a, vout: 0 },
+            p2tr_value_sat: 50 * 100_000_000 - 10_000,
+            p2tr_seed: seed_base,
+            dest: sp_p2tr_script(seed_base.wrapping_add(2)),
+            fee_sat: 10_000,
+        },
     );
     sp_send_raw(node, &raw_mixed);
     sp_generate_to(node, 1, addr);
