@@ -29,7 +29,15 @@
 # Triggers:
 #   - pull_request → PR-gating (required status check)
 #   - schedule weekly → defence in depth against environmental drift
-#   - workflow_dispatch → manual rerun without pushing a commit
+#   - workflow_dispatch → manual rerun without pushing a commit, and the
+#     only way to run the fleet with satd's opt-in surfaces enabled
+#     (`features: on`) rather than at stock defaults
+#
+# The default posture is stock defaults, because that is what a downstream
+# client meets and what PR gating should hold still. Enabling the opt-in
+# surfaces is a release-time question — "does turning these on perturb any
+# downstream client" — so it is a dispatch input rather than a permanent
+# second fleet. Running it costs a full duplicate of the canary jobs.
 #
 # Triage policy lives in STABILITY_POLICY.md. The short version:
 # canary failure → diagnose. If our regression: fix or revert. If a
@@ -40,6 +48,11 @@
 
 name: Canary
 
+# Records the feature mode in the run's title. STABILITY_POLICY.md makes a
+# green `features: on` run a release gate, and a gate you have to open a job
+# log to identify is one that gets mistaken for an ordinary run.
+run-name: Canary (features=${{ inputs.features || 'off' }})
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -49,17 +62,35 @@ on:
     # upstream regression in a pinned dep) without burning quota.
     - cron: '0 6 * * 1'
   workflow_dispatch:
+    inputs:
+      features:
+        description: "satd opt-in surfaces: off (stock defaults) or on (silent-payment index, events gRPC, streaming WS, alert webhooks)"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - "off"
+          - "on"
 
-# Cancel superseded PR runs — the same posture as ci.yml. Doesn't
-# apply to scheduled / dispatched runs (each is its own ref).
+# Cancel superseded PR runs — the same posture as ci.yml.
+#
+# The feature mode is part of the key. Without it a `features: on` dispatch
+# and the weekly cron on the same ref cancel each other, which would silently
+# destroy the very run a release is gated on. (The comment here used to claim
+# dispatched runs were each their own ref. They are not: two dispatches on
+# master share `refs/heads/master`.)
 concurrency:
-  group: canary-${{ github.ref }}
+  group: canary-${{ github.ref }}-${{ inputs.features || 'off' }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
+  # Which satd configuration every canary boots against. `boot-satd.sh` owns
+  # what "on" means; see its header. Empty on pull_request and schedule, where
+  # the helper's own default (off) applies.
+  SATD_CANARY_FEATURES: ${{ inputs.features || 'off' }}
   # Must exactly match rust-toolchain.toml's `channel`. Bare `1.93`
   # resolves to the latest patch (e.g. `1.93.1`), so dtolnay/rust-
   # toolchain installs that, but the workspace then uses
