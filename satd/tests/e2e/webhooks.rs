@@ -936,17 +936,15 @@ async fn a_still_true_condition_is_raised_again_after_a_restart() {
     // receiver.
     let again_id = again.header("x-satd-delivery");
     let node_of = |id: &str| id.split('-').next().unwrap_or_default().to_string();
-    let incarnation_of = |id: &str| {
-        id.split('-').nth(1).unwrap_or_default().to_string()
-    };
+    let incarnation_of = |id: &str| id.split('-').nth(1).unwrap_or_default().to_string();
     assert_eq!(
-        node_of(&again_id),
-        node_of(&first_id),
+        node_of(again_id),
+        node_of(first_id),
         "the re-raise must come from the same node: {again_id} vs {first_id}"
     );
     assert_ne!(
-        incarnation_of(&again_id),
-        incarnation_of(&first_id),
+        incarnation_of(again_id),
+        incarnation_of(first_id),
         "the re-raise must come from a NEW process. Equal instance ids mean \
          this is the pre-restart raise arriving late, not the successor \
          re-evaluating: {again_id} vs {first_id}"
