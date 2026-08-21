@@ -730,10 +730,10 @@ impl AlertReloader {
         // does not exist until the executor first polls that task, so every
         // event published between retiring the outgoing generation and that
         // first poll reaches nobody. Not delayed: gone. Status events have no
-        // replay by design and the detectors that raise them are edge-triggered
-        // against a `HealthState` that outlives the reload, so a `disk_low`
-        // that lands in the window is never re-raised and the page never
-        // arrives. The window is short but it is scheduler latency, which is
+        // replay by design, and a detector raises only on *entering* its
+        // condition, against a `HealthState` that outlives the reload, so a
+        // `disk_low` that lands in the window is never re-raised and the page
+        // never arrives. The window is short but it is scheduler latency, which is
         // longest exactly when the node is loaded enough to be raising alerts.
         //
         // Holding both subscriptions open for a moment is the safe direction: a
@@ -1150,9 +1150,10 @@ heartbeat_interval_secs = 3600
     /// If the fan-in subscribes for itself, the subscription does not exist
     /// until the executor first polls it — and every event published between
     /// retiring the outgoing generation and that first poll reaches nobody.
-    /// A status event lost there is lost for good: there is no replay, and the
-    /// detectors are edge-triggered against a `HealthState` that outlives the
-    /// reload, so the condition is never re-raised.
+    /// A status event lost there is lost for good: there is no replay, and a
+    /// detector raises only on *entering* its condition, against a
+    /// `HealthState` that outlives the reload, so a condition that is already
+    /// standing is never re-raised.
     ///
     /// This is a single-threaded runtime and nothing is awaited across the
     /// second `apply`, so no spawned task has run: the subscriber count is
@@ -1197,10 +1198,11 @@ heartbeat_interval_secs = 3600
     /// Editing one hook must not destroy another hook's pending deliveries.
     ///
     /// A reload used to retire the whole generation, taking every hook's queue
-    /// and retry backoff with it. For chain events that is survivable — the
-    /// durable cursor did not advance. A status event has no replay by design,
-    /// so one sitting in backoff for a hook the operator never touched is
-    /// simply lost, and the edge-triggered detector will not raise it again.
+    /// and retry backoff with it. Nothing is persisted per hook, so whatever a
+    /// retired generation was holding is gone. For chain and mempool events
+    /// that is the accepted best-effort cost. A status event is worse off: one
+    /// sitting in backoff for a hook the operator never touched is lost, and
+    /// the detector will not raise it again until the condition itself changes.
     ///
     /// Identity of the `mpsc::Sender` is the observable: a carried-over hook
     /// keeps the same channel, and therefore the same queue.

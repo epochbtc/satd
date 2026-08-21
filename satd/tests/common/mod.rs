@@ -766,6 +766,11 @@ impl TestNode {
                     attempts += 1;
                     if attempts > 30 {
                         let _ = self.process.kill();
+                        // Reap it. Without this the child is a zombie that may
+                        // still hold the RocksDB LOCK and the RPC port, and a
+                        // restart onto the same datadir then fails as an opaque
+                        // readiness timeout rather than as anything diagnosable.
+                        let _ = self.process.wait();
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -901,8 +906,20 @@ impl StreamingNode {
     /// while the durable confirmed chain (and its cursor replay) survives.
     /// Blocking — call via `spawn_blocking` from an async test.
     pub fn restart(&mut self) {
+        self.restart_with(&[]);
+    }
+
+    /// [`Self::restart`], carrying `extra_args` across the restart.
+    ///
+    /// `restart` deliberately rebuilds the argument list from scratch, so any
+    /// option the node was originally started with is dropped. A test that
+    /// restarts a node configured with something durable (an `--alertfile`, an
+    /// index) has to pass it again here or it silently comes back a different
+    /// node.
+    pub fn restart_with(&mut self, extra_args: &[&str]) {
         self.node.stop();
-        let args = ["--events-grpc-bind=127.0.0.1:0", "--streamws=127.0.0.1:0"];
+        let mut args = vec!["--events-grpc-bind=127.0.0.1:0", "--streamws=127.0.0.1:0"];
+        args.extend_from_slice(extra_args);
         let mut fresh =
             TestNode::start_with_datadir(&self.node.datadir, self.node.rpcport, &args);
         std::mem::swap(&mut self.node.process, &mut fresh.process);
