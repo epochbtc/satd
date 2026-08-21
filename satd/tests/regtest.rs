@@ -5498,29 +5498,96 @@ fn sp_p2tr_script(seed: u8) -> bitcoin::ScriptBuf {
     bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
 }
 
-/// For each height in `funding_heights`, spend that coinbase to a taproot
-/// output and mine the result into its own block.
-fn sp_mine_eligible_blocks(
+/// Broadcast `raw` and require the node to accept it.
+fn sp_send_raw(node: &TestNode, raw: &str) {
+    let sent = node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw)])
+        .expect("sendrawtransaction");
+    assert!(sent["error"].is_null(), "sendrawtransaction: {sent}");
+}
+
+/// Build the eligible-transaction fixture on top of a 105-block chain, then
+/// optionally extend it with one more block per height in `extra_singles`.
+///
+/// The block SHAPES here are the point, not just the count. The live path and
+/// the backfill differ in exactly one place: the backfill re-derives each
+/// spent output by walking `undo.spent_coins` in lockstep with `block.txdata`,
+/// whereas the live path reuses the coins `connect_block` already resolved.
+/// A chain of blocks that each hold one single-input transaction never advances
+/// that cursor past its first step, so it cannot tell a correct walk from one
+/// that returns `spent_coins[0]` every time. This fixture therefore includes:
+///
+///   - a block with TWO independent spending transactions (cursor must carry
+///     across transactions),
+///   - a transaction with TWO inputs and two outputs (cursor must carry within
+///     a transaction),
+///   - a plain single-input block.
+///
+/// Returns the height of the last block mined.
+fn sp_build_eligible_fixture(
     node: &TestNode,
     wallet: &DeterministicWallet,
     addr: &str,
-    funding_heights: &[u64],
+    extra_singles: &[u64],
     seed_base: u8,
-) {
-    for (i, h) in funding_heights.iter().enumerate() {
-        let (raw, _txid) = common::build_signed_p2wpkh_spend_of_coinbase(
+) -> u64 {
+    // Two independent transactions, same block.
+    let (raw_a, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        wallet,
+        1,
+        sp_p2tr_script(seed_base),
+        10_000,
+    );
+    let (raw_b, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        wallet,
+        2,
+        sp_p2tr_script(seed_base.wrapping_add(1)),
+        10_000,
+    );
+    sp_send_raw(node, &raw_a);
+    sp_send_raw(node, &raw_b);
+    sp_generate_to(node, 1, addr);
+
+    // One transaction, two inputs, two outputs.
+    let (raw_multi, _) = common::build_signed_p2wpkh_spend_of_coinbases(
+        node,
+        wallet,
+        &[3, 4],
+        &[
+            sp_p2tr_script(seed_base.wrapping_add(2)),
+            sp_p2tr_script(seed_base.wrapping_add(3)),
+        ],
+        10_000,
+    );
+    sp_send_raw(node, &raw_multi);
+    sp_generate_to(node, 1, addr);
+
+    // A plain single-input block, so the simple shape is covered too.
+    let (raw_single, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        wallet,
+        5,
+        sp_p2tr_script(seed_base.wrapping_add(4)),
+        10_000,
+    );
+    sp_send_raw(node, &raw_single);
+    sp_generate_to(node, 1, addr);
+
+    for (i, h) in extra_singles.iter().enumerate() {
+        let (raw, _) = common::build_signed_p2wpkh_spend_of_coinbase(
             node,
             wallet,
             *h,
-            sp_p2tr_script(seed_base.wrapping_add(i as u8)),
+            sp_p2tr_script(seed_base.wrapping_add(5).wrapping_add(i as u8)),
             10_000,
         );
-        let sent = node
-            .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw)])
-            .expect("sendrawtransaction");
-        assert!(sent["error"].is_null(), "sendrawtransaction: {sent}");
+        sp_send_raw(node, &raw);
         sp_generate_to(node, 1, addr);
     }
+
+    get_rpc_u64(node, "getblockcount").expect("getblockcount")
 }
 
 /// Every block of `node`'s active chain as raw hex, heights 1..=tip.
@@ -5601,8 +5668,13 @@ fn sp_entry_count(node: &TestNode, from: u64, to: u64) -> usize {
 /// again on disconnect. The backfill walks historical heights instead and
 /// reconstructs the same prev-output scripts from undo data. Nothing compared
 /// their output before this test: `index/silent_payments/runner.rs` asserts the
-/// byte-identity property in a comment, and `cleanup_stale_rows_after_reorg`
-/// had no coverage at all.
+/// byte-identity property in a comment and nothing checked it.
+///
+/// Still not covered, and worth stating so nobody reads more into a green run
+/// than it earns: `BackfillRunner::cleanup_stale_rows_after_reorg` runs only
+/// when a reorg lands while a backfill is *in flight*, which neither test
+/// constructs. `SATD_SP_BACKFILL_DEBUG_DELAY_MS` exists to hold a backfill
+/// open long enough to build that case.
 ///
 /// The comparison is over the whole column family, not a list of probed
 /// heights. A row left behind at a height the chain has since replaced is the
@@ -5629,10 +5701,9 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
 
     // --- Node A: the live write path, index on from genesis. ---
     let mut node_a = TestNode::start(&["--silentpaymentindex=1"]);
-    sp_generate_to(&node_a, 101, &addr_a);
-    sp_mine_eligible_blocks(&node_a, &wallet_a, &addr_a, &[1, 2, 3], 0x40);
-    let tip_a = get_rpc_u64(&node_a, "getblockcount").expect("getblockcount");
-    assert_eq!(tip_a, 104, "101 empty blocks plus 3 carrying an eligible tx");
+    sp_generate_to(&node_a, 105, &addr_a);
+    let tip_a = sp_build_eligible_fixture(&node_a, &wallet_a, &addr_a, &[], 0x40);
+    assert_eq!(tip_a, 108, "105 empty blocks plus 3 carrying eligible transactions");
 
     // Fail loudly if the fixture stopped producing eligible transactions: two
     // empty indexes would otherwise compare equal and prove nothing.
@@ -5642,12 +5713,18 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
         "expected at least one tweak per eligible transaction, got {entries_before}"
     );
 
+    // Chain A's blocks, captured before the reorg replaces them. Node C is fed
+    // these first so that the node doing the BACKFILL has also seen a fork:
+    // otherwise the backfill only ever walks a linear chain, and its whole
+    // reorg-safety design (an anchored snapshot walk rather than height-index
+    // lookups) goes untested.
+    let losing_chain = sp_active_chain_hex(&node_a);
+
     // --- The competing chain: longer, and carrying its own eligible txs. ---
     let mut node_b = TestNode::start(&[]);
-    sp_generate_to(&node_b, 101, &addr_b);
-    sp_mine_eligible_blocks(&node_b, &wallet_b, &addr_b, &[1, 2, 3, 4, 5], 0x70);
-    let tip_b = get_rpc_u64(&node_b, "getblockcount").expect("getblockcount");
-    assert_eq!(tip_b, 106);
+    sp_generate_to(&node_b, 105, &addr_b);
+    let tip_b = sp_build_eligible_fixture(&node_b, &wallet_b, &addr_b, &[6, 7], 0x70);
+    assert_eq!(tip_b, 110);
     let winning_chain = sp_active_chain_hex(&node_b);
     node_b.stop();
 
@@ -5665,8 +5742,10 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
          got {entries_after}"
     );
 
-    // --- Node C: the backfill write path over the same winning chain. ---
+    // --- Node C: the backfill write path over the same winning chain, reached
+    // by the same reorg node A went through. ---
     let mut node_c = TestNode::start(&[]);
+    sp_submit_chain(&node_c, &losing_chain);
     sp_submit_chain(&node_c, &winning_chain);
     assert_eq!(
         get_rpc_u64(&node_c, "getblockcount").expect("getblockcount"),
@@ -5722,13 +5801,22 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
         tip_b as usize,
         "the live index must hold exactly one row per block from the activation height"
     );
-    assert_eq!(
-        rebuilt.len(),
-        live.len(),
-        "the backfill wrote {} rows where the live path wrote {}",
-        rebuilt.len(),
-        live.len()
-    );
+    // Name the heights, not just the counts: both datadirs are removed when the
+    // nodes drop, so whatever this message says is all a CI reader will ever
+    // have to work from.
+    if rebuilt.len() != live.len() {
+        let hs = |rows: &[(u32, Vec<u8>)]| rows.iter().map(|(h, _)| *h).collect::<Vec<_>>();
+        let (lh, rh) = (hs(&live), hs(&rebuilt));
+        let only_live: Vec<u32> = lh.iter().copied().filter(|h| !rh.contains(h)).collect();
+        let only_rebuilt: Vec<u32> = rh.iter().copied().filter(|h| !lh.contains(h)).collect();
+        panic!(
+            "the backfill wrote {} rows where the live path wrote {}; \
+             heights only in the live index: {only_live:?}; \
+             heights only in the rebuilt index: {only_rebuilt:?}",
+            rebuilt.len(),
+            live.len(),
+        );
+    }
 
     let mut non_empty = 0;
     for ((h_live, v_live), (h_rebuilt, v_rebuilt)) in live.iter().zip(rebuilt.iter()) {
@@ -5762,56 +5850,56 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
 /// removal does only becomes visible at a height the chain no longer has, so
 /// this test rolls the tip back without replacing it.
 ///
-/// A surviving row is worse than a missing one. Rows are self-authenticating,
-/// so a stale row at a height the chain later reuses is caught at serve time,
-/// but a stale row above the tip is served to a light client as though it
-/// described the chain.
+/// Rows are self-authenticating and every reader checks that, so a survivor is
+/// not served as though it described the chain: the serving RPC and the
+/// streaming replay both compare the row's embedded block hash and both bound
+/// themselves to the active chain. What a survivor costs is space that is
+/// never reclaimed, and a column family that no longer describes the chain it
+/// is supposed to index, which is what makes the rebuild comparison above
+/// meaningful in the first place.
 #[test]
 fn test_sp_index_drops_rows_for_blocks_that_leave_the_chain() {
     let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
     let addr = wallet.address.to_string();
 
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
-    sp_generate_to(&node, 101, &addr);
-    sp_mine_eligible_blocks(&node, &wallet, &addr, &[1, 2, 3], 0x40);
-    assert_eq!(
-        get_rpc_u64(&node, "getblockcount").expect("getblockcount"),
-        104
-    );
+    sp_generate_to(&node, 105, &addr);
+    let tip = sp_build_eligible_fixture(&node, &wallet, &addr, &[], 0x40);
+    assert_eq!(tip, 108);
     assert!(
-        sp_entry_count(&node, 102, 104) >= 3,
+        sp_entry_count(&node, 106, 108) >= 4,
         "the blocks about to be disconnected must carry real tweaks"
     );
 
-    // Roll back to 101 by invalidating the first of the three.
-    let h102 = node
-        .rpc_call_with_params("getblockhash", vec![serde_json::json!(102)])
+    // Roll back to 105 by invalidating the first block that carries tweaks.
+    let h106 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(106)])
         .expect("getblockhash")["result"]
         .as_str()
         .expect("hash")
         .to_string();
     let resp = node
-        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(h102)])
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(h106)])
         .expect("invalidateblock");
     assert!(resp["error"].is_null(), "invalidateblock: {resp}");
     assert_eq!(
         get_rpc_u64(&node, "getblockcount").expect("getblockcount"),
-        101,
-        "invalidating height 102 must roll the tip back to 101"
+        105,
+        "invalidating height 106 must roll the tip back to 105"
     );
 
     let dir = node.datadir.clone();
     node.stop();
     let rows = common::dump_sp_tweaks_cf(&dir);
 
-    let above: Vec<u32> = rows.iter().map(|(h, _)| *h).filter(|h| *h > 101).collect();
+    let above: Vec<u32> = rows.iter().map(|(h, _)| *h).filter(|h| *h > 105).collect();
     assert!(
         above.is_empty(),
         "rows survived at heights the chain no longer has: {above:?}"
     );
     assert_eq!(
         rows.len(),
-        101,
+        105,
         "the index must hold exactly one row per remaining block"
     );
 }

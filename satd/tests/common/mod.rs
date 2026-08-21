@@ -1264,8 +1264,13 @@ pub fn coinbase_txid_at<R: BlockingRpc>(node: &R, height: u64) -> String {
 /// Build + sign a P2WPKH spend of the coinbase at `height` (vout 0) paying
 /// `dest_script`. Like [`build_signed_p2wpkh_spend_seq`], but able to pick a
 /// different funding coinbase each time, so a test can put an independent
-/// transaction in each of several blocks. `height` must be mature and must
-/// have been mined to `wallet.address`.
+/// transaction in each of several blocks.
+///
+/// `height` must be mature and must have been mined to `wallet.address`. It
+/// must also have been mined against an **empty mempool**: the spent amount is
+/// hardcoded to the bare subsidy, and a coinbase that also collected fees is
+/// worth more than that, so the signature would commit to the wrong value and
+/// the spend would be rejected.
 pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
     node: &R,
     wallet: &DeterministicWallet,
@@ -1327,6 +1332,107 @@ pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
     (raw_hex, txid_hex)
 }
 
+/// Build + sign one transaction spending SEVERAL mature coinbases (vout 0 of
+/// each) and paying one output per entry in `dest_scripts`.
+///
+/// The single-input helper above cannot produce the block shapes that
+/// distinguish satd's two silent-payment write paths. The live path reuses the
+/// coins `connect_block` already resolved, whereas the backfill re-derives them
+/// by walking `undo.spent_coins` in lockstep with `block.txdata`. That walk is
+/// only exercised past its first step when a block holds more than one spending
+/// transaction, or a transaction holds more than one input.
+///
+/// Same preconditions as [`build_signed_p2wpkh_spend_of_coinbase`], for every
+/// height listed.
+pub fn build_signed_p2wpkh_spend_of_coinbases<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    heights: &[u64],
+    dest_scripts: &[bitcoin::ScriptBuf],
+    fee_sat: u64,
+) -> (String, String) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::str::FromStr;
+
+    assert!(!heights.is_empty(), "need at least one funding coinbase");
+    assert!(!dest_scripts.is_empty(), "need at least one output");
+    const CB_VALUE_SAT: u64 = 50 * 100_000_000;
+
+    let input: Vec<TxIn> = heights
+        .iter()
+        .map(|h| {
+            assert!(*h < 150, "helper assumes the pre-halving regtest subsidy");
+            let txid =
+                bitcoin::Txid::from_str(&coinbase_txid_at(node, *h)).expect("txid parse");
+            TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_ffff),
+                witness: Witness::new(),
+            }
+        })
+        .collect();
+
+    let total_in = CB_VALUE_SAT * heights.len() as u64;
+    let per_output = (total_in - fee_sat) / dest_scripts.len() as u64;
+    let mut output: Vec<TxOut> = dest_scripts
+        .iter()
+        .map(|spk| TxOut {
+            value: Amount::from_sat(per_output),
+            script_pubkey: spk.clone(),
+        })
+        .collect();
+    // Give any integer-division remainder to the first output so the fee is
+    // exactly `fee_sat` rather than a little more.
+    let assigned = per_output * dest_scripts.len() as u64;
+    output[0].value = Amount::from_sat(per_output + (total_in - fee_sat - assigned));
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input,
+        output,
+    };
+
+    let secp = Secp256k1::new();
+    let src_script = wallet.address.script_pubkey();
+    let sighashes: Vec<_> = {
+        let mut cache = SighashCache::new(&spend);
+        (0..heights.len())
+            .map(|i| {
+                cache
+                    .p2wpkh_signature_hash(
+                        i,
+                        &src_script,
+                        Amount::from_sat(CB_VALUE_SAT),
+                        EcdsaSighashType::All,
+                    )
+                    .expect("sighash")
+            })
+            .collect()
+    };
+    for (i, sighash) in sighashes.into_iter().enumerate() {
+        let msg = Message::from_digest(sighash.to_byte_array());
+        let sig = secp.sign_ecdsa(&msg, &wallet.sk);
+        let mut sig_bytes = sig.serialize_der().to_vec();
+        sig_bytes.push(EcdsaSighashType::All as u8);
+        let mut witness = Witness::new();
+        witness.push(sig_bytes);
+        witness.push(wallet.pk.to_bytes());
+        spend.input[i].witness = witness;
+    }
+
+    let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
+    let txid_hex = spend.compute_txid().to_string();
+    (raw_hex, txid_hex)
+}
+
 /// Every row in the `sp_tweaks` column family, as raw `(height, value_bytes)`
 /// pairs in ascending height order.
 ///
@@ -1337,14 +1443,27 @@ pub fn build_signed_p2wpkh_spend_of_coinbase<R: BlockingRpc>(
 /// can produce, so the rebuild-parity test compares whole column families
 /// rather than a list of probed heights.
 ///
-/// The node must be stopped first: RocksDB holds an exclusive lock while it
-/// runs, and this opens a second handle on the same directory.
+/// **The node must be stopped cleanly first**, and not for the reason one
+/// might assume. A read-only RocksDB handle takes no file lock, so opening one
+/// against a running node succeeds — and then answers from a snapshot that is
+/// missing everything still sitting in `CoinCache`'s pending batch. The
+/// failure mode is a wrong answer, not an error, which is why this asserts the
+/// clean-shutdown marker rather than trusting the caller.
 pub fn dump_sp_tweaks_cf(datadir: &std::path::Path) -> Vec<(u32, Vec<u8>)> {
     use rocksdb::{IteratorMode, Options, DB};
 
-    let path = datadir.join("regtest").join("chainstate");
+    let net_dir = datadir.join("regtest");
+    assert!(
+        net_dir.join(".clean_shutdown").exists(),
+        "sp_tweaks dump requires a cleanly-stopped node: {} has no clean-shutdown \
+         marker, so rows may still be unflushed and any comparison would be \
+         against truncated data",
+        net_dir.display()
+    );
+    let path = net_dir.join("chainstate");
     let opts = Options::default();
-    let cfs = DB::list_cf(&opts, &path).expect("list column families");
+    let cfs = DB::list_cf(&opts, &path)
+        .unwrap_or_else(|e| panic!("list column families at {}: {e}", path.display()));
     let db = DB::open_cf_for_read_only(&opts, &path, &cfs, false).expect("open chainstate");
     let cf = db
         .cf_handle(node_sp_index::CF_SP_TWEAKS)
