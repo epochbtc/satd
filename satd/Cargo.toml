@@ -82,6 +82,14 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 rcgen = { workspace = true }
+# Raw column-family inspection for the silent-payment index rebuild-parity
+# test (tests/regtest.rs). The point of that test is byte-identity between the
+# rows the live connect path wrote and the rows a backfill rebuilt, so it reads
+# the CF directly rather than through an RPC that can only probe the heights it
+# already knows to ask about. Both crates are already in the graph via `node`,
+# so this costs no extra compilation.
+rocksdb = { workspace = true }
+node-sp-index = { path = "../node-sp-index" }
 # Constant-time signature comparison in the webhook e2e helper: that helper is
 # the most likely thing a third party copies when writing a receiver, and the
 # spec requires a constant-time compare.

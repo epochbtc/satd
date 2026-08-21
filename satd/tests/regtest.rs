@@ -5466,6 +5466,593 @@ fn test_sp_index_backfill_pause_resume() {
     node.stop();
 }
 
+/// Mine `count` blocks to `addr` and return the block hashes.
+fn sp_generate_to(node: &TestNode, count: u64, addr: &str) -> Vec<String> {
+    let resp = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(count), serde_json::json!(addr)],
+        )
+        .expect("generatetoaddress");
+    assert!(resp["error"].is_null(), "generatetoaddress: {resp}");
+    resp["result"]
+        .as_array()
+        .expect("array of hashes")
+        .iter()
+        .map(|v| v.as_str().expect("hash").to_string())
+        .collect()
+}
+
+/// A P2TR scriptPubKey derived from `seed`.
+///
+/// Any taproot output makes its transaction silent-payment eligible, which is
+/// what puts a real computed tweak in the block's `sp_tweaks` row. Without one,
+/// every row in the chain is an empty header and the parity assertion below
+/// would be satisfied by two indexes that agree only about nothing.
+fn sp_p2tr_script(seed: u8) -> bitcoin::ScriptBuf {
+    use bitcoin::key::TweakedPublicKey;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret");
+    let (xonly, _) = sk.public_key(&secp).x_only_public_key();
+    bitcoin::ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
+}
+
+/// The keypair behind [`sp_p2tr_script`], for key-path spending one of those
+/// outputs back out again.
+fn sp_p2tr_keypair(seed: u8) -> bitcoin::secp256k1::Keypair {
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret");
+    Keypair::from_secret_key(&secp, &sk)
+}
+
+/// One transaction spending a P2WPKH coinbase AND a P2TR output, paying a
+/// taproot output.
+///
+/// The mixed input types are the whole point. `prev_output_scripts` feeds BIP
+/// 352 input *classification*: the tweak takes its pubkey from the witness for
+/// a P2WPKH input but from the output key for a P2TR one. A block whose spent
+/// outputs are all the same type cannot distinguish a correct undo walk from
+/// one that hands back the wrong coin, because the wrong coin classifies
+/// identically. With one of each, a misaligned walk extracts the wrong pubkey
+/// and the recomputed tweak changes.
+struct SpMixedSpend<'a> {
+    cb_height: u64,
+    cb_wallet: &'a DeterministicWallet,
+    p2tr_outpoint: bitcoin::OutPoint,
+    p2tr_value_sat: u64,
+    p2tr_seed: u8,
+    dest: bitcoin::ScriptBuf,
+    fee_sat: u64,
+}
+
+fn sp_build_mixed_input_spend(node: &TestNode, spec: &SpMixedSpend<'_>) -> String {
+    let SpMixedSpend {
+        cb_height,
+        cb_wallet,
+        p2tr_outpoint,
+        p2tr_value_sat,
+        p2tr_seed,
+        dest,
+        fee_sat,
+    } = spec;
+    let (cb_height, p2tr_value_sat, p2tr_seed, fee_sat) =
+        (*cb_height, *p2tr_value_sat, *p2tr_seed, *fee_sat);
+    let p2tr_outpoint = *p2tr_outpoint;
+    let dest = dest.clone();
+
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::str::FromStr;
+
+    const CB_VALUE_SAT: u64 = 50 * 100_000_000;
+    let cb_txid = bitcoin::Txid::from_str(&common::coinbase_txid_at(node, cb_height))
+        .expect("txid parse");
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint { txid: cb_txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_ffff),
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: p2tr_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xffff_ffff),
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(CB_VALUE_SAT + p2tr_value_sat - fee_sat),
+            script_pubkey: dest,
+        }],
+    };
+
+    let secp = Secp256k1::new();
+    let prevouts = [
+        TxOut {
+            value: Amount::from_sat(CB_VALUE_SAT),
+            script_pubkey: cb_wallet.address.script_pubkey(),
+        },
+        TxOut {
+            value: Amount::from_sat(p2tr_value_sat),
+            script_pubkey: sp_p2tr_script(p2tr_seed),
+        },
+    ];
+
+    let (ecdsa_sighash, taproot_sighash) = {
+        let mut cache = SighashCache::new(&spend);
+        let e = cache
+            .p2wpkh_signature_hash(
+                0,
+                &cb_wallet.address.script_pubkey(),
+                Amount::from_sat(CB_VALUE_SAT),
+                EcdsaSighashType::All,
+            )
+            .expect("p2wpkh sighash");
+        let t = cache
+            .taproot_key_spend_signature_hash(
+                1,
+                &Prevouts::All(&prevouts),
+                TapSighashType::Default,
+            )
+            .expect("taproot sighash");
+        (e, t)
+    };
+
+    let msg = Message::from_digest(ecdsa_sighash.to_byte_array());
+    let sig = secp.sign_ecdsa(&msg, &cb_wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut w0 = Witness::new();
+    w0.push(sig_bytes);
+    w0.push(cb_wallet.pk.to_bytes());
+    spend.input[0].witness = w0;
+
+    let kp = sp_p2tr_keypair(p2tr_seed);
+    let tmsg = Message::from_digest(taproot_sighash.to_byte_array());
+    let schnorr = secp.sign_schnorr_no_aux_rand(&tmsg, &kp);
+    let mut w1 = Witness::new();
+    w1.push(schnorr.as_ref());
+    spend.input[1].witness = w1;
+
+    hex::encode(bitcoin::consensus::serialize(&spend))
+}
+
+/// Broadcast `raw` and require the node to accept it.
+fn sp_send_raw(node: &TestNode, raw: &str) {
+    let sent = node
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw)])
+        .expect("sendrawtransaction");
+    assert!(sent["error"].is_null(), "sendrawtransaction: {sent}");
+}
+
+/// Build the eligible-transaction fixture on top of a 105-block chain, then
+/// optionally extend it with one more block per height in `extra_singles`.
+///
+/// The block SHAPES here are the point, not just the count. The live path and
+/// the backfill differ in exactly one place: the backfill re-derives each
+/// spent output by walking `undo.spent_coins` in lockstep with `block.txdata`,
+/// whereas the live path reuses the coins `connect_block` already resolved.
+/// A chain of blocks that each hold one single-input transaction never advances
+/// that cursor past its first step, so it cannot tell a correct walk from one
+/// that returns `spent_coins[0]` every time. This fixture therefore includes:
+///
+///   - a block with TWO independent spending transactions (cursor must carry
+///     across transactions),
+///   - a transaction with TWO inputs and two outputs (cursor must carry within
+///     a transaction),
+///   - a plain single-input block.
+///
+/// Returns the height of the last block mined.
+fn sp_build_eligible_fixture(
+    node: &TestNode,
+    wallet: &DeterministicWallet,
+    alt: &DeterministicWallet,
+    addr: &str,
+    extra_singles: &[u64],
+    seed_base: u8,
+) -> u64 {
+    // Heights 1..=3 were mined to `alt`, 4.. to `wallet`, so the spends below
+    // draw on outputs with two DIFFERENT scriptPubKeys. Without that a walk
+    // that returns the wrong spent coin returns an identical script, the
+    // recomputed tweak is unchanged, and the comparison proves nothing.
+    //
+    // Two independent transactions, same block, different funding scripts.
+    let (raw_a, txid_a_hex) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        alt,
+        1,
+        sp_p2tr_script(seed_base),
+        10_000,
+    );
+    let txid_a = <bitcoin::Txid as std::str::FromStr>::from_str(&txid_a_hex).expect("txid");
+    let (raw_b, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        wallet,
+        4,
+        sp_p2tr_script(seed_base.wrapping_add(1)),
+        10_000,
+    );
+    sp_send_raw(node, &raw_a);
+    sp_send_raw(node, &raw_b);
+    sp_generate_to(node, 1, addr);
+
+    // One transaction spending two inputs of DIFFERENT types: the P2WPKH
+    // coinbase at height 2, and the P2TR output `raw_a` just created.
+    let raw_mixed = sp_build_mixed_input_spend(
+        node,
+        &SpMixedSpend {
+            cb_height: 2,
+            cb_wallet: alt,
+            p2tr_outpoint: bitcoin::OutPoint { txid: txid_a, vout: 0 },
+            p2tr_value_sat: 50 * 100_000_000 - 10_000,
+            p2tr_seed: seed_base,
+            dest: sp_p2tr_script(seed_base.wrapping_add(2)),
+            fee_sat: 10_000,
+        },
+    );
+    sp_send_raw(node, &raw_mixed);
+    sp_generate_to(node, 1, addr);
+
+    // A plain single-input block, so the simple shape is covered too.
+    let (raw_single, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+        node,
+        wallet,
+        5,
+        sp_p2tr_script(seed_base.wrapping_add(4)),
+        10_000,
+    );
+    sp_send_raw(node, &raw_single);
+    sp_generate_to(node, 1, addr);
+
+    for (i, h) in extra_singles.iter().enumerate() {
+        let (raw, _) = common::build_signed_p2wpkh_spend_of_coinbase(
+            node,
+            wallet,
+            *h,
+            sp_p2tr_script(seed_base.wrapping_add(5).wrapping_add(i as u8)),
+            10_000,
+        );
+        sp_send_raw(node, &raw);
+        sp_generate_to(node, 1, addr);
+    }
+
+    get_rpc_u64(node, "getblockcount").expect("getblockcount")
+}
+
+/// Every block of `node`'s active chain as raw hex, heights 1..=tip.
+fn sp_active_chain_hex(node: &TestNode) -> Vec<String> {
+    let tip = get_rpc_u64(node, "getblockcount").expect("getblockcount");
+    (1..=tip)
+        .map(|h| {
+            let hash = node
+                .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+                .expect("getblockhash")["result"]
+                .as_str()
+                .expect("hash")
+                .to_string();
+            node.rpc_call_with_params(
+                "getblock",
+                vec![serde_json::json!(hash), serde_json::json!(0)],
+            )
+            .expect("getblock")["result"]
+                .as_str()
+                .expect("raw hex")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Feed `chain` to `node` block by block and require every one to be accepted.
+/// `submitblock` reports a rejection in `result` as a reason string and leaves
+/// `error` null, so checking only `error` would let a silently-rejected chain
+/// through.
+fn sp_submit_chain(node: &TestNode, chain: &[String]) {
+    for (i, hex) in chain.iter().enumerate() {
+        let resp = node
+            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+            .expect("submitblock");
+        assert!(resp["error"].is_null(), "submitblock at index {i}: {resp}");
+        assert!(
+            resp["result"].is_null(),
+            "submitblock rejected the block at index {i}: {}",
+            resp["result"]
+        );
+    }
+}
+
+/// Total tweak entries the serving RPC reports across heights `[from, to]`.
+fn sp_entry_count(node: &TestNode, from: u64, to: u64) -> usize {
+    let mut total = 0;
+    for h in from..=to {
+        let hash = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+            .expect("getblockhash")["result"]
+            .as_str()
+            .expect("hash")
+            .to_string();
+        let resp = node
+            .rpc_call_with_params(
+                "getsilentpaymentblockdata",
+                vec![serde_json::json!(hash), serde_json::json!(1)],
+            )
+            .expect("getsilentpaymentblockdata");
+        assert!(
+            resp["error"].is_null(),
+            "getsilentpaymentblockdata at height {h}: {resp}"
+        );
+        total += resp["result"]["tweaks"]
+            .as_array()
+            .expect("tweaks array")
+            .len();
+    }
+    total
+}
+
+/// **Release criterion (0.5.0): the silent-payment tweak index a backfill
+/// rebuilds is byte-identical to the one the live connect path wrote, and a
+/// reorg does not perturb that.**
+///
+/// The two write paths are separate code. The live path builds a row inside
+/// `connect_block` from the block and the coins it spends, and removes the row
+/// again on disconnect. The backfill walks historical heights instead and
+/// reconstructs the same prev-output scripts from undo data. Nothing compared
+/// their output before this test: `index/silent_payments/runner.rs` asserts the
+/// byte-identity property in a comment and nothing checked it.
+///
+/// Still not covered, and worth stating so nobody reads more into a green run
+/// than it earns: `BackfillRunner::cleanup_stale_rows_after_reorg` runs only
+/// when a reorg lands while a backfill is *in flight*, which neither test
+/// constructs. `SATD_SP_BACKFILL_DEBUG_DELAY_MS` exists to hold a backfill
+/// open long enough to build that case.
+///
+/// The comparison is over the whole column family, not a list of probed
+/// heights. A row left behind at a height the chain has since replaced is the
+/// specific damage a reorg can do, and the serving RPC can only answer for
+/// heights the caller already thought to ask about, so it cannot see one.
+///
+/// Shape:
+///   - Node A runs with the index on, builds a chain carrying real eligible
+///     transactions, and is then reorged onto a longer competing chain that
+///     carries its own. The fork is at genesis, so every row it holds is the
+///     product of connect, then disconnect, then connect again.
+///   - Node C takes the same winning chain with the index off, then turns it on
+///     and backfills, so its rows are the product of the walk alone.
+///   - The two column families must be equal byte for byte.
+#[test]
+fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
+    // Distinct coinbase addresses per chain. Mining the same template to the
+    // same address is deterministic, and identical blocks make `submitblock`
+    // answer "duplicate" instead of causing a reorg.
+    let wallet_a = DeterministicWallet::from_secret([0x11u8; 32]);
+    let wallet_b = DeterministicWallet::from_secret([0x33u8; 32]);
+    // A second funding identity per chain, so spent outputs do not all share
+    // one scriptPubKey. See `sp_build_eligible_fixture`.
+    let alt_a = DeterministicWallet::from_secret([0x22u8; 32]);
+    let alt_b = DeterministicWallet::from_secret([0x44u8; 32]);
+    let addr_a = wallet_a.address.to_string();
+    let addr_b = wallet_b.address.to_string();
+
+    // --- Node A: the live write path, index on from genesis. ---
+    let mut node_a = TestNode::start(&["--silentpaymentindex=1"]);
+    sp_generate_to(&node_a, 3, &alt_a.address.to_string());
+    sp_generate_to(&node_a, 102, &addr_a);
+    let tip_a = sp_build_eligible_fixture(&node_a, &wallet_a, &alt_a, &addr_a, &[], 0x40);
+    assert_eq!(tip_a, 108, "105 empty blocks plus 3 carrying eligible transactions");
+
+    // Fail loudly if the fixture stopped producing eligible transactions: two
+    // empty indexes would otherwise compare equal and prove nothing.
+    let entries_before = sp_entry_count(&node_a, 1, tip_a);
+    assert!(
+        entries_before >= 3,
+        "expected at least one tweak per eligible transaction, got {entries_before}"
+    );
+
+    // Chain A's blocks, captured before the reorg replaces them. Node C is fed
+    // these first so that the node doing the BACKFILL has also seen a fork:
+    // otherwise the backfill only ever walks a linear chain, and its whole
+    // reorg-safety design (an anchored snapshot walk rather than height-index
+    // lookups) goes untested.
+    let losing_chain = sp_active_chain_hex(&node_a);
+
+    // --- The competing chain: longer, and carrying its own eligible txs. ---
+    let mut node_b = TestNode::start(&[]);
+    sp_generate_to(&node_b, 3, &alt_b.address.to_string());
+    sp_generate_to(&node_b, 102, &addr_b);
+    let tip_b = sp_build_eligible_fixture(&node_b, &wallet_b, &alt_b, &addr_b, &[7, 8], 0x70);
+    assert_eq!(tip_b, 110);
+    let winning_chain = sp_active_chain_hex(&node_b);
+    node_b.stop();
+
+    // --- Reorg node A onto it. ---
+    sp_submit_chain(&node_a, &winning_chain);
+    assert_eq!(
+        get_rpc_u64(&node_a, "getblockcount").expect("getblockcount"),
+        tip_b,
+        "node A must have adopted the longer chain"
+    );
+    let entries_after = sp_entry_count(&node_a, 1, tip_b);
+    assert!(
+        entries_after >= 5,
+        "the winning chain's eligible transactions must be indexed after the reorg, \
+         got {entries_after}"
+    );
+
+    // --- Node C: the backfill write path over the same winning chain, reached
+    // by the same reorg node A went through. ---
+    let mut node_c = TestNode::start(&[]);
+    sp_submit_chain(&node_c, &losing_chain);
+    sp_submit_chain(&node_c, &winning_chain);
+    assert_eq!(
+        get_rpc_u64(&node_c, "getblockcount").expect("getblockcount"),
+        tip_b
+    );
+
+    node_c.restart_preserving_datadir(&["--silentpaymentindex=1"]);
+    let info = node_c.rpc_call("getindexinfo").expect("getindexinfo");
+    assert_eq!(
+        info["result"]["silentpayments"]["synced"].as_bool(),
+        Some(false),
+        "history that connected with the index off must report as not synced"
+    );
+    let started = node_c
+        .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
+        .expect("backfillindex");
+    assert_eq!(
+        started["result"]["started"].as_bool(),
+        Some(true),
+        "backfillindex silentpayment: {started}"
+    );
+    // Accept `failed` as a terminal state too, so a backfill that aborts fails
+    // this test in a second with its `last_error` rather than after the full
+    // timeout with nothing to read.
+    let done = poll_sp_backfill_state(&node_c, &["completed", "failed"], test_timeout(120));
+    let sp = &done["result"]["silentpayments"];
+    assert_eq!(
+        sp["backfill"]["state"].as_str(),
+        Some("completed"),
+        "the backfill did not complete: {}",
+        sp["backfill"]
+    );
+    assert_eq!(
+        sp["synced"].as_bool(),
+        Some(true),
+        "a completed backfill must report synced"
+    );
+
+    // --- Compare the two column families. ---
+    let dir_a = node_a.datadir.clone();
+    let dir_c = node_c.datadir.clone();
+    node_a.stop();
+    node_c.stop();
+
+    let live = common::dump_sp_tweaks_cf(&dir_a);
+    let rebuilt = common::dump_sp_tweaks_cf(&dir_c);
+
+    // On regtest the index starts at height 1, so both sides describe the whole
+    // chain. An off-by-one in the walk start, or a stale row surviving the
+    // reorg, shows up as a length difference before any row is inspected.
+    assert_eq!(
+        live.len(),
+        tip_b as usize,
+        "the live index must hold exactly one row per block from the activation height"
+    );
+    // Name the heights, not just the counts: both datadirs are removed when the
+    // nodes drop, so whatever this message says is all a CI reader will ever
+    // have to work from.
+    if rebuilt.len() != live.len() {
+        let hs = |rows: &[(u32, Vec<u8>)]| rows.iter().map(|(h, _)| *h).collect::<Vec<_>>();
+        let (lh, rh) = (hs(&live), hs(&rebuilt));
+        let only_live: Vec<u32> = lh.iter().copied().filter(|h| !rh.contains(h)).collect();
+        let only_rebuilt: Vec<u32> = rh.iter().copied().filter(|h| !lh.contains(h)).collect();
+        panic!(
+            "the backfill wrote {} rows where the live path wrote {}; \
+             heights only in the live index: {only_live:?}; \
+             heights only in the rebuilt index: {only_rebuilt:?}",
+            rebuilt.len(),
+            live.len(),
+        );
+    }
+
+    let mut non_empty = 0;
+    for ((h_live, v_live), (h_rebuilt, v_rebuilt)) in live.iter().zip(rebuilt.iter()) {
+        assert_eq!(h_live, h_rebuilt, "row heights diverged");
+        assert_eq!(
+            v_live,
+            v_rebuilt,
+            "row at height {h_live} differs: live {} vs rebuilt {}",
+            hex::encode(v_live),
+            hex::encode(v_rebuilt)
+        );
+        // A row is `version || block_hash || count || entries`; anything longer
+        // than the 37-byte header carries at least one tweak.
+        if v_live.len() > 37 {
+            non_empty += 1;
+        }
+    }
+    assert!(
+        non_empty >= 5,
+        "the compared indexes must contain real tweaks, not only empty rows; \
+         found {non_empty} non-empty rows"
+    );
+}
+
+/// A block that leaves the active chain must take its tweak row with it.
+///
+/// This is the other half of the rebuild-parity criterion, and the parity test
+/// above structurally cannot reach it: there the winning chain is longer, so
+/// every disconnected height is immediately reconnected and a row that was
+/// never removed is overwritten before anyone looks. The damage a missing
+/// removal does only becomes visible at a height the chain no longer has, so
+/// this test rolls the tip back without replacing it.
+///
+/// Rows are self-authenticating and every reader checks that, so a survivor is
+/// not served as though it described the chain: the serving RPC and the
+/// streaming replay both compare the row's embedded block hash and both bound
+/// themselves to the active chain. What a survivor costs is space that is
+/// never reclaimed, and a column family that no longer describes the chain it
+/// is supposed to index, which is what makes the rebuild comparison above
+/// meaningful in the first place.
+#[test]
+fn test_sp_index_drops_rows_for_blocks_that_leave_the_chain() {
+    let wallet = DeterministicWallet::from_secret([0x11u8; 32]);
+    let alt = DeterministicWallet::from_secret([0x22u8; 32]);
+    let addr = wallet.address.to_string();
+
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    sp_generate_to(&node, 3, &alt.address.to_string());
+    sp_generate_to(&node, 102, &addr);
+    let tip = sp_build_eligible_fixture(&node, &wallet, &alt, &addr, &[], 0x40);
+    assert_eq!(tip, 108);
+    assert!(
+        sp_entry_count(&node, 106, 108) >= 4,
+        "the blocks about to be disconnected must carry real tweaks"
+    );
+
+    // Roll back to 105 by invalidating the first block that carries tweaks.
+    let h106 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(106)])
+        .expect("getblockhash")["result"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let resp = node
+        .rpc_call_with_params("invalidateblock", vec![serde_json::json!(h106)])
+        .expect("invalidateblock");
+    assert!(resp["error"].is_null(), "invalidateblock: {resp}");
+    assert_eq!(
+        get_rpc_u64(&node, "getblockcount").expect("getblockcount"),
+        105,
+        "invalidating height 106 must roll the tip back to 105"
+    );
+
+    let dir = node.datadir.clone();
+    node.stop();
+    let rows = common::dump_sp_tweaks_cf(&dir);
+
+    let above: Vec<u32> = rows.iter().map(|(h, _)| *h).filter(|h| *h > 105).collect();
+    assert!(
+        above.is_empty(),
+        "rows survived at heights the chain no longer has: {above:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        105,
+        "the index must hold exactly one row per remaining block"
+    );
+}
+
 /// `backfillindex address` starts a real two-pass backfill on a
 /// non-AssumeUTXO datadir. Replaces the M7-era "no-op" test once the
 /// genesis→tip walk landed.
