@@ -730,10 +730,10 @@ impl AlertReloader {
         // does not exist until the executor first polls that task, so every
         // event published between retiring the outgoing generation and that
         // first poll reaches nobody. Not delayed: gone. Status events have no
-        // replay by design and the detectors that raise them are edge-triggered
-        // against a `HealthState` that outlives the reload, so a `disk_low`
-        // that lands in the window is never re-raised and the page never
-        // arrives. The window is short but it is scheduler latency, which is
+        // replay by design, and a detector raises only on *entering* its
+        // condition, against a `HealthState` that outlives the reload, so a
+        // `disk_low` that lands in the window is never re-raised and the page
+        // never arrives. The window is short but it is scheduler latency, which is
         // longest exactly when the node is loaded enough to be raising alerts.
         //
         // Holding both subscriptions open for a moment is the safe direction: a
@@ -1150,9 +1150,10 @@ heartbeat_interval_secs = 3600
     /// If the fan-in subscribes for itself, the subscription does not exist
     /// until the executor first polls it — and every event published between
     /// retiring the outgoing generation and that first poll reaches nobody.
-    /// A status event lost there is lost for good: there is no replay, and the
-    /// detectors are edge-triggered against a `HealthState` that outlives the
-    /// reload, so the condition is never re-raised.
+    /// A status event lost there is lost for good: there is no replay, and a
+    /// detector raises only on *entering* its condition, against a
+    /// `HealthState` that outlives the reload, so a condition that is already
+    /// standing is never re-raised.
     ///
     /// This is a single-threaded runtime and nothing is awaited across the
     /// second `apply`, so no spawned task has run: the subscriber count is

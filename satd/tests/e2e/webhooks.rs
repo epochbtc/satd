@@ -227,7 +227,7 @@ impl MockReceiver {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for a matching webhook delivery; got: {:?}",
-                self.inner.blocking_lock_bodies()
+                self.inner.try_lock_bodies()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -263,7 +263,7 @@ impl MockReceiver {
                 std::time::Instant::now() < deadline,
                 "timed out waiting for a matching webhook delivery after the \
                  first {skip}; got: {:?}",
-                self.inner.blocking_lock_bodies()
+                self.inner.try_lock_bodies()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -289,14 +289,22 @@ impl MockReceiver {
 }
 
 trait BodiesForPanic {
-    fn blocking_lock_bodies(&self) -> Vec<String>;
+    /// Bodies received so far, for a panic message. Never blocks: a panic
+    /// path must not be able to wedge on a lock a receiver task is holding.
+    ///
+    /// Contention is reported as such rather than as an empty list. The two
+    /// are very different diagnoses -- "nothing was delivered" sends you
+    /// looking for a dispatcher bug, and rendering a busy lock the same way
+    /// sends you there wrongly.
+    fn try_lock_bodies(&self) -> Vec<String>;
 }
 
 impl BodiesForPanic for Mutex<Inner> {
-    fn blocking_lock_bodies(&self) -> Vec<String> {
-        self.try_lock()
-            .map(|g| g.received.iter().map(|r| r.body.clone()).collect())
-            .unwrap_or_default()
+    fn try_lock_bodies(&self) -> Vec<String> {
+        match self.try_lock() {
+            Ok(g) => g.received.iter().map(|r| r.body.clone()).collect(),
+            Err(_) => vec!["<receiver lock busy; deliveries unknown>".to_string()],
+        }
     }
 }
 
@@ -671,7 +679,8 @@ async fn an_unrelated_sighup_does_not_destroy_a_queued_status_event() {
 /// the whole handover. A reload that rebuilt every delivery task would take
 /// `pager`'s in-flight `disk_low` down with it even though the operator only
 /// touched `ops` — and a status event has no replay, so it is lost outright and
-/// the edge-triggered detector never raises it again.
+/// the detector, which raises only on entering its condition, never raises it
+/// again.
 ///
 /// `pager` 503s the first four attempts, so the event is provably still in its
 /// queue, mid-backoff, when the reload lands.
@@ -843,8 +852,10 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
 /// condition that outlives the daemon is announced again by its successor.
 /// That is a real durability property an operator relies on, since an alert
 /// must not go quiet merely because the node bounced. `health.rs` covers the
-/// in-process re-raise; nothing covered the part an operator actually sees,
-/// which is whether it reaches the hook.
+/// in-process re-raise for one condition
+/// (`tip_stall_raises_on_a_node_restarted_while_already_wedged`); nothing
+/// covered the part an operator actually sees, which is whether it reaches
+/// the hook.
 ///
 /// The two delivery ids must differ. They derive from the publisher's
 /// per-process instance id, so a receiver deduplicating on `X-Satd-Delivery`
@@ -867,6 +878,7 @@ async fn a_still_true_condition_is_raised_again_after_a_restart() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    let restart_quiet = quiet_but_disk.clone();
     let (sn, dir) = node_with_hook(&receiver, "ops", "\"status\"", quiet_but_disk).await;
     let alertfile_arg = format!("--alertfile={}", dir.path().join("alertfile.toml").display());
 
@@ -893,7 +905,14 @@ async fn a_still_true_condition_is_raised_again_after_a_restart() {
     // a node restarted without it comes back with no hooks at all.
     let sn = tokio::task::spawn_blocking(move || {
         let mut sn = sn;
-        sn.restart_with(&[alertfile_arg.as_str()]);
+        // The quiet-detector arguments have to be re-passed too, or the
+        // successor runs with stock thresholds and the "only disk_low can
+        // speak" invariant this test relies on stops holding after the
+        // restart. Harmless on regtest today, where the others default off,
+        // which is exactly why it would rot silently.
+        let mut args: Vec<&str> = vec![alertfile_arg.as_str()];
+        args.extend(restart_quiet.iter().map(String::as_str));
+        sn.restart_with(&args);
         sn
     })
     .await
@@ -908,13 +927,38 @@ async fn a_still_true_condition_is_raised_again_after_a_restart() {
         })
         .await;
     assert!(again.signature_valid(SECRET));
+
+    // A delivery id is `<node_id>-<instance_id>-<seq>`. Asserting only that the
+    // two ids differ proves nothing: `seq` alone would do it, and so would a
+    // stray late delivery from the old process. Pin both halves instead --
+    // same node, different incarnation -- which is exactly the claim being
+    // made. The spec tells receivers not to parse this id; a test is not a
+    // receiver.
+    let again_id = again.header("x-satd-delivery");
+    let node_of = |id: &str| id.split('-').next().unwrap_or_default().to_string();
+    let incarnation_of = |id: &str| {
+        id.split('-').nth(1).unwrap_or_default().to_string()
+    };
+    assert_eq!(
+        node_of(&again_id),
+        node_of(&first_id),
+        "the re-raise must come from the same node: {again_id} vs {first_id}"
+    );
     assert_ne!(
-        again.header("x-satd-delivery"),
-        first_id,
-        "the re-raise must carry a fresh delivery id, or a conforming receiver \
-         deduplicates it away and never learns the condition is still standing"
+        incarnation_of(&again_id),
+        incarnation_of(&first_id),
+        "the re-raise must come from a NEW process. Equal instance ids mean \
+         this is the pre-restart raise arriving late, not the successor \
+         re-evaluating: {again_id} vs {first_id}"
+    );
+    assert_ne!(
+        again_id, first_id,
+        "a conforming receiver dedupes on this header, so a repeated id would \
+         hide the re-raise entirely"
     );
 
+    // Keeps the node alive to here, and silences `unused_variables` on the
+    // rebinding above.
     drop(sn);
 }
 

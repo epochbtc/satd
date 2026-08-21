@@ -766,6 +766,11 @@ impl TestNode {
                     attempts += 1;
                     if attempts > 30 {
                         let _ = self.process.kill();
+                        // Reap it. Without this the child is a zombie that may
+                        // still hold the RocksDB LOCK and the RPC port, and a
+                        // restart onto the same datadir then fails as an opaque
+                        // readiness timeout rather than as anything diagnosable.
+                        let _ = self.process.wait();
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
