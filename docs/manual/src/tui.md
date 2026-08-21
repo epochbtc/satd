@@ -238,8 +238,11 @@ A single line summarizing satd's wallet-server surfaces, sourced from
 `getserverstatus` and `getindexinfo`:
 
 ```
-addr-idx <state>   esplora <state>   electrum <state>
+addr-idx <state>   [sp-idx <state>]   esplora <state>   electrum <state>
 ```
+
+The `sp-idx` column appears only when the silent-payment index is
+enabled, so nodes not using it keep the three-column row.
 
 `addr-idx` states:
 
@@ -252,6 +255,22 @@ addr-idx <state>   esplora <state>   electrum <state>
 | `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
 | `⬭ off` (gray) | Address index disabled (`-addressindex=0`). |
 | `⬭ -` (dim) | Status unknown: older satd, or a transient RPC error. |
+
+`sp-idx` states (BIP 352 tweak index, served via
+[`getsilentpaymentblockdata`](./json-rpc-extensions.md#silent-payment-block-data)
+and the streaming [`tweaks`](./streaming.md) category):
+
+| Display | Meaning |
+|---|---|
+| *(column absent)* | Index disabled (`-silentpaymentindex=0`, the default), or a satd too old to report it. |
+| `⬤ synced` (green) | Tweak index is at tip. `getsilentpaymentblockdata` and the streaming `tweaks` category return data. |
+| `⬤ syncing` (yellow) | Enabled but not caught up: fresh sync, or a backfill is still owed. Tweak-serving surfaces do not return data yet. |
+| `⬤ backfill XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height. Unlike the address index this is a **single** pass, so there is no pass counter. |
+| `⬤ backfill paused …` (yellow) | Backfill paused. Resume with `sat-cli resumeindex silentpayment`. |
+| `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
+
+The silent-payment backfill is CPU-bound and can run for hours on mainnet;
+see [Disk footprint](./disk-footprint.md) for measured timings.
 
 `esplora` and `electrum` states:
 

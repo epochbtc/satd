@@ -173,6 +173,13 @@ pub fn get_index_info(
             silent_payments::walk_start(chain.network),
         );
         let mut spi = serde_json::Map::new();
+        // `enabled` is the runtime config bit on its own, reported
+        // separately from `synced` (which folds in the on-disk marker and
+        // backfill quiescence). Without it a consumer cannot tell "index
+        // off" from "index on but not caught up" — both give synced=false
+        // — and would have to guess. `sat-tui`'s services row needs the
+        // distinction to avoid labelling a disabled index as syncing.
+        spi.insert("enabled".into(), json!(report.enabled));
         spi.insert("synced".into(), json!(report.synced));
         spi.insert("best_block_height".into(), json!(best_block_height));
 

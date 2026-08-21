@@ -27,6 +27,9 @@ layer; a node that enables nothing behaves exactly as 0.4.0 did.
 - Deferred backfill for existing datadirs — `backfillindex silentpayment`
   (anchored, resumable) with `pauseindex`/`resumeindex`/`cancelindex`,
   a `getindexinfo` section, and progress/state metrics.
+- `sat-tui` services row gains an `sp-idx` column with tweak-index status and
+  backfill progress; shown only when the index is enabled. `getindexinfo`
+  now reports `silentpayments.enabled` alongside `synced`.
 - Measured disk footprint in the manual, replacing estimates that had drifted.
   The silent-payment index is ~13 GB for the full taproot era (not ~4 GB), grows
   ~1 GB/year, and takes 6 h 46 m to backfill on mainnet; `tweak_dust_limit`

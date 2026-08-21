@@ -171,6 +171,89 @@ pub struct BackfillProgress {
     pub last_error: Option<String>,
 }
 
+/// Snapshot of the silent-payment index from `getindexinfo`.
+///
+/// Unlike the address index, whose steady-state flags arrive via
+/// `getserverstatus`, everything the services row needs for the
+/// silent-payment index comes from `getindexinfo.silentpayments`.
+///
+/// The backfill is a **single** pass over the taproot era, so there is no
+/// `pass` field and progress is a plain cursor/snapshot ratio — the
+/// address index's two-pass arithmetic does not apply here.
+#[derive(Debug, Clone)]
+pub struct SpIndexProgress {
+    /// Runtime config bit (`--silentpaymentindex=1`), reported on its own
+    /// so "off" is distinguishable from "on but not caught up."
+    pub enabled: bool,
+    /// Enabled AND the on-disk marker is set AND no backfill is running.
+    pub synced: bool,
+    /// `running` | `paused` | `completed` | `failed` | `cancelled` |
+    /// `rejected` | `idle`.
+    pub state: String,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    pub estimated_remaining_seconds: u64,
+    /// Populated when state == "failed".
+    pub last_error: Option<String>,
+}
+
+impl SpIndexProgress {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let sp = v.get("silentpayments")?;
+        let bf = sp.get("backfill");
+        Some(SpIndexProgress {
+            // Absent on a satd older than this field: treat as not
+            // enabled so the column stays hidden rather than asserting a
+            // state we cannot know. See `render` in ui::steady.
+            enabled: sp.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false),
+            synced: sp.get("synced").and_then(|b| b.as_bool()).unwrap_or(false),
+            state: bf
+                .and_then(|b| b.get("state"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("idle")
+                .to_string(),
+            cursor_height: bf
+                .and_then(|b| b.get("cursor_height"))
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
+            snapshot_height: bf
+                .and_then(|b| b.get("snapshot_height"))
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
+            estimated_remaining_seconds: bf
+                .and_then(|b| b.get("estimated_remaining_seconds"))
+                .and_then(|s| s.as_u64())
+                .unwrap_or(0),
+            last_error: bf
+                .and_then(|b| b.get("last_error"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        })
+    }
+
+    /// True only for backfill states that warrant replacing the
+    /// steady-state label with progress detail.
+    pub fn backfill_is_visible(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused" | "failed")
+    }
+
+    /// Single-pass progress ratio (0.0..=1.0).
+    pub fn progress_ratio(&self) -> f64 {
+        if self.snapshot_height == 0 {
+            return 0.0;
+        }
+        (self.cursor_height as f64 / self.snapshot_height as f64).clamp(0.0, 1.0)
+    }
+
+    /// Whether the services row should carry a silent-payment column at
+    /// all. Hidden when the index is off, so nodes not using the feature
+    /// (and daemons too old to report `enabled`) keep the previous
+    /// three-column row instead of growing a permanently dim placeholder.
+    pub fn is_visible(&self) -> bool {
+        self.enabled || self.backfill_is_visible()
+    }
+}
+
 /// Snapshot of the runtime listener status from `getserverstatus`.
 /// Drives the steady-view services row.
 ///
@@ -378,6 +461,10 @@ pub struct AppState {
     // Address-index backfill — None when no backfill cursor exists or
     // when the response shape couldn't be parsed.
     pub backfill: Option<BackfillProgress>,
+
+    /// Silent-payment index status from `getindexinfo`. `None` when the
+    /// daemon has not reported a `silentpayments` object at all.
+    pub sp_index: Option<SpIndexProgress>,
 
     /// Listener and address-index status from `getserverstatus`. Drives
     /// the always-visible services row in the steady view.
@@ -595,6 +682,7 @@ impl AppState {
 
             ibd_bitmap: None,
             backfill: None,
+            sp_index: None,
             server_status: ServerStatus::default(),
             server_version: None,
 
@@ -914,6 +1002,7 @@ impl AppState {
     /// Update from `getindexinfo` response.
     pub fn update_index_info(&mut self, v: &serde_json::Value) {
         self.backfill = BackfillProgress::from_json(v);
+        self.sp_index = SpIndexProgress::from_json(v);
     }
 
     /// Update from `getserverstatus` response.
@@ -1975,6 +2064,123 @@ mod tests {
         assert!(!st.is_healthy()); // stale
         st.stale = false;
         assert!(st.is_healthy());
+    }
+
+    #[test]
+    fn sp_index_parses_running_backfill() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": true,
+                "synced": false,
+                "best_block_height": 962_151,
+                "backfill": {
+                    "active": true,
+                    "state": "running",
+                    "cursor_height": 800_000,
+                    "snapshot_height": 962_151,
+                    "estimated_remaining_seconds": 7_200,
+                }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("silentpayments object present");
+        assert!(sp.enabled);
+        assert!(!sp.synced);
+        assert_eq!(sp.state, "running");
+        assert_eq!(sp.cursor_height, 800_000);
+        assert_eq!(sp.snapshot_height, 962_151);
+        assert_eq!(sp.estimated_remaining_seconds, 7_200);
+        assert!(sp.backfill_is_visible());
+        assert!(sp.is_visible());
+        // Single pass: cursor / snapshot, NOT the address index's
+        // cursor / (2 * snapshot).
+        assert!((sp.progress_ratio() - 800_000.0 / 962_151.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sp_index_backfill_visibility_filters_quiet_states() {
+        for state in ["idle", "completed", "cancelled", "rejected"] {
+            let v = json!({
+                "silentpayments": { "enabled": true, "synced": true,
+                                    "backfill": { "state": state } }
+            });
+            let sp = SpIndexProgress::from_json(&v).expect("present");
+            assert!(!sp.backfill_is_visible(), "{state} should be quiet");
+            // Quiet does not mean hidden: an enabled index still shows a
+            // steady-state column.
+            assert!(sp.is_visible(), "{state} should still render a column");
+        }
+    }
+
+    #[test]
+    fn sp_index_column_hidden_when_index_is_off() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": false,
+                "synced": false,
+                "backfill": { "state": "idle" }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert!(!sp.enabled);
+        assert!(!sp.is_visible(), "a disabled index must not take a column");
+    }
+
+    #[test]
+    fn sp_index_column_hidden_on_daemon_without_enabled_field() {
+        // satd older than the `enabled` field: synced=false is
+        // indistinguishable from "off", so stay hidden rather than
+        // labelling a disabled index as syncing.
+        let v = json!({
+            "silentpayments": { "synced": false, "backfill": { "state": "idle" } }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert!(!sp.enabled);
+        assert!(!sp.is_visible());
+    }
+
+    #[test]
+    fn sp_index_running_backfill_shows_even_if_enabled_is_absent() {
+        // A backfill in flight is itself proof the index is on, so the
+        // column appears regardless of the `enabled` field.
+        let v = json!({
+            "silentpayments": {
+                "synced": false,
+                "backfill": { "state": "running", "cursor_height": 1, "snapshot_height": 2 }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert!(!sp.enabled);
+        assert!(sp.is_visible());
+    }
+
+    #[test]
+    fn sp_index_failed_carries_last_error() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": true, "synced": false,
+                "backfill": { "state": "failed", "last_error": "disk full" }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.last_error.as_deref(), Some("disk full"));
+        assert!(sp.backfill_is_visible());
+    }
+
+    #[test]
+    fn sp_index_absent_object_yields_none() {
+        let v = json!({ "address": { "synced": true } });
+        assert!(SpIndexProgress::from_json(&v).is_none());
+    }
+
+    #[test]
+    fn sp_index_zero_snapshot_does_not_divide_by_zero() {
+        let v = json!({
+            "silentpayments": { "enabled": true, "synced": false,
+                                "backfill": { "state": "running",
+                                              "cursor_height": 5, "snapshot_height": 0 } }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.progress_ratio(), 0.0);
     }
 
     #[test]
