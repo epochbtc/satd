@@ -262,10 +262,10 @@ and the streaming [`tweaks`](./streaming.md) category):
 
 | Display | Meaning |
 |---|---|
-| *(column absent)* | Index disabled (`-silentpaymentindex=0`, the default), or a satd too old to report it. |
+| *(column absent)* | Index disabled (`-silentpaymentindex=0`, the default), or a satd too old to report it. Exception: on an older satd with a backfill mid-flight, the backfill itself is proof the index is on, so the column shows (without a percentage — see below). |
 | `⬤ synced` (green) | Tweak index is at tip. `getsilentpaymentblockdata` and the streaming `tweaks` category return data. |
 | `⬤ syncing` (yellow) | Enabled but not caught up: fresh sync, or a backfill is still owed. Tweak-serving surfaces do not return data yet. |
-| `⬤ backfill XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height. Unlike the address index this is a **single** pass, so there is no pass counter. |
+| `⬤ backfill XX% (C/S) ETA …` (green) | Active backfill with progress. `C/S` is cursor / snapshot height, and the percentage is the daemon-reported ratio over the taproot-era walk — **not** `C/S`, which would measure from genesis and overstate progress. Unlike the address index this is a **single** pass, so there is no pass counter. On a satd too old to report the ratio, the counts show with no percentage. |
 | `⬤ backfill paused …` (yellow) | Backfill paused. Resume with `sat-cli resumeindex silentpayment`. |
 | `⬭ backfill FAILED — <err>` (red) | Backfill errored. Check `journalctl` or the satd logs. |
 

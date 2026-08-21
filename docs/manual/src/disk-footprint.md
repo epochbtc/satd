@@ -156,9 +156,11 @@ sat-cli backfillindex silentpayment
 
 The backfill walks from taproot activation to the snapshot height it pinned at
 start, and resumes across a restart. `getindexinfo` reports a `silentpayments`
-section with the synced flag and the backfill progress. Progress is measured
-across that walked span, not from genesis, so it starts near zero rather than
-near the fraction of the chain that predates taproot.
+section with the synced flag and the backfill progress, including a
+`backfill.progress_ratio` field. Progress is measured across that walked span,
+not from genesis, so it starts near zero rather than near the fraction of the
+chain that predates taproot — use the reported ratio rather than dividing
+`cursor_height` by `snapshot_height`, which measures from genesis.
 
 `estimated_remaining_seconds` is reported only while a backfill is both enabled
 and running. A paused, cancelled, failed or disabled cursor reports `0` — its

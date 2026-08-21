@@ -138,11 +138,19 @@ fn services_line(state: &AppState) -> Line<'static> {
 /// index means the column is not rendered at all.
 ///
 /// The backfill is a single pass (unlike the address index's two), so
-/// progress is shown as a plain percentage with no pass counter.
+/// there is no pass counter. The percentage is the daemon's
+/// walk-start-based `progress_ratio`, never cursor/snapshot — that
+/// division measures from genesis and overstates progress on mainnet
+/// from the first block of the run. A daemon too old to send the ratio
+/// gets the raw counts with no percentage at all: no number beats a
+/// wrong one.
 fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProgress) {
     let label = "sp-idx";
     if sp.backfill_is_visible() {
-        let pct = sp.progress_ratio() * 100.0;
+        let pct = sp
+            .progress_ratio()
+            .map(|r| format!("{:.1}% ", r * 100.0))
+            .unwrap_or_default();
         let cursor = format_num(sp.cursor_height as u64);
         let snapshot = format_num(sp.snapshot_height as u64);
         match sp.state.as_str() {
@@ -155,7 +163,7 @@ fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProg
                 spans.push(dot(Color::Green));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
-                    format!(" backfill {:.1}% ({}/{}){}", pct, cursor, snapshot, eta),
+                    format!(" backfill {}({}/{}){}", pct, cursor, snapshot, eta),
                     Style::default().fg(Color::Gray),
                 ));
             }
@@ -163,7 +171,7 @@ fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProg
                 spans.push(dot(Color::Yellow));
                 spans.push(Span::styled(label, Style::default().fg(Color::White)));
                 spans.push(Span::styled(
-                    format!(" backfill paused {pct:.1}% — resumeindex silentpayment"),
+                    format!(" backfill paused {pct}— resumeindex silentpayment"),
                     Style::default().fg(Color::Yellow),
                 ));
             }
@@ -723,11 +731,14 @@ mod tests {
 
     fn sp(enabled: bool, synced: bool, state: &str) -> SpIndexProgress {
         SpIndexProgress {
-            enabled,
+            enabled: Some(enabled),
             synced,
             state: state.to_string(),
             cursor_height: 835_200,
             snapshot_height: 962_151,
+            // Daemon-computed from walk_start=709,632 on this mainnet
+            // shape; cursor/snapshot would misread it as 86.8%.
+            progress_ratio: Some(0.497_263_583),
             estimated_remaining_seconds: 0,
             last_error: None,
         }
@@ -769,15 +780,50 @@ mod tests {
     }
 
     #[test]
-    fn services_row_shows_single_pass_backfill_progress() {
+    fn services_row_shows_daemon_reported_backfill_progress() {
         let mut st = AppState::new();
         st.sp_index = Some(sp(true, false, "running"));
         let r = row(&st);
-        // 835200 / 962151 = 86.8%. The address index's two-pass maths
-        // would render 43.4% here.
-        assert!(r.contains("sp-idx backfill 86.8%"), "{r}");
+        // The daemon's walk-start-based ratio, verbatim: 49.7%. Two
+        // plausible-looking wrong reconstructions from the same counts
+        // must NOT appear: cursor/snapshot measures from genesis and
+        // gives 86.8%; the address index's two-pass maths gives 43.4%.
+        assert!(r.contains("sp-idx backfill 49.7%"), "{r}");
+        assert!(
+            !r.contains("86.8%"),
+            "cursor/snapshot (genesis-measured) reconstruction: {r}"
+        );
+        assert!(!r.contains("43.4%"), "two-pass reconstruction: {r}");
         assert!(r.contains("(835,200/962,151)"), "{r}");
         assert!(!r.contains("pass"), "single-pass backfill must not show a pass counter: {r}");
+    }
+
+    #[test]
+    fn services_row_omits_percentage_when_daemon_sends_no_ratio() {
+        // Old daemon: counts and ETA only. Rendering a percentage here
+        // would require reconstructing it from cursor/snapshot, which is
+        // genesis-measured and wrong (86.8% for a ~49.7%-done walk).
+        let mut st = AppState::new();
+        let mut p = sp(true, false, "running");
+        p.enabled = None;
+        p.progress_ratio = None;
+        p.estimated_remaining_seconds = 7_200;
+        st.sp_index = Some(p);
+        let r = row(&st);
+        assert!(r.contains("sp-idx backfill (835,200/962,151)"), "{r}");
+        assert!(!r.contains('%'), "no ratio from the daemon, no percentage: {r}");
+        assert!(r.contains("ETA"), "{r}");
+    }
+
+    #[test]
+    fn services_row_hides_sp_column_when_disabled_with_stale_cursor() {
+        // Explicit enabled=false beats a leftover running cursor: the
+        // supervisor will not resume it while the index is off, so a
+        // green backfill column would report work that is not happening.
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(false, false, "running"));
+        let r = row(&st);
+        assert!(!r.contains("sp-idx"), "disabled index must not take a column: {r}");
     }
 
     #[test]

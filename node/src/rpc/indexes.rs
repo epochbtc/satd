@@ -196,6 +196,13 @@ pub fn get_index_info(
         bf.insert("state".into(), json!(cursor_state.label()));
         bf.insert("cursor_height".into(), json!(report.cursor_height));
         bf.insert("snapshot_height".into(), json!(report.snapshot_height));
+        // The walk-start-based ratio, not cursor/snapshot: the backfill
+        // walks only the taproot era, so a consumer reconstructing
+        // progress from the two heights measures from genesis and
+        // overstates it (73.8% at the first mainnet block; the exact bug
+        // documented on `BackfillCursor::progress_ratio`). Serving the
+        // daemon's own number is the only way a client can get it right.
+        bf.insert("progress_ratio".into(), json!(report.progress_ratio));
         bf.insert(
             "estimated_remaining_seconds".into(),
             json!(estimated_remaining_seconds),

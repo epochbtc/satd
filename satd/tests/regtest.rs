@@ -5033,6 +5033,15 @@ fn test_getindexinfo_silentpayments_reports_enabled_separately() {
         "backfill substructure missing: {}",
         resp
     );
+    // The daemon must serve its walk-start-based ratio; clients cannot
+    // reconstruct it from cursor/snapshot (that measures from genesis
+    // and overstates progress on any chain with a non-genesis taproot
+    // activation — invisible on regtest, where walk_start is 1).
+    assert!(
+        sp["backfill"]["progress_ratio"].is_f64(),
+        "backfill.progress_ratio missing or not a number: {}",
+        resp
+    );
     node.stop();
 }
 
