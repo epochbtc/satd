@@ -52,6 +52,9 @@ layer; a node that enables nothing behaves exactly as 0.4.0 did.
   complete, falling back per block otherwise.
 - Both SDKs expose all of it, and the Tier 2 matcher is proven against the
   BIP 352 reference vectors over the whole corpus (#592).
+- The Operator Manual gains a dedicated Silent Payments chapter: the tier
+  comparison, index operations, and an end-to-end walkthrough of each
+  consumption mode.
 
 **Alerting & node health**
 

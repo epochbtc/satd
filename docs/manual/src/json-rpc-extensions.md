@@ -113,8 +113,9 @@ disabled, and `-1` when the block is not yet indexed at that height (the row is
 absent — a height-by-height scanner cannot proceed past a gap, but unlike BIP
 157 it cannot silently miss its own outputs either). The method is read-only. A
 light client runs one ECDH per returned tweak locally, so the scan key never
-reaches the node; for the streaming firehose with cursor replay, see the
-[Streaming Consumption API](streaming.md).
+reaches the node; for the streaming firehose with cursor replay, and the
+integrator guide to every silent-payment consumption mode, see
+[Silent Payments (BIP 352)](silent-payments.md).
 
 ## Client-side PSBT signing (no signing RPC)
 

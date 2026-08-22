@@ -43,7 +43,8 @@ the scale-out trade-off.
   terminal dashboard.
 - **Protocol Surfaces**: the [Esplora REST API](esplora.md) and [Electrum
   protocol](electrum.md) references, the [streaming consumption
-  API](streaming.md), and the [MCP server](mcp.md). Each runs as a native,
+  API](streaming.md), the [silent-payments integrator
+  guide](silent-payments.md), and the [MCP server](mcp.md). Each runs as a native,
   shared-chainstate subsystem of `satd` itself rather than as a companion
   process. The [Disk Footprint & Indices](disk-footprint.md) chapter covers
   what the single shared store costs and provides.
