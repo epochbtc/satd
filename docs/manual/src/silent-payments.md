@@ -8,11 +8,11 @@ identifies an output as a silent payment at all. The cost of that privacy falls
 on the receiver: finding your own payments means running an ECDH computation
 against candidate transactions, because there is no address string to look up.
 
-satd ships the receive side of that computation end to end: a node-native tweak
-index, a streaming tweak firehose with unclamped cold-sync replay, mempool-time
-detection, and an optional server-side scan-key matcher — with typed support in
-both first-party SDKs, proven against the BIP 352 reference test vectors. Every
-piece is opt-in; a node that enables none of it behaves exactly as before.
+satd implements the receive side: a tweak index, a streaming tweak firehose
+with cursor replay, mempool-time detection, and an optional server-side
+scan-key matcher, with typed support in both SDKs. The matching kernel is
+tested for parity against the BIP 352 reference vectors. Everything is opt-in;
+a node that enables none of it behaves exactly as before.
 
 This chapter is the integrator guide: what each consumption mode gives you, how
 to pick one, and how to operate the index behind them. The wire-level contract
@@ -20,31 +20,25 @@ lives in the
 [streaming API specification](https://github.com/epochbtc/satd/blob/master/docs/api/streaming.md)
 (§7.7).
 
-## Your node is the whole stack
+## In the node, not beside it
 
-Receiving silent payments without help from your own node today means bolting a
-scanning stack on beside it: a separate tweak-indexing daemon over the node's
-RPC, a serving layer for light clients, and wallet-side scanning code, each with
-its own sync state and reorg handling. As of this release Bitcoin Core ships no
-silent-payment support — no index, no scanning, no wallet integration — so that
-external stack is not an optimization but the only option on a stock node.
+Silent-payment support follows the same one-process, one-store model as satd's
+Electrum and Esplora surfaces: the tweak index is written inside block
+connection, atomically with the chainstate, and the serving and matching layers
+read it in-process from the same RocksDB store the node validates against.
+There is no companion indexer to keep in sync and no window where an external
+index's view lags the node across a reorg — rows are removed in the same batch
+that disconnects the block, and tweak events carry the block's own hash so a
+client re-anchors from the `(block_hash, height)` it already holds.
 
-satd collapses it into the node, in the same one-process, one-store model as
-its Electrum and Esplora surfaces:
+For context: Bitcoin Core has no silent-payment support in any released
+version as of this writing (August 2026), so receiving against a stock node
+means running a separate tweak-indexing daemon and serving layer beside it,
+each with its own sync state and reorg handling. satd's index produces the
+same per-block public tweak data such stacks do, served over the streaming API
+and a JSON-RPC method instead of a sidecar's own protocol.
 
-| | Stock `bitcoind` | `bitcoind` + external SP stack | satd |
-|---|---|---|---|
-| Per-block tweak data | — | separate indexer daemon | `silentpaymentindex=1`, committed atomically with the chainstate |
-| Serve light clients | — | separate oracle/HTTP layer | streaming `tweaks` firehose + `getsilentpaymentblockdata` |
-| Wallet cold-sync | — | walk the external index | one cursor-resumable subscription from taproot activation |
-| Detect at mempool time | — | — | `MempoolTweak` events at admission |
-| Server-side matching for thin clients | — | remote scanner service (custodial for the scan key) | in-process scan-key watch, ≤16 targets, zeroized secrets |
-| Reorg handling | — | indexer lags the node | rows removed on disconnect, events re-anchor by `(block_hash, height)` |
-
-Because the index and the matcher run inside block connection against the same
-RocksDB store, there is no reorg window where a sidecar's view lags the node,
-and nothing to keep in sync. The trade-off, as with every satd index, is local
-disk — measured, not estimated, in
+The trade-off, as with every satd index, is local disk — measured in
 [Disk Footprint & Indices](disk-footprint.md).
 
 ## Choosing a tier
@@ -60,7 +54,7 @@ the ECDH scan, and therefore in who ever sees your scan key.
 | Detection latency | block | mempool admission | mempool admission |
 | History / cold-sync | unclamped cursor replay | none (best-effort, live only) | `RescanBlocks` |
 | Transport | gRPC `Subscribe` | gRPC `Subscribe` | gRPC `Watch` (mirrored on WebSocket) |
-| Fits | wallets, batch scanners | zero-custody point-of-sale | thin clients, phones |
+| Typical consumer | wallets, batch scanners | payment-notification clients | thin clients, phones |
 
 **Tier 1 is the recommended, zero-custody mode.** The node streams each block's
 public tweak data (`BlockTweaks`, category bit 8 — explicitly requested, never
