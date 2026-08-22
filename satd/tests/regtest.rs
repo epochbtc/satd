@@ -4994,6 +4994,57 @@ fn test_address_index_mempool_quiet_when_empty() {
 
 // ── Address-history index — backfill RPCs (M7) ────────────────────────
 
+/// `getindexinfo.silentpayments` reports `enabled` separately from
+/// `synced`.
+///
+/// Both are false when the index is off, and `synced` alone therefore
+/// cannot distinguish "index disabled" from "index on but not caught
+/// up". Consumers that need the difference — `sat-tui`'s services row
+/// decides whether to render a silent-payment column at all — depend on
+/// `enabled` being present in both states.
+#[test]
+fn test_getindexinfo_silentpayments_reports_enabled_separately() {
+    // Off by default.
+    let mut node = TestNode::start(&[]);
+    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let sp = &resp["result"]["silentpayments"];
+    assert!(sp.is_object(), "silentpayments key missing: {}", resp);
+    assert_eq!(
+        sp["enabled"].as_bool(),
+        Some(false),
+        "index is off, enabled must say so: {}",
+        resp
+    );
+    assert_eq!(sp["synced"].as_bool(), Some(false));
+    node.stop();
+
+    // On: `enabled` flips independently of `synced`.
+    let mut node = TestNode::start(&["--silentpaymentindex=1"]);
+    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let sp = &resp["result"]["silentpayments"];
+    assert_eq!(
+        sp["enabled"].as_bool(),
+        Some(true),
+        "index is on, enabled must say so: {}",
+        resp
+    );
+    assert!(
+        sp["backfill"].is_object(),
+        "backfill substructure missing: {}",
+        resp
+    );
+    // The daemon must serve its walk-start-based ratio; clients cannot
+    // reconstruct it from cursor/snapshot (that measures from genesis
+    // and overstates progress on any chain with a non-genesis taproot
+    // activation — invisible on regtest, where walk_start is 1).
+    assert!(
+        sp["backfill"]["progress_ratio"].is_f64(),
+        "backfill.progress_ratio missing or not a number: {}",
+        resp
+    );
+    node.stop();
+}
+
 /// `getindexinfo` returns the wrapping `{"address": {...}}` envelope
 /// with nested `{address: {synced, best_block_height, backfill: {...}}}`.
 /// The shape is constructed in `node/src/rpc/indexes.rs` and locked by

@@ -19,7 +19,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Constraint::Length(11), // mempool + fee estimates
         Constraint::Length(9),  // utxo + network
         Constraint::Min(5),     // peers
-        Constraint::Length(1),  // services status (addr-index, esplora, electrum)
+        Constraint::Length(1),  // services status (addr-index, sp-index, esplora, electrum)
         Constraint::Length(1),  // footer
     ];
 
@@ -66,10 +66,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let table = peer_table(&state.peers, None, &state.peer_dl_rates, state.selected_peer, &peer_title);
     f.render_widget(table, chunks[4]);
 
-    // Services row — always visible. Shows addr-index, Esplora, and
-    // Electrum status side-by-side. When a backfill is running /
-    // paused / failed, the addr-index column shows backfill progress
-    // instead of the steady-state synced/syncing label.
+    // Services row — always visible. Shows addr-index, Esplora and
+    // Electrum status side-by-side, plus the silent-payment index when
+    // it is enabled. When a backfill is running / paused / failed, that
+    // index's column shows backfill progress instead of the steady-state
+    // synced/syncing label.
     f.render_widget(Paragraph::new(services_line(state)), chunks[5]);
 
     let footer_idx = 6;
@@ -96,8 +97,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), chunks[footer_idx]);
 }
 
-/// Single-line services row. Three columns separated by two spaces:
-/// `addr-idx <state>`, `esplora <state>`, `electrum <state>`.
+/// Single-line services row. Columns separated by two spaces:
+/// `addr-idx <state>`, `sp-idx <state>` (only when the silent-payment
+/// index is enabled), `esplora <state>`, `electrum <state>`.
 ///
 /// `<state>` for addr-idx is the backfill summary when one is active
 /// (running / paused / failed), the live `synced`/`syncing`/`off`/`-`
@@ -109,6 +111,14 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 fn services_line(state: &AppState) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     addr_index_spans(&mut spans, state);
+    // Silent-payment column only when the index is on (or mid-backfill).
+    // Nodes not using the feature keep the original three-column row
+    // rather than gaining a permanently dim placeholder, which also keeps
+    // the line from overflowing narrow terminals for no benefit.
+    if let Some(sp) = state.sp_index.as_ref().filter(|s| s.is_visible()) {
+        spans.push(Span::raw("  "));
+        sp_index_spans(&mut spans, sp);
+    }
     spans.push(Span::raw("  "));
     listener_spans(&mut spans, "esplora", &state.server_status.esplora, None);
     spans.push(Span::raw("  "));
@@ -119,6 +129,78 @@ fn services_line(state: &AppState) -> Line<'static> {
         Some(&state.server_status.electrum_tls),
     );
     Line::from(spans)
+}
+
+/// `sp-idx <state>` — the BIP 352 tweak index.
+///
+/// Backfill detail while one is running / paused / failed, otherwise the
+/// steady `synced` / `syncing` label. There is no `off` arm: a disabled
+/// index means the column is not rendered at all.
+///
+/// The backfill is a single pass (unlike the address index's two), so
+/// there is no pass counter. The percentage is the daemon's
+/// walk-start-based `progress_ratio`, never cursor/snapshot — that
+/// division measures from genesis and overstates progress on mainnet
+/// from the first block of the run. A daemon too old to send the ratio
+/// gets the raw counts with no percentage at all: no number beats a
+/// wrong one.
+fn sp_index_spans(spans: &mut Vec<Span<'static>>, sp: &crate::state::SpIndexProgress) {
+    let label = "sp-idx";
+    if sp.backfill_is_visible() {
+        let pct = sp
+            .progress_ratio()
+            .map(|r| format!("{:.1}% ", r * 100.0))
+            .unwrap_or_default();
+        let cursor = format_num(sp.cursor_height as u64);
+        let snapshot = format_num(sp.snapshot_height as u64);
+        match sp.state.as_str() {
+            "running" => {
+                let eta = if sp.estimated_remaining_seconds > 0 {
+                    format!("  ETA {}", format_duration(sp.estimated_remaining_seconds))
+                } else {
+                    String::new()
+                };
+                spans.push(dot(Color::Green));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!(" backfill {}({}/{}){}", pct, cursor, snapshot, eta),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            "paused" => {
+                spans.push(dot(Color::Yellow));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!(" backfill paused {pct}— resumeindex silentpayment"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            "failed" => {
+                let err = sp.last_error.as_deref().unwrap_or("(no error)");
+                let err_short: String = err.chars().take(60).collect();
+                spans.push(dot(Color::Red));
+                spans.push(Span::styled(label, Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!(" backfill FAILED — {err_short}"),
+                    Style::default().fg(Color::LightRed),
+                ));
+            }
+            _ => {}
+        }
+        return;
+    }
+    if sp.synced {
+        spans.push(dot(Color::Green));
+        spans.push(Span::styled(label, Style::default().fg(Color::White)));
+        spans.push(Span::styled(" synced", Style::default().fg(Color::Gray)));
+    } else {
+        // Enabled but not caught up: fresh sync in progress, or a
+        // backfill is still owed before the tweak-serving surfaces
+        // return data.
+        spans.push(dot(Color::Yellow));
+        spans.push(Span::styled(label, Style::default().fg(Color::White)));
+        spans.push(Span::styled(" syncing", Style::default().fg(Color::Yellow)));
+    }
 }
 
 fn addr_index_spans(spans: &mut Vec<Span<'static>>, state: &AppState) {
@@ -630,5 +712,138 @@ fn render_panel(f: &mut Frame, area: Rect, title: &str, lines: &[Line<'_>]) {
             };
             f.render_widget(Paragraph::new(line.clone()), line_area);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AppState, SpIndexProgress};
+
+    /// Render the services row to a plain string, dropping styling.
+    fn row(state: &AppState) -> String {
+        services_line(state)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn sp(enabled: bool, synced: bool, state: &str) -> SpIndexProgress {
+        SpIndexProgress {
+            enabled: Some(enabled),
+            synced,
+            state: state.to_string(),
+            cursor_height: 835_200,
+            snapshot_height: 962_151,
+            // Daemon-computed from walk_start=709,632 on this mainnet
+            // shape; cursor/snapshot would misread it as 86.8%.
+            progress_ratio: Some(0.497_263_583),
+            estimated_remaining_seconds: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn services_row_has_no_sp_column_when_daemon_never_reported_one() {
+        let st = AppState::new();
+        assert!(st.sp_index.is_none());
+        assert!(!row(&st).contains("sp-idx"));
+    }
+
+    #[test]
+    fn services_row_has_no_sp_column_when_index_is_off() {
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(false, false, "idle"));
+        let r = row(&st);
+        assert!(!r.contains("sp-idx"), "disabled index must not take a column: {r}");
+        // The other three columns are untouched.
+        assert!(r.contains("addr-idx"));
+        assert!(r.contains("esplora"));
+        assert!(r.contains("electrum"));
+    }
+
+    #[test]
+    fn services_row_shows_synced_sp_column() {
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, true, "completed"));
+        let r = row(&st);
+        assert!(r.contains("sp-idx synced"), "{r}");
+    }
+
+    #[test]
+    fn services_row_shows_syncing_when_enabled_but_not_caught_up() {
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, false, "idle"));
+        let r = row(&st);
+        assert!(r.contains("sp-idx syncing"), "{r}");
+    }
+
+    #[test]
+    fn services_row_shows_daemon_reported_backfill_progress() {
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, false, "running"));
+        let r = row(&st);
+        // The daemon's walk-start-based ratio, verbatim: 49.7%. Two
+        // plausible-looking wrong reconstructions from the same counts
+        // must NOT appear: cursor/snapshot measures from genesis and
+        // gives 86.8%; the address index's two-pass maths gives 43.4%.
+        assert!(r.contains("sp-idx backfill 49.7%"), "{r}");
+        assert!(
+            !r.contains("86.8%"),
+            "cursor/snapshot (genesis-measured) reconstruction: {r}"
+        );
+        assert!(!r.contains("43.4%"), "two-pass reconstruction: {r}");
+        assert!(r.contains("(835,200/962,151)"), "{r}");
+        assert!(!r.contains("pass"), "single-pass backfill must not show a pass counter: {r}");
+    }
+
+    #[test]
+    fn services_row_omits_percentage_when_daemon_sends_no_ratio() {
+        // Old daemon: counts and ETA only. Rendering a percentage here
+        // would require reconstructing it from cursor/snapshot, which is
+        // genesis-measured and wrong (86.8% for a ~49.7%-done walk).
+        let mut st = AppState::new();
+        let mut p = sp(true, false, "running");
+        p.enabled = None;
+        p.progress_ratio = None;
+        p.estimated_remaining_seconds = 7_200;
+        st.sp_index = Some(p);
+        let r = row(&st);
+        assert!(r.contains("sp-idx backfill (835,200/962,151)"), "{r}");
+        assert!(!r.contains('%'), "no ratio from the daemon, no percentage: {r}");
+        assert!(r.contains("ETA"), "{r}");
+    }
+
+    #[test]
+    fn services_row_hides_sp_column_when_disabled_with_stale_cursor() {
+        // Explicit enabled=false beats a leftover running cursor: the
+        // supervisor will not resume it while the index is off, so a
+        // green backfill column would report work that is not happening.
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(false, false, "running"));
+        let r = row(&st);
+        assert!(!r.contains("sp-idx"), "disabled index must not take a column: {r}");
+    }
+
+    #[test]
+    fn sp_column_sits_between_addr_index_and_esplora() {
+        let mut st = AppState::new();
+        st.sp_index = Some(sp(true, true, "completed"));
+        let r = row(&st);
+        let addr = r.find("addr-idx").expect("addr-idx present");
+        let spi = r.find("sp-idx").expect("sp-idx present");
+        let esp = r.find("esplora").expect("esplora present");
+        assert!(addr < spi && spi < esp, "column order wrong: {r}");
+    }
+
+    #[test]
+    fn failed_sp_backfill_surfaces_the_error() {
+        let mut st = AppState::new();
+        let mut p = sp(true, false, "failed");
+        p.last_error = Some("disk full".into());
+        st.sp_index = Some(p);
+        let r = row(&st);
+        assert!(r.contains("backfill FAILED — disk full"), "{r}");
     }
 }

@@ -173,6 +173,13 @@ pub fn get_index_info(
             silent_payments::walk_start(chain.network),
         );
         let mut spi = serde_json::Map::new();
+        // `enabled` is the runtime config bit on its own, reported
+        // separately from `synced` (which folds in the on-disk marker and
+        // backfill quiescence). Without it a consumer cannot tell "index
+        // off" from "index on but not caught up" — both give synced=false
+        // — and would have to guess. `sat-tui`'s services row needs the
+        // distinction to avoid labelling a disabled index as syncing.
+        spi.insert("enabled".into(), json!(report.enabled));
         spi.insert("synced".into(), json!(report.synced));
         spi.insert("best_block_height".into(), json!(best_block_height));
 
@@ -189,6 +196,13 @@ pub fn get_index_info(
         bf.insert("state".into(), json!(cursor_state.label()));
         bf.insert("cursor_height".into(), json!(report.cursor_height));
         bf.insert("snapshot_height".into(), json!(report.snapshot_height));
+        // The walk-start-based ratio, not cursor/snapshot: the backfill
+        // walks only the taproot era, so a consumer reconstructing
+        // progress from the two heights measures from genesis and
+        // overstates it (73.8% at the first mainnet block; the exact bug
+        // documented on `BackfillCursor::progress_ratio`). Serving the
+        // daemon's own number is the only way a client can get it right.
+        bf.insert("progress_ratio".into(), json!(report.progress_ratio));
         bf.insert(
             "estimated_remaining_seconds".into(),
             json!(estimated_remaining_seconds),

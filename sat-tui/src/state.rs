@@ -171,6 +171,116 @@ pub struct BackfillProgress {
     pub last_error: Option<String>,
 }
 
+/// Snapshot of the silent-payment index from `getindexinfo`.
+///
+/// Unlike the address index, whose steady-state flags arrive via
+/// `getserverstatus`, everything the services row needs for the
+/// silent-payment index comes from `getindexinfo.silentpayments`.
+///
+/// The backfill is a **single** pass over the taproot era, so there is no
+/// `pass` field. Progress must come from the daemon's `progress_ratio`,
+/// never be recomputed as cursor/snapshot: the walk starts at taproot
+/// activation (709,632 on mainnet), so the genesis-measured ratio those
+/// two heights give overstates progress for the entire run — 73.8% at the
+/// very first mainnet block.
+#[derive(Debug, Clone)]
+pub struct SpIndexProgress {
+    /// Runtime config bit (`--silentpaymentindex=1`), reported on its own
+    /// so "off" is distinguishable from "on but not caught up." `None`
+    /// when the daemon predates the field — which is NOT the same as
+    /// `Some(false)`: an explicit `false` is authoritative (the daemon
+    /// can report an interrupted backfill cursor for an index that is
+    /// off), while absence means we genuinely cannot know.
+    pub enabled: Option<bool>,
+    /// Enabled AND the on-disk marker is set AND no backfill is running.
+    pub synced: bool,
+    /// `running` | `paused` | `completed` | `failed` | `cancelled` |
+    /// `rejected` | `idle`.
+    pub state: String,
+    pub cursor_height: u32,
+    pub snapshot_height: u32,
+    /// Daemon-computed, walk-start-based. `None` on a daemon that
+    /// predates the field; the renderer then shows counts with no
+    /// percentage rather than a genesis-measured wrong one.
+    pub progress_ratio: Option<f64>,
+    pub estimated_remaining_seconds: u64,
+    /// Populated when state == "failed".
+    pub last_error: Option<String>,
+}
+
+impl SpIndexProgress {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let sp = v.get("silentpayments")?;
+        let bf = sp.get("backfill");
+        Some(SpIndexProgress {
+            // `None` on a satd older than this field; `is_visible` then
+            // falls back to the backfill state. A present value — either
+            // way — is taken as authoritative.
+            enabled: sp.get("enabled").and_then(|b| b.as_bool()),
+            synced: sp.get("synced").and_then(|b| b.as_bool()).unwrap_or(false),
+            state: bf
+                .and_then(|b| b.get("state"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("idle")
+                .to_string(),
+            cursor_height: bf
+                .and_then(|b| b.get("cursor_height"))
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
+            snapshot_height: bf
+                .and_then(|b| b.get("snapshot_height"))
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
+            progress_ratio: bf
+                .and_then(|b| b.get("progress_ratio"))
+                .and_then(|r| r.as_f64())
+                .filter(|r| r.is_finite()),
+            estimated_remaining_seconds: bf
+                .and_then(|b| b.get("estimated_remaining_seconds"))
+                .and_then(|s| s.as_u64())
+                .unwrap_or(0),
+            last_error: bf
+                .and_then(|b| b.get("last_error"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        })
+    }
+
+    /// True only for backfill states that warrant replacing the
+    /// steady-state label with progress detail.
+    pub fn backfill_is_visible(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused" | "failed")
+    }
+
+    /// Progress ratio to render (0.0..=1.0), or `None` when the daemon
+    /// did not supply one. Always the daemon's walk-start-based number —
+    /// deliberately NOT derivable from `cursor_height`/`snapshot_height`
+    /// here, because that division measures from genesis and overstates
+    /// progress on any chain whose taproot activation is above genesis
+    /// (73.8% at the first stamped mainnet block).
+    pub fn progress_ratio(&self) -> Option<f64> {
+        self.progress_ratio.map(|r| r.clamp(0.0, 1.0))
+    }
+
+    /// Whether the services row should carry a silent-payment column at
+    /// all. Hidden when the index is off, so nodes not using the feature
+    /// keep the previous three-column row instead of growing a
+    /// permanently dim placeholder.
+    ///
+    /// An explicit `enabled` from the daemon is final in both directions:
+    /// `false` hides the column even when an interrupted backfill cursor
+    /// is still reported (the supervisor will not resume it while the
+    /// index is off, so a live-looking green column would be a lie). Only
+    /// when the daemon is too old to say — `enabled` absent — is an
+    /// active backfill taken as proof the index is on.
+    pub fn is_visible(&self) -> bool {
+        match self.enabled {
+            Some(on) => on,
+            None => self.backfill_is_visible(),
+        }
+    }
+}
+
 /// Snapshot of the runtime listener status from `getserverstatus`.
 /// Drives the steady-view services row.
 ///
@@ -378,6 +488,10 @@ pub struct AppState {
     // Address-index backfill — None when no backfill cursor exists or
     // when the response shape couldn't be parsed.
     pub backfill: Option<BackfillProgress>,
+
+    /// Silent-payment index status from `getindexinfo`. `None` when the
+    /// daemon has not reported a `silentpayments` object at all.
+    pub sp_index: Option<SpIndexProgress>,
 
     /// Listener and address-index status from `getserverstatus`. Drives
     /// the always-visible services row in the steady view.
@@ -595,6 +709,7 @@ impl AppState {
 
             ibd_bitmap: None,
             backfill: None,
+            sp_index: None,
             server_status: ServerStatus::default(),
             server_version: None,
 
@@ -914,6 +1029,7 @@ impl AppState {
     /// Update from `getindexinfo` response.
     pub fn update_index_info(&mut self, v: &serde_json::Value) {
         self.backfill = BackfillProgress::from_json(v);
+        self.sp_index = SpIndexProgress::from_json(v);
     }
 
     /// Update from `getserverstatus` response.
@@ -1975,6 +2091,199 @@ mod tests {
         assert!(!st.is_healthy()); // stale
         st.stale = false;
         assert!(st.is_healthy());
+    }
+
+    #[test]
+    fn sp_index_parses_running_backfill() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": true,
+                "synced": false,
+                "best_block_height": 962_151,
+                "backfill": {
+                    "active": true,
+                    "state": "running",
+                    "cursor_height": 800_000,
+                    "snapshot_height": 962_151,
+                    "progress_ratio": 0.357_868_683,
+                    "estimated_remaining_seconds": 7_200,
+                }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("silentpayments object present");
+        assert_eq!(sp.enabled, Some(true));
+        assert!(!sp.synced);
+        assert_eq!(sp.state, "running");
+        assert_eq!(sp.cursor_height, 800_000);
+        assert_eq!(sp.snapshot_height, 962_151);
+        assert_eq!(sp.estimated_remaining_seconds, 7_200);
+        assert!(sp.backfill_is_visible());
+        assert!(sp.is_visible());
+        // The ratio is the daemon's walk-start-based number, taken
+        // verbatim. On this mainnet shape (walk start 709,632) the true
+        // ratio is ~0.358; recomputing cursor/snapshot here would give
+        // 0.831 — measured from genesis, the exact overstatement the
+        // daemon-side `BackfillCursor::progress_ratio` doc documents as
+        // a past bug.
+        let ratio = sp.progress_ratio().expect("daemon supplied a ratio");
+        assert!((ratio - 0.357_868_683).abs() < 1e-9);
+        let genesis_measured = 800_000.0 / 962_151.0;
+        assert!(
+            (ratio - genesis_measured).abs() > 0.1,
+            "ratio must not be reconstructed as cursor/snapshot"
+        );
+    }
+
+    #[test]
+    fn sp_index_ratio_absent_on_old_daemon_yields_none() {
+        // A daemon that predates `progress_ratio` gets no percentage at
+        // all — rendering cursor/snapshot instead would show 83.1% for
+        // a walk that is really ~35.8% done.
+        let v = json!({
+            "silentpayments": {
+                "synced": false,
+                "backfill": { "state": "running",
+                              "cursor_height": 800_000, "snapshot_height": 962_151 }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.progress_ratio(), None);
+    }
+
+    #[test]
+    fn sp_index_ratio_is_clamped() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": true, "synced": false,
+                "backfill": { "state": "running", "progress_ratio": 1.7 }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.progress_ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn sp_index_backfill_visibility_filters_quiet_states() {
+        for state in ["idle", "completed", "cancelled", "rejected"] {
+            let v = json!({
+                "silentpayments": { "enabled": true, "synced": true,
+                                    "backfill": { "state": state } }
+            });
+            let sp = SpIndexProgress::from_json(&v).expect("present");
+            assert!(!sp.backfill_is_visible(), "{state} should be quiet");
+            // Quiet does not mean hidden: an enabled index still shows a
+            // steady-state column.
+            assert!(sp.is_visible(), "{state} should still render a column");
+        }
+    }
+
+    #[test]
+    fn sp_index_column_hidden_when_index_is_off() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": false,
+                "synced": false,
+                "backfill": { "state": "idle" }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.enabled, Some(false));
+        assert!(!sp.is_visible(), "a disabled index must not take a column");
+    }
+
+    #[test]
+    fn sp_index_hidden_when_disabled_despite_active_cursor() {
+        // Reachable state: a backfill was interrupted, then the daemon
+        // restarted with `silentpaymentindex=0`. The persisted cursor
+        // still reads `running`, but the supervisor will not resume it
+        // while the index is off. An explicit `enabled: false` must win
+        // over the backfill state, or the row shows a live green
+        // backfill column forever for an index that is off.
+        for state in ["running", "paused", "failed"] {
+            let v = json!({
+                "silentpayments": {
+                    "enabled": false, "synced": false,
+                    "backfill": { "state": state,
+                                  "cursor_height": 800_000, "snapshot_height": 962_151 }
+                }
+            });
+            let sp = SpIndexProgress::from_json(&v).expect("present");
+            assert!(sp.backfill_is_visible());
+            assert!(
+                !sp.is_visible(),
+                "explicit enabled=false must hide the column even mid-{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn sp_index_column_hidden_on_daemon_without_enabled_field() {
+        // satd older than the `enabled` field: synced=false is
+        // indistinguishable from "off", so stay hidden rather than
+        // labelling a disabled index as syncing.
+        let v = json!({
+            "silentpayments": { "synced": false, "backfill": { "state": "idle" } }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.enabled, None);
+        assert!(!sp.is_visible());
+    }
+
+    #[test]
+    fn sp_index_running_backfill_shows_even_if_enabled_is_absent() {
+        // Old daemon, no `enabled` field: a backfill in flight is the
+        // only evidence available that the index is on, so the column
+        // appears. This fallback applies ONLY when the field is absent —
+        // an explicit `false` wins (see
+        // `sp_index_hidden_when_disabled_despite_active_cursor`).
+        let v = json!({
+            "silentpayments": {
+                "synced": false,
+                "backfill": { "state": "running", "cursor_height": 1, "snapshot_height": 2 }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.enabled, None);
+        assert!(sp.is_visible());
+    }
+
+    #[test]
+    fn sp_index_failed_carries_last_error() {
+        let v = json!({
+            "silentpayments": {
+                "enabled": true, "synced": false,
+                "backfill": { "state": "failed", "last_error": "disk full" }
+            }
+        });
+        let sp = SpIndexProgress::from_json(&v).expect("present");
+        assert_eq!(sp.last_error.as_deref(), Some("disk full"));
+        assert!(sp.backfill_is_visible());
+    }
+
+    #[test]
+    fn sp_index_absent_object_yields_none() {
+        let v = json!({ "address": { "synced": true } });
+        assert!(SpIndexProgress::from_json(&v).is_none());
+    }
+
+    #[test]
+    fn sp_index_hostile_ratio_values_stay_sane() {
+        // Wrong-typed or out-of-range ratios from a daemon we don't
+        // control must degrade, never panic or render garbage.
+        for (ratio, want) in [
+            (json!("0.5"), None),      // wrong type
+            (json!(-0.25), Some(0.0)), // clamped
+            (json!(1e308), Some(1.0)), // clamped
+            (json!(null), None),
+        ] {
+            let v = json!({
+                "silentpayments": { "enabled": true, "synced": false,
+                                    "backfill": { "state": "running",
+                                                  "progress_ratio": ratio } }
+            });
+            let sp = SpIndexProgress::from_json(&v).expect("present");
+            assert_eq!(sp.progress_ratio(), want);
+        }
     }
 
     #[test]
