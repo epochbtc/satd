@@ -36,9 +36,19 @@
 
 ## Why satd?
 
+satd is built in a deliberate priority order: Bitcoin Core **compatibility and
+stability** first; **operator sovereignty** and **modern integration surfaces**
+next. New ideas go into the surfaces around the node — protocol servers, the
+streaming API, SDKs, observability — never into the consensus path, which
+tracks Core's semantics exactly and is held there by differential testing
+against a live `bitcoind`. Some alternative implementations use the freedom of
+a rewrite to rethink the node's architecture or validation; satd spends that
+freedom on the integration surfaces and keeps the engineering underneath
+conservative.
+
+*   **Zero Consensus Divergence (Dual Engine):** Run the independent Rust consensus engine, the Bitcoin Core C++ `libbitcoinconsensus` engine, or both at once with runtime shadow-validation — every script cross-checked against Core (genesis→~945k, zero divergence). See [Consensus & Network](#consensus--network) below for the differential test battery that holds the full block-acceptance pipeline to Core.
 *   **Node Sovereignty:** `satd` puts relay policy back in the operator's hands. Every mempool and relay decision is a first-class, exposed flag — filter spam, cap or disable `OP_RETURN` data carriers, tune dust thresholds and ancestor/descendant limits, and decide for yourself what your node accepts and rebroadcasts (`-datacarrier`, `-datacarriersize`, `-dustrelayfee`, `-permitbaremultisig`, `-limitancestorcount`) — all without running a patched fork. A memory-safe Rust implementation gives economic node operators a robust alternative to the C++ monoculture, strengthening the network's resilience. Read the [Manifesto](MANIFESTO.md).
 *   **Built for the Operator:** Eliminates the `bitcoind` + `electrs` + `esplora` multi-process headache — everything shares a single chainstate and a single RocksDB instance — and ships the operational surfaces you'd otherwise bolt on yourself: native Prometheus `/metrics` and `/healthz` with structured logs, a capability-scoped authentication system (cookie, user/pass, or bearer-token `-authfile`, with native TLS/mTLS on every listener), API scaling knobs that isolate read-only RPC onto a dedicated runtime behind admission control (`--api-threads`), and an optional MCP server that exposes node data and ops surfaces directly to AI agents.
-*   **Zero Consensus Divergence (Dual Engine):** Run the independent Rust consensus engine, the Bitcoin Core C++ `libbitcoinconsensus` engine, or both at once with runtime shadow-validation — every script cross-checked against Core (genesis→~945k, zero divergence). See [Consensus & Network](#consensus--network) below for the differential test battery that holds the full block-acceptance pipeline to Core.
 
 ## Features
 
