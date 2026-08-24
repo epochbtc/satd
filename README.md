@@ -6,7 +6,7 @@
 
 <p><strong>A Bitcoin Core-compatible full node in Rust.</strong></p>
 
-<p><em>One process. One RocksDB. One systemd unit.</em></p>
+<p><em>Modern Bitcoin node implementation for the sovereign operator.</em></p>
 
 <p>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
@@ -36,24 +36,20 @@
 
 ## Why satd?
 
-satd is built in a deliberate priority order: Bitcoin Core **compatibility and
-stability** first; **operator sovereignty** and **modern integration surfaces**
-next. New ideas go into the surfaces around the node — protocol servers, the
-streaming API, SDKs, observability — never into the consensus path, which
-tracks Core's semantics exactly and is held there by differential testing
-against a live `bitcoind`. Some alternative implementations use the freedom of
-a rewrite to rethink the node's architecture or validation; satd spends that
-freedom on the integration surfaces and keeps the engineering underneath
-conservative.
+satd is built with these priorities in mind: 
 
-*   **Zero Consensus Divergence (Dual Engine):** Run the independent Rust consensus engine, the Bitcoin Core C++ `libbitcoinconsensus` engine, or both at once with runtime shadow-validation — every script cross-checked against Core (genesis→~945k, zero divergence). See [Consensus & Network](#consensus--network) below for the differential test battery that holds the full block-acceptance pipeline to Core.
-*   **Node Sovereignty:** `satd` puts relay policy back in the operator's hands. Every mempool and relay decision is a first-class, exposed flag — filter spam, cap or disable `OP_RETURN` data carriers, tune dust thresholds and ancestor/descendant limits, and decide for yourself what your node accepts and rebroadcasts (`-datacarrier`, `-datacarriersize`, `-dustrelayfee`, `-permitbaremultisig`, `-limitancestorcount`) — all without running a patched fork. A memory-safe Rust implementation gives economic node operators a robust alternative to the C++ monoculture, strengthening the network's resilience. Read the [Manifesto](MANIFESTO.md).
-*   **Built for the Operator:** Eliminates the `bitcoind` + `electrs` + `esplora` multi-process headache — everything shares a single chainstate and a single RocksDB instance — and ships the operational surfaces you'd otherwise bolt on yourself: native Prometheus `/metrics` and `/healthz` with structured logs, a capability-scoped authentication system (cookie, user/pass, or bearer-token `-authfile`, with native TLS/mTLS on every listener), API scaling knobs that isolate read-only RPC onto a dedicated runtime behind admission control (`--api-threads`), and an optional MCP server that exposes node data and ops surfaces directly to AI agents.
+- **Bitcoin Core compatibility and stability** first. An unstable node that doesn't work, or splits the chain, isn't useful. Engineering is conservative by default.
+- **Operator sovereignty**. Give operators control over their node's behavior. Don't hardcode policy where we can make it configurable within consensus rules.
+- **Modern integration surfaces**. Polling JSON-RPC or dealing with ZMQ isn't ideal if you're trying to build anything sophisticated on top of Bitcoin. satd ships real, production-grade SDKs for Rust and Go containing useful primitives like watchsets, resilient clients, and more with modern transports like gRPC.
+- **All-in-one architecture**. Ship the API surfaces node operators care about like Electrum and Esplora with native, in-process indices.
+- **Modern operations**. Native, built in Prometheus `/metrics` endpoint. Native TLS on every API surface including legacy JSON-RPC. Structured logs and a working `/healthz` healthcheck endpoint. Independently-scalable read API runtime vs mutating API runtime.
+- **MCP built-in**. Connect your AI tooling to the native, built-in MCP server and agentically query node state and blockchain data.
+- **Modern authn/z**. Native support for legacy cookie and user/pass authentication, or a new fine-grained bearer-token authentication system with native TLS/mTLS on every listener.
 
 ## Features
 
 ### Consensus & Network
-*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback and runtime script-level shadow validation between the two.
+*   **Dual Consensus Engine:** A complete, independently written Rust consensus engine that passes the full Bitcoin Core test suite, with a C++ `libbitcoinconsensus` conservative fallback and runtime script-level shadow validation between the two. Shadow verification has zero wall clock cost in most cases because it's performed async and non-blocking on the critical path.
 *   **Differential Block-Acceptance Testing:** Beyond script verification, the full block-acceptance pipeline (PoW, merkle/witness commitments, sigops, BIP 34, value conservation, maturity, timestamps, locktime/BIP 68) is checked against Core by static fixtures ported from Core's own tests and a generative fuzzer that dual-submits adversarial blocks to `satd` and a live `bitcoind`.
 *   **Swarm-Style IBD:** BitTorrent-like parallel block downloading and speculative verification pipeline for heavily optimized Initial Block Download.
 *   **Full P2P:** BIP 152 compact blocks, ban scoring, addrv2, BIP 324 v2 encrypted transport (`-v2transport`, on by default; opt-in `-v2only` anti-surveillance mode), Tor v3 (hardcoded `.onion` seeds), SOCKS5 `-proxy`.
