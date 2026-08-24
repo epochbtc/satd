@@ -42,7 +42,7 @@ satd is built with these priorities in mind:
 - **Operator sovereignty**. Give operators control over their node's behavior. Don't hardcode policy where we can make it configurable within consensus rules.
 - **Modern integration surfaces**. Polling JSON-RPC or dealing with ZMQ isn't ideal if you're trying to build anything sophisticated on top of Bitcoin. satd ships real, production-grade SDKs for Rust and Go containing useful primitives like watchsets, resilient clients, and more with modern transports like gRPC.
 - **All-in-one architecture**. Ship the API surfaces node operators care about like Electrum and Esplora with native, in-process indices.
-- **Modern operations**. Native, built in Prometheus `/metrics` endpoint. Native TLS on every API surface including legacy JSON-RPC. Structured logs and a working `/healthz` healthcheck endpoint. Independently-scalable read API runtime vs mutating API runtime.
+- **Modern operations**. Native, built-in Prometheus `/metrics` endpoint. Native TLS on every API surface including legacy JSON-RPC. Structured logs and a working `/healthz` healthcheck endpoint. Independently-scalable read API runtime vs mutating API runtime.
 - **TUI**. A beautiful, interactive terminal user interface for monitoring your node, viewing fee estimates, chain stats and more.
 - **MCP built-in**. Connect your AI tooling to the native, built-in MCP server and agentically query node state and blockchain data.
 - **Modern authn/z**. Native support for legacy cookie and user/pass authentication, or a new fine-grained bearer-token authentication system with native TLS/mTLS on every listener.
