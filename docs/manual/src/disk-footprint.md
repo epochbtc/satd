@@ -138,8 +138,8 @@ When a surface is off, its CF is never written and the disk is never spent.
 `sp_tweaks` holds one BIP 352 public tweak per eligible transaction, grouped
 into one row per block. The `silentpaymentindex` option enables it, and it is
 off by default. Two surfaces read it: the streaming `tweaks` firehose and
-index-accelerated scan-key-watch rescans (see
-[Streaming Consumption API](streaming.md)).
+index-accelerated scan-key-watch rescans; the integrator guide for both is
+[Silent Payments (BIP 352)](silent-payments.md).
 
 The index starts at taproot activation, not at genesis, because pre-taproot
 blocks carry no silent payments. Each indexed block writes a row even with no

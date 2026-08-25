@@ -132,6 +132,10 @@ the client to extend. The client decides when to advance `start` or send
 
 ### Silent-payment scan-key watch (BIP 352, Tier 2)
 
+This section is the Tier 2 watch reference. The dedicated
+[Silent Payments (BIP 352)](silent-payments.md) chapter compares all three
+consumption tiers and walks through an integration in each mode.
+
 For clients that would rather not run a per-block scan themselves, `Watch` accepts
 BIP 352 **scan-key targets**. `AddSilentPayments` (or an atomic
 `SetWatchSet.silent_payments` replace) registers up to 16 targets per connection

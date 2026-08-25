@@ -20,6 +20,7 @@
 - [Electrum Protocol Server](electrum.md)
 - [Getting Started: Consuming Events](streaming-tutorial.md)
 - [Streaming Consumption API](streaming.md)
+- [Silent Payments (BIP 352)](silent-payments.md)
 - [Rust SDK (`satd-events-client`)](rust-sdk.md)
 - [Go SDK (`satdevents`)](go-sdk.md)
 - [MCP Server](mcp.md)
