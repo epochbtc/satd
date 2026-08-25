@@ -71,6 +71,14 @@ only tests.
 - `satd -version` prints `satd version <v>` (Core's shape; the word "version"
   was absent before), and a bad flag is reported as `Error parsing command line
   arguments: ...`, matching Core's wording.
+- `-minrelaytxfee` / `-dustrelayfee` accept Core's BTC/kvB spelling
+  (`0.00001`) alongside satd's integer sat/kvB. A value that cannot be parsed
+  is now an error: the config-file path silently discarded one and relayed at
+  the built-in default instead.
+- `-blockfilterindex` may be given with no value, meaning `basic`, as in Core.
+- An unparseable `-bind` reports the problem and exits instead of panicking,
+  and an IPv6 literal is bracketed before it is joined to `-port`, so
+  `-bind=::1` works at all.
 
 ## Releases
 

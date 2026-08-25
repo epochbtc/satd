@@ -3135,9 +3135,18 @@ async fn main() {
     // RPC/Esplora listeners above. An operator who set -listen=1 must not see
     // the daemon report a clean start while silently accepting no inbound peers.
     if config.listen {
-        let p2p_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
-            .parse()
-            .expect("Invalid P2P bind address");
+        let p2p_addr: SocketAddr = match crate::config::parse_p2p_bind(&config.bind, config.port) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!(
+                    "Error: {e}\n\
+                     -bind takes a bare IP address (-bind=127.0.0.1, -bind=::1); \
+                     the port comes from -port. Use -listen=0 to disable inbound P2P."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
         let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
             Ok(l) => l,
             Err(e) => {

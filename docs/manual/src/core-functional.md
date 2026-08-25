@@ -86,6 +86,16 @@ software, not just tests:
 - **`-version` and unknown-argument errors.** satd's `-version` output did not
   contain the word "version", and a bad flag was not reported in Core's
   wording.
+- **Core's fee-rate units.** Core denominates `-minrelaytxfee` and
+  `-dustrelayfee` in BTC/kvB (`0.00001`); satd documents them in sat/kvB
+  (`1000`) — the same rate, written differently. satd now takes both. An
+  unparseable value used to be *silently discarded* in `bitcoin.conf`, leaving
+  the node relaying at a default the operator never chose; it is now an error.
+- **`-blockfilterindex` with no value**, which Core accepts as `basic`.
+- **A panic on an unparseable `-bind`.** satd joined `-bind` to `-port` and
+  unwrapped, so a value it could not parse aborted on a stack trace rather than
+  an error. Underneath that, IPv6 literals were never bracketed, so `-bind=::1`
+  could not have worked at all.
 
 None of these were consensus defects, and none would have shown up in satd's
 own test suite — they are exactly the class of difference that only an
@@ -98,6 +108,7 @@ cd contrib/core-functional
 ./fetch-core.sh          # fetch the pinned Core tree
 cargo build --release --bin satd --bin sat-cli   # from the repo root
 ./run.sh                 # run the inventory's run-set
+./run.sh --candidate <test.py>   # measure a still-skipped test after a fix
 ```
 
 Nothing in the harness assumes a particular machine: the satd binaries, the

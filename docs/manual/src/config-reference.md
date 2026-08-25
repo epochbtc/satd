@@ -186,7 +186,7 @@ startup error.
 | `whitebind` | none | restart | core | Bind an extra permissioned P2P listener (repeatable). |
 | `asmap` | none | restart | core | asmap file for ASN-based addrman bucketing (eclipse resistance). |
 | `port` | network default | restart | core | P2P listen port. |
-| `bind` | `0.0.0.0` | restart | core | Bind P2P to this address. |
+| `bind` | `0.0.0.0` | restart | core | Bind P2P to this address. Takes a bare IP; the port comes from `port`. IPv6 literals may be given plain (`::1`) or bracketed. Core's `addr:port=onion` form is not supported. |
 | `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). Connect-only *exclusivity* is a startup decision (restart to change). |
 | `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding). |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
@@ -244,7 +244,7 @@ startup error.
 | `txindex` | off | restart | core | Maintain a full transaction index. |
 | `addressindex` | on | restart | satd | Maintain an address-history index (backs native Electrum/Esplora). |
 | `addrindexsubscriptions` | 10000 | hot | satd | Max concurrent per-scripthash status subscriptions. |
-| `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`). |
+| `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
 
@@ -254,8 +254,8 @@ startup error.
 |---|---|---|---|---|
 | `mempoolfullrbf` | on | hot | satd | Enable full replace-by-fee. Core removed this flag in v28 (full-RBF is now unconditional there); satd retains the flag. |
 | `maxmempool` | 300 MB | hot | core | Maximum mempool size in MB. |
-| `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. |
-| `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. |
+| `minrelaytxfee` | 1000 sat/kvB | hot | core | Minimum relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
+| `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |
 | `datacarriersize` | 83 bytes | hot | core | Maximum `OP_RETURN` size in bytes (`0` = reject all). |
 | `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. |

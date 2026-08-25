@@ -11,6 +11,10 @@
 #   run.sh --list          print the run-set and exit
 #   run.sh --dry-run       verify pin + inventory + binaries, run nothing
 #   run.sh <test.py> ...   run specific tests (must be `run` in the inventory)
+#   run.sh --candidate <test.py> ...
+#                          run tests that are still `skip`, to find out whether
+#                          a fix unblocks them. Not the scoreboard -- this is
+#                          the measuring step of fix -> measure -> flip.
 #   run.sh -- <args>       pass everything after -- to Core's test_runner.py
 #
 # Environment overrides (nothing here assumes a particular machine):
@@ -34,12 +38,14 @@ SATD_BIN="${SATD_BIN:-$REPO_ROOT/target/release/satd}"
 SAT_CLI_BIN="${SAT_CLI_BIN:-$REPO_ROOT/target/release/sat-cli}"
 
 MODE=run
+CANDIDATE=0
 EXPLICIT_TESTS=()
 RUNNER_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --list)    MODE=list; shift ;;
-        --dry-run) MODE=dry;  shift ;;
+        --list)      MODE=list; shift ;;
+        --dry-run)   MODE=dry;  shift ;;
+        --candidate) CANDIDATE=1; shift ;;
         --)        shift; RUNNER_ARGS+=("$@"); break ;;
         -*)        RUNNER_ARGS+=("$1"); shift ;;
         *)         EXPLICIT_TESTS+=("$1"); shift ;;
@@ -67,12 +73,19 @@ fi
 
 mapfile -t RUN_SET < <("$HERE/check_inventory.py" --print-run-set)
 
-if [[ ${#EXPLICIT_TESTS[@]} -gt 0 ]]; then
+if [[ $CANDIDATE -eq 1 ]]; then
+    # Measuring, not scoring. A candidate run says whether a fix moved a
+    # blocked test; only run.sh's default run-set is the scoreboard, and a
+    # row still only flips to `run` in the PR that makes it pass.
+    [[ ${#EXPLICIT_TESTS[@]} -gt 0 ]] || die "--candidate needs at least one test to measure"
+    echo "--- candidate run: NOT the scoreboard, inventory status ignored ---" >&2
+    RUN_SET=("${EXPLICIT_TESTS[@]}")
+elif [[ ${#EXPLICIT_TESTS[@]} -gt 0 ]]; then
     for t in "${EXPLICIT_TESTS[@]}"; do
         found=0
         for r in ${RUN_SET[@]+"${RUN_SET[@]}"}; do [[ "$r" == "$t" ]] && found=1; done
         [[ $found -eq 1 ]] ||
-            die "$t is not marked run in inventory.toml -- flip its row in the PR that makes it pass"
+            die "$t is not marked run in inventory.toml -- flip its row in the PR that makes it pass, or measure it with --candidate"
     done
     RUN_SET=("${EXPLICIT_TESTS[@]}")
 fi
