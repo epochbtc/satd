@@ -1320,6 +1320,10 @@ impl PeerManager {
             let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
             let mut info = PeerInfo::new(id, addr, Direction::Inbound);
             info.permissions = perms;
+            // `getpeerinfo`'s `addrbind`: which of our listeners this peer
+            // reached us on. Distinct from `-bind` config, since a node may
+            // listen on several addresses.
+            info.bind_addr = stream.local_addr().ok();
             peers.insert(
                 id,
                 PeerHandle {
@@ -5388,6 +5392,12 @@ impl PeerManager {
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
         info.onion_host = onion_host.map(str::to_string);
+        // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
+        // peer this is the socket to the proxy, not a clearnet listener.
+        info.bind_addr = match &transport {
+            IncomingTransport::Raw(s) => s.local_addr().ok(),
+            IncomingTransport::Established(c) => c.local_addr().ok(),
+        };
         let handle = PeerHandle {
             info,
             msg_tx,

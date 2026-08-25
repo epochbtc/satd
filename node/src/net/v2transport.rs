@@ -140,23 +140,37 @@ async fn recv_v2<S: AsyncRead + Unpin>(
         let ciphertext = read_exact_buffered(stream, leftover, packet_len).await?;
         // On-wire bytes for this packet: the 3-byte length prefix + the
         // encrypted body. Counted per packet, including decoys (which loop).
+        let wire_len = LENGTH_FIELD_LEN + packet_len;
         if let Some(c) = counters {
-            c.record_recv(LENGTH_FIELD_LEN + packet_len);
+            c.record_recv(wire_len);
         }
         let (packet_type, plaintext) = cipher
             .decrypt_to_vec(&ciphertext, None)
             .map_err(handshake_io_err)?;
         // Decoys carry no message; the cipher state has already advanced.
+        // Their bytes are real and already counted, so they are attributed to
+        // `*other*` rather than dropped -- otherwise the per-type tallies
+        // would not sum to `bytesrecv` on a peer that sends decoys.
         if packet_type == PacketType::Decoy {
+            if let Some(c) = counters {
+                c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
+            }
             continue;
         }
         // plaintext[0] is the protocol header byte; the message contents
         // follow. An empty-contents genuine packet is not a valid message.
         if plaintext.len() <= 1 {
+            if let Some(c) = counters {
+                c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
+            }
             continue;
         }
-        return decode_message(&plaintext[1..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+        let msg = decode_message(&plaintext[1..])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if let Some(c) = counters {
+            c.attribute_recv(msg.cmd(), wire_len);
+        }
+        return Ok(msg);
     }
 }
 
@@ -356,15 +370,22 @@ impl V2Connection {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
     }
+
+    /// Get the local address this connection is bound to (`getsockname()`).
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
 }
 
 impl V2Writer {
     /// Send a network message over the encrypted channel, recording on-wire
     /// (ciphertext-framed) bytes if counters are set.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
+        let cmd = msg.cmd();
         let n = send_v2(&mut self.stream, &mut self.cipher, msg).await?;
         if let Some(c) = &self.counters {
             c.record_sent(n);
+            c.attribute_sent(cmd, n);
         }
         Ok(())
     }

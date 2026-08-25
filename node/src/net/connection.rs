@@ -114,6 +114,15 @@ impl Connection {
         }
     }
 
+    /// Get the local address this connection is bound to (`getsockname()`),
+    /// behind `getpeerinfo`'s `addrbind`.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            Connection::V1(c) => c.local_addr(),
+            Connection::V2(c) => c.local_addr(),
+        }
+    }
+
     /// Which wire transport this connection uses.
     pub fn transport_protocol(&self) -> crate::net::peer::TransportProtocol {
         match self {
@@ -239,6 +248,11 @@ impl V1Connection {
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.stream.peer_addr()
     }
+
+    /// Get the local address this connection is bound to (`getsockname()`).
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
 }
 
 /// An `AsyncRead` adapter that yields a fixed prefix of bytes before
@@ -285,6 +299,7 @@ impl V1Writer {
         self.stream.write_all(&bytes).await?;
         if let Some(c) = &self.counters {
             c.record_sent(bytes.len());
+            c.attribute_sent(raw.cmd(), bytes.len());
         }
         Ok(())
     }
@@ -345,9 +360,13 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
         }
 
         // Record on-wire bytes for this framed message (counted even if it
-        // fails to deserialize below — the bytes were still received).
+        // fails to deserialize below — the bytes were still received). The
+        // per-message-type attribution waits until the deserialize below has
+        // resolved, so an undecodable frame lands under `*other*` rather than
+        // under a command string its payload never justified.
+        let wire_len = HEADER_SIZE + payload_len;
         if let Some(c) = counters {
-            c.record_recv(HEADER_SIZE + payload_len);
+            c.record_recv(wire_len);
         }
 
         // Combine header + payload and deserialize
@@ -363,9 +382,15 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
                         "wrong network magic",
                     ));
                 }
+                if let Some(c) = counters {
+                    c.attribute_recv(raw.cmd(), wire_len);
+                }
                 return Ok(raw.payload().clone());
             }
             Err(_) => {
+                if let Some(c) = counters {
+                    c.attribute_recv(crate::net::stats::MSG_TYPE_OTHER, wire_len);
+                }
                 let cmd = String::from_utf8_lossy(&header[4..16]);
                 tracing::debug!(cmd = %cmd.trim_end_matches('\0'), "Skipping unparseable message");
                 continue;

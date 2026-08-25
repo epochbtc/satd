@@ -120,11 +120,12 @@ resulting work queue, ranked by how many tests each item unblocks:
 |---:|---|
 | 73 | **`setmocktime`.** Needed for deterministic time, and by `create_cache.py`, which seeds the 199-block chain most tests start from. Unblocks the largest single bucket, and is the largest piece of work: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
 | 48 | **`syncwithvalidationinterfacequeue`.** A hidden, test-only Core RPC that blocks until queued validation callbacks have been delivered. The framework calls it from `sync_all()`, so it is on the path of nearly every multi-node test. Worth thinking through rather than stubbing: if satd applies these side effects synchronously the honest implementation is cheap, but that has to be established, not assumed. |
-| 27 | **`getpeerinfo` fields.** No `bytesrecv_per_msg` / `bytessent_per_msg` (22 tests) and no `addrbind` (5). |
-| 6 | **Repeated command-line options.** Core accepts an option given twice — `-v2transport=0 -v2transport=1` — and resolves it by precedence. satd's parser rejects the duplicate, so any wrapper that appends an override to a base command line breaks. |
-| 3 | **Named JSON-RPC parameters.** satd accepts positional parameters only; a request whose `params` is an object fails on every method. Core supports both, and its framework calls `generatetoaddress(nblocks=…, address=…)` by name. |
+| 22 | **No periodic P2P ping.** `connect_nodes()` waits for a `pong` in both directions, which can only arrive if each side pings. satd has no keepalive at all: `ping_all()` is called only by the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. This is an availability gap before it is a test blocker — a half-open connection holds its slot forever. |
+| 6 | **Repeated command-line options.** Core accepts an option given twice — `-v2transport=0 -v2transport=1` — and takes the last (its config file deliberately takes the first). satd's parser rejects the duplicate, so any wrapper that appends an override to a base command line breaks. |
+| 5 | **Named JSON-RPC parameters.** satd accepts positional parameters only; a request whose `params` is an object fails on every method, not just the one that surfaced it. Core supports both, and its framework calls `generatetoaddress(nblocks=…, address=…)` by name. |
 | 2 | **`scantxoutset`**, which the framework's wallet uses to rescan. |
-| 1 | **Core's `-bind=addr[:port][=onion]` syntax.** satd's `-bind` takes a bare address and gets the port from `-port`. |
+| 1 | **Core's `-bind=addr[:port][=onion]` syntax**, and more than one `-bind`. satd takes a single bare address and gets the port from `-port`. |
+| 1 | **`NODE_NETWORK_LIMITED` under `-prune`.** A pruned satd advertises `NODE_NETWORK|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED|NODE_WITNESS` (1032), so it invites requests for blocks it does not have. |
 
 Ranked this way the table answers "what unblocks the most tests", which is not
 the same question as "what is most worth fixing" — the top two entries are
@@ -145,6 +146,11 @@ be once measured rather than read:
   literal before joining it to `-port`, so `-bind=::1` could never have worked.
 - **`generatetoaddress` parameter shape**, which measurement showed was not
   about `generatetoaddress` at all — see "Named JSON-RPC parameters" above.
+- **`getpeerinfo` was missing `addrbind`, `bytessent_per_msg` and
+  `bytesrecv_per_msg`.** Adding them unblocked none of the 27 tests that wanted
+  them, which is the useful part of the result: with the fields in place those
+  tests get far enough to reveal the real blocker underneath, and for 22 of
+  them it is the missing keepalive ping above.
 
 Nine rows outside satd's compatibility target are skipped as such: six use Core
 v31 options (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a

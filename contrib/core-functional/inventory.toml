@@ -15,7 +15,7 @@ reason = "no-wallet"
 file = "feature_abortnode.py"
 status = "skip"
 reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
+note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "feature_addrman.py"
@@ -42,8 +42,7 @@ note = "needs `scantxoutset`, which satd does not implement; the framework walle
 [[test]]
 file = "feature_assumevalid.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+reason = "core-log"
 
 [[test]]
 file = "feature_bind_extra.py"
@@ -89,7 +88,7 @@ reason = "cache"
 file = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "feature_cltv.py"
@@ -100,8 +99,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_coinstatsindex.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_coinstatsindex_compatibility.py"
@@ -172,8 +171,8 @@ note = "observed: AssertionError: Child test did NOT contain (only) expected err
 [[test]]
 file = "feature_framework_testshell.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_framework_unit_tests.py"
@@ -196,14 +195,14 @@ reason = "cache"
 [[test]]
 file = "feature_init.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_loadblock.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_logging.py"
@@ -214,8 +213,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_maxtipage.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_maxuploadtarget.py"
@@ -226,14 +225,14 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_minchainwork.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_notifications.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_nulldummy.py"
@@ -268,8 +267,8 @@ note = "observed: AssertionError: Predicate ''''"
 [[test]]
 file = "feature_pruning.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_rbf.py"
@@ -318,8 +317,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_signet.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "feature_startupnotify.py"
@@ -352,7 +351,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "feature_versionbits_warning.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
 
 [[test]]
 file = "interface_bitcoin_cli.py"
@@ -470,8 +469,8 @@ note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v3
 [[test]]
 file = "mempool_package_rbf.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "mempool_packages.py"
@@ -524,8 +523,8 @@ note = "uses Core v31 cluster-mempool option; satd targets Core v30 compatibilit
 [[test]]
 file = "mining_basic.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
@@ -551,8 +550,8 @@ reason = "cache"
 [[test]]
 file = "p2p_1p1c_network.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -584,14 +583,14 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_block_sync.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_blockfilters.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_blocksonly.py"
@@ -666,8 +665,8 @@ reason = "cache"
 [[test]]
 file = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_i2p_ports.py"
@@ -688,8 +687,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_ibd_txrelay.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
@@ -745,8 +744,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_net_deadlock.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
@@ -757,8 +756,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_node_network_limited.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+reason = "feature-missing"
+note = "observed: a -prune=550 node advertises NODE_NETWORK|NODE_WITNESS (9) where Core signals NODE_NETWORK_LIMITED|NODE_WITNESS (1032). Follow-up: signal NODE_NETWORK_LIMITED, and drop NODE_NETWORK, when pruning"
 
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
@@ -807,14 +806,14 @@ reason = "cache"
 [[test]]
 file = "p2p_segwit.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_sendheaders.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "p2p_sendtxrcncl.py"
@@ -841,7 +840,7 @@ reason = "cache"
 file = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "p2p_v2_encrypted.py"
@@ -876,8 +875,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "rpc_createmultisig.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "rpc_decodescript.py"
@@ -915,8 +914,8 @@ reason = "cache"
 [[test]]
 file = "rpc_getblockfilter.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "rpc_getblockfrompeer.py"
@@ -965,7 +964,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_invalidateblock.py"
 status = "skip"
 reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
+note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "rpc_misc.py"
@@ -997,7 +996,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_preciousblock.py"
 status = "skip"
 reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
+note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "rpc_psbt.py"
@@ -1022,8 +1021,8 @@ reason = "cache"
 [[test]]
 file = "rpc_setban.py"
 status = "skip"
-reason = "rpc-missing"
-note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+reason = "feature-missing"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "rpc_signer.py"
