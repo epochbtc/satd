@@ -59,6 +59,7 @@
 
 mod common;
 
+use bitcoin::Network;
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash as _;
@@ -184,7 +185,7 @@ fn assemble(
 /// A plain, fully valid block on `prev` at `height`/`time` carrying `txdata`
 /// after its coinbase (coinbase pays the full subsidy to `OP_TRUE`).
 fn valid_block(prev: BlockHash, height: u32, time: u32, mut txdata: Vec<Transaction>) -> Block {
-    let mut txs = vec![coinbase(height, block_subsidy(height), op_true())];
+    let mut txs = vec![coinbase(height, block_subsidy(Network::Regtest, height), op_true())];
     txs.append(&mut txdata);
     assemble(prev, time, POWLIMIT_BITS, txs, None, true)
 }
@@ -309,7 +310,7 @@ fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
         let cb_txid = block.txdata[0].compute_txid();
         ctx.coinbases.push(CoinRef {
             outpoint: OutPoint { txid: cb_txid, vout: 0 },
-            amount: block_subsidy(h),
+            amount: block_subsidy(Network::Regtest, h),
             height: h,
         });
         ctx.advance_to(&block);
@@ -439,15 +440,15 @@ fn is_connectivity(o: &Outcome) -> bool {
 fn c_multiple_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let txs = vec![
-        coinbase(h, block_subsidy(h), op_true()),
-        coinbase(h, block_subsidy(h) / 2, op_true()),
+        coinbase(h, block_subsidy(Network::Regtest, h), op_true()),
+        coinbase(h, block_subsidy(Network::Regtest, h) / 2, op_true()),
     ];
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txs, None, true))
 }
 
 fn c_bad_merkle_root(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let txs = vec![coinbase(h, block_subsidy(h), op_true())];
+    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // Valid PoW over a deliberately wrong merkle root → bad-txnmrklroot
     // (the wrong root is set BEFORE grinding so PoW is valid; otherwise Core
     // would reject `high-hash` first).
@@ -470,7 +471,7 @@ fn c_oversize_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         })
         .collect();
     let cb = {
-        let mut c = coinbase(h, block_subsidy(h), op_true());
+        let mut c = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
         c.output = outputs;
         c
     };
@@ -479,14 +480,14 @@ fn c_oversize_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 
 fn c_coinbase_scriptsig_too_short(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].script_sig = ScriptBuf::from(vec![0xff]); // 1 byte < 2
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
 
 fn c_coinbase_scriptsig_too_long(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].script_sig = ScriptBuf::from(vec![0xff; 101]); // > 100
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
@@ -498,7 +499,7 @@ fn c_merkle_mutation(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let t1 = spend(OutPoint { txid: bitcoin::Txid::from_byte_array([0x11; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0, op_true());
     let t2 = spend(OutPoint { txid: bitcoin::Txid::from_byte_array([0x22; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0, op_true());
-    let txs = vec![coinbase(h, block_subsidy(h), op_true()), t1, t2.clone(), t2];
+    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true()), t1, t2.clone(), t2];
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txs, None, true))
 }
 
@@ -593,21 +594,21 @@ fn c_tx_oversize(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 
 fn c_high_hash(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let txs = vec![coinbase(h, block_subsidy(h), op_true())];
+    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // Hard (mainnet-ish) bits, NOT ground → hash fails the claimed target.
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), 0x1d00_ffff, txs, None, false))
 }
 
 fn c_time_too_new(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let txs = vec![coinbase(h, block_subsidy(h), op_true())];
+    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // 3 hours ahead of real now → beyond the 2h future-time slack.
     Submission::Block(assemble(ctx.tip_hash, now_secs() + 3 * 3600, POWLIMIT_BITS, txs, None, true))
 }
 
 fn c_time_too_old(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let txs = vec![coinbase(h, block_subsidy(h), op_true())];
+    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // At/below the median-time-past of the last 11 blocks → time-too-old.
     Submission::Block(assemble(ctx.tip_hash, GENESIS_TIME, POWLIMIT_BITS, txs, None, true))
 }
@@ -622,14 +623,14 @@ fn c_spend_nonexistent(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 
 fn c_coinbase_value_too_high(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let cb = coinbase(h, block_subsidy(h) + 1, op_true()); // no fees → over subsidy
+    let cb = coinbase(h, block_subsidy(Network::Regtest, h) + 1, op_true()); // no fees → over subsidy
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
 
 fn c_bad_coinbase_height(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     // BIP34 height encodes 999, but the block is at `h`.
-    let cb = coinbase(999, block_subsidy(h), op_true());
+    let cb = coinbase(999, block_subsidy(Network::Regtest, h), op_true());
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
 
@@ -637,7 +638,7 @@ fn c_block_sigops(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     // 4001 bare OP_CHECKMULTISIG → 4001·20·4 sigop cost > 80_000.
     let script = ScriptBuf::from(vec![bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8(); 4001]);
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.output = vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }];
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
@@ -669,7 +670,7 @@ fn c_coinbase_nonfinal(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // height locktime plus a non-final sequence → bad-txns-nonfinal.
     // Found live by the block-differential fuzzer (issue #581): satd
     // exempted the coinbase from the finality check entirely.
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.lock_time = LockTime::from_consensus(1_000_000);
     cb.input[0].sequence = Sequence(0);
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
@@ -752,7 +753,7 @@ const COINBASE_ONLY_WITNESS_ROOT: [u8; 32] = [0u8; 32];
 /// indistinguishable from the honest one.
 fn c_witness_nonce_size(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.output.push(commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]));
     cb.input[0].witness.push([0x11; 7]);
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
@@ -762,16 +763,49 @@ fn c_witness_nonce_size(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 /// ran over `txdata[1..]`, so this was invisible to it.
 fn c_unexpected_witness_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].witness.push([0u8; 32]);
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+}
+
+/// A length-legal block pushed past the weight cap purely by witness bytes,
+/// with a valid nonce and commitment so both nodes get through the witness
+/// rules and reach their weight check: `bad-blk-weight` from Core's
+/// `ContextualCheckBlock`, distinct from `bad-blk-length` (#548). The spent
+/// outpoint need not exist — both nodes weigh the block before looking up
+/// any input.
+fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let mut witness = Witness::new();
+    witness.push(vec![0u8; 4_000_000]);
+    let big = Transaction {
+        version: TxVersion(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness,
+        }],
+        output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: op_true() }],
+    };
+    let mut preimage = [0u8; 64];
+    preimage[32..].copy_from_slice(big.compute_wtxid().to_raw_hash().as_byte_array());
+    let witness_root = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
+    cb.output.push(commitment_output(witness_root, [0u8; 32]));
+    cb.input[0].witness.push([0u8; 32]);
+    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb, big], None, true))
 }
 
 /// A well-formed nonce and a commitment that does not match, in a block with
 /// no witness transactions — the case satd skipped outright.
 fn c_witness_commitment_mismatch(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
-    let mut cb = coinbase(h, block_subsidy(h), op_true());
+    let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     let mut wrong = commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]);
     let mut spk = wrong.script_pubkey.to_bytes();
     spk[37] ^= 0x01; // flip one bit of the committed hash
@@ -797,6 +831,7 @@ fn cases() -> Vec<Case> {
         case("multiple_coinbase", "block-structure", Some("bad-cb-multiple"), c_multiple_coinbase),
         case("bad_merkle_root", "block-structure", Some("bad-txnmrklroot"), c_bad_merkle_root),
         case("oversize_block", "block-structure", Some("bad-blk-length"), c_oversize_block),
+        case("overweight_block", "witness", Some("bad-blk-weight"), c_overweight_block),
         case("coinbase_scriptsig_too_short", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_short),
         case("coinbase_scriptsig_too_long", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_long),
         case("merkle_mutation_cve_2012_2459", "block-structure", Some("bad-txns-duplicate"), c_merkle_mutation),

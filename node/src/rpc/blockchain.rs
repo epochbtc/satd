@@ -451,27 +451,24 @@ pub fn get_tx_out(
 
 /// `gettxoutsetinfo` — return UTXO set statistics.
 pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
-    // Flush the UTXO cache so coin_count/coin_total_amount are accurate
-    let _ = chain_state.flush_coin_cache();
-    let tip_hash = chain_state.tip_hash();
-    let tip_height = chain_state.tip_height();
-    let coin_count = chain_state.coin_count();
-
-    let total_sats = chain_state.coin_total_amount();
+    // One consistent view: tip, coin count, total amount and the height
+    // histogram are read under the chain's accept lock (after a cache
+    // flush) so a block connecting mid-call cannot pair a stale tip with
+    // fresh totals (#556).
+    let info = chain_state.utxo_set_info();
     let unit = default_unit();
-    let total = format_amount(total_sats, unit);
+    let total = format_amount(info.total_amount_sat, unit);
 
     // Compute age distribution from height histogram
     // Buckets: <1h (6 blk), <1d (144), <1w (1008), <1mo (4320),
     //          <6mo (25920), <1y (51840), <3y (155520), 3y+
-    let hist = chain_state.utxo_height_hist();
-    let age_buckets = height_hist_to_age_buckets(&hist, tip_height);
+    let age_buckets = height_hist_to_age_buckets(&info.height_hist, info.height);
 
     let mut response = json!({
-        "height": tip_height,
-        "bestblock": tip_hash.to_string(),
-        "txouts": coin_count,
-        "bogosize": coin_count * 50,
+        "height": info.height,
+        "bestblock": info.best_block.to_string(),
+        "txouts": info.txouts,
+        "bogosize": info.txouts * 50,
         "total_amount": total,
         "hash_serialized_3": "",
         "utxo_age_distribution": {
@@ -629,7 +626,7 @@ pub fn get_block_stats(
         0
     };
 
-    let subsidy = crate::chain::connect::block_subsidy(entry.height);
+    let subsidy = crate::chain::connect::block_subsidy(chain_state.network, entry.height);
 
     Ok(json!({
         "avgfee": avg_fee,

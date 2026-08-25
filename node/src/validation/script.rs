@@ -61,6 +61,8 @@ pub trait ScriptVerifier: Send + Sync {
 pub struct ActivationHeights {
     /// BIP 16 (P2SH).
     pub p2sh: u32,
+    /// BIP 34 (height in coinbase).
+    pub bip34: u32,
     /// BIP 66 (strict DER signatures).
     pub dersig: u32,
     /// BIP 65 (CHECKLOCKTIMEVERIFY).
@@ -90,9 +92,10 @@ pub struct ActivationHeights {
 /// script-verified), so a P2WPKH or P2TR output is NEVER anyone-can-spend
 /// on those networks.
 pub fn activation_heights(network: Network) -> ActivationHeights {
-    match network {
+    let heights = match network {
         Network::Bitcoin => ActivationHeights {
             p2sh: 173_805,
+            bip34: 227_931,
             dersig: 363_725,
             cltv: 388_381,
             csv: 419_328,
@@ -104,6 +107,7 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
         // gate, and libconsensus rejects TAPROOT-without-WITNESS flag sets.
         Network::Testnet => ActivationHeights {
             p2sh: 395,
+            bip34: 21_111,
             dersig: 330_776,
             cltv: 581_885,
             csv: 770_112,
@@ -123,12 +127,75 @@ pub fn activation_heights(network: Network) -> ActivationHeights {
         // rediscovered.
         _ => ActivationHeights {
             p2sh: 0,
+            // Height 1, not 0: the height-in-coinbase rule is meaningless
+            // for genesis, and this preserves `bip34_activation_height`'s
+            // long-standing value for these networks.
+            bip34: 1,
             dersig: 0,
             cltv: 0,
             csv: 0,
             segwit: 0,
             taproot: 0,
         },
+    };
+    if network == Network::Regtest
+        && let Some(overrides) = TEST_ACTIVATION_OVERRIDES.get()
+    {
+        return heights.with_overrides(overrides);
+    }
+    heights
+}
+
+/// Regtest-only overrides for the buried-deployment heights, Core's
+/// `-testactivationheight=name@height` (#548). Core supports exactly five
+/// names (`GetBuriedDeployment`): bip34, dersig, cltv, csv, segwit.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestActivationOverrides {
+    pub bip34: Option<u32>,
+    pub dersig: Option<u32>,
+    pub cltv: Option<u32>,
+    pub csv: Option<u32>,
+    pub segwit: Option<u32>,
+}
+
+static TEST_ACTIVATION_OVERRIDES: std::sync::OnceLock<TestActivationOverrides> =
+    std::sync::OnceLock::new();
+
+/// Install `-testactivationheight` overrides. Called once at daemon startup,
+/// before any validation runs, and only when the chain is regtest — the
+/// config layer rejects the option on every other network, and
+/// [`activation_heights`] only consults the overrides for
+/// [`Network::Regtest`]. Returns `Err` if overrides were already installed.
+pub fn set_test_activation_overrides(o: TestActivationOverrides) -> Result<(), &'static str> {
+    TEST_ACTIVATION_OVERRIDES
+        .set(o)
+        .map_err(|_| "test activation overrides already set")
+}
+
+impl ActivationHeights {
+    /// Apply `-testactivationheight` overrides to a base table. Pure, so the
+    /// merge is testable without touching the process-wide override slot.
+    fn with_overrides(mut self, o: &TestActivationOverrides) -> ActivationHeights {
+        if let Some(h) = o.bip34 {
+            self.bip34 = h;
+        }
+        if let Some(h) = o.dersig {
+            self.dersig = h;
+        }
+        if let Some(h) = o.cltv {
+            self.cltv = h;
+        }
+        if let Some(h) = o.csv {
+            self.csv = h;
+        }
+        if let Some(h) = o.segwit {
+            self.segwit = h;
+            // A taproot spend is a witness spend, so taproot must never gate
+            // on before segwit (the same reason testnet3 pins them together
+            // above): keep the flag set coherent when segwit is moved up.
+            self.taproot = self.taproot.max(h);
+        }
+        self
     }
 }
 
@@ -550,9 +617,42 @@ mod tests {
     // chainparams.cpp buried-deployment heights. Round-tripping our own
     // table proves nothing; these literals were checked against Core.
     #[test]
+    fn test_activation_overrides_merge() {
+        let base = activation_heights(Network::Regtest);
+        // No overrides: identity.
+        assert_eq!(base.with_overrides(&TestActivationOverrides::default()), base);
+
+        // Each name moves exactly its own height.
+        let o = TestActivationOverrides {
+            bip34: Some(500),
+            dersig: Some(102),
+            cltv: Some(111),
+            csv: Some(432),
+            segwit: None,
+        };
+        let h = base.with_overrides(&o);
+        assert_eq!(h.bip34, 500);
+        assert_eq!(h.dersig, 102);
+        assert_eq!(h.cltv, 111);
+        assert_eq!(h.csv, 432);
+        assert_eq!(h.segwit, base.segwit);
+        assert_eq!(h.taproot, base.taproot);
+        assert_eq!(h.p2sh, base.p2sh);
+
+        // Moving segwit up drags taproot with it: a taproot spend is a
+        // witness spend, so taproot active below segwit would be an
+        // incoherent flag set.
+        let o = TestActivationOverrides { segwit: Some(300), ..Default::default() };
+        let h = base.with_overrides(&o);
+        assert_eq!(h.segwit, 300);
+        assert_eq!(h.taproot, 300);
+    }
+
+    #[test]
     fn activation_heights_match_core_chainparams() {
         let main = activation_heights(Network::Bitcoin);
         assert_eq!(main.p2sh, 173_805);
+        assert_eq!(main.bip34, 227_931);
         assert_eq!(main.dersig, 363_725);
         assert_eq!(main.cltv, 388_381);
         assert_eq!(main.csv, 419_328);
@@ -574,7 +674,7 @@ mod tests {
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             assert_eq!(
                 activation_heights(net),
-                ActivationHeights { p2sh: 0, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
+                ActivationHeights { p2sh: 0, bip34: 1, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
                 "{net}: every softfork must be active from genesis"
             );
         }

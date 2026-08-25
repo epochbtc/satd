@@ -19,6 +19,16 @@ item below is (or will be) written up in full in the in-development
 - `signrawtransactionwithkey` and `sat-cli`'s local PSBT signer can now spend untweaked
   P2TR outputs — the BIP 352 silent-payment shape — matching Bitcoin Core's key-path
   fallback (#609)
+- Block subsidy halves every 150 blocks on regtest, matching Core's
+  `nSubsidyHalvingInterval` (#608)
+- Core-compat gaps from the #541 review (#548): `-testactivationheight=name@height`
+  implemented (regtest-only, Core syntax); over-weight blocks reject `bad-blk-weight`
+  after the witness rules as Core orders it, with `bad-blk-length` reserved for the
+  stripped-size check; `getblocktemplate` emits `default_witness_commitment` on every
+  post-segwit template, witness transactions or not
+- `gettxoutsetinfo` reads its tip, count, amount and histogram as one consistent
+  view under the chain accept lock, so a concurrent connect can no longer skew the
+  totals against the reported tip (#556)
 
 ## Releases
 

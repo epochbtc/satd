@@ -579,6 +579,12 @@ pub struct Config {
     /// anchor height for cross-validation against Core's published
     /// `hash_serialized_3` values. `None` (default) = run indefinitely.
     pub stopatheight: Option<u32>,
+    /// Regtest-only buried-deployment overrides from Core's
+    /// `-testactivationheight=name@height` (#548). Parsed and validated
+    /// here; `main` installs them into the validation layer before any
+    /// block is validated. `None` on every other network (the option is
+    /// rejected there, as Core rejects it).
+    pub test_activation_overrides: Option<node::validation::script::TestActivationOverrides>,
     // Mempool policy
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
@@ -2064,6 +2070,50 @@ impl Config {
             .stopatheight
             .or_else(|| file_get("stopatheight").and_then(|v| v.parse().ok()));
 
+        // `-testactivationheight=name@height` (Core-compatible, regtest
+        // only). Each occurrence carries one deployment; a repeated name
+        // takes the last value, matching Core's map-overwrite semantics.
+        let test_activation_overrides = {
+            let mut values: Vec<String> = cli.testactivationheight.clone();
+            if values.is_empty() {
+                values = file_get_all("testactivationheight");
+            }
+            if values.is_empty() {
+                None
+            } else if network != Network::Regtest {
+                return Err(
+                    "-testactivationheight can only be set on regtest".to_string(),
+                );
+            } else {
+                let mut o = node::validation::script::TestActivationOverrides::default();
+                for v in &values {
+                    let Some((name, height)) = v.split_once('@') else {
+                        return Err(format!(
+                            "Invalid format ({v}) for -testactivationheight=name@height."
+                        ));
+                    };
+                    let Ok(height) = height.parse::<u32>() else {
+                        return Err(format!(
+                            "Invalid height value ({v}) for -testactivationheight=name@height."
+                        ));
+                    };
+                    match name {
+                        "bip34" => o.bip34 = Some(height),
+                        "dersig" => o.dersig = Some(height),
+                        "cltv" => o.cltv = Some(height),
+                        "csv" => o.csv = Some(height),
+                        "segwit" => o.segwit = Some(height),
+                        _ => {
+                            return Err(format!(
+                                "Invalid name ({name}) for -testactivationheight=name@height."
+                            ));
+                        }
+                    }
+                }
+                Some(o)
+            }
+        };
+
         // Mempool policy: CLI > config file > defaults
         let mempoolfullrbf = cli
             .mempoolfullrbf
@@ -2902,6 +2952,7 @@ impl Config {
             assumevalid,
             assumevalidage,
             stopatheight,
+            test_activation_overrides,
             mempoolfullrbf,
             maxmempool,
             quarantinemempool,
@@ -4082,6 +4133,13 @@ pub struct CliArgs {
         help = "Stop running after the active-chain tip reaches HEIGHT (matches Core's -stopatheight)"
     )]
     pub stopatheight: Option<u32>,
+
+    #[arg(
+        long,
+        value_name = "NAME@HEIGHT",
+        help = "Regtest only: override a buried softfork deployment's activation height (repeatable; names: bip34, dersig, cltv, csv, segwit; matches Core's -testactivationheight)"
+    )]
+    pub testactivationheight: Vec<String>,
 
     // Mempool policy flags (Bitcoin Core compatible + extensions)
     #[arg(
@@ -5564,6 +5622,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "assumevalid",
         "assumevalidage",
         "stopatheight",
+        "testactivationheight",
         "mempoolfullrbf",
         "maxmempool",
         "quarantinemempool",
@@ -6124,6 +6183,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "assumevalid",
     "assumevalidage",
     "stopatheight",
+    "testactivationheight",
     "consensus",
     // Indexing
     "txindex",
@@ -6960,6 +7020,100 @@ rpcport=8332
         assert_eq!(cfg.alert_reorg_depth, 6);
     }
 
+    /// Core's `-testactivationheight=name@height` (#548): regtest-only,
+    /// repeatable, five deployment names, last value wins per name.
+    #[test]
+    fn testactivationheight_parses_and_is_regtest_only() {
+        use clap::Parser;
+        use node::validation::script::TestActivationOverrides;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let with = |args: &[&str]| {
+            let mut argv = vec!["satd", "--datadir", dir.path().to_str().unwrap()];
+            argv.extend_from_slice(args);
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+
+        // Unset: no overrides.
+        assert_eq!(
+            with(&["--regtest"]).unwrap().test_activation_overrides,
+            None
+        );
+
+        // Repeatable; each name moves its own deployment.
+        let cfg = with(&[
+            "--regtest",
+            "--testactivationheight=segwit@500",
+            "--testactivationheight=csv@432",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.test_activation_overrides,
+            Some(TestActivationOverrides {
+                segwit: Some(500),
+                csv: Some(432),
+                ..Default::default()
+            })
+        );
+
+        // A repeated name takes the last value (Core's map overwrite).
+        let cfg = with(&[
+            "--regtest",
+            "--testactivationheight=segwit@500",
+            "--testactivationheight=segwit@700",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.test_activation_overrides.unwrap().segwit,
+            Some(700)
+        );
+
+        // Malformed values are startup errors, mirroring Core's messages.
+        let err = with(&["--regtest", "--testactivationheight=segwit"]).unwrap_err();
+        assert!(err.contains("Invalid format"), "{err}");
+        let err = with(&["--regtest", "--testactivationheight=segwit@twelve"]).unwrap_err();
+        assert!(err.contains("Invalid height value"), "{err}");
+        let err = with(&["--regtest", "--testactivationheight=taproot@1"]).unwrap_err();
+        assert!(err.contains("Invalid name"), "{err}");
+
+        // Any other chain rejects the option outright.
+        let err = with(&["--signet", "--testactivationheight=segwit@500"]).unwrap_err();
+        assert!(err.contains("only be set on regtest"), "{err}");
+    }
+
+    /// The config-file spelling resolves through the same path.
+    #[test]
+    fn testactivationheight_from_config_file() {
+        use clap::Parser;
+        use node::validation::script::TestActivationOverrides;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(
+            &conf,
+            "regtest=1
+[regtest]
+testactivationheight=segwit@500
+testactivationheight=bip34@2
+",
+        )
+        .unwrap();
+        let argv = [
+            "satd",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--conf",
+            conf.to_str().unwrap(),
+        ];
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert_eq!(
+            cfg.test_activation_overrides,
+            Some(TestActivationOverrides {
+                segwit: Some(500),
+                bip34: Some(2),
+                ..Default::default()
+            })
+        );
+    }
+
     /// `-connect=` pins the node to exactly the peers named and turns off both
     /// DNS seeding and the fixed seeds, so the stock floor of 3 would raise a
     /// warning that nothing on the node could ever clear — and it would land in
@@ -7388,6 +7542,7 @@ rpcport=8332
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
+            testactivationheight: Vec::new(),
             mempoolfullrbf: None,
             maxmempool: None,
             quarantinemempool: None,
@@ -7673,6 +7828,7 @@ rpcport=8332
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
+            testactivationheight: Vec::new(),
             mempoolfullrbf: None,
             maxmempool: None,
             quarantinemempool: None,
