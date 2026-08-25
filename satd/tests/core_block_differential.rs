@@ -768,16 +768,30 @@ fn c_unexpected_witness_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
 }
 
-/// A length-legal block pushed past the weight cap purely by witness bytes,
-/// with a valid nonce and commitment so both nodes get through the witness
-/// rules and reach their weight check: `bad-blk-weight` from Core's
+/// A length-legal block pushed past the weight cap by witness bytes, with a
+/// valid nonce and commitment so both nodes get through the witness rules
+/// and reach their weight check: `bad-blk-weight` from Core's
 /// `ContextualCheckBlock`, distinct from `bad-blk-length` (#548). The spent
 /// outpoint need not exist — both nodes weigh the block before looking up
 /// any input.
+///
+/// Proportions matter: rust-bitcoin's `consensus_decode` caps the WHOLE
+/// object at 4,000,000 serialized bytes, so satd cannot even decode a block
+/// whose total size exceeds that (it fails `Block decode failed` at the RPC
+/// boundary, a different — if equally terminal — reject than Core's). The
+/// weight check is only comparable on a block that decodes: ~480 KB of
+/// stripped outputs (x3 weight multiplier) plus a ~2.2 MB witness gives
+/// weight ≈ 4.1M from a ~2.7 MB serialization.
 fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let mut witness = Witness::new();
-    witness.push(vec![0u8; 4_000_000]);
+    witness.push(vec![0u8; 2_200_000]);
+    let outputs: Vec<TxOut> = (0..16)
+        .map(|_| TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: ScriptBuf::from(vec![0x00; 30_000]),
+        })
+        .collect();
     let big = Transaction {
         version: TxVersion(2),
         lock_time: LockTime::ZERO,
@@ -790,7 +804,7 @@ fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
             sequence: Sequence::MAX,
             witness,
         }],
-        output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: op_true() }],
+        output: outputs,
     };
     let mut preimage = [0u8; 64];
     preimage[32..].copy_from_slice(big.compute_wtxid().to_raw_hash().as_byte_array());
@@ -798,7 +812,16 @@ fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.output.push(commitment_output(witness_root, [0u8; 32]));
     cb.input[0].witness.push([0u8; 32]);
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb, big], None, true))
+    let block = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb, big], None, true);
+    // Guard the proportions this case depends on: over the weight cap, under
+    // both the stripped-size cap and the 4,000,000-byte decode cap.
+    let total = block.total_size();
+    let weight = block.weight().to_wu() as usize;
+    let stripped = (weight - total) / 3;
+    assert!(weight > 4_000_000, "weight {weight} must exceed the cap");
+    assert!(stripped * 4 <= 4_000_000, "stripped {stripped} must stay length-legal");
+    assert!(total < 4_000_000, "total {total} must stay decodable");
+    Submission::Block(block)
 }
 
 /// A well-formed nonce and a commitment that does not match, in a block with
