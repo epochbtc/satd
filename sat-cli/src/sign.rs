@@ -377,6 +377,13 @@ fn sign_input_wif(
             return;
         };
         let msg = Message::from_digest(sighash.to_byte_array());
+        // Like Core, try two readings of each key in order: first as a
+        // BIP 341/86 internal key (taptweak applied), then as the output key
+        // itself with no tweak — the shape of a BIP 352 silent-payment
+        // output. The tweaked reading must be tried first so BIP 86 spends
+        // keep their meaning. is_p2tr() guarantees the script shape
+        // OP_1 OP_PUSHBYTES_32 <output key>.
+        let output_key = &script.as_bytes()[2..34];
         for (xonly, secret) in xonly_key_map {
             if ScriptBuf::new_p2tr(secp, *xonly, None).as_bytes() != script.as_bytes() {
                 continue;
@@ -384,6 +391,18 @@ fn sign_input_wif(
             let keypair = Keypair::from_secret_key(secp, secret);
             let tweaked = keypair.tap_tweak(secp, None);
             let sig = secp.sign_schnorr(&msg, &tweaked.to_keypair());
+            input.tap_key_sig = Some(bitcoin::taproot::Signature {
+                signature: sig,
+                sighash_type: TapSighashType::Default,
+            });
+            return;
+        }
+        for (xonly, secret) in xonly_key_map {
+            if xonly.serialize().as_slice() != output_key {
+                continue;
+            }
+            let keypair = Keypair::from_secret_key(secp, secret);
+            let sig = secp.sign_schnorr(&msg, &keypair);
             input.tap_key_sig = Some(bitcoin::taproot::Signature {
                 signature: sig,
                 sighash_type: TapSighashType::Default,
@@ -542,6 +561,49 @@ mod tests {
         let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
         assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
         assert!(psbt.inputs[0].tap_key_sig.is_some());
+
+        // The signature must verify under the tweaked output key.
+        let (tweaked_key, _) = Keypair::from_secret_key(&secp, &pk.inner)
+            .tap_tweak(&secp, None)
+            .to_keypair()
+            .x_only_public_key();
+        assert_tap_key_sig_verifies(&psbt, &tweaked_key);
+    }
+
+    /// Recompute PSBT input 0's key-spend sighash and verify `tap_key_sig`
+    /// under `expect_key`.
+    fn assert_tap_key_sig_verifies(psbt: &Psbt, expect_key: &XOnlyPublicKey) {
+        let secp = Secp256k1::new();
+        let prevouts: Vec<TxOut> = psbt
+            .inputs
+            .iter()
+            .map(|i| i.witness_utxo.clone().unwrap())
+            .collect();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        let msg = Message::from_digest(sighash.to_byte_array());
+        let sig = psbt.inputs[0].tap_key_sig.unwrap();
+        secp.verify_schnorr(&sig.signature, &msg, expect_key)
+            .expect("tap_key_sig must verify under the output key");
+    }
+
+    #[test]
+    fn signs_p2tr_untweaked_keypath_input() {
+        // The output key IS the signing key, no taptweak — the shape of a
+        // BIP 352 silent-payment output (#609).
+        let (pk, secp) = key(0x45);
+        let (xonly, _) = pk.public_key(&secp).inner.x_only_public_key();
+        let spk = ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
+        );
+        let mut psbt = psbt_spending(spk, 10_000_000);
+
+        let summary = sign_psbt(&mut psbt, &[pk], &[], 0);
+        assert_eq!(summary.per_input, vec![InputOutcome::Signed]);
+        // A taptweaked signature would verify under taptweak(P), not P.
+        assert_tap_key_sig_verifies(&psbt, &xonly);
     }
 
     #[test]
