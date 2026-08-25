@@ -12,6 +12,14 @@ On top of that compatibility, satd adds hardware-profile presets, a set of
 mempool policy options under direct operator control, and live reload of both
 configuration (`SIGHUP`) and TLS certificates (`SIGUSR1`).
 
+**Repeated options** follow Core's rule, which differs by source: an option
+given twice on the **command line** takes the **last** value, while the same key
+repeated in **`bitcoin.conf`** takes the **first**. Core's own comment calls
+this asymmetry a backwards-compatibility quirk, but tooling depends on it — the
+command-line rule is what lets a wrapper append an override onto a base command
+line. Options that are genuinely repeatable (`bind`, `connect`, `addnode`,
+`whitebind`, `rpcallowip`, …) accumulate instead of overriding.
+
 Related chapters: [Observability & Metrics](observability.md) for the TUI,
 Prometheus, and structured logs; [JSON-RPC
 Extensions](json-rpc-extensions.md) for the satd-specific developer APIs;

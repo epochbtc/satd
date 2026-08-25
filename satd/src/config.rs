@@ -792,7 +792,9 @@ pub struct Config {
     /// Bitcoin Core's `-maxuploadtarget`: soft cap in bytes on historical
     /// block upload per rolling 24h. 0 = unlimited.
     pub max_upload_target: u64,
-    pub bind: String,
+    /// Every `-bind` listener. Defaults to a single `0.0.0.0:<port>` when no
+    /// `-bind` is given.
+    pub binds: Vec<BindSpec>,
     /// P2P connection timeout in **milliseconds**, matching Bitcoin
     /// Core's `-timeout` semantics. Defaults to 5000 (5s) when unset.
     /// Parsed via [`parse_timeout_value`] which also accepts the
@@ -2077,6 +2079,50 @@ impl Config {
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
             .unwrap_or_else(|| default_p2p_port(network));
 
+        // -bind: every listener the operator asked for. An explicit -bind
+        // replaces the default listener entirely, as in Core -- it does not
+        // add to it.
+        let binds: Vec<BindSpec> = {
+            let raw: Vec<String> = if !cli.bind.is_empty() {
+                cli.bind.clone()
+            } else {
+                file_get_all("bind")
+            };
+            if raw.is_empty() {
+                vec![BindSpec {
+                    addr: parse_p2p_bind("0.0.0.0", port)?,
+                    onion: false,
+                }]
+            } else {
+                raw.iter()
+                    .map(|r| parse_bind_spec(r, port))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        // Refuse a duplicate binding up front, as Core does. Two listeners on
+        // one address cannot both succeed; without this the second bind fails
+        // later with a bare "address already in use", which reads like a port
+        // clash with another program rather than a contradiction in the
+        // operator's own config. `-bind=X` and `-bind=X=onion` are the same
+        // socket, so they collide too.
+        {
+            let mut seen: Vec<SocketAddr> = Vec::new();
+            for addr in binds
+                .iter()
+                .map(|b| b.addr)
+                .chain(whitebind.iter().map(|(a, _)| *a))
+            {
+                if seen.contains(&addr) {
+                    return Err(format!(
+                        "Duplicate binding configuration: {addr} is named more than once \
+                         across -bind / -whitebind"
+                    ));
+                }
+                seen.push(addr);
+            }
+        }
+
         let mut connect = cli.connect;
         if connect.is_empty() {
             connect = file_get_all("connect");
@@ -3119,10 +3165,7 @@ impl Config {
                     None => 0,
                 }
             },
-            bind: cli
-                .bind
-                .or_else(|| file_get("bind"))
-                .unwrap_or_else(|| "0.0.0.0".to_string()),
+            binds,
             timeout: {
                 // Resolve in CLI > config > default(5000ms) order.
                 // `parse_timeout_value` returns milliseconds and
@@ -3586,7 +3629,7 @@ impl Config {
                 "port": self.port,
                 "max_connections": self.maxconnections,
                 "max_inbound_per_ip": self.maxinboundperip,
-                "bind": self.bind,
+                "bind": self.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "dns": self.dns,
                 "dnsseed": self.dnsseed,
                 "forcednsseed": self.forcednsseed,
@@ -3742,7 +3785,18 @@ pub fn resolve_blocks_dir(
 /// `satd::reload`): the CLI stays authoritative while only the config file is
 /// re-read.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "satd", version, about = "Bitcoin Core-compatible node in Rust")]
+// `args_override_self`: Bitcoin Core resolves a repeated command-line option
+// by taking the last value ("later settings take precedence over early
+// settings" -- GetSetting in Core's settings.cpp; note the config file
+// deliberately reverses this). clap rejects the duplicate instead, which broke
+// any wrapper that appends an override onto a base command line, and Core's own
+// tests do exactly that. Repeatable options (`Vec` fields) still accumulate.
+#[command(
+    name = "satd",
+    version,
+    about = "Bitcoin Core-compatible node in Rust",
+    args_override_self = true
+)]
 pub struct CliArgs {
     #[arg(
         long,
@@ -4720,12 +4774,14 @@ pub struct CliArgs {
     #[arg(long, value_name = "SIZE", help = "Max historical upload per 24h (e.g. 500M; 0=off)")]
     pub maxuploadtarget: Option<String>,
 
+    /// Bitcoin Core's `-bind=addr[:port][=onion]`. Repeatable: a node may
+    /// listen on several addresses.
     #[arg(
         long,
-        value_name = "ADDR",
-        help = "Bind P2P to this address (default: 0.0.0.0)"
+        value_name = "ADDR[:PORT][=onion]",
+        help = "Bind P2P to this address; repeatable (default: 0.0.0.0)"
     )]
-    pub bind: Option<String>,
+    pub bind: Vec<String>,
 
     /// P2P connection timeout. Bitcoin Core's `-timeout` takes
     /// milliseconds (default 5000); satd matches that interpretation
@@ -7025,6 +7081,54 @@ fn parse_blockfilterindex_arg(s: &str) -> Result<bool, String> {
         .ok_or_else(|| format!("expected one of 0/1/basic/true/false/yes/no, got '{s}'"))
 }
 
+/// One `-bind` listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindSpec {
+    pub addr: SocketAddr,
+    /// `-bind=addr[:port]=onion`: the listener a Tor hidden service points at.
+    pub onion: bool,
+}
+
+impl std::fmt::Display for BindSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.addr)?;
+        if self.onion {
+            write!(f, "=onion")?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse one Bitcoin Core `-bind=addr[:port][=onion]` entry.
+///
+/// Core's rules, taken from its own `feature_port.py`: a `-bind` carrying a
+/// port uses it and `-port` is ignored for that entry; a `-bind` without one
+/// combines with `-port`.
+///
+/// Not implemented, and deliberately: Core also opens an automatic
+/// `127.0.0.1:<port + 1>` onion listener when `-listen` is set and no `-bind`
+/// is given at all. That is an extra listening socket on every default node,
+/// so it is left for a separate change rather than folded in here. satd
+/// accepts and binds an explicit `=onion` entry; it just does not synthesise
+/// one.
+pub fn parse_bind_spec(raw: &str, default_port: u16) -> Result<BindSpec, String> {
+    let raw = raw.trim();
+    let (addr_part, onion) = match raw.strip_suffix("=onion") {
+        Some(rest) => (rest.trim(), true),
+        None => (raw, false),
+    };
+    if addr_part.is_empty() {
+        return Err(format!("-bind={raw} names no address"));
+    }
+    // An entry that already carries a port is used as-is; otherwise the bare
+    // address is joined to -port.
+    let addr = match addr_part.parse::<SocketAddr>() {
+        Ok(sa) => sa,
+        Err(_) => parse_p2p_bind(addr_part, default_port)?,
+    };
+    Ok(BindSpec { addr, onion })
+}
+
 /// Join a `-bind` address and `-port` into a P2P socket address.
 ///
 /// `-bind` carries a bare IP, so an IPv6 literal must be bracketed before it
@@ -7283,6 +7387,146 @@ dustrelayfee=0.00005
         let err = build("minrelaytxfee=wat
 ").expect_err("garbage must not be accepted");
         assert!(err.contains("minrelaytxfee"), "unhelpful error: {err}");
+    }
+
+    /// Bitcoin Core takes the LAST value when a command-line option is given
+    /// twice ("later settings take precedence" -- GetSetting in Core's
+    /// settings.cpp). satd used to reject the duplicate outright, which breaks
+    /// any wrapper that appends an override onto a base command line; Core's
+    /// own tests pass `-v2transport` twice for exactly that reason.
+    #[test]
+    fn a_repeated_scalar_option_takes_the_last_value() {
+        let args = normalize_args(
+            ["satd", "-v2transport=0", "-v2transport=1"].iter().map(|s| s.to_string()).collect(),
+        );
+        let cli = CliArgs::try_parse_from(args).expect("a repeated option must not abort startup");
+        assert_eq!(cli.v2transport, Some(true), "the last value must win");
+
+        let args = normalize_args(
+            ["satd", "-port=1111", "-port=2222"].iter().map(|s| s.to_string()).collect(),
+        );
+        assert_eq!(CliArgs::try_parse_from(args).unwrap().port, Some(2222));
+    }
+
+    /// Last-wins must not silently swallow a genuinely repeatable option --
+    /// `-connect`/`-bind`/`-whitebind` accumulate in Core, and collapsing them
+    /// would quietly drop peers or listeners the operator asked for.
+    #[test]
+    fn repeatable_options_still_accumulate() {
+        let args = normalize_args(
+            ["satd", "-bind=127.0.0.1", "-bind=127.0.0.2", "-connect=10.0.0.1:8333", "-connect=10.0.0.2:8333"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let cli = CliArgs::try_parse_from(args).expect("repeatable options must parse");
+        assert_eq!(cli.bind.len(), 2, "-bind must accumulate: {:?}", cli.bind);
+        assert_eq!(cli.connect.len(), 2, "-connect must accumulate");
+    }
+
+    /// Core's `-bind=addr[:port][=onion]`, per its own feature_port.py: an
+    /// entry carrying a port uses it and `-port` is ignored for that entry; an
+    /// entry without one combines with `-port`.
+    #[test]
+    fn bind_specs_follow_cores_port_rules() {
+        // Port on the -bind entry wins over -port.
+        let b = parse_bind_spec("0.0.0.0:8888", 7777).unwrap();
+        assert_eq!(b.addr.to_string(), "0.0.0.0:8888");
+        assert!(!b.onion);
+        // No port on the entry: combine with -port.
+        assert_eq!(
+            parse_bind_spec("0.0.0.0", 7777).unwrap().addr.to_string(),
+            "0.0.0.0:7777"
+        );
+        // IPv6, bare and bracketed.
+        assert_eq!(parse_bind_spec("::1", 7777).unwrap().addr.to_string(), "[::1]:7777");
+        assert_eq!(
+            parse_bind_spec("[::1]:8888", 7777).unwrap().addr.to_string(),
+            "[::1]:8888"
+        );
+        // The onion suffix is recognised, with and without a port.
+        let o = parse_bind_spec("127.0.0.1:8888=onion", 7777).unwrap();
+        assert!(o.onion);
+        assert_eq!(o.addr.to_string(), "127.0.0.1:8888");
+        assert!(parse_bind_spec("127.0.0.1=onion", 7777).unwrap().onion);
+        // Still an error, never a panic.
+        for bad in ["", "=onion", "nope", "1.2.3.4:99999"] {
+            assert!(parse_bind_spec(bad, 7777).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// More than one `-bind` produces more than one listener, and an explicit
+    /// `-bind` replaces the default rather than adding to it.
+    #[test]
+    fn multiple_binds_resolve_to_multiple_listeners() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let with = |extra: &[&str]| {
+            let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            a.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(a).unwrap()).unwrap()
+        };
+
+        let cfg = with(&[]);
+        assert_eq!(cfg.binds.len(), 1, "default is one listener");
+        assert_eq!(cfg.binds[0].addr.ip().to_string(), "0.0.0.0");
+
+        let cfg = with(&["--bind", "127.0.0.1:8001", "--bind", "127.0.0.2:8002=onion"]);
+        assert_eq!(cfg.binds.len(), 2);
+        assert_eq!(cfg.binds[0].addr.to_string(), "127.0.0.1:8001");
+        assert!(cfg.binds[1].onion, "the =onion suffix must survive resolution");
+        assert!(
+            !cfg.binds.iter().any(|b| b.addr.ip().to_string() == "0.0.0.0"),
+            "an explicit -bind must replace the default, not add to it",
+        );
+
+        // The config file is the same namespace, and repeatable there too.
+        let conf = dir.path().join("bind.conf");
+        std::fs::write(&conf, "bind=127.0.0.1:9001
+bind=127.0.0.1:9002
+").unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.binds.len(), 2, "bind= is repeatable in bitcoin.conf too");
+    }
+
+    /// Two listeners cannot share an address, so Core refuses the config up
+    /// front rather than letting the second bind fail later with a bare
+    /// "address already in use" that reads like a clash with another program.
+    /// `-bind=X` and `-bind=X=onion` are the same socket and collide too.
+    #[test]
+    fn a_duplicate_binding_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = |extra: &[&str]| {
+            let mut a = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            a.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(a).unwrap())
+        };
+        const A: &str = "127.0.0.1:11012";
+        for pair in [
+            [format!("--bind={A}"), format!("--bind={A}")],
+            [format!("--bind={A}"), format!("--bind={A}=onion")],
+            [format!("--bind={A}"), format!("--whitebind=noban@{A}")],
+            [format!("--bind={A}=onion"), format!("--whitebind=noban@{A}")],
+        ] {
+            let args: Vec<&str> = pair.iter().map(|s| s.as_str()).collect();
+            let err = cfg(&args).expect_err(&format!("{pair:?} must be refused"));
+            assert!(
+                err.contains("Duplicate binding configuration"),
+                "{pair:?} gave an unhelpful error: {err}"
+            );
+        }
+        // Distinct addresses are still fine.
+        assert!(cfg(&["--bind=127.0.0.1:11012", "--bind=127.0.0.1:11013"]).is_ok());
     }
 
     /// `-bind` is operator input. A value that cannot be joined to `-port`
@@ -8253,7 +8497,7 @@ testactivationheight=bip34@2
             maxconnections: None,
             maxinboundperip: None,
             maxuploadtarget: None,
-            bind: None,
+            bind: Vec::new(),
             timeout: None,
             addnode: vec![],
             seednode: vec![],
@@ -8539,7 +8783,7 @@ testactivationheight=bip34@2
             maxconnections: None,
             maxinboundperip: None,
             maxuploadtarget: None,
-            bind: None,
+            bind: Vec::new(),
             timeout: None,
             addnode: vec![],
             seednode: vec![],

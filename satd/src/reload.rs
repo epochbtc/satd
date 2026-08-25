@@ -665,7 +665,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("whitebind", whitebind),
         restart!("asmap", asmap),
         restart!("port", port),
-        restart!("bind", bind),
+        restart!("bind", binds),
         live_delta!("connect", connect, |old, new, h| dial_added_peers(
             &old.connect,
             &new.connect,

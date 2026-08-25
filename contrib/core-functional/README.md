@@ -121,11 +121,11 @@ resulting work queue, ranked by how many tests each item unblocks:
 | 73 | **`setmocktime`.** Needed for deterministic time, and by `create_cache.py`, which seeds the 199-block chain most tests start from. Unblocks the largest single bucket, and is the largest piece of work: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
 | 48 | **`syncwithvalidationinterfacequeue`.** A hidden, test-only Core RPC that blocks until queued validation callbacks have been delivered. The framework calls it from `sync_all()`, so it is on the path of nearly every multi-node test. Worth thinking through rather than stubbing: if satd applies these side effects synchronously the honest implementation is cheap, but that has to be established, not assumed. |
 | 22 | **No periodic P2P ping.** `connect_nodes()` waits for a `pong` in both directions, which can only arrive if each side pings. satd has no keepalive at all: `ping_all()` is called only by the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. This is an availability gap before it is a test blocker — a half-open connection holds its slot forever. |
-| 6 | **Repeated command-line options.** Core accepts an option given twice — `-v2transport=0 -v2transport=1` — and takes the last (its config file deliberately takes the first). satd's parser rejects the duplicate, so any wrapper that appends an override to a base command line breaks. |
 | 5 | **Named JSON-RPC parameters.** satd accepts positional parameters only; a request whose `params` is an object fails on every method, not just the one that surfaced it. Core supports both, and its framework calls `generatetoaddress(nblocks=…, address=…)` by name. |
 | 2 | **`scantxoutset`**, which the framework's wallet uses to rescan. |
-| 1 | **Core's `-bind=addr[:port][=onion]` syntax**, and more than one `-bind`. satd takes a single bare address and gets the port from `-port`. |
 | 1 | **`NODE_NETWORK_LIMITED` under `-prune`.** A pruned satd advertises `NODE_NETWORK|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED|NODE_WITNESS` (1032), so it invites requests for blocks it does not have. |
+| 1 | **Every `-rpcbind` entry.** Given two, satd binds only the IPv4 one; its invalid-port error also differs from Core's wording. |
+| 1 | **Core's automatic onion bind.** With `-listen` and no `-bind`, Core also opens `127.0.0.1:<port + 1>` as a Tor target. Deliberately not adopted yet: it is an extra listening socket on every default node, which is a decision about what a stock satd exposes rather than a parsing fix. |
 
 Ranked this way the table answers "what unblocks the most tests", which is not
 the same question as "what is most worth fixing" — the top two entries are
@@ -146,6 +146,13 @@ be once measured rather than read:
   literal before joining it to `-port`, so `-bind=::1` could never have worked.
 - **`generatetoaddress` parameter shape**, which measurement showed was not
   about `generatetoaddress` at all — see "Named JSON-RPC parameters" above.
+- **Repeated command-line options aborted startup.** Core takes the last value
+  on the command line and the first in `bitcoin.conf`; satd rejected the
+  duplicate outright, which breaks any wrapper that appends an override.
+- **`-bind` took a single bare address.** It is now repeatable and understands
+  Core's `addr[:port][=onion]`, and a duplicate binding across
+  `-bind`/`-whitebind` is refused up front as Core does. This is what put
+  `feature_bind_extra.py` in the run set.
 - **`getpeerinfo` was missing `addrbind`, `bytessent_per_msg` and
   `bytesrecv_per_msg`.** Adding them unblocked none of the 27 tests that wanted
   them, which is the useful part of the result: with the fields in place those
@@ -156,8 +163,17 @@ Nine rows outside satd's compatibility target are skipped as such: six use Core
 v31 options (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a
 stated Core v30 target, and the rest need Core-only binaries or internals.
 
-Four rows remain `needs-triage` — measured as failing with the error recorded in
+One row remains `needs-triage` — measured as failing with the error recorded in
 the row, cause not yet attributed. That bucket should only ever shrink.
+
+Two of the four rows that used to sit there were the harness's own fault, which
+is worth recording because they read exactly like satd defects. `shims/bitcoind`
+spawned satd as a child process, so `node.process.pid` was the shim's. The
+framework does more with that pid than wait on it — `get_bind_addrs` reads
+`/proc/<pid>/fd` to see which sockets a node is listening on — and a shim owns
+none, so two bind tests reported "bound nothing at all". The shim now execs satd
+in its own process and tees the log from a forked child instead, so the pid the
+framework holds is the node's.
 
 ## Extending it
 
