@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# bitcoin-cli shim: sat-cli is Core CLI-compatible, so this is a plain exec.
+#
+# It exists so the harness can point Core's BITCOINCLI at a stable path, and so
+# there is one obvious place to look if that compatibility ever needs a note.
+# No argument is rewritten or filtered here -- see shims/bitcoind for why the
+# harness refuses to translate on the node's behalf.
+exec "${SAT_CLI_BIN:-sat-cli}" "$@"

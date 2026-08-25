@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""bitcoind shim: run satd where Bitcoin Core's functional tests expect bitcoind.
+
+The tests are run completely unmodified, so anything Core's test framework
+requires of the *process* -- as opposed to of the node's behaviour -- has to be
+provided here. That is a deliberately short list:
+
+  1. A `debug.log`. satd logs to stdout/journald by design and has no
+     debug.log; the framework tails `<datadir>/<chain>/debug.log` for
+     `assert_debug_log`. The shim tees the node's stdout there, appending
+     across restarts the way Core does.
+  2. Log-line rewording. `debuglog_map.toml` maps satd's phrasing onto the
+     substrings tests grep for. Rules reword only -- a rule may never
+     manufacture a line the node did not emit; see the README.
+  3. Turning off satd-only surfaces. The Esplora REST server is on by default
+     on a fixed port, so two nodes on one machine would collide on it. Nothing
+     Core implements is touched.
+
+What the shim deliberately does NOT do: translate, drop, or invent node
+options. satd accepts Core's spelling directly, and skips
+recognized-but-unsupported Core options with a warning of its own. An option
+neither side knows still reaches satd and still aborts startup -- a test that
+needs an option satd lacks must be an honest `skip` row in inventory.toml, not
+a lie told by the shim.
+"""
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HARNESS = HERE.parent
+
+# Chain-name -> datadir subdirectory, matching Core's layout (mainnet is flat).
+CHAIN_DIRS = {
+    "regtest": "regtest",
+    "testnet": "testnet3",
+    "testnet4": "testnet4",
+    "signet": "signet",
+    "main": "",
+}
+
+
+def satd_binary() -> str:
+    for env in ("SATD_BIN", "SATD"):
+        if os.environ.get(env):
+            return os.environ[env]
+    return "satd"
+
+
+def parse_datadir(argv) -> Path:
+    for arg in argv:
+        if arg.startswith(("-datadir=", "--datadir=")):
+            return Path(arg.split("=", 1)[1])
+    return Path.home() / ".bitcoin"
+
+
+def parse_chain(argv, datadir: Path) -> str:
+    """Resolve the chain the same way satd will.
+
+    Command line wins over the config file; Core's framework normally selects
+    the chain with a `regtest=1` line in the generated bitcoin.conf rather than
+    a flag, so both paths matter.
+    """
+    for arg in reversed(argv):
+        bare = arg.lstrip("-")
+        key, _, value = bare.partition("=")
+        if key == "chain" and value:
+            return value
+        if key in CHAIN_DIRS and key != "main" and value in ("", "1"):
+            return key
+    conf = datadir / "bitcoin.conf"
+    if conf.is_file():
+        for line in conf.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "[")):
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key == "chain" and value:
+                return value
+            if key in CHAIN_DIRS and value == "1":
+                return key
+    return "main"
+
+
+def load_log_rules():
+    path = HARNESS / "debuglog_map.toml"
+    if not path.is_file():
+        return []
+    with path.open("rb") as fh:
+        doc = tomllib.load(fh)
+    rules = []
+    for rule in doc.get("rule", []):
+        rules.append((re.compile(rule["match"]), rule["rewrite"], rule.get("why", "")))
+    return rules
+
+
+def apply_rules(line: str, rules) -> str:
+    """Rewrite a satd log line into the phrasing Core's tests grep for.
+
+    Every rule appends its Core-side phrasing to the original line rather than
+    replacing it, so the real line the node emitted is always still present in
+    debug.log for a human reading a failure.
+    """
+    extra = []
+    for pattern, rewrite, _why in rules:
+        match = pattern.search(line)
+        if match:
+            extra.append(match.expand(rewrite))
+    if not extra:
+        return line
+    return line.rstrip("\n") + " | " + " | ".join(extra) + "\n"
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    datadir = parse_datadir(argv)
+    chain = parse_chain(argv, datadir)
+    chain_dir = datadir / CHAIN_DIRS.get(chain, chain)
+    chain_dir.mkdir(parents=True, exist_ok=True)
+    debug_log = chain_dir / "debug.log"
+
+    args = [satd_binary()] + argv
+    # satd-only surface: default-on and bound to one fixed port, so a second
+    # node on the same machine cannot start. Explicit test settings win.
+    if not any(a.lstrip("-").startswith("esplora") for a in argv):
+        args.append("--esplora=0")
+
+    rules = load_log_rules()
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=None,  # straight through: TestNode asserts on it verbatim
+        bufsize=1,
+        text=True,
+        errors="replace",
+    )
+
+    def forward(signum, _frame):
+        proc.send_signal(signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, forward)
+
+    # Append, never truncate: the framework restarts a node in place and
+    # compares debug.log sizes across the restart.
+    with debug_log.open("a", encoding="utf-8", errors="replace") as log:
+        for line in proc.stdout:
+            mapped = apply_rules(line, rules)
+            log.write(mapped)
+            log.flush()
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    return proc.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

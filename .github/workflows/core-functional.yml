@@ -1,0 +1,98 @@
+name: Core functional tests
+
+# Runs Bitcoin Core's own functional test suite, unmodified, against satd.
+# See contrib/core-functional/README.md for what the harness may and may not do
+# to make a test pass.
+#
+# Nightly first, not PR-gating. Promote to a PR gate once the run-set has been
+# stable for ~2 weeks; when that happens, a flake gets its downstream pinned or
+# a `flaky-quarantine` row with an issue behind it -- never a weakened gate.
+
+on:
+  schedule:
+    # Nightly, offset off the hour to avoid the top-of-hour scheduling crowd.
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: core-functional-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  # Cheap, no build: the inventory must describe exactly the pinned test list.
+  # Runs on every PR so a stale or malformed inventory is caught immediately.
+  inventory:
+    name: "Inventory"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate inventory against the pinned test list
+        run: contrib/core-functional/check_inventory.py
+
+      - name: Harness self-test
+        run: contrib/core-functional/tests/test_check_inventory.sh
+
+      - name: Scoreboard
+        run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
+
+  # Is the pin still the newest final Core release? Informational -- a new Core
+  # release should not turn the tree red, it should open a bump PR's worth of
+  # work. Never counts an -rc as newer.
+  pin-freshness:
+    name: "Pin freshness"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare PIN against Core's newest final release
+        run: |
+          set -euo pipefail
+          . contrib/core-functional/PIN
+          latest=$(git ls-remote --tags --refs https://github.com/bitcoin/bitcoin \
+                     | sed 's|.*refs/tags/||' \
+                     | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+                     | sort -V | tail -1)
+          echo "pinned: $CORE_TAG   newest final: $latest"
+          if [ "$CORE_TAG" != "$latest" ]; then
+            echo "::notice::Core $latest is out; pinned at $CORE_TAG. See contrib/core-functional/README.md for the bump procedure."
+          fi
+
+  run:
+    name: "Run"
+    # Self-hosted: the suite starts real nodes on real ports and is far too
+    # slow for a hosted runner.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    needs: inventory
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'core-functional')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build satd and sat-cli
+        run: cargo build --release --locked --bin satd --bin sat-cli
+
+      - name: Fetch the pinned Core tree
+        run: contrib/core-functional/fetch-core.sh
+
+      - name: Preflight
+        run: contrib/core-functional/run.sh --dry-run
+
+      - name: Run the inventory's run-set
+        run: contrib/core-functional/run.sh
+
+      - name: Scoreboard
+        if: always()
+        run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
