@@ -599,16 +599,19 @@ pub fn sign_raw_transaction_with_key(
 
     let mut errors: Vec<Value> = Vec::new();
 
-    // Build the list of all prevouts for SighashCache (needed for taproot)
-    let all_prevouts: Vec<TxOut> = prevouts
-        .iter()
-        .map(|p| {
-            p.clone().unwrap_or(TxOut {
-                value: Amount::ZERO,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-            })
-        })
-        .collect();
+    // The taproot key-spend sighash (BIP 341) commits to every input's amount
+    // and scriptPubKey, so it is only computable when every prevout is known.
+    // Never fabricate placeholder prevouts: that yields a consensus-invalid
+    // signature while implying the input signed fine. Like Core, taproot
+    // inputs stay unsigned (with a per-input error) when any prevout is
+    // missing; non-taproot inputs commit only to their own prevout and are
+    // unaffected.
+    let all_prevouts_known = prevouts.iter().all(Option::is_some);
+    let all_prevouts: Vec<TxOut> = if all_prevouts_known {
+        prevouts.iter().map(|p| p.clone().unwrap()).collect()
+    } else {
+        Vec::new()
+    };
 
     // Sign each input (index needed for both prevouts[] and tx.input[] mutation)
     #[allow(clippy::needless_range_loop)]
@@ -738,6 +741,14 @@ pub fn sign_raw_transaction_with_key(
             // applied), then as the output key itself with no tweak — the
             // shape of a BIP 352 silent-payment output. The tweaked reading
             // must be tried first so BIP 86 spends keep their meaning.
+            if !all_prevouts_known {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, missing spent-output data for the taproot sighash",
+                }));
+                continue;
+            }
             let mut cache = bitcoin::sighash::SighashCache::new(&tx);
             // is_p2tr() guarantees the shape OP_1 OP_PUSHBYTES_32 <output key>.
             let output_key = &script.as_bytes()[2..34];
@@ -1140,6 +1151,71 @@ mod tests {
         assert_eq!(signed_tx.input[0].witness.len(), 1);
         // A taptweaked signature would verify under taptweak(P), not P.
         assert_keyspend_sig_verifies(&signed_tx, &script_pubkey, &xonly);
+    }
+
+    #[test]
+    fn test_sign_p2tr_missing_sibling_prevout_leaves_input_unsigned() {
+        // The BIP 341 key-spend sighash commits to every input's prevout.
+        // With a sibling prevout unknown, a fabricated placeholder would
+        // produce a consensus-invalid signature that looks fine in the
+        // response — the taproot input must instead stay unsigned with its
+        // own error entry, like Core (script/sign.cpp gates schnorr signing
+        // on m_spent_outputs_ready).
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let (xonly, _parity) = pk.inner.x_only_public_key();
+        let script_pubkey = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
+        );
+
+        let known = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let missing = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 1,
+        };
+        let mut tx = unsigned_tx(known);
+        tx.input.push(TxIn {
+            previous_output: missing,
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence(0xffff_fffd),
+            witness: Witness::new(),
+        });
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        // Only the P2TR input's prevout is supplied.
+        let prevtxs = vec![json!({
+            "txid": known.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
+
+        assert_eq!(result["complete"], false);
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert!(
+            signed_tx.input[0].witness.is_empty(),
+            "taproot input must not be signed over fabricated prevouts"
+        );
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "one error per input: {errors:?}");
+        assert!(errors.iter().any(|e| e["vout"] == 0
+            && e["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing spent-output data")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e["vout"] == 1 && e["error"] == "Input not found or already spent")
+        );
     }
 
     #[test]
