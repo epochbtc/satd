@@ -2042,6 +2042,8 @@ pub async fn start(
             admission.clone(),
             bearer.clone(),
             None,
+            // Not the startup listener: this is the full RPC server.
+            None,
         )
         .await?;
         plain_handles.push(handle);
@@ -2157,6 +2159,8 @@ async fn spawn_readonly_listeners(
                 // read-scoped surface already); operator auth only.
                 None,
                 Some(ReadOnlyLayer::new()),
+                // Not the startup listener.
+                None,
             )
             .await;
             let _ = tx.send(res);
@@ -2496,6 +2500,10 @@ pub async fn spawn_plain_surface(
     // rejects non-read methods before dispatch. `None` (the default
     // read/write listener) is a zero-cost identity in the middleware chain.
     rpc_filter: Option<ReadOnlyLayer>,
+    // `Some` only on the startup listener, which serves progress while the
+    // node comes up: answers every other method with Core's `-28 RPC in
+    // warmup` instead of `-32601 Method not found`. `None` elsewhere.
+    warmup: Option<crate::rpc::warmup::WarmupLayer>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2521,6 +2529,7 @@ pub async fn spawn_plain_surface(
         // (after jsonrpsee has parsed the method + split batches).
         .set_rpc_middleware(
             RpcServiceBuilder::new()
+                .option_layer(warmup)
                 .option_layer(rpc_filter)
                 .option_layer(capability_filter),
         )

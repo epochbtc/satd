@@ -3701,6 +3701,17 @@ impl StartupRpcHandle {
 /// listener per `bind_addrs` entry, all sharing the same Methods +
 /// auth. Runs on the RPC port(s) before the full node is initialized,
 /// so the TUI can show startup progress instead of "Connecting...".
+/// Feeds the startup listener's live progress line into the `-28 RPC in warmup`
+/// replies, so a polling client sees what the node is actually doing
+/// ("Verifying blocks...") rather than a bare retry code.
+struct StartupWarmupStatus(Arc<node::startup_progress::StartupProgress>);
+
+impl node::rpc::warmup::WarmupStatus for StartupWarmupStatus {
+    fn message(&self) -> String {
+        self.0.snapshot().message
+    }
+}
+
 async fn start_startup_rpc(
     bind_addrs: Vec<SocketAddr>,
     allowip: Vec<node::rpc::allowip::IpAllowEntry>,
@@ -3712,6 +3723,9 @@ async fn start_startup_rpc(
     use jsonrpsee::server::{Methods, RpcModule, ServerConfig};
     use jsonrpsee::types::ErrorObjectOwned;
 
+    // The warmup layer needs the same progress handle the module serves from,
+    // so both report the identical phase.
+    let warmup_status = Arc::new(StartupWarmupStatus(progress.clone()));
     let mut module = RpcModule::new(progress);
 
     module
@@ -3774,6 +3788,11 @@ async fn start_startup_rpc(
             // a full read/write listener (no read-only method filter).
             None,
             None,
+            // Answer anything but `getstartupinfo` with Core's `-28 RPC in
+            // warmup` and the live progress line, rather than jsonrpsee's
+            // `-32601 Method not found` -- `-28` is what a Core-compatible
+            // client polls on while a node comes up.
+            Some(node::rpc::warmup::WarmupLayer::new(warmup_status.clone())),
         )
         .await
         .unwrap_or_else(|e| {
