@@ -30,7 +30,9 @@ source "$HERE/PIN"
 : "${CORE_COMMIT:?PIN is missing CORE_COMMIT}"
 
 # Sparse set: the functional suite plus the data files some tests read.
-SPARSE_PATHS=(test/functional src/test/data)
+# share/rpcauth is referenced as RPCAUTH= in the generated config.ini; tests
+# that build RPC credentials invoke it directly.
+SPARSE_PATHS=(test/functional src/test/data share/rpcauth)
 
 have_pin() {
     [[ -f "$CORE_DIR/.satd-core-commit" ]] &&

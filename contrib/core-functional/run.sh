@@ -157,10 +157,25 @@ export BITCOINCLI="$HERE/shims/bitcoin-cli"
 echo "Core $CORE_TAG vs satd -- ${#RUN_SET[@]} test(s), $JOBS job(s)"
 echo "tmpdir: $TMPDIR_BASE"
 
-exec python3 "$FUNCTIONAL_DIR/test_runner.py" \
+RESULTS="$TMPDIR_BASE/results.csv"
+
+set +e
+python3 "$FUNCTIONAL_DIR/test_runner.py" \
     --configfile="$CONFIG_INI" \
     --tmpdir="$TMPDIR_BASE" \
     --cachedir="$TMPDIR_BASE/cache" \
     --jobs="$JOBS" \
+    --resultsfile="$RESULTS" \
     ${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"} \
     "${RUN_SET[@]}"
+status=$?
+set -e
+
+# A green exit is not proof the run-set ran: Core's runner exits 0 for tests
+# its own framework skipped at runtime. check_results.py holds the results to
+# the inventory's claim.
+if ! "$HERE/check_results.py" "$RESULTS" "${RUN_SET[@]}"; then
+    status=1
+fi
+
+exit $status

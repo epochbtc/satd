@@ -18,6 +18,7 @@ corpora and the live block-acceptance differential against `bitcoind`.
 | `inventory.toml` | One row per test file: `run`, or `skip` with a reason. |
 | `check_inventory.py` | Enforces the inventory's schema. Also prints the run-set and the scoreboard. |
 | `run.sh` | Runs the run-set via Core's `test_runner.py`. |
+| `check_results.py` | Holds the run's results to the inventory's claim: a `run` row that was skipped at runtime, or absent from the results, fails the run. |
 | `shims/bitcoind`, `shims/bitcoin-cli` | What Core's framework executes instead of Core's binaries. |
 | `debuglog_map.toml` | Maps satd log lines onto the phrasing `assert_debug_log` greps for. |
 | `tests/` | Tests for the harness itself. |
@@ -38,6 +39,12 @@ cargo build --release --bin satd --bin sat-cli   # from the repo root
 
 `run.sh` never runs from `cargo test`: it needs a built binary pair and real
 network ports, and it is a nightly job, not a unit test.
+
+It is also never reachable from a pull request. The job builds and executes
+the checked-out tree, so running it on PR code would execute a contributor's
+code on the runner host; a label gate does not change that, because the label
+outlives the push it was applied to. Push a branch to this repo and use
+`workflow_dispatch` on that ref instead.
 
 ## The rules that keep the number honest
 
