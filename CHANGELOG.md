@@ -15,7 +15,10 @@ Bound for **0.5.1**, a patch release on the 0.5.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
-Nothing yet.
+### Fixed
+- `signrawtransactionwithkey` and `sat-cli`'s local PSBT signer can now spend untweaked
+  P2TR outputs — the BIP 352 silent-payment shape — matching Bitcoin Core's key-path
+  fallback (#609)
 
 ## Releases
 

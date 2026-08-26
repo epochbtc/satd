@@ -599,16 +599,19 @@ pub fn sign_raw_transaction_with_key(
 
     let mut errors: Vec<Value> = Vec::new();
 
-    // Build the list of all prevouts for SighashCache (needed for taproot)
-    let all_prevouts: Vec<TxOut> = prevouts
-        .iter()
-        .map(|p| {
-            p.clone().unwrap_or(TxOut {
-                value: Amount::ZERO,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-            })
-        })
-        .collect();
+    // The taproot key-spend sighash (BIP 341) commits to every input's amount
+    // and scriptPubKey, so it is only computable when every prevout is known.
+    // Never fabricate placeholder prevouts: that yields a consensus-invalid
+    // signature while implying the input signed fine. Like Core, taproot
+    // inputs stay unsigned (with a per-input error) when any prevout is
+    // missing; non-taproot inputs commit only to their own prevout and are
+    // unaffected.
+    let all_prevouts_known = prevouts.iter().all(Option::is_some);
+    let all_prevouts: Vec<TxOut> = if all_prevouts_known {
+        prevouts.iter().map(|p| p.clone().unwrap()).collect()
+    } else {
+        Vec::new()
+    };
 
     // Sign each input (index needed for both prevouts[] and tx.input[] mutation)
     #[allow(clippy::needless_range_loop)]
@@ -733,34 +736,63 @@ pub fn sign_raw_transaction_with_key(
                 }));
             }
         } else if script.is_p2tr() {
-            // P2TR key-path: taproot signing
+            // P2TR key-path: taproot signing. Like Core, try two readings of
+            // each key in order: first as a BIP 341/86 internal key (taptweak
+            // applied), then as the output key itself with no tweak — the
+            // shape of a BIP 352 silent-payment output. The tweaked reading
+            // must be tried first so BIP 86 spends keep their meaning.
+            if !all_prevouts_known {
+                errors.push(json!({
+                    "txid": tx.input[i].previous_output.txid.to_string(),
+                    "vout": tx.input[i].previous_output.vout,
+                    "error": "Unable to sign input, missing spent-output data for the taproot sighash",
+                }));
+                continue;
+            }
             let mut cache = bitcoin::sighash::SighashCache::new(&tx);
-            let mut signed = false;
+            // is_p2tr() guarantees the shape OP_1 OP_PUSHBYTES_32 <output key>.
+            let output_key = &script.as_bytes()[2..34];
+            let mut chosen: Option<(bitcoin::secp256k1::SecretKey, bool)> = None;
             for (xonly_pub, secret) in &xonly_key_map {
                 let expected = bitcoin::ScriptBuf::new_p2tr(&secp, *xonly_pub, None);
                 if expected.as_bytes() == script.as_bytes() {
-                    let sighash = cache
-                        .taproot_key_spend_signature_hash(
-                            i,
-                            &bitcoin::sighash::Prevouts::All(&all_prevouts),
-                            bitcoin::sighash::TapSighashType::Default,
-                        )
-                        .map_err(|e| (-1, format!("Taproot sighash error: {}", e)))?;
-                    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
-                    // Taproot key-path requires key tweaking
-                    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, secret);
-                    let tweaked = keypair.tap_tweak(&secp, None);
-                    let sig = secp.sign_schnorr(&msg, &tweaked.to_keypair());
-                    let tap_sig = bitcoin::taproot::Signature {
-                        signature: sig,
-                        sighash_type: bitcoin::sighash::TapSighashType::Default,
-                    };
-                    let mut witness = Witness::new();
-                    witness.push(tap_sig.serialize());
-                    tx.input[i].witness = witness;
-                    signed = true;
+                    chosen = Some((*secret, true));
                     break;
                 }
+            }
+            if chosen.is_none() {
+                for (xonly_pub, secret) in &xonly_key_map {
+                    if xonly_pub.serialize().as_slice() == output_key {
+                        chosen = Some((*secret, false));
+                        break;
+                    }
+                }
+            }
+            let mut signed = false;
+            if let Some((secret, apply_tweak)) = chosen {
+                let sighash = cache
+                    .taproot_key_spend_signature_hash(
+                        i,
+                        &bitcoin::sighash::Prevouts::All(&all_prevouts),
+                        bitcoin::sighash::TapSighashType::Default,
+                    )
+                    .map_err(|e| (-1, format!("Taproot sighash error: {}", e)))?;
+                let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+                let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &secret);
+                let sig = if apply_tweak {
+                    let tweaked = keypair.tap_tweak(&secp, None);
+                    secp.sign_schnorr(&msg, &tweaked.to_keypair())
+                } else {
+                    secp.sign_schnorr(&msg, &keypair)
+                };
+                let tap_sig = bitcoin::taproot::Signature {
+                    signature: sig,
+                    sighash_type: bitcoin::sighash::TapSighashType::Default,
+                };
+                let mut witness = Witness::new();
+                witness.push(tap_sig.serialize());
+                tx.input[i].witness = witness;
+                signed = true;
             }
             if !signed {
                 errors.push(json!({
@@ -1042,6 +1074,208 @@ mod tests {
         let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
         let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
         assert_eq!(signed_tx.input[0].witness.len(), 1); // [schnorr_sig]
+    }
+
+    /// Recompute the key-spend sighash of `signed_tx` input 0 and verify its
+    /// witness signature under `expect_key`.
+    fn assert_keyspend_sig_verifies(
+        signed_tx: &Transaction,
+        prevout_spk: &bitcoin::Script,
+        expect_key: &bitcoin::key::XOnlyPublicKey,
+    ) {
+        let secp = Secp256k1::new();
+        let prevout = TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: prevout_spk.into(),
+        };
+        let mut cache = bitcoin::sighash::SighashCache::new(signed_tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(
+                0,
+                &bitcoin::sighash::Prevouts::All(&[prevout]),
+                bitcoin::sighash::TapSighashType::Default,
+            )
+            .unwrap();
+        let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
+            &signed_tx.input[0].witness[0],
+        )
+        .unwrap();
+        secp.verify_schnorr(&sig, &msg, expect_key)
+            .expect("signature must verify under the output key");
+    }
+
+    #[test]
+    fn test_sign_p2tr_untweaked_keypath() {
+        // The output key IS the signing key, no taptweak — the shape of a
+        // BIP 352 silent-payment output (#609).
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let (xonly, _parity) = pk.inner.x_only_public_key();
+        let script_pubkey = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
+        );
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["complete"], true,
+            "untweaked P2TR input did not sign: {}",
+            result["errors"]
+        );
+
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert_eq!(signed_tx.input[0].witness.len(), 1);
+        // A taptweaked signature would verify under taptweak(P), not P.
+        assert_keyspend_sig_verifies(&signed_tx, &script_pubkey, &xonly);
+    }
+
+    #[test]
+    fn test_sign_p2tr_missing_sibling_prevout_leaves_input_unsigned() {
+        // The BIP 341 key-spend sighash commits to every input's prevout.
+        // With a sibling prevout unknown, a fabricated placeholder would
+        // produce a consensus-invalid signature that looks fine in the
+        // response — the taproot input must instead stay unsigned with its
+        // own error entry, like Core (script/sign.cpp gates schnorr signing
+        // on m_spent_outputs_ready).
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, _sk) = test_keypair();
+
+        let (xonly, _parity) = pk.inner.x_only_public_key();
+        let script_pubkey = bitcoin::ScriptBuf::new_p2tr_tweaked(
+            bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly),
+        );
+
+        let known = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let missing = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 1,
+        };
+        let mut tx = unsigned_tx(known);
+        tx.input.push(TxIn {
+            previous_output: missing,
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence(0xffff_fffd),
+            witness: Witness::new(),
+        });
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        // Only the P2TR input's prevout is supplied.
+        let prevtxs = vec![json!({
+            "txid": known.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result =
+            sign_raw_transaction_with_key(&cs, &hex_tx, &[wif], Some(&prevtxs), None).unwrap();
+
+        assert_eq!(result["complete"], false);
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert!(
+            signed_tx.input[0].witness.is_empty(),
+            "taproot input must not be signed over fabricated prevouts"
+        );
+        let errors = result["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "one error per input: {errors:?}");
+        assert!(errors.iter().any(|e| e["vout"] == 0
+            && e["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing spent-output data")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e["vout"] == 1 && e["error"] == "Input not found or already spent")
+        );
+    }
+
+    #[test]
+    fn test_sign_p2tr_tweaked_reading_verifies_and_survives_ambiguity() {
+        // Script is the BIP 86 form taptweak(P); the keyset holds both the
+        // internal key and the tweaked scalar (whose pubkey IS the output
+        // key). Both readings resolve to the same signing scalar, so the
+        // assertions are that the ambiguity doesn't break signing and the
+        // signature verifies under the output key. Also proves the BIP 86
+        // path still signs with the untweaked fallback present.
+        let (cs, _dir) = make_chain_state();
+        let (wif, pk, sk) = test_keypair();
+
+        let secp = Secp256k1::new();
+        let (xonly, _parity) = pk.inner.x_only_public_key();
+        let script_pubkey = bitcoin::ScriptBuf::new_p2tr(&secp, xonly, None);
+        let output_key =
+            bitcoin::key::XOnlyPublicKey::from_slice(&script_pubkey.as_bytes()[2..34]).unwrap();
+
+        let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let tweaked_sk = keypair.tap_tweak(&secp, None).to_keypair().secret_key();
+        let wif_tweaked = bitcoin::PrivateKey {
+            compressed: true,
+            network: bitcoin::NetworkKind::Test,
+            inner: tweaked_sk,
+        }
+        .to_wif();
+
+        let outpoint = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = unsigned_tx(outpoint);
+        let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+
+        let prevtxs = vec![json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(script_pubkey.as_bytes()),
+            "amount": 50.0,
+        })];
+
+        let result = sign_raw_transaction_with_key(
+            &cs,
+            &hex_tx,
+            &[wif, wif_tweaked],
+            Some(&prevtxs),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["complete"], true,
+            "ambiguous keyset did not sign: {}",
+            result["errors"]
+        );
+
+        let signed_bytes = hex::decode(result["hex"].as_str().unwrap()).unwrap();
+        let signed_tx: Transaction = bitcoin::consensus::deserialize(&signed_bytes).unwrap();
+        assert_keyspend_sig_verifies(&signed_tx, &script_pubkey, &output_key);
     }
 
     #[test]
