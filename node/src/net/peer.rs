@@ -218,7 +218,7 @@ impl PeerInfo {
             Some(host) => format!("{host}:{}", self.addr.port()),
             None => self.addr.to_string(),
         };
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "id": self.id,
             "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
@@ -248,14 +248,6 @@ impl PeerInfo {
             // not this per-peer record.
             "timeoffset": 0,
             "inflight": [],
-            // Core reports the local end of the connection here, and its own
-            // test framework matches a peer by it. `0.0.0.0:0` is Core's
-            // unset-CService rendering, used when the socket is gone or the
-            // peer is routed through a proxy.
-            "addrbind": self
-                .bind_addr
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "0.0.0.0:0".to_string()),
             // Per-message-type wire tallies. Core omits zero entries, so an
             // idle peer yields `{}` rather than a table of zeros.
             "bytessent_per_msg": per_msg_json(&stats.bytes_sent_per_msg()),
@@ -265,7 +257,16 @@ impl PeerInfo {
                 Direction::Inbound => "inbound-full-relay",
                 Direction::Outbound => "outbound-full-relay",
             },
-        })
+        });
+        // Core reports the local end of the connection here, and its own test
+        // framework matches a peer by it — but only when it has one: the field
+        // is documented optional and pushed under `if (addrBind.IsValid())`.
+        // Rendering an unset bind as `0.0.0.0:0` would invent a listener
+        // address that no peer is actually on.
+        if let Some(bind) = self.bind_addr {
+            obj["addrbind"] = serde_json::Value::String(bind.to_string());
+        }
+        obj
     }
 }
 
@@ -351,9 +352,10 @@ mod rpc_json_tests {
         info.to_rpc_json(&stats)
     }
 
-    /// Core's framework matches a peer by `addrbind` and reads
-    /// `bytes*_per_msg` without a null guard, so all three keys must always be
-    /// present -- a missing one raises KeyError and aborts the client.
+    /// Core's framework reads `bytes*_per_msg` without a null guard, so those
+    /// keys must always be present -- a missing one raises KeyError and aborts
+    /// the client. `addrbind` is present whenever there is a bind address to
+    /// report, which is how the framework matches a peer.
     #[test]
     fn core_fields_are_always_present() {
         let v = peer_json(Some("127.0.0.1:18445"), &[]);
@@ -365,10 +367,16 @@ mod rpc_json_tests {
     }
 
     /// A peer whose local address is unknown (proxied, or the socket is gone)
-    /// still reports a string, using Core's unset rendering.
+    /// omits the key, as Core does: it pushes `addrbind` only under
+    /// `if (stats.addrBind.IsValid())` and documents the field optional.
+    /// Rendering `0.0.0.0:0` would name a listener no peer is on.
     #[test]
-    fn unknown_bind_address_reports_cores_placeholder() {
-        assert_eq!(peer_json(None, &[])["addrbind"], "0.0.0.0:0");
+    fn unknown_bind_address_omits_addrbind_like_core() {
+        let v = peer_json(None, &[]);
+        assert!(v.get("addrbind").is_none(), "{v}");
+        // The unconditional keys are still there.
+        assert!(v["bytessent_per_msg"].is_object());
+        assert!(v["bytesrecv_per_msg"].is_object());
     }
 
     /// Core emits only non-zero entries.
