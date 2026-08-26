@@ -11,6 +11,10 @@ layout) per [`STABILITY_POLICY.md`](STABILITY_POLICY.md).
 
 ## [Unreleased]
 
+Bound for **0.5.1**, a patch release on the 0.5.x line. This is an index: every
+item below is (or will be) written up in full in the in-development
+[`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
+
 Nothing yet.
 
 ## Releases
