@@ -1239,7 +1239,7 @@ impl Config {
         // exactly as the same key in bitcoin.conf would be (drop-in
         // compatibility). Unrecognized options stay in place so clap still
         // rejects typos.
-        let (normalized, cli_warnings) = filter_unsupported_core_cli_args(normalized);
+        let (normalized, cli_warnings) = filter_unsupported_core_cli_args(normalized)?;
         let cli = match CliArgs::try_parse_from(normalized) {
             Ok(c) => c,
             Err(e) => {
@@ -5946,7 +5946,8 @@ fn is_satd_long_flag(name: &str) -> bool {
 }
 
 /// Drop recognized-but-unsupported Bitcoin Core options from the command line,
-/// returning one warning per dropped option.
+/// returning one warning per dropped option, or an error for an option that is
+/// fatal to skip.
 ///
 /// Bitcoin Core treats command-line options and `bitcoin.conf` keys as a single
 /// namespace: `-fallbackfee=0.0002` and a `fallbackfee=0.0002` line mean the
@@ -5955,12 +5956,32 @@ fn is_satd_long_flag(name: &str) -> bool {
 /// not for the command line, where the same option reached clap as an unknown
 /// argument and aborted startup. That asymmetry is the bug this closes.
 ///
-/// Only options satd *recognises as Core's* are dropped. A genuine typo is left
-/// in place so clap still rejects it: silently swallowing `-daatdir=/x` would
-/// start the node against the wrong directory, which is far worse than a hard
-/// error. Run this after [`normalize_args`], which has already rewritten every
-/// option satd implements into `--double-dash` form.
-pub fn filter_unsupported_core_cli_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+/// Only options satd *recognises as Core's, and does not itself implement,* are
+/// dropped. A genuine typo is left in place so clap still rejects it: silently
+/// swallowing `-daatdir=/x` would start the node against the wrong directory,
+/// which is far worse than a hard error. Run this after [`normalize_args`],
+/// which has already rewritten every option satd implements into
+/// `--double-dash` form.
+///
+/// Two things are deliberately never dropped:
+///
+/// - An option satd supports. `normalize_args` rewrites those to `--long`
+///   form, but only for spellings it knows: a negation like `-noconnect`
+///   (`connect` is not one of its negatable booleans) arrives here still
+///   single-dashed, and its base key *is* a Core key. Dropping it would
+///   silently discard the operator's directive — for `-noconnect` or
+///   `-nolisten`, a network-isolation directive. Keep it, and let clap reject
+///   it loudly. Honouring `-no<opt>` for satd's non-boolean options is
+///   separate work; being loud about it is not.
+/// - An option that is fatal to skip. `bitcoin.conf` refuses to load with one
+///   of these present, because skipping it would leave the node less
+///   restricted, more exposed, or less private than the config asks for. Core
+///   treats the command line and the file as one namespace, so the command
+///   line must refuse too — otherwise moving a key from the file to a flag
+///   downgrades a hard error into a warning nobody reads.
+pub fn filter_unsupported_core_cli_args(
+    args: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let mut kept = Vec::with_capacity(args.len());
     let mut warnings = Vec::new();
 
@@ -5980,20 +6001,24 @@ pub fn filter_unsupported_core_cli_args(args: Vec<String>) -> (Vec<String>, Vec<
             kept.push(arg.clone());
             continue;
         }
-        if let Some(guidance) = classify_unsupported_key(base) {
-            warnings.push(format!(
-                "ignoring unsupported Bitcoin Core option '{base}' (command line); the node \
-                 will run without it. {guidance}"
-            ));
-        } else {
-            warnings.push(format!(
-                "ignoring unsupported Bitcoin Core v30 option '{base}' (command line); satd \
-                 does not implement it, so the node will run without it."
+        // satd implements it (or its negation's base): never silently drop.
+        if is_known_config_key(base) || is_satd_long_flag(base) {
+            kept.push(arg.clone());
+            continue;
+        }
+        if let Some(reason) = classify_unsupported_key(base) {
+            return Err(format!(
+                "'{base}' is a Bitcoin Core option that satd does not support. {reason} \
+                 Remove it from the command line before starting satd."
             ));
         }
+        warnings.push(format!(
+            "ignoring unsupported Bitcoin Core v30 option '{base}' (command line); satd \
+             does not implement it, so the node will run without it."
+        ));
     }
 
-    (kept, warnings)
+    Ok((kept, warnings))
 }
 
 /// Parsed bitcoin.conf file.
@@ -7027,7 +7052,7 @@ mod tests {
                 format!("-{flag}"),
                 "{flag} must normalize to its double-dash form"
             );
-            let (kept, warnings) = filter_unsupported_core_cli_args(args);
+            let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
             assert_eq!(kept.len(), 2, "{flag} was dropped");
             assert!(warnings.is_empty(), "{flag} warned: {warnings:?}");
             // clap reports these as errors of a display kind, which the caller
@@ -7046,7 +7071,7 @@ mod tests {
     fn core_named_satd_flags_are_not_dropped() {
         for flag in ["-blockfilterindex=1", "-peerblockfilters=1", "-txindex=1", "-prune=550"] {
             let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
-            let (kept, warnings) = filter_unsupported_core_cli_args(args);
+            let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
             assert_eq!(kept.len(), 2, "{flag} was dropped");
             assert!(warnings.is_empty(), "{flag} warned: {warnings:?}");
         }
@@ -7064,7 +7089,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
         );
-        let (kept, warnings) = filter_unsupported_core_cli_args(args);
+        let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
         assert_eq!(kept, vec!["satd".to_string(), "--datadir=/tmp/x".to_string()]);
         assert_eq!(warnings.len(), 3, "got: {warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("fallbackfee")));
@@ -7078,7 +7103,7 @@ mod tests {
     #[test]
     fn negated_unsupported_core_option_is_skipped() {
         let args = normalize_args(vec!["satd".to_string(), "-nodebuglogfile".to_string()]);
-        let (kept, warnings) = filter_unsupported_core_cli_args(args);
+        let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
         assert_eq!(kept, vec!["satd".to_string()]);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("debuglogfile"), "got: {warnings:?}");
@@ -7090,10 +7115,53 @@ mod tests {
     #[test]
     fn typos_are_left_for_clap_to_reject() {
         let args = normalize_args(vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]);
-        let (kept, warnings) = filter_unsupported_core_cli_args(args);
+        let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
         assert_eq!(kept, vec!["satd".to_string(), "-daatdir=/tmp/x".to_string()]);
         assert!(warnings.is_empty());
         assert!(CliArgs::try_parse_from(kept).is_err(), "clap must still reject the typo");
+    }
+
+    /// A Core option that is fatal to skip must be fatal on the command line
+    /// too. Core treats the file and the command line as one namespace, so if
+    /// `rpcwhitelist=` in bitcoin.conf refuses to start the node, `-rpcwhitelist=`
+    /// must as well — otherwise moving the key to a flag silently downgrades
+    /// RPC restriction to a warning.
+    #[test]
+    fn fatal_core_cli_options_abort_like_the_config_file() {
+        for flag in [
+            "-rpcwhitelist=monitor:getblockcount",
+            "-rpcwhitelistdefault=0",
+            "-i2psam=127.0.0.1:7656",
+        ] {
+            let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
+            let err = filter_unsupported_core_cli_args(args)
+                .expect_err("{flag} must be fatal on the command line");
+            assert!(err.contains("does not support"), "{flag}: {err}");
+        }
+    }
+
+    /// The negated form of an option satd *implements* must never be dropped.
+    /// `-noconnect` is a standard Core idiom for "make no automatic
+    /// connections"; silently discarding it would leave a node the operator
+    /// believes is isolated connecting out normally. satd does not honour the
+    /// negation yet, so the requirement is that it is loud, not that it is
+    /// obeyed.
+    #[test]
+    fn negated_supported_option_is_not_silently_dropped() {
+        for flag in ["-noconnect", "-noonion", "-noproxy"] {
+            let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
+            let (kept, warnings) =
+                filter_unsupported_core_cli_args(args).expect("not a fatal key");
+            assert!(
+                kept.iter().any(|a| a.contains(flag.trim_start_matches('-'))),
+                "{flag} was dropped: kept={kept:?} warnings={warnings:?}"
+            );
+            assert!(warnings.is_empty(), "{flag} warned instead of erroring: {warnings:?}");
+            assert!(
+                CliArgs::try_parse_from(kept).is_err(),
+                "{flag} must reach clap and be rejected"
+            );
+        }
     }
 
     #[test]
