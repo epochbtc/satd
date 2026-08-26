@@ -450,12 +450,14 @@ pub fn get_tx_out(
 }
 
 /// `gettxoutsetinfo` — return UTXO set statistics.
-pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
+pub fn get_tx_out_set_info(chain_state: &ChainState) -> Result<Value, (i32, String)> {
     // One consistent view: tip, coin count, total amount and the height
     // histogram are read under the chain's accept lock (after a cache
     // flush) so a block connecting mid-call cannot pair a stale tip with
     // fresh totals (#556).
-    let info = chain_state.utxo_set_info();
+    let info = chain_state
+        .utxo_set_info()
+        .map_err(|e| (-32603, format!("Unable to read UTXO set: {e}")))?;
     let unit = default_unit();
     let total = format_amount(info.total_amount_sat, unit);
 
@@ -477,7 +479,7 @@ pub fn get_tx_out_set_info(chain_state: &ChainState) -> Value {
         },
     });
     annotate_units(&mut response, unit);
-    response
+    Ok(response)
 }
 
 /// Convert a height histogram (1000-block buckets) into 8 age-based buckets

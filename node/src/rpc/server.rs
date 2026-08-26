@@ -1233,7 +1233,8 @@ pub async fn start(
     })?;
 
     module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(blockchain::get_tx_out_set_info(&ctx.chain_state))
+        blockchain::get_tx_out_set_info(&ctx.chain_state)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("estimatesmartfee", |params, ctx, _extensions| {

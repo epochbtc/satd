@@ -2071,19 +2071,23 @@ impl Config {
             .or_else(|| file_get("stopatheight").and_then(|v| v.parse().ok()));
 
         // `-testactivationheight=name@height` (Core-compatible, regtest
-        // only). Each occurrence carries one deployment; a repeated name
-        // takes the last value, matching Core's map-overwrite semantics.
+        // only). Core reads command-line occurrences first and config-file
+        // occurrences after (ArgsManager::GetArgs order) and assigns each
+        // into a per-deployment map, so both sources apply and a repeated
+        // name takes the last value seen — the config file therefore wins
+        // over the command line for the same deployment. Off regtest Core
+        // never reads the key at all (ReadRegTestArgs runs only for the
+        // regtest branch), so warn and ignore rather than refusing to start.
         let test_activation_overrides = {
             let mut values: Vec<String> = cli.testactivationheight.clone();
-            if values.is_empty() {
-                values = file_get_all("testactivationheight");
-            }
+            values.extend(file_get_all("testactivationheight"));
             if values.is_empty() {
                 None
             } else if network != Network::Regtest {
-                return Err(
-                    "-testactivationheight can only be set on regtest".to_string(),
+                eprintln!(
+                    "Warning: ignoring -testactivationheight, which applies only to regtest"
                 );
+                None
             } else {
                 let mut o = node::validation::script::TestActivationOverrides::default();
                 for v in &values {
@@ -2092,10 +2096,20 @@ impl Config {
                             "Invalid format ({v}) for -testactivationheight=name@height."
                         ));
                     };
-                    let Ok(height) = height.parse::<u32>() else {
-                        return Err(format!(
-                            "Invalid height value ({v}) for -testactivationheight=name@height."
-                        ));
+                    // Core parses the height as int32_t and rejects
+                    // negatives and anything >= INT_MAX; its from_chars-based
+                    // parse also rejects a leading '+'.
+                    let height = match height.parse::<i64>() {
+                        Ok(h) if (0..i32::MAX as i64).contains(&h)
+                            && !height.starts_with('+') =>
+                        {
+                            h as u32
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Invalid height value ({v}) for -testactivationheight=name@height."
+                            ));
+                        }
                     };
                     match name {
                         "bip34" => o.bip34 = Some(height),
@@ -7075,9 +7089,59 @@ rpcport=8332
         let err = with(&["--regtest", "--testactivationheight=taproot@1"]).unwrap_err();
         assert!(err.contains("Invalid name"), "{err}");
 
-        // Any other chain rejects the option outright.
-        let err = with(&["--signet", "--testactivationheight=segwit@500"]).unwrap_err();
-        assert!(err.contains("only be set on regtest"), "{err}");
+        // Core parses the height as int32_t: negatives, >= INT_MAX, and a
+        // leading '+' (rejected by its from_chars parse) are all invalid.
+        for bad in ["segwit@-1", "segwit@2147483647", "segwit@99999999999", "segwit@+5"] {
+            let err = with(&["--regtest", &format!("--testactivationheight={bad}")]).unwrap_err();
+            assert!(err.contains("Invalid height value"), "{bad}: {err}");
+        }
+        // One below INT_MAX is the largest Core accepts.
+        let cfg = with(&["--regtest", "--testactivationheight=segwit@2147483646"]).unwrap();
+        assert_eq!(cfg.test_activation_overrides.unwrap().segwit, Some(2147483646));
+
+        // Off regtest Core never reads the key (ReadRegTestArgs runs only for
+        // the regtest branch), so satd warns and ignores rather than refusing
+        // to start — a shared bitcoin.conf must not break a mainnet node.
+        let cfg = with(&["--signet", "--testactivationheight=segwit@500"]).unwrap();
+        assert_eq!(cfg.test_activation_overrides, None);
+    }
+
+    /// Core's `GetArgs` returns command-line values first and config-file
+    /// values after, then assigns each into a per-deployment map: both
+    /// sources apply, and for one name the config file wins.
+    #[test]
+    fn testactivationheight_merges_cli_and_config_file() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(
+            &conf,
+            "regtest=1
+[regtest]
+testactivationheight=csv@200
+testactivationheight=segwit@900
+",
+        )
+        .unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+                "--testactivationheight=segwit@100",
+                "--testactivationheight=bip34@7",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let o = cfg.test_activation_overrides.expect("overrides");
+        // CLI-only name survives, file-only name survives, and for the name
+        // in both the file value wins (it is assigned last).
+        assert_eq!(o.bip34, Some(7));
+        assert_eq!(o.csv, Some(200));
+        assert_eq!(o.segwit, Some(900));
     }
 
     /// The config-file spelling resolves through the same path.

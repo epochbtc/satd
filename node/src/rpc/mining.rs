@@ -80,9 +80,27 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
     let target = crate::storage::blockindex::target_from_compact(template.bits);
     let target_hex = hex::encode(target);
 
+    // Core shapes the whole template around segwit activation at the
+    // template height (its `fPreSegWit`): before activation it does not
+    // advertise the segwit/taproot rules, reports the unscaled pre-segwit
+    // sigop and size limits, omits `weightlimit` entirely, and omits the
+    // witness commitment (#548). Stock regtest activates segwit at genesis;
+    // `-testactivationheight=segwit@N` is what makes the pre-segwit shape
+    // reachable.
+    let pre_segwit =
+        !crate::validation::block::segwit_active_at(chain_state.network, template.height);
+    let rules: Vec<&str> = if pre_segwit {
+        vec!["csv"]
+    } else {
+        // Core marks segwit with `!`: a client that does not understand the
+        // rule must not use the template as-is (BIP 9 / BIP 22).
+        vec!["csv", "!segwit", "taproot"]
+    };
+    let scale = crate::validation::block::WITNESS_SCALE_FACTOR as u64;
+
     let mut result = json!({
         "version": template.version,
-        "rules": ["csv", "segwit", "taproot"],
+        "rules": rules,
         "vbavailable": {},
         "vbrequired": 0,
         "previousblockhash": template.prev_hash.to_string(),
@@ -94,19 +112,19 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
         "capabilities": ["proposal"],
-        "sigoplimit": 80000,
-        "sizelimit": 4000000,
-        "weightlimit": 4000000,
+        "sigoplimit": if pre_segwit { 80000 / scale } else { 80000 },
+        "sizelimit": if pre_segwit { 4_000_000 / scale } else { 4_000_000 },
         "curtime": template.cur_time,
         "bits": format!("{:08x}", template.bits.to_consensus()),
         "height": template.height,
         "longpollid": format!("{}{:x}", template.prev_hash, template.cur_time),
         "expires": 120,
     });
-    // Core includes `default_witness_commitment` on every template once
-    // segwit is active at the template height, witness transactions or not,
-    // and omits it before activation (its `fPreSegWit`) (#548).
-    if crate::validation::block::segwit_active_at(chain_state.network, template.height) {
+    if !pre_segwit {
+        // `weightlimit` is a post-segwit field, and Core includes
+        // `default_witness_commitment` on every post-segwit template —
+        // witness transactions or not.
+        result["weightlimit"] = Value::from(4_000_000);
         result["default_witness_commitment"] = Value::String(
             crate::mining::template::compute_witness_commitment_hex(&template.transactions),
         );

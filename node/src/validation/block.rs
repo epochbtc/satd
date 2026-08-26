@@ -8,7 +8,7 @@ use crate::validation::ValidationError;
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 
 /// BIP 141 witness scale factor (Core's `WITNESS_SCALE_FACTOR`).
-const WITNESS_SCALE_FACTOR: usize = 4;
+pub const WITNESS_SCALE_FACTOR: usize = 4;
 
 /// BIP 141 witness commitment header (OP_RETURN + push 36 bytes + magic).
 const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];

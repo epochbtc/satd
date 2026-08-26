@@ -2560,17 +2560,21 @@ impl ChainState {
     /// consistent with; its error is deliberately not fatal (matching the
     /// RPC's long-standing behavior) because the reads still form a
     /// consistent — merely staler — view under the lock.
-    pub fn utxo_set_info(&self) -> UtxoSetInfo {
+    pub fn utxo_set_info(&self) -> Result<UtxoSetInfo, crate::storage::StoreError> {
         let _accept = self.accept_lock.lock();
-        let _ = self.store.flush();
+        // A failed flush leaves dirty coins in the cache and rolls the
+        // count/amount deltas back, so the totals no longer describe any
+        // single state. Report the failure instead of returning numbers
+        // that silently contradict each other.
+        self.store.flush()?;
         let (best_block, height) = self.tip_snapshot();
-        UtxoSetInfo {
+        Ok(UtxoSetInfo {
             best_block,
             height,
             txouts: self.store.coin_count(),
             total_amount_sat: self.store.coin_total_amount(),
             height_hist: self.store.utxo_height_hist(),
-        }
+        })
     }
 
     /// Get the total amount (in satoshis) across all UTXOs.

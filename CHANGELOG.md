@@ -22,13 +22,16 @@ item below is (or will be) written up in full in the in-development
 - Block subsidy halves every 150 blocks on regtest, matching Core's
   `nSubsidyHalvingInterval` (#608)
 - Core-compat gaps from the #541 review (#548): `-testactivationheight=name@height`
-  implemented (regtest-only, Core syntax); over-weight blocks reject `bad-blk-weight`
-  after the witness rules as Core orders it, with `bad-blk-length` reserved for the
-  stripped-size check; `getblocktemplate` emits `default_witness_commitment` on every
-  post-segwit template, witness transactions or not
+  implemented (regtest-only, Core syntax, command-line and config-file occurrences
+  merged as Core merges them); over-weight blocks reject `bad-blk-weight` after the
+  witness rules as Core orders it, with `bad-blk-length` reserved for the
+  stripped-size check; `getblocktemplate` matches Core's full pre/post-segwit
+  template shape, including `default_witness_commitment` on every post-segwit
+  template, witness transactions or not
 - `gettxoutsetinfo` reads its tip, count, amount and histogram as one consistent
   view under the chain accept lock, so a concurrent connect can no longer skew the
-  totals against the reported tip (#556)
+  totals against the reported tip, and a failed flush is reported rather than
+  answered with self-contradicting totals (#556)
 
 ## Releases
 

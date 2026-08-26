@@ -1224,15 +1224,30 @@ fn test_gbt_witness_commitment_and_testactivationheight() {
         .as_str()
         .expect("witness-free post-segwit template must carry a commitment");
     assert!(dwc.starts_with("6a24aa21a9ed"), "{dwc}");
+    let result = &response["result"];
+    assert_eq!(
+        result["rules"],
+        serde_json::json!(["csv", "!segwit", "taproot"]),
+        "{result}"
+    );
+    assert_eq!(result["sigoplimit"], 80000, "{result}");
+    assert_eq!(result["sizelimit"], 4000000, "{result}");
+    assert_eq!(result["weightlimit"], 4000000, "{result}");
     node.stop();
 
     let mut node = TestNode::start(&["-testactivationheight=segwit@100"]);
     let response = node.rpc_call("getblocktemplate").unwrap();
+    let result = &response["result"];
     assert!(
-        response["result"].get("default_witness_commitment").is_none(),
-        "template below the overridden segwit height must omit the commitment: {}",
-        response["result"]
+        result.get("default_witness_commitment").is_none(),
+        "template below the overridden segwit height must omit the commitment: {result}"
     );
+    // Core's whole pre-segwit template shape, not just the commitment: no
+    // segwit/taproot rules, unscaled sigop and size limits, no weightlimit.
+    assert_eq!(result["rules"], serde_json::json!(["csv"]), "{result}");
+    assert_eq!(result["sigoplimit"], 20000, "{result}");
+    assert_eq!(result["sizelimit"], 1000000, "{result}");
+    assert!(result.get("weightlimit").is_none(), "{result}");
     node.stop();
 }
 
