@@ -934,6 +934,34 @@ fn test_gettxoutsetinfo() {
     assert!(result["bestblock"].is_string());
     assert!(result["txouts"].as_u64().unwrap() >= 1);
 
+    // The documented invariants the #556 consistency fix protects: the
+    // age-distribution counts sum to exactly `txouts`, and `bestblock` is
+    // the active-chain hash at `height` — every field from one view.
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(5), serde_json::json!(addr)],
+    )
+    .unwrap();
+    let response = node.rpc_call("gettxoutsetinfo").unwrap();
+    let result = &response["result"];
+    let txouts = result["txouts"].as_u64().unwrap();
+    let hist_sum: u64 = result["utxo_age_distribution"]["counts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(hist_sum, txouts, "histogram must account for every txout");
+    let height = result["height"].as_u64().unwrap();
+    let hash_at = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(height)])
+        .unwrap();
+    assert_eq!(
+        hash_at["result"].as_str().unwrap(),
+        result["bestblock"].as_str().unwrap(),
+        "bestblock must be the active-chain hash at the reported height"
+    );
+
     node.stop();
 }
 
@@ -1179,6 +1207,47 @@ fn test_ibd_detection() {
     let result = &response["result"];
     assert_eq!(result["initialblockdownload"], false);
 
+    node.stop();
+}
+
+#[test]
+fn test_gbt_witness_commitment_and_testactivationheight() {
+    // Core emits `default_witness_commitment` on every post-segwit template,
+    // witness transactions or not, and omits it pre-activation (#548). On
+    // stock regtest segwit is active from genesis; `-testactivationheight=
+    // segwit@N` (Core-compatible) moves the gate so the pre-segwit shape is
+    // reachable — which also proves the option survives the whole
+    // config -> startup -> validation pipeline.
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    let dwc = response["result"]["default_witness_commitment"]
+        .as_str()
+        .expect("witness-free post-segwit template must carry a commitment");
+    assert!(dwc.starts_with("6a24aa21a9ed"), "{dwc}");
+    let result = &response["result"];
+    assert_eq!(
+        result["rules"],
+        serde_json::json!(["csv", "!segwit", "taproot"]),
+        "{result}"
+    );
+    assert_eq!(result["sigoplimit"], 80000, "{result}");
+    assert_eq!(result["sizelimit"], 4000000, "{result}");
+    assert_eq!(result["weightlimit"], 4000000, "{result}");
+    node.stop();
+
+    let mut node = TestNode::start(&["-testactivationheight=segwit@100"]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    let result = &response["result"];
+    assert!(
+        result.get("default_witness_commitment").is_none(),
+        "template below the overridden segwit height must omit the commitment: {result}"
+    );
+    // Core's whole pre-segwit template shape, not just the commitment: no
+    // segwit/taproot rules, unscaled sigop and size limits, no weightlimit.
+    assert_eq!(result["rules"], serde_json::json!(["csv"]), "{result}");
+    assert_eq!(result["sigoplimit"], 20000, "{result}");
+    assert_eq!(result["sizelimit"], 1000000, "{result}");
+    assert!(result.get("weightlimit").is_none(), "{result}");
     node.stop();
 }
 

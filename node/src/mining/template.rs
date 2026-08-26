@@ -34,7 +34,7 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
     let tip_hash = chain_state.tip_hash();
     let tip_entry = chain_state.get_block_index(&tip_hash).unwrap();
     let height = tip_entry.height + 1;
-    let subsidy = crate::chain::connect::block_subsidy(height);
+    let subsidy = crate::chain::connect::block_subsidy(chain_state.network, height);
 
     // Determine bits (difficulty)
     let bits = match chain_state.network {
@@ -221,15 +221,13 @@ fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
 
 /// Compute the default witness commitment hex for a block template.
 /// Returns the full OP_RETURN script hex (6a24aa21a9ed + 32-byte commitment).
-/// Returns empty string if no transactions have witness data.
+///
+/// Computed even when no transaction carries witness data: Core emits a
+/// commitment for every post-segwit template (a witness-free template still
+/// has a well-defined witness root — wtxid == txid for legacy transactions,
+/// and the coinbase slot is zeroed), and external mining software trusts the
+/// field rather than computing its own (#548).
 pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
-    let has_witness = txs
-        .iter()
-        .any(|ttx| ttx.tx.input.iter().any(|i| !i.witness.is_empty()));
-    if !has_witness {
-        return String::new();
-    }
-
     // Coinbase wtxid = 0x00...00, then wtxids of included transactions
     let mut hashes: Vec<[u8; 32]> = vec![[0u8; 32]];
     for ttx in txs {
@@ -330,11 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn test_witness_commitment_emitted_for_witness_free_template() {
+        // Core emits `default_witness_commitment` on every post-segwit
+        // template even when nothing carries witness data (#548). The
+        // witness root of a witness-free template is the zeroed coinbase
+        // slot alone, so the commitment is fixed and non-empty.
+        let (cs, mp, _dir) = make_template_env();
+        let template = create_template(&cs, &mp);
+        assert!(template.transactions.is_empty());
+        let hex = compute_witness_commitment_hex(&template.transactions);
+        assert!(hex.starts_with("6a24aa21a9ed"), "commitment script header: {hex}");
+        assert_eq!(hex.len(), 38 * 2, "OP_RETURN + 36-byte push: {hex}");
+
+        // getblocktemplate carries it (segwit is active from 0 on regtest).
+        let gbt = crate::rpc::mining::get_block_template(&cs, &mp);
+        assert_eq!(gbt["default_witness_commitment"].as_str(), Some(hex.as_str()));
+    }
+
+    #[test]
     fn test_template_coinbase_subsidy_only() {
         let (cs, mp, dir) = make_template_env();
 
         let template = create_template(&cs, &mp);
-        let expected_subsidy = crate::chain::connect::block_subsidy(template.height);
+        let expected_subsidy =
+            crate::chain::connect::block_subsidy(Network::Regtest, template.height);
         // With empty mempool, coinbase_value should equal the subsidy alone
         assert_eq!(template.coinbase_value, expected_subsidy);
         assert_eq!(template.coinbase_value, 50 * 100_000_000);

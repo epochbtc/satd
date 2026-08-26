@@ -17,6 +17,11 @@ pub fn get_utxo(ctx: &McpContext, txid: &str, vout: u32) -> String {
 
 /// Get UTXO set statistics: total outputs, value, and age distribution.
 pub fn get_utxo_set_stats(ctx: &McpContext) -> String {
-    let result = rpc::get_tx_out_set_info(&ctx.chain_state);
-    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+    match rpc::get_tx_out_set_info(&ctx.chain_state) {
+        Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
+        // Same uniform `{"error": ...}` contract as the tools above. Serialising
+        // the Result itself would emit `{"Ok": {...}}` and quietly change the
+        // tool's shape.
+        Err((_code, msg)) => json!({"error": msg}).to_string(),
+    }
 }

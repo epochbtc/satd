@@ -161,8 +161,16 @@ pub(crate) fn median_time_past_with_plan(
 }
 
 /// Block subsidy (coinbase reward) for a given height.
-pub fn block_subsidy(height: u32) -> u64 {
-    let halvings = height / 210_000;
+///
+/// The halving interval is per-network: Core's `nSubsidyHalvingInterval` is
+/// 150 on regtest and 210,000 everywhere else (#608). A network-blind
+/// 210,000 made satd accept regtest coinbases Core rejects from height 150.
+pub fn block_subsidy(network: Network, height: u32) -> u64 {
+    let interval = match network {
+        Network::Regtest => 150,
+        _ => 210_000,
+    };
+    let halvings = height / interval;
     if halvings >= 64 {
         return 0;
     }
@@ -183,42 +191,38 @@ pub fn block_subsidy(height: u32) -> u64 {
 /// matching Bitcoin Core behavior.
 /// BIP 34 activation height per network.
 pub fn bip34_activation_height(network: Network) -> u32 {
-    match network {
-        Network::Bitcoin => 227_931,  // BIP 34 activated at this height per Bitcoin Core
-        Network::Testnet => 21_111,
-        _ => 1, // Signet, Regtest: always active
-    }
+    // Sourced from the shared buried-deployment table so a
+    // `-testactivationheight=bip34@N` override reaches it; floored at 1
+    // because genesis is never subject to the height-in-coinbase rule.
+    crate::validation::script::activation_heights(network).bip34.max(1)
 }
 
 /// BIP 113 (MTP for locktime) / BIP 68 (sequence locks) activation height.
 /// Before this height, time-based locktimes compare against block timestamp,
 /// not MTP. BIP 68 sequence locks are not enforced before this height.
 pub fn bip113_activation_height(network: Network) -> u32 {
-    match network {
-        Network::Bitcoin => 419_328,
-        Network::Testnet => 770_112,
-        _ => 1, // Signet, Regtest: always active
-    }
+    // Sourced from the shared buried-deployment table (BIP 113 is part of the
+    // csv deployment) so a `-testactivationheight=csv@N` override reaches it.
+    // Floored at 1: the table says 0 for the always-active networks, but this
+    // gate has always treated them as active from height 1 (genesis is never
+    // transaction-validated).
+    crate::validation::script::activation_heights(network).csv.max(1)
 }
 
 /// BIP 66 (strict DER) activation height per network. Used by the mandatory
 /// block-version gate (`version >= 3` at/after this height).
 pub fn bip66_activation_height(network: Network) -> u32 {
-    match network {
-        Network::Bitcoin => 363_725,
-        Network::Testnet => 330_776,
-        _ => 1, // Signet, Regtest: always active
-    }
+    // dersig in the shared table; see `bip113_activation_height` for the
+    // delegation and the `.max(1)` floor.
+    crate::validation::script::activation_heights(network).dersig.max(1)
 }
 
 /// BIP 65 (CHECKLOCKTIMEVERIFY) activation height per network. Used by the
 /// mandatory block-version gate (`version >= 4` at/after this height).
 pub fn bip65_activation_height(network: Network) -> u32 {
-    match network {
-        Network::Bitcoin => 388_381,
-        Network::Testnet => 581_885,
-        _ => 1, // Signet, Regtest: always active
-    }
+    // cltv in the shared table; see `bip113_activation_height` for the
+    // delegation and the `.max(1)` floor.
+    crate::validation::script::activation_heights(network).cltv.max(1)
 }
 
 /// Enforce the mandatory minimum block version for `height` (Bitcoin Core's
@@ -845,7 +849,7 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             .iter()
             .map(|o| o.value.to_sat())
             .sum();
-        let max_coinbase = block_subsidy(height) + total_fees;
+        let max_coinbase = block_subsidy(network, height) + total_fees;
         if coinbase_value > max_coinbase {
             return Err(ConnectError::BadCoinbaseValue);
         }
@@ -1108,7 +1112,7 @@ mod tests {
             }],
             output: vec![
                 TxOut { value: Amount::from_sat(0), script_pubkey: op_return },
-                TxOut { value: Amount::from_sat(block_subsidy(1)), script_pubkey: normal },
+                TxOut { value: Amount::from_sat(block_subsidy(Network::Regtest, 1)), script_pubkey: normal },
                 TxOut { value: Amount::from_sat(0), script_pubkey: oversized },
             ],
         };
@@ -1153,11 +1157,21 @@ mod tests {
 
     #[test]
     fn test_block_subsidy() {
-        assert_eq!(block_subsidy(0), 50 * 100_000_000);
-        assert_eq!(block_subsidy(209_999), 50 * 100_000_000);
-        assert_eq!(block_subsidy(210_000), 25 * 100_000_000);
-        assert_eq!(block_subsidy(420_000), 1_250_000_000);
-        assert_eq!(block_subsidy(210_000 * 64), 0);
+        // Mainnet (and every non-regtest network): 210,000-block interval.
+        assert_eq!(block_subsidy(Network::Bitcoin, 0), 50 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Bitcoin, 209_999), 50 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Bitcoin, 210_000), 25 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Bitcoin, 420_000), 1_250_000_000);
+        assert_eq!(block_subsidy(Network::Bitcoin, 210_000 * 64), 0);
+        assert_eq!(block_subsidy(Network::Signet, 210_000), 25 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Testnet, 210_000), 25 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Testnet4, 210_000), 25 * 100_000_000);
+        // Regtest halves every 150 blocks, per Core's nSubsidyHalvingInterval.
+        assert_eq!(block_subsidy(Network::Regtest, 0), 50 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Regtest, 149), 50 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Regtest, 150), 25 * 100_000_000);
+        assert_eq!(block_subsidy(Network::Regtest, 300), 12_5000_0000);
+        assert_eq!(block_subsidy(Network::Regtest, 150 * 64), 0);
     }
 
     // ── BIP30 gating / exemption (historical-correctness, untestable on
@@ -1333,7 +1347,7 @@ mod tests {
 
     /// Build a block containing a coinbase and a spending transaction.
     ///
-    /// The coinbase encodes `height` via BIP 34 and pays exactly `block_subsidy(height)`.
+    /// The coinbase encodes `height` via BIP 34 and pays exactly `block_subsidy(Network::Regtest, height)`.
     /// The spending tx consumes `outpoint` (expected to hold 50_000_000 sats)
     /// and produces a single output of the same value (zero fee).
     fn make_block_spending(
@@ -1358,7 +1372,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -1670,7 +1684,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -2242,7 +2256,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -2343,7 +2357,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -2468,7 +2482,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(101)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, 101)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -2546,7 +2560,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(101)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, 101)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -2699,7 +2713,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };

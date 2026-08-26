@@ -405,7 +405,7 @@ mod tests {
             .push_opcode(bitcoin::opcodes::OP_FALSE)
             .into_script();
         let mut output = vec![TxOut {
-            value: Amount::from_sat(block_subsidy(height)),
+            value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
             script_pubkey: bitcoin::ScriptBuf::new(),
         }];
         for _ in 0..extra_outputs {

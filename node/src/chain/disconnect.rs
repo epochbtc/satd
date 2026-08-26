@@ -268,7 +268,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -320,7 +320,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -731,7 +731,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };
@@ -854,7 +854,7 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
                 script_pubkey: bitcoin::ScriptBuf::new(),
             }],
         };

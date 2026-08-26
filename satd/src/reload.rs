@@ -724,6 +724,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("assumevalid", assumevalid),
         restart!("assumevalidage", assumevalidage),
         restart!("stopatheight", stopatheight),
+        restart!("testactivationheight", test_activation_overrides),
         restart!("consensus", consensus),
         // ---- Indexing ----
         restart!("txindex", txindex),

@@ -7,6 +7,9 @@ use crate::validation::ValidationError;
 /// Maximum block weight (4 million weight units, per BIP 141).
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 
+/// BIP 141 witness scale factor (Core's `WITNESS_SCALE_FACTOR`).
+pub const WITNESS_SCALE_FACTOR: usize = 4;
+
 /// BIP 141 witness commitment header (OP_RETURN + push 36 bytes + magic).
 const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
@@ -69,23 +72,34 @@ pub fn check_block(
         return Err(ValidationError::BadTxDuplicate);
     }
 
-    // Check block weight.
+    // Size limits, split exactly as Core splits them (#548):
     //
-    // Core runs this AFTER the witness rules below, because it can mark a
-    // block permanently failed: an attacker who pads the coinbase witness
-    // inflates the weight without changing the block hash, so weighing first
-    // would let a mutated copy poison the index against the honest block.
-    // satd never persists a verdict from this function — a rejected block
-    // leaves no `block_index` entry, and only the `invalidateblock` RPC ever
-    // marks a hash `Invalid` — so the cheap check can stay first. If a failure
-    // here ever becomes durable, this ordering must flip to Core's.
+    // 1. `CheckBlock`'s stripped-size test — tx count and witness-stripped
+    //    serialized size, each scaled by the witness factor — rejects
+    //    `bad-blk-length`. Witness bytes cannot trigger it.
+    // (`Block::base_size` is private in rust-bitcoin 0.32; recover it exactly
+    // from the public pair via weight = base * 3 + total.)
     let weight = block.weight().to_wu() as usize;
-    if weight > MAX_BLOCK_WEIGHT {
+    let base_size = (weight - block.total_size()) / 3;
+    if block.txdata.len() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+        || base_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    {
         return Err(ValidationError::OversizedBlock);
     }
 
     // Witness commitment (BIP 141), height-gated as Core gates it.
     check_witness_rules(block, segwit_active_at(network, height))?;
+
+    // 2. `ContextualCheckBlock`'s full-weight test rejects `bad-blk-weight`,
+    //    and Core runs it AFTER the witness rules above: an attacker who pads
+    //    the coinbase witness inflates the weight without changing the block
+    //    hash, so a mutated copy must fail on its witness commitment (a
+    //    non-durable verdict in Core) before it is ever weighed. satd never
+    //    persists a verdict from this function either way, but the live
+    //    differential compares reject reasons, so the ordering matches Core's.
+    if weight > MAX_BLOCK_WEIGHT {
+        return Err(ValidationError::OverweightBlock);
+    }
 
     Ok(())
 }
@@ -664,6 +678,110 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         assert!(check_block(&block, Network::Regtest, 0).is_ok());
+    }
+
+    /// Build a two-tx block whose spending tx carries `witness_bytes` of
+    /// witness data, with a valid BIP 141 commitment when `commit` is set.
+    /// Stripped size stays tiny either way, so only the full weight moves.
+    fn block_with_witness_bytes(witness_bytes: usize, commit: bool) -> Block {
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+        use bitcoin::hashes::Hash as _;
+
+        let witness_nonce = [0u8; 32];
+
+        let mut witness = Witness::new();
+        witness.push(vec![0u8; witness_bytes]);
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }];
+        let mut coinbase_witness = Witness::new();
+        if commit {
+            let wtxid_hashes: Vec<[u8; 32]> = vec![
+                [0u8; 32],
+                spending.compute_wtxid().to_raw_hash().to_byte_array(),
+            ];
+            let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
+            let mut preimage = [0u8; 64];
+            preimage[..32].copy_from_slice(&witness_root);
+            preimage[32..].copy_from_slice(&witness_nonce);
+            let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
+            let mut commitment_script = Vec::with_capacity(38);
+            commitment_script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+            commitment_script.extend_from_slice(&commitment);
+            outputs.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::from(commitment_script),
+            });
+            coinbase_witness.push(witness_nonce);
+        }
+
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x04, 0xff, 0xff, 0x00]),
+                sequence: Sequence::MAX,
+                witness: coinbase_witness,
+            }],
+            output: outputs,
+        };
+
+        let mut block = bitcoin::constants::genesis_block(Network::Regtest);
+        block.txdata = vec![coinbase, spending];
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    #[test]
+    fn test_overweight_block_is_bad_blk_weight() {
+        // Stripped size is a few hundred bytes but the witness pushes the
+        // weight past 4M: Core rejects this `bad-blk-weight` from
+        // `ContextualCheckBlock`, not `bad-blk-length` (#548).
+        let block = block_with_witness_bytes(4_000_000, true);
+        let base = (block.weight().to_wu() as usize - block.total_size()) / 3;
+        assert!(base * 4 <= 4_000_000);
+        assert!(block.weight().to_wu() > 4_000_000);
+        assert!(matches!(
+            check_block(&block, Network::Regtest, 0),
+            Err(ValidationError::OverweightBlock)
+        ));
+        // Just under the cap with the same shape passes both size checks.
+        let ok = block_with_witness_bytes(1_000, true);
+        assert!(check_block(&ok, Network::Regtest, 0).is_ok());
+    }
+
+    #[test]
+    fn test_weight_checked_after_witness_rules_like_core() {
+        // The same overweight block with no commitment must fail on its
+        // witness rules, not its weight — Core weighs a block only after the
+        // coinbase witness and commitment are verified, because witness
+        // padding inflates weight without changing the block hash.
+        let block = block_with_witness_bytes(4_000_000, false);
+        assert!(matches!(
+            check_block(&block, Network::Regtest, 0),
+            Err(ValidationError::UnexpectedWitness)
+        ));
     }
 
     #[test]

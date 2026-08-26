@@ -24,6 +24,12 @@ pub enum ValidationError {
     MultipleCoinbase,
     #[error("bad-blk-length")]
     OversizedBlock,
+    // Core distinguishes the stripped-size limit in `CheckBlock`
+    // (`bad-blk-length`, above) from `ContextualCheckBlock`'s full-weight
+    // limit (`bad-blk-weight`) — the latter is only reachable when witness
+    // bytes push a length-legal block over the weight cap (#548).
+    #[error("bad-blk-weight")]
+    OverweightBlock,
     #[error("bad-diffbits")]
     BadDifficulty,
     // Core folds the empty-block case into its size-limits check, which emits

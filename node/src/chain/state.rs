@@ -251,6 +251,16 @@ struct PendingReorgRecord {
     original_disconnected: Vec<(BlockHash, u32)>,
 }
 
+/// One consistent `gettxoutsetinfo` view; see [`ChainState::utxo_set_info`].
+pub struct UtxoSetInfo {
+    pub best_block: BlockHash,
+    pub height: u32,
+    pub txouts: u64,
+    pub total_amount_sat: u64,
+    /// UTXO creation-height histogram (1000-block buckets).
+    pub height_hist: Vec<u64>,
+}
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -2536,6 +2546,35 @@ impl ChainState {
     /// Get the total number of UTXOs in the set.
     pub fn coin_count(&self) -> u64 {
         self.store.coin_count()
+    }
+
+    /// Everything `gettxoutsetinfo` reports, read as one consistent view.
+    ///
+    /// The tip, the three coin-metadata keys (count / total amount / height
+    /// histogram) and the `CoinCache` deltas all move together under
+    /// `accept_lock`, so holding it across the flush and the reads means no
+    /// block can connect between them — without it, the RPC could pair a tip
+    /// at height H with an amount and histogram from H+1 and break its own
+    /// "sum over the histogram == txouts" invariant (#556). The flush is
+    /// what folds the cache deltas into the durable keys the histogram is
+    /// consistent with; its error is deliberately not fatal (matching the
+    /// RPC's long-standing behavior) because the reads still form a
+    /// consistent — merely staler — view under the lock.
+    pub fn utxo_set_info(&self) -> Result<UtxoSetInfo, crate::storage::StoreError> {
+        let _accept = self.accept_lock.lock();
+        // A failed flush leaves dirty coins in the cache and rolls the
+        // count/amount deltas back, so the totals no longer describe any
+        // single state. Report the failure instead of returning numbers
+        // that silently contradict each other.
+        self.store.flush()?;
+        let (best_block, height) = self.tip_snapshot();
+        Ok(UtxoSetInfo {
+            best_block,
+            height,
+            txouts: self.store.coin_count(),
+            total_amount_sat: self.store.coin_total_amount(),
+            height_hist: self.store.utxo_height_hist(),
+        })
     }
 
     /// Get the total amount (in satoshis) across all UTXOs.
@@ -10347,7 +10386,12 @@ pub(crate) mod tests {
         };
 
         let coinbase_output = TxOut {
-            value: Amount::from_sat(5_000_000_000),
+            // Exactly the height's subsidy: regtest halves every 150 blocks,
+            // and tests here build chains past that boundary.
+            value: Amount::from_sat(crate::chain::connect::block_subsidy(
+                Network::Regtest,
+                height,
+            )),
             script_pubkey: ScriptBuf::new(),
         };
 

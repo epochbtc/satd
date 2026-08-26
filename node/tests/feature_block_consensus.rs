@@ -421,55 +421,55 @@ fn case_spend_nonexistent() -> Satd {
 fn case_immature_coinbase_spend() -> Satd {
     // coinbase coin at height 50, spent at height 149 (only 99 confirmations).
     let (store, op) = store_with_coin(50_000_000, 50, true);
-    let block = block_of(vec![coinbase(149, block_subsidy(149)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![coinbase(149, block_subsidy(Network::Regtest, 149)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
     connect(&store, &block, 149, 0)
 }
 
 fn case_mature_coinbase_spend_ok() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 50, true);
-    let block = block_of(vec![coinbase(150, block_subsidy(150)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![coinbase(150, block_subsidy(Network::Regtest, 150)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
     connect(&store, &block, 150, 0)
 }
 
 fn case_inputs_below_outputs() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 10, false);
     // Spend 50_000_000 but pay out 60_000_000.
-    let block = block_of(vec![coinbase(60, block_subsidy(60)), spending_tx(op, 60_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![coinbase(60, block_subsidy(Network::Regtest, 60)), spending_tx(op, 60_000_000, 2, 0xffff_ffff, 0)]);
     connect(&store, &block, 60, 0)
 }
 
 fn case_coinbase_value_too_high() -> Satd {
     // No fees; coinbase claims subsidy + 1.
     let store = InMemoryStore::new();
-    let block = block_of(vec![coinbase(1, block_subsidy(1) + 1)]);
+    let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1) + 1)]);
     connect(&store, &block, 1, 0)
 }
 
 fn case_bad_coinbase_height_bip34() -> Satd {
     // Coinbase encodes height 999 but the block is at height 1.
     let store = InMemoryStore::new();
-    let block = block_of(vec![coinbase(999, block_subsidy(1))]);
+    let block = block_of(vec![coinbase(999, block_subsidy(Network::Regtest, 1))]);
     connect(&store, &block, 1, 0)
 }
 
 fn case_locktime_not_final() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 10, false);
     // Height-based locktime 50, block at height 49, non-final sequence.
-    let block = block_of(vec![coinbase(49, block_subsidy(49)), spending_tx(op, 50_000_000, 2, 0, 50)]);
+    let block = block_of(vec![coinbase(49, block_subsidy(Network::Regtest, 49)), spending_tx(op, 50_000_000, 2, 0, 50)]);
     connect(&store, &block, 49, 0)
 }
 
 fn case_bip68_sequence_not_met() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 50, false);
     // tx v2, sequence requires 10 blocks, coin at 50, block at 55.
-    let block = block_of(vec![coinbase(55, block_subsidy(55)), spending_tx(op, 50_000_000, 2, 10, 0)]);
+    let block = block_of(vec![coinbase(55, block_subsidy(Network::Regtest, 55)), spending_tx(op, 50_000_000, 2, 10, 0)]);
     connect(&store, &block, 55, 0)
 }
 
 /// Spend an output created earlier in the same block (valid ordering).
 fn case_intra_block_spend_ok() -> Satd {
     let store = InMemoryStore::new();
-    let cbtx = coinbase(1, block_subsidy(1));
+    let cbtx = coinbase(1, block_subsidy(Network::Regtest, 1));
     let cb_txid = cbtx.compute_txid();
     // The coinbase output is immature (height 1, spent at height 1), so to
     // get a clean accept we instead fund via a non-coinbase intermediate.
@@ -479,7 +479,7 @@ fn case_intra_block_spend_ok() -> Satd {
     let mid_txid = mid.compute_txid();
     let child = spending_tx(OutPoint { txid: mid_txid, vout: 0 }, 50_000_000, 2, 0xffff_ffff, 0);
     let _ = (store, cbtx, cb_txid);
-    let block = block_of(vec![coinbase(1, block_subsidy(1)), mid, child]);
+    let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1)), mid, child]);
     connect(&store2, &block, 1, 0)
 }
 
@@ -491,7 +491,7 @@ fn case_intra_block_child_before_parent() -> Satd {
     let mid_txid = mid.compute_txid();
     let child = spending_tx(OutPoint { txid: mid_txid, vout: 0 }, 50_000_000, 2, 0xffff_ffff, 0);
     // child placed before its parent `mid`.
-    let block = block_of(vec![coinbase(1, block_subsidy(1)), child, mid]);
+    let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1)), child, mid]);
     connect(&store, &block, 1, 0)
 }
 
@@ -564,7 +564,7 @@ fn case_gap_bip30() -> Satd {
         Coin { amount: 1_000, script_pubkey: bitcoin::ScriptBuf::new(), height: 1, coinbase: false },
     ));
     store.write_batch(batch).unwrap();
-    let block = block_of(vec![coinbase(200, block_subsidy(200)), spend]);
+    let block = block_of(vec![coinbase(200, block_subsidy(Network::Regtest, 200)), spend]);
     connect(&store, &block, 200, 0)
 }
 
@@ -579,7 +579,7 @@ fn case_gap_time_too_new() -> Satd {
 fn case_gap_block_version() -> Satd {
     // Block version 1 at a height where BIP34/66/65 are active → Core:
     // `bad-version(0x00000001)`. Now enforced by check_block_version.
-    let mut b = block_of(vec![coinbase(1, block_subsidy(1))]);
+    let mut b = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1))]);
     b.header.version = bitcoin::block::Version::from_consensus(1);
     b.header.merkle_root = b.compute_merkle_root().unwrap();
     check_block_version(&b.header, 1, Network::Regtest).map_err(|e| e.to_string())

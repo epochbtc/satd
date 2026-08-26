@@ -168,6 +168,14 @@ async fn main() {
         }
     };
 
+    // Install `-testactivationheight` overrides (regtest only, enforced by
+    // config) before anything touches validation. Infallible here: this is
+    // the process's only call site and it runs once.
+    if let Some(overrides) = config.test_activation_overrides {
+        node::validation::script::set_test_activation_overrides(overrides)
+            .expect("test activation overrides installed twice");
+    }
+
     // Base log filter (see `config::build_env_filter` for the full precedence
     // rules). The filter is wrapped in a `reload::Layer` so SIGHUP can change
     // log verbosity live (`reload::LogReloadHandle`). Only the EnvFilter is
