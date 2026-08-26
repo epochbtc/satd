@@ -2088,6 +2088,15 @@ impl Config {
             } else {
                 file_get_all("bind")
             };
+            // Core refuses this combination outright ("Cannot set -bind or
+            // -whitebind together with -listen=0"). Accepting it would start a
+            // node that binds nothing while its config plainly names listeners
+            // -- discovered only when no peer ever connects in.
+            if !listen && (!raw.is_empty() || !whitebind_raw.is_empty()) {
+                return Err(
+                    "Cannot set -bind or -whitebind together with -listen=0".to_string()
+                );
+            }
             if raw.is_empty() {
                 vec![BindSpec {
                     addr: parse_p2p_bind("0.0.0.0", port)?,
@@ -7103,7 +7112,11 @@ impl std::fmt::Display for BindSpec {
 ///
 /// Core's rules, taken from its own `feature_port.py`: a `-bind` carrying a
 /// port uses it and `-port` is ignored for that entry; a `-bind` without one
-/// combines with `-port`.
+/// combines with `-port` — except an `=onion` entry, which combines with
+/// `-port + 1` (Core's `default_bind_port_onion`). That offset is why the
+/// stock Tor config `bind=127.0.0.1` + `bind=127.0.0.1=onion` describes two
+/// different sockets; reading both as `-port` would make it a self-collision
+/// and point a `HiddenServicePort` at a closed port.
 ///
 /// Not implemented, and deliberately: Core also opens an automatic
 /// `127.0.0.1:<port + 1>` onion listener when `-listen` is set and no `-bind`
@@ -7121,10 +7134,14 @@ pub fn parse_bind_spec(raw: &str, default_port: u16) -> Result<BindSpec, String>
         return Err(format!("-bind={raw} names no address"));
     }
     // An entry that already carries a port is used as-is; otherwise the bare
-    // address is joined to -port.
+    // address is joined to -port, or to -port + 1 for an onion entry. Core
+    // computes that offset in uint16_t, so it wraps rather than saturating.
     let addr = match addr_part.parse::<SocketAddr>() {
         Ok(sa) => sa,
-        Err(_) => parse_p2p_bind(addr_part, default_port)?,
+        Err(_) => {
+            let port = if onion { default_port.wrapping_add(1) } else { default_port };
+            parse_p2p_bind(addr_part, port)?
+        }
     };
     Ok(BindSpec { addr, onion })
 }
@@ -7424,6 +7441,52 @@ dustrelayfee=0.00005
         assert_eq!(cli.connect.len(), 2, "-connect must accumulate");
     }
 
+    /// Core's stock Tor configuration must load: the two bare entries are
+    /// different sockets, so they are not a duplicate binding.
+    #[test]
+    fn cores_stock_tor_bind_pair_is_accepted() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--port=9000",
+                "--bind=127.0.0.1",
+                "--bind=127.0.0.1=onion",
+            ])
+            .unwrap(),
+        )
+        .expect("Core's documented Tor bind pair must be accepted");
+        let addrs: Vec<String> = cfg.binds.iter().map(|b| b.addr.to_string()).collect();
+        assert_eq!(addrs, vec!["127.0.0.1:9000", "127.0.0.1:9001"]);
+    }
+
+    /// Core refuses -bind/-whitebind together with -listen=0 rather than
+    /// starting a node that binds nothing while its config names listeners.
+    #[test]
+    fn bind_with_listen_disabled_is_refused_like_core() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let with = |extra: &[&str]| {
+            let mut argv = vec!["satd", "--regtest", "--datadir", dir.path().to_str().unwrap()];
+            argv.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+        for extra in [
+            vec!["--listen=0", "--bind=127.0.0.1"],
+            vec!["--listen=0", "--whitebind=noban@127.0.0.1:9000"],
+        ] {
+            let err = with(&extra).unwrap_err();
+            assert!(err.contains("together with -listen=0"), "{extra:?}: {err}");
+        }
+        // Either alone is fine.
+        assert!(with(&["--listen=0"]).is_ok());
+        assert!(with(&["--bind=127.0.0.1"]).is_ok());
+    }
+
     /// Core's `-bind=addr[:port][=onion]`, per its own feature_port.py: an
     /// entry carrying a port uses it and `-port` is ignored for that entry; an
     /// entry without one combines with `-port`.
@@ -7448,7 +7511,14 @@ dustrelayfee=0.00005
         let o = parse_bind_spec("127.0.0.1:8888=onion", 7777).unwrap();
         assert!(o.onion);
         assert_eq!(o.addr.to_string(), "127.0.0.1:8888");
-        assert!(parse_bind_spec("127.0.0.1=onion", 7777).unwrap().onion);
+        // A bare onion entry combines with -port + 1, not -port: Core's
+        // default_bind_port_onion. This is what makes the stock Tor config
+        // (`bind=127.0.0.1` + `bind=127.0.0.1=onion`) two sockets rather than
+        // a duplicate-binding error, and what a torrc HiddenServicePort is
+        // written against.
+        let bare = parse_bind_spec("127.0.0.1=onion", 7777).unwrap();
+        assert!(bare.onion);
+        assert_eq!(bare.addr.to_string(), "127.0.0.1:7778");
         // Still an error, never a panic.
         for bad in ["", "=onion", "nope", "1.2.3.4:99999"] {
             assert!(parse_bind_spec(bad, 7777).is_err(), "{bad:?} was accepted");

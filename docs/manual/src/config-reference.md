@@ -186,7 +186,7 @@ startup error.
 | `whitebind` | none | restart | core | Bind an extra permissioned P2P listener (repeatable). |
 | `asmap` | none | restart | core | asmap file for ASN-based addrman bucketing (eclipse resistance). |
 | `port` | network default | restart | core | P2P listen port. |
-| `bind` | `0.0.0.0` | restart | core | Bind P2P to this address; **repeatable**. Accepts `addr`, `addr:port`, and `addr[:port]=onion`. An entry with a port uses it; a bare address takes `port`. IPv6 literals may be plain (`::1`) or bracketed. Any explicit `bind` replaces the default listener. |
+| `bind` | `0.0.0.0` | restart | core | Bind P2P to this address; **repeatable**. Accepts `addr`, `addr:port`, and `addr[:port]=onion`. An entry with a port uses it; a bare address takes `port`, and a bare `=onion` entry takes `port` + 1 (as in Core). IPv6 literals may be plain (`::1`) or bracketed. Any explicit `bind` replaces the default listener. Cannot be combined with `listen=0`. |
 | `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). Connect-only *exclusivity* is a startup decision (restart to change). |
 | `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding). |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
