@@ -2199,22 +2199,30 @@ impl Config {
         // silent fall-through to the default: `minrelaytxfee=0.00001` in a
         // dropped-in bitcoin.conf used to be discarded without a word, leaving
         // the node relaying at a rate the operator never chose.
+        //
+        // Only when the command line does not already answer the key, though.
+        // Core reads the effective value (command line shadowing file) and
+        // parses that one, so a stale typo in a shared bitcoin.conf does not
+        // stop a node whose systemd unit passes a good value. Parsing the file
+        // eagerly here would turn that into a startup failure on upgrade.
         let file_fee_rate = |key: &str| -> Result<Option<u64>, String> {
             file_get(key)
                 .map(|v| parse_fee_rate_value(&v).map_err(|e| format!("{key} in config file: {e}")))
                 .transpose()
         };
 
-        let minrelaytxfee = cli
-            .minrelaytxfee
-            .or(file_fee_rate("minrelaytxfee")?)
-            .or(profile_defaults.minrelaytxfee)
-            .unwrap_or(1_000); // sat/kvB
+        let minrelaytxfee = match cli.minrelaytxfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("minrelaytxfee")?,
+        }
+        .or(profile_defaults.minrelaytxfee)
+        .unwrap_or(1_000); // sat/kvB
 
-        let dustrelayfee = cli
-            .dustrelayfee
-            .or(file_fee_rate("dustrelayfee")?)
-            .unwrap_or(3_000); // sat/kvB
+        let dustrelayfee = match cli.dustrelayfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("dustrelayfee")?,
+        }
+        .unwrap_or(3_000); // sat/kvB
 
         let datacarriersize = cli
             .datacarriersize
@@ -2721,7 +2729,17 @@ impl Config {
         // operator pays the disk overhead only when wallets need it.
         let blockfilterindex = cli
             .blockfilterindex
-            .or_else(|| file_get("blockfilterindex").and_then(parse_blockfilterindex_value))
+            .or(match file_get("blockfilterindex") {
+                // Core hard-errors on a value it cannot name
+                // ("Unknown -blockfilterindex value %s."). Dropping it here
+                // instead would start the node with filters off and say
+                // nothing, discovered only when a light client gets no
+                // NODE_COMPACT_FILTERS.
+                Some(v) => Some(parse_blockfilterindex_value(v.clone()).ok_or_else(|| {
+                    format!("Unknown -blockfilterindex value {v}.")
+                })?),
+                None => None,
+            })
             .unwrap_or(false);
 
         // BIP 157 P2P advertisement and serving.
@@ -6993,7 +7011,9 @@ fn parse_bool_arg(s: &str) -> Result<bool, String> {
 /// the caller can fall back to the default (off).
 fn parse_blockfilterindex_value(s: String) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "basic" => Some(true),
+        // Core reads an empty value as "index enabled": its init.cpp treats
+        // `blockfilterindex_value == ""` exactly like `"1"`.
+        "basic" | "" => Some(true),
         other => parse_bool(other),
     }
 }
@@ -7272,6 +7292,57 @@ dustrelayfee=0.00005
         assert!(parse_p2p_bind("not-an-ip", 18444).is_err());
         assert!(parse_p2p_bind("127.0.0.1:8333", 18444).is_err());
         assert!(parse_p2p_bind("", 18444).is_err());
+    }
+
+    /// A malformed fee rate in the config file must not stop a node whose
+    /// command line already answers the key: Core parses the effective value,
+    /// so the file's typo is never read. Without the command-line value it is
+    /// still an error, not a silent fall-through to the default.
+    #[test]
+    fn bad_config_fee_rate_is_shadowed_by_the_command_line() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\nminrelaytxfee=0,00001\n").unwrap();
+        let base = ["satd", "--datadir", dir.path().to_str().unwrap(), "--conf"];
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.push(conf.to_str().unwrap());
+        let err = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap_err();
+        assert!(err.contains("minrelaytxfee"), "{err}");
+
+        argv.push("--minrelaytxfee=2000");
+        let cfg = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap();
+        assert_eq!(cfg.minrelaytxfee, 2000);
+    }
+
+    /// Core reads `blockfilterindex=` (empty) as "on" and hard-errors on a
+    /// value it cannot name. Silently disabling the index instead is only
+    /// discovered when a light client finds no NODE_COMPACT_FILTERS.
+    #[test]
+    fn blockfilterindex_matches_core_value_handling() {
+        use clap::Parser;
+        let load = |body: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conf = dir.path().join("bitcoin.conf");
+            std::fs::write(&conf, body).unwrap();
+            let argv = [
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+
+        assert!(load("regtest=1\nblockfilterindex=\n").unwrap().blockfilterindex);
+        assert!(load("regtest=1\nblockfilterindex=basic\n").unwrap().blockfilterindex);
+        assert!(load("regtest=1\nblockfilterindex=1\n").unwrap().blockfilterindex);
+        assert!(!load("regtest=1\nblockfilterindex=0\n").unwrap().blockfilterindex);
+
+        let err = load("regtest=1\nblockfilterindex=basci\n").unwrap_err();
+        assert!(err.contains("Unknown -blockfilterindex value"), "{err}");
     }
 
     /// An IPv6 literal has to be bracketed before it is joined to a port.
