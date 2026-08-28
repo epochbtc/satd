@@ -33,6 +33,36 @@ item below is (or will be) written up in full in the in-development
   totals against the reported tip, and a failed flush is reported rather than
   answered with self-contradicting totals (#556)
 
+## Deferred to 0.5.1
+
+Held out of 0.5.0 so that release could stabilise. Written up in full in
+[`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
+
+### Fixed
+
+**Bitcoin Core client compatibility.** Found by pointing Core's own functional
+test suite at satd; each affects real Core-derived clients, not only tests.
+
+- RPC replies now carry exactly `Content-Type: application/json`, as Core's do,
+  instead of `application/json; charset=utf-8`. Core-derived clients compare the
+  header for equality, so the redundant parameter read to them as a non-JSON
+  response.
+- The startup RPC listener answers `-28 RPC in warmup` with the live progress
+  line for any method it does not itself serve, instead of `-32601 Method not
+  found`. `-28` is the code Core-compatible clients poll on while a node comes
+  up; `-32601` reads as a permanent failure.
+- A recognized-but-unsupported Core option passed on the command line is now
+  skipped with a warning, as the same key in `bitcoin.conf` already was. Core
+  treats the two as one namespace. Unrecognized options are still rejected, so
+  a typo cannot be silently swallowed.
+- 56 satd flags — including Core's own `-blockfilterindex` and
+  `-peerblockfilters` — were reachable only in `--double-dash` form because the
+  single-dash compatibility table had drifted from the parser. The set is now
+  derived from the parser itself.
+- `satd -version` prints `satd version <v>` (Core's shape; the word "version"
+  was absent before), and a bad flag is reported as `Error parsing command line
+  arguments: ...`, matching Core's wording.
+
 ## Releases
 
 | Version | Date | Notes |

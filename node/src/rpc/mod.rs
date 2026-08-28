@@ -15,5 +15,6 @@ pub mod policy;
 pub mod psbt;
 pub mod rawtx;
 pub mod readonly;
+pub mod warmup;
 pub mod server;
 pub mod util;

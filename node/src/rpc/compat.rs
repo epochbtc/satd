@@ -103,6 +103,37 @@ fn fix_request_object(value: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Rewrite a JSON response's `Content-Type` to Core's exact spelling.
+///
+/// Bitcoin Core answers every RPC with literally `application/json`. jsonrpsee
+/// answers with `application/json; charset=utf-8`. The parameter is redundant
+/// -- RFC 8259 fixes JSON's encoding as UTF-8 -- but Core-derived clients
+/// compare the header for equality rather than parsing the media type, so the
+/// suffix reads to them as a non-JSON response. Core's own functional-test
+/// client is one of these: it rejects every satd reply with
+/// `-342 non-JSON HTTP response`, having never looked at the perfectly valid
+/// JSON body.
+///
+/// Only a body that already claims to be JSON is rewritten, so an error
+/// response from another layer keeps whatever type it set.
+fn normalize_response_content_type(headers: &mut hyper::HeaderMap) {
+    let is_json = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|media| media.eq_ignore_ascii_case("application/json"))
+        });
+    if is_json {
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+    }
+}
+
 /// Tower layer installing the JSON-RPC version-compatibility shim.
 #[derive(Clone, Default)]
 pub struct JsonRpcCompatLayer;
@@ -194,7 +225,9 @@ where
             };
 
             let new_req = HttpRequest::from_parts(parts, new_body);
-            inner.call(new_req).await
+            let mut resp = inner.call(new_req).await?;
+            normalize_response_content_type(resp.headers_mut());
+            Ok(resp)
         })
     }
 }
@@ -211,6 +244,56 @@ fn payload_too_large() -> HttpResponse<HttpBody> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Bitcoin Core sends exactly `application/json`, and Core-derived clients
+    /// compare the header for equality. jsonrpsee's
+    /// `application/json; charset=utf-8` made every reply look non-JSON to
+    /// them -- Core's own test client rejects it with -342 without reading the
+    /// body. Deleting the rewrite in `normalize_response_content_type` fails
+    /// this test.
+    #[test]
+    fn json_content_type_matches_core_exactly() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        super::normalize_response_content_type(&mut headers);
+        assert_eq!(headers[hyper::header::CONTENT_TYPE], "application/json");
+    }
+
+    /// Already-correct headers must survive untouched, and the match is on the
+    /// media type only, so casing in the parameter cannot defeat it.
+    #[test]
+    fn json_content_type_is_idempotent_and_case_insensitive() {
+        for start in ["application/json", "Application/JSON; charset=UTF-8"] {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str(start).unwrap(),
+            );
+            super::normalize_response_content_type(&mut headers);
+            assert_eq!(headers[hyper::header::CONTENT_TYPE], "application/json", "from {start}");
+        }
+    }
+
+    /// A non-JSON response keeps its own type: this layer normalizes JSON
+    /// replies, it does not relabel everything as JSON.
+    #[test]
+    fn non_json_content_type_is_left_alone() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        super::normalize_response_content_type(&mut headers);
+        assert_eq!(headers[hyper::header::CONTENT_TYPE], "text/plain; charset=utf-8");
+
+        // A response with no Content-Type at all must not gain one.
+        let mut empty = hyper::HeaderMap::new();
+        super::normalize_response_content_type(&mut empty);
+        assert!(empty.get(hyper::header::CONTENT_TYPE).is_none());
+    }
     use super::*;
 
     fn norm(s: &str) -> Option<serde_json::Value> {

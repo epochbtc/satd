@@ -36,7 +36,7 @@ pub const READONLY_REJECT_CODE: i32 = -32001;
 /// the batch-response builder below uses the same bound the inner service
 /// enforces. If a read-only surface ever overrides the response size, thread
 /// that value through instead of this constant.
-const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
+pub(crate) const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 fn rejected_error(method: &str) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(
