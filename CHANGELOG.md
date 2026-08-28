@@ -38,10 +38,19 @@ item below is (or will be) written up in full in the in-development
 Held out of 0.5.0 so that release could stabilise. Written up in full in
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
+### Added
+
+**Bitcoin Core functional-test harness** (`contrib/core-functional/`) — runs
+Core's own functional suite, unmodified, against satd, with every test file in
+the pinned release inventoried as `run` or `skip` with a reason. Nightly
+workflow, scoreboard in the Operator Manual. See
+[Core Functional-Test Conformance](https://epochbtc.github.io/satd/core-functional.html).
+
 ### Fixed
 
 **Bitcoin Core client compatibility.** Found by pointing Core's own functional
-test suite at satd; each affects real Core-derived clients, not only tests.
+test framework at satd (see Added); each affects real Core-derived clients, not
+only tests.
 
 - RPC replies now carry exactly `Content-Type: application/json`, as Core's do,
   instead of `application/json; charset=utf-8`. Core-derived clients compare the

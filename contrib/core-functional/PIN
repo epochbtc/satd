@@ -1,0 +1,8 @@
+# Bitcoin Core pin for the functional-test harness.
+#
+# CORE_TAG must be a *final* release tag (never an -rc). Bump procedure is in
+# README.md: refresh this file and the <tag>-tests.txt list, re-run
+# check_inventory.py, and triage new/renamed/removed tests in a single PR.
+CORE_TAG=v31.1
+# The commit the tag points at (annotated tags peel: `git rev-parse v31.1^{commit}`).
+CORE_COMMIT=9be056a8a72b624dae9623b2f7bded92c2a21c91

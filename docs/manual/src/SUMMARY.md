@@ -25,6 +25,10 @@
 - [Go SDK (`satdevents`)](go-sdk.md)
 - [MCP Server](mcp.md)
 
+# Conformance
+
+- [Core Functional-Test Conformance](core-functional.md)
+
 # Architecture
 
 - [Guided Code Tour](code-tour.md)

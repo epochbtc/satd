@@ -24,3 +24,11 @@ result-*
 # uploads these as release artifacts; never check them in.
 *.cdx.json
 *.cdx.json.sha256
+
+# Bitcoin Core functional-test harness (contrib/core-functional). The Core
+# tree is fetched from the pinned tag by fetch-core.sh, never vendored; the
+# config.ini handed to Core's framework is generated per run by run.sh.
+/contrib/core-functional/core/
+# Core's framework seeds a cached chain next to the tests; run.sh redirects it
+# out of the tree, but a hand-run test would otherwise drop it here.
+/contrib/core-functional/cache/

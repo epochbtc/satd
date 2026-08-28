@@ -1,0 +1,1427 @@
+# Bitcoin Core functional-test inventory.
+#
+# One row per test file in the pinned Core release. Generated once from a
+# measured full-suite run; maintained by hand from then on.
+#
+# A row flips to `status = "run"` only in the pull request that makes it pass.
+# `check_inventory.py` enforces the schema; see README.md for the rules.
+
+[[test]]
+file = "example_test.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "feature_abortnode.py"
+status = "skip"
+reason = "rpc-missing"
+note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+
+[[test]]
+file = "feature_addrman.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_anchors.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_asmap.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs `setmocktime`; the framework uses it for deterministic time and to seed the cached chain"
+
+[[test]]
+file = "feature_assumeutxo.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs `scantxoutset`, which satd does not implement; the framework wallet uses it to rescan the UTXO set"
+
+[[test]]
+file = "feature_assumevalid.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+
+[[test]]
+file = "feature_bind_extra.py"
+status = "skip"
+reason = "feature-missing"
+note = "satd panics on a malformed -bind value instead of reporting it; follow-up: clean error for an unparseable bind address"
+
+[[test]]
+file = "feature_bind_port_discover.py"
+status = "skip"
+reason = "harness"
+note = "the framework skipped it; re-triage when the run-set grows"
+
+[[test]]
+file = "feature_bind_port_externalip.py"
+status = "skip"
+reason = "harness"
+note = "the framework skipped it; re-triage when the run-set grows"
+
+[[test]]
+file = "feature_bip68_sequence.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_block.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_blocksdir.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_blocksxor.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_chain_tiebreaks.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+
+[[test]]
+file = "feature_cltv.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_coinstatsindex.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_coinstatsindex_compatibility.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
+file = "feature_config_args.py"
+status = "skip"
+reason = "needs-triage"
+note = "observed: AssertionError: [node 0] Expected message(s) ['[warning] Parsed potentially confusing double-negative -listen=0/n'] not found in log:"
+
+[[test]]
+file = "feature_csv_activation.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_dbcrash.py"
+status = "skip"
+reason = "core-internal"
+
+[[test]]
+file = "feature_dersig.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_dirsymlinks.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_discover.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "feature_fastprune.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_fee_estimation.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs `scantxoutset`, which satd does not implement; the framework wallet uses it to rescan the UTXO set"
+
+[[test]]
+file = "feature_filelock.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "feature_framework_miniwallet.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_framework_startup_failures.py"
+status = "skip"
+reason = "needs-triage"
+note = "observed: AssertionError: Child test did NOT contain (only) expected errors:"
+
+[[test]]
+file = "feature_framework_testshell.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_framework_unit_tests.py"
+status = "run"
+
+[[test]]
+file = "feature_help.py"
+status = "run"
+
+[[test]]
+file = "feature_includeconf.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_index_prune.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_init.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_loadblock.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_logging.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_maxtipage.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_maxuploadtarget.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_minchainwork.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_notifications.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_nulldummy.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_port.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "feature_posix_fs_permissions.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_presegwit_node_upgrade.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_proxy.py"
+status = "skip"
+reason = "needs-triage"
+note = "observed: AssertionError: Predicate ''''"
+
+[[test]]
+file = "feature_pruning.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_rbf.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_reindex.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_reindex_init.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_reindex_readonly.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_remove_pruned_files_on_startup.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_segwit.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "feature_settings.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_shutdown.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_signet.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "feature_startupnotify.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "feature_taproot.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "feature_uacomment.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_unsupported_utxo_db.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
+file = "feature_utxo_set_hash.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "feature_versionbits_warning.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+
+[[test]]
+file = "interface_bitcoin_cli.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "interface_http.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "interface_ipc.py"
+status = "skip"
+reason = "no-ipc"
+
+[[test]]
+file = "interface_ipc_mining.py"
+status = "skip"
+reason = "no-ipc"
+
+[[test]]
+file = "interface_rest.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "interface_rpc.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "interface_usdt_coinselection.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "interface_usdt_mempool.py"
+status = "skip"
+reason = "no-usdt"
+
+[[test]]
+file = "interface_usdt_net.py"
+status = "skip"
+reason = "no-usdt"
+
+[[test]]
+file = "interface_usdt_utxocache.py"
+status = "skip"
+reason = "no-usdt"
+
+[[test]]
+file = "interface_usdt_validation.py"
+status = "skip"
+reason = "no-usdt"
+
+[[test]]
+file = "interface_zmq.py"
+status = "skip"
+reason = "no-core-zmq"
+
+[[test]]
+file = "mempool_accept.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_accept_wtxid.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_cluster.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_compatibility.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
+file = "mempool_datacarrier.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_dust.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_ephemeral_dust.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_expiry.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_limit.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "mempool_package_limits.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "mempool_package_rbf.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "mempool_packages.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "mempool_persist.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "mempool_reorg.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_resurrect.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_sigoplimit.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_spend_coinbase.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_truc.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "mempool_unbroadcast.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mempool_updatefromblock.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses Core v31 cluster-mempool option; satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "mining_basic.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "mining_getblocktemplate_longpoll.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mining_mainnet.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "mining_prioritisetransaction.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "mining_template_verification.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_1p1c_network.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_add_connections.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_addr_relay.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_addr_selfannouncement.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_addrfetch.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_addrv2_relay.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_block_sync.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_blockfilters.py"
+status = "skip"
+reason = "feature-missing"
+note = "Core accepts a bare -blockfilterindex; satd requires a value. Follow-up: default the bare form to basic"
+
+[[test]]
+file = "p2p_blocksonly.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_compactblocks.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_compactblocks_blocksonly.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_compactblocks_hb.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_disconnect_ban.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_dns_seeds.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_eviction.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_feefilter.py"
+status = "skip"
+reason = "feature-missing"
+note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+
+[[test]]
+file = "p2p_filter.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_fingerprint.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_getaddr_caching.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "p2p_getdata.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_handshake.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_headers_sync_with_minchainwork.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_i2p_ports.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_i2p_sessions.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_ibd_stalling.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_ibd_txrelay.py"
+status = "skip"
+reason = "feature-missing"
+note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+
+[[test]]
+file = "p2p_initial_headers_sync.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_invalid_block.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_invalid_locator.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_invalid_messages.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_invalid_tx.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_leak.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_leak_tx.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_message_capture.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_mutated_blocks.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_net_deadlock.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_nobloomfilter_messages.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_node_network_limited.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+
+[[test]]
+file = "p2p_opportunistic_1p1c.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_orphan_handling.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_outbound_eviction.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_permissions.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_ping.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_private_broadcast.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "p2p_private_broadcast_retry_v1.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "p2p_seednode.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_segwit.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_sendheaders.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "p2p_sendtxrcncl.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_timeouts.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "p2p_tx_download.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_tx_privacy.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "p2p_unrequested_blocks.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no addrbind field; follow-up: report the local bound address of each peer connection"
+
+[[test]]
+file = "p2p_v2_encrypted.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "p2p_v2_misbehaving.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "p2p_v2_transport.py"
+status = "skip"
+reason = "feature-missing"
+note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+
+[[test]]
+file = "rpc_bind.py"
+status = "skip"
+reason = "needs-triage"
+note = "observed: AssertionError: not(set() == {('7f000001', 17704), ('00000000000000000000000000000001', 17704)})"
+
+[[test]]
+file = "rpc_blockchain.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_createmultisig.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "rpc_decodescript.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_deprecated.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_deriveaddresses.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_dumptxoutset.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_estimatefee.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_generate.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_getblockfilter.py"
+status = "skip"
+reason = "feature-missing"
+note = "Core accepts a bare -blockfilterindex; satd requires a value. Follow-up: default the bare form to basic"
+
+[[test]]
+file = "rpc_getblockfrompeer.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_getblockstats.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "rpc_getchaintips.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_getdescriptoractivity.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_getdescriptorinfo.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_gettxspendingprevout.py"
+status = "skip"
+reason = "feature-missing"
+note = "uses -txospenderindex (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+
+[[test]]
+file = "rpc_help.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_invalid_address_message.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_invalidateblock.py"
+status = "skip"
+reason = "rpc-missing"
+note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+
+[[test]]
+file = "rpc_misc.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_named_arguments.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_net.py"
+status = "skip"
+reason = "feature-missing"
+note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+
+[[test]]
+file = "rpc_orphans.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_packages.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_preciousblock.py"
+status = "skip"
+reason = "rpc-missing"
+note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+
+[[test]]
+file = "rpc_psbt.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "rpc_rawtransaction.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_scanblocks.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_scantxoutset.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_setban.py"
+status = "skip"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
+
+[[test]]
+file = "rpc_signer.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "rpc_signmessagewithprivkey.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_signrawtransactionwithkey.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_txoutproof.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_uptime.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_users.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "rpc_validateaddress.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "rpc_whitelist.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "tool_bench_sanity_check.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_bitcoin.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_bitcoin_chainstate.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_rpcauth.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_signet_miner.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_utils.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "tool_utxo_to_sqlite.py"
+status = "skip"
+reason = "cache"
+
+[[test]]
+file = "tool_wallet.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "wallet_abandonconflict.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_address_types.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_anchor.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_assumeutxo.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_avoid_mixing_output_types.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_avoidreuse.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_backup.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_backwards_compatibility.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
+file = "wallet_balance.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_basic.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_blank.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_bumpfee.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_change_address.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_coinbase_category.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_conflicts.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_create_tx.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_createwallet.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_createwalletdescriptor.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_crosschain.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_descriptor.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_disable.py"
+status = "skip"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+
+[[test]]
+file = "wallet_encryption.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_fallbackfee.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_fast_rescan.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_fundrawtransaction.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_gethdkeys.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_groups.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_hd.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_importdescriptors.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_importprunedfunds.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_keypool.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_keypool_topup.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_labels.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_listdescriptors.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_listreceivedby.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_listsinceblock.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_listtransactions.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_migration.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
+file = "wallet_miniscript.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_miniscript_decaying_multisig_descriptor_psbt.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_multisig_descriptor_psbt.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_multiwallet.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_musig.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_orphanedreward.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_reindex.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_reorgsrestore.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_rescan_unconfirmed.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_resendwallettransactions.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_send.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_sendall.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_sendmany.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_signer.py"
+status = "skip"
+reason = "no-tool"
+
+[[test]]
+file = "wallet_signmessagewithaddress.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_signrawtransactionwithwallet.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_simulaterawtx.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_spend_unconfirmed.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_startup.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_taproot.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_timelock.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_transactiontime_rescan.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_txn_clone.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_txn_doublespend.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+file = "wallet_v3_txs.py"
+status = "skip"
+reason = "no-wallet"

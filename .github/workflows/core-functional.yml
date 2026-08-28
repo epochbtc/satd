@@ -1,0 +1,123 @@
+name: Core functional tests
+
+# Runs Bitcoin Core's own functional test suite, unmodified, against satd.
+# See contrib/core-functional/README.md for what the harness may and may not do
+# to make a test pass.
+#
+# Nightly first, not PR-gating. Promote to a PR gate once the run-set has been
+# stable for ~2 weeks; when that happens, a flake gets its downstream pinned or
+# a `flaky-quarantine` row with an issue behind it -- never a weakened gate.
+
+on:
+  schedule:
+    # Nightly, offset off the hour to avoid the top-of-hour scheduling crowd.
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    # Only the hosted `inventory` job runs on PRs. The self-hosted `run` job
+    # must never execute PR code -- see its comment below.
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: core-functional-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  # Cheap, no build: the inventory must describe exactly the pinned test list.
+  # Runs on every PR so a stale or malformed inventory is caught immediately.
+  inventory:
+    name: "Inventory"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate inventory against the pinned test list
+        run: contrib/core-functional/check_inventory.py
+
+      - name: Harness self-tests
+        run: |
+          contrib/core-functional/tests/test_check_inventory.sh
+          contrib/core-functional/tests/test_check_results.sh
+
+      - name: Scoreboard
+        run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
+
+  # Is the pin still the newest final Core release? Informational -- a new Core
+  # release should not turn the tree red, it should open a bump PR's worth of
+  # work. Never counts an -rc as newer.
+  pin-freshness:
+    name: "Pin freshness"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare PIN against Core's newest final release
+        run: |
+          set -euo pipefail
+          . contrib/core-functional/PIN
+          latest=$(git ls-remote --tags --refs https://github.com/bitcoin/bitcoin \
+                     | sed 's|.*refs/tags/||' \
+                     | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+                     | sort -V | tail -1)
+          echo "pinned: $CORE_TAG   newest final: $latest"
+          if [ "$CORE_TAG" != "$latest" ]; then
+            echo "::notice::Core $latest is out; pinned at $CORE_TAG. See contrib/core-functional/README.md for the bump procedure."
+          fi
+
+  run:
+    name: "Run"
+    # Self-hosted: the suite starts real nodes on real ports and is far too
+    # slow for a hosted runner.
+    #
+    # Deliberately NOT reachable from `pull_request`. This job builds and
+    # executes the checked-out tree -- `cargo build` alone runs every
+    # dependency's build.rs, and the harness then runs run.sh, the shims and
+    # Core's python -- so a pull_request run would execute contributor code
+    # on the runner host with its filesystem and credentials. A label gate
+    # does not fix that: the label survives later pushes, so `labeled` on a
+    # reviewed diff followed by `synchronize` on a rewritten one re-runs with
+    # the new code. To exercise a branch here, push it to this repo and use
+    # workflow_dispatch on that ref.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    needs: inventory
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    env:
+      # Keep datadirs inside the workspace so the cleanup step below can
+      # remove them even when a test fails or the job times out.
+      SATD_CF_TMPDIR: ${{ github.workspace }}/.core-functional-tmp
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build satd and sat-cli
+        run: cargo build --release --locked --bin satd --bin sat-cli
+
+      - name: Fetch the pinned Core tree
+        run: contrib/core-functional/fetch-core.sh
+
+      - name: Preflight
+        run: contrib/core-functional/run.sh --dry-run
+
+      - name: Run the inventory's run-set
+        run: contrib/core-functional/run.sh
+
+      - name: Scoreboard
+        if: always()
+        run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up test datadirs
+        if: always()
+        # Core's runner keeps a failing test's datadir for debugging; on a
+        # persistent runner those accumulate a full node's block files and
+        # RocksDB per failed test, every night, forever. The failure output
+        # is already in the job log.
+        run: rm -rf "$SATD_CF_TMPDIR"

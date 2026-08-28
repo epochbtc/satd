@@ -1,0 +1,22 @@
+# satd log line -> Bitcoin Core debug.log phrasing.
+#
+# Core's functional tests grep debug.log for literal substrings via
+# `assert_debug_log`. satd words its logs differently, so the bitcoind shim
+# appends the Core phrasing to any line matching a rule below. The original
+# satd line is always preserved; a rule only ever *adds* text.
+#
+# The rule that makes this honest: a rule may reword an event the node really
+# logged. It may never manufacture one it did not. If a test greps for a line
+# describing behaviour satd does not implement, the answer is a `core-log` or
+# feature-specific skip row in inventory.toml -- never a rule here that fakes
+# the line. A rule that fires on an unrelated line is a bug of the same kind.
+#
+# Each rule:
+#   match   = Python regex applied to the satd log line
+#   rewrite = replacement text (backreferences \1, \2 ... allowed)
+#   why     = which Core test greps for it, so a stale rule can be retired
+#
+# Rules are added in the PR that flips the test needing them, so this file
+# starts small and grows with evidence.
+
+# (no rules yet -- the first flips are tests that do not grep debug.log)
