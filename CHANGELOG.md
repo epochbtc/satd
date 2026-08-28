@@ -79,6 +79,9 @@ only tests.
 - An unparseable `-bind` reports the problem and exits instead of panicking,
   and an IPv6 literal is bracketed before it is joined to `-port`, so
   `-bind=::1` works at all.
+- `getpeerinfo` gains Core's `addrbind` (the local end of each connection) and
+  `bytessent_per_msg` / `bytesrecv_per_msg` (per-message-type wire tallies).
+  Core-derived clients read all three without a null guard.
 
 ## Releases
 

@@ -137,6 +137,25 @@ pub struct PeerInfo {
     /// dedup, getpeerinfo, and addrman can distinguish onion peers. `None`
     /// for clearnet and inbound peers.
     pub onion_host: Option<String>,
+    /// The local socket address this connection is bound to
+    /// (`getsockname()`), behind `getpeerinfo`'s `addrbind`. `None` until the
+    /// socket exists, and for onion peers, whose local end belongs to the
+    /// proxy rather than to us.
+    pub bind_addr: Option<SocketAddr>,
+}
+
+/// Render a per-message-type byte tally as `getpeerinfo` reports it.
+///
+/// Bitcoin Core emits only the entries with a non-zero count, so a peer that
+/// has exchanged nothing yields an empty object rather than a wall of zeros.
+fn per_msg_json(counts: &std::collections::BTreeMap<&'static str, u64>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (cmd, bytes) in counts {
+        if *bytes > 0 {
+            obj.insert((*cmd).to_string(), serde_json::json!(bytes));
+        }
+    }
+    serde_json::Value::Object(obj)
 }
 
 impl PeerInfo {
@@ -158,6 +177,7 @@ impl PeerInfo {
             fee_filter: 0,
             conn_time: SystemTime::now(),
             permissions: crate::net::permissions::NetPermissions::NONE,
+            bind_addr: None,
             onion_host: None,
         }
     }
@@ -198,7 +218,7 @@ impl PeerInfo {
             Some(host) => format!("{host}:{}", self.addr.port()),
             None => self.addr.to_string(),
         };
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "id": self.id,
             "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
@@ -228,12 +248,25 @@ impl PeerInfo {
             // not this per-peer record.
             "timeoffset": 0,
             "inflight": [],
+            // Per-message-type wire tallies. Core omits zero entries, so an
+            // idle peer yields `{}` rather than a table of zeros.
+            "bytessent_per_msg": per_msg_json(&stats.bytes_sent_per_msg()),
+            "bytesrecv_per_msg": per_msg_json(&stats.bytes_recv_per_msg()),
             "minfeefilter": self.fee_filter as f64 / 100_000_000.0,
             "connection_type": match self.direction {
                 Direction::Inbound => "inbound-full-relay",
                 Direction::Outbound => "outbound-full-relay",
             },
-        })
+        });
+        // Core reports the local end of the connection here, and its own test
+        // framework matches a peer by it — but only when it has one: the field
+        // is documented optional and pushed under `if (addrBind.IsValid())`.
+        // Rendering an unset bind as `0.0.0.0:0` would invent a listener
+        // address that no peer is actually on.
+        if let Some(bind) = self.bind_addr {
+            obj["addrbind"] = serde_json::Value::String(bind.to_string());
+        }
+        obj
     }
 }
 
@@ -301,6 +334,61 @@ pub fn onion_host_to_torv3_pubkey(host: &str) -> Option<[u8; 32]> {
         return None;
     }
     Some(pubkey)
+}
+
+#[cfg(test)]
+mod rpc_json_tests {
+    use super::*;
+    use crate::net::stats::{NetTotals, PeerStats};
+
+    fn peer_json(bind: Option<&str>, wire: &[(&'static str, usize)]) -> serde_json::Value {
+        let mut info = PeerInfo::new(7, "203.0.113.9:8333".parse().unwrap(), Direction::Outbound);
+        info.bind_addr = bind.map(|b| b.parse().unwrap());
+        let stats = PeerStats::new(NetTotals::new());
+        for (cmd, n) in wire {
+            stats.record_sent(*n);
+            stats.attribute_sent(cmd, *n);
+        }
+        info.to_rpc_json(&stats)
+    }
+
+    /// Core's framework reads `bytes*_per_msg` without a null guard, so those
+    /// keys must always be present -- a missing one raises KeyError and aborts
+    /// the client. `addrbind` is present whenever there is a bind address to
+    /// report, which is how the framework matches a peer.
+    #[test]
+    fn core_fields_are_always_present() {
+        let v = peer_json(Some("127.0.0.1:18445"), &[]);
+        assert_eq!(v["addrbind"], "127.0.0.1:18445");
+        assert!(v["bytessent_per_msg"].is_object());
+        assert!(v["bytesrecv_per_msg"].is_object());
+        // Nothing exchanged yet: empty objects, not absent keys.
+        assert_eq!(v["bytessent_per_msg"].as_object().unwrap().len(), 0);
+    }
+
+    /// A peer whose local address is unknown (proxied, or the socket is gone)
+    /// omits the key, as Core does: it pushes `addrbind` only under
+    /// `if (stats.addrBind.IsValid())` and documents the field optional.
+    /// Rendering `0.0.0.0:0` would name a listener no peer is on.
+    #[test]
+    fn unknown_bind_address_omits_addrbind_like_core() {
+        let v = peer_json(None, &[]);
+        assert!(v.get("addrbind").is_none(), "{v}");
+        // The unconditional keys are still there.
+        assert!(v["bytessent_per_msg"].is_object());
+        assert!(v["bytesrecv_per_msg"].is_object());
+    }
+
+    /// Core emits only non-zero entries.
+    #[test]
+    fn per_message_counters_omit_zero_entries() {
+        let v = peer_json(Some("127.0.0.1:1"), &[("ping", 32), ("pong", 32), ("ping", 32)]);
+        let sent = v["bytessent_per_msg"].as_object().unwrap();
+        assert_eq!(sent.len(), 2, "only the types actually sent: {sent:?}");
+        assert_eq!(sent["ping"], 64);
+        assert_eq!(sent["pong"], 32);
+        assert_eq!(v["bytesrecv_per_msg"].as_object().unwrap().len(), 0);
+    }
 }
 
 #[cfg(test)]

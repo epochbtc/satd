@@ -36,14 +36,25 @@ systemd `ExecStartPost=` poll.
 
 For dashboards and alerting, scrape `/metrics` rather than polling RPC. The
 Bitcoin Core methods `getnettotals` (byte totals) and `getpeerinfo`
-(`bytessent`, `bytesrecv`, `lastsend`, `lastrecv`) are populated and accurate
-for steady-state traffic, but they exist for Core compatibility. The Prometheus
+(`bytessent`, `bytesrecv`, `lastsend`, `lastrecv`, and the per-message-type
+breakdowns `bytessent_per_msg` / `bytesrecv_per_msg`) are populated and
+accurate for steady-state traffic, but they exist for Core compatibility. The Prometheus
 endpoint is a counter model built for time-series tooling (rates, retention,
 labels) and does not consume an RPC worker on every scrape.
 
 > **Note.** The RPC byte counters cover post-handshake traffic only. The
 > one-time handshake bytes are not included, so absolute socket totals read
 > marginally lower than the kernel's.
+>
+> The per-message tallies sum to `bytessent` / `bytesrecv` for the same peer
+> once a message is fully accounted for. The peer total is bumped before the
+> per-type tally, so a `getpeerinfo` that lands mid-message can observe the
+> breakdown trailing the total by one message's bytes — during IBD, by as much
+> as a block. Treat the equality as a resting invariant, not something to
+> alert on. They are on-wire sizes for the transport in use, so the same
+> message costs fewer bytes on a BIP 324 v2 link than on v1. Message types satd has no
+> variant for, undecodable frames, and v2 decoy packets are all counted under
+> `*other*`, matching Core.
 
 ### Index readiness
 
