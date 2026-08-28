@@ -2576,9 +2576,18 @@ async fn main() {
         }
 
         if let Some(mcp_port) = config.mcp_port {
-            let mcp_bind: SocketAddr = format!("{}:{}", config.mcp_bind, mcp_port)
-                .parse()
-                .expect("Invalid MCP bind address");
+            // Operator input: report it, never abort on a stack trace. An
+            // unbracketed IPv6 literal is the common way to get here
+            // (`-mcpbind=::1` joins to `::1:<port>`, which is not an address).
+            let mcp_bind: SocketAddr = match crate::config::parse_p2p_bind(&config.mcp_bind, mcp_port)
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Error: -mcpbind/-mcpport: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
             let tls_configured = config.mcp_tls_cert.is_some() && config.mcp_tls_key.is_some();
             // Safety guard: MCP exposes block-connecting tools. A non-loopback
             // bind is refused unless the operator opted into authenticated
@@ -2660,9 +2669,15 @@ async fn main() {
     // Start metrics/health HTTP server if enabled (unauthenticated — bind to
     // loopback by default, or firewall externally).
     if let Some(metricsport) = config.metricsport {
-        let metrics_bind: SocketAddr = format!("{}:{}", config.metricsbind, metricsport)
-            .parse()
-            .expect("Invalid metrics bind address");
+        let metrics_bind: SocketAddr =
+            match crate::config::parse_p2p_bind(&config.metricsbind, metricsport) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Error: -metricsbind/-metricsport: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
         let metrics_ctx = node::metrics::MetricsContext {
             chain_state: chain_state.clone(),
             mempool: mempool.clone(),
@@ -2744,10 +2759,18 @@ async fn main() {
                 auth.cleanup();
                 std::process::exit(1);
             }
-            let bind: SocketAddr = config
-                .esplora_bind
-                .parse()
-                .expect("Invalid esplora bind address");
+            let bind: SocketAddr = match config.esplora_bind.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!(
+                        "Error: -esplorabind={} is not a valid address ({e}). Use \
+                         [host]:port notation for IPv6.",
+                        config.esplora_bind
+                    );
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
             let auth_cfg = match &config.esplora_auth {
                 crate::config::EsploraAuthMode::None => esplora_handlers::EsploraAuth::None,
                 crate::config::EsploraAuthMode::Cookie => {
@@ -3135,9 +3158,18 @@ async fn main() {
     // RPC/Esplora listeners above. An operator who set -listen=1 must not see
     // the daemon report a clean start while silently accepting no inbound peers.
     if config.listen {
-        let p2p_addr: SocketAddr = format!("{}:{}", config.bind, config.port)
-            .parse()
-            .expect("Invalid P2P bind address");
+        let p2p_addr: SocketAddr = match crate::config::parse_p2p_bind(&config.bind, config.port) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!(
+                    "Error: {e}\n\
+                     -bind takes a bare IP address (-bind=127.0.0.1, -bind=::1); \
+                     the port comes from -port. Use -listen=0 to disable inbound P2P."
+                );
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
         let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
             Ok(l) => l,
             Err(e) => {

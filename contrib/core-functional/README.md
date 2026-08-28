@@ -35,7 +35,14 @@ cargo build --release --bin satd --bin sat-cli   # from the repo root
 ./run.sh --list       # print the run-set
 ./run.sh              # run it
 ./check_inventory.py --summary   # the scoreboard
+
+# measure a test that is still `skip`, to find out whether a fix unblocks it
+./run.sh --candidate rpc_getblockfilter.py
 ```
+
+`--candidate` is the measuring step of fix -> measure -> flip. It ignores
+inventory status and says so on stderr; it is not the scoreboard, and a row
+still only flips to `run` in the PR that makes it pass.
 
 `run.sh` never runs from `cargo test`: it needs a built binary pair and real
 network ports, and it is a nightly job, not a unit test.
@@ -104,22 +111,40 @@ series. Take the newest **final** (non-`rc`) tag by version order.
    removed files need their rows deleted, renamed files are both.
 4. Do it in one PR, separate from any flip.
 
-## What the first full run found
+## What the run found
 
 Every row's reason came from running the test, not from reading it. The
 resulting work queue, ranked by how many tests each item unblocks:
 
 | Tests | Blocker |
 |---:|---|
-| 71 | **`setmocktime`.** Needed for deterministic time, and by `create_cache.py`, which seeds the 199-block chain 70 tests start from. Unblocks the largest single bucket, and is the largest piece of work: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
+| 73 | **`setmocktime`.** Needed for deterministic time, and by `create_cache.py`, which seeds the 199-block chain most tests start from. Unblocks the largest single bucket, and is the largest piece of work: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
 | 48 | **`syncwithvalidationinterfacequeue`.** A hidden, test-only Core RPC that blocks until queued validation callbacks have been delivered. The framework calls it from `sync_all()`, so it is on the path of nearly every multi-node test. Worth thinking through rather than stubbing: if satd applies these side effects synchronously the honest implementation is cheap, but that has to be established, not assumed. |
-| 24 | **`getpeerinfo` fields.** No `bytesrecv_per_msg` / `bytessent_per_msg` (19 tests) and no `addrbind` (5). |
+| 27 | **`getpeerinfo` fields.** No `bytesrecv_per_msg` / `bytessent_per_msg` (22 tests) and no `addrbind` (5). |
 | 6 | **Repeated command-line options.** Core accepts an option given twice — `-v2transport=0 -v2transport=1` — and resolves it by precedence. satd's parser rejects the duplicate, so any wrapper that appends an override to a base command line breaks. |
-| 3 | **`generatetoaddress`** rejects a parameter shape Core accepts. |
-| 3 | **`-minrelaytxfee`** rejects a value Core accepts. |
+| 3 | **Named JSON-RPC parameters.** satd accepts positional parameters only; a request whose `params` is an object fails on every method. Core supports both, and its framework calls `generatetoaddress(nblocks=…, address=…)` by name. |
 | 2 | **`scantxoutset`**, which the framework's wallet uses to rescan. |
-| 2 | **Bare `-blockfilterindex`.** Core accepts the flag with no value; satd requires one. |
-| 1 | **A panic on a malformed `-bind` value**, rather than a clean error. satd's config contract says operator input must never panic. |
+| 1 | **Core's `-bind=addr[:port][=onion]` syntax.** satd's `-bind` takes a bare address and gets the port from `-port`. |
+
+Ranked this way the table answers "what unblocks the most tests", which is not
+the same question as "what is most worth fixing" — the top two entries are
+test-only facilities no operator will ever call. Read it as a map of the
+framework's demands, not as a priority order.
+
+### Already fixed
+
+Items the harness surfaced that have since landed, with what they turned out to
+be once measured rather than read:
+
+- **`-minrelaytxfee` / `-dustrelayfee` units.** Core denominates them in BTC/kvB,
+  satd in sat/kvB. Both spellings are accepted now. The unit mismatch was the
+  visible half; the dangerous half was that an unparseable value in
+  `bitcoin.conf` was silently discarded and the default used instead.
+- **Bare `-blockfilterindex`.** Core accepts the flag with no value.
+- **A panic on an unparseable `-bind`.** Underneath it: satd bracketed no IPv6
+  literal before joining it to `-port`, so `-bind=::1` could never have worked.
+- **`generatetoaddress` parameter shape**, which measurement showed was not
+  about `generatetoaddress` at all — see "Named JSON-RPC parameters" above.
 
 Nine rows outside satd's compatibility target are skipped as such: six use Core
 v31 options (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a

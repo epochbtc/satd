@@ -2195,16 +2195,34 @@ impl Config {
             ));
         }
 
-        let minrelaytxfee = cli
-            .minrelaytxfee
-            .or_else(|| file_get("minrelaytxfee").and_then(|v| v.parse().ok()))
-            .or(profile_defaults.minrelaytxfee)
-            .unwrap_or(1_000); // sat/kvB
+        // A recognised fee-rate key that cannot be parsed is an error, not a
+        // silent fall-through to the default: `minrelaytxfee=0.00001` in a
+        // dropped-in bitcoin.conf used to be discarded without a word, leaving
+        // the node relaying at a rate the operator never chose.
+        //
+        // Only when the command line does not already answer the key, though.
+        // Core reads the effective value (command line shadowing file) and
+        // parses that one, so a stale typo in a shared bitcoin.conf does not
+        // stop a node whose systemd unit passes a good value. Parsing the file
+        // eagerly here would turn that into a startup failure on upgrade.
+        let file_fee_rate = |key: &str| -> Result<Option<u64>, String> {
+            file_get(key)
+                .map(|v| parse_fee_rate_value(&v).map_err(|e| format!("{key} in config file: {e}")))
+                .transpose()
+        };
 
-        let dustrelayfee = cli
-            .dustrelayfee
-            .or_else(|| file_get("dustrelayfee").and_then(|v| v.parse().ok()))
-            .unwrap_or(3_000); // sat/kvB
+        let minrelaytxfee = match cli.minrelaytxfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("minrelaytxfee")?,
+        }
+        .or(profile_defaults.minrelaytxfee)
+        .unwrap_or(1_000); // sat/kvB
+
+        let dustrelayfee = match cli.dustrelayfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("dustrelayfee")?,
+        }
+        .unwrap_or(3_000); // sat/kvB
 
         let datacarriersize = cli
             .datacarriersize
@@ -2711,7 +2729,17 @@ impl Config {
         // operator pays the disk overhead only when wallets need it.
         let blockfilterindex = cli
             .blockfilterindex
-            .or_else(|| file_get("blockfilterindex").and_then(parse_blockfilterindex_value))
+            .or(match file_get("blockfilterindex") {
+                // Core hard-errors on a value it cannot name
+                // ("Unknown -blockfilterindex value %s."). Dropping it here
+                // instead would start the node with filters off and say
+                // nothing, discovered only when a light client gets no
+                // NODE_COMPACT_FILTERS.
+                Some(v) => Some(parse_blockfilterindex_value(v.clone()).ok_or_else(|| {
+                    format!("Unknown -blockfilterindex value {v}.")
+                })?),
+                None => None,
+            })
             .unwrap_or(false);
 
         // BIP 157 P2P advertisement and serving.
@@ -4222,15 +4250,17 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        value_name = "RATE",
-        help = "Minimum relay fee rate in sat/kvB (default: 1000)"
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Minimum relay fee rate, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00001) or a bare integer of sat/kvB (default: 1000)"
     )]
     pub minrelaytxfee: Option<u64>,
 
     #[arg(
         long,
-        value_name = "RATE",
-        help = "Dust relay fee rate in sat/kvB (default: 3000)"
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Dust relay fee rate, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00003) or a bare integer of sat/kvB (default: 3000)"
     )]
     pub dustrelayfee: Option<u64>,
 
@@ -4603,7 +4633,9 @@ pub struct CliArgs {
         long,
         value_name = "BOOL_OR_BASIC",
         value_parser = parse_blockfilterindex_arg,
-        help = "Build a BIP 158 compact-block-filter index (default: false). Accepts 0/1/basic; \"basic\" is the BIP 158 SCRIPT_FILTER (the only filter type defined today). Required by --peerblockfilters=1 and `getblockfilter`."
+        num_args = 0..=1,
+        default_missing_value = "basic",
+        help = "Build a BIP 158 compact-block-filter index (default: false). Accepts 0/1/basic, or no value at all for \"basic\", matching Bitcoin Core; \"basic\" is the BIP 158 SCRIPT_FILTER (the only filter type defined today). Required by --peerblockfilters=1 and `getblockfilter`."
     )]
     pub blockfilterindex: Option<bool>,
     #[arg(
@@ -6979,7 +7011,9 @@ fn parse_bool_arg(s: &str) -> Result<bool, String> {
 /// the caller can fall back to the default (off).
 fn parse_blockfilterindex_value(s: String) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "basic" => Some(true),
+        // Core reads an empty value as "index enabled": its init.cpp treats
+        // `blockfilterindex_value == ""` exactly like `"1"`.
+        "basic" | "" => Some(true),
         other => parse_bool(other),
     }
 }
@@ -6989,6 +7023,83 @@ fn parse_blockfilterindex_value(s: String) -> Option<bool> {
 fn parse_blockfilterindex_arg(s: &str) -> Result<bool, String> {
     parse_blockfilterindex_value(s.to_string())
         .ok_or_else(|| format!("expected one of 0/1/basic/true/false/yes/no, got '{s}'"))
+}
+
+/// Join a `-bind` address and `-port` into a P2P socket address.
+///
+/// `-bind` carries a bare IP, so an IPv6 literal must be bracketed before it
+/// can be joined to a port: `::1` and `18444` make `[::1]:18444`, not
+/// `::1:18444`, which is not an address at all. Returns an error rather than
+/// panicking — `-bind` is operator input, and satd does not abort on a
+/// stack trace for a value a human typed.
+pub fn parse_p2p_bind(bind: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let bind = bind.trim();
+    let spec = if bind.contains(':') && !bind.starts_with('[') {
+        format!("[{bind}]:{port}")
+    } else {
+        format!("{bind}:{port}")
+    };
+    spec.parse()
+        .map_err(|e| format!("-bind={bind} with -port={port} is not a valid address ({e})"))
+}
+
+/// Parse a Bitcoin-Core-style fee-rate option (`-minrelaytxfee`,
+/// `-dustrelayfee`) into satd's internal sat/kvB.
+///
+/// Core spells both as a BTC-per-kvB decimal amount (`0.00001`); satd has
+/// always documented them as an integer sat/kvB rate (`1000`). Both spellings
+/// are accepted, because in practice they are disjoint: a Core value is a
+/// fraction of a coin, a satd value is a whole number of satoshis. A value
+/// carrying a decimal point is read as BTC/kvB, a bare integer as sat/kvB, so
+/// no existing config file changes meaning. The two agree on the defaults —
+/// `0.00001` BTC/kvB is 1000 sat/kvB, `0.00003` is 3000.
+fn parse_fee_rate_value(s: &str) -> Result<u64, String> {
+    const SATS_PER_BTC: u64 = 100_000_000;
+    const EXPECTED: &str = "expected a fee rate in BTC/kvB (0.00001) or sat/kvB (1000)";
+
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(format!("{EXPECTED}, got an empty value"));
+    }
+    if t.starts_with('-') {
+        return Err(format!("fee rate must not be negative, got '{s}'"));
+    }
+
+    let Some((whole, frac)) = t.split_once('.') else {
+        // satd spelling: a bare integer, already in sat/kvB.
+        return t.parse::<u64>().map_err(|_| format!("{EXPECTED}, got '{s}'"));
+    };
+
+    // Core spelling: BTC/kvB. One satoshi is the smallest representable
+    // amount, so more than 8 decimal places is an error rather than a
+    // silent truncation of the operator's value.
+    if whole.is_empty() && frac.is_empty() {
+        return Err(format!("{EXPECTED}, got '{s}'"));
+    }
+    if frac.len() > 8 {
+        return Err(format!(
+            "fee rate '{s}' has more than 8 decimal places; one satoshi is the smallest unit"
+        ));
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{EXPECTED}, got '{s}'"));
+    }
+
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse()
+            .map_err(|_| format!("fee rate '{s}' is too large"))?
+    };
+    let frac: u64 = format!("{frac:0<8}")
+        .parse()
+        .map_err(|_| format!("{EXPECTED}, got '{s}'"))?;
+
+    whole
+        .checked_mul(SATS_PER_BTC)
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(|| format!("fee rate '{s}' is too large"))
 }
 
 #[cfg(test)]
@@ -7075,6 +7186,178 @@ mod tests {
             assert_eq!(kept.len(), 2, "{flag} was dropped");
             assert!(warnings.is_empty(), "{flag} warned: {warnings:?}");
         }
+    }
+
+    /// Bitcoin Core denominates `-minrelaytxfee` / `-dustrelayfee` in BTC/kvB.
+    /// satd documents them in sat/kvB. Both spellings must resolve, and they
+    /// must agree on the values Core ships as defaults.
+    #[test]
+    fn core_btc_fee_rates_and_satd_sat_rates_both_parse() {
+        // Core's spelling, including the exact defaults from Core's init.cpp.
+        assert_eq!(parse_fee_rate_value("0.00001"), Ok(1_000));
+        assert_eq!(parse_fee_rate_value("0.00001000"), Ok(1_000));
+        assert_eq!(parse_fee_rate_value("0.00003"), Ok(3_000));
+        assert_eq!(parse_fee_rate_value("0.00000500"), Ok(500));
+        assert_eq!(parse_fee_rate_value("0.00000100"), Ok(100));
+        assert_eq!(parse_fee_rate_value("0.00000001"), Ok(1));
+        assert_eq!(parse_fee_rate_value("1.0"), Ok(100_000_000));
+        // satd's spelling: a bare integer is already sat/kvB.
+        assert_eq!(parse_fee_rate_value("1000"), Ok(1_000));
+        assert_eq!(parse_fee_rate_value("0"), Ok(0));
+        assert_eq!(parse_fee_rate_value("  1000  "), Ok(1_000));
+    }
+
+    /// A value satd cannot represent is rejected rather than silently rounded
+    /// or truncated to something the operator did not ask for.
+    #[test]
+    fn unrepresentable_fee_rates_are_rejected() {
+        for bad in ["-0.001", "abc", "", ".", "0.000000001", "1.2.3", "0x10", "1e-5"] {
+            assert!(parse_fee_rate_value(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// `-minrelaytxfee=0.00001000` is what Bitcoin Core's own functional tests
+    /// pass. It used to abort startup as an unparseable integer.
+    #[test]
+    fn core_spelled_fee_rate_is_accepted_on_the_command_line() {
+        let args = normalize_args(
+            ["satd", "-minrelaytxfee=0.00001000", "-dustrelayfee=0.00003"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let cli = CliArgs::try_parse_from(args).expect("Core-spelled fee rates must parse");
+        assert_eq!(cli.minrelaytxfee, Some(1_000));
+        assert_eq!(cli.dustrelayfee, Some(3_000));
+    }
+
+    /// Core accepts `-blockfilterindex` with no value, meaning `basic`. satd
+    /// required a value, so a Core config or command line that omitted it
+    /// failed to start.
+    #[test]
+    fn bare_blockfilterindex_means_basic() {
+        for spelling in ["-blockfilterindex", "-blockfilterindex=basic", "-blockfilterindex=1"] {
+            let args = normalize_args(vec!["satd".to_string(), spelling.to_string()]);
+            let cli = CliArgs::try_parse_from(args).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert_eq!(cli.blockfilterindex, Some(true), "{spelling}");
+        }
+        let args = normalize_args(vec!["satd".to_string(), "-blockfilterindex=0".to_string()]);
+        let cli = CliArgs::try_parse_from(args).expect("explicit 0 must still parse");
+        assert_eq!(cli.blockfilterindex, Some(false));
+    }
+
+    /// A Core-spelled fee rate in a dropped-in `bitcoin.conf` must take effect,
+    /// and an unparseable one must stop the node instead of being discarded.
+    /// The old `.parse().ok()` swallowed both cases: `minrelaytxfee=0.00001`
+    /// left the node relaying at the built-in default the operator never chose.
+    #[test]
+    fn config_file_fee_rates_take_effect_and_never_silently_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build = |body: &str| {
+            let conf = dir.path().join("fee.conf");
+            std::fs::write(&conf, body).unwrap();
+            Config::from_cli(
+                CliArgs::try_parse_from([
+                    "satd",
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    "--conf",
+                    conf.to_str().unwrap(),
+                ])
+                .unwrap(),
+            )
+        };
+
+        let cfg = build("minrelaytxfee=0.00002
+dustrelayfee=0.00005
+")
+            .expect("Core-spelled fee rates must be honoured");
+        assert_eq!(cfg.minrelaytxfee, 2_000, "BTC/kvB was not applied");
+        assert_eq!(cfg.dustrelayfee, 5_000, "BTC/kvB was not applied");
+
+        // satd's own spelling keeps working.
+        let cfg = build("minrelaytxfee=1500
+").expect("sat/kvB must still be honoured");
+        assert_eq!(cfg.minrelaytxfee, 1_500);
+
+        let err = build("minrelaytxfee=wat
+").expect_err("garbage must not be accepted");
+        assert!(err.contains("minrelaytxfee"), "unhelpful error: {err}");
+    }
+
+    /// `-bind` is operator input. A value that cannot be joined to `-port`
+    /// must produce an error the operator can act on, never a panic.
+    #[test]
+    fn malformed_bind_is_an_error_not_a_panic() {
+        assert!(parse_p2p_bind("not-an-ip", 18444).is_err());
+        assert!(parse_p2p_bind("127.0.0.1:8333", 18444).is_err());
+        assert!(parse_p2p_bind("", 18444).is_err());
+    }
+
+    /// A malformed fee rate in the config file must not stop a node whose
+    /// command line already answers the key: Core parses the effective value,
+    /// so the file's typo is never read. Without the command-line value it is
+    /// still an error, not a silent fall-through to the default.
+    #[test]
+    fn bad_config_fee_rate_is_shadowed_by_the_command_line() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\nminrelaytxfee=0,00001\n").unwrap();
+        let base = ["satd", "--datadir", dir.path().to_str().unwrap(), "--conf"];
+
+        let mut argv: Vec<&str> = base.to_vec();
+        argv.push(conf.to_str().unwrap());
+        let err = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap_err();
+        assert!(err.contains("minrelaytxfee"), "{err}");
+
+        argv.push("--minrelaytxfee=2000");
+        let cfg = Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).unwrap();
+        assert_eq!(cfg.minrelaytxfee, 2000);
+    }
+
+    /// Core reads `blockfilterindex=` (empty) as "on" and hard-errors on a
+    /// value it cannot name. Silently disabling the index instead is only
+    /// discovered when a light client finds no NODE_COMPACT_FILTERS.
+    #[test]
+    fn blockfilterindex_matches_core_value_handling() {
+        use clap::Parser;
+        let load = |body: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conf = dir.path().join("bitcoin.conf");
+            std::fs::write(&conf, body).unwrap();
+            let argv = [
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ];
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+        };
+
+        assert!(load("regtest=1\nblockfilterindex=\n").unwrap().blockfilterindex);
+        assert!(load("regtest=1\nblockfilterindex=basic\n").unwrap().blockfilterindex);
+        assert!(load("regtest=1\nblockfilterindex=1\n").unwrap().blockfilterindex);
+        assert!(!load("regtest=1\nblockfilterindex=0\n").unwrap().blockfilterindex);
+
+        let err = load("regtest=1\nblockfilterindex=basci\n").unwrap_err();
+        assert!(err.contains("Unknown -blockfilterindex value"), "{err}");
+    }
+
+    /// An IPv6 literal has to be bracketed before it is joined to a port.
+    /// `-bind=::1` used to build `::1:18444`, which parses as nothing and
+    /// panicked, so satd could not bind an IPv6 address at all.
+    #[test]
+    fn ipv6_bind_addresses_are_bracketed() {
+        let addr = parse_p2p_bind("::1", 18444).expect("-bind=::1 must resolve");
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.to_string(), "[::1]:18444");
+        assert_eq!(parse_p2p_bind("[::1]", 18444).map(|a| a.to_string()), Ok("[::1]:18444".into()));
+        assert_eq!(
+            parse_p2p_bind("0.0.0.0", 18444).map(|a| a.to_string()),
+            Ok("0.0.0.0:18444".into())
+        );
     }
 
     /// A recognized-but-unsupported Core option on the command line warns and

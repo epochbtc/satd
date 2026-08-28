@@ -15,7 +15,7 @@ reason = "no-wallet"
 file = "feature_abortnode.py"
 status = "skip"
 reason = "rpc-missing"
-note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "feature_addrman.py"
@@ -49,7 +49,7 @@ note = "getpeerinfo has no addrbind field; follow-up: report the local bound add
 file = "feature_bind_extra.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd panics on a malformed -bind value instead of reporting it; follow-up: clean error for an unparseable bind address"
+note = "needs Core's -bind=addr[:port][=onion] syntax; satd's -bind takes a bare address and the port from -port. Follow-up: Core-compatible -bind parsing and multiple bind addresses"
 
 [[test]]
 file = "feature_bind_port_discover.py"
@@ -590,8 +590,8 @@ note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per
 [[test]]
 file = "p2p_blockfilters.py"
 status = "skip"
-reason = "feature-missing"
-note = "Core accepts a bare -blockfilterindex; satd requires a value. Follow-up: default the bare form to basic"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
 
 [[test]]
 file = "p2p_blocksonly.py"
@@ -634,8 +634,7 @@ reason = "cache"
 [[test]]
 file = "p2p_feefilter.py"
 status = "skip"
-reason = "feature-missing"
-note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+reason = "cache"
 
 [[test]]
 file = "p2p_filter.py"
@@ -689,8 +688,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_ibd_txrelay.py"
 status = "skip"
-reason = "feature-missing"
-note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
@@ -916,8 +915,8 @@ reason = "cache"
 [[test]]
 file = "rpc_getblockfilter.py"
 status = "skip"
-reason = "feature-missing"
-note = "Core accepts a bare -blockfilterindex; satd requires a value. Follow-up: default the bare form to basic"
+reason = "rpc-missing"
+note = "getpeerinfo has no bytesrecv_per_msg / bytessent_per_msg; follow-up: per-message byte counters on getpeerinfo"
 
 [[test]]
 file = "rpc_getblockfrompeer.py"
@@ -966,7 +965,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_invalidateblock.py"
 status = "skip"
 reason = "rpc-missing"
-note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "rpc_misc.py"
@@ -981,8 +980,7 @@ reason = "cache"
 [[test]]
 file = "rpc_net.py"
 status = "skip"
-reason = "feature-missing"
-note = "satd rejects a -minrelaytxfee value Core accepts; follow-up: accept Core-valid fee-rate values"
+reason = "cache"
 
 [[test]]
 file = "rpc_orphans.py"
@@ -999,7 +997,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_preciousblock.py"
 status = "skip"
 reason = "rpc-missing"
-note = "generatetoaddress rejects the parameter shape Core accepts; follow-up: match Core parameter handling"
+note = "satd accepts positional JSON-RPC parameters only; the framework calls generatetoaddress(nblocks=..., address=...) by name, and a named request fails on every method. Follow-up: named-parameter support across the RPC surface"
 
 [[test]]
 file = "rpc_psbt.py"
