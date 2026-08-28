@@ -8,11 +8,12 @@
 // local re-filter. Folded into the `e2e` target via `mod sdk;` in `tests/e2e.rs`,
 // so reach the shared harness through `crate::common`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use satd_events_client::{
-    Categories, Cursor, Event, PrefixWatcher, ResilientConfig, StatusKind, StatusSeverity,
-    StatusState, StreamClient, StreamError, SubscribeOptions,
+    Categories, Cursor, Event, FileCursorStore, PrefixWatcher, ResilientConfig, StatusKind,
+    StatusSeverity, StatusState, StreamClient, StreamError, SubscribeOptions,
 };
 
 use crate::common::{
@@ -99,6 +100,34 @@ async fn next_matching(
         }
     };
     tokio::time::timeout(e2e_test_timeout(secs), fut).await.expect("matching event within timeout")
+}
+
+/// A tweaks-only cold sync anchored below the first block. A cursor names the
+/// last height already scanned, so height 0 makes block 1 the first replayed.
+fn tweak_cold_sync_opts() -> SubscribeOptions {
+    SubscribeOptions {
+        categories: Categories::TWEAKS,
+        from_cursor: Some(Cursor { height: 0, tx_index: 0, mempool_seq: 0, instance_id: 0 }),
+        ..Default::default()
+    }
+}
+
+/// The height of the next `BlockTweaks`. A `ReplayGap` is fatal here rather than
+/// logged: it names blocks that were never delivered, and an unscanned block is
+/// an unseen payment.
+async fn next_tweak_height(
+    sub: &mut satd_events_client::ResilientSubscription,
+    secs: u64,
+) -> u32 {
+    loop {
+        match next_resilient(sub, secs).await {
+            Event::BlockTweaks { height, .. } => return height,
+            Event::ReplayGap { resume_height, first_height } => {
+                panic!("replay gap ({resume_height}, {first_height}): a scan must never skip a block")
+            }
+            _ => continue,
+        }
+    }
 }
 
 fn txid_internal(display_hex: &str) -> [u8; 32] {
@@ -265,6 +294,109 @@ async fn sdk_resilient_subscribe_replays_from_cursor() {
     let ev = next_resilient(&mut sub, 15).await;
     let Event::BlockConnected { height, .. } = ev else { panic!("expected block, got {ev:?}") };
     assert_eq!(height, 2, "resilient subscription replays from cursor.height + 1");
+}
+
+/// A tweak scan killed mid-stream resumes without skipping a block, repeating at
+/// most the one it had in hand.
+///
+/// This is the conformance property every silent-payment light client needs, and
+/// the one a shipped wallet gets wrong (cake_wallet#3574): the persisted anchor
+/// must never run ahead of the scanning. `resilience.rs` unit-tests
+/// commit-on-poll against a mock store; nothing proved it end to end on the
+/// tweaks path, where a skipped block is a missed payment rather than a missed
+/// log line.
+///
+/// The kill is `drop` without `commit`, which is what a `SIGKILL` or a phone
+/// suspending the process looks like to the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_tweak_scan_resumes_after_a_kill_without_skipping_a_block() {
+    let sn = start_async(vec!["-silentpaymentindex=1"]).await;
+    mine_n(&sn, 6).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cursor_path = dir.path().join("sp.cursor");
+
+    // Scan three blocks, then die: no `commit`, no clean shutdown. Commit-on-poll
+    // means the store now holds block 2 — the anchor of the event *before* the
+    // one that was in hand.
+    let client = connect(&sn).await;
+    let mut sub = client.resilient_subscribe(
+        tweak_cold_sync_opts(),
+        ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(&cursor_path))),
+    );
+    let mut before = Vec::new();
+    for _ in 0..3 {
+        before.push(next_tweak_height(&mut sub, 20).await);
+    }
+    assert_eq!(before, vec![1, 2, 3], "cold sync replays the taproot era in height order");
+    drop(sub);
+    drop(client);
+
+    // A restarted process reads the file back and resumes from it.
+    let client = connect(&sn).await;
+    let mut sub = client.resilient_subscribe(
+        tweak_cold_sync_opts(),
+        ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(&cursor_path))),
+    );
+    let mut after = Vec::new();
+    while after.last() != Some(&6) {
+        after.push(next_tweak_height(&mut sub, 20).await);
+    }
+
+    assert_eq!(
+        after,
+        vec![3, 4, 5, 6],
+        "the block that was in hand at the kill is rescanned, and exactly one is"
+    );
+    let mut union: Vec<u32> = before.iter().chain(after.iter()).copied().collect();
+    union.sort_unstable();
+    union.dedup();
+    assert_eq!(
+        union,
+        (1..=6).collect::<Vec<u32>>(),
+        "every block is scanned at least once across the kill — no gap at any height"
+    );
+}
+
+/// The clean-shutdown path: `commit` before exiting, and the resume repeats
+/// nothing.
+///
+/// The pair of tests brackets the contract — an uncommitted kill repeats exactly
+/// one block, a committed shutdown repeats none — so a regression that advanced
+/// the anchor early would break the first, and one that never advanced it would
+/// break the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
+    let sn = start_async(vec!["-silentpaymentindex=1"]).await;
+    mine_n(&sn, 5).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cursor_path = dir.path().join("sp.cursor");
+
+    let client = connect(&sn).await;
+    let mut sub = client.resilient_subscribe(
+        tweak_cold_sync_opts(),
+        ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(&cursor_path))),
+    );
+    for _ in 0..3 {
+        next_tweak_height(&mut sub, 20).await;
+    }
+    // The scan of block 3 is done, so its anchor is safe to persist now rather
+    // than on a `next` that will never come.
+    sub.commit().expect("commit writes the armed anchor");
+    drop(sub);
+    drop(client);
+
+    let client = connect(&sn).await;
+    let mut sub = client.resilient_subscribe(
+        tweak_cold_sync_opts(),
+        ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(&cursor_path))),
+    );
+    assert_eq!(
+        next_tweak_height(&mut sub, 20).await,
+        4,
+        "a committed anchor resumes at the next unscanned block"
+    );
 }
 
 /// The typed `Event::Status` path end to end: a real condition detected by a
