@@ -52,6 +52,11 @@ workflow, scoreboard in the Operator Manual. See
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- `setmocktime` moves the node clock that block-template timestamps, the
+  `time-too-new` future-block check and mempool entry time/expiry read. Gated
+  to regtest exactly as Core gates it, and additionally carved out of
+  `rpc:write` into a `test:clock` capability, so a delegated bearer token
+  cannot move the clock even on regtest unless `auth.toml` grants it.
 - JSON-RPC requests may pass `params` as an object, naming arguments the way
   Bitcoin Core does, instead of only as a positional array. An object `params`
   previously failed on every method. Names, aliases (`verbosity|verbose`),

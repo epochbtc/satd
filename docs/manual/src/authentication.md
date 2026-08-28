@@ -56,6 +56,7 @@ token does not hold.
 | Stream subscribe | `stream:subscribe` | Open a streaming subscription (events gRPC, `streamws`). |
 | Stream watch | `stream:watch` | Register outpoint/script/descriptor/txid watches, bounded by the token's watch quota. |
 | MCP | `mcp:*` | The MCP server. One capability; there is no per-tool split. |
+| Test clock | `test:clock` | `setmocktime`, which moves the node clock (regtest only). **Not** implied by `rpc:write`: it reaches the future-block check, mempool expiry and block-template timestamps, so it must be granted deliberately. |
 
 The operator and loopback-trust principals hold all capabilities.
 

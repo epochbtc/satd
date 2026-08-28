@@ -158,11 +158,10 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
         remaining = deferred;
     }
 
-    // Timestamp: max of current time and parent time + 1
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
+    // Timestamp: max of current time and parent time + 1. Reads the node
+    // clock, not the system one, so a mocked chain mines at the mocked time --
+    // which is how Core's tests get deterministic block timestamps.
+    let now = crate::time::now_secs() as u32;
     let cur_time = std::cmp::max(now, tip_entry.header.time + 1);
 
     BlockTemplate {

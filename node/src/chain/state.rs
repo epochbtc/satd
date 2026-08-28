@@ -18,15 +18,11 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
-/// Current wall-clock time in seconds since the Unix epoch, for the
-/// future-block-time consensus check. Returns 0 if the system clock is
-/// before the epoch (impossible in practice), which only makes the check
-/// stricter, never laxer.
+/// The node's current time in seconds since the Unix epoch, for the
+/// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
+/// moves it on a mockable chain; off regtest that is always the system clock.
 fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time::now_secs()
 }
 
 /// Controls script verification skipping during IBD.

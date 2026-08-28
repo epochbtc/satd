@@ -36,10 +36,7 @@ const INFECTIOUS_RULE: &str = "(infectious: quarantined ancestor)";
 /// Current Unix time in seconds (saturating to 0 before the epoch). Used for
 /// policy-load timestamps; the hot paths inline their own `now`.
 fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::time::now_secs()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1543,10 +1540,7 @@ impl Mempool {
             demoted.retain(|(t, _, _)| !gone.contains(t));
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = crate::time::now_secs();
         for txid in &promoted {
             self.emit_quarantine(QuarantineEvent::Promoted { txid: *txid, time: now });
         }
@@ -2189,10 +2183,7 @@ impl Mempool {
         self.sync_unbroadcast_len(&inner);
 
         // Insert
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = crate::time::now_secs();
 
         for input in &tx.input {
             inner.spends.insert(input.previous_output, txid);
@@ -2557,10 +2548,7 @@ impl Mempool {
     /// Remove transactions that have been in the mempool longer than the expiry time.
     /// Returns the number of transactions removed.
     pub fn remove_expired(&self) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = crate::time::now_secs();
 
         // Snapshot the policy field BEFORE locking `inner`, so the policy lock
         // is never held while `inner` is. This keeps the policy lock a leaf
