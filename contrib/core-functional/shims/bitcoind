@@ -26,8 +26,6 @@ a lie told by the shim.
 
 import os
 import re
-import signal
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -117,33 +115,6 @@ def apply_rules(line: str, rules) -> str:
     return line.rstrip("\n") + " | " + " | ".join(extra) + "\n"
 
 
-def die_with_parent() -> None:
-    """Ask the kernel to kill satd when the shim dies.
-
-    The framework SIGKILLs a node it has given up on (TestNode's cleanup path),
-    and SIGKILL cannot be caught, so the forwarding below never runs for it.
-    Without this the real satd outlives the shim as an orphan still holding its
-    P2P/RPC ports and datadir -- which on a persistent runner then fails the
-    *next* run with a port collision. PR_SET_PDEATHSIG is per-thread and set in
-    the child after fork, so re-check the parent afterwards to close the race
-    where it died in between.
-    """
-    if not sys.platform.startswith("linux"):
-        return
-    ppid = os.getppid()
-    try:
-        import ctypes
-
-        PR_SET_PDEATHSIG = 1
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
-            PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0
-        )
-    except Exception:
-        return
-    if os.getppid() != ppid:
-        os._exit(1)
-
-
 def main() -> int:
     argv = sys.argv[1:]
     datadir = parse_datadir(argv)
@@ -160,33 +131,38 @@ def main() -> int:
 
     rules = load_log_rules()
 
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=None,  # straight through: TestNode asserts on it verbatim
-        bufsize=1,
-        text=True,
-        errors="replace",
-        preexec_fn=die_with_parent,
-    )
+    # satd must end up as *this* process, not a child of it.
+    #
+    # The framework does more with a node's pid than wait on it: `get_bind_addrs`
+    # reads /proc/<pid>/fd to learn which sockets the node is listening on. A
+    # shim that spawns satd as a child owns no listening sockets, so those tests
+    # see an empty set and read as a satd defect when nothing is wrong with satd.
+    #
+    # So the tee runs in the child and satd execs here: fork, give the child the
+    # read end plus the real stdout, point our stdout at the write end, and
+    # exec. Signal forwarding disappears with the indirection -- the framework's
+    # SIGTERM now lands on satd directly.
+    read_fd, write_fd = os.pipe()
+    if os.fork() == 0:
+        # Child: tee satd's stdout into debug.log and on to the real stdout.
+        os.close(write_fd)
+        # Append, never truncate: the framework restarts a node in place and
+        # compares debug.log sizes across the restart.
+        with os.fdopen(read_fd, "r", errors="replace") as pipe, debug_log.open(
+            "a", encoding="utf-8", errors="replace"
+        ) as log:
+            for line in pipe:
+                log.write(apply_rules(line, rules))
+                log.flush()
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        os._exit(0)
 
-    def forward(signum, _frame):
-        proc.send_signal(signum)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, forward)
-
-    # Append, never truncate: the framework restarts a node in place and
-    # compares debug.log sizes across the restart.
-    with debug_log.open("a", encoding="utf-8", errors="replace") as log:
-        for line in proc.stdout:
-            mapped = apply_rules(line, rules)
-            log.write(mapped)
-            log.flush()
-            sys.stdout.write(line)
-            sys.stdout.flush()
-
-    return proc.wait()
+    os.close(read_fd)
+    os.dup2(write_fd, 1)  # stdout -> tee; stderr (fd 2) is left untouched
+    os.close(write_fd)
+    os.execv(args[0], args)
+    raise AssertionError("execv returned")  # unreachable
 
 
 if __name__ == "__main__":

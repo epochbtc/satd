@@ -1,167 +1,140 @@
 # Bitcoin Core functional tests against satd
 
-This harness runs Bitcoin Core's own functional test suite, **unmodified**,
-against satd. Every test file in the pinned Core release gets a row in
-`inventory.toml` saying either "we run this" or "we skip it, and here is why",
-so "Core-compatible" becomes a number anyone can check rather than a claim.
-
-It is the third leg of satd's conformance stack, alongside the ported fixture
-corpora and the live block-acceptance differential against `bitcoind`.
+Runs Bitcoin Core's functional test suite, unmodified, against satd. Every test
+file in the pinned Core release has a row in `inventory.toml`: `run`, or `skip`
+with a reason.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `PIN` | The Core release this harness targets: tag + commit. |
+| `PIN` | Core release targeted: tag + commit. |
 | `fetch-core.sh` | Fetches that tree into `core/` (gitignored, never vendored). |
-| `<tag>-tests.txt` | The test files that tag contains. Checked in so the inventory can be validated offline. |
-| `inventory.toml` | One row per test file: `run`, or `skip` with a reason. |
-| `check_inventory.py` | Enforces the inventory's schema. Also prints the run-set and the scoreboard. |
+| `<tag>-tests.txt` | Test files in that tag. Checked in so the inventory validates offline. |
+| `inventory.toml` | One row per test file. |
+| `check_inventory.py` | Enforces the inventory schema; prints the run-set and the scoreboard. |
 | `run.sh` | Runs the run-set via Core's `test_runner.py`. |
-| `check_results.py` | Holds the run's results to the inventory's claim: a `run` row that was skipped at runtime, or absent from the results, fails the run. |
-| `shims/bitcoind`, `shims/bitcoin-cli` | What Core's framework executes instead of Core's binaries. |
+| `check_results.py` | Fails the run if a `run` row was skipped at runtime or is absent from the results. |
+| `shims/bitcoind`, `shims/bitcoin-cli` | Executed by Core's framework in place of Core's binaries. |
 | `debuglog_map.toml` | Maps satd log lines onto the phrasing `assert_debug_log` greps for. |
-| `tests/` | Tests for the harness itself. |
+| `tests/` | Tests for the harness. |
 
-## Running it
+## Running
 
 ```sh
-# once, to get the pinned Core tree (honours SATD_CORE_MIRROR for a local clone)
-./fetch-core.sh
-
+./fetch-core.sh                                  # honours SATD_CORE_MIRROR
 cargo build --release --bin satd --bin sat-cli   # from the repo root
 
-./run.sh --dry-run    # verify pin, inventory and binaries
-./run.sh --list       # print the run-set
-./run.sh              # run it
-./check_inventory.py --summary   # the scoreboard
+./run.sh --dry-run               # verify pin, inventory, binaries
+./run.sh --list                  # print the run-set
+./run.sh
+./check_inventory.py --summary   # scoreboard
 
-# measure a test that is still `skip`, to find out whether a fix unblocks it
-./run.sh --candidate rpc_getblockfilter.py
+./run.sh --candidate rpc_getblockfilter.py   # measure a row that is still skip
 ```
 
-`--candidate` is the measuring step of fix -> measure -> flip. It ignores
-inventory status and says so on stderr; it is not the scoreboard, and a row
-still only flips to `run` in the PR that makes it pass.
+`--candidate` ignores inventory status and does not touch the scoreboard.
 
-`run.sh` never runs from `cargo test`: it needs a built binary pair and real
-network ports, and it is a nightly job, not a unit test.
+`run.sh` is not a `cargo test`: it needs built binaries and real ports, and runs
+nightly.
 
-It is also never reachable from a pull request. The job builds and executes
-the checked-out tree, so running it on PR code would execute a contributor's
-code on the runner host; a label gate does not change that, because the label
-outlives the push it was applied to. Push a branch to this repo and use
-`workflow_dispatch` on that ref instead.
+It is not reachable from a pull request. The job builds and executes the
+checked-out tree, so PR code would run on the runner host; a label gate does not
+help, because the label outlives the push it was applied to. Push a branch to
+this repo and use `workflow_dispatch` on that ref.
 
-## The rules that keep the number honest
+## Rules
 
-The scoreboard is only worth publishing if it cannot be inflated. Four rules
-do that work, and they are the part of this directory to defend in review.
+The scoreboard is only worth publishing if it cannot be inflated.
 
-**1. A row flips to `run` only in the PR that makes it pass.** Never
-speculatively, never in a batch "these look fine". The flip and the fix ride
-together, so every increment of the score has a diff behind it.
+1. **A row flips to `run` only in the PR that makes it pass.** The flip and the
+   fix ride together.
+2. **The shim does not translate for the node.** It supplies a `debug.log`,
+   rewords log lines, and disables satd-only surfaces. It does not drop, rename
+   or invent options. A test needing something satd lacks is a `skip` row, not a
+   shim special case.
+3. **A `debuglog_map.toml` rule rewords an event, never manufactures one.**
+   Rules append Core's phrasing to a line satd emitted, leaving the original in
+   place. Emitting a string satd never logged turns `assert_debug_log` into a
+   no-op.
+4. **Every skip names a taxonomy reason; open-ended ones name a follow-up.**
+   `rpc-missing`, `feature-missing`, `harness`, `needs-triage` and
+   `flaky-quarantine` require a `note` — for `needs-triage`, the observed error.
+   `check_inventory.py` fails the build otherwise.
 
-**2. The shim does not translate on the node's behalf.** It provides a
-`debug.log`, rewords log lines, and turns off satd-only surfaces. It does not
-drop, rename, or invent node options. satd accepts Core's spelling directly and
-skips recognized-but-unsupported Core options with a warning of its own; an
-option neither side knows still aborts startup, which is the honest outcome. A
-test that needs something satd lacks is a `skip` row, not a shim special case.
-
-**3. A `debuglog_map.toml` rule may reword an event, never manufacture one.**
-Rules append Core's phrasing to a line satd actually emitted, leaving the
-original text in place. If a test greps for a line describing behaviour satd
-does not have, that is a `core-log` or feature-specific skip — writing a rule
-that emits the string anyway would turn `assert_debug_log` into a no-op.
-
-**4. Every skip names a reason from the taxonomy, and the open-ended ones name
-a follow-up.** `rpc-missing`, `feature-missing`, `harness`, `needs-triage` and
-`flaky-quarantine` rows must carry a `note` pointing at the work that will
-retire them — for `needs-triage`, the error actually observed — so a skip cannot
-quietly become permanent. `check_inventory.py` fails the build otherwise.
-
-There is also a fifth rule that is not mechanically enforced, because it
-cannot be: **declare satd's real gaps in `config.ini`.** `run.sh` tells the
-framework `ENABLE_WALLET=false`, `ENABLE_ZMQ=false` and so on, which makes
-Core's own `skip_if_no_*` guards fire. That is how a wallet test reports
-"skipped" instead of failing on a missing RPC — the framework is doing the
-skipping, on the strength of a true statement about satd. Declaring a
-component we do not have as `true` would convert honest skips into noise, and
-declaring one we do have as `false` would hide tests we ought to be passing.
+Not mechanically enforced: **declare satd's real gaps in `config.ini`.** `run.sh`
+sets `ENABLE_WALLET=false`, `ENABLE_ZMQ=false` and so on, which fires Core's own
+`skip_if_no_*` guards. Declaring a component satd lacks as `true` turns honest
+skips into noise; declaring one it has as `false` hides tests that should pass.
 
 ## Skip taxonomy
 
-`check_inventory.py` carries the list and its one-line meanings; run
-`./check_inventory.py --summary` for the current counts. Every category
-describes a property of satd or of the harness rather than "this one fails" —
-with one deliberate exception, `needs-triage`, which records a measured failure
-whose cause has not been attributed yet. It carries the observed error so the
-row is still evidence, and it is the one bucket expected to empty.
+`check_inventory.py` carries the categories and their meanings; run
+`./check_inventory.py --summary` for counts. Each describes a property of satd
+or of the harness, except `needs-triage`, which records a measured failure not
+yet attributed and carries the observed error. That bucket should only shrink.
 
 ## Bumping the pin
 
-Core's `/releases/latest` is not a reliable source: it reports whatever tag was
-published most recently, which can be a maintenance release for an older
-series. Take the newest **final** (non-`rc`) tag by version order.
+Core's `/releases/latest` reports the most recently published tag, which can be
+a maintenance release for an older series. Take the newest final (non-`rc`) tag
+by version order.
 
-1. Update `PIN` with the new tag and its commit hash.
-2. Regenerate `<tag>-tests.txt` and delete the old one.
-3. Run `./check_inventory.py` and triage what it reports: new files need rows,
-   removed files need their rows deleted, renamed files are both.
-4. Do it in one PR, separate from any flip.
+1. Update `PIN` with the tag and its commit.
+2. Regenerate `<tag>-tests.txt`; delete the old one.
+3. Run `./check_inventory.py` and triage: new files need rows, removed files
+   need their rows deleted, renames are both.
+4. One PR, separate from any flip.
 
-## What the run found
+## Blockers
 
-Every row's reason came from running the test, not from reading it. The
-resulting work queue, ranked by how many tests each item unblocks:
+Every reason came from running the test, not from reading it. Ranked by tests
+unblocked, which is a map of the framework's demands rather than a priority
+order — the top two are test-only facilities no operator calls.
 
 | Tests | Blocker |
 |---:|---|
-| 73 | **`setmocktime`.** Needed for deterministic time, and by `create_cache.py`, which seeds the 199-block chain most tests start from. Unblocks the largest single bucket, and is the largest piece of work: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
-| 48 | **`syncwithvalidationinterfacequeue`.** A hidden, test-only Core RPC that blocks until queued validation callbacks have been delivered. The framework calls it from `sync_all()`, so it is on the path of nearly every multi-node test. Worth thinking through rather than stubbing: if satd applies these side effects synchronously the honest implementation is cheap, but that has to be established, not assumed. |
-| 22 | **No periodic P2P ping.** `connect_nodes()` waits for a `pong` in both directions, which can only arrive if each side pings. satd has no keepalive at all: `ping_all()` is called only by the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. This is an availability gap before it is a test blocker — a half-open connection holds its slot forever. |
-| 6 | **Repeated command-line options.** Core accepts an option given twice — `-v2transport=0 -v2transport=1` — and takes the last (its config file deliberately takes the first). satd's parser rejects the duplicate, so any wrapper that appends an override to a base command line breaks. |
-| 5 | **Named JSON-RPC parameters.** satd accepts positional parameters only; a request whose `params` is an object fails on every method, not just the one that surfaced it. Core supports both, and its framework calls `generatetoaddress(nblocks=…, address=…)` by name. |
-| 2 | **`scantxoutset`**, which the framework's wallet uses to rescan. |
-| 1 | **Core's `-bind=addr[:port][=onion]` syntax**, and more than one `-bind`. satd takes a single bare address and gets the port from `-port`. |
-| 1 | **`NODE_NETWORK_LIMITED` under `-prune`.** A pruned satd advertises `NODE_NETWORK|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED|NODE_WITNESS` (1032), so it invites requests for blocks it does not have. |
+| 73 | `setmocktime`. Also used by `create_cache.py` to seed the 199-block chain most tests start from. Largest item: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
+| 48 | `syncwithvalidationinterfacequeue`. Hidden test-only RPC that blocks until queued validation callbacks are delivered; the framework calls it from `sync_all()`. Cheap if satd already applies these side effects synchronously, but that needs establishing, not assuming. |
+| 22 | No periodic P2P ping. `connect_nodes()` waits for a `pong` in both directions. satd has no keepalive: `ping_all()` runs only from the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. An availability gap before it is a test blocker. |
+| 5 | Named JSON-RPC parameters. satd is positional-only; an object `params` fails on every method, not just the one that surfaced it. |
+| 2 | `scantxoutset`, used by the framework's wallet to rescan. |
+| 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS` (1032), inviting requests for blocks it does not have. |
+| 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one; its invalid-port error also differs from Core's wording. |
+| 1 | Core's automatic onion bind: `127.0.0.1:<port + 1>` with `-listen` and no `-bind`. Not adopted — an extra listening socket on every default node is a decision about what a stock satd exposes, not a parsing fix. |
 
-Ranked this way the table answers "what unblocks the most tests", which is not
-the same question as "what is most worth fixing" — the top two entries are
-test-only facilities no operator will ever call. Read it as a map of the
-framework's demands, not as a priority order.
+Nine rows are outside the compatibility target: six use Core v31 options
+(cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
+target; the rest need Core-only binaries or internals.
 
-### Already fixed
+## Fixed
 
-Items the harness surfaced that have since landed, with what they turned out to
-be once measured rather than read:
+- `-minrelaytxfee` / `-dustrelayfee` units: Core denominates in BTC/kvB, satd in
+  sat/kvB. Both accepted now. An unparseable value in `bitcoin.conf` was also
+  silently discarded and the default used.
+- Bare `-blockfilterindex`, which Core accepts with no value.
+- Panic on an unparseable `-bind`. Underneath it, satd bracketed no IPv6 literal
+  before joining it to `-port`, so `-bind=::1` could never have worked.
+- `generatetoaddress` parameter shape, which measurement showed was the named
+  JSON-RPC parameter gap above.
+- Repeated command-line options aborted startup. Core takes the last value on
+  the command line and the first in `bitcoin.conf`.
+- `-bind` took a single bare address. Now repeatable, understands
+  `addr[:port][=onion]`, and refuses a duplicate binding across
+  `-bind`/`-whitebind`. This put `feature_bind_extra.py` in the run-set.
+- `getpeerinfo` was missing `addrbind`, `bytessent_per_msg` and
+  `bytesrecv_per_msg`. Adding them unblocked none of the 27 tests that wanted
+  them: with the fields present those tests reach the real blocker underneath,
+  which for 22 of them is the keepalive ping above.
 
-- **`-minrelaytxfee` / `-dustrelayfee` units.** Core denominates them in BTC/kvB,
-  satd in sat/kvB. Both spellings are accepted now. The unit mismatch was the
-  visible half; the dangerous half was that an unparseable value in
-  `bitcoin.conf` was silently discarded and the default used instead.
-- **Bare `-blockfilterindex`.** Core accepts the flag with no value.
-- **A panic on an unparseable `-bind`.** Underneath it: satd bracketed no IPv6
-  literal before joining it to `-port`, so `-bind=::1` could never have worked.
-- **`generatetoaddress` parameter shape**, which measurement showed was not
-  about `generatetoaddress` at all — see "Named JSON-RPC parameters" above.
-- **`getpeerinfo` was missing `addrbind`, `bytessent_per_msg` and
-  `bytesrecv_per_msg`.** Adding them unblocked none of the 27 tests that wanted
-  them, which is the useful part of the result: with the fields in place those
-  tests get far enough to reveal the real blocker underneath, and for 22 of
-  them it is the missing keepalive ping above.
+Two rows that looked like satd defects were the harness's own: `shims/bitcoind`
+spawned satd as a child, so `node.process.pid` was the shim's. `get_bind_addrs`
+reads `/proc/<pid>/fd` to find a node's listening sockets and a shim owns none,
+so two bind tests reported binding nothing at all. The shim now execs satd in
+its own process and tees the log from a forked child.
 
-Nine rows outside satd's compatibility target are skipped as such: six use Core
-v31 options (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a
-stated Core v30 target, and the rest need Core-only binaries or internals.
+## Extending
 
-Four rows remain `needs-triage` — measured as failing with the error recorded in
-the row, cause not yet attributed. That bucket should only ever shrink.
-
-## Extending it
-
-Beyond the table above: `debuglog_map.toml` rules for `core-log` rows, and
-re-examining the `core-net-policy` and `no-core-zmq` buckets — Core-topic ZMQ is
-a plausible small satd feature with real ecosystem value, and would convert a
-whole category.
+`debuglog_map.toml` rules for `core-log` rows, and the `core-net-policy` and
+`no-core-zmq` buckets — Core-topic ZMQ is a plausible small satd feature with
+real ecosystem value, and would convert a whole category.

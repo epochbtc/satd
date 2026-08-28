@@ -82,6 +82,12 @@ only tests.
 - `getpeerinfo` gains Core's `addrbind` (the local end of each connection) and
   `bytessent_per_msg` / `bytesrecv_per_msg` (per-message-type wire tallies).
   Core-derived clients read all three without a null guard.
+- A command-line option given twice now takes the last value, as in Core,
+  instead of aborting startup. This is what lets a wrapper append an override
+  onto a base command line. Repeatable options still accumulate.
+- `-bind` is repeatable and accepts Core's `addr[:port][=onion]` form. An entry
+  carrying a port uses it; a bare address combines with `-port`; an explicit
+  `-bind` replaces the default listener rather than adding to it.
 
 ## Releases
 

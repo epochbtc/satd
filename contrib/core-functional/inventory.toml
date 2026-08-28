@@ -46,9 +46,7 @@ reason = "core-log"
 
 [[test]]
 file = "feature_bind_extra.py"
-status = "skip"
-reason = "feature-missing"
-note = "needs Core's -bind=addr[:port][=onion] syntax; satd's -bind takes a bare address and the port from -port. Follow-up: Core-compatible -bind parsing and multiple bind addresses"
+status = "run"
 
 [[test]]
 file = "feature_bind_port_discover.py"
@@ -110,8 +108,7 @@ reason = "prev-release"
 [[test]]
 file = "feature_config_args.py"
 status = "skip"
-reason = "needs-triage"
-note = "observed: AssertionError: [node 0] Expected message(s) ['[warning] Parsed potentially confusing double-negative -listen=0/n'] not found in log:"
+reason = "core-log"
 
 [[test]]
 file = "feature_csv_activation.py"
@@ -138,8 +135,8 @@ reason = "cache"
 [[test]]
 file = "feature_discover.py"
 status = "skip"
-reason = "feature-missing"
-note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
 
 [[test]]
 file = "feature_fastprune.py"
@@ -165,8 +162,7 @@ reason = "cache"
 [[test]]
 file = "feature_framework_startup_failures.py"
 status = "skip"
-reason = "needs-triage"
-note = "observed: AssertionError: Child test did NOT contain (only) expected errors:"
+reason = "cache"
 
 [[test]]
 file = "feature_framework_testshell.py"
@@ -243,8 +239,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_port.py"
 status = "skip"
-reason = "feature-missing"
-note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
 
 [[test]]
 file = "feature_posix_fs_permissions.py"
@@ -262,7 +258,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "feature_proxy.py"
 status = "skip"
 reason = "needs-triage"
-note = "observed: AssertionError: Predicate ''''"
+note = "observed: AssertionError: Predicate 'find_conn(from_connection, to_connection_subver, inbound=False) is not None' not true after 60 seconds -- an outbound peer dialed through -proxy never appears in getpeerinfo"
 
 [[test]]
 file = "feature_pruning.py"
@@ -649,8 +645,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_getaddr_caching.py"
 status = "skip"
-reason = "feature-missing"
-note = "passes -bind twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+reason = "cache"
 
 [[test]]
 file = "p2p_getdata.py"
@@ -845,26 +840,24 @@ note = "satd accepts positional JSON-RPC parameters only; a named request fails 
 [[test]]
 file = "p2p_v2_encrypted.py"
 status = "skip"
-reason = "feature-missing"
-note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+reason = "cache"
 
 [[test]]
 file = "p2p_v2_misbehaving.py"
 status = "skip"
-reason = "feature-missing"
-note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+reason = "cache"
 
 [[test]]
 file = "p2p_v2_transport.py"
 status = "skip"
 reason = "feature-missing"
-note = "passes -v2transport twice; Core accepts a repeated option, satd rejects it. Follow-up: Core-style repeated-option precedence on the command line"
+note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees the pong it waits for (bytesrecv_per_msg['pong'] >= 29). satd has no keepalive and no inactivity disconnect; -peertimeout is unimplemented. Follow-up: Core-style periodic ping and peer timeout"
 
 [[test]]
 file = "rpc_bind.py"
 status = "skip"
-reason = "needs-triage"
-note = "observed: AssertionError: not(set() == {('7f000001', 17704), ('00000000000000000000000000000001', 17704)})"
+reason = "feature-missing"
+note = "observed: with two -rpcbind addresses satd binds only 127.0.0.1, not ::1, and rejects a bad -rpcbind port with different wording than `Error: Invalid port specified in -rpcbind`. Follow-up: bind every -rpcbind entry, and match Core's invalid-port error"
 
 [[test]]
 file = "rpc_blockchain.py"

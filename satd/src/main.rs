@@ -3158,36 +3158,31 @@ async fn main() {
     // RPC/Esplora listeners above. An operator who set -listen=1 must not see
     // the daemon report a clean start while silently accepting no inbound peers.
     if config.listen {
-        let p2p_addr: SocketAddr = match crate::config::parse_p2p_bind(&config.bind, config.port) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!(
-                    "Error: {e}\n\
-                     -bind takes a bare IP address (-bind=127.0.0.1, -bind=::1); \
-                     the port comes from -port. Use -listen=0 to disable inbound P2P."
-                );
-                auth.cleanup();
-                std::process::exit(1);
-            }
-        };
-        let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "Error: failed to bind P2P listener on {p2p_addr}: {e}\n\
-                     Another instance of satd may already be running, or the port is in use.\n\
-                     Set -port=<n>/-bind=<addr> to change it, or -listen=0 to disable inbound P2P."
-                );
-                auth.cleanup();
-                std::process::exit(1);
-            }
-        };
-        let pm = peer_manager.clone();
-        tokio::spawn(async move {
-            pm.accept_loop(listener, node::net::permissions::NetPermissions::NONE)
-                .await;
-        });
-        tracing::info!(port = config.port, "P2P listening");
+        // Every -bind entry gets its own listener. A node may legitimately
+        // listen on several addresses, so one failure is still fatal: an
+        // operator who named an address must not be told the node started
+        // cleanly while that address accepts nothing.
+        for spec in &config.binds {
+            let p2p_addr = spec.addr;
+            let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "Error: failed to bind P2P listener on {p2p_addr}: {e}\n\
+                         Another instance of satd may already be running, or the port is in use.\n\
+                         Set -port=<n>/-bind=<addr> to change it, or -listen=0 to disable inbound P2P."
+                    );
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            let pm = peer_manager.clone();
+            tokio::spawn(async move {
+                pm.accept_loop(listener, node::net::permissions::NetPermissions::NONE)
+                    .await;
+            });
+            tracing::info!(bind = %p2p_addr, onion = spec.onion, "Bound to {p2p_addr}");
+        }
     }
 
     // -whitebind: extra permissioned listeners (independent of -listen). These
