@@ -52,6 +52,10 @@ workflow, scoreboard in the Operator Manual. See
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- JSON-RPC requests may pass `params` as an object, naming arguments the way
+  Bitcoin Core does, instead of only as a positional array. An object `params`
+  previously failed on every method. Names, aliases (`verbosity|verbose`),
+  argument holes, options objects and the `args` mixed form all follow Core.
 - RPC replies now carry exactly `Content-Type: application/json`, as Core's do,
   instead of `application/json; charset=utf-8`. Core-derived clients compare the
   header for equality, so the redundant parameter read to them as a non-JSON

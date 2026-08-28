@@ -10,6 +10,7 @@ pub mod compat;
 pub mod error;
 pub mod indexes;
 pub mod mining;
+pub mod named_params;
 pub mod network;
 pub mod policy;
 pub mod psbt;

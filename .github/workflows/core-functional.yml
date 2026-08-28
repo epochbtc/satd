@@ -44,6 +44,14 @@ jobs:
           contrib/core-functional/tests/test_check_inventory.sh
           contrib/core-functional/tests/test_check_results.sh
 
+      - name: Named-parameter table matches the pinned Core
+        run: |
+          # A renamed Core argument costs compatibility; a *reordered* one
+          # binds values to the wrong positions and nothing else would notice.
+          contrib/core-functional/fetch-core.sh
+          contrib/core-functional/gen-named-params.py --check --cross-check \
+            contrib/core-functional/core
+
       - name: Scoreboard
         run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
 

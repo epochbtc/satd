@@ -12353,3 +12353,76 @@ fn test_readonly_rpc_tls_round_trip() {
 
     node.stop();
 }
+
+/// Bitcoin Core accepts a JSON object as `params` on every RPC, and its own
+/// test framework's `authproxy` switches to that form the moment a caller uses
+/// a keyword argument. satd read `params` as a sequence everywhere, so an
+/// object failed on every method — see `node/src/rpc/named_params.rs`.
+///
+/// The unit tests cover the mapping itself; this one covers the wiring, which
+/// they cannot: that the middleware is actually installed on the listener and
+/// that a translated request reaches the handler with its arguments in the
+/// right positions.
+#[test]
+fn named_rpc_params_are_accepted_like_core() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+
+    // Keywords in an order that is *not* the declaration order: if the layer
+    // bound positionally the node would be asked for `"bcrt1p..."` blocks.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generatetoaddress","params":{{"address":"{addr}","nblocks":3}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).expect("named call");
+    let hashes = resp["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected block hashes, got {resp}"));
+    assert_eq!(hashes.len(), 3, "nblocks must bind to the count, not the address");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        3
+    );
+
+    // `verbosity|verbose`: Core renamed this argument and kept the old
+    // spelling working, so both must reach the same position.
+    let hash = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for alias in ["verbosity", "verbose"] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"getblock","params":{{"blockhash":"{hash}","{alias}":0}}}}"#
+        );
+        let resp = node.rpc_call_raw_body(&body).unwrap();
+        assert!(
+            resp["result"].is_string(),
+            "verbosity 0 via `{alias}` should return the raw hex, got {resp}"
+        );
+    }
+
+    // A misspelled name must be refused, not silently ignored: ignoring it
+    // would run the call with a default the caller never asked for. Core
+    // reports RPC_INVALID_PARAMETER (-8).
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getblock","params":{{"blockhash":"{hash}","verbosityy":0}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert_eq!(
+        resp["error"]["message"].as_str(),
+        Some("Unknown named parameter verbosityy")
+    );
+
+    // A method that declares no arguments still has to reject names.
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":{"height":1}}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+
+    // Positional calls must be entirely unaffected.
+    let resp = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+        .unwrap();
+    assert!(resp["result"].is_string(), "positional still works: {resp}");
+}

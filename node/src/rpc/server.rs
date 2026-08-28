@@ -11,6 +11,7 @@ use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::JsonRpcCompatLayer;
 use crate::rpc::capability::CapabilityLayer;
+use crate::rpc::named_params::NamedParamsLayer;
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -2017,6 +2018,29 @@ pub async fn start(
     // by each per-bind `Server::start()` call below, plus one to feed
     // the TLS path's per-connection service builder if TLS is enabled.
     let methods: Methods = module.into();
+
+    // Completeness audit for the named-parameter table. A method missing from
+    // it is not rejected -- it simply keeps failing on object `params` the way
+    // the whole surface used to -- so nothing here is load-bearing for safety.
+    // But a gap is a silent Core-compatibility regression for that method, and
+    // the table is generated from Core's declarations rather than maintained
+    // by hand, so a newly registered RPC is exactly the case that slips
+    // through. `debug_assert` makes the test suite the place that catches it.
+    let unnamed: Vec<&str> = methods
+        .method_names()
+        .filter(|m| crate::rpc::named_params::arg_names(m).is_none())
+        .collect();
+    if !unnamed.is_empty() {
+        tracing::warn!(
+            methods = ?unnamed,
+            "registered RPC methods missing from the named-parameter table in \
+             rpc::named_params; they will reject object `params` that Bitcoin Core accepts"
+        );
+        debug_assert!(
+            unnamed.is_empty(),
+            "RPC methods missing from rpc::named_params::arg_names: {unnamed:?}"
+        );
+    }
     if bind_addrs.is_empty() {
         return Err("rpc::server::start: bind_addrs is empty".into());
     }
@@ -2295,6 +2319,10 @@ async fn spawn_tls_surface(
         .set_http_middleware(tls_middleware)
         .set_rpc_middleware(
             RpcServiceBuilder::new()
+                // Outermost: object `params` becomes positional `params`
+                // before anything downstream inspects them, so the filters and
+                // every handler see one shape.
+                .layer(NamedParamsLayer::new())
                 .option_layer(rpc_filter)
                 .option_layer(capability_filter),
         )
@@ -2529,6 +2557,10 @@ pub async fn spawn_plain_surface(
         // (after jsonrpsee has parsed the method + split batches).
         .set_rpc_middleware(
             RpcServiceBuilder::new()
+                // Outermost: object `params` becomes positional `params`
+                // before anything downstream inspects them, so the filters and
+                // every handler see one shape.
+                .layer(NamedParamsLayer::new())
                 .option_layer(warmup)
                 .option_layer(rpc_filter)
                 .option_layer(capability_filter),
