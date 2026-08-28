@@ -149,7 +149,7 @@ including the estimator's stint semantics and the row format, is in
 ## Serving tweaks (Tier 1 on the wire)
 
 With the index enabled and synced, a gRPC `Subscribe` with category bit 8
-streams one `BlockTweaks` per connected block, shaped by four per-subscription
+streams one `BlockTweaks` per connected block, shaped by five per-subscription
 knobs:
 
 - `tweak_dust_limit` — drop entries whose largest eligible output is below the
@@ -161,6 +161,23 @@ knobs:
 - `tweak_outputs` — include each entry's taproot outputs, re-derived at serve
   time, so matches confirm in-band. Off by default because it makes replay read
   each block; `MempoolTweak` always carries its outputs regardless.
+- `tweak_unspent_only` — cut-through: drop entries whose taproot outputs are all
+  already spent, and keep only the unspent ones on the entries that survive. The
+  biggest single saving on a cold sync, and the one knob with a correctness
+  caveat, below.
+
+**Cut-through is a balance scan, not a restore.** `tweak_unspent_only` asks the
+node "is this coin still there?", answered against the UTXO set at the moment the
+event is served — not against the chain as of that height. A payment received at
+height `H` and spent at `H+100` is therefore absent from a scan of `H` that runs
+today. A wallet that wants a current balance loses nothing and skips the ECDH for
+every coin that no longer exists; a wallet reconstructing its transaction history
+must leave the flag off, or the history will omit everything it has already
+spent. Entries dropped this way set the block's `filtered` flag, so an empty
+block is never mistaken for one with no eligible transactions. Like
+`tweak_outputs`, it re-derives outputs from the block, so it needs a block source
+and reads one block per event. It never applies to `MempoolTweak` — an
+unconfirmed output is in no confirmed UTXO set.
 
 The firehose serves on gRPC only in this release — the WebSocket/SSE transports
 do not carry the tweaks category. For scripts and integrators not on an SDK,

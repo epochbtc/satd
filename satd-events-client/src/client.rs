@@ -88,6 +88,21 @@ pub struct SubscribeOptions {
     /// [`MempoolTweak`](crate::Event::MempoolTweak) carries its outputs
     /// regardless of this flag.
     pub tweak_outputs: bool,
+    /// Cut-through: drop [`Event::BlockTweaks`](crate::Event::BlockTweaks)
+    /// entries whose taproot outputs are **all** already spent on the confirmed
+    /// chain, and — with [`tweak_outputs`](Self::tweak_outputs) — carry only the
+    /// still-unspent outputs. A balance scan then never runs ECDH against a coin
+    /// that is already gone.
+    ///
+    /// A **restore** that needs transaction history must leave this `false`: a
+    /// payment received and later spent is omitted entirely, so the balance is
+    /// right and the history is not. Spentness is evaluated at serve time, so the
+    /// same historical block can yield fewer entries on a later scan. Dropped
+    /// entries set the block's `filtered` flag. A modifier on the
+    /// [`TWEAKS`](Categories::TWEAKS) category — the server rejects it without
+    /// that bit, or on a node with no block source. Never applies to
+    /// [`MempoolTweak`](crate::Event::MempoolTweak).
+    pub tweak_unspent_only: bool,
 }
 
 impl SubscribeOptions {
@@ -106,6 +121,7 @@ impl SubscribeOptions {
             tweaks_only: self.tweaks_only.then_some(true),
             mempool_tweaks: self.mempool_tweaks.then_some(true),
             tweak_outputs: self.tweak_outputs.then_some(true),
+            tweak_unspent_only: self.tweak_unspent_only.then_some(true),
             ..Default::default()
         }
     }
@@ -1297,18 +1313,21 @@ mod tests {
             .into_request();
         assert_eq!(default.mempool_tweaks, None);
         assert_eq!(default.tweak_outputs, None);
+        assert_eq!(default.tweak_unspent_only, None);
 
         let full = SubscribeOptions {
             categories: Categories::TWEAKS,
             mempool_tweaks: true,
             tweak_outputs: true,
             tweaks_only: true,
+            tweak_unspent_only: true,
             ..Default::default()
         }
         .into_request();
         assert_eq!(full.mempool_tweaks, Some(true));
         assert_eq!(full.tweak_outputs, Some(true));
         assert_eq!(full.tweaks_only, Some(true));
+        assert_eq!(full.tweak_unspent_only, Some(true));
     }
 
     #[tokio::test]

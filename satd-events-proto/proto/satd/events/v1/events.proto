@@ -537,6 +537,23 @@ message SubscribeRequest {
   // serve time — the on-disk index does not store them — so a cold-sync with
   // this set reads each block (heavier than a lean cold-sync).
   optional bool tweak_outputs = 7;
+
+  // Cut-through: drop BlockTweaks entries whose taproot outputs are all already
+  // spent on the confirmed chain as of serve time, and (when `tweak_outputs` is
+  // set) carry only the still-unspent outputs. A balance scan never has to run
+  // ECDH against a coin that is already gone; a RESTORE that needs transaction
+  // history must leave this off, because a payment received and later spent is
+  // omitted entirely. Default false = every eligible entry, spent or not.
+  //
+  // A modifier on the `tweaks` category: setting it without bit 8 is rejected
+  // in-band (invalid_argument); a node with no block source rejects it
+  // (failed_precondition), since the outputs are re-derived from the block.
+  // Dropped entries set the block's `filtered` flag, exactly like the dust
+  // floor. Spentness is evaluated against the UTXO set at the moment the event
+  // is served, so the same historical block can yield fewer entries on a later
+  // scan; it never applies to MempoolTweak (an unconfirmed output is in no
+  // confirmed UTXO set, and filtering on that would drop every mempool tweak).
+  optional bool tweak_unspent_only = 8;
 }
 
 // Durable resume position. Confirmed-side cursors are `(height,

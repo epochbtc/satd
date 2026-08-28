@@ -975,17 +975,43 @@ impl NodeEventStream for NodeEventStreamSvc {
                 "tweak_outputs requires the tweaks category (bit 8)",
             ));
         }
-        let outputs_scan_source = if tweak_outputs {
+        // `tweak_unspent_only`: cut-through. Drop confirmed entries whose taproot
+        // outputs are all already spent, so a balance scan never runs ECDH against
+        // a coin that is gone. Like the other two it modifies the `tweaks`
+        // category, and like `tweak_outputs` it needs block access — the outputs
+        // whose spentness is being tested are re-derived from the block.
+        let tweak_unspent_only = req.tweak_unspent_only.unwrap_or(false);
+        if tweak_unspent_only && !wants_tweaks {
+            debug!(target: "events::grpc", code = "invalid_argument", "rejecting Subscribe: tweak_unspent_only set without the tweaks category (bit 8)");
+            return Err(Status::invalid_argument(
+                "tweak_unspent_only requires the tweaks category (bit 8)",
+            ));
+        }
+        // One source serves both block-reading modifiers.
+        let tweak_scan_source = if tweak_outputs || tweak_unspent_only {
             self.scan_source.clone()
         } else {
             None
         };
-        if tweak_outputs && outputs_scan_source.is_none() {
+        if tweak_outputs && tweak_scan_source.is_none() {
             debug!(target: "events::grpc", code = "failed_precondition", "rejecting Subscribe: tweak_outputs requires a block source");
             return Err(Status::failed_precondition(
                 "tweak_outputs requires a block source (none configured)",
             ));
         }
+        if tweak_unspent_only && tweak_scan_source.is_none() {
+            debug!(target: "events::grpc", code = "failed_precondition", "rejecting Subscribe: tweak_unspent_only requires a block source");
+            return Err(Status::failed_precondition(
+                "tweak_unspent_only requires a block source (none configured)",
+            ));
+        }
+        let tweak_opts = TweakServeOpts {
+            dust_limit: tweak_dust_limit,
+            tweaks_only,
+            outputs: tweak_outputs,
+            unspent_only: tweak_unspent_only,
+            source: tweak_scan_source,
+        };
 
         // Subscribe to the live broadcast FIRST, before reading the tip for
         // replay. This is the snapshot→live handoff ordering that guarantees
@@ -1083,11 +1109,11 @@ impl NodeEventStream for NodeEventStreamSvc {
             }
         }
 
-        // Per-consumer clones of the block source used to enrich `BlockTweaks`
-        // with taproot outputs (only `Some` when `tweak_outputs` was requested).
-        // The live closure and each replay stage move their own clone.
-        let live_outputs_scan = outputs_scan_source.clone();
-        let replay_outputs_scan = outputs_scan_source.clone();
+        // Per-consumer clones of the confirmed-tweak shaping (dust floor, compact
+        // form, taproot outputs, cut-through) plus the block source the last two
+        // need. The live closure and each replay stage move their own clone.
+        let live_tweak_opts = tweak_opts.clone();
+        let replay_tweak_opts = tweak_opts.clone();
 
         // `sub_guard` is moved into the live stream closure so the
         // subscription slot is held for exactly as long as the (combined)
@@ -1152,12 +1178,16 @@ impl NodeEventStream for NodeEventStreamSvc {
                     if let Some(c) = &env.cursor {
                         last_h = c.height;
                     }
-                    // A `tweak_outputs` subscriber's confirmed BlockTweaks are
-                    // enriched with the block's taproot outputs here; the mempool
-                    // path already carries them and other bodies are unaffected.
-                    let enriched = enrich_block_tweaks_outputs(&env, live_outputs_scan.as_ref());
-                    let out_env = enriched.as_ref().unwrap_or(&env);
-                    Some(Ok(envelope_to_proto_sp(out_env, tweak_dust_limit, tweaks_only)))
+                    // Confirmed BlockTweaks are shaped here for the subscribers
+                    // that asked (outputs attached, spent entries cut through);
+                    // the mempool path already carries its outputs and other
+                    // bodies are unaffected.
+                    let refined = refine_block_tweaks(&env, &live_tweak_opts);
+                    let (out_env, cut) = match &refined {
+                        Some((e, cut)) => (e, *cut),
+                        None => (&env, false),
+                    };
+                    Some(Ok(envelope_to_proto_sp(out_env, &live_tweak_opts, cut)))
                 }
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // Tell the client in-band: how many events were dropped and
@@ -1178,9 +1208,12 @@ impl NodeEventStream for NodeEventStreamSvc {
                 // helper as `NodeEvent`s; convert each to proto and emit before
                 // joining the live stream.
                 let replay_events = tokio_stream::iter(r.events.into_iter().map(move |e| {
-                    let enriched = enrich_block_tweaks_outputs(&e, replay_outputs_scan.as_ref());
-                    let out_env = enriched.as_ref().unwrap_or(&e);
-                    Ok(envelope_to_proto_sp(out_env, tweak_dust_limit, tweaks_only))
+                    let refined = refine_block_tweaks(&e, &replay_tweak_opts);
+                    let (out_env, cut) = match &refined {
+                        Some((ev, cut)) => (ev, *cut),
+                        None => (&e, false),
+                    };
+                    Ok(envelope_to_proto_sp(out_env, &replay_tweak_opts, cut))
                 }));
                 // A tweaks-only deep-replay exemption defers its (possibly
                 // whole-taproot-era) span to here rather than materializing it
@@ -1206,9 +1239,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                             self.publisher.clone(),
                             start,
                             end,
-                            tweak_dust_limit,
-                            tweaks_only,
-                            outputs_scan_source,
+                            tweak_opts,
                         );
                         Box::pin(replay_events.chain(deep).chain(live))
                     }
@@ -2752,14 +2783,22 @@ fn envelope_to_proto(env: &NodeEvent) -> pb::NodeEvent {
 /// Convert an envelope to proto, applying the subscription's per-subscription
 /// `tweaks` filters (`dust_limit`, `tweaks_only`) to a [`BlockTweaks`] body.
 /// Every other body is identical to [`envelope_to_proto`].
-fn envelope_to_proto_sp(env: &NodeEvent, dust_limit: u64, tweaks_only: bool) -> pb::NodeEvent {
+///
+/// `cut` reports whether [`refine_block_tweaks`] already dropped an entry for
+/// this block: cut-through happens upstream (it needs the block), so the flag has
+/// to be carried in rather than recomputed, or the block would claim to be
+/// unfiltered while missing entries.
+fn envelope_to_proto_sp(env: &NodeEvent, opts: &TweakServeOpts, cut: bool) -> pb::NodeEvent {
     match &env.body {
         NodeEventBody::BlockTweaks(bt) => pb::NodeEvent {
             schema_version: env.schema_version,
             stamp: Some(stamp_to_proto(&env.stamp)),
             cursor: env.cursor.map(cursor_to_proto),
             body: Some(pb::node_event::Body::BlockTweaks(block_tweaks_to_proto(
-                bt, dust_limit, tweaks_only,
+                bt,
+                opts.dust_limit,
+                opts.tweaks_only,
+                cut,
             ))),
         },
         _ => envelope_to_proto(env),
@@ -2792,9 +2831,7 @@ fn deep_tweak_replay_stream(
     publisher: std::sync::Arc<node::events::EventPublisher>,
     start: u32,
     end: u32,
-    dust_limit: u64,
-    tweaks_only: bool,
-    outputs_scan_source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
+    tweak_opts: TweakServeOpts,
 ) -> ReceiverStream<Result<pb::NodeEvent, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::NodeEvent, Status>>(4);
     tokio::spawn(async move {
@@ -2803,22 +2840,24 @@ fn deep_tweak_replay_stream(
             let chunk_end = h.saturating_add(DEEP_TWEAK_REPLAY_CHUNK - 1).min(end);
             let sp_chunk = sp.clone();
             let pub_chunk = publisher.clone();
-            let scan_chunk = outputs_scan_source.clone();
-            // Read + render one bounded chunk off the async runtime. Output
-            // enrichment (when `tweak_outputs` is set) reads each block here too —
-            // in the same blocking context, paced by the outer channel's
-            // backpressure, so a cold-sync with outputs stays bounded in memory
-            // and I/O rate.
+            let opts_chunk = tweak_opts.clone();
+            // Read + render one bounded chunk off the async runtime. The
+            // block-reading modifiers (`tweak_outputs`, `tweak_unspent_only`) read
+            // each block here too — in the same blocking context, paced by the
+            // outer channel's backpressure, so a cold-sync with either stays
+            // bounded in memory and I/O rate.
             let rendered = tokio::task::spawn_blocking(move || {
                 let mut out: Vec<Result<pb::NodeEvent, Status>> = Vec::new();
                 for hh in h..=chunk_end {
                     match sp_chunk.tweaks_at(hh) {
                         Ok(row) => {
                             let env = node::events::make_block_tweaks_event(&pub_chunk, hh, row);
-                            let enriched =
-                                enrich_block_tweaks_outputs(&env, scan_chunk.as_ref());
-                            let out_env = enriched.as_ref().unwrap_or(&env);
-                            out.push(Ok(envelope_to_proto_sp(out_env, dust_limit, tweaks_only)));
+                            let refined = refine_block_tweaks(&env, &opts_chunk);
+                            let (out_env, cut) = match &refined {
+                                Some((e, cut)) => (e, *cut),
+                                None => (&env, false),
+                            };
+                            out.push(Ok(envelope_to_proto_sp(out_env, &opts_chunk, cut)));
                         }
                         // Range is clamped to `[activation, tip]`, so a missing
                         // row here is a hole, not a below-activation absence.
@@ -2875,29 +2914,70 @@ fn deep_tweak_replay_stream(
     ReceiverStream::new(rx)
 }
 
-/// Re-derive each confirmed `BlockTweaks` entry's taproot outputs from the block
-/// for a `tweak_outputs` subscriber, returning an enriched clone of the
-/// envelope. Returns `None` — meaning "use the original unchanged" — when this
-/// is not a `BlockTweaks`, the row is empty, or the block cannot be read (a
-/// client scanning confirmed history can still fall back to the block itself).
+/// Per-subscription shaping of confirmed `BlockTweaks`, resolved once at
+/// `Subscribe` and carried unchanged to every serve path (live, replay, and the
+/// deep cold-sync pager) so all three shape a block identically.
+#[derive(Clone)]
+struct TweakServeOpts {
+    /// Drop entries whose `max_value` is below this floor (satoshis); 0 = off.
+    dust_limit: u64,
+    /// Compact form: strip `txid`/`max_value`, leaving the 33-byte tweak.
+    tweaks_only: bool,
+    /// Attach each entry's taproot outputs, re-derived from the block.
+    outputs: bool,
+    /// Cut-through: keep only entries with at least one still-unspent taproot
+    /// output, and (with `outputs`) carry only those outputs.
+    unspent_only: bool,
+    /// Block + UTXO access. `Some` exactly when `outputs || unspent_only`; the
+    /// `Subscribe` handler refuses either modifier on a node without a source.
+    source: Option<std::sync::Arc<dyn node::events::BlockScanSource>>,
+}
+
+impl TweakServeOpts {
+    /// Whether this subscription needs the block at all. When false, the serve
+    /// paths hand the index-decoded envelope straight to the proto mapper.
+    fn reads_block(&self) -> bool {
+        self.outputs || self.unspent_only
+    }
+}
+
+/// Apply the block-reading tweak modifiers to one confirmed `BlockTweaks`,
+/// returning `(rewritten envelope, whether cut-through dropped an entry)`.
+///
+/// `None` means "serve the original unchanged": not a `BlockTweaks`, an empty
+/// row, neither modifier requested, or the block is not readable. That last case
+/// is deliberate on both modifiers. For `tweak_outputs` the client falls back to
+/// the block, as it always could. For `tweak_unspent_only` the fallback is a
+/// *superset* — every entry, spent ones included — which costs the client
+/// redundant ECDH but can never hide a payment. Failing the stream instead would
+/// turn a pruned or missing body into a dead scan.
 ///
 /// The lean on-chain index stores no per-output data, so this is the only place
 /// confirmed outputs are materialized. It costs one block read per event, paced
 /// by the subscriber's own consumption (the live/replay streams are demand-
-/// driven), so a slow `tweak_outputs` consumer cannot make the node read faster
-/// than it consumes. Only the SP-eligible txids named by the row have their
-/// outputs enumerated, not every transaction in the block.
-fn enrich_block_tweaks_outputs(
+/// driven), so a slow consumer cannot make the node read faster than it consumes.
+/// Only the SP-eligible txids named by the row have their outputs enumerated,
+/// not every transaction in the block.
+///
+/// Spentness is a live UTXO-set test at serve time, not a historical one: a coin
+/// received at height H and spent at H+100 is cut from a scan of H that runs
+/// after H+100. That is what makes cut-through a balance scan rather than a
+/// restore — see the `tweak_unspent_only` contract in the streaming spec.
+fn refine_block_tweaks(
     env: &NodeEvent,
-    scan_source: Option<&std::sync::Arc<dyn node::events::BlockScanSource>>,
-) -> Option<NodeEvent> {
+    opts: &TweakServeOpts,
+) -> Option<(NodeEvent, bool)> {
+    if !opts.reads_block() {
+        return None;
+    }
     let NodeEventBody::BlockTweaks(bt) = &env.body else {
         return None;
     };
     if bt.entries.is_empty() {
         return None;
     }
-    let block = scan_source?.block_body(&bt.block_hash)?;
+    let source = opts.source.as_ref()?;
+    let block = source.block_body(&bt.block_hash)?;
 
     let wanted: std::collections::HashSet<bitcoin::Txid> =
         bt.entries.iter().map(|e| e.txid).collect();
@@ -2910,15 +2990,32 @@ fn enrich_block_tweaks_outputs(
         }
     }
 
-    let mut new_bt = bt.clone();
-    for e in &mut new_bt.entries {
-        if let Some(outs) = by_txid.get(&e.txid) {
-            e.taproot_outputs = outs.clone();
+    let mut cut = false;
+    let mut kept = Vec::with_capacity(bt.entries.len());
+    for e in &bt.entries {
+        let mut outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
+        // A row naming a transaction the block does not contain is a reorg race,
+        // not evidence that its coins are spent: keep the entry rather than cut a
+        // payment on the strength of a block read that disagrees with the index.
+        if opts.unspent_only && by_txid.contains_key(&e.txid) {
+            outs.retain(|o| {
+                source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout })
+            });
+            if outs.is_empty() {
+                cut = true;
+                continue;
+            }
         }
+        let mut kept_entry = e.clone();
+        kept_entry.taproot_outputs = if opts.outputs { outs } else { Vec::new() };
+        kept.push(kept_entry);
     }
+
+    let mut new_bt = bt.clone();
+    new_bt.entries = kept;
     let mut new_env = env.clone();
     new_env.body = NodeEventBody::BlockTweaks(new_bt);
-    Some(new_env)
+    Some((new_env, cut))
 }
 
 /// Map a [`BlockTweaks`] to its proto form under a subscription's filters.
@@ -2929,9 +3026,12 @@ fn block_tweaks_to_proto(
     bt: &node::events::BlockTweaks,
     dust_limit: u64,
     tweaks_only: bool,
+    cut: bool,
 ) -> pb::BlockTweaks {
     use bitcoin::hashes::Hash;
-    let mut filtered = false;
+    // Seeded by the upstream cut-through: entries this block no longer carries
+    // were dropped before the mapper saw them.
+    let mut filtered = cut;
     let entries = bt
         .entries
         .iter()
@@ -3062,7 +3162,9 @@ fn body_to_proto(body: &NodeEventBody) -> pb::node_event::Body {
         // Unfiltered mapping (no dust limit, full entries) — the `Subscribe`
         // path applies per-subscription filters via `block_tweaks_to_proto`;
         // this covers any other conversion site for exhaustiveness.
-        NodeEventBody::BlockTweaks(bt) => Body::BlockTweaks(block_tweaks_to_proto(bt, 0, false)),
+        NodeEventBody::BlockTweaks(bt) => {
+            Body::BlockTweaks(block_tweaks_to_proto(bt, 0, false, false))
+        }
         // The `mempool_tweaks` opt-in and dust floor are applied upstream in the
         // Subscribe live-stream filter (a below-floor or unwanted MempoolTweak is
         // dropped before conversion); this maps the survivor to its full proto
@@ -3285,7 +3387,7 @@ mod tests {
 
     #[test]
     fn block_tweaks_to_proto_unfiltered() {
-        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, false);
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, false, false);
         assert_eq!(pb.height, 100);
         assert!(!pb.filtered, "no dust limit ⇒ not filtered");
         assert_eq!(pb.entries.len(), 2);
@@ -3362,7 +3464,7 @@ mod tests {
     #[test]
     fn block_tweaks_to_proto_dust_limit_sets_filtered() {
         // A floor above the smaller entry drops it and flags `filtered`.
-        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 10_000, false);
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 10_000, false, false);
         assert_eq!(pb.entries.len(), 1, "sub-floor entry dropped");
         assert_eq!(pb.entries[0].max_value, 50_000);
         assert!(pb.filtered, "a dust limit dropped an entry");
@@ -3370,7 +3472,7 @@ mod tests {
 
     #[test]
     fn block_tweaks_to_proto_tweaks_only_strips_fields() {
-        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, true);
+        let pb = block_tweaks_to_proto(&sample_block_tweaks(), 0, true, false);
         assert_eq!(pb.entries.len(), 2);
         for e in &pb.entries {
             assert_eq!(e.tweak.len(), 33, "tweak always present");
@@ -3415,8 +3517,12 @@ mod tests {
 
     /// A block holding one transaction with two taproot outputs (plus a
     /// non-taproot output that must be ignored), and the corresponding empty
-    /// `BlockTweaks` envelope (as the lean index would produce it).
-    fn enrichment_fixture() -> (
+    /// `BlockTweaks` envelope (as the lean index would produce it). `spent` is
+    /// the set the mock source reports as no longer in the UTXO set, so a
+    /// cut-through test can retire outputs one at a time.
+    fn enrichment_fixture(
+        spent: std::collections::HashSet<bitcoin::OutPoint>,
+    ) -> (
         node::events::NodeEvent,
         Arc<dyn node::events::BlockScanSource>,
         bitcoin::Txid,
@@ -3481,49 +3587,68 @@ mod tests {
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(42u32, block);
         let scan: Arc<dyn node::events::BlockScanSource> =
-            Arc::new(MockScanBlocks { tip: 42, blocks });
+            Arc::new(MockScanBlocks { tip: 42, blocks, spent });
         (env, scan, txid)
     }
 
-    #[test]
-    fn enrich_block_tweaks_populates_outputs_from_block() {
-        let (env, scan, _txid) = enrichment_fixture();
-        // Pre-condition: the index-sourced entry has no outputs.
+    /// Options for a subscriber that wants outputs attached and nothing cut.
+    fn outputs_opts(scan: Option<Arc<dyn node::events::BlockScanSource>>) -> TweakServeOpts {
+        TweakServeOpts {
+            dust_limit: 0,
+            tweaks_only: false,
+            outputs: true,
+            unspent_only: false,
+            source: scan,
+        }
+    }
+
+    fn entries_of(env: &node::events::NodeEvent) -> Vec<node::events::SpTweakEntry> {
         match &env.body {
-            NodeEventBody::BlockTweaks(bt) => {
-                assert!(bt.entries[0].taproot_outputs.is_empty())
-            }
-            _ => panic!("expected BlockTweaks"),
-        }
-
-        let enriched =
-            enrich_block_tweaks_outputs(&env, Some(&scan)).expect("BlockTweaks is enriched");
-        match &enriched.body {
-            NodeEventBody::BlockTweaks(bt) => {
-                let outs = &bt.entries[0].taproot_outputs;
-                // Only the two taproot outputs, in vout order (the p2wpkh at
-                // vout 1 is skipped but does not shift vout 2).
-                assert_eq!(outs.len(), 2);
-                assert_eq!(outs[0].vout, 0);
-                assert_eq!(outs[0].value, 4_000);
-                assert_eq!(outs[1].vout, 2);
-                assert_eq!(outs[1].value, 9_000);
-            }
+            NodeEventBody::BlockTweaks(bt) => bt.entries.clone(),
             _ => panic!("expected BlockTweaks"),
         }
     }
 
     #[test]
-    fn enrich_block_tweaks_noop_without_scan_source() {
-        let (env, _scan, _txid) = enrichment_fixture();
-        // No block source ⇒ no enrichment (returns None, carrier uses original).
-        assert!(enrich_block_tweaks_outputs(&env, None).is_none());
+    fn refine_block_tweaks_populates_outputs_from_block() {
+        let (env, scan, _txid) = enrichment_fixture(Default::default());
+        // Pre-condition: the index-sourced entry has no outputs.
+        assert!(entries_of(&env)[0].taproot_outputs.is_empty());
+
+        let (enriched, cut) =
+            refine_block_tweaks(&env, &outputs_opts(Some(scan))).expect("BlockTweaks is enriched");
+        assert!(!cut, "nothing is cut without unspent_only");
+        let outs = &entries_of(&enriched)[0].taproot_outputs;
+        // Only the two taproot outputs, in vout order (the p2wpkh at vout 1 is
+        // skipped but does not shift vout 2).
+        assert_eq!(outs.len(), 2);
+        assert_eq!((outs[0].vout, outs[0].value), (0, 4_000));
+        assert_eq!((outs[1].vout, outs[1].value), (2, 9_000));
     }
 
     #[test]
-    fn enrich_block_tweaks_ignores_non_block_tweaks() {
-        // A non-BlockTweaks body is never enriched, even with a source present.
-        let (_env, scan, _txid) = enrichment_fixture();
+    fn refine_block_tweaks_noop_without_scan_source() {
+        let (env, _scan, _txid) = enrichment_fixture(Default::default());
+        // No block source ⇒ nothing to refine (carrier uses the original).
+        assert!(refine_block_tweaks(&env, &outputs_opts(None)).is_none());
+    }
+
+    #[test]
+    fn refine_block_tweaks_noop_without_a_block_reading_modifier() {
+        let (env, scan, _txid) = enrichment_fixture(Default::default());
+        let opts = TweakServeOpts {
+            outputs: false,
+            unspent_only: false,
+            ..outputs_opts(Some(scan))
+        };
+        // A plain dust-floor subscriber must not pay for a block read.
+        assert!(refine_block_tweaks(&env, &opts).is_none());
+    }
+
+    #[test]
+    fn refine_block_tweaks_ignores_non_block_tweaks() {
+        // A non-BlockTweaks body is never refined, even with a source present.
+        let (_env, scan, _txid) = enrichment_fixture(Default::default());
         let stamp = node::events::EdgeStamp {
             node_id: [1; 16],
             region: None,
@@ -3532,7 +3657,70 @@ mod tests {
             seq: 1,
         };
         let hb = NodeEvent::new(stamp, NodeEventBody::Heartbeat { uptime_ns: 1 });
-        assert!(enrich_block_tweaks_outputs(&hb, Some(&scan)).is_none());
+        assert!(refine_block_tweaks(&hb, &outputs_opts(Some(scan))).is_none());
+    }
+
+    #[test]
+    fn cut_through_keeps_an_entry_with_one_unspent_output() {
+        // vout 0 spent, vout 2 still live: the payment could be the live one, so
+        // the entry survives and carries only the output that is still there.
+        let (env, scan, txid) = enrichment_fixture(Default::default());
+        let spent = [bitcoin::OutPoint { txid, vout: 0 }].into_iter().collect();
+        let (env2, scan2, _) = enrichment_fixture(spent);
+        let _ = (env, scan);
+
+        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(scan2)) };
+        let (refined, cut) = refine_block_tweaks(&env2, &opts).expect("refined");
+        assert!(!cut, "no entry was dropped, so the block is not `filtered`");
+        let outs = &entries_of(&refined)[0].taproot_outputs;
+        assert_eq!(outs.len(), 1, "the spent output is cut from the entry");
+        assert_eq!(outs[0].vout, 2);
+    }
+
+    #[test]
+    fn cut_through_drops_an_entry_whose_outputs_are_all_spent() {
+        let (env, scan, txid) = enrichment_fixture(Default::default());
+        let _ = scan;
+        let spent = [
+            bitcoin::OutPoint { txid, vout: 0 },
+            bitcoin::OutPoint { txid, vout: 2 },
+        ]
+        .into_iter()
+        .collect();
+        let (env2, scan2, _) = enrichment_fixture(spent);
+        let _ = env;
+
+        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(scan2)) };
+        let (refined, cut) = refine_block_tweaks(&env2, &opts).expect("refined");
+        assert!(entries_of(&refined).is_empty(), "nothing left to scan in this block");
+        assert!(cut, "a dropped entry must set the block's `filtered` flag");
+
+        // And the flag survives the proto mapping, which is where a client reads
+        // it: an empty `entries` with `filtered` means "some were removed", not
+        // "this block had none".
+        let opts_proto = TweakServeOpts { unspent_only: true, ..opts };
+        let ev = envelope_to_proto_sp(&refined, &opts_proto, cut);
+        let Some(pb::node_event::Body::BlockTweaks(bt)) = ev.body else {
+            panic!("expected BlockTweaks")
+        };
+        assert!(bt.entries.is_empty());
+        assert!(bt.filtered);
+    }
+
+    #[test]
+    fn cut_through_without_outputs_still_filters_but_carries_none() {
+        // `tweak_unspent_only` alone: the entry survives on its live output, but
+        // a subscriber that did not ask for outputs does not get them.
+        let spent = std::collections::HashSet::new();
+        let (env, scan, _txid) = enrichment_fixture(spent);
+        let opts = TweakServeOpts {
+            outputs: false,
+            unspent_only: true,
+            ..outputs_opts(Some(scan))
+        };
+        let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
+        assert!(!cut);
+        assert!(entries_of(&refined)[0].taproot_outputs.is_empty());
     }
 
     #[tokio::test]
@@ -3560,6 +3748,7 @@ mod tests {
             tweaks_only: None,
             mempool_tweaks: Some(true),
             tweak_outputs: None,
+            tweak_unspent_only: None,
             from_cursor: None,
         });
         let err = match svc.subscribe(req).await {
@@ -3594,6 +3783,7 @@ mod tests {
             tweaks_only: None,
             mempool_tweaks: None,
             tweak_outputs: Some(true),
+            tweak_unspent_only: None,
             from_cursor: None,
         });
         let err = svc.subscribe(req).await.err().expect("must be rejected");
@@ -3627,6 +3817,71 @@ mod tests {
             tweaks_only: None,
             mempool_tweaks: None,
             tweak_outputs: Some(true),
+            tweak_unspent_only: None,
+            from_cursor: None,
+        });
+        let err = svc.subscribe(req).await.err().expect("must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_tweak_unspent_only_without_tweaks_category() {
+        // Cut-through modifies the tweaks category; alone it has nothing to cut.
+        let publisher = EventPublisher::new(edge(), 16);
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 4,
+            block_source: None,
+            scan_source: None,
+            watch_registry: None,
+            tweak_source: None,
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
+        };
+        let req = Request::new(pb::SubscribeRequest {
+            categories: 0,
+            since_seq: None,
+            tweak_dust_limit: None,
+            tweaks_only: None,
+            mempool_tweaks: None,
+            tweak_outputs: None,
+            tweak_unspent_only: Some(true),
+            from_cursor: None,
+        });
+        let err = svc.subscribe(req).await.err().expect("must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(svc.active_subs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_tweak_unspent_only_without_block_source() {
+        // Spentness is tested against outputs re-derived from the block. With no
+        // block source the filter would silently do nothing, and a client that
+        // asked to skip spent coins would quietly scan all of them instead.
+        let publisher = EventPublisher::new(edge(), 16);
+        let sp: Arc<dyn node::index::silent_payments::SpIndex> =
+            Arc::new(MockSp { tip: 5, complete: true });
+        let svc = NodeEventStreamSvc {
+            publisher,
+            active_subs: Arc::new(AtomicUsize::new(0)),
+            max_subscriptions: 4,
+            block_source: None,
+            scan_source: None, // <- the missing block source
+            watch_registry: None,
+            tweak_source: Some(sp),
+            prefix_min_bits: 8,
+            prefix_max_bits: 32,
+        };
+        let req = Request::new(pb::SubscribeRequest {
+            categories: node::events::CATEGORY_TWEAKS,
+            since_seq: None,
+            tweak_dust_limit: None,
+            tweaks_only: None,
+            mempool_tweaks: None,
+            tweak_outputs: None,
+            tweak_unspent_only: Some(true),
             from_cursor: None,
         });
         let err = svc.subscribe(req).await.err().expect("must be rejected");
@@ -4419,6 +4674,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             })
             .await
@@ -4522,6 +4778,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             })
         };
@@ -4717,6 +4974,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -4776,6 +5034,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 4,
                     tx_index: 0,
@@ -4857,6 +5116,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 3,
                     tx_index: 0,
@@ -4938,6 +5198,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             }))
             .await;
@@ -4990,6 +5251,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             }))
             .await
@@ -5005,6 +5267,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             }))
             .await
@@ -5083,6 +5346,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -5146,6 +5410,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -5212,6 +5477,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 0,
                     tx_index: 0,
@@ -5266,6 +5532,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -5311,6 +5578,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: Some(pb::Cursor {
                     height: 2,
                     tx_index: 0,
@@ -5362,6 +5630,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                 from_cursor: None,
             }))
             .await
@@ -6468,6 +6737,7 @@ mod tests {
                 tweaks_only: None,
                 mempool_tweaks: None,
                 tweak_outputs: None,
+                tweak_unspent_only: None,
                     from_cursor: None,
                 }))
                 .await
@@ -6483,6 +6753,8 @@ mod tests {
     struct MockScanBlocks {
         tip: u32,
         blocks: std::collections::HashMap<u32, bitcoin::Block>,
+        /// Outpoints treated as spent by `is_unspent`; everything else is live.
+        spent: std::collections::HashSet<bitcoin::OutPoint>,
     }
 
     impl node::events::BlockCursorSource for MockScanBlocks {
@@ -6504,6 +6776,9 @@ mod tests {
         }
         fn block_undo(&self, _hash: &BlockHash) -> Option<node::storage::undo::UndoData> {
             None
+        }
+        fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool {
+            !self.spent.contains(outpoint)
         }
     }
 
@@ -6547,7 +6822,7 @@ mod tests {
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(3u32, block3);
         let scan_source: Arc<dyn node::events::BlockScanSource> =
-            Arc::new(MockScanBlocks { tip: 5, blocks });
+            Arc::new(MockScanBlocks { tip: 5, blocks, spent: Default::default() });
 
         let sink = GrpcEventSink::bind(
             "127.0.0.1:0",

@@ -803,6 +803,33 @@ serves under the existing `stream:subscribe` capability.
   floor and sets `filtered = true`; `tweaks_only` strips `txid`/`max_value`,
   leaving the 33-byte tweak alone. Both apply per subscription, on live and
   replayed events alike.
+- **Cut-through (`tweak_unspent_only`).** Drops entries whose taproot outputs are
+  **all** already spent on the confirmed chain, and — with `tweak_outputs` — keeps
+  only the still-unspent outputs on the entries that survive. An entry with one
+  spent and one live output survives on the live one: cut-through never decides
+  that a coin is not yours, only that a coin is gone. Dropped entries set
+  `filtered = true`, like the dust floor. It is a modifier on the `tweaks`
+  category (`INVALID_ARGUMENT` without bit 8) and, because the outputs whose
+  spentness is tested are re-derived from the block, it needs a block source
+  (`FAILED_PRECONDITION` without one).
+
+  **This is a balance scan, not a restore.** Spentness is a live UTXO-set test at
+  serve time, not "was it spent as of this height": a coin received at height `H`
+  and spent at `H+100` is absent from a scan of `H` that runs after `H+100`. A
+  wallet reconstructing transaction history must leave the flag off, or its
+  history will be missing every coin it has already spent. What the flag buys is
+  the cold sync a phone actually wants — the taproot era minus the coins that no
+  longer exist — at the cost of one block read per event, the same read
+  `tweak_outputs` already pays for.
+
+  Two edges are deliberate. A block that cannot be read (pruned, or missing)
+  serves the entries **unfiltered** rather than failing: a superset costs the
+  client redundant ECDH, while an error would end the scan. And a reorg that
+  un-spends an output does not retract anything already served — the client
+  re-anchors on the `(block_hash, height)` it holds and rescans the affected
+  range, as it does for any reorg. `MempoolTweak` is never cut through: its
+  outputs are unconfirmed, so no confirmed UTXO set contains them, and filtering
+  on that would drop every mempool tweak.
 - **Outputs (`tweak_outputs`).** Off by default the confirmed firehose is lean —
   a `BlockTweaks` `TweakEntry` carries no `taproot_outputs`, and a client that
   wants to confirm a candidate fetches the block (which it holds or can request).

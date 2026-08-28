@@ -137,6 +137,17 @@ pub trait BlockScanSource: BlockCursorSource {
     /// order), or `None` if not held. Needed only when a script or prefix is
     /// watched; the caller skips fetching it otherwise.
     fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData>;
+
+    /// Whether `outpoint` is still unspent on the confirmed chain **right now**
+    /// — a live UTXO-set membership test, not a historical one. Backs the
+    /// silent-payment cut-through filter, whose whole point is "is this coin
+    /// still there at the moment I am serving it".
+    ///
+    /// Deliberately has no default: a `true`-by-default implementation would
+    /// turn cut-through into a silent no-op on any source that forgot to
+    /// override it, and the caller cannot tell that apart from a chain where
+    /// nothing is spent.
+    fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool;
 }
 
 impl BlockScanSource for crate::chain::state::ChainState {
@@ -146,6 +157,13 @@ impl BlockScanSource for crate::chain::state::ChainState {
 
     fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
         self.get_undo(hash)
+    }
+
+    fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool {
+        // Membership in the UTXO set *is* unspentness: a connected spend removes
+        // the coin in the same batch that connects the block, and a disconnect
+        // restores it from undo.
+        self.get_coin(outpoint).is_some()
     }
 }
 
@@ -607,6 +625,10 @@ mod tests {
         }
         fn block_undo(&self, _hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
             None
+        }
+        // No bodies, so no outputs to ask about; range planning never calls this.
+        fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
+            false
         }
     }
 
