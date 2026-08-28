@@ -202,8 +202,9 @@ What it absorbs:
   is persisted only when you call `next()` again — an implicit ack — so the store
   never advances past an event you have not finished handling, and a crash
   mid-processing replays it. That makes delivery **at-least-once, not
-  at-most-once**: dedup on your side if you need exactly-once. `flush_cursor()`
-  commits the pending anchor before a clean shutdown.
+  at-most-once**: dedup on your side if you need exactly-once. `commit()` writes
+  the pending anchor before a clean shutdown, so the last event handled is not
+  replayed on the next start.
 - **Lag recovery.** Under the default `LagPolicy::AutoResume`, a `Lagged`
   notice becomes a reconnect from its `resume_cursor`. `LagPolicy::Surface`
   hands the notice to you instead.

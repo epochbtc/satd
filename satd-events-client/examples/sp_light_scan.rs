@@ -30,8 +30,8 @@
 //! A mempool hit and its later confirmed hit share a txid, so a real scanner
 //! dedups on `entry.txid`.
 //!
-//! **Resume is durable, and the SDK owns the hard part.** The scan runs under
-//! [`ResilientSubscription`] with a [`FileCursorStore`], which persists each
+//! **Resume is durable, and the SDK owns the hard part.** The scan runs under a
+//! `ResilientSubscription` with a `FileCursorStore`, which persists each
 //! block's cursor **commit-on-poll**: the write happens when this loop comes back
 //! for the next event — that is, only once the block it belongs to has been
 //! scanned. A crash mid-block replays that block instead of skipping it. Getting
