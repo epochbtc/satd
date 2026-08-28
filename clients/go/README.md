@@ -137,7 +137,7 @@ Each is a runnable program in [`examples/`](examples/) — `go run ./firehose_ta
 | `health_watch` | node-health alerting, including why silence must be a deadline |
 | `prefix_privacy` | register a coarse bucket, filter locally; the node never sees your scripts |
 | `sp_wallet` | BIP 352 scan-key watch (Tier 2) — node matches, you derive the spend key |
-| `sp_light_scan` | BIP 352 client-side scan (Tier 1) — the scan key never leaves the device |
+| `sp_light_scan` | BIP 352 client-side scan (Tier 1) — the scan key never leaves the device; durable cold-sync cursor |
 | `tls_tail` | TLS, pinning a self-signed node CA |
 | `mtls_tail` | mutual TLS against `eventsgrpcmtls=1` |
 

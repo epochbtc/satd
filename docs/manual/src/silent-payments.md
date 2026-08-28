@@ -175,17 +175,25 @@ The shipped SDK examples are the reference implementations —
 (Rust) and
 [`sp_light_scan`](https://github.com/epochbtc/satd/blob/master/clients/go/examples/sp_light_scan)
 (Go) — each a complete scanner in one file: subscribe, ECDH, label handling,
-in-band output confirmation. The shape, in Rust:
+in-band output confirmation, and a restart-durable resume cursor. The shape, in
+Rust:
 
 ```rust,ignore
-let mut stream = client
-    .subscribe(SubscribeOptions {
-        categories: Categories::TWEAKS,   // bit 8 — never implied by "all"
-        mempool_tweaks: true,             // Tier 1.5: detect at admission
-        tweak_outputs: true,              // confirm matches in-band
-        ..Default::default()
-    })
-    .await?;
+let opts = SubscribeOptions {
+    categories: Categories::TWEAKS,   // bit 8 — never implied by "all"
+    mempool_tweaks: true,             // Tier 1.5: detect at admission
+    tweak_outputs: true,              // confirm matches in-band
+    // Cold-start anchor, used only when the cursor file is empty. A cursor
+    // names the last height already done, so `activation - 1` scans the
+    // activation block itself.
+    from_cursor: Some(Cursor { height: 709_631, ..Default::default() }),
+    ..Default::default()
+};
+let mut sub = client.resilient_subscribe(
+    opts,
+    ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(path))),
+);
+while let Ok(event) = sub.next().await { /* scan, then poll again */ }
 ```
 
 For each `TweakEntry`, the wallet computes locally, per BIP 352:
@@ -206,8 +214,21 @@ entirely on the device.
 
 Cold-sync is the same subscription with a `from_cursor` at taproot activation;
 the replay is unclamped, index-backed, and ends in-band on any storage error
-rather than skipping a height. Store the cursor from each event and resume from
-it after any disconnect.
+rather than skipping a height.
+
+The resume anchor to persist is the cursor of the last event you have **finished
+scanning**, not the last one delivered — a cursor written ahead of the work it
+stands for turns a crash into a silently skipped block, and for a scanner a
+skipped block is a missed payment. Both SDKs get this right for you: a
+`ResilientSubscription` with a `CursorStore` commits **on poll**, writing an
+event's cursor only when you come back for the next one, so an interrupted scan
+replays its last block instead of stepping over it. Use that rather than
+hand-rolling persistence around the raw stream; both reference examples do
+([`sp_light_scan.rs`](https://github.com/epochbtc/satd/blob/master/satd-events-client/examples/sp_light_scan.rs),
+[`sp_light_scan`](https://github.com/epochbtc/satd/blob/master/clients/go/examples/sp_light_scan)).
+The mirror-image slip — persisting the *previous* event's cursor — costs only a
+repeated scan, and has shipped in a production wallet
+([cake_wallet#3574](https://github.com/cake-tech/cake_wallet/issues/3574)).
 
 ## Walkthrough: a thin client with a registered scan key (Tier 2)
 

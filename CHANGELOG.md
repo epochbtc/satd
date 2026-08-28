@@ -15,6 +15,15 @@ Bound for **0.5.1**, a patch release on the 0.5.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
+### Changed
+- The BIP 352 client-side scan examples (Rust and Go) now run under the SDKs'
+  `ResilientSubscription` with a file-backed cursor store, so an interrupted scan
+  resumes where it stopped instead of rescanning from its start height, and take a
+  cold-sync start height as an argument
+- The Silent Payments and Rust SDK manual chapters state the commit-on-poll cursor
+  contract the SDKs implement: persist the cursor of the last event you finished
+  processing, never the one you were handed
+
 ### Fixed
 - A mined or submitted block that was stored without connecting (a sibling won
   the race) no longer purges the mempool or reports a confirming height; every

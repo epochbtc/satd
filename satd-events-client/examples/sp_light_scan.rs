@@ -30,15 +30,36 @@
 //! A mempool hit and its later confirmed hit share a txid, so a real scanner
 //! dedups on `entry.txid`.
 //!
+//! **Resume is durable, and the SDK owns the hard part.** The scan runs under
+//! [`ResilientSubscription`] with a [`FileCursorStore`], which persists each
+//! block's cursor **commit-on-poll**: the write happens when this loop comes back
+//! for the next event — that is, only once the block it belongs to has been
+//! scanned. A crash mid-block replays that block instead of skipping it. Getting
+//! this backwards is how a scanner silently loses a payment: persist the cursor of
+//! an event you have not finished processing and a restart resumes past it. (The
+//! opposite slip — persisting one event *behind* — only costs a rescan, and is a
+//! real bug in a shipped wallet: cake-tech/cake_wallet#3574.) Do not hand-roll it;
+//! the safe side of that trade is already implemented here.
+//!
+//! **Cold sync.** Give a start height as the third argument and, when the cursor
+//! file is empty, the scan begins there — taproot activation (709632 on mainnet)
+//! for a fresh wallet, which the server replays in one unclamped, backpressured
+//! subscription. Once the file holds a cursor it wins, so the argument is a seed
+//! for the first run only and is harmless to leave in place.
+//!
 //! Requires the default `bitcoin` feature.
 //!
 //! ```sh
-//! cargo run -p satd-events-client --example sp_light_scan -- http://127.0.0.1:50051
+//! cargo run -p satd-events-client --example sp_light_scan -- \
+//!     http://127.0.0.1:50051 /tmp/satd-sp.cursor 709632
 //! ```
+
+use std::sync::Arc;
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use satd_events_client::{
-    display_hex, Categories, Event, StreamClient, SubscribeOptions, TweakEntry,
+    display_hex, Categories, Cursor, Event, FileCursorStore, ResilientConfig, StreamClient,
+    SubscribeOptions, TweakEntry,
 };
 
 /// How many outputs per transaction to probe (`k = 0..N`). A real scanner keeps
@@ -52,9 +73,17 @@ const LABELS: &[u32] = &[0];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    let mut args = std::env::args().skip(1);
+    let endpoint = args.next().unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    let cursor_path = args.next().unwrap_or_else(|| "/tmp/satd-sp.cursor".into());
+    // First height to scan on a cold start. A cursor names the last height
+    // already *done*, so anchoring at `h - 1` makes `h` itself the first block
+    // replayed — pass 709632 (mainnet taproot activation) and block 709632 is
+    // scanned, not skipped.
+    let from_height: Option<u32> = match args.next() {
+        Some(h) => Some(h.parse::<u32>()?.saturating_sub(1)),
+        None => None,
+    };
 
     // Your keys never leave this process. `b_spend` is public-derived once.
     let secp = Secp256k1::new();
@@ -62,24 +91,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b_spend = SecretKey::from_slice(&[0x22; 32])?;
     let spend_pubkey = PublicKey::from_secret_key(&secp, &b_spend);
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
     // Request ONLY the tweaks category (bit 8, explicit — not in the default),
     // opt into mempool-time tweaks so payments surface at admission too, and set
     // `tweak_outputs` so confirmed `BlockTweaks` entries carry the transaction's
     // taproot outputs as well. With that, both streams confirm a match in-band —
     // no block/tx fetch. (A `MempoolTweak` carries its outputs regardless; drop
     // `tweak_outputs` and the block path falls back to the candidate key below.)
-    let mut events = client
-        .subscribe(SubscribeOptions {
-            categories: Categories::TWEAKS,
-            mempool_tweaks: true,
-            tweak_outputs: true,
+    let opts = SubscribeOptions {
+        categories: Categories::TWEAKS,
+        mempool_tweaks: true,
+        tweak_outputs: true,
+        // Seed only: the persisted cursor wins whenever the store has one, so
+        // this anchor is used on a first run and never again.
+        from_cursor: from_height.map(|height| Cursor {
+            height,
             ..Default::default()
-        })
-        .await?;
+        }),
+        ..Default::default()
+    };
+    // The file-backed store is what makes a restart resume rather than rescan
+    // from scratch, and commit-on-poll is what makes it resume *safely*.
+    let mut sub = client.resilient_subscribe(
+        opts,
+        ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(cursor_path))),
+    );
 
-    while let Some(event) = events.message().await? {
-        match event {
+    // `next()` reconnects and replays underneath, and commits the previous
+    // event's cursor on the way in. It returns `Err` only on a permanent failure.
+    loop {
+        match sub.next().await? {
             // Confirmed: one entry per SP-eligible tx in the connected block.
             Event::BlockTweaks { height, entries, .. } => {
                 for entry in &entries {
@@ -91,10 +132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::MempoolTweak { entry } => {
                 scan_entry(&secp, &b_scan, &spend_pubkey, &b_spend, &entry, "mempool")?;
             }
+            // Tweak replay is unclamped, so a scanner should never see this. If it
+            // ever does, blocks went unscanned — for a wallet that is missed money,
+            // not a warning. Stop rather than continue with a hole in the history.
+            Event::ReplayGap { resume_height, first_height } => {
+                return Err(format!(
+                    "replay gap: blocks ({resume_height}, {first_height}) were never scanned; \
+                     rescan that range before trusting this wallet's balance"
+                )
+                .into());
+            }
             _ => {}
         }
     }
-    Ok(())
 }
 
 /// Run the client-side scan over one tweak entry, printing each candidate. Shared
