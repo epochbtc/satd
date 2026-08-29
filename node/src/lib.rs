@@ -15,6 +15,7 @@ pub mod rpc;
 pub mod shutdown;
 pub mod stall_watchdog;
 pub mod startup_progress;
+pub mod time;
 pub mod storage;
 pub mod validation;
 pub mod warnings;

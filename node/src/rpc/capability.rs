@@ -43,9 +43,16 @@ const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// (unknown) methods — needs `rpc:write`. Fail-closed: an unknown method can
 /// never be reached by a read-only token.
 fn required_capability(method: &str) -> Capability {
-    match classify(method) {
-        Some(RpcAccess::Read) => Capability::RpcRead,
-        _ => Capability::RpcWrite,
+    match method {
+        // Moving the node clock reaches the future-block check, mempool expiry
+        // and block-template timestamps, so it is carved out of `rpc:write`
+        // and must be granted on its own. The operator principal (cookie /
+        // rpcauth) holds every capability and is unaffected.
+        "setmocktime" => Capability::TestClock,
+        _ => match classify(method) {
+            Some(RpcAccess::Read) => Capability::RpcRead,
+            _ => Capability::RpcWrite,
+        },
     }
 }
 

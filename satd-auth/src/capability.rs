@@ -24,17 +24,25 @@ pub enum Capability {
     StreamWatch,
     /// MCP tool access (serialized as the wildcard `mcp:*`).
     McpAll,
+    /// Move the node clock via `setmocktime` (regtest only).
+    ///
+    /// Deliberately *not* implied by [`Capability::RpcWrite`]: shifting the
+    /// clock reaches the future-block check, mempool expiry and block-template
+    /// timestamps, so a token handed out for ordinary writes should not carry
+    /// it. Must be granted explicitly in `auth.toml`.
+    TestClock,
 }
 
 /// Every capability, in bit order. The single source of truth used to derive
 /// [`CapabilitySet::ALL`] and to render a set for logging.
-const ALL_CAPS: [Capability; 6] = [
+const ALL_CAPS: [Capability; 7] = [
     Capability::RpcRead,
     Capability::RpcWrite,
     Capability::EsploraRead,
     Capability::StreamSubscribe,
     Capability::StreamWatch,
     Capability::McpAll,
+    Capability::TestClock,
 ];
 
 impl Capability {
@@ -47,6 +55,7 @@ impl Capability {
             Capability::StreamSubscribe => "stream:subscribe",
             Capability::StreamWatch => "stream:watch",
             Capability::McpAll => "mcp:*",
+            Capability::TestClock => "test:clock",
         }
     }
 
@@ -92,7 +101,8 @@ impl CapabilitySet {
                 | Capability::EsploraRead.bit()
                 | Capability::StreamSubscribe.bit()
                 | Capability::StreamWatch.bit()
-                | Capability::McpAll.bit(),
+                | Capability::McpAll.bit()
+                | Capability::TestClock.bit(),
         )
     };
 

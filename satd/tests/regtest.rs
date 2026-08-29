@@ -12549,3 +12549,140 @@ fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
     let msg = r["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("verbosity 2"), "{r}");
 }
+
+/// `setmocktime` moves the node clock that block templates, the future-block
+/// check and mempool expiry all read. Core gates it to a mockable chain —
+/// regtest alone — and satd matches that; on top, satd carves it out of
+/// `rpc:write` so a delegated bearer token cannot move the clock.
+#[test]
+fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
+    use std::io::Write as _;
+
+    // A token with full *write* capability — but not `test:clock`.
+    const TOKEN: &str = "satd-test-writeclock-token-v1";
+    const TOKEN_SHA256: &str =
+        "8c98a1aa21c891f07ed6b8eac4c1931d880b0dc8921ded96c80d6986f62feef6";
+
+    let dir = fresh_test_datadir("satd-mocktime-it");
+    let authfile = dir.join("auth.toml");
+    {
+        let mut f = std::fs::File::create(&authfile).unwrap();
+        f.write_all(
+            format!(
+                "version = 1\n[[token]]\nid = \"rw\"\nhash = \"sha256:{TOKEN_SHA256}\"\n\
+                 capabilities = [\"rpc:read\", \"rpc:write\"]\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&authfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let node = TestNode::start(&[
+        &format!("--authfile={}", authfile.display()),
+        "--rpcauthbearer=1",
+    ]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    let mine = |n: u64| -> serde_json::Value {
+        node.rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(n), serde_json::json!(addr)],
+        )
+        .unwrap()
+    };
+    let block_time = |hash: &str| -> u64 {
+        node.rpc_call_with_params("getblock", vec![serde_json::json!(hash)]).unwrap()["result"]
+            ["time"]
+            .as_u64()
+            .unwrap()
+    };
+
+    // A mocked clock has to reach the block template, or the framework's whole
+    // reason for calling this (deterministic block timestamps) is defeated.
+    // A time in the past (2017): after the regtest genesis so the template
+    // takes it, and behind real time so un-mocking moves the clock *forward*.
+    // Mocking into the future instead would leave the tip beyond the real
+    // clock's 2h future-block window, and the next block would be correctly
+    // rejected as time-too-new.
+    const MOCK: u64 = 1_500_000_000;
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(MOCK)])
+        .unwrap();
+    let hash = mine(1)["result"][0].as_str().unwrap().to_string();
+    assert_eq!(
+        block_time(&hash),
+        MOCK,
+        "block template must timestamp at the mocked time"
+    );
+
+    // Core spells "stop mocking" as timestamp 0; the clock must come back.
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(0)])
+        .unwrap();
+    let hash = mine(1)["result"][0].as_str().unwrap().to_string();
+    assert!(
+        block_time(&hash) > MOCK,
+        "clock should be back on real time, got {}",
+        block_time(&hash)
+    );
+
+    // Core's range check, with Core's message shape. -8 here and only here:
+    // Core reports the range error as RPC_INVALID_PARAMETER but the
+    // wrong-chain refusal as RPC_MISC_ERROR (-1), so the two must not share a
+    // code. (The wrong-chain path itself is covered by
+    // `time::tests::only_regtest_has_a_mockable_clock` — this harness only
+    // ever starts regtest nodes.)
+    for bad in [serde_json::json!(-1), serde_json::json!(9_223_372_037i64)] {
+        let resp = node.rpc_call_with_params("setmocktime", vec![bad.clone()]).unwrap();
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "for {bad}: got {resp}");
+    }
+
+    // The largest in-range value is accepted, so the bound is inclusive as
+    // Core's is. Clear it again immediately: a tip stamped from a far-future
+    // mock cannot be un-mined, and every later template would be time-too-new.
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(9_223_372_036i64)])
+        .unwrap();
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(0)]).unwrap();
+
+    // The carve-out: a token that may send transactions and manage the node
+    // still may not move the clock, because `test:clock` is not implied by
+    // `rpc:write` and this authfile does not grant it.
+    let url = format!("http://127.0.0.1:{}/", node.rpcport);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let resp: serde_json::Value = client
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": "setmocktime", "params": [MOCK],
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32004),
+        "an rpc:write token must be denied the clock: {resp}"
+    );
+
+    // ...while the same token can still do ordinary writes, proving the denial
+    // is the capability carve-out and not a broken token.
+    let resp: serde_json::Value = client
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "t", "method": "getblockcount", "params": [],
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(resp.get("result").is_some(), "token still works: {resp}");
+}

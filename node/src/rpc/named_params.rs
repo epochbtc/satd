@@ -183,15 +183,12 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "savemempool" => &[],
         "sendrawtransaction" => &[("hexstring", false), ("maxfeerate|allowquarantined", false), ("maxburnamount", false)],
         "setban" => &[("subnet", false), ("command", false), ("bantime", false), ("absolute", false)],
+        "setmocktime" => &[("timestamp", false)],
         "setnetworkactive" => &[("state", false)],
         "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
         "stop" => &[("wait", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
         "submitheader" => &[("hexdata", false)],
-        // satd's `register_subscription` pair. jsonrpsee owns the
-        // subscription-id argument on the unsubscribe side, and Core has no
-        // equivalent methods, so neither declares a nameable parameter --
-        // but both still need a row so the startup audit stays meaningful.
         "subscribemempool" => &[],
         "testmempoolaccept" => &[("rawtxs", false), ("maxfeerate", false)],
         "unsubscribemempool" => &[],

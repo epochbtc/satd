@@ -101,10 +101,9 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     // IBD heuristic: if tip is more than 24 hours behind wall clock, we're
     // in IBD. Shares one definition with the per-block flush gate in
     // `ChainState` (see `tip_time_is_ibd` / issue #262).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Node clock, for the same reason as `tip_time_is_ibd`, which this is
+    // reported alongside.
+    let now = crate::time::now_secs();
     let is_ibd = ChainState::tip_time_is_ibd(time as u32);
 
     json!({
@@ -147,10 +146,10 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         .map(|entry| (target_to_difficulty(entry.header.bits), entry.header.time as u64))
         .unwrap_or((0.0, 0));
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Node clock, matching `ChainState::tip_time_is_ibd`: both sides of this
+    // comparison have to be on the same clock or a mocked chain reports itself
+    // as syncing forever.
+    let now = crate::time::now_secs();
     let is_ibd = time + 86400 < now;
     let verificationprogress = if is_ibd && now > 0 {
         time as f64 / now as f64

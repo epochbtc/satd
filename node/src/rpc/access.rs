@@ -173,7 +173,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // mempool *policy* mutation (mining priority), not a submit
         | "prioritisetransaction"
         // operational flush of the mempool to disk
-        | "savemempool" => Control,
+        | "savemempool"
+        // moves the node clock on a mockable chain (regtest); additionally
+        // gated on the `test:clock` capability, which `rpc:write` does not imply
+        | "setmocktime" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,
@@ -248,6 +251,7 @@ mod tests {
             "getblockfrompeer",
             "prioritisetransaction",
             "savemempool",
+            "setmocktime",
             "backfillindex",
             "pauseindex",
             "resumeindex",

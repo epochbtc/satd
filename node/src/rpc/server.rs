@@ -1637,6 +1637,7 @@ pub async fn start(
             "savemempool",
             "sendrawtransaction",
             "setban",
+            "setmocktime",
             "signrawtransactionwithkey",
             "setnetworkactive",
             "stop",
@@ -1649,6 +1650,49 @@ pub async fn start(
             "verifychain",
         ];
         Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+    })?;
+
+    // Core gates this to a "mockable chain", which in Core is regtest alone --
+    // mainnet, testnet3, testnet4 and signet all set m_is_mockable_chain
+    // false. satd matches that, with Core's message, so a node off regtest
+    // behaves exactly as bitcoind would. satd adds one further restriction on
+    // top: `test:clock` is not implied by `rpc:write`, so a delegated bearer
+    // token cannot move the clock even on regtest unless the authfile grants
+    // it. The cookie/rpcauth operator has every capability, which is what lets
+    // the test harness drive it.
+    module.register_method("setmocktime", |params, ctx, _extensions| {
+        if !crate::time::clock_is_mockable(ctx.chain_state.network) {
+            // -1 (RPC_MISC_ERROR), not -8: Core throws a bare
+            // `std::runtime_error` here, which its dispatcher converts to
+            // RPC_MISC_ERROR. Only the range check below is
+            // RPC_INVALID_PARAMETER. A Core-derived test asserting -1 would
+            // otherwise fail against satd for the wrong reason.
+            return Err(ErrorObjectOwned::owned(
+                -1,
+                "setmocktime is for regression testing (-regtest mode) only",
+                None::<()>,
+            ));
+        }
+        let mut seq = params.sequence();
+        let timestamp: i64 = seq.next().map_err(|e| {
+            ErrorObjectOwned::owned(-8, format!("Invalid timestamp: {e}"), None::<()>)
+        })?;
+        // Core's bound is the largest second representable as nanoseconds.
+        const MAX_MOCK_TIME: i64 = i64::MAX / 1_000_000_000;
+        if !(0..=MAX_MOCK_TIME).contains(&timestamp) {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!("Mocktime must be in the range [0, {MAX_MOCK_TIME}], not {timestamp}."),
+                None::<()>,
+            ));
+        }
+        // Core spells "stop mocking" as timestamp 0.
+        crate::time::set_mock_time(if timestamp == 0 {
+            None
+        } else {
+            Some(timestamp as u64)
+        });
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
     module.register_method("uptime", |_params, ctx, _extensions| {

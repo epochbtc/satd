@@ -15,6 +15,8 @@ provided here. That is a deliberately short list:
   3. Turning off satd-only surfaces. The Esplora REST server is on by default
      on a fixed port, so two nodes on one machine would collide on it. Nothing
      Core implements is touched.
+  4. An empty `wallets/` directory, which Core always has and the cache builder
+     removes. satd has no wallet to create it.
 
 What the shim deliberately does NOT do: translate, drop, or invent node
 options. satd accepts Core's spelling directly, and skips
@@ -121,6 +123,12 @@ def main() -> int:
     chain = parse_chain(argv, datadir)
     chain_dir = datadir / CHAIN_DIRS.get(chain, chain)
     chain_dir.mkdir(parents=True, exist_ok=True)
+    # 4. An empty `wallets/` directory. Core always creates one and the
+    #    framework's cache builder rmdir()s it unconditionally while stripping
+    #    the datadir down to blocks/chainstate. satd has no wallet, so there is
+    #    nothing to create it. This is a property of the *process* layout, not
+    #    of node behaviour, which is why it belongs here.
+    (chain_dir / "wallets").mkdir(exist_ok=True)
     debug_log = chain_dir / "debug.log"
 
     args = [satd_binary()] + argv
