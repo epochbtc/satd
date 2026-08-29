@@ -130,7 +130,7 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
         // `version < 190000`, so anything advertising sub-0.19 here
         // breaks every Core-compat client.
         "version": 280000,
-        "subversion": crate::USER_AGENT,
+        "subversion": crate::user_agent(),
         "protocolversion": 70016,
         "localservices": "0000000000000409",
         "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED"],

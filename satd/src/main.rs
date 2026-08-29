@@ -168,6 +168,11 @@ async fn main() {
         }
     };
 
+    // Install the user agent (built from -uacomment, already validated during
+    // config load) before anything can advertise or report it: peers read it
+    // from the version message and getnetworkinfo reports it as `subversion`.
+    node::set_user_agent(config.user_agent.clone());
+
     // Install `-testactivationheight` overrides (regtest only, enforced by
     // config) before anything touches validation. Infallible here: this is
     // the process's only call site and it runs once.

@@ -802,6 +802,9 @@ pub struct Config {
     #[allow(dead_code)]
     pub timeout: u64,
     pub addnode: Vec<String>,
+    /// The BIP 14 user agent this node advertises, already built from
+    /// `-uacomment` and validated. Installed process-wide by `main.rs`.
+    pub user_agent: String,
     /// One-shot seed peers (Bitcoin Core's `-seednode`, repeatable).
     /// Connected at startup to bootstrap peer discovery, across all
     /// networks (unlike `signet_seed_nodes`, which is signet-only).
@@ -3196,6 +3199,17 @@ impl Config {
                 }
                 nodes
             },
+            user_agent: {
+                // Repeatable, and CLI wins over the config file wholesale
+                // rather than merging -- same rule as -addnode above.
+                let mut comments = cli.uacomment;
+                if comments.is_empty() {
+                    comments = file_get_all("uacomment");
+                }
+                // Rejected here so a bad comment is a startup error with
+                // Core's own wording, not a silently-dropped option.
+                node::format_user_agent(&comments)?
+            },
             seednode: {
                 let mut nodes = cli.seednode;
                 if nodes.is_empty() {
@@ -4813,6 +4827,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "COMMENT",
+        help = "Append a comment to the user agent string (repeatable)"
+    )]
+    pub uacomment: Vec<String>,
+
+    #[arg(
+        long,
         value_name = "ADDR",
         help = "Connect to a node to retrieve peer addresses (repeatable). All networks."
     )]
@@ -6415,6 +6436,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bind",
     "connect",
     "addnode",
+    "uacomment",
     "seednode",
     "maxconnections",
     "maxinboundperip",
@@ -7687,10 +7709,18 @@ bind=127.0.0.1:9002
                 .collect(),
         );
         let (kept, warnings) = filter_unsupported_core_cli_args(args).expect("no fatal key");
-        assert_eq!(kept, vec!["satd".to_string(), "--datadir=/tmp/x".to_string()]);
-        assert_eq!(warnings.len(), 3, "got: {warnings:?}");
+        // -uacomment is implemented, so it survives the filter rather than
+        // being warned about and dropped.
+        assert_eq!(
+            kept,
+            vec![
+                "satd".to_string(),
+                "--datadir=/tmp/x".to_string(),
+                "--uacomment=node0".to_string(),
+            ]
+        );
+        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("fallbackfee")));
-        assert!(warnings.iter().any(|w| w.contains("uacomment")));
         // The surviving args must still parse.
         assert!(CliArgs::try_parse_from(kept).is_ok());
     }
@@ -8570,6 +8600,7 @@ testactivationheight=bip34@2
             bind: Vec::new(),
             timeout: None,
             addnode: vec![],
+            uacomment: vec![],
             seednode: vec![],
             dns: None,
             dnsseed: None,
@@ -8856,6 +8887,7 @@ testactivationheight=bip34@2
             bind: Vec::new(),
             timeout: None,
             addnode: vec![],
+            uacomment: vec![],
             seednode: vec![],
             dns: None,
             dnsseed: None,

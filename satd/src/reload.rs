@@ -665,6 +665,11 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("whitebind", whitebind),
         restart!("asmap", asmap),
         restart!("port", port),
+        // The user agent rides in the version message, which is sent once per
+        // connection at handshake time. A live change would apply only to
+        // peers connected afterwards, leaving two different advertised
+        // identities on one node.
+        restart!("uacomment", user_agent),
         restart!("bind", binds),
         live_delta!("connect", connect, |old, new, h| dial_added_peers(
             &old.connect,

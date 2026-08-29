@@ -1311,6 +1311,42 @@ fn test_two_nodes_connect() {
 }
 
 #[test]
+fn uacomment_appends_to_the_advertised_user_agent() {
+    // -uacomment was accepted and ignored. Beyond losing the operator's label,
+    // that made every satd node on a host advertise an identical subversion,
+    // which is how Bitcoin Core's test framework tells two nodes apart when it
+    // connects them.
+    let node = TestNode::start(&["--uacomment=testnode0", "--uacomment=foo"]);
+    let info = node.rpc_call("getnetworkinfo").unwrap();
+    let subver = info["result"]["subversion"].as_str().unwrap();
+    assert!(
+        subver.ends_with("(testnode0; foo)/"),
+        "comments should be joined into one paren group: {subver}"
+    );
+    assert!(subver.starts_with("/satd:"), "{subver}");
+    drop(node);
+}
+
+#[test]
+fn an_unsafe_uacomment_is_refused_at_startup() {
+    // The user agent's own delimiters must not be forgeable from a comment,
+    // and the failure has to be loud: an ignored -uacomment is how the
+    // identical-subversion problem above went unnoticed.
+    for unsafe_char in ["/", ":", "(", ")"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
+            .args(["--regtest", &format!("--uacomment={unsafe_char}")])
+            .output()
+            .expect("spawn satd");
+        assert!(!out.status.success(), "satd should refuse -uacomment={unsafe_char}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("User Agent comment ({unsafe_char}) contains unsafe characters.")),
+            "unexpected stderr for -uacomment={unsafe_char}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn peers_exchange_keepalive_pings_without_being_asked() {
     // Regression: satd had a `ping` RPC and answered an inbound ping, but
     // nothing ever sent one on its own -- `ping_all()`'s only caller was the
