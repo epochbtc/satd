@@ -122,7 +122,19 @@ impl CursorStore for FileCursorStore {
         // lost. Either way a power loss resurrects the previous cursor — or an
         // empty file — and surviving exactly that is the store's whole purpose.
         let res = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
+            // 0600: this file records how far a wallet has scanned, which on a
+            // shared machine says a silent-payment wallet lives here and when it
+            // last ran. `File::create` would leave it at 0644 under the usual
+            // umask; the Go store already sets 0600, and the two must not
+            // disagree about a privacy property.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             f.write_all(line.as_bytes())?;
             f.sync_all()?;
             drop(f);
@@ -626,6 +638,30 @@ impl ResilientSubscription {
 
 #[cfg(test)]
 mod tests {
+    /// The cursor file records how far a wallet has scanned. On a shared host a
+    /// world-readable one tells every other user that a silent-payment wallet
+    /// lives here and when it last ran, so the mode is part of the contract —
+    /// and it has to match the Go store, which sets 0600.
+    #[cfg(unix)]
+    #[test]
+    fn file_cursor_store_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "satd-cursor-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("scan.cursor");
+        let store = FileCursorStore::new(&path);
+        store
+            .save(Cursor { height: 7, ..Default::default() })
+            .expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "cursor file must not be group- or world-readable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

@@ -119,8 +119,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `next()` reconnects and replays underneath, and commits the previous
     // event's cursor on the way in. It returns `Err` only on a permanent failure.
+    //
+    // Ctrl-C races the poll so the shutdown can commit. Commit-on-poll leaves the
+    // event handled last still pending, so without this the next start replays
+    // it. At-least-once is the design and a repeat is harmless — but a clean exit
+    // is where a wallet should spend the one write to avoid it.
     loop {
-        match sub.next().await? {
+        let next = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                sub.commit()?;
+                return Ok(());
+            }
+            ev = sub.next() => ev?,
+        };
+        match next {
             // Confirmed: one entry per SP-eligible tx in the connected block.
             Event::BlockTweaks { height, entries, .. } => {
                 for entry in &entries {
@@ -132,13 +145,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::MempoolTweak { entry } => {
                 scan_entry(&secp, &b_scan, &spend_pubkey, &b_spend, &entry, "mempool")?;
             }
-            // Tweak replay is unclamped, so a scanner should never see this. If it
-            // ever does, blocks went unscanned — for a wallet that is missed money,
-            // not a warning. Stop rather than continue with a hole in the history.
+            // A tweaks-only subscription against a COMPLETE index is exempt from
+            // the replay clamp, and a node whose index is incomplete refuses the
+            // subscribe outright, so this should be unreachable here — but do not
+            // rely on that. Note also the detection limit on `ReplayGap`: a
+            // clamped subscription that filtered chain events out gets no gap
+            // notice at all, so the absence of this event is not proof of a
+            // complete scan.
+            //
+            // If it does arrive, blocks went unscanned — for a wallet that is
+            // missed money, not a warning. Stop rather than continue with a hole.
             Event::ReplayGap { resume_height, first_height } => {
                 return Err(format!(
-                    "replay gap: blocks ({resume_height}, {first_height}) were never scanned; \
-                     rescan that range before trusting this wallet's balance"
+                    "replay gap: blocks [{resume_height}, {}] were never scanned; \
+                     re-derive that range via getblock before trusting this wallet's balance",
+                    first_height.saturating_sub(1)
                 )
                 .into());
             }

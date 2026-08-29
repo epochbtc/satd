@@ -193,7 +193,15 @@ let mut sub = client.resilient_subscribe(
     opts,
     ResilientConfig::new().cursor_store(Arc::new(FileCursorStore::new(path))),
 );
-while let Ok(event) = sub.next().await { /* scan, then poll again */ }
+loop {
+    // Propagate, never `while let Ok(..)`: `next()` returns `Err` on every
+    // PERMANENT failure — a corrupt cursor file, a rejected subscribe (an index
+    // still backfilling answers `FAILED_PRECONDITION`), retries exhausted.
+    // Swallowing that exits the loop silently and the wallet reports a zero
+    // balance it never actually scanned for.
+    let event = sub.next().await?;
+    // scan, then poll again — the next poll commits this event's cursor
+}
 ```
 
 For each `TweakEntry`, the wallet computes locally, per BIP 352:

@@ -18,7 +18,8 @@ item below is (or will be) written up in full in the in-development
 ### Changed
 - The BIP 352 client-side scan examples (Rust and Go) now run under the SDKs'
   `ResilientSubscription` with a file-backed cursor store, so an interrupted scan
-  resumes where it stopped instead of rescanning from its start height, and take a
+  resumes where it stopped instead of rescanning from its start height. The cursor
+  file is written 0600 in both SDKs, and take a
   cold-sync start height as an argument
 - The Silent Payments and Rust SDK manual chapters state the commit-on-poll cursor
   contract the SDKs implement: persist the cursor of the last event you finished
