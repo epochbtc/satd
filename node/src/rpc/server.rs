@@ -1342,8 +1342,11 @@ pub async fn start(
                     )
                 })?;
                 let chain_state = std::sync::Arc::clone(&ctx.chain_state);
+                let shutdown = ctx.shutdown_tx.subscribe();
                 tokio::task::spawn_blocking(move || {
-                    blockchain::scan_tx_out_set_start(&chain_state, &scanobjects)
+                    blockchain::scan_tx_out_set_start(&chain_state, &scanobjects, &|| {
+                        *shutdown.borrow()
+                    })
                 })
                 .await
                 .map_err(|e| {

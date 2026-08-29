@@ -1469,9 +1469,13 @@ pub fn scan_tx_out_set_abort() -> Value {
 ///
 /// Blocking and minute-scale on a large chain; the caller runs it on a
 /// blocking thread so `status` and `abort` stay answerable meanwhile.
+/// `interrupted` is polled alongside the abort flag; Core does the same
+/// through `rpc_interruption_point`, so that stopping the node does not have
+/// to wait out a scan that may have minutes left to run.
 pub fn scan_tx_out_set_start(
     chain_state: &ChainState,
     scanobjects: &Value,
+    interrupted: &dyn Fn() -> bool,
 ) -> Result<Value, (i32, String)> {
     use std::sync::atomic::Ordering;
 
@@ -1522,7 +1526,9 @@ pub fn scan_tx_out_set_start(
     let base = chain_state
         .for_each_coin_snapshot(&mut |outpoint, coin| {
             count += 1;
-            if count.is_multiple_of(8192) && SCAN_ABORT.load(Ordering::Acquire) {
+            if count.is_multiple_of(8192)
+                && (SCAN_ABORT.load(Ordering::Acquire) || interrupted())
+            {
                 aborted = true;
                 // The store has no cancel channel; unwinding via an error is
                 // how the iteration stops early. `aborted` distinguishes this
