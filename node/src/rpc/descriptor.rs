@@ -143,25 +143,74 @@ const KNOWN_FUNCS: &[&str] = &[
     "sortedmulti_a", "musig",
 ];
 
+/// Core's `ParseRange` + `ParseDescriptorRange`.
+///
+/// Core validates the range's *shape* before it parses the descriptor, whether
+/// or not the descriptor turns out to be ranged — so a malformed `range` is
+/// rejected even alongside a descriptor that would ignore it. satd parses no
+/// ranged descriptors, but skipping the check would answer a caller's
+/// nonsensical range with silence, and Core's own `rpc_scantxoutset.py` asserts
+/// these messages.
+fn check_range(value: &serde_json::Value) -> Result<(), (i32, String)> {
+    let invalid = |m: &str| (RPC_INVALID_PARAMETER, m.to_string());
+    let (low, high) = match value {
+        serde_json::Value::Number(n) => (
+            0i64,
+            n.as_i64()
+                .ok_or_else(|| invalid("Range must be specified as end or as [begin,end]"))?,
+        ),
+        serde_json::Value::Array(a) if a.len() == 2 && a.iter().all(|v| v.is_number()) => {
+            let low = a[0].as_i64().unwrap_or(i64::MIN);
+            let high = a[1].as_i64().unwrap_or(i64::MAX);
+            if low > high {
+                return Err(invalid(
+                    "Range specified as [begin,end] must not have begin after end",
+                ));
+            }
+            (low, high)
+        }
+        _ => return Err(invalid("Range must be specified as end or as [begin,end]")),
+    };
+    if low < 0 {
+        return Err(invalid("Range should be greater or equal than 0"));
+    }
+    if (high >> 31) != 0 {
+        return Err(invalid("End of range is too high"));
+    }
+    if high >= low.saturating_add(1_000_000) {
+        return Err(invalid("Range is too large"));
+    }
+    Ok(())
+}
+
 /// Turn one element of `scanobjects` into the output scripts to search
-/// for. Core's `EvalDescriptorStringOrObject`, minus the ranged forms —
-/// nothing satd parses is a ranged descriptor, so `range` is accepted and
-/// ignored exactly as Core ignores it for a non-range descriptor.
+/// for. Core's `EvalDescriptorStringOrObject`, minus the ranged descriptors —
+/// satd parses none, so a valid `range` is accepted and ignored exactly as
+/// Core ignores it for a non-ranged descriptor. An *invalid* one is still
+/// rejected, because Core checks it before it looks at the descriptor.
 pub fn scan_object_to_scripts(
     obj: &serde_json::Value,
     network: Network,
 ) -> Result<Vec<ScriptBuf>, (i32, String)> {
     let desc = match obj {
         serde_json::Value::String(s) => s.as_str(),
-        serde_json::Value::Object(map) => match map.get("desc") {
-            Some(serde_json::Value::String(s)) => s.as_str(),
-            Some(_) | None => {
-                return Err((
-                    RPC_INVALID_PARAMETER,
-                    "Descriptor needs to be provided in scan object".to_string(),
-                ));
+        serde_json::Value::Object(map) => {
+            let desc = match map.get("desc") {
+                Some(serde_json::Value::String(s)) => s.as_str(),
+                Some(_) | None => {
+                    return Err((
+                        RPC_INVALID_PARAMETER,
+                        "Descriptor needs to be provided in scan object".to_string(),
+                    ));
+                }
+            };
+            // Checked before the descriptor, as Core does.
+            match map.get("range") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(r) => check_range(r)?,
             }
-        },
+            desc
+        }
         _ => {
             return Err((
                 RPC_INVALID_PARAMETER,
@@ -180,6 +229,14 @@ pub fn parse_descriptor(desc: &str, network: Network) -> Result<ScriptBuf, Strin
     let expr = strip_checksum(desc)?;
 
     if let Some(inner) = func("raw", expr) {
+        // Core gates on `IsHex`, which is false for the empty string, so
+        // `raw()` is refused before any scanning. `hex::decode("")` succeeds,
+        // which would turn one token into a full pass over the UTXO set
+        // looking for the empty output script -- minute-scale on mainnet, and
+        // holding the scan reservation for all of it.
+        if inner.is_empty() {
+            return Err("Raw script is not hex".to_string());
+        }
         let bytes = hex::decode(inner).map_err(|_| "Raw script is not hex".to_string())?;
         return Ok(ScriptBuf::from_bytes(bytes));
     }
@@ -316,8 +373,15 @@ fn bare_multisig(script: &bitcoin::Script) -> Option<(u8, Vec<&[u8]>)> {
     Some((threshold, keys))
 }
 
-/// Core's `IsSmallInteger` + `DecodeOP_N`: OP_1..OP_16 only.
+/// Core's `GetScriptNumber` for the two multisig integers: OP_1..OP_16, **or**
+/// a minimally-encoded single-byte push for 17..=20.
+///
+/// Consensus allows up to `MAX_PUBKEYS_PER_MULTISIG` = 20 keys, and 17..20
+/// cannot be spelled as a push-number opcode, so Core accepts
+/// `OP_PUSHBYTES_1 0x11` there. Reading only the opcode form named those
+/// outputs `raw()` instead of `multi()`.
 fn small_int(insn: bitcoin::script::Instruction<'_>) -> Option<u8> {
+    const MAX_PUBKEYS_PER_MULTISIG: u8 = 20;
     match insn {
         bitcoin::script::Instruction::Op(op) => {
             let v = op.to_u8();
@@ -325,7 +389,12 @@ fn small_int(insn: bitcoin::script::Instruction<'_>) -> Option<u8> {
                 .contains(&v)
                 .then(|| v - opcodes::OP_PUSHNUM_1.to_u8() + 1)
         }
-        _ => None,
+        // `instructions_minimal` has already rejected a non-minimal push, so a
+        // one-byte push reaching here is minimal by construction.
+        bitcoin::script::Instruction::PushBytes(p) => match p.as_bytes() {
+            [n] if *n > 16 && *n <= MAX_PUBKEYS_PER_MULTISIG => Some(*n),
+            _ => None,
+        },
     }
 }
 
@@ -586,6 +655,101 @@ mod tests {
         // malformed rather than unimplemented.
         let err = parse_descriptor("addrr(x)", Network::Regtest).unwrap_err();
         assert!(err.contains("not a valid descriptor function"), "{err}");
+    }
+
+    /// `raw()` with nothing in it is not "the empty script", it is a typo.
+    /// Core's `IsHex` is false for the empty string and refuses it before any
+    /// scanning; accepting it turned one token into a full pass over the UTXO
+    /// set, holding the scan reservation for all of it.
+    #[test]
+    fn an_empty_raw_descriptor_is_refused_like_core() {
+        assert_eq!(
+            parse_descriptor("raw()", Network::Regtest).unwrap_err(),
+            "Raw script is not hex"
+        );
+        assert_eq!(
+            parse_descriptor("raw()#58lrscpx", Network::Regtest).unwrap_err(),
+            "Raw script is not hex"
+        );
+        // An odd-length payload is Core's other `IsHex` rejection.
+        assert_eq!(
+            parse_descriptor("raw(5)", Network::Regtest).unwrap_err(),
+            "Raw script is not hex"
+        );
+        // …and one real byte is still fine.
+        assert_eq!(
+            parse_descriptor("raw(51)", Network::Regtest).unwrap(),
+            script("51")
+        );
+    }
+
+    /// Consensus allows up to 20 keys, and 17..=20 cannot be spelled as a
+    /// push-number opcode — Core reads both multisig integers through
+    /// `GetScriptNumber`, which also accepts a minimal one-byte push. Reading
+    /// only `OP_1..OP_16` named those outputs `raw()` instead of `multi()`.
+    #[test]
+    fn bare_multisig_reads_thresholds_above_sixteen() {
+        const A: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        // 17-of-17: `OP_PUSHBYTES_1 0x11 <17 keys> OP_PUSHBYTES_1 0x11 OP_CHECKMULTISIG`
+        let keys = format!("21{A}").repeat(17);
+        let spk = format!("0111{keys}0111ae");
+        let got = infer_descriptor(script(&spk).as_script(), Network::Regtest);
+        assert!(got.starts_with("multi(17,"), "{got}");
+        assert_eq!(got.matches(A).count(), 17);
+
+        // 20 is the ceiling; 21 is not a multisig.
+        let keys20 = format!("21{A}").repeat(20);
+        assert!(
+            infer_descriptor(script(&format!("0114{keys20}0114ae")).as_script(), Network::Regtest)
+                .starts_with("multi(20,")
+        );
+        let keys21 = format!("21{A}").repeat(21);
+        assert!(
+            infer_descriptor(script(&format!("0115{keys21}0115ae")).as_script(), Network::Regtest)
+                .starts_with("raw(")
+        );
+    }
+
+    /// Core validates the range's shape before it even parses the descriptor,
+    /// so these fire regardless of whether the descriptor is ranged.
+    #[test]
+    fn range_is_validated_like_core() {
+        let bad = |range: serde_json::Value, want: &str| {
+            let obj = serde_json::json!({"desc": "raw(51)", "range": range});
+            let (code, msg) = scan_object_to_scripts(&obj, Network::Regtest).unwrap_err();
+            assert_eq!(code, -8, "{msg}");
+            assert_eq!(msg, want);
+        };
+        // The five rows `rpc_scantxoutset.py` asserts, verbatim. Note a bare
+        // `-1` becomes the range {0, -1}, so it is the *end* that is rejected.
+        bad(serde_json::json!(-1), "End of range is too high");
+        bad(serde_json::json!([-1, 10]), "Range should be greater or equal than 0");
+        bad(
+            serde_json::json!([(2i64 << 32) - 1_000_000, 2i64 << 32]),
+            "End of range is too high",
+        );
+        bad(
+            serde_json::json!([2, 1]),
+            "Range specified as [begin,end] must not have begin after end",
+        );
+        bad(serde_json::json!([0, 1_000_001]), "Range is too large");
+        bad(
+            serde_json::json!("nope"),
+            "Range must be specified as end or as [begin,end]",
+        );
+        bad(
+            serde_json::json!([1, 2, 3]),
+            "Range must be specified as end or as [begin,end]",
+        );
+
+        // A valid range is accepted and ignored: satd parses no ranged forms.
+        for ok in [serde_json::json!(999), serde_json::json!([0, 999])] {
+            let obj = serde_json::json!({"desc": "raw(51)", "range": ok});
+            assert_eq!(
+                scan_object_to_scripts(&obj, Network::Regtest).unwrap(),
+                vec![script("51")]
+            );
+        }
     }
 
     #[test]

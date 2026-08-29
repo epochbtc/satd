@@ -1432,6 +1432,10 @@ impl ScanReservation {
         if SCAN_IN_PROGRESS.swap(true, Ordering::AcqRel) {
             None
         } else {
+            // Owned by the reservation, as in Core's `CoinsViewScanReserver`.
+            // Resetting later -- after the descriptors parse, say -- leaves a
+            // window where `status` reports the *previous* scan's percentage.
+            SCAN_PROGRESS.store(0, Ordering::Release);
             Some(ScanReservation)
         }
     }
@@ -1439,6 +1443,7 @@ impl ScanReservation {
 
 impl Drop for ScanReservation {
     fn drop(&mut self) {
+        SCAN_PROGRESS.store(0, std::sync::atomic::Ordering::Release);
         SCAN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1506,7 +1511,6 @@ pub fn scan_tx_out_set_start(
     }
 
     SCAN_ABORT.store(false, Ordering::Release);
-    SCAN_PROGRESS.store(0, Ordering::Release);
 
     // Flush so the point-in-time view the iteration takes includes coins
     // still sitting in the in-memory cache.
@@ -1514,10 +1518,6 @@ pub fn scan_tx_out_set_start(
         .flush_coin_cache()
         .map_err(|e| (-32603, format!("Unable to flush coins: {e}")))?;
 
-    // Only used if the scan is aborted, which cuts the iteration short
-    // before it can report the base its coins came from. It is at or
-    // behind that base, and the result is flagged `success: false`.
-    let pre_scan_tip = chain_state.tip_snapshot();
 
     let mut count: u64 = 0;
     let mut found: Vec<(bitcoin::OutPoint, crate::storage::coinview::Coin)> = Vec::new();
@@ -1556,7 +1556,12 @@ pub fn scan_tx_out_set_start(
         .map(|b| (b.base_hash, b.base_height))
         .or_else(|e| {
             if aborted {
-                Ok(pre_scan_tip)
+                // The walk was cut short before it could report the base its
+                // coins came from. Read the tip now rather than before the
+                // scan: a tip from before the snapshot can sit *below* coins
+                // the snapshot contained, and then an entry's own `height`
+                // exceeds the response's top-level `height`.
+                Ok(chain_state.tip_snapshot())
             } else {
                 Err((-32603, format!("Unable to read UTXO set: {e}")))
             }
@@ -1567,20 +1572,49 @@ pub fn scan_tx_out_set_start(
         SCAN_PROGRESS.store(100, Ordering::Release);
     }
 
+    // The coins come from one point-in-time view; the block hashes below come
+    // from the live height index. They only describe one chain if the base the
+    // coins belong to is still on it. One lookup settles that: if the active
+    // chain still has `base_hash` at `base_height`, every lesser height on it
+    // is an ancestor of the base, which is what Core's `GetAncestor` walk
+    // guarantees for free.
+    if chain_state.get_block_hash_by_height(base_height) != Some(base_hash) {
+        return Err((
+            -32603,
+            "chain reorganized during the scan; the result would mix blocks \
+             from two chains. Retry the scan"
+                .to_string(),
+        ));
+    }
+
     let unit = default_unit();
     let mut total_sat: u64 = 0;
     let mut unspents = Vec::with_capacity(found.len());
     for (outpoint, coin) in &found {
         total_sat = total_sat.saturating_add(coin.amount);
-        // Height -> hash goes through the active-chain height index. A reorg
-        // below the scan base while the scan runs could name a block the coin
-        // no longer belongs to; the same race applies to every RPC that pairs
-        // a coin with a block, and the alternative is an ancestry walk per
-        // distinct height.
-        let blockhash = chain_state
-            .get_block_hash_by_height(coin.height)
-            .map(|h| h.to_string())
-            .unwrap_or_default();
+        // Core takes this from `tip->GetAncestor(coin.nHeight)`, so it is an
+        // ancestor of the `bestblock` it reports by construction. satd has no
+        // skiplist to walk cheaply, so it reads the active-chain height index
+        // -- which the base-consistency check above has just confirmed still
+        // contains the snapshot base, making every height at or below it an
+        // ancestor of it too.
+        //
+        // A missing row is not a race we can paper over: emitting `""` where
+        // every Core-shaped client expects 64 hex characters is worse than
+        // failing, and Core cannot produce it.
+        let blockhash = match chain_state.get_block_hash_by_height(coin.height) {
+            Some(h) => h.to_string(),
+            None => {
+                return Err((
+                    -32603,
+                    format!(
+                        "chain state moved during the scan: no block at height {} \
+                         on the active chain; retry the scan",
+                        coin.height
+                    ),
+                ));
+            }
+        };
         let mut entry = json!({
             "txid": outpoint.txid.to_string(),
             "vout": outpoint.vout,
