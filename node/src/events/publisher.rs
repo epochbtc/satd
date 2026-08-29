@@ -443,12 +443,26 @@ impl EventPublisher {
     }
 }
 
+/// Clears a drain lane's `bridged` flag however its bridge ends — the shutdown
+/// arm, a closed channel, or a panic. Without this the flag latches on for the
+/// life of the process and `syncwithvalidationinterfacequeue` waits out its
+/// full timeout on a lane that can no longer make any progress.
+struct BridgeLifetime(fn());
+
+impl Drop for BridgeLifetime {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 async fn bridge_mempool(
     publisher: Arc<EventPublisher>,
     mut rx: broadcast::Receiver<MempoolEvent>,
     mempool_tweak_source: Option<Arc<dyn MempoolTweakSource>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    crate::events::drain::mempool_bridge_started();
+    let _lifetime = BridgeLifetime(crate::events::drain::mempool_bridge_stopped);
     loop {
         tokio::select! {
             biased;
@@ -475,9 +489,13 @@ async fn bridge_mempool(
                             SpTweakEntry::from_tweak_entry(&tweak),
                         ));
                     }
+                    crate::events::drain::mempool_processed(1);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "mempool bridge lagged");
+                    // Skipped events are never delivered; counting them keeps a
+                    // drain waiter from waiting for something that cannot come.
+                    crate::events::drain::mempool_processed(n);
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
@@ -491,6 +509,10 @@ async fn bridge_chain(
     tweak_source: Option<Arc<dyn SpIndex>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // From here on this stream can make progress, so
+    // `syncwithvalidationinterfacequeue` may wait on it.
+    crate::events::drain::chain_bridge_started();
+    let _lifetime = BridgeLifetime(crate::events::drain::chain_bridge_stopped);
     loop {
         tokio::select! {
             biased;
@@ -565,9 +587,11 @@ async fn bridge_chain(
                             }
                         }
                     }
+                    crate::events::drain::chain_processed(1);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "chain bridge lagged");
+                    crate::events::drain::chain_processed(n);
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },

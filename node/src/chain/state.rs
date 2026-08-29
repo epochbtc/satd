@@ -1349,7 +1349,17 @@ impl ChainState {
              connection must stay on the core runtime (see rpc::access)"
         );
         if let Some(tx) = self.chain_event_tx.lock().as_ref() {
-            let _ = tx.send(event);
+            // Counted before the send so a waiter can never snapshot a total
+            // that excludes an event already in flight.
+            crate::events::drain::chain_emitted();
+            if tx.send(event).is_err() {
+                // `broadcast::send` fails only when there are no receivers, so
+                // this event can never be published. Count it as processed
+                // immediately -- the same treatment a lagged skip gets -- or a
+                // waiter that already snapshotted it would wait out the whole
+                // drain timeout for something nobody will ever deliver.
+                crate::events::drain::chain_processed(1);
+            }
         }
     }
 

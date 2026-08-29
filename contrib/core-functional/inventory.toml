@@ -129,9 +129,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "feature_dirsymlinks.py"
-status = "skip"
-reason = "cache"
-
+status = "run"
 [[test]]
 file = "feature_discover.py"
 status = "skip"
@@ -318,9 +316,7 @@ note = "satd sends no periodic P2P ping, so Core's connect_nodes() never sees th
 
 [[test]]
 file = "feature_startupnotify.py"
-status = "skip"
-reason = "cache"
-
+status = "run"
 [[test]]
 file = "feature_taproot.py"
 status = "skip"
@@ -649,9 +645,7 @@ reason = "cache"
 
 [[test]]
 file = "p2p_getdata.py"
-status = "skip"
-reason = "cache"
-
+status = "run"
 [[test]]
 file = "p2p_handshake.py"
 status = "skip"

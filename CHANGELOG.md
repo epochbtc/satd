@@ -52,6 +52,11 @@ workflow, scoreboard in the Operator Manual. See
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- `syncwithvalidationinterfacequeue` blocks until the asynchronous event
+  bridges have published everything emitted before the call, the settle barrier
+  Core's test framework calls from `sync_all()`. With it, Core's framework can
+  build its shared 199-block chain against satd, and the functional-test
+  scoreboard goes from 3 tests to 6.
 - `setmocktime` moves the node clock that block-template timestamps, the
   `time-too-new` future-block check and mempool entry time/expiry read. Gated
   to regtest exactly as Core gates it, and additionally carved out of

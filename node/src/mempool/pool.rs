@@ -821,7 +821,16 @@ impl Mempool {
             }
         }
         if let Some(tx) = self.event_tx.lock().as_ref() {
-            let _ = tx.send(event);
+            // Counted before the send; see `events::drain`.
+            crate::events::drain::mempool_emitted();
+            if tx.send(event).is_err() {
+                // `broadcast::send` fails only when there are no receivers, so
+                // this event can never be published. Count it as processed
+                // immediately -- the same treatment a lagged skip gets -- or a
+                // waiter that already snapshotted it would wait out the whole
+                // drain timeout for something nobody will ever deliver.
+                crate::events::drain::mempool_processed(1);
+            }
         }
     }
 

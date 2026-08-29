@@ -1644,6 +1644,7 @@ pub async fn start(
             "submitblock",
             "submitheader",
             "subscribemempool",
+            "syncwithvalidationinterfacequeue",
             "testmempoolaccept",
             "unsubscribemempool",
             "uptime",
@@ -1651,6 +1652,40 @@ pub async fn start(
         ];
         Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
     })?;
+
+    // Core's version blocks until its serialized validation-callback queue has
+    // drained past everything pending on entry; its test framework calls it
+    // from `sync_all()` so assertions do not race a callback. satd writes
+    // indexes inline during block connection and updates the mempool under its
+    // own lock, so RPC-visible state is already settled when the RPC that
+    // changed it returns; what is genuinely asynchronous here is outbound
+    // event delivery, so that is what this drains. See `events::drain`.
+    //
+    // Scope, so callers do not over-read it: this waits for events to reach the
+    // `NodeEvent` bus, not for any particular subscriber to have received one.
+    // The gRPC/WebSocket/ZMQ sinks consume the bus as independent tasks and are
+    // not counted, and neither are the other consumers of the chain-event
+    // broadcast (the address-index status notifier, the P2P block-announcement
+    // task, `-stopatheight`, `-blocknotify`). Core's drain does cover its
+    // equivalents, so a test that needs one of those settled needs more than
+    // this. Unlike `setmocktime` below, this is not chain-gated -- Core's is
+    // not either.
+    module.register_async_method(
+        "syncwithvalidationinterfacequeue",
+        |_params, _ctx, _extensions| async move {
+            if crate::events::drain::wait_for_drain().await {
+                Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+            } else {
+                // Better to say the queue is wedged than to return as though
+                // it drained and let a caller assert against stale state.
+                Err(ErrorObjectOwned::owned(
+                    -32603,
+                    "timed out waiting for the event queue to drain",
+                    None::<()>,
+                ))
+            }
+        },
+    )?;
 
     // Core gates this to a "mockable chain", which in Core is regtest alone --
     // mainnet, testnet3, testnet4 and signet all set m_is_mockable_chain
