@@ -1419,16 +1419,37 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Disconnect a peer by address.
+    /// Disconnect a peer by address. Returns whether one matched.
     pub fn disconnect(&self, addr: &SocketAddr) -> bool {
-        let peers = self.peers.read();
-        for (_id, handle) in peers.iter() {
-            if handle.info.addr == *addr {
-                let _ = handle.msg_tx.try_send(NetworkMessage::Ping(0));
-                return true;
-            }
+        let id = self
+            .peers
+            .read()
+            .iter()
+            .find(|(_, handle)| handle.info.addr == *addr)
+            .map(|(id, _)| *id);
+        match id {
+            Some(id) => self.disconnect_by_id(id),
+            None => false,
         }
-        false
+    }
+
+    /// Disconnect a peer by its `getpeerinfo` id. Returns whether one matched.
+    ///
+    /// Dropping the `PeerHandle` is what actually closes the connection: it
+    /// closes the peer task's `msg_rx`, which the write loop treats as
+    /// "manager dropped our handle" and returns on, aborting the reader task
+    /// and closing the socket. The task then emits `PeerDisconnected`, which
+    /// runs the rest of the teardown (IBD reassignment, background-range
+    /// requeue) exactly as an organic disconnect would.
+    pub fn disconnect_by_id(&self, id: PeerId) -> bool {
+        let removed = self.peers.write().remove(&id);
+        match removed {
+            Some(handle) => {
+                tracing::info!(id, addr = %handle.info.addr, "Disconnecting peer on request");
+                true
+            }
+            None => false,
+        }
     }
 
     /// Get info about all connected peers.

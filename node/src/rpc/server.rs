@@ -1605,14 +1605,52 @@ pub async fn start(
     })?;
 
     module.register_method("disconnectnode", |params, ctx, _extensions| {
-        let addr_str: String = params
-            .one()
+        // Core takes the peer either by address or by id, and requires
+        // exactly one of the two -- `disconnectnode "" 3` is how its own test
+        // framework disconnects, so the address slot is present but empty.
+        let mut seq = params.sequence();
+        let addr_str: Option<String> = seq
+            .optional_next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-            })?;
-        ctx.peer_manager.disconnect(&addr);
+        let node_id: Option<u64> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let addr_str = addr_str.filter(|s| !s.is_empty());
+
+        let disconnected = match (addr_str, node_id) {
+            (Some(_), Some(_)) => {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "Only one of address and nodeid should be provided.",
+                    None::<()>,
+                ));
+            }
+            (None, None) => {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "Address and nodeid cannot both be empty.",
+                    None::<()>,
+                ));
+            }
+            (Some(addr_str), None) => {
+                let addr: std::net::SocketAddr =
+                    addr_str.parse().map_err(|e: std::net::AddrParseError| {
+                        ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
+                    })?;
+                ctx.peer_manager.disconnect(&addr)
+            }
+            (None, Some(id)) => ctx.peer_manager.disconnect_by_id(id),
+        };
+
+        // Core reports a peer it could not find rather than returning success
+        // for a disconnect that did not happen.
+        if !disconnected {
+            return Err(ErrorObjectOwned::owned(
+                -29,
+                "Node not found in connected nodes",
+                None::<()>,
+            ));
+        }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
