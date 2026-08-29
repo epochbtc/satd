@@ -62,9 +62,12 @@ pub struct Subscriptions {
     scripthash_tasks: HashMap<Scripthash, JoinHandle<()>>,
     headers_task: Option<JoinHandle<()>>,
     /// The connection's in-flight BIP 352 tweak stream, if any. One per
-    /// connection: a fresh `blockchain.tweaks.subscribe` supersedes whatever
-    /// was still streaming, which is exactly what a client resubscribing after
-    /// `done` (or restarting a scan at a different height) means by it.
+    /// connection: while one is running a fresh `blockchain.tweaks.subscribe`
+    /// is **refused**, not superseded. Aborting the running task cannot retract
+    /// notification lines it has already pushed into the shared channel, so
+    /// they would land after the new subscribe's `result` and a client reading
+    /// the last key as its progress marker would skip everything in between.
+    /// See `dispatch::handle_tweaks_subscribe`.
     tweaks_task: Option<JoinHandle<()>>,
     notify_tx: mpsc::Sender<String>,
     max_per_conn: usize,

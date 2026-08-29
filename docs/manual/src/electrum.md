@@ -128,6 +128,19 @@ Two long-lived push subscriptions are supported, both counted against
 `blockchain.tweaks.subscribe` also pushes notifications, but it is a bounded
 chunk rather than a standing subscription — it ends itself with
 `{"message":"done"}` — so it does not count against the per-connection cap.
+
+A chunk serves at most **1000 heights**, whatever `count` asks for; both known
+clients request the entire remaining chain in one call and resubscribe when the
+chunk ends, and the de-facto reference server clamps the same way. The cap is
+what makes the end marker unambiguous: clients disagree about what `done` means
+— Cake reads it as "this chunk ended, ask again from the last height key",
+kiss-bdk as "the range I requested was served in full" — and those readings only
+agree if the server finishes every range it accepts. satd therefore bounds the
+range up front rather than truncating an accepted one. If a chunk does stop
+early anyway (a height it cannot read, or the 60-second budget), it ends with
+`{"message":"incomplete: …; resume from height <h>"}` instead of `done`, so a
+client that reads the sentinel as completion is not told that unserved heights
+were scanned and empty.
 Only one runs per connection at a time: a second subscribe while one is still
 producing is refused rather than replacing it, because notifications the
 superseded stream had already queued cannot be recalled and would arrive after
@@ -179,8 +192,8 @@ next unscanned height, which is what `done` is for.
 satd reports `satd-electrs-compatible/<version>` from `server.version` and
 `server.features.server_version`.
 
-Electrum's handshake has no capability field, so clients feature-detect by
-matching on that string. Cake Wallet will not probe
+Cake Wallet feature-detects by matching on that string rather than on
+`server.features`, and will not probe
 `blockchain.tweaks.subscribe` at all unless it contains the substring `electrs`
 — note `electrs`, not `electrum`; the two read the same to a person and only one
 matches. Carrying the token is what makes silent-payment support work out of the
@@ -199,6 +212,15 @@ for another client:
 ```ini
 electrumservername=satd/0.5.1
 ```
+
+Keep an override from *beginning* with `electrs`. Several clients test that
+prefix rather than searching the whole string: BlueWallet uses it to decide a
+server needs request batching disabled, and a name starting with `electrs`
+would leave batching off permanently. Leading with `satd-` — identity first,
+compatibility token second — is what keeps the default matching Cake's
+substring test while matching nobody's prefix test. An empty value
+(`electrumservername=`) is ignored with a warning rather than advertising a
+nameless server.
 
 Other tweak clients (for example
 [kiss-bdk](https://github.com/kkdao/kiss-bdk)) do not need the substring — they

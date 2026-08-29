@@ -78,11 +78,14 @@ pub fn donation_address(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 }
 
 /// `server.features()` — small descriptor dict consumed by some
-/// clients. Mirrors `romanz/electrs`'s shape: genesis hash, supported
-/// protocol min/max (both = our PROTOCOL_VERSION since we don't
-/// negotiate), server name, and the `hosts` map populated with
-/// `tcp_port` (and `ssl_port` when TLS is bound) so peer-discovery
-/// clients can distinguish service ports.
+/// clients: genesis hash, supported protocol min/max (both = our
+/// PROTOCOL_VERSION since we don't negotiate), server name, and the
+/// `hosts` map populated with `tcp_port` (and `ssl_port` when TLS is
+/// bound) so peer-discovery clients can distinguish service ports.
+///
+/// `hosts` follows the Electrum spec — `{"<host>": {"tcp_port": N}}` —
+/// rather than `romanz/electrs`, which emits a flat `{"tcp_port": N}`
+/// with no host level.
 pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     let genesis_hash = state
         .chain
@@ -128,12 +131,23 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 /// Defaults to `satd-electrs-compatible/<version>`: identity first, then a
 /// compatibility token, on the same principle that keeps `Mozilla` at the front
 /// of every browser user-agent long after it stopped meaning anything about who
-/// wrote the browser. The token is load-bearing rather than decorative --
-/// Electrum's `server.version` carries no capability field, so clients feature-
-/// detect by matching on this string, and Cake Wallet will not probe
-/// `blockchain.tweaks.subscribe` at all unless it contains the substring
-/// `electrs`. Spelling it `electrum` would read the same to a human and signal
-/// nothing to the client.
+/// wrote the browser. The token is load-bearing rather than decorative: Cake
+/// Wallet decides whether to probe `blockchain.tweaks.subscribe` by testing
+/// this string for the substring `electrs` (case-insensitively), and will not
+/// probe at all without it. Spelling it `electrum` would read the same to a
+/// human and signal nothing to the client.
+///
+/// (Narrowly Cake's behaviour, not Electrum's in general: `server.features` is
+/// used as a capability channel elsewhere -- Frigate advertises
+/// `silent_payments` there and Sparrow reads it. Cake is the client that gates
+/// on the version string.)
+///
+/// **Both halves of the shape matter.** Leading with `satd-` is not just an
+/// identity preference: several clients test `starts_with("electrs")` rather
+/// than `contains`, and BlueWallet uses that test to decide a server needs
+/// batching disabled. A name *beginning* with `electrs` would permanently
+/// disable BlueWallet's request batching; one that merely contains it does not
+/// match any of those prefix tests, so nothing outside Cake changes behaviour.
 ///
 /// It is a claim about the protocol satd speaks, not about the software it is:
 /// the name leads with `satd`, and the P2P surface is untouched -- peers see
@@ -141,7 +155,8 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
 ///
 /// An operator can override it with `electrumservername` -- to drop the
 /// compatibility token, or to adopt a different one if another client gates on
-/// a different string.
+/// a different string. An override should still not *begin* with `electrs`,
+/// for the BlueWallet reason above.
 fn server_name(state: &ElectrumState) -> String {
     state
         .config

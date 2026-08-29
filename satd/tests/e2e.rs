@@ -1672,9 +1672,17 @@ fn test_e2e_electrum_tweaks_subscribe_keeps_every_output_of_a_surviving_entry() 
     rpc.send_raw_tx(&raw_spend2);
     rpc.mine(1, &wallet.address.to_string());
 
+    // Not `outs_at(..).is_none()`: `Value::Index` on a missing height key yields
+    // `Null`, and `.get()` on `Null` is `None` too, so that spelling cannot tell
+    // "the entry was dropped" from "the height map went missing or changed
+    // shape". Pin the height key's presence and its emptiness separately.
+    let (first, _) = cli.tweaks_subscribe(height, 1, false);
+    let map = first[height.to_string()]
+        .as_object()
+        .expect("the height is still served -- cut-through drops entries, not heights");
     assert!(
-        outs_at(&mut cli, false).is_none(),
-        "every output spent: the entry is dropped whole"
+        !map.contains_key(&key),
+        "every output spent: the entry is dropped whole, got {map:?}"
     );
     assert_eq!(
         outs_at(&mut cli, true).as_deref(),

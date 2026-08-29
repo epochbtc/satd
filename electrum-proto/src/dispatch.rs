@@ -308,7 +308,27 @@ fn handle_tweaks_subscribe(
     // that height and an immediate `done`, which is how a caught-up wallet
     // polls. `last < from` makes the stream task a no-op plus `done`.
     let last = treq.last_height(state.chain.tip_height()).unwrap_or(treq.start);
-    let first = tweaks::height_map(&src, treq.start, treq.cut_through())?;
+    // `height_map` is the heaviest read on this surface: one index read, a full
+    // block read out of the flat files, and -- under cut-through, which is what
+    // Cake sends by default -- one UTXO lookup per taproot output of every
+    // eligible transaction in that block. `stream_chunk` already wraps the
+    // identical call in `spawn_blocking`; this synchronous first height was
+    // left on the API runtime's reactor, which is `max(2, cores/4)` workers
+    // shared with Esplora, events-gRPC and `/metrics`. On a small box that is
+    // two threads, and the per-request timeout in `server.rs` cannot preempt a
+    // synchronous body, so a client pipelining subscribes at dense heights
+    // could hold both. `block_in_place` moves this worker to the blocking pool
+    // for the duration and starts a replacement.
+    //
+    // Guarded because `block_in_place` panics on a current-thread runtime and
+    // outside a runtime altogether -- handler-level tests call this directly.
+    let read_first = || tweaks::height_map(&src, treq.start, treq.cut_through());
+    let first = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(read_first)
+        }
+        _ => read_first(),
+    }?;
     subs.add_tweaks(
         src,
         treq.start.saturating_add(1),

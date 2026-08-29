@@ -57,6 +57,21 @@ pub const CHUNK_BUDGET: Duration = Duration::from_secs(60);
 /// amortising the hop.
 pub const HEIGHTS_PER_HOP: u32 = 16;
 
+/// Most heights one subscribe will serve, whatever `count` asks for.
+///
+/// The de-facto reference server (`cake-tech/blockstream-electrs`) clamps
+/// `count` to 1000 the same way, and both known clients ask for the entire
+/// remaining chain in a single call — Cake sends `count = tip - syncHeight + 1`.
+/// Clamping is therefore the expected behaviour, not a satd restriction.
+///
+/// It also settles what `{"message":"done"}` means. The two clients read the
+/// sentinel differently: Cake treats it as "this chunk ended, resubscribe from
+/// the last height key", while kiss-bdk treats it as "the range I requested was
+/// fully served" and stops (kkdao/kiss-bdk#10). Those readings only agree if the
+/// server always finishes the range it accepted before saying `done` — so satd
+/// bounds the range up front rather than truncating an accepted one part-way.
+pub const MAX_CHUNK_HEIGHTS: u32 = 1000;
+
 /// Pre-activation heights collapsed into a single notification. Nothing below
 /// taproot activation can carry a silent payment, so those heights are empty by
 /// construction — but a client restoring from an old height still needs to see
@@ -82,13 +97,20 @@ impl TweakReq {
         !self.historical
     }
 
-    /// Inclusive last height to serve, clamped to `tip`. `None` when `start` is
-    /// already above the tip — there is nothing to stream.
+    /// Inclusive last height to serve, clamped to `tip` and to
+    /// [`MAX_CHUNK_HEIGHTS`]. `None` when `start` is already above the tip —
+    /// there is nothing to stream.
+    ///
+    /// The height cap is what lets `done` mean the same thing to both clients:
+    /// satd only ever accepts a range it intends to finish, so a client that
+    /// reads the sentinel as "the requested range was served" is not misled.
+    /// A client wanting more resubscribes, which is what both already do.
     pub fn last_height(&self, tip: u32) -> Option<u32> {
         if self.start > tip {
             return None;
         }
-        Some(self.start.saturating_add(self.count.saturating_sub(1)).min(tip))
+        let capped = self.count.min(MAX_CHUNK_HEIGHTS);
+        Some(self.start.saturating_add(capped.saturating_sub(1)).min(tip))
     }
 }
 
@@ -134,6 +156,14 @@ fn u32_param(v: Option<&Value>, name: &str) -> Result<u32, JsonRpcError> {
 pub struct TweakSource {
     pub chain: Arc<ChainState>,
     pub index: Arc<dyn SpIndex>,
+    /// The tip when this request began, frozen.
+    ///
+    /// Deliberately *not* re-read from the chain per height. A reorg lowers the
+    /// live tip below heights this source already promised to serve, and a
+    /// liveness check would then classify their dropped rows as "above the tip,
+    /// no row by construction" — the exact silent skip the row-miss guard
+    /// exists to stop. See [`absence_is_an_answer`].
+    pub tip_at_start: u32,
 }
 
 impl TweakSource {
@@ -153,7 +183,11 @@ impl TweakSource {
         if !index.is_complete() {
             return Err(index_unavailable(&SpIndexError::Incomplete));
         }
-        Ok(Self { chain: state.chain.clone(), index })
+        Ok(Self {
+            chain: state.chain.clone(),
+            index,
+            tip_at_start: state.chain.tip_height(),
+        })
     }
 
     /// Taproot activation on this network — the lowest height that can carry a
@@ -166,28 +200,39 @@ impl TweakSource {
 /// Whether a missing index row at `height` is a legitimate answer rather than a
 /// hole.
 ///
-/// Below taproot activation and above the tip there is no row *by
-/// construction*, and `{"<h>": {}}` is the honest reply — it is how a client's
-/// progress marker crosses barren stretches. Anywhere inside `[activation,
-/// tip]` a complete index must have a row, so a miss means a reorg is in
-/// flight (the disconnect drops each disconnected height's row, and the
-/// replacement branch is written back one block per batch). Replying `{}` there
-/// says "no payments at this height" about a block that is about to be replaced
-/// by one that may well pay the client, and the client's marker moves past it
-/// for good.
+/// Below taproot activation, and above the tip this request started from, there
+/// is no row *by construction*, and `{"<h>": {}}` is the honest reply — it is
+/// how a client's progress marker crosses barren stretches. Anywhere inside
+/// `[activation, tip_at_start]` a complete index must have a row, so a miss
+/// means the rows are moving under us: a reorg drops every disconnected
+/// height's row in one batch and writes the replacement branch back one block
+/// per batch. Replying `{}` there says "no payments at this height" about a
+/// block that is about to be replaced by one that may well pay the client, and
+/// the client's marker moves past it for good.
+///
+/// `tip_at_start` must be the tip frozen when the request began, **never** the
+/// live tip. `perform_reorg` commits the disconnect batch — dropping those rows
+/// — and only then lowers the in-memory tip to the fork point, so for the whole
+/// reconnect leg the rowless heights sit *above* the live tip. Against a live
+/// tip this predicate would call each of them "above the tip, empty by
+/// construction" and serve `{}`, which is precisely the silent skip it is here
+/// to prevent; against the frozen tip they are inside the promised range and
+/// refuse in-band. The guarded window is the long one, not the microseconds
+/// between the batch commit and the tip write.
 ///
 /// A named predicate rather than an inline comparison because it is the whole
 /// of the difference between a served scan and a silently short one, and an
 /// inline `&&` is not something a test can fail on.
-fn absence_is_an_answer(height: u32, activation: u32, tip: u32) -> bool {
-    height < activation || height > tip
+fn absence_is_an_answer(height: u32, activation: u32, tip_at_start: u32) -> bool {
+    height < activation || height > tip_at_start
 }
 
 /// One height's map, `{"<height>": {<txid>: {...}}}`, as the result and every
 /// notification carry it.
 ///
 /// A height with no eligible transactions — including one below taproot
-/// activation or above the tip — is `{"<height>": {}}`. That is a real answer,
+/// activation or above the tip this request started from — is
+/// `{"<height>": {}}`. That is a real answer,
 /// not an error: it is how a client's progress marker advances across barren
 /// stretches of chain.
 pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<Value, JsonRpcError> {
@@ -198,7 +243,7 @@ pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<V
             // heights carry no row by construction, and `{"<h>": {}}` is how a
             // client's progress marker crosses them.
             //
-            // Inside `[activation, tip]` it is a hole, not an answer.
+            // Inside `[activation, tip_at_start]` it is a hole, not an answer.
             // `from_state` already refused an incomplete index, so the way to
             // get here is a reorg: the disconnect drops each disconnected
             // height's row, and the replacement branch is written back one
@@ -208,8 +253,18 @@ pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<V
             // be replaced by one that may well pay it — the silent skip this
             // whole surface exists to avoid. Refuse in-band instead, exactly as
             // the streaming pager does for the same case.
-            if !absence_is_an_answer(height, src.activation_height(), src.chain.tip_height()) {
-                return Err(JsonRpcError::internal(format!(
+            //
+            // The tip here is frozen at subscribe time on purpose: during a
+            // reorg's reconnect leg the live tip sits *below* these heights,
+            // which would send them down the "above the tip" arm and serve `{}`.
+            if !absence_is_an_answer(height, src.activation_height(), src.tip_at_start) {
+                // `bad_request`, not `internal`: `internal` sends a fixed
+                // `"internal error"` and keeps the detail in the log, which
+                // would make this "refuse in-band" in name only. The text is
+                // composed here from a height and carries nothing about the
+                // node's filesystem, so it is safe to put on the wire — and a
+                // client that is told to re-request the height can act on it.
+                return Err(JsonRpcError::bad_request(format!(
                     "silent-payment index has no row for height {height} \
                      (a reorg is in flight); re-request this height"
                 )));
@@ -239,7 +294,7 @@ fn txs_object(
         // Pruned or otherwise unreadable. Serving tweak-only entries would look
         // like transactions with no outputs, which a client reads as "not mine";
         // an error is the honest answer.
-        return Err(JsonRpcError::internal(format!(
+        return Err(JsonRpcError::bad_request(format!(
             "block {} is not available locally; cannot serve its tweak outputs",
             row.block_hash
         )));
@@ -340,8 +395,29 @@ pub fn notification_line(map: &Value) -> String {
 
 /// The end-of-chunk marker. Clients resubscribe from the next unscanned height
 /// when they see it; a client that never receives it waits forever.
+///
+/// Only sent once the whole accepted range has been served — see
+/// [`incomplete_line`].
 pub fn done_line() -> String {
     notification_line(&json!({ "message": "done" }))
+}
+
+/// End-of-stream marker for a range that was **not** served in full.
+///
+/// `done` cannot be used here. kiss-bdk reads it as "the requested range was
+/// fully served" and stops (kkdao/kiss-bdk#10), so sending it after an early
+/// break would tell that client every undelivered height had been scanned and
+/// found empty — the silent skip the rest of this module is built to prevent.
+/// Cake reads any `{"message": ...}` as end-of-chunk and resubscribes from the
+/// last height key it saw, so it is unaffected either way.
+///
+/// The message names the last height actually served, so a client that does
+/// look at it can resume exactly.
+pub fn incomplete_line(served_through: u32, reason: &str) -> String {
+    let resume = u64::from(served_through) + 1;
+    notification_line(&json!({
+        "message": format!("incomplete: {reason}; resume from height {resume}")
+    }))
 }
 
 /// Map an index state to the JSON-RPC error a client sees. Refusing is
@@ -349,7 +425,21 @@ pub fn done_line() -> String {
 /// heights it has not indexed, and the client cannot tell that from "no payments
 /// here".
 fn index_unavailable(e: &SpIndexError) -> JsonRpcError {
-    JsonRpcError::bad_request(format!("blockchain.tweaks.subscribe unavailable: {e}"))
+    match e {
+        // `Storage` wraps a stringified backend error, and RocksDB's routinely
+        // embed absolute paths. `bad_request` keeps its message on the wire, so
+        // routing this one there would hand the datadir layout to any
+        // unauthenticated Electrum client. `internal` logs the detail and sends
+        // a fixed `"internal error"`.
+        SpIndexError::Storage(_) => JsonRpcError::internal(format!(
+            "blockchain.tweaks.subscribe unavailable: {e}"
+        )),
+        // These two are satd's own text and name the option an operator has to
+        // change, so they are worth putting in front of the user.
+        SpIndexError::Disabled | SpIndexError::Incomplete | SpIndexError::NotFound(_) => {
+            JsonRpcError::bad_request(format!("blockchain.tweaks.subscribe unavailable: {e}"))
+        }
+    }
 }
 
 /// Advance the stream cursor by `by`, or `None` when that would pass `last`.
@@ -388,8 +478,14 @@ pub async fn stream_chunk(
 ) {
     let started = Instant::now();
     let mut h = from;
+    // Highest height actually delivered by this task, and — if the loop stopped
+    // before reaching `last` — why. The end marker depends on the difference:
+    // `done` claims the accepted range was served, and one client believes it.
+    let mut served_through: Option<u32> = None;
+    let mut cut_short: Option<&str> = None;
     while h <= last {
         if started.elapsed() >= budget {
+            cut_short = Some("chunk budget elapsed");
             break;
         }
         // Nothing below taproot activation can carry a payment, so those heights
@@ -401,6 +497,7 @@ pub async fn stream_chunk(
             if notify_tx.send(notification_line(&empty_heights(h, end))).await.is_err() {
                 return;
             }
+            served_through = Some(end);
             let Some(next) = advance(end, 1, last) else { break };
             h = next;
             continue;
@@ -433,13 +530,26 @@ pub async fn stream_chunk(
             }
         }
         if served == 0 {
+            // The hop could not read the height it started on. `height_map`
+            // already refused rather than skipping it, so stopping here leaves
+            // the client short of `last` — which the end marker must say.
+            cut_short = Some("a height could not be read");
             break;
         }
+        served_through = Some(h.saturating_add(served - 1));
         let Some(next) = advance(h, served, last) else { break };
         h = next;
     }
+
+    // `from - 1` is the height the synchronous half of the subscribe already
+    // answered, so it is the floor for "how far this client got".
+    let served_through = served_through.unwrap_or(from.saturating_sub(1));
+    let end = match cut_short {
+        None => done_line(),
+        Some(reason) => incomplete_line(served_through, reason),
+    };
     // Best-effort: the client may already be gone.
-    let _ = notify_tx.send(done_line()).await;
+    let _ = notify_tx.send(end).await;
 }
 
 #[cfg(test)]
@@ -458,6 +568,51 @@ mod tests {
         let req = parse_req(&json!([850_000])).expect("start alone parses");
         assert_eq!(req.count, 1, "one height, like Cake's getTweaks probe");
         assert!(!req.historical);
+    }
+
+    #[test]
+    fn an_accepted_range_never_exceeds_the_chunk_cap() {
+        // Both clients ask for the whole remaining chain in one call -- Cake
+        // sends `count = tip - syncHeight + 1`. Serving only part of an accepted
+        // range and then saying `done` tells kiss-bdk the rest was scanned and
+        // empty, so the range satd accepts has to be one it will finish.
+        let huge = TweakReq { start: 800_000, count: u32::MAX, historical: false };
+        assert_eq!(
+            huge.last_height(900_000),
+            Some(800_000 + MAX_CHUNK_HEIGHTS - 1),
+            "a whole-chain request is capped, not accepted in full",
+        );
+
+        // The tip still wins when it is the tighter bound.
+        let past_tip = TweakReq { start: 899_990, count: u32::MAX, historical: false };
+        assert_eq!(past_tip.last_height(900_000), Some(900_000), "clamped to the tip");
+
+        // Under the cap nothing changes.
+        let small = TweakReq { start: 100, count: 5, historical: false };
+        assert_eq!(small.last_height(900_000), Some(104));
+
+        // The cap is a height count, so the boundary case serves exactly it.
+        let exact = TweakReq { start: 0, count: MAX_CHUNK_HEIGHTS, historical: false };
+        assert_eq!(exact.last_height(900_000), Some(MAX_CHUNK_HEIGHTS - 1));
+    }
+
+    #[test]
+    fn a_truncated_stream_does_not_end_with_done() {
+        // `done` is not a neutral "stream over": kiss-bdk reads it as "the range
+        // I asked for was fully served" and stops. Anything short of `last` has
+        // to end with a marker that does not carry that claim, naming where to
+        // resume.
+        let line = incomplete_line(899_998, "chunk budget elapsed");
+        let v: Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(v["method"], METHOD, "same notification envelope as a height");
+        let msg = v["params"][0]["message"].as_str().expect("message");
+        assert!(!msg.contains("done"), "must not read as completion, got {msg:?}");
+        assert!(msg.contains("899999"), "names the resume height, got {msg:?}");
+
+        // And the completion marker still says exactly `done`, which is the
+        // string the clients match on.
+        let d: Value = serde_json::from_str(&done_line()).expect("valid JSON");
+        assert_eq!(d["params"][0]["message"], "done");
     }
 
     #[test]
@@ -503,6 +658,44 @@ mod tests {
         // is inside the range and no height is "below activation".
         assert!(!absence_is_an_answer(0, 0, 10), "regtest genesis is in range");
         assert!(absence_is_an_answer(11, 0, 10), "still an answer above the tip");
+    }
+
+    #[test]
+    fn a_reorg_window_is_a_hole_even_though_the_live_tip_dropped_below_it() {
+        // The case this predicate exists for, and the one it got wrong while it
+        // read the live tip.
+        //
+        // A subscription starts at tip 900_000. A 3-block reorg lands:
+        // `perform_reorg` commits the disconnect batch — dropping the rows for
+        // 899_998..=900_000 — and only then lowers the in-memory tip to 899_997.
+        // The replacement branch is written back one block per batch, so for the
+        // whole reconnect leg those three heights have no row *and* sit above
+        // the live tip.
+        //
+        // Fed the live tip, every one of them takes the "above the tip, empty by
+        // construction" arm and is served as `{}`. The client reads the map's
+        // last key, records 900_000 as scanned, resumes at 900_001, and never
+        // scans the three replacement blocks. Fed the tip frozen at subscribe,
+        // they are inside the promised range and refuse in-band.
+        const ACT: u32 = 709_632;
+        const TIP_AT_START: u32 = 900_000;
+        const LIVE_TIP_MID_REORG: u32 = 899_997;
+
+        for h in [899_998, 899_999, 900_000] {
+            assert!(
+                !absence_is_an_answer(h, ACT, TIP_AT_START),
+                "height {h} was promised by this subscription; a dropped row there is a hole",
+            );
+            assert!(
+                absence_is_an_answer(h, ACT, LIVE_TIP_MID_REORG),
+                "height {h} against the live tip is the silent skip — this asserts the \
+                 wrong-input behaviour so the frozen-tip requirement cannot be quietly undone",
+            );
+        }
+
+        // Above the promise it stays an answer, reorg or not: that is the
+        // caught-up wallet polling one past the tip.
+        assert!(absence_is_an_answer(900_001, ACT, TIP_AT_START), "one past the promise");
     }
 
     #[test]

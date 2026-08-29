@@ -209,9 +209,9 @@ rest arrive as notifications, `{"message":"done"}` ends the chunk), and its
 `historical_mode` parameter is the cut-through trade described above with the
 polarity flipped: `false` cuts spent coins, `true` keeps them for a restore.
 The [Electrum chapter](electrum.md#serving-silent-payment-tweaks) has the wire
-shape, the per-network behaviour, and the one client quirk that needs an
-operator decision — Cake Wallet probes the method only when the server names
-itself `…electrs…`.
+shape and the per-network behaviour. Nothing here needs an operator decision:
+Cake Wallet probes the method only when the advertised server name contains
+`electrs`, and satd's default name does, so enabling the index above is enough.
 
 ## Walkthrough: a zero-custody light wallet (Tier 1)
 

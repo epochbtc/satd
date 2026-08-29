@@ -761,11 +761,15 @@ pub struct Config {
     /// `server.features.server_version`. `None` reports
     /// `satd-electrs-compatible/<version>`.
     ///
-    /// The reason this is configurable: Cake Wallet only probes
-    /// `blockchain.tweaks.subscribe` when the name contains the substring
-    /// `electrs`. Operators who want to serve silent payments to Cake set
-    /// something like `satd-electrs/0.5.1`; nobody else needs to touch it, and
-    /// satd never claims to be electrs by default.
+    /// The reason the default carries `electrs`: Electrum has no capability
+    /// field, so clients feature-detect on this string, and Cake Wallet probes
+    /// `blockchain.tweaks.subscribe` only when it contains that substring. The
+    /// override exists for operators who would rather not advertise the token
+    /// — at the cost of those clients never probing — or who front satd with
+    /// tooling that keys off a name of their own.
+    ///
+    /// An empty value is treated as unset, with a warning: it would otherwise
+    /// advertise a nameless server and silently switch every gating client off.
     pub electrum_server_name: Option<String>,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
@@ -2788,8 +2792,25 @@ impl Config {
             .or_else(|| file_get("electrumfeehistogramttl").and_then(|v| v.parse().ok()))
             .unwrap_or(10);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
-        let electrum_server_name =
-            cli.electrumservername.or_else(|| file_get("electrumservername"));
+        // A blank override (`electrumservername=` with nothing after it, the
+        // natural spelling for "leave this alone") would otherwise parse as a
+        // genuine `Some("")` and advertise a nameless server — switching off
+        // every client that feature-detects on the name, with nothing logged.
+        // Fall back to the default and say so.
+        let electrum_server_name = cli
+            .electrumservername
+            .or_else(|| file_get("electrumservername"))
+            .and_then(|name| {
+                if name.trim().is_empty() {
+                    eprintln!(
+                        "Warning: ignoring empty electrumservername; \
+                         reporting the default server name"
+                    );
+                    None
+                } else {
+                    Some(name)
+                }
+            });
 
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
