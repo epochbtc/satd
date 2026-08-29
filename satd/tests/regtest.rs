@@ -1311,6 +1311,67 @@ fn test_two_nodes_connect() {
 }
 
 #[test]
+fn peers_exchange_keepalive_pings_without_being_asked() {
+    // Regression: satd had a `ping` RPC and answered an inbound ping, but
+    // nothing ever sent one on its own -- `ping_all()`'s only caller was the
+    // RPC. A link that goes quiet therefore produced no evidence it was still
+    // alive, `getpeerinfo` never reported a `pingtime`, and Bitcoin Core's
+    // test framework hung for its full timeout in `connect_nodes()`, which
+    // waits for a pong on BOTH sides of a new connection.
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "node A did not see a connection",
+    );
+
+    // Neither side is asked to ping: the keepalive fires on its own once the
+    // connection is set up. Both directions must measure a round trip, which
+    // is what proves each node pings rather than only answering.
+    let measured = |node: &TestNode| -> bool {
+        node.rpc_call("getpeerinfo")
+            .ok()
+            .and_then(|v| v["result"].as_array().cloned())
+            .is_some_and(|peers| {
+                peers
+                    .iter()
+                    .any(|p| p["pingtime"].as_f64().is_some_and(|t| t > 0.0))
+            })
+    };
+    poll_until(
+        || measured(&node_a),
+        Duration::from_secs(30),
+        "node A never measured a ping round trip",
+    );
+    poll_until(
+        || measured(&node_b),
+        Duration::from_secs(30),
+        "node B never measured a ping round trip",
+    );
+
+    // `minping` accompanies `pingtime`, and the pong is attributed to the
+    // right message type -- Core's framework gates `connect_nodes` on
+    // `bytesrecv_per_msg["pong"]`, not on the ping fields.
+    let peers = node_a.rpc_call("getpeerinfo").unwrap();
+    let peer = &peers["result"].as_array().unwrap()[0];
+    assert!(
+        peer["minping"].as_f64().is_some_and(|t| t > 0.0),
+        "minping should be set once a round trip is measured: {peer}"
+    );
+    let pong_bytes = peer["bytesrecv_per_msg"]["pong"].as_u64().unwrap_or(0);
+    assert!(
+        pong_bytes >= 29,
+        "pong bytes should be attributed to the pong message type, got {pong_bytes}: {peer}"
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
 fn test_block_sync_between_nodes() {
     let p2p_port_a = find_available_port();
     let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);

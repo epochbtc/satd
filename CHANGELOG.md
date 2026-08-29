@@ -54,6 +54,12 @@ set, taking the scoreboard to 10 tests.
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- satd now sends P2P keepalive pings, and drops a peer that stops answering
+  them. It answered a `ping` and had a `ping` RPC, but nothing ever pinged on
+  its own, so a quiet link produced no evidence it was still alive and
+  `getpeerinfo` never reported `pingtime`. Ping on connection setup and every
+  two minutes thereafter, disconnect after twenty minutes without a pong (Core's
+  `TIMEOUT_INTERVAL`), and report `pingtime`, `minping` and `pingwait`.
 - `scantxoutset` scans the UTXO set for outputs paying a descriptor. satd's first
   descriptor support: `raw(<hex script>)` and `addr(<address>)` with BIP380
   checksums, plus Core's inference for the reported `desc`. Descriptor forms satd

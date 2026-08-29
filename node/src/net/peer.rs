@@ -266,6 +266,19 @@ impl PeerInfo {
         if let Some(bind) = self.bind_addr {
             obj["addrbind"] = serde_json::Value::String(bind.to_string());
         }
+        // Ping round-trip timings. Core pushes each of these only when it has
+        // a value -- a peer that has not completed a ping/pong exchange yet
+        // reports no `pingtime` rather than a zero, which would read as an
+        // instantaneous link.
+        if let Some(secs) = stats.ping_time_secs() {
+            obj["pingtime"] = serde_json::json!(secs);
+        }
+        if let Some(secs) = stats.min_ping_secs() {
+            obj["minping"] = serde_json::json!(secs);
+        }
+        if let Some(secs) = stats.ping_wait_secs() {
+            obj["pingwait"] = serde_json::json!(secs);
+        }
         obj
     }
 }

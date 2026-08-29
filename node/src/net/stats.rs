@@ -44,6 +44,16 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Monotonic microseconds for round-trip timing.
+///
+/// Deliberately not wall-clock: `setmocktime` and NTP steps both move
+/// `SystemTime`, and either would otherwise show up as a nonsense ping time
+/// (or a negative one, clamped to zero).
+fn now_micros() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
 /// Process-global byte totals across all peers, past and present. Like
 /// Bitcoin Core's `CConnman` totals, these persist after a peer disconnects
 /// (a peer's bytes are not subtracted when it goes away).
@@ -84,6 +94,15 @@ pub struct PeerStats {
     /// Locked only for the duration of one `+=`; never held across an await.
     per_msg_sent: Mutex<BTreeMap<&'static str, u64>>,
     per_msg_recv: Mutex<BTreeMap<&'static str, u64>>,
+    /// Nonce of the ping awaiting a pong, or 0 when none is outstanding.
+    /// satd never sends nonce 0, so 0 is unambiguous as "nothing pending".
+    ping_nonce: AtomicU64,
+    /// [`now_micros`] at which the outstanding ping was sent.
+    ping_sent_us: AtomicU64,
+    /// Last measured round trip, in microseconds; 0 = never measured.
+    ping_time_us: AtomicU64,
+    /// Best round trip seen, in microseconds; `u64::MAX` = never measured.
+    min_ping_us: AtomicU64,
     totals: Arc<NetTotals>,
 }
 
@@ -97,6 +116,10 @@ impl PeerStats {
             last_recv: AtomicU64::new(0),
             per_msg_sent: Mutex::new(BTreeMap::new()),
             per_msg_recv: Mutex::new(BTreeMap::new()),
+            ping_nonce: AtomicU64::new(0),
+            ping_sent_us: AtomicU64::new(0),
+            ping_time_us: AtomicU64::new(0),
+            min_ping_us: AtomicU64::new(u64::MAX),
             totals,
         })
     }
@@ -164,11 +187,182 @@ impl PeerStats {
     pub fn bytes_recv_per_msg(&self) -> BTreeMap<&'static str, u64> {
         self.per_msg_recv.lock().map(|m| m.clone()).unwrap_or_default()
     }
+
+    /// Note that a keepalive ping carrying `nonce` has just gone out.
+    ///
+    /// Overwrites any previous outstanding ping, which cannot happen on the
+    /// send path (it only pings when nothing is pending) but keeps this
+    /// honest if a caller ever pings unconditionally: the newest ping is the
+    /// one a pong will be matched against.
+    pub fn ping_sent(&self, nonce: u64) {
+        self.ping_nonce.store(nonce, Ordering::Relaxed);
+        self.ping_sent_us.store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// Match a received pong against the outstanding ping, recording the
+    /// round trip. Returns whether it matched.
+    ///
+    /// A peer that echoes a stale or invented nonce is ignored rather than
+    /// allowed to write a bogus round-trip time -- and because the nonce is
+    /// cleared before the timing is stored, a peer that sends the same valid
+    /// pong twice is counted once.
+    pub fn pong_received(&self, nonce: u64) -> bool {
+        let outstanding = self.ping_nonce.load(Ordering::Relaxed);
+        if outstanding == 0 || nonce != outstanding {
+            return false;
+        }
+        self.ping_nonce.store(0, Ordering::Relaxed);
+        // A sub-microsecond round trip (loopback) would otherwise store 0,
+        // which is this field's "never measured" sentinel.
+        let rtt = now_micros()
+            .saturating_sub(self.ping_sent_us.load(Ordering::Relaxed))
+            .max(1);
+        self.ping_time_us.store(rtt, Ordering::Relaxed);
+        self.min_ping_us.fetch_min(rtt, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a ping is still awaiting its pong.
+    pub fn ping_outstanding(&self) -> bool {
+        self.ping_nonce.load(Ordering::Relaxed) != 0
+    }
+
+    /// Last measured round trip in seconds, or `None` if never measured.
+    pub fn ping_time_secs(&self) -> Option<f64> {
+        match self.ping_time_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(us as f64 / 1_000_000.0),
+        }
+    }
+
+    /// Best round trip seen in seconds, or `None` if never measured.
+    pub fn min_ping_secs(&self) -> Option<f64> {
+        match self.min_ping_us.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            us => Some(us as f64 / 1_000_000.0),
+        }
+    }
+
+    /// Whether the outstanding ping has gone unanswered for longer than
+    /// `timeout`.
+    ///
+    /// False when no ping is pending, which is the important half: an idle
+    /// but healthy peer -- one that answered its last ping and has had
+    /// nothing to say since -- must never be judged timed out.
+    pub fn ping_timed_out(&self, timeout: std::time::Duration) -> bool {
+        self.ping_wait_secs()
+            .is_some_and(|waited| waited > timeout.as_secs_f64())
+    }
+
+    /// Seconds the outstanding ping has been waiting, or `None` if no ping
+    /// is pending.
+    pub fn ping_wait_secs(&self) -> Option<f64> {
+        if !self.ping_outstanding() {
+            return None;
+        }
+        let waited = now_micros().saturating_sub(self.ping_sent_us.load(Ordering::Relaxed));
+        Some(waited as f64 / 1_000_000.0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_matching_pong_records_a_round_trip() {
+        let s = PeerStats::new(NetTotals::new());
+        assert_eq!(s.ping_time_secs(), None, "nothing measured yet");
+        assert_eq!(s.min_ping_secs(), None);
+        assert_eq!(s.ping_wait_secs(), None, "no ping outstanding");
+
+        s.ping_sent(42);
+        assert!(s.ping_outstanding());
+        assert!(s.ping_wait_secs().is_some());
+
+        assert!(s.pong_received(42));
+        assert!(!s.ping_outstanding());
+        // Loopback round trips can be sub-microsecond; the recorded time must
+        // still be non-zero so it is distinguishable from "never measured".
+        assert!(s.ping_time_secs().unwrap() > 0.0);
+        assert_eq!(s.ping_time_secs(), s.min_ping_secs());
+        assert_eq!(s.ping_wait_secs(), None);
+    }
+
+    #[test]
+    fn a_wrong_or_repeated_nonce_cannot_write_a_ping_time() {
+        let s = PeerStats::new(NetTotals::new());
+        // Unsolicited pong, before any ping went out.
+        assert!(!s.pong_received(7));
+        assert_eq!(s.ping_time_secs(), None);
+
+        s.ping_sent(1234);
+        // A peer echoing some other nonce leaves the ping outstanding.
+        assert!(!s.pong_received(9999));
+        assert!(s.ping_outstanding());
+        assert_eq!(s.ping_time_secs(), None);
+
+        assert!(s.pong_received(1234));
+        let measured = s.ping_time_secs();
+        // The same valid pong replayed is counted once, not twice.
+        assert!(!s.pong_received(1234));
+        assert_eq!(s.ping_time_secs(), measured);
+    }
+
+    #[test]
+    fn only_an_unanswered_ping_can_time_out() {
+        use std::time::Duration;
+        let s = PeerStats::new(NetTotals::new());
+
+        // A peer that has never been pinged is not timed out, however small
+        // the timeout -- there is nothing outstanding to be late.
+        assert!(!s.ping_timed_out(Duration::ZERO));
+
+        s.ping_sent(1);
+        assert!(
+            !s.ping_timed_out(Duration::from_secs(1200)),
+            "a ping sent just now is not overdue"
+        );
+
+        // The clock here is monotonic from process start, so a 20-minute wait
+        // cannot be faked by backdating -- the subtraction just clamps to
+        // zero. Compare a real elapsed wait against a small deadline instead;
+        // the predicate is the same one PING_TIMEOUT drives.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            s.ping_timed_out(Duration::from_millis(1)),
+            "a ping unanswered past its deadline has timed out"
+        );
+
+        // Answering it clears the timeout: an idle peer that pongs is healthy
+        // and must not be dropped no matter how long it then stays quiet.
+        assert!(s.pong_received(1));
+        assert!(!s.ping_timed_out(Duration::ZERO));
+    }
+
+    #[test]
+    fn minping_keeps_the_best_round_trip_not_the_last() {
+        let s = PeerStats::new(NetTotals::new());
+        s.ping_sent(1);
+        assert!(s.pong_received(1));
+        let first = s.ping_time_us.load(Ordering::Relaxed);
+
+        // Force a deliberately slow second round trip by backdating the send.
+        s.ping_sent(2);
+        s.ping_sent_us
+            .store(now_micros().saturating_sub(first + 50_000), Ordering::Relaxed);
+        assert!(s.pong_received(2));
+
+        assert!(
+            s.ping_time_us.load(Ordering::Relaxed) > first,
+            "pingtime tracks the latest round trip"
+        );
+        assert_eq!(
+            s.min_ping_us.load(Ordering::Relaxed),
+            first,
+            "minping keeps the best round trip seen"
+        );
+    }
 
     #[test]
     fn per_peer_records_roll_up_into_global_totals() {

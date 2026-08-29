@@ -32,6 +32,22 @@ use crate::net::sync;
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
 const BAN_THRESHOLD: u32 = 100;
+/// Keepalive cadence: how often each peer is sent a `ping` when none is
+/// outstanding. Bitcoin Core's `PING_INTERVAL` (net_processing.h).
+///
+/// The pong that comes back is what proves the link is still alive in both
+/// directions, and it is what populates `getpeerinfo`'s `pingtime`.
+const PING_INTERVAL: Duration = Duration::from_secs(120);
+
+/// How long a ping may go unanswered before the peer is disconnected.
+/// Bitcoin Core's `TIMEOUT_INTERVAL` (net.h).
+///
+/// Core additionally gates its inactivity checks on the connection being
+/// older than `-peertimeout` (60s). That gate is subsumed here: satd's first
+/// ping goes out when the connection is set up, so a ping cannot have been
+/// outstanding for twenty minutes unless the connection is at least that old.
+const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 /// Minimum interval between announcement-triggered `getheaders` to a single
 /// peer. Caps the header-discovery work a peer can make us do by spamming
 /// invs / unconnectable headers (anti-DoS), while still reacting promptly to
@@ -2108,6 +2124,14 @@ impl PeerManager {
         match msg {
             NetworkMessage::Ping(nonce) => {
                 self.send_to_peer(id, NetworkMessage::Pong(nonce));
+            }
+            NetworkMessage::Pong(nonce) => {
+                // Clone the counters out before releasing the peer map lock;
+                // matching the nonce touches only atomics on the Arc.
+                let stats = self.peers.read().get(&id).map(|h| h.stats.clone());
+                if let Some(stats) = stats {
+                    stats.pong_received(nonce);
+                }
             }
             NetworkMessage::Inv(inventory) => {
                 self.handle_inv(id, inventory);
@@ -5743,7 +5767,18 @@ impl PeerManager {
         });
 
         // Main loop: receive from reader task OR send outbound messages
-        let result = Self::peer_write_loop(id, &self.event_tx, &mut writer, &mut msg_rx, &mut read_rx).await;
+        // Ping accounting rides on the per-peer counters, which the write
+        // loop needs anyway to decide whether a ping is already outstanding.
+        let ping_stats = self.peers.read().get(&id).map(|h| h.stats.clone());
+        let result = Self::peer_write_loop(
+            id,
+            &self.event_tx,
+            &mut writer,
+            &mut msg_rx,
+            &mut read_rx,
+            ping_stats,
+        )
+        .await;
 
         read_task.abort();
         result
@@ -5767,9 +5802,50 @@ impl PeerManager {
         writer: &mut ConnectionWriter,
         msg_rx: &mut mpsc::Receiver<NetworkMessage>,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
+        stats: Option<Arc<crate::net::stats::PeerStats>>,
     ) -> Result<(), String> {
+        // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
+        // The first tick of a tokio interval fires immediately, which is also
+        // what Core does: a peer whose last ping time is still zero is pinged
+        // as soon as it is set up, not two minutes later.
+        let mut ping_timer = tokio::time::interval(PING_INTERVAL);
         loop {
             tokio::select! {
+                _ = ping_timer.tick() => {
+                    // A peer that has not answered its ping for TIMEOUT_INTERVAL
+                    // is gone whether or not the socket has noticed: a half-open
+                    // TCP connection stays writable indefinitely. Returning here
+                    // takes the ordinary teardown path -- the reader task is
+                    // aborted, the socket closed, and PeerDisconnected emitted,
+                    // so IBD block reassignment runs as it would for any drop.
+                    //
+                    // Detection lands within one tick of the timeout, so up to
+                    // PING_INTERVAL late; Core polls more often and is tighter.
+                    if let Some(stats) = &stats
+                        && stats.ping_timed_out(PING_TIMEOUT)
+                    {
+                        return Err(format!(
+                            "ping timeout: no pong in {}s",
+                            PING_TIMEOUT.as_secs()
+                        ));
+                    }
+                    // Only one ping in flight at a time, as in Core -- a peer
+                    // that never pongs is not sent a fresh nonce every two
+                    // minutes, so `pingwait` keeps measuring from the ping
+                    // that actually went unanswered.
+                    if let Some(stats) = &stats
+                        && !stats.ping_outstanding()
+                    {
+                        // Nonce 0 is the "nothing outstanding" sentinel, so
+                        // it must never go on the wire.
+                        let nonce = rand::random::<u64>().max(1);
+                        stats.ping_sent(nonce);
+                        writer
+                            .send(NetworkMessage::Ping(nonce))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
                 msg = read_rx.recv() => {
                     match msg {
                         Some(msg) => {
