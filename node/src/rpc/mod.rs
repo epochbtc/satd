@@ -7,6 +7,7 @@ pub mod auth;
 pub mod blockchain;
 pub mod capability;
 pub mod compat;
+pub mod descriptor;
 pub mod error;
 pub mod indexes;
 pub mod mining;

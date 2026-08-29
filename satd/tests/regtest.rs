@@ -12686,3 +12686,157 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
         .unwrap();
     assert!(resp.get("result").is_some(), "token still works: {resp}");
 }
+
+/// `scantxoutset` walks the UTXO set for outputs paying a descriptor.
+///
+/// This is what Core's test framework calls from `MiniWallet.rescan_utxos()`,
+/// so the shape matters as much as the contents: the framework reads
+/// `success`, `height`, and per-unspent `txid`/`vout`/`amount`/`height`/
+/// `coinbase`, and calls it with *named* parameters.
+#[test]
+fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(10), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let spk = addr
+        .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let spk_hex = hex::encode(spk.as_bytes());
+
+    let scan = |desc: &str| -> serde_json::Value {
+        node.rpc_call_with_params(
+            "scantxoutset",
+            vec![
+                serde_json::json!("start"),
+                serde_json::json!([desc]),
+            ],
+        )
+        .unwrap()["result"]
+            .clone()
+    };
+
+    let res = scan(&format!("raw({spk_hex})"));
+    assert_eq!(res["success"], serde_json::json!(true));
+
+    // Genesis's coinbase is not in the UTXO set, so heights 1..=10 are.
+    let unspents = res["unspents"].as_array().unwrap();
+    assert_eq!(unspents.len(), 10, "{res}");
+    assert_eq!(res["txouts"], serde_json::json!(10));
+    assert_eq!(res["height"], serde_json::json!(10));
+    assert_eq!(
+        res["bestblock"],
+        node.rpc_call("getbestblockhash").unwrap()["result"]
+    );
+    // 10 coinbases at the regtest subsidy, before the first halving.
+    // Rendered with Core's fixed eight decimals, so compare numerically.
+    assert_eq!(res["total_amount"].as_f64().unwrap(), 500.0);
+
+    let mut heights: Vec<u64> = unspents
+        .iter()
+        .map(|u| {
+            assert_eq!(u["coinbase"], serde_json::json!(true));
+            assert_eq!(u["scriptPubKey"], serde_json::json!(spk_hex));
+            assert_eq!(u["vout"], serde_json::json!(0));
+            assert_eq!(u["amount"].as_f64().unwrap(), 50.0);
+            let h = u["height"].as_u64().unwrap();
+            // Core computes this from the scan's tip, not from the coin.
+            assert_eq!(u["confirmations"], serde_json::json!(10 - h + 1));
+            // …and names the block that created the output.
+            let want = node
+                .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+                .unwrap()["result"]
+                .clone();
+            assert_eq!(u["blockhash"], want);
+            h
+        })
+        .collect();
+    heights.sort_unstable();
+    assert_eq!(heights, (1..=10).collect::<Vec<u64>>());
+
+    // The descriptor reported back is the one inferred from the matched
+    // script, not the one asked for: this is a P2TR output with an on-curve
+    // key, so Core names it `rawtr(...)`.
+    let desc = unspents[0]["desc"].as_str().unwrap();
+    assert!(desc.starts_with("rawtr("), "{desc}");
+
+    // addr() reaches the same outputs by a different route.
+    let by_addr = scan(&format!("addr({addr})"));
+    assert_eq!(by_addr["unspents"].as_array().unwrap().len(), 10);
+    assert_eq!(by_addr["total_amount"], res["total_amount"]);
+
+    // A descriptor nothing pays matches nothing, but still succeeds.
+    let empty = scan("raw(51)");
+    assert_eq!(empty["success"], serde_json::json!(true));
+    assert_eq!(empty["unspents"].as_array().unwrap().len(), 0);
+    assert_eq!(empty["total_amount"].as_f64().unwrap(), 0.0);
+    assert_eq!(empty["txouts"], serde_json::json!(10), "txouts counts the set, not the matches");
+
+    // Core's framework calls this with keyword arguments.
+    let named = node
+        .rpc_call_raw_body(&format!(
+            r#"{{"jsonrpc":"2.0","id":"t","method":"scantxoutset",
+                "params":{{"action":"start","scanobjects":["raw({spk_hex})"]}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(named["result"]["unspents"].as_array().unwrap().len(), 10, "{named}");
+
+    // Idle status and abort, which is all that is observable when a scan
+    // over ten coins finishes before another request can be issued.
+    assert_eq!(
+        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("status")]).unwrap()
+            ["result"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        node.rpc_call_with_params("scantxoutset", vec![serde_json::json!("abort")]).unwrap()
+            ["result"],
+        serde_json::json!(false)
+    );
+
+    // Errors: an unknown action, and a descriptor satd does not implement.
+    let bad = node
+        .rpc_call_with_params("scantxoutset", vec![serde_json::json!("bogus")])
+        .unwrap();
+    assert_eq!(bad["error"]["code"], serde_json::json!(-8));
+    assert_eq!(bad["error"]["message"], serde_json::json!("Invalid action 'bogus'"));
+
+    let unsupported = node
+        .rpc_call_with_params(
+            "scantxoutset",
+            vec![
+                serde_json::json!("start"),
+                serde_json::json!(["wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"]),
+            ],
+        )
+        .unwrap();
+    assert_eq!(unsupported["error"]["code"], serde_json::json!(-5));
+    let msg = unsupported["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("wpkh"), "{msg}");
+
+    // A bad checksum is rejected rather than scanned for the wrong script.
+    let bad_sum = node
+        .rpc_call_with_params(
+            "scantxoutset",
+            vec![
+                serde_json::json!("start"),
+                serde_json::json!([format!("raw({spk_hex})#00000000")]),
+            ],
+        )
+        .unwrap();
+    assert_eq!(bad_sum["error"]["code"], serde_json::json!(-5));
+    assert!(
+        bad_sum["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match computed checksum"),
+        "{bad_sum}"
+    );
+}

@@ -189,7 +189,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // `getblocktemplate` also has a proposal mode that validates blocks;
         // `dumptxoutset` and `getblockfileaudit` are minute-scale on
         // mainnet; `verifychain` re-verifies the chain. ---
-        "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain" => Control,
+        "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain"
+        // walks the whole UTXO set; minute-scale on mainnet
+        | "scantxoutset" => Control,
 
         // --- Block-connecting / chainstate-activating (correctness-critical) ---
         "generateblock"
@@ -262,6 +264,7 @@ mod tests {
             "cancelindex",
             "getblocktemplate",
             "dumptxoutset",
+            "scantxoutset",
             "getblockfileaudit",
             "verifychain",
         ] {

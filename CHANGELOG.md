@@ -52,6 +52,12 @@ workflow, scoreboard in the Operator Manual. See
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- `scantxoutset` scans the UTXO set for outputs paying a descriptor. satd's first
+  descriptor support: `raw(<hex script>)` and `addr(<address>)` with BIP380
+  checksums, plus Core's inference for the reported `desc`. Descriptor forms satd
+  does not implement are refused by name rather than matching nothing. Takes the
+  functional-test scoreboard from 6 tests to 7, and re-triages 23 rows onto
+  measured causes.
 - `syncwithvalidationinterfacequeue` blocks until the asynchronous event
   bridges have published everything emitted before the call, the settle barrier
   Core's test framework calls from `sync_all()`. With it, Core's framework can

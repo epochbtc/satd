@@ -98,20 +98,34 @@ Every reason came from running the test, not from reading it. Ranked by tests
 unblocked, which is a map of the framework's demands rather than a priority
 order.
 
-**The cache now builds**, which retires the three items that used to head this
-table. The 73 rows still marked `cache` in the inventory therefore name a
-blocker that no longer applies: they reach their test bodies and stop on
-something of satd's own. Re-triaging them against a measured serial run is the
-next piece of work; until that lands this ranking is only as complete as the
-measured row below plus the older entries under it.
+**The cache now builds**, and the 23 tests `scantxoutset` was blocking have been
+measured one blocker deeper. The 50 rows still marked `cache` in the inventory
+name a blocker that no longer applies: they reach their test bodies and stop on
+something of satd's own. Re-triaging them the same way is the next piece of work;
+until that lands this ranking is only as complete as the measured rows below plus
+the older entries under them.
 
 | Tests | Blocker |
 |---:|---|
-| 22 | `scantxoutset`. The framework's MiniWallet calls it from `rescan_utxos()`, so one missing RPC is the first blocker for 22 tests. Measured on the run that first built the cache. |
 | 22 | No periodic P2P ping. `connect_nodes()` waits for a `pong` in both directions. satd has no keepalive: `ping_all()` runs only from the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. An availability gap before it is a test blocker. |
 | 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS` (1032), inviting requests for blocks it does not have. |
 | 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one; its invalid-port error also differs from Core's wording. |
 | 1 | Core's automatic onion bind: `127.0.0.1:<port + 1>` with `-listen` and no `-bind`. Not adopted — an extra listening socket on every default node is a decision about what a stock satd exposes, not a parsing fix. |
+
+From the 23 rows re-triaged after `scantxoutset` landed. Small individually, but
+each is now a measured cause rather than a guess:
+
+| Tests | Blocker |
+|---:|---|
+| 4 | `generatetodescriptor`. The framework mines to MiniWallet's own descriptor. satd already parses the `raw()` form it passes, so this is a mining-RPC gap, not a descriptor one. `generateblock` has the same shape: Core's `output` is an address *or* a descriptor, satd's is an address (1 more test). |
+| 1 each | Missing RPCs: `getprioritisedtransactions`, `getorphantxs`, `createmultisig`. |
+| 1 each | Missing fields on RPCs satd has: `getmempoolinfo.permitbaremultisig`, `testmempoolaccept.wtxid`, and `getnetworkinfo.localrelay` (always true; Core reports false under `-blocksonly`). |
+| 1 | `OP_RETURN` output size. satd rejects a ~20000-byte `OP_RETURN` as a nonstandard `scriptpubkey`; Core v31's `-datacarriersize` defaults to `MAX_STANDARD_TX_WEIGHT/4`, so MiniWallet's padding output is standard there. |
+| 1 | `sendrawtransaction` returns the right rejection reason under the wrong code: `-25` where Core returns `-26`. |
+| 1 | Dust policy: satd allows an output Core's dust rule rejects. |
+| 1 | Sigop-equivalent vsize differs by one (satd 344, Core 345). |
+| 1 | `prioritisetransaction` with no arguments leaks a Rust `ErrorObject { .. }` Debug rendering where Core returns its help text. |
+| 1 | Key-based descriptors — `pkh()`, `combo()`, `sh(multi())`, `tr()`, and ranged xpub derivation — which `rpc_scantxoutset.py` needs and satd's `raw()`/`addr()` subset does not cover. |
 
 Nine rows are outside the compatibility target: six use Core v31 options
 (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
@@ -127,6 +141,10 @@ target; the rest need Core-only binaries or internals.
   before joining it to `-port`, so `-bind=::1` could never have worked.
 - `generatetoaddress` parameter shape, which measurement showed was the named
   JSON-RPC parameter gap above.
+- `scantxoutset`, over the key-free descriptors (`raw()`, `addr()`) with BIP380
+  checksums and Core's `desc` inference. `desc` parity was settled against a live
+  Bitcoin Core rather than by reading `InferScript`. Unblocked
+  `mempool_resurrect` and moved the other 22 onto measured causes.
 - Repeated command-line options aborted startup. Core takes the last value on
   the command line and the first in `bitcoin.conf`.
 - `-bind` took a single bare address. Now repeatable, understands

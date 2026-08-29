@@ -1409,3 +1409,268 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// --- scantxoutset ---------------------------------------------------------
+
+/// One scan at a time, process-wide. Core's `CoinsViewScanReserver` over
+/// `g_scan_in_progress`; the scan holds a point-in-time view of the coins
+/// database and is minute-scale on mainnet, so a second concurrent scan is
+/// refused rather than queued.
+static SCAN_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Percentage complete, published for `action="status"`.
+static SCAN_PROGRESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Set by `action="abort"`, read by the scan loop.
+static SCAN_ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII guard: releases the reservation however the scan ends.
+struct ScanReservation;
+
+impl ScanReservation {
+    /// `Some` if no scan was running, and the caller now owns the slot.
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if SCAN_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            // Owned by the reservation, as in Core's `CoinsViewScanReserver`.
+            // Resetting later -- after the descriptors parse, say -- leaves a
+            // window where `status` reports the *previous* scan's percentage.
+            SCAN_PROGRESS.store(0, Ordering::Release);
+            Some(ScanReservation)
+        }
+    }
+}
+
+impl Drop for ScanReservation {
+    fn drop(&mut self) {
+        SCAN_PROGRESS.store(0, std::sync::atomic::Ordering::Release);
+        SCAN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `scantxoutset "status"` — `null` when idle, `{"progress": n}` while a
+/// scan runs.
+pub fn scan_tx_out_set_status() -> Value {
+    if SCAN_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire) {
+        json!({ "progress": SCAN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) })
+    } else {
+        Value::Null
+    }
+}
+
+/// `scantxoutset "abort"` — `true` if a scan was running and has been asked
+/// to stop, `false` if there was nothing to abort.
+pub fn scan_tx_out_set_abort() -> Value {
+    if SCAN_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire) {
+        SCAN_ABORT.store(true, std::sync::atomic::Ordering::Release);
+        json!(true)
+    } else {
+        json!(false)
+    }
+}
+
+/// `scantxoutset "start" [<descriptor>, ...]` — walk the UTXO set for
+/// outputs paying any of the given descriptors.
+///
+/// Blocking and minute-scale on a large chain; the caller runs it on a
+/// blocking thread so `status` and `abort` stay answerable meanwhile.
+/// `interrupted` is polled alongside the abort flag; Core does the same
+/// through `rpc_interruption_point`, so that stopping the node does not have
+/// to wait out a scan that may have minutes left to run.
+pub fn scan_tx_out_set_start(
+    chain_state: &ChainState,
+    scanobjects: &Value,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Value, (i32, String)> {
+    use std::sync::atomic::Ordering;
+
+    let Some(_reservation) = ScanReservation::acquire() else {
+        return Err((
+            -8,
+            "Scan already in progress, use action \"abort\" or \"status\"".to_string(),
+        ));
+    };
+
+    let Some(objects) = scanobjects.as_array() else {
+        return Err((
+            -8,
+            "Scan object needs to be either a string or an object".to_string(),
+        ));
+    };
+
+    // Resolve every descriptor before touching the database, so a typo in
+    // the third scan object fails immediately rather than after a full pass.
+    // `needles` maps script -> the descriptor Core would report for it.
+    let mut needles: std::collections::HashMap<bitcoin::ScriptBuf, String> =
+        std::collections::HashMap::new();
+    for obj in objects {
+        for script in crate::rpc::descriptor::scan_object_to_scripts(obj, chain_state.network)? {
+            let inferred = crate::rpc::descriptor::infer_descriptor(&script, chain_state.network);
+            needles.insert(script, inferred);
+        }
+    }
+
+    SCAN_ABORT.store(false, Ordering::Release);
+
+    // Flush so the point-in-time view the iteration takes includes coins
+    // still sitting in the in-memory cache.
+    chain_state
+        .flush_coin_cache()
+        .map_err(|e| (-32603, format!("Unable to flush coins: {e}")))?;
+
+
+    let mut count: u64 = 0;
+    let mut found: Vec<(bitcoin::OutPoint, crate::storage::coinview::Coin)> = Vec::new();
+    let mut aborted = false;
+
+    let base = chain_state
+        .for_each_coin_snapshot(&mut |outpoint, coin| {
+            count += 1;
+            if count.is_multiple_of(8192)
+                && (SCAN_ABORT.load(Ordering::Acquire) || interrupted())
+            {
+                aborted = true;
+                // The store has no cancel channel; unwinding via an error is
+                // how the iteration stops early. `aborted` distinguishes this
+                // from a real failure.
+                return Err(crate::storage::StoreError::Database(
+                    "scan aborted".to_string(),
+                ));
+            }
+            if count.is_multiple_of(256) {
+                // Core's progress estimate: how far the leading two bytes of
+                // the txid have advanced through the keyspace. satd iterates
+                // in the same (txid, vout) order, so the same estimate holds.
+                let txid: &[u8; 32] = outpoint.txid.as_ref();
+                let high = 0x100u32 * txid[0] as u32 + txid[1] as u32;
+                SCAN_PROGRESS.store(
+                    (high as f64 * 100.0 / 65536.0 + 0.5) as u8,
+                    Ordering::Relaxed,
+                );
+            }
+            if needles.contains_key(&coin.script_pubkey) {
+                found.push((*outpoint, coin.clone()));
+            }
+            Ok(())
+        })
+        .map(|b| (b.base_hash, b.base_height))
+        .or_else(|e| {
+            if aborted {
+                // The walk was cut short before it could report the base its
+                // coins came from. Read the tip now rather than before the
+                // scan: a tip from before the snapshot can sit *below* coins
+                // the snapshot contained, and then an entry's own `height`
+                // exceeds the response's top-level `height`.
+                Ok(chain_state.tip_snapshot())
+            } else {
+                Err((-32603, format!("Unable to read UTXO set: {e}")))
+            }
+        })?;
+    let (base_hash, base_height) = base;
+
+    if !aborted {
+        SCAN_PROGRESS.store(100, Ordering::Release);
+    }
+
+    // The coins come from one point-in-time view; the block hashes below come
+    // from the live height index. They only describe one chain if the base the
+    // coins belong to is still on it. One lookup settles that: if the active
+    // chain still has `base_hash` at `base_height`, every lesser height on it
+    // is an ancestor of the base, which is what Core's `GetAncestor` walk
+    // guarantees for free.
+    if chain_state.get_block_hash_by_height(base_height) != Some(base_hash) {
+        return Err((
+            -32603,
+            "chain reorganized during the scan; the result would mix blocks \
+             from two chains. Retry the scan"
+                .to_string(),
+        ));
+    }
+
+    let unit = default_unit();
+    let mut total_sat: u64 = 0;
+    let mut unspents = Vec::with_capacity(found.len());
+    for (outpoint, coin) in &found {
+        total_sat = total_sat.saturating_add(coin.amount);
+        // Core takes this from `tip->GetAncestor(coin.nHeight)`, so it is an
+        // ancestor of the `bestblock` it reports by construction. satd has no
+        // skiplist to walk cheaply, so it reads the active-chain height index
+        // -- which the base-consistency check above has just confirmed still
+        // contains the snapshot base, making every height at or below it an
+        // ancestor of it too.
+        //
+        // A missing row is not a race we can paper over: emitting `""` where
+        // every Core-shaped client expects 64 hex characters is worse than
+        // failing, and Core cannot produce it.
+        let blockhash = match chain_state.get_block_hash_by_height(coin.height) {
+            Some(h) => h.to_string(),
+            None => {
+                return Err((
+                    -32603,
+                    format!(
+                        "chain state moved during the scan: no block at height {} \
+                         on the active chain; retry the scan",
+                        coin.height
+                    ),
+                ));
+            }
+        };
+        let mut entry = json!({
+            "txid": outpoint.txid.to_string(),
+            "vout": outpoint.vout,
+            "scriptPubKey": hex::encode(coin.script_pubkey.as_bytes()),
+            "desc": needles.get(&coin.script_pubkey).cloned().unwrap_or_default(),
+            "amount": format_amount(coin.amount, unit),
+            "coinbase": coin.coinbase,
+            "height": coin.height,
+            "blockhash": blockhash,
+            "confirmations": base_height.saturating_sub(coin.height) + 1,
+        });
+        annotate_units(&mut entry, unit);
+        unspents.push(entry);
+    }
+
+    let mut response = json!({
+        "success": !aborted,
+        "txouts": count,
+        "height": base_height,
+        "bestblock": base_hash.to_string(),
+        "unspents": unspents,
+        "total_amount": format_amount(total_sat, unit),
+    });
+    annotate_units(&mut response, unit);
+    Ok(response)
+}
+
+#[cfg(test)]
+mod scan_reservation_tests {
+    use super::*;
+
+    /// The reservation is what makes `status` and `abort` meaningful: it is
+    /// the only record that a scan is running. A leak wedges every later
+    /// scan on this process with "Scan already in progress".
+    #[test]
+    fn reservation_admits_one_scan_and_is_released_on_drop() {
+        assert_eq!(scan_tx_out_set_status(), Value::Null);
+        assert_eq!(scan_tx_out_set_abort(), json!(false));
+
+        let first = ScanReservation::acquire();
+        assert!(first.is_some());
+        assert!(
+            ScanReservation::acquire().is_none(),
+            "a second scan must be refused, not queued"
+        );
+
+        // Now that a scan is notionally running, both are answerable.
+        assert_eq!(scan_tx_out_set_status(), json!({"progress": 0}));
+        assert_eq!(scan_tx_out_set_abort(), json!(true));
+
+        drop(first);
+        assert_eq!(scan_tx_out_set_status(), Value::Null);
+        assert_eq!(scan_tx_out_set_abort(), json!(false));
+        assert!(
+            ScanReservation::acquire().is_some(),
+            "the slot must be reusable after the scan ends"
+        );
+    }
+}
