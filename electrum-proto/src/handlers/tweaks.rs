@@ -163,6 +163,26 @@ impl TweakSource {
     }
 }
 
+/// Whether a missing index row at `height` is a legitimate answer rather than a
+/// hole.
+///
+/// Below taproot activation and above the tip there is no row *by
+/// construction*, and `{"<h>": {}}` is the honest reply — it is how a client's
+/// progress marker crosses barren stretches. Anywhere inside `[activation,
+/// tip]` a complete index must have a row, so a miss means a reorg is in
+/// flight (the disconnect drops each disconnected height's row, and the
+/// replacement branch is written back one block per batch). Replying `{}` there
+/// says "no payments at this height" about a block that is about to be replaced
+/// by one that may well pay the client, and the client's marker moves past it
+/// for good.
+///
+/// A named predicate rather than an inline comparison because it is the whole
+/// of the difference between a served scan and a silently short one, and an
+/// inline `&&` is not something a test can fail on.
+fn absence_is_an_answer(height: u32, activation: u32, tip: u32) -> bool {
+    height < activation || height > tip
+}
+
 /// One height's map, `{"<height>": {<txid>: {...}}}`, as the result and every
 /// notification carry it.
 ///
@@ -188,7 +208,7 @@ pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<V
             // be replaced by one that may well pay it — the silent skip this
             // whole surface exists to avoid. Refuse in-band instead, exactly as
             // the streaming pager does for the same case.
-            if height >= src.activation_height() && height <= src.chain.tip_height() {
+            if !absence_is_an_answer(height, src.activation_height(), src.chain.tip_height()) {
                 return Err(JsonRpcError::internal(format!(
                     "silent-payment index has no row for height {height} \
                      (a reorg is in flight); re-request this height"
@@ -461,6 +481,28 @@ mod tests {
         assert_eq!(req.last_height(120), Some(120), "clamped to tip");
         assert_eq!(req.last_height(1_000), Some(149), "start + count - 1");
         assert_eq!(TweakReq { start: 200, count: 1, historical: false }.last_height(120), None);
+    }
+
+    #[test]
+    fn a_missing_row_is_an_answer_only_outside_the_served_range() {
+        // Outside [activation, tip]: no row exists by construction, so an empty
+        // map is the honest reply and the client's marker advances.
+        assert!(absence_is_an_answer(0, 709_632, 900_000), "below activation");
+        assert!(absence_is_an_answer(709_631, 709_632, 900_000), "one below activation");
+        assert!(absence_is_an_answer(900_001, 709_632, 900_000), "one above the tip");
+        assert!(absence_is_an_answer(u32::MAX, 709_632, 900_000), "far above the tip");
+
+        // Inside it: a complete index must have a row, so a miss is a reorg
+        // window. Answering `{}` here is the silent skip -- the client records
+        // the height as scanned and never revisits the block that replaces it.
+        assert!(!absence_is_an_answer(709_632, 709_632, 900_000), "activation itself");
+        assert!(!absence_is_an_answer(800_000, 709_632, 900_000), "mid-range");
+        assert!(!absence_is_an_answer(900_000, 709_632, 900_000), "the tip itself");
+
+        // Regtest and signet activate at 0, so every height at or below the tip
+        // is inside the range and no height is "below activation".
+        assert!(!absence_is_an_answer(0, 0, 10), "regtest genesis is in range");
+        assert!(absence_is_an_answer(11, 0, 10), "still an answer above the tip");
     }
 
     #[test]

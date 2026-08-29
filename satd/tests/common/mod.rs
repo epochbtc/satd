@@ -1290,6 +1290,39 @@ pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
     fee_sat: u64,
     sequence: u32,
 ) -> (String, String) {
+    build_signed_p2wpkh_spend_inner(node, wallet, dest_script, fee_sat, sequence, None)
+}
+
+/// Spend block 1's coinbase to an explicit output list.
+///
+/// The single-output helpers cover most tests; this exists for the ones that
+/// need one transaction to carry *several* taproot outputs — BIP 352 numbers a
+/// recipient's outputs `k = 0, 1, 2, …` within a transaction, so anything
+/// asserting on `k` enumeration needs more than one. Values are the caller's to
+/// choose and must leave a fee.
+pub fn build_signed_p2wpkh_spend_to_outputs<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    outputs: Vec<bitcoin::TxOut>,
+) -> (String, String) {
+    build_signed_p2wpkh_spend_inner(
+        node,
+        wallet,
+        bitcoin::ScriptBuf::new(),
+        0,
+        0xffff_ffff,
+        Some(outputs),
+    )
+}
+
+fn build_signed_p2wpkh_spend_inner<R: BlockingRpc>(
+    node: &R,
+    wallet: &DeterministicWallet,
+    dest_script: bitcoin::ScriptBuf,
+    fee_sat: u64,
+    sequence: u32,
+    outputs: Option<Vec<bitcoin::TxOut>>,
+) -> (String, String) {
     use bitcoin::hashes::Hash as _;
     use bitcoin::secp256k1::{Message, Secp256k1};
     use bitcoin::sighash::{EcdsaSighashType, SighashCache};
@@ -1316,10 +1349,13 @@ pub fn build_signed_p2wpkh_spend_seq<R: BlockingRpc>(
             sequence: Sequence(sequence),
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_value_sat - fee_sat),
-            script_pubkey: dest_script,
-        }],
+        output: match outputs {
+            Some(outs) => outs,
+            None => vec![TxOut {
+                value: Amount::from_sat(cb_value_sat - fee_sat),
+                script_pubkey: dest_script,
+            }],
+        },
     };
 
     let secp = Secp256k1::new();

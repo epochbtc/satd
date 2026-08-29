@@ -1489,6 +1489,13 @@ fn test_e2e_electrum_tweaks_subscribe_streams_result_then_notifications_then_don
     e2e.node.rpc_handle().mine(2, &wallet.address.to_string());
 
     let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    // The capability flag must say `true` on a node that can actually serve --
+    // the refusal test covers the `false` side, and a flag that is only ever
+    // asserted in one direction is half a test.
+    cli.send(r#"{"id":9,"method":"server.features"}"#);
+    let features = cli.recv();
+    assert_eq!(features["result"]["tweaks"], serde_json::json!(true));
+
     let (first, notifications) = cli.tweaks_subscribe(height, 3, true);
 
     // Result: exactly the first height, and it carries the eligible transaction.
@@ -1572,6 +1579,153 @@ fn test_e2e_electrum_tweaks_subscribe_cut_through_follows_historical_mode() {
     assert!(
         kept[height.to_string()].get(&key).is_some(),
         "historicalMode=true keeps it: a restore needs spent coins in its history"
+    );
+    e2e.node.stop();
+}
+
+/// Cut-through drops a whole entry, and never trims a surviving one.
+///
+/// This is the contract the whole feature turns on, and the Electrum surface is
+/// the wallet-facing one. BIP 352 numbers a recipient's outputs `k = 0, 1, 2, …`
+/// within a transaction and a scanner stops at the first `k` it cannot match, so
+/// serving only the unspent subset would truncate that walk: a wallet paid twice
+/// here that had spent its `k = 0` coin would derive `P_0`, miss the output the
+/// server removed, stop, and never reach the `k = 1` coin it still owns.
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_keeps_every_output_of_a_surviving_entry() {
+    use bitcoin::{Amount, OutPoint, TxOut};
+
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let rpc = e2e.node.rpc_handle();
+    rpc.mine(101, &wallet.address.to_string());
+
+    // One transaction, two taproot outputs to the same key: the k = 0 / k = 1
+    // shape. Both are eligible, so the index writes one entry naming this txid.
+    let (kp, spk) = common::p2tr_keypath_output(&secp, [0x33; 32]);
+    let each = 20 * 100_000_000u64;
+    let (raw, txid) = common::build_signed_p2wpkh_spend_to_outputs(
+        &rpc,
+        &wallet,
+        vec![
+            TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() },
+            TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() },
+        ],
+    );
+    rpc.send_raw_tx(&raw);
+    rpc.mine(1, &wallet.address.to_string());
+    let height = 102u32;
+    let funding_txid = bitcoin::Txid::from_str(&txid).expect("txid");
+    let key = funding_txid.to_string();
+
+    let outs_at = |cli: &mut RawElectrum, historical: bool| -> Option<Vec<String>> {
+        let (first, _) = cli.tweaks_subscribe(height, 1, historical);
+        let entry = first[height.to_string()].get(&key)?.clone();
+        let mut vouts: Vec<String> = entry["output_pubkeys"]
+            .as_object()
+            .expect("output_pubkeys")
+            .keys()
+            .cloned()
+            .collect();
+        vouts.sort();
+        Some(vouts)
+    };
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    assert_eq!(
+        outs_at(&mut cli, false).as_deref(),
+        Some(&["0".to_string(), "1".to_string()][..]),
+        "both outputs unspent: both are candidates"
+    );
+
+    // Spend k = 0 only. The entry must survive on k = 1 -- and must still carry
+    // BOTH outputs, or a scanner's walk stops at the missing k = 0.
+    let (raw_spend, _) = common::build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        OutPoint { txid: funding_txid, vout: 0 },
+        spk.clone(),
+        each,
+        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        10_000,
+    );
+    rpc.send_raw_tx(&raw_spend);
+    rpc.mine(1, &wallet.address.to_string());
+
+    assert_eq!(
+        outs_at(&mut cli, false).as_deref(),
+        Some(&["0".to_string(), "1".to_string()][..]),
+        "a surviving entry carries its full candidate set, spent outputs included"
+    );
+
+    // Spend k = 1 too: now nothing is left at any k, so the entry goes.
+    let (raw_spend2, _) = common::build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        OutPoint { txid: funding_txid, vout: 1 },
+        spk,
+        each,
+        DeterministicWallet::from_secret([0x55; 32]).address.script_pubkey(),
+        10_000,
+    );
+    rpc.send_raw_tx(&raw_spend2);
+    rpc.mine(1, &wallet.address.to_string());
+
+    assert!(
+        outs_at(&mut cli, false).is_none(),
+        "every output spent: the entry is dropped whole"
+    );
+    assert_eq!(
+        outs_at(&mut cli, true).as_deref(),
+        Some(&["0".to_string(), "1".to_string()][..]),
+        "historical mode keeps it: a restore needs the spent coins"
+    );
+    e2e.node.stop();
+}
+
+/// A chunk longer than one blocking hop still delivers every height, exactly
+/// once, in ascending order.
+///
+/// `stream_chunk` reads in hops of `HEIGHTS_PER_HOP` (16) and advances its
+/// cursor by however many lines the hop actually produced, so the hop boundary
+/// is where an off-by-one would duplicate or skip a height — and a skipped
+/// height is a block a wallet never scans. Every other test here requests three
+/// heights or fewer and never crosses it.
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_spans_multiple_read_hops_without_gaps() {
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    // Comfortably more than two hops of 16.
+    e2e.node.rpc_handle().mine(40, &wallet.address.to_string());
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    let (first, notifications) = cli.tweaks_subscribe(1, 40, true);
+
+    let mut heights: Vec<u32> = first
+        .as_object()
+        .expect("first height map")
+        .keys()
+        .map(|k| k.parse().expect("numeric height"))
+        .collect();
+    for map in &notifications {
+        if map.get("message").is_some() {
+            continue;
+        }
+        for k in map.as_object().expect("height map").keys() {
+            heights.push(k.parse().expect("numeric height"));
+        }
+    }
+
+    assert_eq!(
+        heights,
+        (1..=40).collect::<Vec<u32>>(),
+        "every requested height, once, ascending, across the hop boundary"
+    );
+    assert_eq!(
+        notifications.last().expect("at least one")["message"],
+        "done",
+        "and the chunk terminates"
     );
     e2e.node.stop();
 }
