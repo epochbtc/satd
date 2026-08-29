@@ -443,6 +443,18 @@ impl EventPublisher {
     }
 }
 
+/// Clears a drain lane's `bridged` flag however its bridge ends — the shutdown
+/// arm, a closed channel, or a panic. Without this the flag latches on for the
+/// life of the process and `syncwithvalidationinterfacequeue` waits out its
+/// full timeout on a lane that can no longer make any progress.
+struct BridgeLifetime(fn());
+
+impl Drop for BridgeLifetime {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 async fn bridge_mempool(
     publisher: Arc<EventPublisher>,
     mut rx: broadcast::Receiver<MempoolEvent>,
@@ -450,6 +462,7 @@ async fn bridge_mempool(
     mut shutdown: watch::Receiver<bool>,
 ) {
     crate::events::drain::mempool_bridge_started();
+    let _lifetime = BridgeLifetime(crate::events::drain::mempool_bridge_stopped);
     loop {
         tokio::select! {
             biased;
@@ -499,6 +512,7 @@ async fn bridge_chain(
     // From here on this stream can make progress, so
     // `syncwithvalidationinterfacequeue` may wait on it.
     crate::events::drain::chain_bridge_started();
+    let _lifetime = BridgeLifetime(crate::events::drain::chain_bridge_stopped);
     loop {
         tokio::select! {
             biased;

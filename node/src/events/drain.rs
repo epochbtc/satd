@@ -117,6 +117,26 @@ impl Lane {
             .fetch_max(self.emitted.load(Ordering::Acquire), Ordering::AcqRel);
         self.bridged.store(true, Ordering::Release);
     }
+
+    /// Mark this lane unconsumable again, because its bridge has returned.
+    ///
+    /// `bridged` used to latch on for the life of the process. Both bridges
+    /// return on shutdown and on a closed channel, and the senders stay
+    /// installed for the other subscribers, so `emitted` kept climbing while
+    /// `processed` could not — and every later wait burned the full timeout
+    /// rather than observing that there was nothing left to wait for. That
+    /// matters during graceful shutdown in particular, where the bridges and
+    /// the RPC server share one shutdown signal: a drain arriving after the
+    /// bridges exit would hold an RPC admission permit for 30 seconds and
+    /// delay the shutdown by that much.
+    fn bridge_stopped(&self) {
+        self.bridged.store(false, Ordering::Release);
+        // Anything still outstanding is now undeliverable; release waiters
+        // rather than leaving them to time out.
+        self.processed
+            .fetch_max(self.emitted.load(Ordering::Acquire), Ordering::AcqRel);
+        self.progress.notify_waiters();
+    }
 }
 
 static CHAIN: Lane = Lane::new();
@@ -130,6 +150,16 @@ pub fn chain_emitted() {
 /// A mempool event was handed to the broadcast channel.
 pub fn mempool_emitted() {
     MEMPOOL.emitted();
+}
+
+/// A chain bridge has returned; the lane can no longer make progress.
+pub fn chain_bridge_stopped() {
+    CHAIN.bridge_stopped();
+}
+
+/// A mempool bridge has returned; the lane can no longer make progress.
+pub fn mempool_bridge_stopped() {
+    MEMPOOL.bridge_stopped();
 }
 
 /// `n` chain events have been fully published (or provably skipped by a lagged
@@ -244,6 +274,76 @@ mod tests {
 
         A.processed(1);
         assert!(waiter.await.unwrap(), "and returns once processed catches up");
+    }
+
+    /// A bridge that has returned cannot publish anything ever again, so a
+    /// lane it left behind must stop being waited on. Before `bridge_stopped`
+    /// the flag latched on for the life of the process: `emitted` kept
+    /// climbing from the senders, which stay installed for other subscribers,
+    /// while `processed` could not move — so every later drain burned the full
+    /// 30-second timeout and returned a failure.
+    #[tokio::test]
+    async fn a_lane_whose_bridge_returned_stops_being_waited_on() {
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+        A.bridge_started();
+        A.emitted();
+
+        // While the bridge is live this is a real wait.
+        let mut waiter = tokio::spawn(wait_for_lanes(lanes(&A, &B)));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut waiter)
+                .await
+                .is_err(),
+            "a live bridge must still be waited on"
+        );
+
+        // The bridge returns with the event still outstanding. The waiter must
+        // be released, not left to time out.
+        A.bridge_stopped();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+                .await
+                .expect("the waiter must not be left to time out")
+                .unwrap()
+        );
+
+        // And a later drain does not wait either, however far `emitted` runs on.
+        A.emitted();
+        A.emitted();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                wait_for_lanes(lanes(&A, &B))
+            )
+            .await
+            .expect("a stopped lane has nothing to wait for")
+        );
+    }
+
+    /// An event handed to a broadcast channel with no receivers is never
+    /// delivered. Counting it as emitted without ever counting it as processed
+    /// leaves a permanent deficit, which is the same 30-second stall by another
+    /// route — so the emit sites account for it immediately, exactly as they do
+    /// for a lagged skip.
+    #[tokio::test]
+    async fn an_undeliverable_event_does_not_strand_the_barrier() {
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+        A.bridge_started();
+
+        // What `emit` does when `tx.send` reports no receivers.
+        A.emitted();
+        A.processed(1);
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                wait_for_lanes(lanes(&A, &B))
+            )
+            .await
+            .expect("an undeliverable event must not strand the barrier")
+        );
     }
 
     #[tokio::test]
