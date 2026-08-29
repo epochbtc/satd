@@ -2602,6 +2602,24 @@ impl ChainState {
         })
     }
 
+    /// Walk every coin in one RocksDB point-in-time view, as
+    /// `dump_utxo_snapshot` does. Backs `scantxoutset`.
+    ///
+    /// Blocks can connect during the walk without disturbing it: the
+    /// returned [`CoinSnapshotBase`] names the block the coins actually
+    /// correspond to, which is not necessarily the in-memory tip. Callers
+    /// must flush the coin cache first (see `flush_coin_cache`) so
+    /// committed-but-uncached writes are visible.
+    pub fn for_each_coin_snapshot(
+        &self,
+        f: &mut dyn FnMut(
+            &OutPoint,
+            &crate::storage::coinview::Coin,
+        ) -> Result<(), crate::storage::StoreError>,
+    ) -> Result<crate::storage::CoinSnapshotBase, crate::storage::StoreError> {
+        self.store.for_each_coin_snapshot(f)
+    }
+
     /// Get the total amount (in satoshis) across all UTXOs.
     pub fn coin_total_amount(&self) -> u64 {
         self.store.coin_total_amount()

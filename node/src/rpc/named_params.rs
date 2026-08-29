@@ -181,6 +181,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "reconsiderblock" => &[("blockhash", false)],
         "resumeindex" => &[("index_name", false)],
         "savemempool" => &[],
+        "scantxoutset" => &[("action", false), ("scanobjects", false)],
         "sendrawtransaction" => &[("hexstring", false), ("maxfeerate|allowquarantined", false), ("maxburnamount", false)],
         "setban" => &[("subnet", false), ("command", false), ("bantime", false), ("absolute", false)],
         "setmocktime" => &[("timestamp", false)],

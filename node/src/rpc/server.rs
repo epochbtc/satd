@@ -1321,6 +1321,44 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    // Core runs the scan on the RPC thread and answers `status`/`abort` from
+    // other threads meanwhile. satd registers it async and puts the scan on a
+    // blocking thread for the same reason: a full pass is minute-scale on
+    // mainnet, and an `abort` that queued behind it could never land.
+    module.register_async_method("scantxoutset", |params, ctx, _extensions| async move {
+        let mut seq = params.sequence();
+        let action: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        match action.as_str() {
+            "status" => Ok(blockchain::scan_tx_out_set_status()),
+            "abort" => Ok(blockchain::scan_tx_out_set_abort()),
+            "start" => {
+                let scanobjects: serde_json::Value = seq.optional_next().ok().flatten().ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -1,
+                        "scanobjects argument is required for the start action",
+                        None::<()>,
+                    )
+                })?;
+                let chain_state = std::sync::Arc::clone(&ctx.chain_state);
+                tokio::task::spawn_blocking(move || {
+                    blockchain::scan_tx_out_set_start(&chain_state, &scanobjects)
+                })
+                .await
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(-32603, format!("scan task failed: {e}"), None::<()>)
+                })?
+                .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+            }
+            other => Err(ErrorObjectOwned::owned(
+                -8,
+                format!("Invalid action '{other}'"),
+                None::<()>,
+            )),
+        }
+    })?;
+
     module.register_method("estimatesmartfee", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let conf_target: u32 = seq
@@ -1636,6 +1674,7 @@ pub async fn start(
             "reconsiderblock",
             "savemempool",
             "sendrawtransaction",
+            "scantxoutset",
             "setban",
             "setmocktime",
             "signrawtransactionwithkey",
