@@ -2981,7 +2981,7 @@ type BlockTweaks struct {
 	BlockHash     []byte                 `protobuf:"bytes,1,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"` // 32 bytes, internal byte order
 	Height        uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
 	Entries       []*TweakEntry          `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`    // empty = indexed block, no eligible txs
-	Filtered      bool                   `protobuf:"varint,4,opt,name=filtered,proto3" json:"filtered,omitempty"` // true when a per-subscription dust limit dropped entries
+	Filtered      bool                   `protobuf:"varint,4,opt,name=filtered,proto3" json:"filtered,omitempty"` // true when a per-subscription filter dropped entries
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3315,11 +3315,15 @@ type SubscribeRequest struct {
 	// this set reads each block (heavier than a lean cold-sync).
 	TweakOutputs *bool `protobuf:"varint,7,opt,name=tweak_outputs,json=tweakOutputs,proto3,oneof" json:"tweak_outputs,omitempty"`
 	// Cut-through: drop BlockTweaks entries whose taproot outputs are all already
-	// spent on the confirmed chain as of serve time, and (when `tweak_outputs` is
-	// set) carry only the still-unspent outputs. A balance scan never has to run
-	// ECDH against a coin that is already gone; a RESTORE that needs transaction
-	// history must leave this off, because a payment received and later spent is
-	// omitted entirely. Default false = every eligible entry, spent or not.
+	// spent on the confirmed chain as of serve time. A balance scan never has to
+	// run ECDH against a coin that is already gone; a RESTORE that needs
+	// transaction history must leave this off, because a payment received and
+	// later spent is omitted entirely. Default false = every eligible entry,
+	// spent or not.
+	//
+	// Spentness decides only whether an entry SURVIVES, never which outputs it
+	// carries: a surviving entry carries its full taproot output set, because BIP
+	// 352 scanning stops at the first k that does not match a carried output.
 	//
 	// A modifier on the `tweaks` category: setting it without bit 8 is rejected
 	// in-band (invalid_argument); a node with no block source rejects it
