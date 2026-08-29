@@ -938,6 +938,35 @@ pub async fn start(
         let address: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        // Core's `transactions` and `submit` are not implemented. Accepting and
+        // ignoring them is not a tolerable failure mode for either: `submit`
+        // false asks for a block to be built and NOT connected, and answering
+        // by mining and connecting it advances the chain the caller was told
+        // would not move — a test that asserts on the tip afterwards is then
+        // asserting against state it did not create. `transactions` asks for a
+        // specific block body and satd always builds from the mempool. Refuse
+        // both, so the gap is visible instead of silently wrong. (Ignoring them
+        // predates named parameters — a positional caller hit it too — but
+        // named arguments are how Core's own suite passes them.)
+        let transactions = seq.optional_next::<Vec<serde_json::Value>>();
+        let transactions_ok = matches!(&transactions, Ok(None))
+            || matches!(&transactions, Ok(Some(v)) if v.is_empty());
+        if !transactions_ok {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "generateblock: the 'transactions' argument is not supported by satd; \
+                 the block is built from the mempool",
+                None::<()>,
+            ));
+        }
+        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "generateblock: submit=false is not supported by satd; \
+                 a generated block is always submitted",
+                None::<()>,
+            ));
+        }
         mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;

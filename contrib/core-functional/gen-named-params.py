@@ -240,7 +240,43 @@ def parse_file(path):
 
 # satd's own RPCs, which Core does not declare. These take the parameter names
 # the Operator Manual already documents for them.
+# satd extensions that ride in a Core argument slot. The name is added as an
+# alias on that slot, so both Core's name and satd's resolve to it. Keyed by
+# method, then by zero-based slot index.
+SATD_SLOT_ALIASES = {
+    # `allowquarantined` (satd) shares Core's `maxfeerate` slot, which satd does
+    # not enforce; a numeric maxfeerate there fails satd's bool parse and reads
+    # as "not set", so Core clients are unaffected. Without the alias the
+    # Operator Manual's own documented call --
+    # `sendrawtransaction hexstring allowquarantined=true` -- is rejected as an
+    # unknown named parameter.
+    "sendrawtransaction": {1: "allowquarantined"},
+}
+
 SATD_ONLY = {
+    # satd-only RPCs that take arguments. Core has no row for these, so without
+    # an entry here the table would give them `[]` and every named call would be
+    # rejected with "Unknown named parameter" and no name that works. See the
+    # exhaustiveness check in build_table().
+    "backfillindex": [["index_name", False]],
+    "cancelindex": [["index_name", False]],
+    "pauseindex": [["index_name", False]],
+    "resumeindex": [["index_name", False]],
+    "getaddressbalance": [["address", False]],
+    "getaddresshistory": [["address", False]],
+    "getaddressutxos": [["address", False]],
+    # satd-only status/diagnostic RPCs that take no arguments. Listed
+    # explicitly rather than defaulted, so the exhaustiveness check stays
+    # meaningful and a future argument cannot be added without a row.
+    "getblockfileaudit": [],
+    "getconfig": [],
+    "getibdprogress": [],
+    "getorphaninfo": [],
+    "getpolicyinfo": [],
+    "getquarantineinfo": [],
+    "getserverstatus": [],
+    "getsysteminfo": [],
+    "getwarnings": [],
     "estimatefees": [["targets", False], ["mode", False]],
     "getmempoolhistory": [["since_secs", False]],
     "getquarantineentry": [["txid", False]],
@@ -293,8 +329,33 @@ def build(bitcoin_dir, repo_root):
     if UNRESOLVED:
         sys.exit(f"unresolved identifier args: {sorted(UNRESOLVED)}")
     table = {}
+    unknown = []
     for m in satd_methods(repo_root):
-        table[m] = SATD_ONLY[m] if m in SATD_ONLY else core.get(m, [])
+        if m in SATD_ONLY:
+            table[m] = SATD_ONLY[m]
+        elif m in core:
+            row = [list(a) for a in core[m]]
+            for idx, alias in SATD_SLOT_ALIASES.get(m, {}).items():
+                if idx >= len(row):
+                    sys.exit(f"{m}: alias slot {idx} is beyond Core's arity")
+                row[idx][0] = f"{row[idx][0]}|{alias}"
+            table[m] = row
+        else:
+            # Neither Core nor SATD_ONLY knows this method. Defaulting to `[]`
+            # here is how seven satd-only RPCs shipped with no nameable
+            # argument at all: `--check` compared the generated `[]` against
+            # the committed `[]` and passed, and the presence assertion in
+            # server.rs only checks that a row exists, not that it is right.
+            # Every layer reported green. Fail instead.
+            unknown.append(m)
+            table[m] = []
+    if unknown:
+        sys.exit(
+            "methods registered in satd but absent from Core and from SATD_ONLY: "
+            + ", ".join(sorted(unknown))
+            + "\nAdd each to SATD_ONLY with its argument names (use [] if it "
+            "genuinely takes none)."
+        )
     return core, table
 
 

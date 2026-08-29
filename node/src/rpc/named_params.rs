@@ -53,6 +53,16 @@
 //! for a method that accepts none. A startup audit in
 //! [`crate::rpc::server::start`] fails debug builds if a registered method is
 //! missing from the table.
+//!
+//! An empty row therefore has to mean "takes no arguments", never "we did not
+//! look". Seven satd-only RPCs that each take one required argument shipped
+//! with `&[]` because the generator defaulted any method Core did not declare,
+//! and every guard agreed: `--check` compared the generated `[]` against the
+//! committed `[]`, and the startup audit only asserts a row *exists*. Their
+//! named form was unusable, with no name that worked. The generator now fails
+//! on a satd-registered method that is in neither Core nor its own
+//! `SATD_ONLY` list, so an empty row is a decision someone made rather than a
+//! default nobody saw.
 
 use std::future::Future;
 
@@ -83,8 +93,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
         "addnode" => &[("node", false), ("command", false), ("v2transport", false)],
         "analyzepsbt" => &[("psbt", false)],
-        "backfillindex" => &[],
-        "cancelindex" => &[],
+        "backfillindex" => &[("index_name", false)],
+        "cancelindex" => &[("index_name", false)],
         "clearbanned" => &[],
         "combinepsbt" => &[("txs", false)],
         "combinerawtransaction" => &[("txs", false)],
@@ -102,9 +112,9 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
         "getaddednodeinfo" => &[("node", false)],
-        "getaddressbalance" => &[],
-        "getaddresshistory" => &[],
-        "getaddressutxos" => &[],
+        "getaddressbalance" => &[("address", false)],
+        "getaddresshistory" => &[("address", false)],
+        "getaddressutxos" => &[("address", false)],
         "getbestblockhash" => &[],
         "getblock" => &[("blockhash", false), ("verbosity|verbose", false)],
         "getblockchaininfo" => &[],
@@ -156,15 +166,15 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "listquarantine" => &[("rule", false), ("count", false), ("skip", false)],
         "loadtxoutset" => &[("path", false)],
         "logging" => &[("include", false), ("exclude", false)],
-        "pauseindex" => &[],
+        "pauseindex" => &[("index_name", false)],
         "ping" => &[],
         "policytest" => &[("rawtx", false)],
         "preciousblock" => &[("blockhash", false)],
         "prioritisetransaction" => &[("txid", false), ("dummy", false), ("fee_delta", false)],
         "reconsiderblock" => &[("blockhash", false)],
-        "resumeindex" => &[],
+        "resumeindex" => &[("index_name", false)],
         "savemempool" => &[],
-        "sendrawtransaction" => &[("hexstring", false), ("maxfeerate", false), ("maxburnamount", false)],
+        "sendrawtransaction" => &[("hexstring", false), ("maxfeerate|allowquarantined", false), ("maxburnamount", false)],
         "setban" => &[("subnet", false), ("command", false), ("bantime", false), ("absolute", false)],
         "setnetworkactive" => &[("state", false)],
         "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
@@ -581,6 +591,88 @@ mod tests {
         assert_eq!(
             arg_names("listquarantine").unwrap(),
             &[("rule", false), ("count", false), ("skip", false)]
+        );
+    }
+
+    #[test]
+    fn satd_only_methods_with_arguments_are_nameable() {
+        // These take a required argument and shipped with an empty row, so
+        // every named call was rejected with no name that worked. An empty row
+        // must mean "takes none", not "nobody filled it in".
+        for (m, name) in [
+            ("getaddressbalance", "address"),
+            ("getaddresshistory", "address"),
+            ("getaddressutxos", "address"),
+            ("backfillindex", "index_name"),
+            ("cancelindex", "index_name"),
+            ("pauseindex", "index_name"),
+            ("resumeindex", "index_name"),
+        ] {
+            assert_eq!(
+                arg_names(m).unwrap(),
+                &[(name, false)],
+                "{m} must be callable by name"
+            );
+        }
+        // And a method that genuinely takes none keeps its empty row, so the
+        // unknown-name rejection still fires for it.
+        assert_eq!(arg_names("getwarnings").unwrap(), &[] as &[(&str, bool)]);
+    }
+
+    #[test]
+    fn a_satd_extension_sharing_a_core_slot_is_nameable_under_both_names() {
+        // `allowquarantined` rides in Core's `maxfeerate` slot, and the Operator
+        // Manual tells operators to pass it by name. Without the alias that call
+        // is rejected as an unknown parameter and the transaction is not sent.
+        assert_eq!(
+            map("sendrawtransaction", json!({"hexstring": "0200", "allowquarantined": true}))
+                .unwrap(),
+            vec![json!("0200"), json!(true)]
+        );
+        // Core's own name still binds the same slot, so Core clients are
+        // unaffected.
+        assert_eq!(
+            map("sendrawtransaction", json!({"hexstring": "0200", "maxfeerate": 0.1})).unwrap(),
+            vec![json!("0200"), json!(0.1)]
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_holds_its_slot() {
+        // Core distinguishes "argument omitted" from "argument given as null"
+        // only by position: an explicit null still occupies its slot, so a
+        // later argument is not silently promoted into it. `contains_key`
+        // rather than `is_null` is what keeps that true.
+        assert_eq!(
+            map("getblock", json!({"blockhash": "ab", "verbosity": Value::Null})).unwrap(),
+            vec![json!("ab"), Value::Null]
+        );
+    }
+
+    #[test]
+    fn an_empty_object_yields_no_arguments() {
+        // `{}` on a method with a required argument is not an error here — the
+        // handler reports the missing argument, exactly as it does for `[]`.
+        // The transform's job is the mapping, not arity enforcement.
+        assert_eq!(map("getblock", json!({})).unwrap(), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn a_non_array_args_is_left_for_the_handler_to_reject() {
+        // Core removes `args` unconditionally but only splices it when it is an
+        // array; a scalar `args` must not be reported as an unknown name, or
+        // the error tells the caller the wrong thing.
+        assert_eq!(
+            map("getblock", json!({"args": 5, "blockhash": "ab"})).unwrap(),
+            vec![json!("ab")]
+        );
+    }
+
+    #[test]
+    fn args_alone_needs_no_named_remainder() {
+        assert_eq!(
+            map("getblock", json!({"args": ["ab", 2]})).unwrap(),
+            vec![json!("ab"), json!(2)]
         );
     }
 

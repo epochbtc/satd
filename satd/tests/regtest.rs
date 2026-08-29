@@ -12425,4 +12425,30 @@ fn named_rpc_params_are_accepted_like_core() {
         .rpc_call_with_params("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
         .unwrap();
     assert!(resp["result"].is_string(), "positional still works: {resp}");
+
+    // A satd-only RPC must be callable by name. Seven of them shipped with an
+    // empty row in the table, so every named form was rejected and no name
+    // worked at all.
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"getaddressbalance","params":{"address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert!(
+        resp["error"]["message"].as_str() != Some("Unknown named parameter address"),
+        "satd-only RPCs need nameable arguments too: {resp}"
+    );
+
+    // `submit=false` asks for a block that is built and NOT connected. satd
+    // does not implement it, and used to ignore it and mine anyway — moving a
+    // chain the caller was told would not move. Refusing is the honest answer.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":[],"submit":false}}}}"#
+    );
+    let before = node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap(),
+        before,
+        "a refused generateblock must not have mined anything"
+    );
 }
