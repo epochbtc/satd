@@ -162,9 +162,9 @@ knobs:
   time, so matches confirm in-band. Off by default because it makes replay read
   each block; `MempoolTweak` always carries its outputs regardless.
 - `tweak_unspent_only` — cut-through: drop entries whose taproot outputs are all
-  already spent, and keep only the unspent ones on the entries that survive. The
-  biggest single saving on a cold sync, and the one knob with a correctness
-  caveat, below.
+  already spent. Entries that survive carry their full output set. The biggest
+  single saving on a cold sync, and the one knob with a correctness caveat,
+  below.
 
 **Cut-through is a balance scan, not a restore.** `tweak_unspent_only` asks the
 node "is this coin still there?", answered against the UTXO set at the moment the
@@ -174,7 +174,13 @@ today. A wallet that wants a current balance loses nothing and skips the ECDH fo
 every coin that no longer exists; a wallet reconstructing its transaction history
 must leave the flag off, or the history will omit everything it has already
 spent. Entries dropped this way set the block's `filtered` flag, so an empty
-block is never mistaken for one with no eligible transactions. Like
+block is never mistaken for one with no eligible transactions.
+
+Spentness decides only whether an *entry* survives — never which outputs a
+surviving entry carries. Scanning walks `k = 0, 1, 2, …` and stops at the first
+`k` with no match among the outputs it was given, so an entry trimmed to just its
+unspent outputs would cut the walk short and hide a live coin at a higher `k`.
+An entry with one spent and one live output therefore arrives carrying both. Like
 `tweak_outputs`, it re-derives outputs from the block, so it needs a block source
 and reads one block per event. It never applies to `MempoolTweak` — an
 unconfirmed output is in no confirmed UTXO set.

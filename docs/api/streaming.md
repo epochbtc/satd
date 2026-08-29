@@ -746,20 +746,22 @@ one-ECDH-per-transaction scan locally, so the scan key never leaves the device.
 The `tweaks` category is **bit 8**, and unlike the other category bits it is
 **not** part of the `categories = 0` ("all") default — a pre-existing
 `0`-subscriber never begins receiving tweak volume after a node upgrade; a client
-must set bit 8 explicitly. `SubscribeRequest` gains two tweak-only knobs:
+must set bit 8 explicitly. `SubscribeRequest` gains five tweak-only knobs:
 
 ```proto
 // SubscribeRequest additions (apply only when the tweaks bit is set):
-//   uint64 tweak_dust_limit = 4;  // drop entries whose max_value is below this floor; 0 = unfiltered
-//   bool   tweaks_only      = 5;  // compact entries: 33-byte tweak alone, no txid/max_value (BlockTweaks only)
-//   bool   mempool_tweaks   = 6;  // also stream MempoolTweak at admission (Tier 1.5); default off
-//   bool   tweak_outputs    = 7;  // include taproot_outputs on BlockTweaks entries; default off (MempoolTweak always has them)
+//   uint64 tweak_dust_limit   = 4;  // drop entries whose max_value is below this floor; 0 = unfiltered
+//   bool   tweaks_only        = 5;  // compact entries: 33-byte tweak alone, no txid/max_value (BlockTweaks only)
+//   bool   mempool_tweaks     = 6;  // also stream MempoolTweak at admission (Tier 1.5); default off
+//   bool   tweak_outputs      = 7;  // include taproot_outputs on BlockTweaks entries; default off (MempoolTweak always has them)
+//   bool   tweak_unspent_only = 8;  // drop entries whose taproot outputs are all spent; needs a block source
 
 message BlockTweaks {              // NodeEvent body 28 — one per connected block ≥ taproot activation
   bytes  block_hash           = 1;
   uint32 height               = 2;
   repeated TweakEntry entries = 3; // empty = indexed block with no eligible txs
-  bool   filtered             = 4; // a per-subscription dust limit dropped entries
+  bool   filtered             = 4; // a per-subscription filter dropped entries
+                                  // (tweak_dust_limit floor, or tweak_unspent_only cut-through)
 }
 message TweakEntry {
   bytes  tweak     = 1;  // 33-byte compressed public tweak T = input_hash · A (always present)
@@ -804,9 +806,12 @@ serves under the existing `stream:subscribe` capability.
   leaving the 33-byte tweak alone. Both apply per subscription, on live and
   replayed events alike.
 - **Cut-through (`tweak_unspent_only`).** Drops entries whose taproot outputs are
-  **all** already spent on the confirmed chain, and — with `tweak_outputs` — keeps
-  only the still-unspent outputs on the entries that survive. An entry with one
-  spent and one live output survives on the live one: cut-through never decides
+  **all** already spent on the confirmed chain. Spentness decides only whether an
+  entry survives, never which outputs it carries: an entry with one spent and one
+  live output survives carrying **both**, because BIP 352 scanning walks
+  `k = 0, 1, 2, …` and stops at the first `k` that does not match a carried
+  output — trimming the spent one would truncate the walk and hide a live coin at
+  a higher `k`. Cut-through never decides
   that a coin is not yours, only that a coin is gone. Dropped entries set
   `filtered = true`, like the dust floor. It is a modifier on the `tweaks`
   category (`INVALID_ARGUMENT` without bit 8) and, because the outputs whose
@@ -824,7 +829,12 @@ serves under the existing `stream:subscribe` capability.
 
   Two edges are deliberate. A block that cannot be read (pruned, or missing)
   serves the entries **unfiltered** rather than failing: a superset costs the
-  client redundant ECDH, while an error would end the scan. And a reorg that
+  client redundant ECDH, while an error would end the scan. Note that those
+  entries also arrive with an empty `taproot_outputs` even under `tweak_outputs`,
+  since the outputs are re-derived from the block that could not be read — an
+  empty list means "the server could not read the block", never "no candidates",
+  and a client must fall back to the block itself rather than treat the entry as
+  having nothing to scan. And a reorg that
   un-spends an output does not retract anything already served — the client
   re-anchors on the `(block_hash, height)` it holds and rescans the affected
   range, as it does for any reorg. `MempoolTweak` is never cut through: its

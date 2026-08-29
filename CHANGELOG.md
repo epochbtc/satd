@@ -17,9 +17,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 - `tweak_unspent_only`, a cut-through filter on the streaming `tweaks` category:
-  `BlockTweaks` entries whose taproot outputs are all already spent are dropped
-  (and, with `tweak_outputs`, only the still-unspent outputs are carried), so a
-  balance scan skips the ECDH for coins that no longer exist. Opt-in per
+  `BlockTweaks` entries whose taproot outputs are all already spent are dropped,
+  so a balance scan skips the ECDH for coins that no longer exist. A surviving
+  entry still carries its full taproot output set, so BIP 352 `k` enumeration is
+  unaffected. Opt-in per
   subscription, in both SDKs; a wallet restoring transaction history must leave it
   off
 

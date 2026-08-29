@@ -370,9 +370,11 @@ type SubscribeOptions struct {
 	// no block source. A [MempoolTweak] carries its outputs regardless.
 	TweakOutputs bool
 	// TweakUnspentOnly cuts through spent coins: a [BlockTweaks] entry whose
-	// taproot outputs are ALL already spent on the confirmed chain is dropped,
-	// and with TweakOutputs set the entry carries only its still-unspent outputs.
+	// taproot outputs are ALL already spent on the confirmed chain is dropped.
 	// A balance scan then never runs ECDH against a coin that is already gone.
+	// A surviving entry carries its full taproot output set - spentness decides
+	// whether an entry survives, never which outputs it carries, so BIP 352 k
+	// enumeration is never truncated.
 	//
 	// A RESTORE that needs transaction history must leave this false: a payment
 	// received and later spent is omitted entirely, so the balance is right and

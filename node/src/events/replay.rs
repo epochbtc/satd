@@ -162,8 +162,11 @@ impl BlockScanSource for crate::chain::state::ChainState {
     fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool {
         // Membership in the UTXO set *is* unspentness: a connected spend removes
         // the coin in the same batch that connects the block, and a disconnect
-        // restores it from undo.
-        self.get_coin(outpoint).is_some()
+        // restores it from undo. `has_coin` rather than `get_coin`: this runs
+        // once per taproot output of every eligible transaction a cut-through
+        // scan touches, and `get_coin` would promote each historical coin it
+        // reads into the clean LRU, evicting the coins validation is using.
+        self.has_coin(outpoint)
     }
 }
 

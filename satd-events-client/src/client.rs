@@ -90,9 +90,10 @@ pub struct SubscribeOptions {
     pub tweak_outputs: bool,
     /// Cut-through: drop [`Event::BlockTweaks`](crate::Event::BlockTweaks)
     /// entries whose taproot outputs are **all** already spent on the confirmed
-    /// chain, and — with [`tweak_outputs`](Self::tweak_outputs) — carry only the
-    /// still-unspent outputs. A balance scan then never runs ECDH against a coin
-    /// that is already gone.
+    /// chain. A balance scan then never runs ECDH against a coin that is already
+    /// gone. A surviving entry carries its **full** taproot output set —
+    /// spentness decides whether an entry survives, never which outputs it
+    /// carries, so BIP 352 `k` enumeration is never truncated.
     ///
     /// A **restore** that needs transaction history must leave this `false`: a
     /// payment received and later spent is omitted entirely, so the balance is

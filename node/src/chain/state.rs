@@ -2002,6 +2002,15 @@ impl ChainState {
         self.store.get_coin(outpoint)
     }
 
+    /// Whether `outpoint` is still in the UTXO set, without materializing the
+    /// coin. Unlike [`Self::get_coin`], a miss here does not populate the clean
+    /// LRU, so a bulk membership sweep (silent-payment cut-through walks one
+    /// outpoint per taproot output per eligible transaction) cannot evict the
+    /// working set that block connection and mempool acceptance depend on.
+    pub fn has_coin(&self, outpoint: &OutPoint) -> bool {
+        self.store.has_coin(outpoint)
+    }
+
     /// Undo data (the coins spent) for a connected block — one `Coin` per
     /// non-coinbase input in connect order. The decoupled watch matcher uses
     /// this for input-side script matching: by the time it scans a connected

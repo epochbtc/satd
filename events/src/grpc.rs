@@ -2993,15 +2993,23 @@ fn refine_block_tweaks(
     let mut cut = false;
     let mut kept = Vec::with_capacity(bt.entries.len());
     for e in &bt.entries {
-        let mut outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
+        let outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
         // A row naming a transaction the block does not contain is a reorg race,
         // not evidence that its coins are spent: keep the entry rather than cut a
         // payment on the strength of a block read that disagrees with the index.
         if opts.unspent_only && by_txid.contains_key(&e.txid) {
-            outs.retain(|o| {
-                source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout })
-            });
-            if outs.is_empty() {
+            // Spentness decides whether the ENTRY survives — never which outputs
+            // a surviving entry carries. BIP 352 scanning walks k = 0, 1, 2, ...
+            // and stops at the first k that misses, so serving only the unspent
+            // subset would truncate the enumeration: a wallet paid twice in one
+            // transaction that has since spent its k=0 coin would derive P_0,
+            // miss, and never reach the k=1 coin it still owns. A transaction
+            // with nothing left unspent has no coin at any k, so dropping it
+            // whole is safe; trimming a survivor is not.
+            let any_unspent = outs
+                .iter()
+                .any(|o| source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout }));
+            if !any_unspent {
                 cut = true;
                 continue;
             }
@@ -3661,9 +3669,18 @@ mod tests {
     }
 
     #[test]
-    fn cut_through_keeps_an_entry_with_one_unspent_output() {
-        // vout 0 spent, vout 2 still live: the payment could be the live one, so
-        // the entry survives and carries only the output that is still there.
+    fn cut_through_keeps_every_output_of_a_surviving_entry() {
+        // vout 0 spent, vout 2 still live: the entry survives on the live one,
+        // and carries BOTH taproot outputs rather than just the unspent one.
+        //
+        // That is the k-enumeration contract, not a cosmetic choice. A BIP 352
+        // scanner walks k = 0, 1, 2, ... and stops at the first k that does not
+        // match one of the carried outputs. Serving only vout 2 would truncate
+        // the walk: a wallet paid twice in this transaction would derive P_0,
+        // fail to match the coin it had already spent, break, and never derive
+        // P_1 — a coin it still owns, silently missing from its balance.
+        // Cut-through may decide a coin is gone; it must never decide a coin is
+        // not yours.
         let (env, scan, txid) = enrichment_fixture(Default::default());
         let spent = [bitcoin::OutPoint { txid, vout: 0 }].into_iter().collect();
         let (env2, scan2, _) = enrichment_fixture(spent);
@@ -3673,8 +3690,12 @@ mod tests {
         let (refined, cut) = refine_block_tweaks(&env2, &opts).expect("refined");
         assert!(!cut, "no entry was dropped, so the block is not `filtered`");
         let outs = &entries_of(&refined)[0].taproot_outputs;
-        assert_eq!(outs.len(), 1, "the spent output is cut from the entry");
-        assert_eq!(outs[0].vout, 2);
+        assert_eq!(outs.len(), 2, "a surviving entry carries its full candidate set");
+        assert_eq!(
+            (outs[0].vout, outs[1].vout),
+            (0, 2),
+            "including the spent one, in vout order, so k enumeration stays intact"
+        );
     }
 
     #[test]

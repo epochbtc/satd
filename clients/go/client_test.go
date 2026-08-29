@@ -17,7 +17,8 @@ func TestSubscribeOptionsSendTweakKnobsOnlyWhenSet(t *testing.T) {
 	// before these knobs existed, so an older node never sees a field it does
 	// not know.
 	plain := SubscribeOptions{Categories: CategoryTweaks}.toProto()
-	if plain.TweaksOnly != nil || plain.MempoolTweaks != nil || plain.TweakOutputs != nil {
+	if plain.TweaksOnly != nil || plain.MempoolTweaks != nil || plain.TweakOutputs != nil ||
+		plain.TweakUnspentOnly != nil {
 		t.Errorf("unset knobs reached the wire: %+v", plain)
 	}
 	if plain.SinceSeq != nil || plain.FromCursor != nil || plain.TweakDustLimit != nil {
@@ -25,15 +26,17 @@ func TestSubscribeOptionsSendTweakKnobsOnlyWhenSet(t *testing.T) {
 	}
 
 	full := SubscribeOptions{
-		Categories:     CategoryTweaks,
-		TweaksOnly:     true,
-		MempoolTweaks:  true,
-		TweakOutputs:   true,
-		SinceSeq:       u64(7),
-		TweakDustLimit: u64(546),
-		FromCursor:     &Cursor{Height: 9, TxIndex: 1, MempoolSeq: 2, InstanceID: 3},
+		Categories:       CategoryTweaks,
+		TweaksOnly:       true,
+		MempoolTweaks:    true,
+		TweakOutputs:     true,
+		TweakUnspentOnly: true,
+		SinceSeq:         u64(7),
+		TweakDustLimit:   u64(546),
+		FromCursor:       &Cursor{Height: 9, TxIndex: 1, MempoolSeq: 2, InstanceID: 3},
 	}.toProto()
-	if !full.GetTweaksOnly() || !full.GetMempoolTweaks() || !full.GetTweakOutputs() {
+	if !full.GetTweaksOnly() || !full.GetMempoolTweaks() || !full.GetTweakOutputs() ||
+		!full.GetTweakUnspentOnly() {
 		t.Errorf("set knobs did not reach the wire: %+v", full)
 	}
 	if full.GetSinceSeq() != 7 || full.GetTweakDustLimit() != 546 {
