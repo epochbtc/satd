@@ -485,6 +485,27 @@ These surfaces will not ship. Each is a deliberate scope decision.
 
 ---
 
+## Partial surfaces
+
+Core methods satd implements over a narrower input domain than Core does.
+Each rejects what it does not cover with an error naming the gap, rather than
+silently returning an empty or wrong answer.
+
+- **Output descriptors** — satd implements the key-free forms, `raw(<hex
+  script>)` and `addr(<address>)`, with BIP 380 checksums (optional on input,
+  verified when present, always emitted). Key expressions — `pk()`, `pkh()`,
+  `wpkh()`, `sh()`, `wsh()`, `tr()`, `rawtr()`, `combo()`, `multi()` and the
+  sorted/`_a` variants — and xpub derivation with ranges are not implemented.
+  This is the input domain of `scantxoutset`; anything outside it returns
+  `-5` naming the unsupported function.
+
+  Descriptor *inference*, which fills `scantxoutset`'s `desc` field, is
+  complete for standard scripts and matches Core: `pk()` and `multi()` for
+  key-carrying scripts, `rawtr()` for a taproot output whose key is on the
+  curve, `addr()` for anything with an address, `raw()` otherwise.
+
+---
+
 ## Behavioral defaults that intentionally differ
 
 Both behaviors sit inside the Core compatibility envelope, but the satd
