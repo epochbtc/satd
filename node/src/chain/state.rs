@@ -2389,6 +2389,13 @@ impl ChainState {
 
     /// Check if script verification should be skipped (assumevalid optimization).
     fn should_skip_scripts(&self, height: u32) -> bool {
+        self.should_skip_scripts_at(height, crate::time::now_secs())
+    }
+
+    /// [`should_skip_scripts`](Self::should_skip_scripts) against an explicit
+    /// `now`, so the age comparison is testable without installing the
+    /// process-global mock clock — which every other test in this binary shares.
+    fn should_skip_scripts_at(&self, height: u32, now: u64) -> bool {
         match &self.assumevalid {
             AssumeValid::Disabled => false,
             AssumeValid::Hash(av_hash) => {
@@ -2406,10 +2413,15 @@ impl ChainState {
                 if let Some(hash) = self.store.get_block_hash_by_height(height)
                     && let Some(entry) = self.store.get_block_index(&hash)
                 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    // The node clock, for the same reason as `tip_time_is_ibd`:
+                    // `block_time` is a header timestamp and headers are stamped
+                    // from `crate::time::now_secs()`, so `SystemTime::now()`
+                    // would put the two sides of this comparison on different
+                    // clocks. This one decides whether scripts are verified at
+                    // all -- under `-assumevalid=all`, a mock to a past date
+                    // (which is what Core's framework does before building its
+                    // cache chain) makes every freshly mined block look years
+                    // stale, and the whole chain connects unverified.
                     let block_time = entry.header.time as u64;
                     return now.saturating_sub(block_time) > *max_age_secs;
                 }
@@ -11513,6 +11525,72 @@ pub(crate) mod tests {
             !cs.should_skip_scripts(1_000_000),
             "should_skip_scripts should be false at height 1M with Disabled"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-assumevalid=all` decides whether scripts are verified at all, by
+    /// comparing a block's header timestamp against "now". Headers are stamped
+    /// from the node clock, so "now" must be too: mock to a past date — which
+    /// is what Core's framework does before building its cache chain — and a
+    /// system-clock "now" makes every freshly mined block look years stale, so
+    /// the whole chain connects unverified.
+    ///
+    /// Driven through `should_skip_scripts_at` rather than by installing the
+    /// process-global mock, which every other test in this binary shares.
+    #[test]
+    fn test_should_skip_scripts_all_ages_against_the_node_clock() {
+        // Must exceed genesis' median-time-past to be accepted at all.
+        const BLOCK_TIME: u32 = 1_300_000_001;
+        const MAX_AGE: u64 = 86_400;
+
+        let dir = std::env::temp_dir().join(format!(
+            "satd-av-all-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::All {
+                max_age_secs: MAX_AGE,
+            },
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let block1 = build_test_block(genesis_hash, 1, BLOCK_TIME);
+        cs.accept_block(&block1).expect("accept block 1");
+
+        let t = BLOCK_TIME as u64;
+        // A node whose clock says "now" is when the block was mined must
+        // verify it. This is the mocked-to-the-past case.
+        assert!(
+            !cs.should_skip_scripts_at(1, t),
+            "a block mined at the current node time is not old"
+        );
+        assert!(
+            !cs.should_skip_scripts_at(1, t + MAX_AGE),
+            "the cutoff is exclusive, matching Core's `>`"
+        );
+        // One second past the cutoff it is genuinely old, and skipping is the
+        // whole point of the option.
+        assert!(cs.should_skip_scripts_at(1, t + MAX_AGE + 1));
+        // A clock behind the block's timestamp saturates to age 0, never to a
+        // huge age that would skip.
+        assert!(!cs.should_skip_scripts_at(1, t - 1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
