@@ -12628,11 +12628,23 @@ fn setmocktime_moves_the_node_clock_and_is_capability_gated() {
         block_time(&hash)
     );
 
-    // Core's range check, with Core's message shape.
-    let resp = node
-        .rpc_call_with_params("setmocktime", vec![serde_json::json!(-1)])
+    // Core's range check, with Core's message shape. -8 here and only here:
+    // Core reports the range error as RPC_INVALID_PARAMETER but the
+    // wrong-chain refusal as RPC_MISC_ERROR (-1), so the two must not share a
+    // code. (The wrong-chain path itself is covered by
+    // `time::tests::only_regtest_has_a_mockable_clock` — this harness only
+    // ever starts regtest nodes.)
+    for bad in [serde_json::json!(-1), serde_json::json!(9_223_372_037i64)] {
+        let resp = node.rpc_call_with_params("setmocktime", vec![bad.clone()]).unwrap();
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "for {bad}: got {resp}");
+    }
+
+    // The largest in-range value is accepted, so the bound is inclusive as
+    // Core's is. Clear it again immediately: a tip stamped from a far-future
+    // mock cannot be un-mined, and every later template would be time-too-new.
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(9_223_372_036i64)])
         .unwrap();
-    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    node.rpc_call_with_params("setmocktime", vec![serde_json::json!(0)]).unwrap();
 
     // The carve-out: a token that may send transactions and manage the node
     // still may not move the clock, because `test:clock` is not implied by

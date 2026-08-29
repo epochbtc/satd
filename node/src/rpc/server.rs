@@ -1661,9 +1661,14 @@ pub async fn start(
     // it. The cookie/rpcauth operator has every capability, which is what lets
     // the test harness drive it.
     module.register_method("setmocktime", |params, ctx, _extensions| {
-        if ctx.chain_state.network != bitcoin::Network::Regtest {
+        if !crate::time::clock_is_mockable(ctx.chain_state.network) {
+            // -1 (RPC_MISC_ERROR), not -8: Core throws a bare
+            // `std::runtime_error` here, which its dispatcher converts to
+            // RPC_MISC_ERROR. Only the range check below is
+            // RPC_INVALID_PARAMETER. A Core-derived test asserting -1 would
+            // otherwise fail against satd for the wrong reason.
             return Err(ErrorObjectOwned::owned(
-                -8,
+                -1,
                 "setmocktime is for regression testing (-regtest mode) only",
                 None::<()>,
             ));

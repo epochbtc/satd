@@ -1420,10 +1420,17 @@ impl ChainState {
     /// active-chain tip is more than 24h behind wall-clock time. Shared so
     /// the RPC and the per-block flush gate use one definition.
     pub(crate) fn tip_time_is_ibd(tip_time: u32) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // The node clock, not the system one. `tip_time` comes from a block
+        // header, and headers are now stamped from `crate::time::now_secs()`
+        // (see `mining::template`), so comparing against `SystemTime::now()`
+        // would put the two sides of this test on different clocks. Under a
+        // mock that is not a cosmetic drift: `setmocktime` to a past date --
+        // which is exactly what Core's framework does, mocking to
+        // TIME_GENESIS_BLOCK before building its cache chain -- would make
+        // every freshly mined block look a day stale and silently disable the
+        // per-block coin-cache flush at the call site below, i.e. the #262
+        // mitigation, in the tests most likely to reorg.
+        let now = crate::time::now_secs();
         (tip_time as u64) + 86_400 < now
     }
 
