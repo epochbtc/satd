@@ -209,6 +209,37 @@ pub struct ReadOnlyListener {
 }
 
 /// Shared state for RPC handlers.
+/// Read Core's `verbose`/`verbosity` argument, which accepts **either** a bool
+/// or a number (`ParseVerbosity`, `src/rpc/util.cpp`): `false` is 0, `true` is 1.
+///
+/// Reading the slot as one concrete Rust type is not merely lossy, it is
+/// silently destructive. `ParamsSequence::next_inner` clears the remaining
+/// buffer on any deserialize error, so a mistyped argument becomes the default
+/// *and every argument after it disappears* -- `getrawtransaction` would answer
+/// a numeric `verbosity` as non-verbose and drop the caller's `blockhash`. Going
+/// through `Value` cannot fail on type, so the sequence is never poisoned.
+fn optional_verbosity(
+    seq: &mut jsonrpsee::types::params::ParamsSequence<'_>,
+    default: u32,
+) -> Result<u32, ErrorObjectOwned> {
+    let raw: Option<serde_json::Value> = seq
+        .optional_next()
+        .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Bool(b)) => Ok(u32::from(b)),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>)),
+        Some(_) => Err(ErrorObjectOwned::owned(
+            -1,
+            "JSON value is not a boolean or number as expected",
+            None::<()>,
+        )),
+    }
+}
+
 pub struct RpcContext {
     pub chain_state: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
@@ -510,7 +541,9 @@ pub async fn start(
         let hash: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let verbosity: u32 = seq.optional_next().unwrap_or(Some(1)).unwrap_or(1);
+        // Core defaults this to 1 and accepts a bool, where `false` means 0 --
+        // a hex string, not an object.
+        let verbosity = optional_verbosity(&mut seq, 1)?;
         blockchain::get_block(&ctx.chain_state, &hash, verbosity)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
@@ -1067,7 +1100,28 @@ pub async fn start(
         let txid: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        // Core declares this NUM with a 0 default and accepts a bool for it.
+        // Verbosity 2 adds `fee` and per-input `prevout`, which satd's verbose
+        // form does not produce -- so it is refused by name rather than answered
+        // as though it were 1, which would silently omit fields the caller asked
+        // for.
+        let verbosity = optional_verbosity(&mut seq, 0)?;
+        if verbosity > 2 {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Invalid verbosity value",
+                None::<()>,
+            ));
+        }
+        if verbosity == 2 {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "satd does not implement getrawtransaction verbosity 2 \
+                 (per-input `fee`/`prevout`); use verbosity 1",
+                None::<()>,
+            ));
+        }
+        let verbose = verbosity == 1;
         let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
         rawtx::get_raw_transaction(
             &ctx.chain_state,

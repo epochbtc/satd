@@ -89,6 +89,13 @@ fn invalid(msg: String) -> ErrorObjectOwned {
 ///
 /// `None` means "not ours" and the request is passed through untouched so
 /// jsonrpsee can answer with its own method-not-found.
+/// Names satd adds as an alias on a Core argument slot, from the generator's
+/// `SATD_SLOT_ALIASES` (`contrib/core-functional/gen-named-params.py`), which is
+/// the source of truth. Core has no behaviour to match for these names, so a
+/// collision with the Core spelling is reported as a conflict rather than as an
+/// unknown parameter. `satd_slot_aliases_are_really_aliases` keeps this honest.
+const SATD_SLOT_ALIASES: &[&str] = &["allowquarantined"];
+
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
         "addnode" => &[("node", false), ("command", false), ("v2transport", false)],
@@ -214,9 +221,14 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
 /// the reading of a malformed object differs.
 pub fn named_to_positional(
     specs: &[ArgSpec],
-    params: &Map<String, Value>,
+    params: Map<String, Value>,
 ) -> Result<Vec<Value>, ErrorObjectOwned> {
-    let mut args_in = params.clone();
+    // By value: both callers own the map and drop it immediately after, so a
+    // clone here only doubled peak memory. `max_request_body_size` is 10 MiB by
+    // default, and a body of nothing but array elements expands to an order of
+    // magnitude more `Value` tree than that -- duplicated, once per concurrent
+    // connection, for nothing.
+    let mut args_in = params;
     let mut out: Vec<Value> = Vec::with_capacity(specs.len());
 
     // Unspecified arguments sitting *before* a specified one have to be
@@ -234,6 +246,31 @@ pub fn named_to_positional(
             .split('|')
             .find(|alias| args_in.contains_key(*alias))
             .map(str::to_string);
+
+        // A pattern's aliases are alternative spellings of ONE slot, so two of
+        // them cannot both be honoured; rejecting is right either way. What
+        // differs is the message.
+        //
+        // For two *Core* spellings, Core resolves the first and leaves the
+        // other to fall out below as "Unknown named parameter". That is Core's
+        // observable behaviour and satd matches it exactly.
+        //
+        // A satd extension sharing a Core slot is a different case: the name
+        // does not exist in Core, so there is no behaviour to match, and
+        // "unknown parameter" would send an operator hunting for a spelling
+        // that works when the real problem is that `maxfeerate` and
+        // `allowquarantined` are one argument.
+        if let Some(chosen) = &key
+            && let Some(other) = pattern
+                .split('|')
+                .find(|a| a != chosen && args_in.contains_key(*a))
+            && (SATD_SLOT_ALIASES.contains(&other) || SATD_SLOT_ALIASES.contains(&chosen.as_str()))
+        {
+            return Err(invalid(format!(
+                "Parameter {other} conflicts with parameter {chosen}: satd's \
+                 {other} and Core's {chosen} are the same argument"
+            )));
+        }
 
         if *named_only {
             // Not addressable itself: its fields were lifted to the top level
@@ -325,7 +362,7 @@ fn rewrite(
     };
     let obj: Map<String, Value> = serde_json::from_str(raw.get())
         .map_err(|e| invalid(format!("Invalid named parameters: {e}")))?;
-    let positional = named_to_positional(specs, &obj)?;
+    let positional = named_to_positional(specs, obj)?;
     let rewritten = serde_json::value::to_raw_value(&Value::Array(positional))
         .map_err(|e| invalid(format!("Could not encode parameters: {e}")))?;
     *params = Some(std::borrow::Cow::Owned(rewritten));
@@ -475,7 +512,71 @@ mod tests {
     fn map(method: &str, params: Value) -> Result<Vec<Value>, String> {
         let specs = arg_names(method).expect("method is registered");
         let obj = params.as_object().expect("object params").clone();
-        named_to_positional(specs, &obj).map_err(|e| e.message().to_string())
+        named_to_positional(specs, obj).map_err(|e| e.message().to_string())
+    }
+
+    /// Two spellings of one slot cannot both be honoured, so rejecting is
+    /// right -- but the caller has to be told *why*. Core leaves the loser in
+    /// the map and it falls out as "Unknown named parameter", which sends an
+    /// operator looking for a name that does not exist. satd shares Core's
+    /// `maxfeerate` slot with its own `allowquarantined`, so the two names
+    /// mean different things and a Core-shaped client can easily send both.
+    #[test]
+    fn colliding_aliases_name_the_conflict_rather_than_the_parameter() {
+        let err = map(
+            "sendrawtransaction",
+            json!({"hexstring": "0200", "maxfeerate": 0, "allowquarantined": true}),
+        )
+        .unwrap_err();
+        assert!(err.contains("conflicts"), "{err}");
+        assert!(err.contains("allowquarantined"), "{err}");
+        assert!(err.contains("maxfeerate"), "{err}");
+        assert!(
+            !err.contains("Unknown named parameter"),
+            "the name is known, it collides: {err}"
+        );
+
+        // Either name alone still resolves to the shared slot.
+        assert_eq!(
+            map("sendrawtransaction", json!({"hexstring": "0200", "maxfeerate": 0})).unwrap(),
+            vec![json!("0200"), json!(0)]
+        );
+        assert_eq!(
+            map("sendrawtransaction", json!({"hexstring": "0200", "allowquarantined": true}))
+                .unwrap(),
+            vec![json!("0200"), json!(true)]
+        );
+    }
+
+    /// Mirrors the generator's `SATD_SLOT_ALIASES`. Two invariants: the alias
+    /// is really on a slot (or the conflict branch above is unreachable and
+    /// silently does nothing), and Core's spelling is listed *first* so it is
+    /// the one that resolves -- a satd extension must never win a slot over
+    /// the Core name for it.
+    #[test]
+    fn satd_slot_aliases_ride_behind_cores_own_name() {
+        // Mirrors the generator's SATD_SLOT_ALIASES; grows with it.
+        const PAIRS: &[(&str, &str, &str)] =
+            &[("sendrawtransaction", "maxfeerate", "allowquarantined")];
+        for &(method, core_name, satd_name) in PAIRS {
+            assert!(
+                SATD_SLOT_ALIASES.contains(&satd_name),
+                "{satd_name} missing from SATD_SLOT_ALIASES"
+            );
+            let specs = arg_names(method).expect("method is registered");
+            let pattern = specs
+                .iter()
+                .map(|(p, _)| *p)
+                .find(|p| p.split('|').any(|a| a == satd_name))
+                .unwrap_or_else(|| panic!("{satd_name} is on no {method} slot"));
+            let mut aliases = pattern.split('|');
+            assert_eq!(
+                aliases.next(),
+                Some(core_name),
+                "Core's name must resolve first"
+            );
+            assert!(aliases.any(|a| a == satd_name));
+        }
     }
 
     #[test]

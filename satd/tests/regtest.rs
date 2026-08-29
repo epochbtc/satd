@@ -12452,3 +12452,100 @@ fn named_rpc_params_are_accepted_like_core() {
         "a refused generateblock must not have mined anything"
     );
 }
+
+/// Core declares `verbose`/`verbosity` as accepting either a bool or a number,
+/// and satd read each slot as one concrete type. That is not merely lossy:
+/// jsonrpsee clears the rest of the parameter sequence on a deserialize error,
+/// so the mistyped argument silently became a default *and every argument after
+/// it disappeared*. Named parameters are what made both reachable, since a Core
+/// client naturally sends `verbosity=1` rather than `true`.
+#[test]
+fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let hash1 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hash2 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(2)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let named = |body: String| -> serde_json::Value { node.rpc_call_raw_body(&body).unwrap() };
+
+    // `verbose: false` is verbosity 0 — a hex string, not an object. Reading
+    // the slot as u32 turned the failed parse into the default of 1.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+            "params":{{"blockhash":"{hash1}","verbose":false}}}}"#
+    ));
+    assert!(
+        r["result"].is_string(),
+        "verbose=false must return hex, got {r}"
+    );
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+            "params":{{"blockhash":"{hash1}","verbosity":0}}}}"#
+    ));
+    assert!(r["result"].is_string(), "verbosity=0 must return hex: {r}");
+    // …and the object forms still behave.
+    for v in ["true", "1", "2"] {
+        let r = named(format!(
+            r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+                "params":{{"blockhash":"{hash1}","verbosity":{v}}}}}"#
+        ));
+        assert!(r["result"].is_object(), "verbosity={v}: {r}");
+    }
+
+    let cb1 = common::coinbase_txid_at(&node, 1);
+
+    // The poisoned-sequence case: a numeric `verbosity` used to fail the bool
+    // parse, which cleared the sequence and took `blockhash` with it. Point it
+    // at the wrong block — if the argument survives, the lookup fails.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":1,"blockhash":"{hash2}"}}}}"#
+    ));
+    assert!(
+        r.get("error").is_some_and(|e| !e.is_null()),
+        "blockhash must not be silently dropped: {r}"
+    );
+
+    // With the right block it resolves, and verbosity 1 really is verbose.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":1,"blockhash":"{hash1}"}}}}"#
+    ));
+    assert!(
+        r["result"].is_object(),
+        "verbosity=1 must be verbose, got {r}"
+    );
+    assert_eq!(r["result"]["txid"], serde_json::json!(cb1));
+
+    // Verbosity 0 is Core's default here, and is hex.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","blockhash":"{hash1}"}}}}"#
+    ));
+    assert!(r["result"].is_string(), "default verbosity is 0: {r}");
+
+    // Verbosity 2 adds fields satd does not produce, so it is refused by name
+    // rather than answered as though it were 1.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":2,"blockhash":"{hash1}"}}}}"#
+    ));
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("verbosity 2"), "{r}");
+}
