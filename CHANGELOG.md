@@ -44,7 +44,9 @@ Held out of 0.5.0 so that release could stabilise. Written up in full in
 Core's own functional suite, unmodified, against satd, with every test file in
 the pinned release inventoried as `run` or `skip` with a reason. Nightly
 workflow, scoreboard in the Operator Manual. See
-[Core Functional-Test Conformance](https://epochbtc.github.io/satd/core-functional.html).
+[Core Functional-Test Conformance](https://epochbtc.github.io/satd/core-functional.html). `feature_discover.py`, `rpc_deprecated.py`
+and `rpc_uptime.py` were measured passing unmodified and moved into the run
+set, taking the scoreboard to 10 tests.
 
 ### Fixed
 
