@@ -821,6 +821,8 @@ impl Mempool {
             }
         }
         if let Some(tx) = self.event_tx.lock().as_ref() {
+            // Counted before the send; see `events::drain`.
+            crate::events::drain::mempool_emitted();
             let _ = tx.send(event);
         }
     }

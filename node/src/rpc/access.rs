@@ -176,7 +176,10 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "savemempool"
         // moves the node clock on a mockable chain (regtest); additionally
         // gated on the `test:clock` capability, which `rpc:write` does not imply
-        | "setmocktime" => Control,
+        | "setmocktime"
+        // blocks until the event bridges catch up; a settle barrier for
+        // test harnesses, not a consumer read
+        | "syncwithvalidationinterfacequeue" => Control,
 
         // --- Control: index management ---
         "backfillindex" | "pauseindex" | "resumeindex" | "cancelindex" => Control,
@@ -252,6 +255,7 @@ mod tests {
             "prioritisetransaction",
             "savemempool",
             "setmocktime",
+            "syncwithvalidationinterfacequeue",
             "backfillindex",
             "pauseindex",
             "resumeindex",

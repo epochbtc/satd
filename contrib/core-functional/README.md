@@ -96,15 +96,19 @@ by version order.
 
 Every reason came from running the test, not from reading it. Ranked by tests
 unblocked, which is a map of the framework's demands rather than a priority
-order — the top two are test-only facilities no operator calls.
+order.
+
+**The cache now builds**, which retires the three items that used to head this
+table. The 73 rows still marked `cache` in the inventory therefore name a
+blocker that no longer applies: they reach their test bodies and stop on
+something of satd's own. Re-triaging them against a measured serial run is the
+next piece of work; until that lands this ranking is only as complete as the
+measured row below plus the older entries under it.
 
 | Tests | Blocker |
 |---:|---|
-| 73 | `setmocktime`. Also used by `create_cache.py` to seed the 199-block chain most tests start from. Largest item: a mockable clock has to reach validation, mempool expiry and P2P timeouts. |
-| 48 | `syncwithvalidationinterfacequeue`. Hidden test-only RPC that blocks until queued validation callbacks are delivered; the framework calls it from `sync_all()`. Cheap if satd already applies these side effects synchronously, but that needs establishing, not assuming. |
+| 22 | `scantxoutset`. The framework's MiniWallet calls it from `rescan_utxos()`, so one missing RPC is the first blocker for 22 tests. Measured on the run that first built the cache. |
 | 22 | No periodic P2P ping. `connect_nodes()` waits for a `pong` in both directions. satd has no keepalive: `ping_all()` runs only from the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. An availability gap before it is a test blocker. |
-| 5 | Named JSON-RPC parameters. satd is positional-only; an object `params` fails on every method, not just the one that surfaced it. |
-| 2 | `scantxoutset`, used by the framework's wallet to rescan. |
 | 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS` (1032), inviting requests for blocks it does not have. |
 | 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one; its invalid-port error also differs from Core's wording. |
 | 1 | Core's automatic onion bind: `127.0.0.1:<port + 1>` with `-listen` and no `-bind`. Not adopted — an extra listening socket on every default node is a decision about what a stock satd exposes, not a parsing fix. |
@@ -132,6 +136,16 @@ target; the rest need Core-only binaries or internals.
   `bytesrecv_per_msg`. Adding them unblocked none of the 27 tests that wanted
   them: with the fields present those tests reach the real blocker underneath,
   which for 22 of them is the keepalive ping above.
+
+- Named JSON-RPC parameters. satd was positional-only, so an object `params`
+  failed on every method — and Core's `authproxy` sends one for any keyword
+  argument, which is the first thing the framework does.
+- `setmocktime`, on a node clock reaching block-template timestamps, the
+  future-block check and mempool expiry. Regtest-only as in Core, and behind a
+  `test:clock` capability that `rpc:write` does not imply.
+- `syncwithvalidationinterfacequeue`, draining the event bridges. These three
+  together built the 199-block cache for the first time and took the scoreboard
+  from three to six.
 
 Two rows that looked like satd defects were the harness's own: `shims/bitcoind`
 spawned satd as a child, so `node.process.pid` was the shim's. `get_bind_addrs`

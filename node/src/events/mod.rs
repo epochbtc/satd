@@ -19,6 +19,7 @@
 //! - [`status`] — `StatusEvent` node-health conditions (`status` category).
 //! - [`schema`] — schema-version constant and evolution rules.
 
+pub mod drain;
 pub mod envelope;
 pub mod publisher;
 pub mod replay;

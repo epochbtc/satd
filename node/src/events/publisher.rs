@@ -449,6 +449,7 @@ async fn bridge_mempool(
     mempool_tweak_source: Option<Arc<dyn MempoolTweakSource>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    crate::events::drain::mempool_bridge_started();
     loop {
         tokio::select! {
             biased;
@@ -475,9 +476,13 @@ async fn bridge_mempool(
                             SpTweakEntry::from_tweak_entry(&tweak),
                         ));
                     }
+                    crate::events::drain::mempool_processed(1);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "mempool bridge lagged");
+                    // Skipped events are never delivered; counting them keeps a
+                    // drain waiter from waiting for something that cannot come.
+                    crate::events::drain::mempool_processed(n);
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
@@ -491,6 +496,9 @@ async fn bridge_chain(
     tweak_source: Option<Arc<dyn SpIndex>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // From here on this stream can make progress, so
+    // `syncwithvalidationinterfacequeue` may wait on it.
+    crate::events::drain::chain_bridge_started();
     loop {
         tokio::select! {
             biased;
@@ -565,9 +573,11 @@ async fn bridge_chain(
                             }
                         }
                     }
+                    crate::events::drain::chain_processed(1);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(target: "events", dropped = n, "chain bridge lagged");
+                    crate::events::drain::chain_processed(n);
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },

@@ -1349,6 +1349,9 @@ impl ChainState {
              connection must stay on the core runtime (see rpc::access)"
         );
         if let Some(tx) = self.chain_event_tx.lock().as_ref() {
+            // Counted before the send so a waiter can never snapshot a total
+            // that excludes an event already in flight.
+            crate::events::drain::chain_emitted();
             let _ = tx.send(event);
         }
     }

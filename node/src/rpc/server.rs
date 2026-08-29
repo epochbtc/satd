@@ -1644,6 +1644,7 @@ pub async fn start(
             "submitblock",
             "submitheader",
             "subscribemempool",
+            "syncwithvalidationinterfacequeue",
             "testmempoolaccept",
             "unsubscribemempool",
             "uptime",
@@ -1660,6 +1661,30 @@ pub async fn start(
     // token cannot move the clock even on regtest unless the authfile grants
     // it. The cookie/rpcauth operator has every capability, which is what lets
     // the test harness drive it.
+    // Core's version blocks until its serialized validation-callback queue has
+    // drained past everything pending on entry; its test framework calls it
+    // from `sync_all()` so assertions do not race a callback. satd writes
+    // indexes inline during block connection and updates the mempool under its
+    // own lock, so RPC-visible state is already settled when the RPC that
+    // changed it returns; what is genuinely asynchronous here is outbound
+    // event delivery, so that is what this drains. See `events::drain`.
+    module.register_async_method(
+        "syncwithvalidationinterfacequeue",
+        |_params, _ctx, _extensions| async move {
+            if crate::events::drain::wait_for_drain().await {
+                Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
+            } else {
+                // Better to say the queue is wedged than to return as though
+                // it drained and let a caller assert against stale state.
+                Err(ErrorObjectOwned::owned(
+                    -32603,
+                    "timed out waiting for the event queue to drain",
+                    None::<()>,
+                ))
+            }
+        },
+    )?;
+
     module.register_method("setmocktime", |params, ctx, _extensions| {
         if !crate::time::clock_is_mockable(ctx.chain_state.network) {
             // -1 (RPC_MISC_ERROR), not -8: Core throws a bare
