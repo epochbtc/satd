@@ -12353,3 +12353,199 @@ fn test_readonly_rpc_tls_round_trip() {
 
     node.stop();
 }
+
+/// Bitcoin Core accepts a JSON object as `params` on every RPC, and its own
+/// test framework's `authproxy` switches to that form the moment a caller uses
+/// a keyword argument. satd read `params` as a sequence everywhere, so an
+/// object failed on every method — see `node/src/rpc/named_params.rs`.
+///
+/// The unit tests cover the mapping itself; this one covers the wiring, which
+/// they cannot: that the middleware is actually installed on the listener and
+/// that a translated request reaches the handler with its arguments in the
+/// right positions.
+#[test]
+fn named_rpc_params_are_accepted_like_core() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+
+    // Keywords in an order that is *not* the declaration order: if the layer
+    // bound positionally the node would be asked for `"bcrt1p..."` blocks.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generatetoaddress","params":{{"address":"{addr}","nblocks":3}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).expect("named call");
+    let hashes = resp["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected block hashes, got {resp}"));
+    assert_eq!(hashes.len(), 3, "nblocks must bind to the count, not the address");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        3
+    );
+
+    // `verbosity|verbose`: Core renamed this argument and kept the old
+    // spelling working, so both must reach the same position.
+    let hash = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(1)]).unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for alias in ["verbosity", "verbose"] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"getblock","params":{{"blockhash":"{hash}","{alias}":0}}}}"#
+        );
+        let resp = node.rpc_call_raw_body(&body).unwrap();
+        assert!(
+            resp["result"].is_string(),
+            "verbosity 0 via `{alias}` should return the raw hex, got {resp}"
+        );
+    }
+
+    // A misspelled name must be refused, not silently ignored: ignoring it
+    // would run the call with a default the caller never asked for. Core
+    // reports RPC_INVALID_PARAMETER (-8).
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getblock","params":{{"blockhash":"{hash}","verbosityy":0}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert_eq!(
+        resp["error"]["message"].as_str(),
+        Some("Unknown named parameter verbosityy")
+    );
+
+    // A method that declares no arguments still has to reject names.
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":{"height":1}}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+
+    // Positional calls must be entirely unaffected.
+    let resp = node
+        .rpc_call_with_params("getblock", vec![serde_json::json!(hash), serde_json::json!(0)])
+        .unwrap();
+    assert!(resp["result"].is_string(), "positional still works: {resp}");
+
+    // A satd-only RPC must be callable by name. Seven of them shipped with an
+    // empty row in the table, so every named form was rejected and no name
+    // worked at all.
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"getaddressbalance","params":{"address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert!(
+        resp["error"]["message"].as_str() != Some("Unknown named parameter address"),
+        "satd-only RPCs need nameable arguments too: {resp}"
+    );
+
+    // `submit=false` asks for a block that is built and NOT connected. satd
+    // does not implement it, and used to ignore it and mine anyway — moving a
+    // chain the caller was told would not move. Refusing is the honest answer.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":[],"submit":false}}}}"#
+    );
+    let before = node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap(),
+        before,
+        "a refused generateblock must not have mined anything"
+    );
+}
+
+/// Core declares `verbose`/`verbosity` as accepting either a bool or a number,
+/// and satd read each slot as one concrete type. That is not merely lossy:
+/// jsonrpsee clears the rest of the parameter sequence on a deserialize error,
+/// so the mistyped argument silently became a default *and every argument after
+/// it disappeared*. Named parameters are what made both reachable, since a Core
+/// client naturally sends `verbosity=1` rather than `true`.
+#[test]
+fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(2), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let hash1 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hash2 = node
+        .rpc_call_with_params("getblockhash", vec![serde_json::json!(2)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let named = |body: String| -> serde_json::Value { node.rpc_call_raw_body(&body).unwrap() };
+
+    // `verbose: false` is verbosity 0 — a hex string, not an object. Reading
+    // the slot as u32 turned the failed parse into the default of 1.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+            "params":{{"blockhash":"{hash1}","verbose":false}}}}"#
+    ));
+    assert!(
+        r["result"].is_string(),
+        "verbose=false must return hex, got {r}"
+    );
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+            "params":{{"blockhash":"{hash1}","verbosity":0}}}}"#
+    ));
+    assert!(r["result"].is_string(), "verbosity=0 must return hex: {r}");
+    // …and the object forms still behave.
+    for v in ["true", "1", "2"] {
+        let r = named(format!(
+            r#"{{"jsonrpc":"2.0","id":"t","method":"getblock",
+                "params":{{"blockhash":"{hash1}","verbosity":{v}}}}}"#
+        ));
+        assert!(r["result"].is_object(), "verbosity={v}: {r}");
+    }
+
+    let cb1 = common::coinbase_txid_at(&node, 1);
+
+    // The poisoned-sequence case: a numeric `verbosity` used to fail the bool
+    // parse, which cleared the sequence and took `blockhash` with it. Point it
+    // at the wrong block — if the argument survives, the lookup fails.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":1,"blockhash":"{hash2}"}}}}"#
+    ));
+    assert!(
+        r.get("error").is_some_and(|e| !e.is_null()),
+        "blockhash must not be silently dropped: {r}"
+    );
+
+    // With the right block it resolves, and verbosity 1 really is verbose.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":1,"blockhash":"{hash1}"}}}}"#
+    ));
+    assert!(
+        r["result"].is_object(),
+        "verbosity=1 must be verbose, got {r}"
+    );
+    assert_eq!(r["result"]["txid"], serde_json::json!(cb1));
+
+    // Verbosity 0 is Core's default here, and is hex.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","blockhash":"{hash1}"}}}}"#
+    ));
+    assert!(r["result"].is_string(), "default verbosity is 0: {r}");
+
+    // Verbosity 2 adds fields satd does not produce, so it is refused by name
+    // rather than answered as though it were 1.
+    let r = named(format!(
+        r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
+            "params":{{"txid":"{cb1}","verbosity":2,"blockhash":"{hash1}"}}}}"#
+    ));
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("verbosity 2"), "{r}");
+}

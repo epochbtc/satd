@@ -15,6 +15,7 @@ with a reason.
 | `check_inventory.py` | Enforces the inventory schema; prints the run-set and the scoreboard. |
 | `run.sh` | Runs the run-set via Core's `test_runner.py`. |
 | `check_results.py` | Fails the run if a `run` row was skipped at runtime or is absent from the results. |
+| `gen-named-params.py` | Derives satd's named-parameter table from Core's `RPCHelpMan` declarations; `--check` fails on drift. |
 | `shims/bitcoind`, `shims/bitcoin-cli` | Executed by Core's framework in place of Core's binaries. |
 | `debuglog_map.toml` | Maps satd log lines onto the phrasing `assert_debug_log` greps for. |
 | `tests/` | Tests for the harness. |
@@ -84,7 +85,12 @@ by version order.
 2. Regenerate `<tag>-tests.txt`; delete the old one.
 3. Run `./check_inventory.py` and triage: new files need rows, removed files
    need their rows deleted, renames are both.
-4. One PR, separate from any flip.
+4. Run `./gen-named-params.py --check --cross-check core`. If Core changed an
+   RPC's arguments, regenerate with `--emit-rust` and splice the arms into
+   `arg_names()` in `node/src/rpc/named_params.rs`. CI runs this check; a
+   reordered argument would otherwise bind values to the wrong positions
+   silently.
+5. One PR, separate from any flip.
 
 ## Blockers
 
