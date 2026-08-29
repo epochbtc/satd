@@ -849,6 +849,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("electrummaxbroadcastpackagetxs", electrum_max_broadcast_package_txs),
         restart!("electrumfeehistogramttl", electrum_fee_histogram_ttl),
         restart!("electrumbanner", electrum_banner),
+        restart!("electrumservername", electrum_server_name),
         // ---- Storage / pruning / reindex ----
         restart!("prune", prune),
         restart!("reindex", reindex),

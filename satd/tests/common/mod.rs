@@ -1202,6 +1202,70 @@ pub fn display_to_internal_hex(display_hex: &str) -> String {
     hex::encode(b)
 }
 
+/// A taproot key-path output controlled by `secret`: the keypair plus the
+/// scriptPubKey paying it (BIP 86 style — key-path only, no script tree).
+///
+/// Shared by the silent-payment serving tests, which need an eligible
+/// transaction (any taproot output plus any eligible input) and then need to
+/// spend it to prove the cut-through filter.
+pub fn p2tr_keypath_output(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    secret: [u8; 32],
+) -> (bitcoin::secp256k1::Keypair, bitcoin::ScriptBuf) {
+    let kp = bitcoin::secp256k1::Keypair::from_seckey_slice(secp, &secret).expect("taproot key");
+    let spk = bitcoin::ScriptBuf::new_p2tr(secp, kp.x_only_public_key().0, None);
+    (kp, spk)
+}
+
+/// Build + sign a key-path spend of the P2TR output at `prevout`, paying
+/// `prevout_value - fee_sat` to `dest`. Returns `(raw_tx_hex, display_txid)`.
+pub fn build_signed_p2tr_keypath_spend(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    kp: &bitcoin::secp256k1::Keypair,
+    prevout: bitcoin::OutPoint,
+    prevout_spk: bitcoin::ScriptBuf,
+    prevout_value: u64,
+    dest: bitcoin::ScriptBuf,
+    fee_sat: u64,
+) -> (String, String) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::TapTweak;
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+    let prev = bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(prevout_value),
+        script_pubkey: prevout_spk,
+    };
+    let mut tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: prevout,
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(prevout_value - fee_sat),
+            script_pubkey: dest,
+        }],
+    };
+    let sighash = SighashCache::new(&tx)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prev]), TapSighashType::Default)
+        .expect("key-path sighash");
+    let sig = secp.sign_schnorr_no_aux_rand(
+        &bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array()),
+        &kp.tap_tweak(secp, None).to_keypair(),
+    );
+    let mut witness = bitcoin::Witness::new();
+    witness.push(sig.as_ref());
+    tx.input[0].witness = witness;
+    (
+        hex::encode(bitcoin::consensus::serialize(&tx)),
+        tx.compute_txid().to_string(),
+    )
+}
+
 /// Build + sign a P2WPKH spend from block-1's coinbase to `dest_script`.
 /// Returns `(raw_tx_hex, txid_hex)`. The caller must have mined ≥101 blocks to
 /// `wallet.address` so the coinbase is mature. `Sequence::MAX` (no RBF

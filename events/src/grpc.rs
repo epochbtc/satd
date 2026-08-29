@@ -3001,14 +3001,9 @@ fn refine_block_tweaks(
 
     let wanted: std::collections::HashSet<bitcoin::Txid> =
         bt.entries.iter().map(|e| e.txid).collect();
-    let mut by_txid: std::collections::HashMap<bitcoin::Txid, Vec<node::events::SpTaprootOutput>> =
-        std::collections::HashMap::new();
-    for tx in &block.txdata {
-        let txid = tx.compute_txid();
-        if wanted.contains(&txid) {
-            by_txid.insert(txid, node::events::SpTaprootOutput::from_tx(tx));
-        }
-    }
+    let src = source.clone();
+    let unspent = |op: &bitcoin::OutPoint| src.is_unspent(op);
+    let by_txid = node::sp_serve::taproot_outputs_by_txid(&block, &wanted);
 
     // Cut-through reads the UTXO set once per taproot output and then decides
     // all-or-nothing: an entry whose every output looks spent is dropped whole.
@@ -3029,29 +3024,31 @@ fn refine_block_tweaks(
         let mut cut = false;
         let mut kept = Vec::with_capacity(bt.entries.len());
         for e in &bt.entries {
-            let outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
             // A row naming a transaction the block does not contain is a reorg
             // race, not evidence that its coins are spent: keep the entry rather
             // than cut a payment on the strength of a block read that disagrees
-            // with the index.
-            if may_cut && by_txid.contains_key(&e.txid) {
-                // Spentness decides whether the ENTRY survives -- never which
-                // outputs a surviving entry carries. BIP 352 scanning walks
-                // k = 0, 1, 2, ... and stops at the first k that misses, so
-                // serving only the unspent subset would truncate the
-                // enumeration: a wallet paid twice in one transaction that has
-                // since spent its k=0 coin would derive P_0, miss, and never
-                // reach the k=1 coin it still owns. A transaction with nothing
-                // left unspent has no coin at any k, so dropping it whole is
-                // safe; trimming a survivor is not.
-                let any_unspent = outs
-                    .iter()
-                    .any(|o| source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout }));
-                if !any_unspent {
+            // with the index. `taproot_outputs_by_txid` distinguishes the two --
+            // absent means "not in this block", present means "these are its
+            // taproot outputs".
+            //
+            // Spentness decides whether the ENTRY survives -- never which
+            // outputs a surviving entry carries. BIP 352 scanning walks
+            // k = 0, 1, 2, ... and stops at the first k that misses, so serving
+            // only the unspent subset would truncate the enumeration: a wallet
+            // paid twice in one transaction that has since spent its k=0 coin
+            // would derive P_0, miss, and never reach the k=1 coin it still
+            // owns. A transaction with nothing left unspent has no coin at any
+            // k, so dropping it whole is safe; trimming a survivor is not.
+            let outs = match by_txid.get(&e.txid) {
+                Some(outs)
+                    if may_cut && !node::sp_serve::any_unspent(e.txid, outs, &unspent) =>
+                {
                     cut = true;
                     continue;
                 }
-            }
+                Some(outs) => outs.clone(),
+                None => Vec::new(),
+            };
             let mut kept_entry = e.clone();
             kept_entry.taproot_outputs = if opts.outputs { outs } else { Vec::new() };
             kept.push(kept_entry);

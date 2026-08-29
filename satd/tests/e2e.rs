@@ -1363,6 +1363,338 @@ fn test_e2e_electrum_server_features_from_third_party_client() {
     e2e.node.stop();
 }
 
+/// A line-oriented Electrum client with no protocol opinions, for methods the
+/// third-party `electrum-client` crate does not know.
+///
+/// `blockchain.tweaks.subscribe` is one of those: it is a de-facto method whose
+/// shape is fixed by the wallets that consume it, and the point of these tests
+/// is that the exact bytes on the wire are what those wallets expect. A typed
+/// client would hide precisely the thing under test — and would drop the
+/// unsolicited notifications that carry most of the answer.
+struct RawElectrum {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl RawElectrum {
+    fn connect(port: u16) -> Self {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("electrum connect");
+        stream
+            .set_read_timeout(Some(e2e_test_timeout(20)))
+            .expect("read timeout");
+        let reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        RawElectrum { reader, writer: stream }
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write as _;
+        self.writer.write_all(line.as_bytes()).expect("write");
+        self.writer.write_all(b"\n").expect("write newline");
+        self.writer.flush().expect("flush");
+    }
+
+    fn recv(&mut self) -> serde_json::Value {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).expect("read line");
+        assert!(n > 0, "server closed the connection mid-stream");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON: {line:?} ({e})"))
+    }
+
+    /// Subscribe and return `(first height map, every notification map)`, where
+    /// the notifications run up to and including the `{"message":"done"}` that
+    /// ends the chunk.
+    fn tweaks_subscribe(
+        &mut self,
+        start: u32,
+        count: u32,
+        historical: bool,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        self.send(&format!(
+            r#"{{"id":1,"method":"blockchain.tweaks.subscribe","params":[{start},{count},{historical}]}}"#
+        ));
+        let resp = self.recv();
+        assert!(
+            resp.get("error").is_none(),
+            "tweaks.subscribe rejected: {resp}"
+        );
+        let first = resp["result"].clone();
+        let mut notifications = Vec::new();
+        loop {
+            let n = self.recv();
+            assert_eq!(
+                n["method"], "blockchain.tweaks.subscribe",
+                "unexpected line on the stream: {n}"
+            );
+            // Clients read `params.last`, so the map must be the sole param.
+            let map = n["params"].as_array().expect("params array")[0].clone();
+            let done = map.get("message").and_then(|m| m.as_str()) == Some("done");
+            notifications.push(map);
+            if done {
+                return (first, notifications);
+            }
+        }
+    }
+}
+
+fn electrum_tweaks_e2e_args() -> Vec<&'static str> {
+    vec![
+        "--electrum=1",
+        "--electrumbind=127.0.0.1:0",
+        "-silentpaymentindex=1",
+    ]
+}
+
+/// Fund one taproot output from block-1's coinbase and mine it in. Returns
+/// `(funding txid, its height, the output's value, its scriptPubKey, keypair)`.
+///
+/// One taproot output plus one eligible input is the whole BIP 352 eligibility
+/// test, so this is the minimum transaction the tweak index will write a row for.
+fn fund_taproot_output(
+    e2e: &E2eNode,
+    wallet: &DeterministicWallet,
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    fee: u64,
+) -> (bitcoin::Txid, u32, u64, bitcoin::ScriptBuf, bitcoin::secp256k1::Keypair) {
+    let (kp, spk) = common::p2tr_keypath_output(secp, [0x33; 32]);
+    let rpc = e2e.node.rpc_handle();
+    rpc.mine(101, &wallet.address.to_string());
+    let (raw, txid) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(&rpc, wallet, spk.clone(), fee);
+    rpc.send_raw_tx(&raw);
+    rpc.mine(1, &wallet.address.to_string());
+    (
+        bitcoin::Txid::from_str(&txid).expect("txid"),
+        102,
+        50 * 100_000_000 - fee,
+        spk,
+        kp,
+    )
+}
+
+/// The stream shape itself: JSON-RPC result carries the FIRST height, further
+/// heights arrive as notifications, and `{"message":"done"}` ends the chunk.
+///
+/// A server that answered the whole range in `result` would leave Cake Wallet
+/// waiting for notifications that never come, so this is the load-bearing
+/// assertion of the whole method.
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_streams_result_then_notifications_then_done() {
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let fee = 10_000u64;
+    let (funding_txid, height, value, _spk, _kp) = fund_taproot_output(&e2e, &wallet, &secp, fee);
+    // Two more blocks so the requested range spans past the funded height.
+    e2e.node.rpc_handle().mine(2, &wallet.address.to_string());
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    let (first, notifications) = cli.tweaks_subscribe(height, 3, true);
+
+    // Result: exactly the first height, and it carries the eligible transaction.
+    let first_obj = first.as_object().expect("height map");
+    assert_eq!(first_obj.len(), 1, "the result is ONE height, not the range");
+    let txs = first[height.to_string()]
+        .as_object()
+        .expect("height object");
+    let entry = txs
+        .get(&funding_txid.to_string())
+        .unwrap_or_else(|| panic!("funding tx is indexed: {txs:?}"));
+    assert_eq!(
+        entry["tweak"].as_str().expect("tweak hex").len(),
+        66,
+        "the tweak is a 33-byte compressed point"
+    );
+    let outs = entry["output_pubkeys"].as_object().expect("output_pubkeys");
+    let out = outs["0"].as_array().expect("[x-only hex, value]");
+    assert_eq!(out[0].as_str().expect("x-only hex").len(), 64);
+    assert_eq!(out[1].as_u64(), Some(value), "value rides the output entry");
+
+    // Notifications: heights 103 and 104, then done. Empty maps are real
+    // answers — that is how a client's progress marker crosses barren blocks.
+    let heights: Vec<String> = notifications
+        .iter()
+        .filter(|m| m.get("message").is_none())
+        .flat_map(|m| m.as_object().expect("map").keys().cloned().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(heights, vec!["103".to_string(), "104".to_string()]);
+    assert_eq!(
+        notifications.last().expect("at least one")["message"],
+        "done",
+        "the chunk must end with done, or a client waits forever"
+    );
+    e2e.node.stop();
+}
+
+/// `historicalMode = false` (what Cake sends) cuts through spent outputs; `true`
+/// keeps them, which is what a wallet restoring history needs.
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_cut_through_follows_historical_mode() {
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let fee = 10_000u64;
+    let (funding_txid, height, value, spk, kp) = fund_taproot_output(&e2e, &wallet, &secp, fee);
+    let key = funding_txid.to_string();
+
+    // While the coin is unspent both modes serve it: cut-through decides that a
+    // coin is gone, never that a coin is not yours.
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    for historical in [true, false] {
+        let (first, _) = cli.tweaks_subscribe(height, 1, historical);
+        assert!(
+            first[height.to_string()].get(&key).is_some(),
+            "an unspent taproot output survives historical={historical}"
+        );
+    }
+
+    // Spend it key-path to a P2WPKH, so the spending transaction is not itself
+    // eligible and only the funding height carries a row.
+    let rpc = e2e.node.rpc_handle();
+    let (raw, _txid) = common::build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        bitcoin::OutPoint { txid: funding_txid, vout: 0 },
+        spk,
+        value,
+        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        fee,
+    );
+    rpc.send_raw_tx(&raw);
+    rpc.mine(1, &wallet.address.to_string());
+
+    let (cut, _) = cli.tweaks_subscribe(height, 1, false);
+    assert!(
+        cut[height.to_string()].get(&key).is_none(),
+        "historicalMode=false must omit a transaction whose taproot outputs are spent"
+    );
+    let (kept, _) = cli.tweaks_subscribe(height, 1, true);
+    assert!(
+        kept[height.to_string()].get(&key).is_some(),
+        "historicalMode=true keeps it: a restore needs spent coins in its history"
+    );
+    e2e.node.stop();
+}
+
+/// A height with no row is an empty map only where absence is the answer:
+/// above the tip, or below taproot activation. Inside the served range a
+/// missing row means a reorg is in flight, and answering `{}` there would push
+/// a client's progress marker past a block that is about to be replaced.
+///
+/// This pins the benign direction — the one a too-eager hole check would break.
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_answers_above_the_tip_without_refusing() {
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    e2e.node.rpc_handle().mine(1, &wallet.address.to_string());
+    let tip = e2e.node.rpc_handle().block_count();
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    let above = tip + 50;
+    let (first, notifications) = cli.tweaks_subscribe(above as u32, 1, true);
+    assert!(
+        first[above.to_string()].as_object().expect("height object").is_empty(),
+        "a height above the tip is an empty answer, not an error"
+    );
+    assert_eq!(
+        notifications.last().expect("at least one")["message"],
+        "done",
+        "and the chunk still terminates, so a caught-up wallet can poll"
+    );
+    e2e.node.stop();
+}
+
+/// A request pipelined onto the connection while a tweak stream is pushing
+/// notifications must still be answered.
+///
+/// The connection loop reads inside a `select!` whose notification arm is
+/// continuously ready during a stream, so the read future is created and
+/// cancelled repeatedly. Bytes it has already absorbed are gone from the socket
+/// and live only in the caller's buffer — clearing that buffer on re-entry
+/// silently ate the request, with no error on either side. A wallet that pings
+/// or broadcasts mid-scan simply never heard back.
+#[test]
+fn test_e2e_electrum_request_pipelined_during_a_tweak_stream_is_answered() {
+    let mut e2e = E2eNode::boot_with(&electrum_tweaks_e2e_args());
+    let wallet = DeterministicWallet::from_secret([0x11; 32]);
+    e2e.node.rpc_handle().mine(20, &wallet.address.to_string());
+
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    cli.send(r#"{"id":1,"method":"blockchain.tweaks.subscribe","params":[0,100000,true]}"#);
+    let first = cli.recv();
+    assert_eq!(first["id"], 1);
+    // Sent while the stream is producing, so it lands mid-notification-burst.
+    cli.send(r#"{"id":2,"method":"server.ping"}"#);
+
+    let mut answered = false;
+    for _ in 0..2_000 {
+        let v = cli.recv();
+        if v.get("id").and_then(serde_json::Value::as_u64) == Some(2) {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the pipelined request was swallowed by the stream");
+    e2e.node.stop();
+}
+
+/// Without the index the method refuses in-band instead of answering a scan
+/// with silence — which a client cannot tell from "no payments here".
+#[test]
+fn test_e2e_electrum_tweaks_subscribe_refused_without_the_index() {
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    cli.send(r#"{"id":1,"method":"blockchain.tweaks.subscribe","params":[0,1,false]}"#);
+    let resp = cli.recv();
+    let msg = resp["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error, got {resp}"));
+    assert!(
+        msg.contains("silentpaymentindex"),
+        "the error must name the option that fixes it, got {msg:?}"
+    );
+
+    // And the capability is advertised as absent, so a client can check before
+    // it starts a scan.
+    cli.send(r#"{"id":2,"method":"server.features"}"#);
+    let features = cli.recv();
+    assert_eq!(features["result"]["tweaks"], serde_json::json!(false));
+    e2e.node.stop();
+}
+
+/// The server name is `satd/<version>` unless an operator overrides it. Cake
+/// Wallet gates its silent-payment probe on the substring `electrs`, so the
+/// override is the only way to serve that wallet — and satd never claims to be
+/// electrs on its own.
+#[test]
+fn test_e2e_electrum_server_name_is_satd_but_configurable() {
+    let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    cli.send(r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#);
+    let v = cli.recv();
+    let name = v["result"][0].as_str().expect("server name");
+    assert!(name.starts_with("satd/"), "default name is satd/<version>, got {name:?}");
+    assert!(!name.contains("electrs"), "satd does not claim to be electrs by default");
+    e2e.node.stop();
+
+    let mut e2e = E2eNode::boot_with(&[
+        "--electrum=1",
+        "--electrumbind=127.0.0.1:0",
+        "--electrumservername=satd-electrs/test",
+    ]);
+    let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
+    cli.send(r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#);
+    let v = cli.recv();
+    assert_eq!(v["result"][0], "satd-electrs/test");
+    cli.send(r#"{"id":2,"method":"server.features"}"#);
+    let f = cli.recv();
+    assert_eq!(
+        f["result"]["server_version"], "satd-electrs/test",
+        "features must report the same name as server.version"
+    );
+    e2e.node.stop();
+}
+
 #[test]
 fn test_e2e_electrum_headers_subscribe_notification() {
     use electrum_client::ElectrumApi;

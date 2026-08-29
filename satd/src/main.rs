@@ -3078,6 +3078,7 @@ async fn main() {
             mtls_client_ca: config.electrum_mtls_client_ca.clone(),
             mtls_client_allow: config.electrum_mtls_client_allow.clone(),
             banner: config.electrum_banner.clone(),
+            server_name: config.electrum_server_name.clone(),
             donation_address: String::new(),
             max_history_entries: electrum_proto::config::MAX_HISTORY_ENTRIES,
             max_headers_per_request: electrum_proto::config::MAX_HEADERS_PER_REQUEST,
@@ -3108,6 +3109,11 @@ async fn main() {
             address_index: address_index.clone(),
             spend_index,
             fee_estimator: fee_estimator.clone(),
+            // Same read handle the streaming tweak firehose uses, so the two
+            // surfaces cannot disagree about what a block's tweaks are. `None`
+            // when `silentpaymentindex=0`, which makes
+            // `blockchain.tweaks.subscribe` refuse in-band.
+            sp_index: sp_tweak_source.clone(),
             electrum_extras,
             network: config.network,
             config: std::sync::Arc::new(electrum_cfg.clone()),

@@ -185,11 +185,33 @@ An entry with one spent and one live output therefore arrives carrying both. Lik
 and reads one block per event. It never applies to `MempoolTweak` — an
 unconfirmed output is in no confirmed UTXO set.
 
-The firehose serves on gRPC only in this release — the WebSocket/SSE transports
-do not carry the tweaks category. For scripts and integrators not on an SDK,
+The firehose serves on gRPC only — the WebSocket/SSE transports do not carry the
+tweaks category. For scripts and integrators not on an SDK,
 `getsilentpaymentblockdata "blockhash" ( verbosity dust_limit )` returns the
 same per-block bytes over JSON-RPC; see
 [JSON-RPC Extensions](json-rpc-extensions.md).
+
+## Serving tweaks to existing wallets (Electrum)
+
+The streaming API is the better protocol — durable cursors, mempool-time tweaks,
+reorg anchors — but no third-party wallet speaks it yet. The wallets that do
+scan silent payments today speak `blockchain.tweaks.subscribe` on the Electrum
+port, so satd serves that method too, from the same index and with the same
+tweaks:
+
+```ini
+electrum=1
+silentpaymentindex=1
+```
+
+It is a stream rather than a call (the JSON-RPC result is the first height, the
+rest arrive as notifications, `{"message":"done"}` ends the chunk), and its
+`historical_mode` parameter is the cut-through trade described above with the
+polarity flipped: `false` cuts spent coins, `true` keeps them for a restore.
+The [Electrum chapter](electrum.md#serving-silent-payment-tweaks) has the wire
+shape, the per-network behaviour, and the one client quirk that needs an
+operator decision — Cake Wallet probes the method only when the server names
+itself `…electrs…`.
 
 ## Walkthrough: a zero-custody light wallet (Tier 1)
 

@@ -757,6 +757,15 @@ pub struct Config {
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
     pub electrum_banner: Option<String>,
+    /// Override for the server name reported by `server.version` and
+    /// `server.features.server_version`. `None` reports `satd/<version>`.
+    ///
+    /// The reason this is configurable: Cake Wallet only probes
+    /// `blockchain.tweaks.subscribe` when the name contains the substring
+    /// `electrs`. Operators who want to serve silent payments to Cake set
+    /// something like `satd-electrs/0.5.1`; nobody else needs to touch it, and
+    /// satd never claims to be electrs by default.
+    pub electrum_server_name: Option<String>,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
@@ -2778,6 +2787,8 @@ impl Config {
             .or_else(|| file_get("electrumfeehistogramttl").and_then(|v| v.parse().ok()))
             .unwrap_or(10);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
+        let electrum_server_name =
+            cli.electrumservername.or_else(|| file_get("electrumservername"));
 
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
@@ -2979,6 +2990,25 @@ impl Config {
                  or pass --txindex on the CLI to override the config."
                 .into());
         }
+        // A custom Electrum server name is almost always set to reach a wallet
+        // that gates on the name — Cake Wallet probes `blockchain.tweaks.
+        // subscribe` only when it contains `electrs`. Advertising that without
+        // the tweak index means every probe it triggers is refused, which looks
+        // like a broken server rather than a missing option.
+        if electrum_resolved
+            && !silentpaymentindex
+            && electrum_server_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains("electrs"))
+        {
+            pending_notes.push(ConfigNote {
+                level: NoteLevel::Warn,
+                message: "electrumservername advertises 'electrs' but \
+                     --silentpaymentindex is off, so every blockchain.tweaks.subscribe \
+                     this attracts will be refused. Enable the index or drop the name."
+                    .to_string(),
+            });
+        }
         if electrum_resolved && !addressindex {
             return Err(
                 "electrum=1 with addressindex=0 in config: refusing to start. \
@@ -3141,6 +3171,7 @@ impl Config {
             electrum_max_broadcast_package_txs,
             electrum_fee_histogram_ttl,
             electrum_banner,
+            electrum_server_name,
             blockfilterindex,
             peerblockfilters,
             prune,
@@ -4713,6 +4744,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "TEXT",
+        help = "Server name reported by server.version (default satd/<version>)"
+    )]
+    pub electrumservername: Option<String>,
+
+    #[arg(
+        long,
         value_name = "BOOL_OR_BASIC",
         value_parser = parse_blockfilterindex_arg,
         num_args = 0..=1,
@@ -5845,6 +5883,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrummaxbroadcastpackagetxs",
         "electrumfeehistogramttl",
         "electrumbanner",
+        "electrumservername",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -6528,6 +6567,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "electrummaxbroadcastpackagetxs",
     "electrumfeehistogramttl",
     "electrumbanner",
+    "electrumservername",
     // Storage / pruning / reindex
     "prune",
     "reindex",
@@ -8641,6 +8681,7 @@ testactivationheight=bip34@2
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            electrumservername: None,
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,
@@ -8928,6 +8969,7 @@ testactivationheight=bip34@2
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            electrumservername: None,
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,

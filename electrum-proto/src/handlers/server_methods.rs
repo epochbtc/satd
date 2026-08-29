@@ -18,7 +18,7 @@ use crate::state::ElectrumState;
 /// form is NOT a min-only — electrs's `check_between(version, single,
 /// single)` rejects clients that don't match exactly. We mirror that
 /// to keep the `server.version` contract identical.
-pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
+pub fn version(state: &ElectrumState, params: Value) -> Result<Value, JsonRpcError> {
     // Client name + protocol-version arg are both optional. We do
     // intersection logic only when we got a useful protocol-version.
     let arr = match &params {
@@ -51,8 +51,7 @@ pub fn version(_state: &ElectrumState, params: Value) -> Result<Value, JsonRpcEr
         )));
     }
 
-    let server_name = format!("satd/{}", env!("CARGO_PKG_VERSION"));
-    Ok(json!([server_name, supported]))
+    Ok(json!([server_name(state), supported]))
 }
 
 /// `server.ping()` — returns `null`.
@@ -111,9 +110,28 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
         "protocol_max": PROTOCOL_VERSION,
         "protocol_min": PROTOCOL_VERSION,
         "pruning": serde_json::Value::Null,
-        "server_version": format!("satd/{}", env!("CARGO_PKG_VERSION")),
+        "server_version": server_name(state),
         "hash_function": "sha256",
+        // Whether `blockchain.tweaks.subscribe` can actually be served on this
+        // node right now. Deliberately the same test `TweakSource::from_state`
+        // makes — index present AND complete — not merely "the operator turned
+        // the index on". A node whose backfill is still running has the index
+        // configured and refuses every subscribe, so reporting `true` there
+        // would send a wallet to a backend that cannot answer it for hours.
+        "tweaks": state.sp_index.as_ref().is_some_and(|i| i.is_complete()),
     }))
+}
+
+/// The name reported to clients. Defaults to `satd/<version>`; an operator can
+/// override it, which is the only way to serve silent-payment tweaks to Cake
+/// Wallet (it probes `blockchain.tweaks.subscribe` only when this contains the
+/// substring `electrs`). satd never claims to be electrs on its own.
+fn server_name(state: &ElectrumState) -> String {
+    state
+        .config
+        .server_name
+        .clone()
+        .unwrap_or_else(|| format!("satd/{}", env!("CARGO_PKG_VERSION")))
 }
 
 /// `server.peers.subscribe()` — always returns `[]`. We're not part of

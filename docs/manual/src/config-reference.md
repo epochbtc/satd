@@ -313,6 +313,7 @@ startup error.
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |
 | `electrumbanner` | `powered by satd <ver>` | restart | satd | Override for `server.banner`. |
+| `electrumservername` | `satd/<ver>` | restart | satd | Name reported by `server.version` and `server.features.server_version`. Set it only to reach a client that gates on the name — Cake Wallet probes silent-payment tweaks only when it contains `electrs`. |
 
 ## Storage / pruning / reindex
 

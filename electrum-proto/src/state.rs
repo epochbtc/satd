@@ -13,6 +13,7 @@ use node::chain::state::ChainState;
 use node::mempool::fee::FeeEstimator;
 use node::mempool::pool::Mempool;
 use node::net::manager::TxBroadcaster;
+use node::index::silent_payments::SpIndex;
 use node_index::{AddressIndex, SpendIndex};
 
 use crate::config::ElectrumConfig;
@@ -30,6 +31,10 @@ pub struct ElectrumState {
     pub address_index: Arc<dyn AddressIndex>,
     pub spend_index: Arc<dyn SpendIndex>,
     pub fee_estimator: Arc<FeeEstimator>,
+    /// BIP 352 tweak index, wired only when `silentpaymentindex=1`. `None`
+    /// means `blockchain.tweaks.subscribe` refuses in-band rather than serving
+    /// a scan that would silently return no payments.
+    pub sp_index: Option<Arc<dyn SpIndex>>,
     pub electrum_extras: Arc<dyn ElectrumExtras>,
     pub network: Network,
     pub config: Arc<ElectrumConfig>,

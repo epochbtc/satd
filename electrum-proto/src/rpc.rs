@@ -29,19 +29,27 @@ pub enum FramingError {
     Utf8,
 }
 
-/// Read one newline-terminated line into `buf` (cleared first).
+/// Read one newline-terminated line into `buf`.
 /// Returns the line as `&str` if it's valid UTF-8 within the cap.
 ///
 /// Why not `BufRead::read_line`: it has no built-in cap, so a
 /// pathological client sending an unbounded line would grow `buf`
 /// without limit. We read byte-by-byte until `\n` or `MAX_LINE_BYTES`,
 /// matching electrs's careful framing.
+///
+/// **Cancel safety.** `buf` is the caller's, and it carries the partial line
+/// across cancellations: bytes are consumed from `reader` as they are absorbed,
+/// so anything already moved into `buf` exists nowhere else. This function
+/// therefore must not clear it on entry — dropping the future mid-line (which
+/// is exactly what `tokio::select!` does whenever another branch wins) would
+/// otherwise destroy the consumed prefix, and the client's request would vanish
+/// with no error on either side. **The caller clears `buf` after consuming a
+/// returned line**, and not before.
 pub async fn read_line_bounded<'a, R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &'a mut Vec<u8>,
     cap: usize,
 ) -> Result<&'a str, FramingError> {
-    buf.clear();
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
@@ -118,6 +126,41 @@ mod tests {
             .unwrap();
         assert_eq!(line, "hello");
         let _ = written.await;
+    }
+
+    #[tokio::test]
+    async fn read_line_survives_cancellation_mid_line() {
+        // The connection loop reads inside a `select!`, so the read future is
+        // dropped whenever a notification wins the race. Bytes already absorbed
+        // have been consumed from the socket and live only in `buf`, so a clear
+        // on re-entry would lose them: the client's request would vanish with no
+        // error on either end. That is reachable in one line of client traffic —
+        // pipeline a request while a tweak stream is pushing notifications.
+        let (mut client, server) = pair().await;
+        let (rd, _wr) = server.into_split();
+        let mut reader = BufReader::new(rd);
+        let mut buf = Vec::new();
+
+        client.write_all(b"{\"id\":1,").await.unwrap();
+        client.flush().await.unwrap();
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES),
+        )
+        .await;
+        assert!(cancelled.is_err(), "no newline yet, so the read is still pending");
+
+        client.write_all(b"\"method\":\"server.ping\"}\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let line = read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            line, r#"{"id":1,"method":"server.ping"}"#,
+            "the prefix absorbed before the cancellation must survive it"
+        );
     }
 
     #[tokio::test]

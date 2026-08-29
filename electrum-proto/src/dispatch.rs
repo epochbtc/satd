@@ -261,12 +261,62 @@ pub fn dispatch_with_subscriptions(
         "blockchain.headers.subscribe" => {
             handle_headers_subscribe(state, subs, headers_source, extras, &req)
         }
+        "blockchain.tweaks.subscribe" => handle_tweaks_subscribe(state, subs, &req),
         _ => return dispatch(state, req),
     };
     match outcome {
         Ok(result) => Response::success(id, result),
         Err(err) => Response::error(id, err),
     }
+}
+
+/// `blockchain.tweaks.subscribe` — a stream, not a call.
+///
+/// The synchronous half answers with the FIRST height's map; the rest of the
+/// requested range is streamed as notifications by a task this registers, ending
+/// in `{"message":"done"}`. Splitting it that way is not a satd choice: it is the
+/// shape the clients that consume this method (Cake Wallet, kiss-bdk) already
+/// expect, and a server that answered the whole range in `result` would leave
+/// them waiting for notifications that never come.
+fn handle_tweaks_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    use crate::handlers::tweaks;
+
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let treq = tweaks::parse_req(&params)?;
+    let src = tweaks::TweakSource::from_state(state)?;
+    let activation = src.activation_height();
+
+    // One stream per connection at a time. Superseding a live one is not
+    // possible safely: aborting the old task cannot retract notification lines
+    // it has already pushed into this connection's shared channel, so they
+    // would be written after the new subscribe's `result` and a client reading
+    // the last key as its progress marker would skip every height in between.
+    // Refusing is the safe direction and costs the normal client nothing — by
+    // the time it has read `{"message":"done"}` the task that sent it is gone.
+    if subs.tweaks_running() {
+        return Err(JsonRpcError::invalid_params(
+            "a tweak stream is already running on this connection; read it to \
+             {\"message\":\"done\"} before subscribing again",
+        ));
+    }
+
+    // A start above the tip is not an error: the client gets an empty map for
+    // that height and an immediate `done`, which is how a caught-up wallet
+    // polls. `last < from` makes the stream task a no-op plus `done`.
+    let last = treq.last_height(state.chain.tip_height()).unwrap_or(treq.start);
+    let first = tweaks::height_map(&src, treq.start, treq.cut_through())?;
+    subs.add_tweaks(
+        src,
+        treq.start.saturating_add(1),
+        last,
+        treq.cut_through(),
+        activation,
+    );
+    Ok(first)
 }
 
 fn handle_scripthash_subscribe(

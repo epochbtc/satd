@@ -16,6 +16,12 @@ item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
 ### Added
+- `blockchain.tweaks.subscribe` on the Electrum server — the BIP 352 tweak stream
+  Cake Wallet and kiss-bdk already speak, served from the same index as the
+  streaming firehose. Requires `silentpaymentindex=1`; `historical_mode=false`
+  cuts through spent coins. New `electrumservername=` sets the name reported by
+  `server.version` (default `satd/<version>`), which is what Cake gates its
+  silent-payment probe on
 - `tweak_unspent_only`, a cut-through filter on the streaming `tweaks` category:
   `BlockTweaks` entries whose taproot outputs are all already spent are dropped,
   so a balance scan skips the ECDH for coins that no longer exist. A surviving
