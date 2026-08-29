@@ -106,8 +106,15 @@ impl Lane {
     /// permanent deficit and make every later wait burn the full timeout, so
     /// the baseline moves to the current emitted count.
     fn bridge_started(&self) {
+        // `fetch_max`, not `store`. The correctness argument for the whole
+        // barrier is that both counters only ever increase, so a target
+        // snapshot cannot be overtaken; an unconditional store breaks exactly
+        // that. `bridge_started` is `pub` and nothing enforces one publisher
+        // per process, so a second one — or a bridge restarted on reconnect —
+        // would move `processed` *backwards* and strand any waiter whose
+        // target sits above the new value until its timeout expires.
         self.processed
-            .store(self.emitted.load(Ordering::Acquire), Ordering::Release);
+            .fetch_max(self.emitted.load(Ordering::Acquire), Ordering::AcqRel);
         self.bridged.store(true, Ordering::Release);
     }
 }
@@ -151,7 +158,20 @@ pub fn mempool_bridge_started() {
 /// Returns `false` if [`DRAIN_TIMEOUT`] elapsed first, which means a bridge is
 /// wedged — the caller should report that rather than pretend it drained.
 pub async fn wait_for_drain() -> bool {
-    let targets = [(&CHAIN, CHAIN.target()), (&MEMPOOL, MEMPOOL.target())];
+    wait_for_lanes([(&CHAIN, CHAIN.target()), (&MEMPOOL, MEMPOOL.target())]).await
+}
+
+/// [`wait_for_drain`] over an explicit pair of lanes.
+///
+/// Split out so tests can drive the barrier on lanes they own. The globals are
+/// shared with every other test in this binary — `spawn_bridges` in
+/// `events::publisher` flips `bridged`, and the mempool and chain-state tests
+/// raise `emitted` for events no bridge consumes — so a test that asserted on
+/// them would be asserting on whatever the rest of the binary had done to them,
+/// and would be flaky in both directions: a spurious pass when another test has
+/// inflated `processed`, and a 30-second stall then a failure when one has
+/// inflated `emitted`.
+async fn wait_for_lanes(targets: [(&Lane, Option<u64>); 2]) -> bool {
     let wait = async {
         for (lane, target) in targets {
             let Some(target) = target else { continue };
@@ -184,42 +204,82 @@ pub async fn wait_for_drain() -> bool {
 mod tests {
     use super::*;
 
-    /// The lanes are process-global, so these cases share state and must run
-    /// in one test, in order — the unbridged case in particular only holds
-    /// before any bridge has registered.
+    /// Lanes the test owns, so the assertions are about the barrier rather
+    /// than about whatever else in this test binary has touched the globals.
+    fn lanes(a: &'static Lane, b: &'static Lane) -> [(&'static Lane, Option<u64>); 2] {
+        [(a, a.target()), (b, b.target())]
+    }
+
     #[tokio::test]
-    async fn drain_waits_only_on_lanes_that_can_progress() {
-        // (a) Events are emitted whether or not a bridge exists. Without the
+    async fn an_unbridged_lane_has_nothing_to_wait_for() {
+        // Events are emitted whether or not a bridge exists. Without the
         // `bridged` guard, every node running without the events surface would
-        // block here forever.
-        chain_emitted();
-        mempool_emitted();
+        // block here for the full timeout.
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+        A.emitted();
+        B.emitted();
+        assert!(wait_for_lanes(lanes(&A, &B)).await);
+    }
+
+    #[tokio::test]
+    async fn the_barrier_blocks_until_the_emitted_event_is_published() {
+        // The load-bearing property: this must NOT return early. Replace
+        // `wait_for_lanes` with `async { true }` and this is the assertion that
+        // fails — without it the test walks the happy path and a no-op barrier
+        // passes, which is exactly what a barrier must never be allowed to
+        // become.
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+        A.bridge_started();
+        A.emitted();
+
+        let mut waiter = tokio::spawn(wait_for_lanes(lanes(&A, &B)));
         assert!(
-            wait_for_drain().await,
-            "an unbridged lane has nothing to wait for"
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut waiter)
+                .await
+                .is_err(),
+            "the barrier returned before the event was published"
         );
 
-        // (b) Once a bridge is live the wait is real: it must not return until
-        // `processed` reaches the count emitted at entry.
-        // Starting the bridge discounts (a)'s event, which it never saw.
-        chain_bridge_started();
-        chain_emitted();
-        let waiter = tokio::spawn(wait_for_drain());
-        tokio::task::yield_now().await;
-        chain_processed(1);
-        assert!(
-            waiter.await.unwrap(),
-            "should finish once processed catches up"
-        );
+        A.processed(1);
+        assert!(waiter.await.unwrap(), "and returns once processed catches up");
+    }
 
-        // (c) A lagged receiver never delivers what it skipped, so those count
-        // as processed; insisting on them would never return.
-        mempool_bridge_started();
+    #[tokio::test]
+    async fn events_a_lagged_receiver_skipped_count_as_published() {
+        // A lagged receiver never delivers what it skipped, so those count as
+        // processed; insisting on them would never return.
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+        B.bridge_started();
         for _ in 0..5 {
-            mempool_emitted();
+            B.emitted();
         }
-        mempool_processed(5);
-        assert!(wait_for_drain().await, "skipped events must count as done");
+        B.processed(5);
+        assert!(wait_for_lanes(lanes(&A, &B)).await);
+    }
+
+    #[tokio::test]
+    async fn a_second_bridge_cannot_move_processed_backwards() {
+        // `bridge_started` discounts events a bridge never saw, but it must do
+        // that with `fetch_max`: a plain store would drop `processed` below a
+        // live waiter's target and strand it until the timeout. Nothing
+        // enforces one publisher per process, and the function is `pub`.
+        let lane = Lane::new();
+        lane.bridge_started();
+        lane.emitted();
+        // A lagged receiver reports the events it skipped, which can carry
+        // `processed` past this lane's own `emitted` — that is the whole point
+        // of counting skips as done.
+        lane.processed(3);
+        assert!(lane.drained(3));
+
+        // Now a second bridge registers. `emitted` is 1, so a plain store would
+        // drop `processed` from 3 to 1 and strand any waiter holding a target
+        // of 3 until its timeout expires.
+        lane.bridge_started();
+        assert!(lane.drained(3), "processed must never move backwards");
     }
 
     /// A bridge that starts after events were already broadcast must not

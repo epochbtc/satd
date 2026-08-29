@@ -1653,14 +1653,6 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
     })?;
 
-    // Core gates this to a "mockable chain", which in Core is regtest alone --
-    // mainnet, testnet3, testnet4 and signet all set m_is_mockable_chain
-    // false. satd matches that, with Core's message, so a node off regtest
-    // behaves exactly as bitcoind would. satd adds one further restriction on
-    // top: `test:clock` is not implied by `rpc:write`, so a delegated bearer
-    // token cannot move the clock even on regtest unless the authfile grants
-    // it. The cookie/rpcauth operator has every capability, which is what lets
-    // the test harness drive it.
     // Core's version blocks until its serialized validation-callback queue has
     // drained past everything pending on entry; its test framework calls it
     // from `sync_all()` so assertions do not race a callback. satd writes
@@ -1668,6 +1660,16 @@ pub async fn start(
     // own lock, so RPC-visible state is already settled when the RPC that
     // changed it returns; what is genuinely asynchronous here is outbound
     // event delivery, so that is what this drains. See `events::drain`.
+    //
+    // Scope, so callers do not over-read it: this waits for events to reach the
+    // `NodeEvent` bus, not for any particular subscriber to have received one.
+    // The gRPC/WebSocket/ZMQ sinks consume the bus as independent tasks and are
+    // not counted, and neither are the other consumers of the chain-event
+    // broadcast (the address-index status notifier, the P2P block-announcement
+    // task, `-stopatheight`, `-blocknotify`). Core's drain does cover its
+    // equivalents, so a test that needs one of those settled needs more than
+    // this. Unlike `setmocktime` below, this is not chain-gated -- Core's is
+    // not either.
     module.register_async_method(
         "syncwithvalidationinterfacequeue",
         |_params, _ctx, _extensions| async move {
@@ -1685,6 +1687,14 @@ pub async fn start(
         },
     )?;
 
+    // Core gates this to a "mockable chain", which in Core is regtest alone --
+    // mainnet, testnet3, testnet4 and signet all set m_is_mockable_chain
+    // false. satd matches that, with Core's message, so a node off regtest
+    // behaves exactly as bitcoind would. satd adds one further restriction on
+    // top: `test:clock` is not implied by `rpc:write`, so a delegated bearer
+    // token cannot move the clock even on regtest unless the authfile grants
+    // it. The cookie/rpcauth operator has every capability, which is what lets
+    // the test harness drive it.
     module.register_method("setmocktime", |params, ctx, _extensions| {
         if !crate::time::clock_is_mockable(ctx.chain_state.network) {
             // -1 (RPC_MISC_ERROR), not -8: Core throws a bare
