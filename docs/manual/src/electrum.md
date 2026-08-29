@@ -46,7 +46,7 @@ the address index for scripthash history (on by default) and
 | `--electrummaxbroadcastpackagetxs=<n>` | `25` | Max txs per `blockchain.transaction.broadcast_package`. |
 | `--electrumfeehistogramttl=<secs>` | `10` | TTL for the `mempool.get_fee_histogram` cache. |
 | `--electrumbanner=<text>` | `powered by satd <version>` | Override for `server.banner`. |
-| `--electrumservername=<text>` | `satd/<version>` | Name reported by `server.version` / `server.features.server_version`. See [Serving silent-payment tweaks](#serving-silent-payment-tweaks). |
+| `--electrumservername=<text>` | `satd-electrs-compatible/<version>` | Name reported by `server.version` / `server.features.server_version`. Does not affect the P2P user agent. See [The server name](#the-server-name-and-why-it-says-electrs). |
 
 The server runs on satd's [isolated API runtime](api-scaling.md)
 (`--api-threads`), so Electrum load cannot starve block connection.
@@ -174,20 +174,36 @@ progress marker advance without the server writing ~700k lines. A chunk ends
 after 60 seconds of wall clock at a height boundary; clients resubscribe from the
 next unscanned height, which is what `done` is for.
 
-### Reaching Cake Wallet
+### The server name, and why it says `electrs`
 
-Cake Wallet only probes this method when `server.version[0]` contains the
-substring `electrs`. satd reports `satd/<version>` and does **not** claim to be
-electrs on its own; an operator who wants to serve Cake sets the name
-explicitly:
+satd reports `satd-electrs-compatible/<version>` from `server.version` and
+`server.features.server_version`.
+
+Electrum's handshake has no capability field, so clients feature-detect by
+matching on that string. Cake Wallet will not probe
+`blockchain.tweaks.subscribe` at all unless it contains the substring `electrs`
+— note `electrs`, not `electrum`; the two read the same to a person and only one
+matches. Carrying the token is what makes silent-payment support work out of the
+box for those clients.
+
+The name leads with satd's own identity and states a claim about the *protocol*,
+in the same way every browser still sends `Mozilla` at the front of its
+user-agent long after that stopped saying anything about who wrote the browser.
+It is scoped to this surface: peers on the P2P network see satd's own user agent
+(`/satd:<version>/`, reported by `getnetworkinfo` as `subversion`), which this
+setting cannot change.
+
+Override it if you would rather not advertise the token, or need a different one
+for another client:
 
 ```ini
-electrumservername=satd-electrs/0.5.1
+electrumservername=satd/0.5.1
 ```
 
-Nothing else about the server changes. Other tweak clients (for example
+Other tweak clients (for example
 [kiss-bdk](https://github.com/kkdao/kiss-bdk)) do not need the substring — they
-identify the chain from `server.features.genesis_hash`.
+identify the chain from `server.features.genesis_hash`. Nothing else about the
+server depends on the name.
 
 Sparrow's silent-payment path is a *different* method
 (`blockchain.silentpayments.subscribe`), which uploads a scan key to the server.

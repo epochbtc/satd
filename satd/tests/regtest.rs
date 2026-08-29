@@ -10256,8 +10256,8 @@ fn electrum_round_trip(port: u16, request: &serde_json::Value) -> serde_json::Va
     serde_json::from_str(line.trim_end()).expect("electrum response is valid JSON")
 }
 
-/// `server.version` round-trips and reports `satd/<ver>` + protocol
-/// version `1.4.5`.
+/// `server.version` round-trips and reports satd's name plus protocol
+/// version `1.4`.
 #[test]
 fn test_electrum_server_version_round_trips() {
     let electrum_port = find_available_port();
@@ -10277,8 +10277,8 @@ fn test_electrum_server_version_round_trips() {
     let result = v["result"].as_array().expect("result is array");
     let server_name = result[0].as_str().expect("server name string");
     assert!(
-        server_name.starts_with("satd/"),
-        "server.version should report satd/<ver>; got {server_name}"
+        server_name.starts_with("satd-"),
+        "server.version should lead with satd's identity; got {server_name}"
     );
     // Protocol version matches romanz/electrs v0.11.1 — `"1.4"`. See
     // electrum-proto::PROTOCOL_VERSION for the rationale.

@@ -57,7 +57,8 @@ pub struct ElectrumConfig {
     /// Electrum plain-TCP port (50001).
     pub bind: SocketAddr,
     /// Server name reported by `server.version` and
-    /// `server.features.server_version`. `None` reports `satd/<version>`.
+    /// `server.features.server_version`. `None` reports
+    /// `satd-electrs-compatible/<version>`.
     /// Configurable because Cake Wallet gates its silent-payment probe on the
     /// substring `electrs` appearing here; see the Electrum manual chapter.
     pub server_name: Option<String>,

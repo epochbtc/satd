@@ -1816,19 +1816,46 @@ fn test_e2e_electrum_tweaks_subscribe_refused_without_the_index() {
     e2e.node.stop();
 }
 
-/// The server name is `satd/<version>` unless an operator overrides it. Cake
-/// Wallet gates its silent-payment probe on the substring `electrs`, so the
-/// override is the only way to serve that wallet — and satd never claims to be
-/// electrs on its own.
+/// The default server name identifies satd and carries an `electrs`
+/// compatibility token, and an operator can override it.
+///
+/// Electrum's `server.version` has no capability field, so clients feature-
+/// detect by matching on this string — Cake Wallet will not probe
+/// `blockchain.tweaks.subscribe` unless it contains the substring `electrs`.
+/// The substring is therefore the load-bearing part and is asserted literally:
+/// spelling it `electrum` would read identically to a human and silently turn
+/// silent-payment support off for every such client.
 #[test]
-fn test_e2e_electrum_server_name_is_satd_but_configurable() {
+fn test_e2e_electrum_server_name_signals_compatibility_and_is_configurable() {
     let mut e2e = E2eNode::boot_with(&electrum_e2e_args());
     let mut cli = RawElectrum::connect(e2e.electrum_port.expect("electrum port"));
     cli.send(r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#);
     let v = cli.recv();
     let name = v["result"][0].as_str().expect("server name");
-    assert!(name.starts_with("satd/"), "default name is satd/<version>, got {name:?}");
-    assert!(!name.contains("electrs"), "satd does not claim to be electrs by default");
+    assert!(
+        name.starts_with("satd-"),
+        "the name must lead with satd's own identity, got {name:?}"
+    );
+    assert!(
+        name.contains("electrs"),
+        "clients gate on this exact substring; `electrum` does not match, got {name:?}"
+    );
+    assert!(
+        name.contains(env!("CARGO_PKG_VERSION")),
+        "and it carries satd's version, got {name:?}"
+    );
+
+    // The P2P surface is a different name entirely and this must not touch it:
+    // peers see satd's own user agent, not a compatibility claim.
+    let subver = e2e.node.rpc_handle().call("getnetworkinfo", vec![]).expect("getnetworkinfo")
+        ["result"]["subversion"]
+        .as_str()
+        .expect("subversion")
+        .to_string();
+    assert!(
+        subver.starts_with("/satd:") && !subver.contains("electrs"),
+        "the P2P user agent stays satd's own, got {subver:?}"
+    );
     e2e.node.stop();
 
     let mut e2e = E2eNode::boot_with(&[

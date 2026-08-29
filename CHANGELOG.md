@@ -19,9 +19,7 @@ item below is (or will be) written up in full in the in-development
 - `blockchain.tweaks.subscribe` on the Electrum server — the BIP 352 tweak stream
   Cake Wallet and kiss-bdk already speak, served from the same index as the
   streaming firehose. Requires `silentpaymentindex=1`; `historical_mode=false`
-  cuts through spent coins. New `electrumservername=` sets the name reported by
-  `server.version` (default `satd/<version>`), which is what Cake gates its
-  silent-payment probe on
+  cuts through spent coins
 - `tweak_unspent_only`, a cut-through filter on the streaming `tweaks` category:
   `BlockTweaks` entries whose taproot outputs are all already spent are dropped,
   so a balance scan skips the ECDH for coins that no longer exist. A surviving
@@ -39,6 +37,11 @@ item below is (or will be) written up in full in the in-development
 - The Silent Payments and Rust SDK manual chapters state the commit-on-poll cursor
   contract the SDKs implement: persist the cursor of the last event you finished
   processing, never the one you were handed
+- The Electrum server name now reports `satd-electrs-compatible/<version>` from
+  `server.version` and `server.features.server_version`, instead of
+  `satd/<version>`. Electrum has no capability field, so clients feature-detect
+  on this string; Cake Wallet probes silent-payment tweaks only when it contains
+  `electrs`. `electrumservername=` overrides it. The P2P user agent is unchanged
 
 ### Fixed
 - A mined or submitted block that was stored without connecting (a sibling won

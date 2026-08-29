@@ -122,16 +122,32 @@ pub fn features(state: &ElectrumState) -> Result<Value, JsonRpcError> {
     }))
 }
 
-/// The name reported to clients. Defaults to `satd/<version>`; an operator can
-/// override it, which is the only way to serve silent-payment tweaks to Cake
-/// Wallet (it probes `blockchain.tweaks.subscribe` only when this contains the
-/// substring `electrs`). satd never claims to be electrs on its own.
+/// The name reported to clients, as `server.version`'s first element and
+/// `server.features.server_version`.
+///
+/// Defaults to `satd-electrs-compatible/<version>`: identity first, then a
+/// compatibility token, on the same principle that keeps `Mozilla` at the front
+/// of every browser user-agent long after it stopped meaning anything about who
+/// wrote the browser. The token is load-bearing rather than decorative --
+/// Electrum's `server.version` carries no capability field, so clients feature-
+/// detect by matching on this string, and Cake Wallet will not probe
+/// `blockchain.tweaks.subscribe` at all unless it contains the substring
+/// `electrs`. Spelling it `electrum` would read the same to a human and signal
+/// nothing to the client.
+///
+/// It is a claim about the protocol satd speaks, not about the software it is:
+/// the name leads with `satd`, and the P2P surface is untouched -- peers see
+/// `node::USER_AGENT` (`/satd:<version>/`), which this cannot change.
+///
+/// An operator can override it with `electrumservername` -- to drop the
+/// compatibility token, or to adopt a different one if another client gates on
+/// a different string.
 fn server_name(state: &ElectrumState) -> String {
     state
         .config
         .server_name
         .clone()
-        .unwrap_or_else(|| format!("satd/{}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| format!("satd-electrs-compatible/{}", env!("CARGO_PKG_VERSION")))
 }
 
 /// `server.peers.subscribe()` — always returns `[]`. We're not part of

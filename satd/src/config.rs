@@ -758,7 +758,8 @@ pub struct Config {
     /// version)`).
     pub electrum_banner: Option<String>,
     /// Override for the server name reported by `server.version` and
-    /// `server.features.server_version`. `None` reports `satd/<version>`.
+    /// `server.features.server_version`. `None` reports
+    /// `satd-electrs-compatible/<version>`.
     ///
     /// The reason this is configurable: Cake Wallet only probes
     /// `blockchain.tweaks.subscribe` when the name contains the substring
@@ -2990,25 +2991,6 @@ impl Config {
                  or pass --txindex on the CLI to override the config."
                 .into());
         }
-        // A custom Electrum server name is almost always set to reach a wallet
-        // that gates on the name — Cake Wallet probes `blockchain.tweaks.
-        // subscribe` only when it contains `electrs`. Advertising that without
-        // the tweak index means every probe it triggers is refused, which looks
-        // like a broken server rather than a missing option.
-        if electrum_resolved
-            && !silentpaymentindex
-            && electrum_server_name
-                .as_deref()
-                .is_some_and(|n| n.to_ascii_lowercase().contains("electrs"))
-        {
-            pending_notes.push(ConfigNote {
-                level: NoteLevel::Warn,
-                message: "electrumservername advertises 'electrs' but \
-                     --silentpaymentindex is off, so every blockchain.tweaks.subscribe \
-                     this attracts will be refused. Enable the index or drop the name."
-                    .to_string(),
-            });
-        }
         if electrum_resolved && !addressindex {
             return Err(
                 "electrum=1 with addressindex=0 in config: refusing to start. \
@@ -4745,7 +4727,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "TEXT",
-        help = "Server name reported by server.version (default satd/<version>)"
+        help = "Server name reported by server.version (default satd-electrs-compatible/<version>)"
     )]
     pub electrumservername: Option<String>,
 
