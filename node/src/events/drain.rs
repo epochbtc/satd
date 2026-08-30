@@ -206,6 +206,24 @@ async fn wait_for_lanes(targets: [(&Lane, Option<u64>); 2]) -> bool {
         for (lane, target) in targets {
             let Some(target) = target else { continue };
             while !lane.drained(target) {
+                // A bridge can return *while* we wait — both do on shutdown and
+                // on a closed channel — and once it has, nothing will ever
+                // advance `processed` to the target we snapshotted.
+                //
+                // The snapshot can even be unreachable the moment it is taken.
+                // `target()` reads `bridged` and then `emitted`, two separate
+                // loads: a bridge that stops between them has already run its
+                // `fetch_max` against the *older* emitted count, and the
+                // senders stay installed for the other subscribers, so
+                // `emitted` keeps climbing afterwards. The target then sits
+                // above a `processed` nothing will move again.
+                //
+                // Re-checking here covers both, and costs one relaxed pair of
+                // loads per wakeup: an unbridged lane has nothing left to wait
+                // for, which is the same thing `target() == None` says up front.
+                if lane.target().is_none() {
+                    break;
+                }
                 // Two guards, because the failure mode of getting this wrong is
                 // an RPC that never answers.
                 //
@@ -250,6 +268,45 @@ mod tests {
         A.emitted();
         B.emitted();
         assert!(wait_for_lanes(lanes(&A, &B)).await);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_was_unreachable_when_taken_does_not_strand_the_waiter() {
+        // `target()` is two separate loads: `bridged`, then `emitted`. A bridge
+        // that stops between them yields a target that was already unreachable
+        // the moment it was taken -- `bridge_stopped` ran its `fetch_max`
+        // against the older emitted count, and the senders stay installed for
+        // the other subscribers, so `emitted` keeps climbing afterwards.
+        //
+        // This reconstructs that interleaving directly rather than trying to
+        // race it: the target below is what a `target()` call straddling the
+        // stop would have returned.
+        static A: Lane = Lane::new();
+        static B: Lane = Lane::new();
+
+        A.bridge_started();
+        A.emitted();
+        A.bridge_stopped(); // fetch_max lifts processed to 1
+        A.emitted();
+        A.emitted(); // emitted is now 3, processed is 1, and no bridge remains
+
+        assert_eq!(A.target(), None, "the lane is not consumable any more");
+
+        // The waiter holds the pre-stop reading of `bridged` together with the
+        // post-stop reading of `emitted`. Nothing will ever raise `processed`
+        // to 3, so before the in-loop re-check this burned the full
+        // DRAIN_TIMEOUT and then reported the drain as failed -- an RPC hanging
+        // 30 seconds and lying about the result.
+        let stranded: [(&'static Lane, Option<u64>); 2] = [(&A, Some(3)), (&B, B.target())];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                wait_for_lanes(stranded),
+            )
+            .await
+            .expect("must not wait out DRAIN_TIMEOUT on a lane no bridge can serve"),
+            "a stopped lane reports drained rather than failing",
+        );
     }
 
     #[tokio::test]
