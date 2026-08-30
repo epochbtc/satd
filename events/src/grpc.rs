@@ -3010,33 +3010,66 @@ fn refine_block_tweaks(
         }
     }
 
-    let mut cut = false;
-    let mut kept = Vec::with_capacity(bt.entries.len());
-    for e in &bt.entries {
-        let outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
-        // A row naming a transaction the block does not contain is a reorg race,
-        // not evidence that its coins are spent: keep the entry rather than cut a
-        // payment on the strength of a block read that disagrees with the index.
-        if opts.unspent_only && by_txid.contains_key(&e.txid) {
-            // Spentness decides whether the ENTRY survives — never which outputs
-            // a surviving entry carries. BIP 352 scanning walks k = 0, 1, 2, ...
-            // and stops at the first k that misses, so serving only the unspent
-            // subset would truncate the enumeration: a wallet paid twice in one
-            // transaction that has since spent its k=0 coin would derive P_0,
-            // miss, and never reach the k=1 coin it still owns. A transaction
-            // with nothing left unspent has no coin at any k, so dropping it
-            // whole is safe; trimming a survivor is not.
-            let any_unspent = outs
-                .iter()
-                .any(|o| source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout }));
-            if !any_unspent {
-                cut = true;
-                continue;
+    // Cut-through reads the UTXO set once per taproot output and then decides
+    // all-or-nothing: an entry whose every output looks spent is dropped whole.
+    // Those reads are independent, so a connect or reorg landing between them
+    // gives a mixed view, and a mixed view can say "all spent" about an entry
+    // that is unspent on the chain we end up on -- the client never sees the
+    // coin. Comparing the chain token across the loop rules that out; `None`
+    // means the source cannot vouch for consistency at all.
+    //
+    // Unlike the Electrum pager there is no request to refuse here: this is a
+    // push stream. So the fallback is to *not cut*. Serving an entry that could
+    // have been dropped costs the client some ECDH; dropping one that should
+    // have survived costs it a payment.
+    let snapshot_before = source.chain_snapshot();
+    let may_cut = opts.unspent_only && snapshot_before.is_some();
+
+    let build = |may_cut: bool| {
+        let mut cut = false;
+        let mut kept = Vec::with_capacity(bt.entries.len());
+        for e in &bt.entries {
+            let outs = by_txid.get(&e.txid).cloned().unwrap_or_default();
+            // A row naming a transaction the block does not contain is a reorg
+            // race, not evidence that its coins are spent: keep the entry rather
+            // than cut a payment on the strength of a block read that disagrees
+            // with the index.
+            if may_cut && by_txid.contains_key(&e.txid) {
+                // Spentness decides whether the ENTRY survives -- never which
+                // outputs a surviving entry carries. BIP 352 scanning walks
+                // k = 0, 1, 2, ... and stops at the first k that misses, so
+                // serving only the unspent subset would truncate the
+                // enumeration: a wallet paid twice in one transaction that has
+                // since spent its k=0 coin would derive P_0, miss, and never
+                // reach the k=1 coin it still owns. A transaction with nothing
+                // left unspent has no coin at any k, so dropping it whole is
+                // safe; trimming a survivor is not.
+                let any_unspent = outs
+                    .iter()
+                    .any(|o| source.is_unspent(&bitcoin::OutPoint { txid: e.txid, vout: o.vout }));
+                if !any_unspent {
+                    cut = true;
+                    continue;
+                }
             }
+            let mut kept_entry = e.clone();
+            kept_entry.taproot_outputs = if opts.outputs { outs } else { Vec::new() };
+            kept.push(kept_entry);
         }
-        let mut kept_entry = e.clone();
-        kept_entry.taproot_outputs = if opts.outputs { outs } else { Vec::new() };
-        kept.push(kept_entry);
+        (cut, kept)
+    };
+
+    let (mut cut, mut kept) = build(may_cut);
+    if cut && source.chain_snapshot() != snapshot_before {
+        // The chain moved under the reads. Redo without cutting rather than
+        // serve a decision no single chain state supports.
+        tracing::debug!(
+            target: "events::grpc",
+            "chain advanced during cut-through; serving the block uncut",
+        );
+        let redone = build(false);
+        cut = redone.0;
+        kept = redone.1;
     }
 
     let mut new_bt = bt.clone();
@@ -3761,6 +3794,100 @@ mod tests {
         };
         assert!(bt.entries.is_empty());
         assert!(bt.filtered);
+    }
+
+    #[test]
+    fn cut_through_is_skipped_when_the_chain_moved_under_its_reads() {
+        // Spentness is read one output at a time and the decision is
+        // all-or-nothing, so a connect or reorg landing mid-loop yields a mixed
+        // view -- and a mixed view can say "all spent" about an entry that is
+        // unspent on the chain we end up on. There is no request to refuse on a
+        // push stream, so the fallback is to serve the block uncut: extra ECDH
+        // for the client beats a payment it never sees.
+        //
+        // `MovingChain` reports every output spent (so cut-through would drop
+        // the entry) while its chain token changes between the before and after
+        // reads, which is exactly the interleaving.
+        struct MovingChain {
+            inner: std::sync::Arc<dyn node::events::BlockScanSource>,
+            calls: std::sync::atomic::AtomicU32,
+        }
+        impl node::events::BlockCursorSource for MovingChain {
+            fn current_tip_height(&self) -> u32 {
+                self.inner.current_tip_height()
+            }
+            fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, bitcoin::BlockHash)> {
+                self.inner.active_chain_range(from, to)
+            }
+        }
+        impl node::events::BlockScanSource for MovingChain {
+            fn block_body(&self, hash: &bitcoin::BlockHash) -> Option<bitcoin::Block> {
+                self.inner.block_body(hash)
+            }
+            fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
+                self.inner.block_undo(hash)
+            }
+            fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
+                false
+            }
+            fn chain_snapshot(&self) -> Option<(bitcoin::BlockHash, u32)> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some((bitcoin::BlockHash::from_byte_array([n as u8; 32]), n))
+            }
+        }
+
+        let (env, scan, _txid) = enrichment_fixture(Default::default());
+        let moving: std::sync::Arc<dyn node::events::BlockScanSource> =
+            std::sync::Arc::new(MovingChain {
+                inner: scan,
+                calls: std::sync::atomic::AtomicU32::new(0),
+            });
+
+        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(moving)) };
+        let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
+        assert!(
+            !entries_of(&refined).is_empty(),
+            "the chain moved under the reads, so the entry must be served uncut \
+             rather than dropped on a decision no single chain state supports",
+        );
+        assert!(!cut, "nothing was cut, so the block must not claim it was filtered");
+    }
+
+    #[test]
+    fn a_source_that_cannot_vouch_for_consistency_does_not_cut() {
+        // `chain_snapshot` defaults to `None` so the trait stays additive. A
+        // source that leaves it there gets no cut-through rather than a filter
+        // applied across reads nothing guarantees are consistent -- fail toward
+        // serving too much, never toward dropping a live coin.
+        struct NoSnapshot(std::sync::Arc<dyn node::events::BlockScanSource>);
+        impl node::events::BlockCursorSource for NoSnapshot {
+            fn current_tip_height(&self) -> u32 {
+                self.0.current_tip_height()
+            }
+            fn active_chain_range(&self, from: u32, to: u32) -> Vec<(u32, bitcoin::BlockHash)> {
+                self.0.active_chain_range(from, to)
+            }
+        }
+        impl node::events::BlockScanSource for NoSnapshot {
+            fn block_body(&self, hash: &bitcoin::BlockHash) -> Option<bitcoin::Block> {
+                self.0.block_body(hash)
+            }
+            fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
+                self.0.block_undo(hash)
+            }
+            fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
+                false
+            }
+            // chain_snapshot deliberately left at the default `None`.
+        }
+
+        let (env, scan, _txid) = enrichment_fixture(Default::default());
+        let opaque: std::sync::Arc<dyn node::events::BlockScanSource> =
+            std::sync::Arc::new(NoSnapshot(scan));
+        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(opaque)) };
+        let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
+        assert!(!entries_of(&refined).is_empty(), "no guarantee means no cutting");
+        assert!(!cut);
     }
 
     #[test]
@@ -6833,6 +6960,14 @@ mod tests {
         fn block_undo(&self, _hash: &BlockHash) -> Option<node::storage::undo::UndoData> {
             None
         }
+        fn chain_snapshot(&self) -> Option<(bitcoin::BlockHash, u32)> {
+            // A fixed token: this double never mutates, so every read in a
+            // cut-through pass is trivially consistent. Without an override the
+            // default `None` would disable cut-through here and these tests
+            // would assert on a filter that never ran.
+            Some((bitcoin::BlockHash::from_byte_array([0x7c; 32]), 0))
+        }
+
         fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool {
             !self.spent.contains(outpoint)
         }
