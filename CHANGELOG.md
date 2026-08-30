@@ -59,7 +59,13 @@ only tests.
   its own, so a quiet link produced no evidence it was still alive and
   `getpeerinfo` never reported `pingtime`. Ping on connection setup and every
   two minutes thereafter, disconnect after twenty minutes without a pong (Core's
-  `TIMEOUT_INTERVAL`), and report `pingtime`, `minping` and `pingwait`.
+  `TIMEOUT_INTERVAL`), and report `pingtime`, `minping` and `pingwait`. The
+  `ping` RPC shares the same accounting, and a ping-timeout drop is counted by
+  `satd_peer_ping_timeouts_total`. `feature_framework_testshell.py` and
+  `p2p_block_sync.py` were measured passing as a result and moved into the run
+  set, taking the scoreboard to 12 tests; the other 21 rows that named the
+  missing ping as their blocker were re-measured onto the blocker they now
+  actually reach.
 - `scantxoutset` scans the UTXO set for outputs paying a descriptor. satd's first
   descriptor support: `raw(<hex script>)` and `addr(<address>)` with BIP380
   checksums, plus Core's inference for the reported `desc`. Descriptor forms satd

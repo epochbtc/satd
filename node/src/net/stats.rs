@@ -61,6 +61,11 @@ fn now_micros() -> u64 {
 pub struct NetTotals {
     bytes_sent: AtomicU64,
     bytes_recv: AtomicU64,
+    /// Peers dropped for not answering a ping. Its own counter because this
+    /// is the one disconnect satd initiates on its own judgement of a peer:
+    /// if it ever misfires the symptom is a falling peer count with no
+    /// external cause, and a log line is not something you can alert on.
+    ping_timeouts: AtomicU64,
 }
 
 impl NetTotals {
@@ -74,6 +79,10 @@ impl NetTotals {
 
     pub fn bytes_recv(&self) -> u64 {
         self.bytes_recv.load(Ordering::Relaxed)
+    }
+
+    pub fn ping_timeouts(&self) -> u64 {
+        self.ping_timeouts.load(Ordering::Relaxed)
     }
 }
 
@@ -122,6 +131,11 @@ impl PeerStats {
             min_ping_us: AtomicU64::new(u64::MAX),
             totals,
         })
+    }
+
+    /// Record that this peer is being dropped for an unanswered ping.
+    pub fn note_ping_timeout(&self) {
+        self.totals.ping_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record `n` bytes written to this peer (updates per-peer + global +
@@ -203,20 +217,40 @@ impl PeerStats {
     /// round trip. Returns whether it matched.
     ///
     /// A peer that echoes a stale or invented nonce is ignored rather than
-    /// allowed to write a bogus round-trip time -- and because the nonce is
-    /// cleared before the timing is stored, a peer that sends the same valid
-    /// pong twice is counted once.
+    /// allowed to write a bogus round-trip time, and a peer that sends the
+    /// same valid pong twice is counted once.
+    ///
+    /// A pong carrying nonce zero clears the outstanding ping without
+    /// recording a time. That is Bitcoin Core's "Nonce zero" case
+    /// (`net_processing.cpp`): the peer is plainly answering, it just cannot
+    /// be timed, so the ping is finished rather than left pending. Without
+    /// this the ping would stay outstanding forever -- no further ping would
+    /// ever be sent, and the peer would be dropped at `PING_TIMEOUT` for
+    /// answering.
+    ///
+    /// The send timestamp is read *before* the nonce is cleared. Both halves
+    /// run on the peer's own task today, but the read-then-clear order is
+    /// what makes that an optimisation rather than a correctness
+    /// requirement: clearing first would let a concurrent `ping_sent`
+    /// overwrite the timestamp between the two, yielding a ~0 round trip
+    /// that `min_ping_us` would then keep forever.
     pub fn pong_received(&self, nonce: u64) -> bool {
         let outstanding = self.ping_nonce.load(Ordering::Relaxed);
-        if outstanding == 0 || nonce != outstanding {
+        if outstanding == 0 {
             return false;
         }
+        if nonce == 0 {
+            self.ping_nonce.store(0, Ordering::Relaxed);
+            return true;
+        }
+        if nonce != outstanding {
+            return false;
+        }
+        let sent_us = self.ping_sent_us.load(Ordering::Relaxed);
         self.ping_nonce.store(0, Ordering::Relaxed);
         // A sub-microsecond round trip (loopback) would otherwise store 0,
         // which is this field's "never measured" sentinel.
-        let rtt = now_micros()
-            .saturating_sub(self.ping_sent_us.load(Ordering::Relaxed))
-            .max(1);
+        let rtt = now_micros().saturating_sub(sent_us).max(1);
         self.ping_time_us.store(rtt, Ordering::Relaxed);
         self.min_ping_us.fetch_min(rtt, Ordering::Relaxed);
         true
@@ -261,6 +295,12 @@ impl PeerStats {
             return None;
         }
         let waited = now_micros().saturating_sub(self.ping_sent_us.load(Ordering::Relaxed));
+        // Core gates on `m_ping_wait > 0s`, so a getpeerinfo issued in the
+        // same microsecond as the ping omits the field rather than reporting
+        // a zero-length wait.
+        if waited == 0 {
+            return None;
+        }
         Some(waited as f64 / 1_000_000.0)
     }
 }
@@ -278,7 +318,11 @@ mod tests {
 
         s.ping_sent(42);
         assert!(s.ping_outstanding());
-        assert!(s.ping_wait_secs().is_some());
+        // Core omits `pingwait` until the wait is measurably non-zero, so the
+        // field only appears once time has actually passed.
+        assert_eq!(s.ping_wait_secs(), None, "no measurable wait yet");
+        std::thread::sleep(std::time::Duration::from_micros(1500));
+        assert!(s.ping_wait_secs().is_some_and(|w| w > 0.0));
 
         assert!(s.pong_received(42));
         assert!(!s.ping_outstanding());
@@ -307,6 +351,28 @@ mod tests {
         // The same valid pong replayed is counted once, not twice.
         assert!(!s.pong_received(1234));
         assert_eq!(s.ping_time_secs(), measured);
+    }
+
+    #[test]
+    fn a_pong_carrying_nonce_zero_finishes_the_ping_without_timing_it() {
+        use std::time::Duration;
+        let s = PeerStats::new(NetTotals::new());
+
+        // Nothing outstanding: a nonce-zero pong is still just an
+        // unsolicited pong.
+        assert!(!s.pong_received(0));
+
+        s.ping_sent(77);
+        // Core treats a nonce-zero pong as finishing the ping ("Nonce zero")
+        // rather than as a mismatch. Left outstanding, this peer would never
+        // be pinged again and would be dropped at PING_TIMEOUT -- for
+        // answering.
+        assert!(s.pong_received(0));
+        assert!(!s.ping_outstanding());
+        assert!(!s.ping_timed_out(Duration::ZERO));
+        // It cannot be timed, so it must not write a round trip.
+        assert_eq!(s.ping_time_secs(), None);
+        assert_eq!(s.min_ping_secs(), None);
     }
 
     #[test]

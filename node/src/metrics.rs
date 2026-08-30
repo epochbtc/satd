@@ -87,6 +87,7 @@ impl MetricsContext {
         let net_totals = self.peer_manager.net_totals();
         let net_bytes_sent = net_totals.bytes_sent();
         let net_bytes_recv = net_totals.bytes_recv();
+        let ping_timeouts = net_totals.ping_timeouts();
         let uptime_secs = self.start_time.elapsed().as_secs();
         let network_str = network_label(self.network);
         let (rss_bytes, vm_bytes) = process_memory().unwrap_or((0, 0));
@@ -220,6 +221,14 @@ impl MetricsContext {
             "counter",
             &[],
             net_bytes_recv,
+        );
+        metric(
+            &mut out,
+            "satd_peer_ping_timeouts_total",
+            "Peers disconnected for not answering a keepalive ping.",
+            "counter",
+            &[],
+            ping_timeouts,
         );
         metric(
             &mut out,

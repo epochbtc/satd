@@ -1367,6 +1367,20 @@ fn peers_exchange_keepalive_pings_without_being_asked() {
         "pong bytes should be attributed to the pong message type, got {pong_bytes}: {peer}"
     );
 
+    // The round trip must be a round trip, not a measure of how busy the node
+    // is. Over loopback the true figure is microseconds; matching the pong
+    // anywhere other than the peer's own connection task folds that task's
+    // scheduling delay in, and routing it through the manager loop -- which
+    // drains its queue on a 500ms timer -- would land this in the hundreds of
+    // milliseconds. 100ms is three orders of magnitude above the real value
+    // and still well under that floor.
+    let rtt = peer["pingtime"].as_f64().unwrap();
+    assert!(
+        rtt < 0.1,
+        "loopback ping time should be sub-millisecond, got {rtt}s -- \
+         the pong is being timed somewhere other than the connection task: {peer}"
+    );
+
     node_b.stop();
     node_a.stop();
 }

@@ -1557,11 +1557,31 @@ impl PeerManager {
     }
 
     /// Send a ping to all connected peers.
+    ///
+    /// Registered with the peer's counters exactly as a keepalive ping is, so
+    /// the `ping` RPC populates `pingtime` -- in Core the RPC and the
+    /// keepalive share one timer, and a pong that nothing is waiting for is
+    /// discarded. A peer already awaiting a pong is left alone rather than
+    /// handed a second nonce, which would reset its `pingwait` and hide the
+    /// ping that actually went unanswered.
     pub fn ping_all(&self) {
         let peers = self.peers.read();
         for (_, handle) in peers.iter() {
             if handle.info.state == PeerState::Connected {
-                let _ = handle.msg_tx.try_send(NetworkMessage::Ping(rand::random()));
+                if handle.stats.ping_outstanding() {
+                    continue;
+                }
+                // Nonce 0 is the "nothing outstanding" sentinel; Core
+                // likewise re-rolls until the nonce is non-zero.
+                let nonce = rand::random::<u64>().max(1);
+                // Recorded only once the send is actually queued. A full
+                // queue drops the message, and marking a ping outstanding
+                // that never reached the wire would have the peer dropped at
+                // PING_TIMEOUT for failing to answer something it was never
+                // sent.
+                if handle.msg_tx.try_send(NetworkMessage::Ping(nonce)).is_ok() {
+                    handle.stats.ping_sent(nonce);
+                }
             }
         }
     }
@@ -2125,14 +2145,9 @@ impl PeerManager {
             NetworkMessage::Ping(nonce) => {
                 self.send_to_peer(id, NetworkMessage::Pong(nonce));
             }
-            NetworkMessage::Pong(nonce) => {
-                // Clone the counters out before releasing the peer map lock;
-                // matching the nonce touches only atomics on the Arc.
-                let stats = self.peers.read().get(&id).map(|h| h.stats.clone());
-                if let Some(stats) = stats {
-                    stats.pong_received(nonce);
-                }
-            }
+            // `Pong` never reaches here: the peer's write loop matches it
+            // against that peer's outstanding ping and does not forward it.
+            NetworkMessage::Pong(_) => {}
             NetworkMessage::Inv(inventory) => {
                 self.handle_inv(id, inventory);
             }
@@ -5680,9 +5695,12 @@ impl PeerManager {
         // getnettotals / metrics. Looked up from the already-registered
         // PeerHandle; if the peer was dropped between registration and here,
         // the connection is torn down anyway.
-        if let Some(stats) = self.peers.read().get(&id).map(|h| h.stats.clone()) {
+        // Also the ping accounting the write loop needs below, so the map is
+        // read once rather than again just before the loop starts.
+        let ping_stats = self.peers.read().get(&id).map(|h| h.stats.clone());
+        if let Some(stats) = &ping_stats {
             reader.set_counters(stats.clone());
-            writer.set_counters(stats);
+            writer.set_counters(stats.clone());
         }
 
         // Request headers to start sync
@@ -5766,10 +5784,10 @@ impl PeerManager {
             }
         });
 
-        // Main loop: receive from reader task OR send outbound messages
-        // Ping accounting rides on the per-peer counters, which the write
-        // loop needs anyway to decide whether a ping is already outstanding.
-        let ping_stats = self.peers.read().get(&id).map(|h| h.stats.clone());
+        // Main loop: receive from reader task OR send outbound messages.
+        // Ping accounting rides on the per-peer counters cloned above, which
+        // the write loop needs anyway to decide whether a ping is already
+        // outstanding.
         let result = Self::peer_write_loop(
             id,
             &self.event_tx,
@@ -5809,21 +5827,39 @@ impl PeerManager {
         // what Core does: a peer whose last ping time is still zero is pinged
         // as soon as it is set up, not two minutes later.
         let mut ping_timer = tokio::time::interval(PING_INTERVAL);
+        // After a stall, catch up by resuming the cadence rather than firing
+        // the missed ticks back to back. The `ping_outstanding()` guard below
+        // already swallows a burst, but not relying on that keeps the
+        // argument for why this cannot flood a peer a local one.
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ping_timer.tick() => {
-                    // A peer that has not answered its ping for TIMEOUT_INTERVAL
-                    // is gone whether or not the socket has noticed: a half-open
-                    // TCP connection stays writable indefinitely. Returning here
-                    // takes the ordinary teardown path -- the reader task is
-                    // aborted, the socket closed, and PeerDisconnected emitted,
-                    // so IBD block reassignment runs as it would for any drop.
+                    // A peer that keeps talking but never answers a ping is
+                    // dropped here. Returning takes the ordinary teardown
+                    // path -- the reader task is aborted, the socket closed,
+                    // and PeerDisconnected emitted, so IBD block reassignment
+                    // runs as it would for any drop.
+                    //
+                    // A peer that goes fully silent is dealt with earlier and
+                    // elsewhere: the reader task's 600s recv timeout ends the
+                    // connection well before this deadline. So this branch is
+                    // specifically for a peer that is present on the wire and
+                    // declining to answer, which is the case a read timeout
+                    // cannot see.
                     //
                     // Detection lands within one tick of the timeout, so up to
                     // PING_INTERVAL late; Core polls more often and is tighter.
                     if let Some(stats) = &stats
                         && stats.ping_timed_out(PING_TIMEOUT)
                     {
+                        stats.note_ping_timeout();
+                        tracing::warn!(
+                            id,
+                            timeout_secs = PING_TIMEOUT.as_secs(),
+                            reason = "ping_timeout",
+                            "Dropping peer that stopped answering pings"
+                        );
                         return Err(format!(
                             "ping timeout: no pong in {}s",
                             PING_TIMEOUT.as_secs()
@@ -5848,6 +5884,30 @@ impl PeerManager {
                 }
                 msg = read_rx.recv() => {
                     match msg {
+                        // A pong is matched here, on the peer's own task,
+                        // rather than forwarded to the manager loop.
+                        //
+                        // Two reasons. The round trip is only meaningful if
+                        // it is stamped where the ping was sent: the manager
+                        // drains events at most every 500ms, so routing the
+                        // pong through it added up to half a second of
+                        // queueing delay to every measurement, and `minping`
+                        // -- a lifetime minimum -- would converge on the
+                        // manager's scheduling floor instead of the link.
+                        //
+                        // More importantly, the deadline is evaluated on this
+                        // task. Judging it against evidence that arrives on a
+                        // *different*, shared task means a backlog anywhere
+                        // in the node is charged against every peer's
+                        // deadline at once -- all of them timing out together
+                        // while their pongs sit unprocessed in the queue.
+                        // Send and receipt now sit on the same task, so a
+                        // peer can only ever be dropped for its own silence.
+                        Some(NetworkMessage::Pong(nonce)) => {
+                            if let Some(stats) = &stats {
+                                stats.pong_received(nonce);
+                            }
+                        }
                         Some(msg) => {
                             event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
