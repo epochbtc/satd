@@ -745,7 +745,7 @@ mod tests {
                 1_300_000_000 + i,
             );
             // Accept the full block so we get both header and height_hash entries
-            parent_hash = cs.accept_block(&block).unwrap();
+            parent_hash = cs.accept_block(&block).unwrap().hash();
         }
 
         (cs, dir)

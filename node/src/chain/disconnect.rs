@@ -1494,17 +1494,17 @@ mod tests {
 
         // Build chain A: genesis -> A1 -> A2
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let _a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let _a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
 
         // Build chain B: genesis -> B1 -> B2 -> B3 (more work => triggers reorg)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
 
         // Tip should be B3
         assert_eq!(cs.tip_height(), 3);
