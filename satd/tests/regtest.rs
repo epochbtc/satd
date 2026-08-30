@@ -7461,6 +7461,27 @@ fn test_esplora_blocks_recent_returns_descending_summaries() {
         assert!(entry["nonce"].as_u64().is_some());
     }
 
+    // The page is one chain segment, not ten independent lookups: every entry
+    // must name its successor's parent. The handler now walks `prev_blockhash`
+    // from a reorg-safe anchor, so this holds by construction; resolving each
+    // height separately could break it under a reorg mid-page or a `height_hash`
+    // row naming a side-chain block, and an explorer would draw a discontinuous
+    // chain with no way to tell.
+    for pair in arr.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        assert_eq!(
+            child["previousblockhash"].as_str(),
+            parent["id"].as_str(),
+            "block at height {:?} must name the next page entry as its parent",
+            child["height"],
+        );
+        assert_eq!(
+            child["height"].as_i64().unwrap() - 1,
+            parent["height"].as_i64().unwrap(),
+            "and the page must not skip a height",
+        );
+    }
+
     node.stop();
 }
 

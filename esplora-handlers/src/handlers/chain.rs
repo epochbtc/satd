@@ -71,14 +71,24 @@ fn collect_blocks_descending(
 ) -> Result<Vec<BlockHeaderJson>, EsploraError> {
     const PAGE: u32 = 10;
     let mut out = Vec::with_capacity(PAGE as usize);
-    for offset in 0..PAGE {
-        let h = match start_height.checked_sub(offset) {
-            Some(h) => h,
-            None => break,
-        };
-        let Some(hash) = state.chain.get_block_hash_by_height(h) else {
-            break;
-        };
+
+    // Resolve the top of the page once, then follow parent pointers down.
+    //
+    // Resolving each height independently made the page ten unrelated lookups
+    // presented as one chain segment: a reorg part-way down, or a `height_hash`
+    // row naming a side-chain block (the index is "best known at height", which
+    // `accept_header` and `store_block` also populate), breaks the invariant a
+    // client actually renders -- `page[i].previousblockhash == page[i+1].id`.
+    // An explorer then draws a discontinuous chain and has no way to tell.
+    //
+    // `active_chain_hash_at_height` walks back from a pinned tip rather than
+    // trusting the height index, and every entry after the first comes from its
+    // child's `prev_blockhash`, so the page is contiguous by construction.
+    let Some(anchor) = state.chain.active_chain_hash_at_height(start_height) else {
+        return Ok(out);
+    };
+    let mut hash = anchor;
+    for _ in 0..PAGE {
         let Some(entry) = state.chain.get_block_index(&hash) else {
             break;
         };
@@ -95,6 +105,7 @@ fn collect_blocks_descending(
         let mediantime = state
             .chain
             .get_median_time_past(entry.height.saturating_add(1));
+        let height = entry.height;
         out.push(block_header_json(
             &hash,
             &entry,
@@ -103,6 +114,10 @@ fn collect_blocks_descending(
             weight,
             mediantime,
         ));
+        if height == 0 {
+            break;
+        }
+        hash = entry.header.prev_blockhash;
     }
     Ok(out)
 }
