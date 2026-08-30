@@ -3200,12 +3200,17 @@ impl Config {
                 nodes
             },
             user_agent: {
-                // Repeatable, and CLI wins over the config file wholesale
-                // rather than merging -- same rule as -addnode above.
+                // Repeatable, and both sources accumulate: Core's
+                // `GetSettingsList` walks command line then config file and
+                // stops early only for a negated or forced setting, so
+                // `-uacomment=a` alongside `uacomment=b` in bitcoin.conf
+                // yields `(a; b)`. Command line first, as Core orders it.
+                //
+                // (`-addnode` above resolves CLI-or-file rather than merging.
+                // That predates this and is its own divergence; it is not the
+                // rule to copy.)
                 let mut comments = cli.uacomment;
-                if comments.is_empty() {
-                    comments = file_get_all("uacomment");
-                }
+                comments.extend(file_get_all("uacomment"));
                 // Rejected here so a bad comment is a startup error with
                 // Core's own wording, not a silently-dropped option.
                 node::format_user_agent(&comments)?
@@ -8070,6 +8075,55 @@ testactivationheight=segwit@900
         assert_eq!(o.bip34, Some(7));
         assert_eq!(o.csv, Some(200));
         assert_eq!(o.segwit, Some(900));
+    }
+
+    #[test]
+    fn uacomment_accumulates_across_the_command_line_and_the_config_file() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\nuacomment=fromfile\n").unwrap();
+
+        // Core's GetSettingsList walks the command line and then the config
+        // file, stopping early only for a negated or forced setting, so a
+        // list-valued option takes both sources. An earlier draft had the
+        // command line replace the file wholesale, which silently dropped the
+        // operator's config-file label whenever a wrapper appended one flag.
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+                "--uacomment=fromcli",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.user_agent.ends_with("(fromcli; fromfile)/"),
+            "command line first, then config file: {}",
+            cfg.user_agent
+        );
+
+        // Either source alone still works.
+        let file_only = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            file_only.user_agent.ends_with("(fromfile)/"),
+            "{}",
+            file_only.user_agent
+        );
     }
 
     /// The config-file spelling resolves through the same path.

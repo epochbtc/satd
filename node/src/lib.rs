@@ -53,10 +53,22 @@ pub fn user_agent() -> &'static str {
 /// Install the process-wide user agent. Call once, at startup, before any
 /// peer connection or `getnetworkinfo` can observe it.
 ///
-/// Returns whether it was installed; a second call is refused rather than
-/// silently ignored, so a caller cannot believe it changed a value that
-/// peers have already been told.
+/// Returns whether it was installed. A second call is refused rather than
+/// silently ignored, so a caller cannot believe it changed a value that peers
+/// have already been told, and so is a string that is not safe to put on the
+/// wire.
+///
+/// The wire check is deliberately not the `-uacomment` character rule --
+/// that one governs *comments*, and a formatted user agent legitimately
+/// contains the `/`, `:`, `(` and `)` that rule excludes. What is checked is
+/// the invariant that matters wherever this value ends up: printable ASCII
+/// within Core's length bound. [`format_user_agent`] is the only producer
+/// today and cannot violate it; this keeps that true for the next caller,
+/// since a newline here would land in log lines and JSON alike.
 pub fn set_user_agent(ua: String) -> bool {
+    if ua.len() > MAX_SUBVERSION_LENGTH || !ua.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return false;
+    }
     USER_AGENT_OVERRIDE.set(ua).is_ok()
 }
 
