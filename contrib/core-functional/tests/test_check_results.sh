@@ -61,6 +61,25 @@ alpha.py,Passed,3
 ALL,Passed,3
 EOF
 
+expect accept "a test reported under its per-variant names is present" alpha.py <<'EOF'
+test,status,duration(seconds)
+alpha.py --v1transport,Passed,3
+alpha.py --v2transport,Passed,3
+ALL,Passed,6
+EOF
+
+expect reject "a variant suffix does not excuse an absent test" alpha.py beta.py <<'EOF'
+test,status,duration(seconds)
+alpha.py --v1transport,Passed,3
+ALL,Passed,3
+EOF
+
+expect reject "a runtime-skipped variant is still a runtime skip" alpha.py <<'EOF'
+test,status,duration(seconds)
+alpha.py --v1transport,Skipped,0
+ALL,Passed,0
+EOF
+
 expect accept "a failing test is the runner's own exit code to report" alpha.py <<'EOF'
 test,status,duration(seconds)
 alpha.py,Failed,3

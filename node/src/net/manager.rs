@@ -5674,8 +5674,24 @@ impl PeerManager {
         // Perform handshake with timeout
         let version = self.perform_handshake(id, &mut conn, direction).await?;
 
-        // Notify manager
+        // The handshake is done, so record it here rather than waiting for the
+        // manager to drain the event below. The manager still gets the event
+        // -- it owns the rest of the transition (addrman promotion, sync
+        // scheduling) -- but the peer is observably connected the moment it
+        // is, not up to one manager drain later.
+        //
+        // This used to be masked. `getpeerinfo` lists only `Connected` peers,
+        // and anything that round-tripped a message through the manager
+        // (answering a ping, until it moved onto this task) forced the queue
+        // to drain first, so the state was always in place by the time a
+        // caller could look. Core's test framework leans on exactly that
+        // sequence: `add_p2p_connection` does a ping round trip and then
+        // asserts its connection appears in `getpeerinfo`.
         let addr = conn.peer_addr().map_err(|e| e.to_string())?;
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.set_version(version.clone());
+            handle.info.state = PeerState::Connected;
+        }
         self.event_tx
             .send(NetEvent::PeerConnected {
                 id,
