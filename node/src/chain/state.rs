@@ -10926,6 +10926,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn getblockstats_prices_a_connected_block_from_its_undo_data() {
+        // Fees were resolved with `get_coin` against the LIVE UTXO set.
+        // Connecting a block removes exactly the coins its inputs spend, so
+        // every lookup missed for any block the node had connected -- which is
+        // all of them -- `inputs_found` went false, and every fee field stayed
+        // 0. Verified against a live node before fixing: a block with 65
+        // transactions and 273 inputs reported totalfee 0.
+        //
+        // The prevouts live in the block's undo data, which is where the filter
+        // and silent-payment index runners already read them from.
+        let (cs, dir) = make_chain_state();
+
+        // Long enough that the height-1 coinbase is mature when spent at 103.
+        let base = build_and_connect_chain(&cs, 102);
+        let spend = OutPoint { txid: base[0].txdata[0].compute_txid(), vout: 0 };
+        let coinbase_value = base[0].txdata[0].output[0].value.to_sat();
+
+        let b = build_test_block_spending(base[101].block_hash(), 103, 1_600_000_013, spend);
+        cs.accept_block(&b).expect("connect the spending block");
+        assert_eq!(cs.tip_hash(), b.block_hash(), "premise: it connected");
+
+        // The grafted transaction pays 1_000 sat out of a whole coinbase, so
+        // the fee is everything else.
+        let spend_out: u64 = b.txdata[1].output.iter().map(|o| o.value.to_sat()).sum();
+        let expected_fee = coinbase_value - spend_out;
+        assert!(expected_fee > 0, "premise: the block carries a fee");
+
+        let stats = crate::rpc::blockchain::get_block_stats(&cs, &b.block_hash().to_string())
+            .expect("stats");
+        assert_eq!(
+            stats["totalfee"].as_u64(),
+            Some(expected_fee),
+            "a connected block's fees come from its undo data, not the live UTXO set",
+        );
+        assert_eq!(stats["maxfee"].as_u64(), Some(expected_fee));
+        assert_eq!(stats["minfee"].as_u64(), Some(expected_fee));
+        assert_eq!(
+            stats["medianfee"].as_u64(),
+            Some(expected_fee),
+            "one fee-paying transaction, so the median is that fee",
+        );
+        assert!(
+            stats["avgfeerate"].as_u64().unwrap_or(0) > 0,
+            "a non-zero fee over a non-zero weight is a non-zero rate",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verifychain_is_immune_to_a_polluted_height_index() {
+        // `verifychain` returning false means "database corrupt" -- the loudest
+        // false positive satd can emit -- so it must not be reachable on a
+        // healthy node.
+        //
+        // It walked the active chain by `get_block_hash_by_height`, which is
+        // "best known at height", not an active-chain oracle: `accept_header`
+        // and `store_block` populate it too. A header-only side block at a
+        // height the active chain also occupies leaves a row whose index entry
+        // exists and whose body legitimately does not -- and the level-1 body
+        // check read that as corruption.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
+        let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
+        cs.accept_block(&a3).expect("accept A3");
+
+        assert_eq!(
+            crate::rpc::blockchain::verify_chain(&cs, 1, 0),
+            serde_json::json!(true),
+            "premise: a healthy chain verifies",
+        );
+
+        // A side block at height 1, header only -- index entry present, body
+        // absent, which is exactly what a header-first sync leaves behind.
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        cs.accept_header(&b1.header).expect("accept B1 header");
+        pollute_height_hash(&cs, 1, b1.block_hash());
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1.block_hash()),
+            "premise: height_hash[1] now names the header-only side block",
+        );
+        assert!(
+            cs.get_block(&b1.block_hash()).is_none(),
+            "premise: the side block has no body",
+        );
+
+        assert_eq!(
+            crate::rpc::blockchain::verify_chain(&cs, 1, 0),
+            serde_json::json!(true),
+            "the active chain is intact; a side-chain row in the height index \
+             is not database corruption",
+        );
+        assert_eq!(
+            cs.tip_hash(),
+            a3.block_hash(),
+            "and the walk did not disturb the tip",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_reorg_fork_point_immune_to_polluted_height_hash() {
         // The height_hash index is "best known at height" — populated
         // by accept_header / accept_headers / store_block as well as

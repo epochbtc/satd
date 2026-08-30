@@ -83,10 +83,13 @@ pub struct ChainTipJson {
 
 pub async fn root(State(state): State<EsploraState>) -> Json<RootJson> {
     let count = state.mempool.get_acting_entries().len() as u64;
+    // One read -- see `ChainState::tip_snapshot`. Reporting a height beside the
+    // hash of a different block is the one thing a chain-tip field must not do.
+    let (tip_hash, tip_height) = state.chain.tip_snapshot();
     Json(RootJson {
         chain_tip: ChainTipJson {
-            hash: state.chain.tip_hash().to_string(),
-            height: state.chain.tip_height(),
+            hash: tip_hash.to_string(),
+            height: tip_height,
         },
         mempool_count: count,
     })

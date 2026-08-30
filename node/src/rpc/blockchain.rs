@@ -13,8 +13,23 @@ use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
 /// a stale block from a losing branch. Core distinguishes the two everywhere it
 /// reports `confirmations`, and tooling reasoning about forks depends on it.
 pub(crate) fn is_on_active_chain(chain_state: &ChainState, hash: &bitcoin::BlockHash, height: u32) -> bool {
-    height <= chain_state.tip_height()
-        && chain_state.get_block_hash_by_height(height) == Some(*hash)
+    is_on_active_chain_at(chain_state, hash, height, chain_state.tip_height())
+}
+
+/// [`is_on_active_chain`] against a caller-supplied tip height.
+///
+/// Split out so a caller that also needs the depth reads the tip **once**.
+/// `is_on_active_chain` followed by `tip_height() - height` is two independent
+/// reads: a reorg between them leaves the membership test satisfied while the
+/// tip has already dropped below `height`, and the subtraction underflows —
+/// a panic under `overflow-checks`, and roughly 4.29e9 confirmations without it.
+pub(crate) fn is_on_active_chain_at(
+    chain_state: &ChainState,
+    hash: &bitcoin::BlockHash,
+    height: u32,
+    tip_height: u32,
+) -> bool {
+    height <= tip_height && chain_state.get_block_hash_by_height(height) == Some(*hash)
 }
 
 /// Core's `confirmations`: depth for a block on the active chain, `-1` for a
@@ -24,8 +39,11 @@ pub(crate) fn is_on_active_chain(chain_state: &ChainState, hash: &bitcoin::Block
 /// on a losing branch 60,000 deep claimed 60,000 confirmations, which is worse
 /// than useless to anything deciding whether a block is final.
 fn block_confirmations(chain_state: &ChainState, hash: &bitcoin::BlockHash, height: u32) -> i64 {
-    if is_on_active_chain(chain_state, hash, height) {
-        i64::from(chain_state.tip_height() - height + 1)
+    // One tip read, shared by the membership test and the depth. See
+    // `is_on_active_chain_at` for what two reads cost here.
+    let tip_height = chain_state.tip_height();
+    if is_on_active_chain_at(chain_state, hash, height, tip_height) {
+        i64::from(tip_height.saturating_sub(height) + 1)
     } else {
         -1
     }
@@ -82,8 +100,10 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
         Network::Bitcoin => "main",
     };
 
-    let tip_hash = chain_state.tip_hash();
-    let tip_height = chain_state.tip_height();
+    // One read: `tip_snapshot`'s own docs require it of any caller needing both
+    // fields, because two reads can straddle a connect and report a height
+    // alongside the hash of a different block.
+    let (tip_hash, tip_height) = chain_state.tip_snapshot();
 
     let (difficulty, time, mediantime, chainwork) =
         if let Some(entry) = chain_state.get_block_index(&tip_hash) {
@@ -138,8 +158,10 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
 /// the snapshot entry gains `snapshot_blockhash` + `validated: false`
 /// until the background catch-up completes the handoff.
 pub fn get_chain_states(chain_state: &ChainState) -> Value {
-    let tip_hash = chain_state.tip_hash();
-    let tip_height = chain_state.tip_height();
+    // One read: `tip_snapshot`'s own docs require it of any caller needing both
+    // fields, because two reads can straddle a connect and report a height
+    // alongside the hash of a different block.
+    let (tip_hash, tip_height) = chain_state.tip_snapshot();
 
     let (difficulty, time) = chain_state
         .get_block_index(&tip_hash)
@@ -418,24 +440,54 @@ pub fn get_tx_out(
 
     let outpoint = bitcoin::OutPoint { txid, vout };
 
-    // Bitcoin Core returns JSON `null` for a missing or spent
-    // outpoint — not an error. Clients (including `bitcoincore-rpc`)
-    // use this as the UTXO-existence probe; returning an error
-    // breaks the `Option<GetTxOutResult>` round-trip.
-    let Some(coin) = chain_state.get_coin(&outpoint) else {
+    // `bestblock` is not decoration: it names the chain state the unspent
+    // verdict belongs to, and clients use `gettxout` as *the* UTXO-existence
+    // probe. Reading the coin, the tip hash and the tip height independently
+    // lets the reply name a block in which the coin was in fact spent -- an
+    // answer no single chain state supports, which is worse than a stale one.
+    //
+    // Pair them: snapshot the tip, read the coin, and confirm the tip did not
+    // move. The tip changes on every connect and disconnect and nothing else
+    // changes the UTXO set, so an unchanged tip means the coin and the block
+    // named beside it belong together. A handful of retries is ample -- this
+    // loses only to a node reorganising faster than it can answer one RPC.
+    let mut attempt = 0;
+    let (tip_hash, tip_height, coin) = loop {
+        let (tip_hash, tip_height) = chain_state.tip_snapshot();
+        let coin = chain_state.get_coin(&outpoint);
+        if chain_state.tip_snapshot() == (tip_hash, tip_height) {
+            break (tip_hash, tip_height, coin);
+        }
+        attempt += 1;
+        if attempt >= 8 {
+            return Err(
+                "chain is advancing faster than gettxout can answer consistently; retry"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Bitcoin Core returns JSON `null` for a missing or spent outpoint — not an
+    // error. Clients (including `bitcoincore-rpc`) use this as the
+    // UTXO-existence probe; returning an error breaks the
+    // `Option<GetTxOutResult>` round-trip.
+    let Some(coin) = coin else {
         return Ok(Value::Null);
     };
 
     let unit = default_unit();
     let value = format_amount(coin.amount, unit);
-    let confirmations = if chain_state.tip_height() >= coin.height {
-        chain_state.tip_height() - coin.height + 1
+    // `saturating_sub`: `coin.height` above the tip is not reachable for a coin
+    // read under the same snapshot, but the subtraction must not be the thing
+    // that discovers otherwise.
+    let confirmations = if tip_height >= coin.height {
+        tip_height.saturating_sub(coin.height) + 1
     } else {
         0
     };
 
     let mut response = json!({
-        "bestblock": chain_state.tip_hash().to_string(),
+        "bestblock": tip_hash.to_string(),
         "confirmations": confirmations,
         "value": value,
         "scriptPubKey": {
@@ -565,6 +617,21 @@ pub fn get_block_stats(
     let mut max_fee_rate = 0u64;
     let mut segwit_txs = 0u64;
     let mut utxo_increase: i64 = 0;
+    let mut fees: Vec<u64> = Vec::with_capacity(block.txdata.len());
+    let mut sw_total_size: usize = 0;
+    let mut sw_total_weight: u64 = 0;
+
+    // Prevouts come from the block's **undo** data, not the live UTXO set.
+    // Connecting a block removes exactly the coins its inputs spend, so a
+    // `get_coin` lookup for a block that is already connected misses every
+    // time — which made every fee field here structurally zero for any block
+    // the node had connected, i.e. all of them. The filter and silent-payment
+    // index runners read prevouts from undo data for precisely this reason.
+    //
+    // `spent_coins` holds one coin per non-coinbase input in connect order, so
+    // a cursor over it lines up with the same traversal below.
+    let undo = chain_state.get_undo(&hash);
+    let mut spent = undo.as_ref().map(|u| u.spent_coins.iter());
 
     for tx in &block.txdata {
         let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -577,11 +644,23 @@ pub fn get_block_stats(
 
         utxo_increase -= tx.input.len() as i64;
 
-        // Compute fee from inputs
+        // Fee from the coins this transaction spent.
         let mut in_sum: u64 = 0;
         let mut inputs_found = true;
         for input in &tx.input {
-            match chain_state.get_coin(&input.previous_output) {
+            let coin = match spent.as_mut() {
+                // Undo data present: take the next coin in connect order. It
+                // runs out only if the undo row disagrees with the block, which
+                // is corruption rather than a missing prevout — stop pricing
+                // this block rather than silently misattribute coins to the
+                // wrong inputs.
+                Some(it) => it.next().cloned(),
+                // No undo row (a block that never connected, or pruned undo).
+                // The live set is then the only source, and it is correct for
+                // exactly that case: the coins are still there.
+                None => chain_state.get_coin(&input.previous_output),
+            };
+            match coin {
                 Some(coin) => in_sum += coin.amount,
                 None => {
                     inputs_found = false;
@@ -593,6 +672,7 @@ pub fn get_block_stats(
         if inputs_found && in_sum >= out_sum {
             let fee = in_sum - out_sum;
             total_fee += fee;
+            fees.push(fee);
             min_fee = min_fee.min(fee);
             max_fee = max_fee.max(fee);
 
@@ -606,6 +686,12 @@ pub fn get_block_stats(
 
         if tx.input.iter().any(|i| !i.witness.is_empty()) {
             segwit_txs += 1;
+            // Core reports the size and weight the segwit transactions
+            // contribute, not just how many there are. These were hardcoded to
+            // zero, which read as "this block has no segwit data" beside a
+            // non-zero `swtxs`.
+            sw_total_size += serialize(tx).len();
+            sw_total_weight += tx.weight().to_wu();
         }
     }
 
@@ -627,6 +713,19 @@ pub fn get_block_stats(
         0
     };
 
+    // A real median, not the mean wearing its name. With fees now actually
+    // computed the two differ sharply on any block with a fee outlier, which is
+    // most of them.
+    fees.sort_unstable();
+    let median_fee = if fees.is_empty() {
+        0
+    } else if fees.len() % 2 == 1 {
+        fees[fees.len() / 2]
+    } else {
+        // Core averages the two middle elements.
+        (fees[fees.len() / 2 - 1] + fees[fees.len() / 2]) / 2
+    };
+
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, entry.height);
 
     Ok(json!({
@@ -639,7 +738,7 @@ pub fn get_block_stats(
         "maxfee": max_fee,
         "maxfeerate": max_fee_rate,
         "maxtxsize": block.txdata.iter().map(|tx| serialize(tx).len()).max().unwrap_or(0),
-        "medianfee": avg_fee, // simplified: use avg as median
+        "medianfee": median_fee,
         "mediantime": block_median_time(chain_state, &entry),
         "mediantxsize": if num_txs > 0 { total_size / num_txs } else { 0 },
         "minfee": min_fee,
@@ -647,8 +746,8 @@ pub fn get_block_stats(
         "mintxsize": block.txdata.iter().map(|tx| serialize(tx).len()).min().unwrap_or(0),
         "outs": block.txdata.iter().map(|tx| tx.output.len()).sum::<usize>(),
         "subsidy": subsidy,
-        "swtotal_size": 0,
-        "swtotal_weight": 0,
+        "swtotal_size": sw_total_size,
+        "swtotal_weight": sw_total_weight,
         "swtxs": segwit_txs,
         "time": entry.header.time,
         "total_out": total_out,
@@ -663,8 +762,10 @@ pub fn get_block_stats(
 
 /// `getchaintips` — return chain tip info.
 pub fn get_chain_tips(chain_state: &ChainState) -> Value {
-    let tip_hash = chain_state.tip_hash();
-    let tip_height = chain_state.tip_height();
+    // One read: `tip_snapshot`'s own docs require it of any caller needing both
+    // fields, because two reads can straddle a connect and report a height
+    // alongside the hash of a different block.
+    let (tip_hash, tip_height) = chain_state.tip_snapshot();
 
     // Currently we only track the active chain tip
     json!([{
@@ -937,25 +1038,43 @@ pub fn reconsider_block(
 
 /// `verifychain` — verify chain database integrity.
 pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) -> Value {
-    let tip = chain_state.tip_height();
-    let check_blocks = if nblocks == 0 { tip } else { nblocks.min(tip) };
-    let start = tip.saturating_sub(check_blocks);
+    // `json!(false)` from this RPC means "database corrupt", which is about the
+    // loudest false positive satd can emit, so the walk has to be one that can
+    // only fail for real. The old one could fail on a healthy node three ways:
+    //
+    //  * It resolved each height through `get_block_hash_by_height`, which is
+    //    **not** an active-chain oracle: a header-first or out-of-order
+    //    `store_block` can leave a row naming a side-chain or header-only
+    //    block, whose body is legitimately absent.
+    //  * It read `tip_height()` once and then resolved every height
+    //    independently, so a reorg mid-walk mixed two chains.
+    //  * It treated a pruned body as corruption. Pruning is the operator
+    //    deleting those bodies on purpose.
+    //
+    // Walking parent pointers from a pinned tip fixes the first two — it is the
+    // same shape `get_chain_tx_stats` and `active_chain_range` already use —
+    // and `is_pruned` fixes the third.
+    let (tip_hash, tip_height) = chain_state.tip_snapshot();
+    let check_blocks = if nblocks == 0 { tip_height } else { nblocks.min(tip_height) };
 
-    let mut verified = 0u32;
-    for h in start..=tip {
-        if let Some(hash) = chain_state.get_block_hash_by_height(h)
-            && chain_state.get_block_index(&hash).is_some() {
-                verified += 1;
-                if check_level >= 1 {
-                    // Level 1+: verify block data exists
-                    if chain_state.get_block(&hash).is_none() {
-                        return json!(false);
-                    }
-                }
-            }
+    let mut hash = tip_hash;
+    for _ in 0..=check_blocks {
+        let Some(entry) = chain_state.get_block_index(&hash) else {
+            return json!(false);
+        };
+        // Level 1+: the body must be readable, unless the operator pruned it.
+        if check_level >= 1
+            && !chain_state.is_pruned(&hash)
+            && chain_state.get_block(&hash).is_none()
+        {
+            return json!(false);
+        }
+        if entry.height == 0 {
+            break;
+        }
+        hash = entry.header.prev_blockhash;
     }
 
-    let _ = verified; // suppress unused
     json!(true)
 }
 

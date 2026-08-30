@@ -50,6 +50,8 @@ pub fn get_system_info(ctx: &McpContext) -> String {
         * 1024;
 
     let uptime = ctx.start_time.elapsed().as_secs();
+    // One read -- see `ChainState::tip_snapshot`.
+    let (tip_hash, tip_height) = ctx.chain_state.tip_snapshot();
 
     let result = json!({
         "memory_rss_bytes": rss,
@@ -58,8 +60,8 @@ pub fn get_system_info(ctx: &McpContext) -> String {
             "coin_count": ctx.chain_state.coin_count(),
         },
         "chain": {
-            "height": ctx.chain_state.tip_height(),
-            "tip": ctx.chain_state.tip_hash().to_string(),
+            "height": tip_height,
+            "tip": tip_hash.to_string(),
         },
     });
 
