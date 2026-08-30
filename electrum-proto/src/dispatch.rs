@@ -322,6 +322,14 @@ fn handle_tweaks_subscribe(
     //
     // Guarded because `block_in_place` panics on a current-thread runtime and
     // outside a runtime altogether -- handler-level tests call this directly.
+    //
+    // Bounded, not just relocated: `block_in_place` moves the work off the
+    // reactor but nothing can interrupt it once started, and the per-request
+    // timeout wrapping this dispatch cannot fire while a synchronous body is
+    // running. So the cap has to be at admission. Refusing rather than queueing
+    // is the point -- waiting for a slot would hold this connection's request
+    // slot for exactly as long, and tell the client nothing.
+    let _slot = tweaks::try_claim_scan_slot().ok_or_else(tweaks::scan_slots_busy)?;
     let read_first = || tweaks::height_map(&src, treq.start, treq.cut_through());
     let first = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {

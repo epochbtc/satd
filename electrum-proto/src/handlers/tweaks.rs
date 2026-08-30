@@ -36,7 +36,7 @@ use bitcoin::OutPoint;
 use node::chain::state::ChainState;
 use node::index::silent_payments::{SpBlockRow, SpIndex, SpIndexError};
 use serde_json::{json, Map, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::error::JsonRpcError;
 use crate::state::ElectrumState;
@@ -56,6 +56,42 @@ pub const CHUNK_BUDGET: Duration = Duration::from_secs(60);
 /// block read, so this bounds how long a blocking thread is held while still
 /// amortising the hop.
 pub const HEIGHTS_PER_HOP: u32 = 16;
+
+/// Concurrent silent-payment block scans allowed across the whole node.
+///
+/// A tweak read is the heaviest thing this surface does — a block read out of
+/// the flat files plus, under cut-through, one UTXO lookup per taproot output in
+/// it — and it is reachable by any unauthenticated client. `block_in_place` and
+/// `spawn_blocking` keep that work off the async reactor, but neither *bounds*
+/// it: the per-request timeout cannot interrupt a synchronous body, so without
+/// a cap a client pipelining subscribes decides how much of the machine to
+/// occupy. This is the cap. It is deliberately global rather than
+/// per-connection, because the resource being protected is the node's storage
+/// bandwidth, not any one connection's fairness.
+///
+/// The streaming half waits for a permit (it is already asynchronous and
+/// chunked, so backpressure is free); the synchronous first height refuses
+/// instead, because blocking there would hold the connection's request slot for
+/// exactly as long as waiting would have.
+static SP_READ_SLOTS: std::sync::LazyLock<Semaphore> = std::sync::LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    Semaphore::new(cores.div_ceil(2).clamp(2, 8))
+});
+
+/// Try to claim a scan slot without waiting. `None` means the node is already
+/// running as many silent-payment scans as it will.
+pub fn try_claim_scan_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    SP_READ_SLOTS.try_acquire().ok()
+}
+
+/// The refusal a client gets when every scan slot is taken. Deliberately says
+/// what to do about it: this is transient, and a wallet that retries succeeds.
+pub fn scan_slots_busy() -> JsonRpcError {
+    JsonRpcError::bad_request(
+        "blockchain.tweaks.subscribe: this node is already running as many \
+         silent-payment scans as it will; retry shortly",
+    )
+}
 
 /// Most heights one subscribe will serve, whatever `count` asks for.
 ///
@@ -273,7 +309,7 @@ pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<V
         }
         Err(e) => return Err(index_unavailable(&e)),
     };
-    Ok(json!({ height.to_string(): txs_object(src, &row, cut_through)? }))
+    Ok(json!({ height.to_string(): txs_object(src, &row, cut_through, height)? }))
 }
 
 /// The `{txid: {tweak, output_pubkeys}}` half of a height map.
@@ -281,6 +317,7 @@ fn txs_object(
     src: &TweakSource,
     row: &SpBlockRow,
     cut_through: bool,
+    height: u32,
 ) -> Result<Value, JsonRpcError> {
     if row.entries.is_empty() {
         return Ok(Value::Object(Map::new()));
@@ -300,6 +337,20 @@ fn txs_object(
         )));
     };
     let wanted: HashSet<bitcoin::Txid> = row.entries.iter().map(|e| e.txid).collect();
+    // Spentness is read one output at a time against the live UTXO set, so a
+    // connect or a reorg landing mid-evaluation gives a mixed view: some outputs
+    // judged against the old chain, some against the new. That matters because
+    // "every output spent" *drops the entry*, so a mixed view can drop an entry
+    // that is unspent in the chain we end up on -- a scanner then never sees the
+    // coin, which is the same silent miss the row-hole guard above exists to
+    // stop.
+    //
+    // The tip moves on every connect and every disconnect, and nothing else
+    // changes the UTXO set, so an unchanged tip across the evaluation is proof
+    // the set held still. Check it after rather than locking: block connection
+    // is the last thing a consumption surface should be able to block, and on a
+    // node not reorging this costs two atomic reads and never fires.
+    let tip_before = src.chain.tip_snapshot();
     let chain = src.chain.clone();
     // `has_coin`, not `get_coin`: this runs once per taproot output of every
     // eligible transaction the scan touches, and `get_coin` would promote each
@@ -343,6 +394,16 @@ fn txs_object(
             e.txid.to_string(),
             json!({ "tweak": hex::encode(e.tweak.serialize()), "output_pubkeys": pubkeys }),
         );
+    }
+
+    // Only cut-through consults the UTXO set; a historical request built this
+    // map from the block alone and nothing under it can have moved.
+    if cut_through && src.chain.tip_snapshot() != tip_before {
+        return Err(JsonRpcError::bad_request(format!(
+            "the chain advanced while height {} was being cut through; \
+             re-request this height",
+            height,
+        )));
     }
     Ok(Value::Object(out))
 }
@@ -505,9 +566,22 @@ pub async fn stream_chunk(
 
         let hop_end = h.saturating_add(HEIGHTS_PER_HOP - 1).min(last);
         let src_hop = src.clone();
+        // Aborting this task -- which is what a disconnect does -- cannot stop a
+        // `spawn_blocking` closure that has already started, so without a check
+        // inside it a client that connects, subscribes and drops repeats a full
+        // 16-height scan of block reads and UTXO lookups per cycle, detached
+        // from any connection limit. The channel closes when the connection
+        // goes, so poll it between heights and stop at the next boundary.
+        let hop_tx = notify_tx.clone();
+        // Wait rather than refuse: this task already owns its chunk, and the
+        // client is holding a connection open for it.
+        let permit = SP_READ_SLOTS.acquire().await;
         let lines = tokio::task::spawn_blocking(move || {
             let mut lines = Vec::with_capacity((hop_end - h + 1) as usize);
             for hh in h..=hop_end {
+                if hop_tx.is_closed() {
+                    break;
+                }
                 match height_map(&src_hop, hh, cut_through) {
                     Ok(map) => lines.push(notification_line(&map)),
                     // Stop at the first failure rather than skipping the height:
@@ -522,6 +596,7 @@ pub async fn stream_chunk(
         })
         .await
         .unwrap_or_default();
+        drop(permit);
 
         let served = lines.len() as u32;
         for line in lines {
@@ -568,6 +643,34 @@ mod tests {
         let req = parse_req(&json!([850_000])).expect("start alone parses");
         assert_eq!(req.count, 1, "one height, like Cake's getTweaks probe");
         assert!(!req.historical);
+    }
+
+    #[test]
+    fn scan_slots_are_finite_and_refuse_rather_than_queue() {
+        // The cap is the only thing bounding how much storage work an
+        // unauthenticated client can start: `block_in_place` keeps the reads off
+        // the reactor, but nothing interrupts them once running and the
+        // per-request timeout cannot fire during a synchronous body.
+        let mut held = Vec::new();
+        while let Some(p) = try_claim_scan_slot() {
+            held.push(p);
+            assert!(held.len() <= 64, "the semaphore must be finite");
+        }
+        assert!(held.len() >= 2, "at least two concurrent scans, got {}", held.len());
+
+        // Exhausted: a further claim fails instead of waiting, and the refusal
+        // tells the client it is transient.
+        assert!(try_claim_scan_slot().is_none(), "must refuse once full");
+        let err = scan_slots_busy();
+        assert_eq!(err.code, 1, "in-band refusal, not a transport error");
+        assert!(err.message.contains("retry"), "must say it is transient: {}", err.message);
+
+        // Releasing one frees exactly one.
+        held.pop();
+        let regained = try_claim_scan_slot();
+        assert!(regained.is_some(), "a released slot is reusable");
+        drop(regained);
+        drop(held);
     }
 
     #[test]
