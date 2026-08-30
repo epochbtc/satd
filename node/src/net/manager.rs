@@ -2142,9 +2142,10 @@ impl PeerManager {
 
     fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
         match msg {
-            NetworkMessage::Ping(nonce) => {
-                self.send_to_peer(id, NetworkMessage::Pong(nonce));
-            }
+            // Neither `Ping` nor `Pong` reaches here: the peer's write loop
+            // answers the one and matches the other against that peer's
+            // outstanding ping, on the peer's own task.
+            NetworkMessage::Ping(_) => {}
             // `Pong` never reaches here: the peer's write loop matches it
             // against that peer's outstanding ping and does not forward it.
             NetworkMessage::Pong(_) => {}
@@ -5907,6 +5908,18 @@ impl PeerManager {
                             if let Some(stats) = &stats {
                                 stats.pong_received(nonce);
                             }
+                        }
+                        // Answered here for the same reason the pong is
+                        // matched here: a pong is a reflex that needs no
+                        // manager state, and routing it through the manager
+                        // put the manager's 500ms drain cadence into the
+                        // round-trip time our *peer* measures. Core answers
+                        // from its message-processing loop, promptly.
+                        Some(NetworkMessage::Ping(nonce)) => {
+                            writer
+                                .send(NetworkMessage::Pong(nonce))
+                                .await
+                                .map_err(|e| e.to_string())?;
                         }
                         Some(msg) => {
                             event_tx
