@@ -1182,7 +1182,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                     // that asked (outputs attached, spent entries cut through);
                     // the mempool path already carries its outputs and other
                     // bodies are unaffected.
-                    let refined = refine_block_tweaks(&env, &live_tweak_opts);
+                    let refined = off_reactor(|| refine_block_tweaks(&env, &live_tweak_opts));
                     let (out_env, cut) = match &refined {
                         Some((e, cut)) => (e, *cut),
                         None => (&env, false),
@@ -1208,7 +1208,7 @@ impl NodeEventStream for NodeEventStreamSvc {
                 // helper as `NodeEvent`s; convert each to proto and emit before
                 // joining the live stream.
                 let replay_events = tokio_stream::iter(r.events.into_iter().map(move |e| {
-                    let refined = refine_block_tweaks(&e, &replay_tweak_opts);
+                    let refined = off_reactor(|| refine_block_tweaks(&e, &replay_tweak_opts));
                     let (out_env, cut) = match &refined {
                         Some((ev, cut)) => (ev, *cut),
                         None => (&e, false),
@@ -2963,6 +2963,26 @@ impl TweakServeOpts {
 /// received at height H and spent at H+100 is cut from a scan of H that runs
 /// after H+100. That is what makes cut-through a balance scan rather than a
 /// restore — see the `tweak_unspent_only` contract in the streaming spec.
+/// Run a blocking storage read without pinning the async worker that asked for
+/// it.
+///
+/// `refine_block_tweaks` reads a block off the flat files and, under
+/// cut-through, one UTXO entry per taproot output in it. Both live delivery and
+/// bounded replay call it from inside a stream combinator, which is polled on a
+/// runtime worker — so without this the read holds that worker and delays every
+/// other RPC and event the runtime is carrying. `block_in_place` hands the
+/// worker to the blocking pool for the duration and starts a replacement, which
+/// is what the deep pager achieves with `spawn_blocking`.
+///
+/// Guarded: `block_in_place` panics on a current-thread runtime and outside a
+/// runtime altogether, and the unit tests below call the refiner directly.
+fn off_reactor<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 fn refine_block_tweaks(
     env: &NodeEvent,
     opts: &TweakServeOpts,
@@ -3632,6 +3652,21 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert_eq!((outs[0].vout, outs[0].value), (0, 4_000));
         assert_eq!((outs[1].vout, outs[1].value), (2, 9_000));
+    }
+
+    #[tokio::test]
+    async fn off_reactor_survives_a_current_thread_runtime() {
+        // `block_in_place` panics on a current-thread runtime. The gRPC server
+        // runs multi-threaded, but this helper is called from stream
+        // combinators that tests and embedders drive on whatever runtime they
+        // have -- so the guard is the difference between relocating a blocking
+        // read and aborting the process. Without it this test panics.
+        assert_eq!(off_reactor(|| 7u32), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_reactor_takes_the_blocking_path_when_there_is_a_pool() {
+        assert_eq!(off_reactor(|| 7u32), 7);
     }
 
     #[test]
