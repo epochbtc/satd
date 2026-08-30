@@ -201,6 +201,20 @@ impl PeerInfo {
         self.version.as_ref().map(|v| v.relay).unwrap_or(true)
     }
 
+    /// How this peer is named to operators -- what `getpeerinfo` reports as
+    /// `addr`, and what `disconnectnode` matches an address against.
+    ///
+    /// Onion peers share the 0.0.0.0 placeholder socket, so the real
+    /// `<base32>.onion:port` hostname is reported instead (as Core does).
+    /// The two callers must agree, or an address satd itself printed cannot
+    /// be fed back to it.
+    pub fn addr_string(&self) -> String {
+        match &self.onion_host {
+            Some(host) => format!("{host}:{}", self.addr.port()),
+            None => self.addr.to_string(),
+        }
+    }
+
     /// Convert to JSON-compatible format for getpeerinfo RPC. `stats` carries
     /// the live wire counters (bytes + last-activity timestamps) recorded by
     /// the connection read/write halves.
@@ -211,13 +225,7 @@ impl PeerInfo {
             .unwrap_or_default()
             .as_secs();
 
-        // Onion peers share the 0.0.0.0 placeholder socket; report the real
-        // .onion hostname so getpeerinfo identifies them (matches Core, which
-        // shows `<base32>.onion:port`).
-        let addr_str = match &self.onion_host {
-            Some(host) => format!("{host}:{}", self.addr.port()),
-            None => self.addr.to_string(),
-        };
+        let addr_str = self.addr_string();
         let mut obj = serde_json::json!({
             "id": self.id,
             "addr": addr_str,

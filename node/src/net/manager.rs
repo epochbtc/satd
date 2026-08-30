@@ -204,6 +204,15 @@ struct PeerHandle {
     /// of queued `inv` allocations, so even a *permissioned* peer must not
     /// be able to spam it in a tight loop. `None` until the first serve.
     last_mempool_served: Option<Instant>,
+    /// Signals the peer's write loop to end, shared with that task.
+    ///
+    /// Dropping this handle closes `msg_rx`, which the write loop already
+    /// treats as "the manager dropped us" -- but only once the *last* sender
+    /// is gone, and `handle_get_cfilters` clones one into a task that may hold
+    /// it for up to 1000 awaited sends. Without an explicit signal a
+    /// `disconnectnode` issued mid-`getcfilters` reports success while the
+    /// socket stays open and the peer keeps feeding the node.
+    disconnect: Arc<tokio::sync::Notify>,
     /// Per-peer wire counters (bytes + last activity), shared with the peer's
     /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
     /// [`NetTotals`].
@@ -1345,6 +1354,7 @@ impl PeerManager {
                 PeerHandle {
                     info,
                     msg_tx,
+                    disconnect: Arc::new(tokio::sync::Notify::new()),
                     last_getheaders_sent: None,
                     last_mempool_served: None,
                     stats: PeerStats::new(self.net_totals.clone()),
@@ -1421,11 +1431,29 @@ impl PeerManager {
 
     /// Disconnect a peer by address. Returns whether one matched.
     pub fn disconnect(&self, addr: &SocketAddr) -> bool {
+        self.disconnect_by_addr(&addr.to_string())
+    }
+
+    /// Disconnect the peer whose address string matches `addr`, as Bitcoin
+    /// Core's `DisconnectNode(std::string_view)` does.
+    ///
+    /// The comparison is against the string `getpeerinfo` reports, not a
+    /// parsed socket address. That is what Core compares (`m_addr_name`), and
+    /// it is the difference between an operator being able to feed
+    /// `getpeerinfo`'s own output back in and not: an onion peer is reported
+    /// as `<base32>.onion:port` while its socket is a placeholder, so parsing
+    /// first made those peers impossible to name. Parsing also turned any
+    /// unrecognised string into a parse error where Core simply finds no
+    /// match.
+    ///
+    /// Core stops at the first match (`find_if`), so this does too; the
+    /// disconnect-every-match overloads are the ones `setban` uses.
+    pub fn disconnect_by_addr(&self, addr: &str) -> bool {
         let id = self
             .peers
             .read()
             .iter()
-            .find(|(_, handle)| handle.info.addr == *addr)
+            .find(|(_, handle)| handle.info.addr_string() == addr)
             .map(|(id, _)| *id);
         match id {
             Some(id) => self.disconnect_by_id(id),
@@ -1445,7 +1473,23 @@ impl PeerManager {
         let removed = self.peers.write().remove(&id);
         match removed {
             Some(handle) => {
-                tracing::info!(id, addr = %handle.info.addr, "Disconnecting peer on request");
+                // Signal before the handle drops. Dropping it closes `msg_rx`
+                // only when the last sender goes, and a `getcfilters` stream
+                // task can be holding a clone -- in which case the RPC would
+                // report success on a connection that is still open and still
+                // relaying. The write loop selects on this, so the socket
+                // closes now rather than whenever that task finishes.
+                // `notify_one`, not `notify_waiters`: the write loop builds a
+                // fresh `notified()` each pass, so a signal sent while it is
+                // between iterations -- or parked in a `send` -- has to be
+                // stored as a permit rather than dropped for want of a waiter.
+                handle.disconnect.notify_one();
+                tracing::info!(
+                    id,
+                    addr = %handle.info.addr_string(),
+                    reason = "rpc_request",
+                    "Disconnecting peer on request"
+                );
                 true
             }
             None => false,
@@ -5468,6 +5512,7 @@ impl PeerManager {
         let handle = PeerHandle {
             info,
             msg_tx,
+            disconnect: Arc::new(tokio::sync::Notify::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
             stats: PeerStats::new(self.net_totals.clone()),
@@ -5741,7 +5786,13 @@ impl PeerManager {
         // the connection is torn down anyway.
         // Also the ping accounting the write loop needs below, so the map is
         // read once rather than again just before the loop starts.
-        let ping_stats = self.peers.read().get(&id).map(|h| h.stats.clone());
+        let (ping_stats, disconnect_signal) = {
+            let peers = self.peers.read();
+            match peers.get(&id) {
+                Some(h) => (Some(h.stats.clone()), Some(h.disconnect.clone())),
+                None => (None, None),
+            }
+        };
         if let Some(stats) = &ping_stats {
             reader.set_counters(stats.clone());
             writer.set_counters(stats.clone());
@@ -5839,6 +5890,7 @@ impl PeerManager {
             &mut msg_rx,
             &mut read_rx,
             ping_stats,
+            disconnect_signal,
         )
         .await;
 
@@ -5865,6 +5917,7 @@ impl PeerManager {
         msg_rx: &mut mpsc::Receiver<NetworkMessage>,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
         stats: Option<Arc<crate::net::stats::PeerStats>>,
+        disconnect_signal: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), String> {
         // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
         // The first tick of a tokio interval fires immediately, which is also
@@ -5876,8 +5929,29 @@ impl PeerManager {
         // already swallows a burst, but not relying on that keeps the
         // argument for why this cannot flood a peer a local one.
         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Built once and pinned, not rebuilt each pass. A `Notified` that is
+        // created, polled, and dropped can take a stored permit with it, and
+        // here that would be a disconnect the peer never hears about. Peers
+        // registered before this signal existed (only the unit-test handles)
+        // get a future that never completes, leaving them on the other
+        // branches exactly as before.
+        let disconnect_requested = async {
+            match &disconnect_signal {
+                Some(signal) => signal.notified().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(disconnect_requested);
+
         loop {
             tokio::select! {
+                _ = &mut disconnect_requested => {
+                    // Explicit teardown, as opposed to noticing `msg_rx`
+                    // close. Same exit, so the outer task aborts the reader
+                    // and closes the socket.
+                    return Err("disconnected by manager".to_string());
+                }
                 _ = ping_timer.tick() => {
                     // A peer that keeps talking but never answers a ping is
                     // dropped here. Returning takes the ordinary teardown
@@ -6461,6 +6535,7 @@ mod tests {
         PeerHandle {
             info,
             msg_tx: tx,
+            disconnect: Arc::new(tokio::sync::Notify::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
             stats: PeerStats::new(NetTotals::new()),
@@ -6660,6 +6735,7 @@ mod tests {
             PeerHandle {
                 info,
                 msg_tx: tx,
+                disconnect: Arc::new(tokio::sync::Notify::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
                 stats: PeerStats::new(NetTotals::new()),
@@ -7625,6 +7701,7 @@ mod tests {
             PeerHandle {
                 info,
                 msg_tx: tx,
+                disconnect: Arc::new(tokio::sync::Notify::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
                 stats: PeerStats::new(NetTotals::new()),

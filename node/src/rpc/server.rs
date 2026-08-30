@@ -1609,37 +1609,29 @@ pub async fn start(
         // exactly one of the two -- `disconnectnode "" 3` is how its own test
         // framework disconnects, so the address slot is present but empty.
         let mut seq = params.sequence();
-        let addr_str: Option<String> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let node_id: Option<u64> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr_str = addr_str.filter(|s| !s.is_empty());
+        let addr_str: Option<String> = seq.optional_next().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Address must be a string", None::<()>)
+        })?;
+        let node_id: Option<u64> = seq.optional_next().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Node ID must be a number", None::<()>)
+        })?;
 
-        let disconnected = match (addr_str, node_id) {
-            (Some(_), Some(_)) => {
+        // Core's branch conditions verbatim (rpc/net.cpp): an address that was
+        // supplied at all -- including as the empty string -- takes the
+        // by-address path unless a nodeid came with it, and the "only one"
+        // error covers *neither* as well as both, because both guards fail.
+        let disconnected = match (&addr_str, node_id) {
+            (Some(addr), None) => ctx.peer_manager.disconnect_by_addr(addr),
+            (_, Some(id)) if addr_str.as_deref().unwrap_or("").is_empty() => {
+                ctx.peer_manager.disconnect_by_id(id)
+            }
+            _ => {
                 return Err(ErrorObjectOwned::owned(
                     -32602,
                     "Only one of address and nodeid should be provided.",
                     None::<()>,
                 ));
             }
-            (None, None) => {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    "Address and nodeid cannot both be empty.",
-                    None::<()>,
-                ));
-            }
-            (Some(addr_str), None) => {
-                let addr: std::net::SocketAddr =
-                    addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                        ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-                    })?;
-                ctx.peer_manager.disconnect(&addr)
-            }
-            (None, Some(id)) => ctx.peer_manager.disconnect_by_id(id),
         };
 
         // Core reports a peer it could not find rather than returning success

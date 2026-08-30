@@ -593,6 +593,26 @@ impl TestNode {
         method: &str,
         params: Vec<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
+        self.rpc_call_with_raw_params(method, serde_json::json!(params))
+    }
+
+    /// Call with `params` exactly as given -- an array or, for Core's named
+    /// form, an object. Core's own test framework switches to the object form
+    /// the moment a caller passes a keyword argument, so some methods are only
+    /// ever reached this way in practice.
+    pub fn rpc_call_with_named_params(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.rpc_call_with_raw_params(method, params)
+    }
+
+    fn rpc_call_with_raw_params(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let url = format!("http://127.0.0.1:{}/", self.rpcport);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
