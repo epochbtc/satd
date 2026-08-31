@@ -45,18 +45,22 @@ pub struct BlockTemplate {
 /// `bad-txns-inputs-missingorspent`. A miner that wins the race at the
 /// contested height submits an invalid block instead of a valid competing one.
 ///
-/// So: assemble, then check the tip did not move, and rebuild if it did. If the
-/// chain is moving faster than the node can assemble, fall back to a
+/// So: assemble against a chainstate that held still, and rebuild if it did
+/// not. `coherent_read` is what decides that, rather than a `tip_snapshot()`
+/// on each side -- a connect publishes its coins at the store commit and moves
+/// the tip a moment later, and in between, the tip is unchanged while
+/// `get_coin` already answers from the new block. That is precisely the
+/// X-and-T case above, so the check has to cover the window rather than just
+/// the tip.
+///
+/// If the chain is moving faster than the node can assemble, fall back to a
 /// coinbase-only template -- less profitable for one poll, but a template with
 /// no transactions has no cross-chain inconsistency available to it.
 pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
-    const ATTEMPTS: usize = 4;
-    for _ in 0..ATTEMPTS {
-        let before = chain_state.tip_snapshot();
-        let template = assemble_template(chain_state, mempool, true);
-        if chain_state.tip_snapshot() == before {
-            return template;
-        }
+    if let Some(template) =
+        chain_state.coherent_read(|| assemble_template(chain_state, mempool, true))
+    {
+        return template;
     }
     tracing::warn!(
         target: "mining::template",
