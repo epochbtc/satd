@@ -218,7 +218,7 @@ async fn wait_for_lanes(targets: [(&Lane, Option<u64>); 2]) -> bool {
                 // `emitted` keeps climbing afterwards. The target then sits
                 // above a `processed` nothing will move again.
                 //
-                // Re-checking here covers both, and costs one relaxed pair of
+                // Re-checking here covers both, and costs one pair of acquire
                 // loads per wakeup: an unbridged lane has nothing left to wait
                 // for, which is the same thing `target() == None` says up front.
                 if lane.target().is_none() {
