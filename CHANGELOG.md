@@ -54,6 +54,15 @@ set, taking the scoreboard to 10 tests.
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- `-uacomment` is honored instead of accepted and ignored. It appends comments
+  to the advertised user agent (`/satd:0.5.1(comment1; comment2)/`), rejecting
+  the delimiters `/`, `:`, `(` and `)` inside a comment and refusing a total
+  user agent over 256 bytes, both with Core's wording. Command-line and
+  config-file occurrences accumulate, as Core accumulates list-valued options.
+  Beyond losing the operator's label, ignoring it made every satd node on a
+  host advertise an identical `subversion`. **Upgrade note:** the value was
+  previously unvalidated because it was unused, so a `bitcoin.conf` carrying
+  an unsafe comment now stops the node at startup.
 - satd now sends P2P keepalive pings, and drops a peer that stops answering
   them. It answered a `ping` and had a `ping` RPC, but nothing ever pinged on
   its own, so a quiet link produced no evidence it was still alive and

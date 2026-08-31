@@ -323,9 +323,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "feature_uacomment.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "feature_unsupported_utxo_db.py"
