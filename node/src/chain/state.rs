@@ -348,6 +348,17 @@ pub struct ChainState {
     /// drop -- including on an error-path unwind, so it cannot be stranded odd
     /// by a mutator that fails between the two.
     chain_gen: AtomicU64,
+    /// How many chain-mutation guards are live.
+    ///
+    /// Mutators nest -- `accept_block` calls `abort_reorg` from its commit
+    /// error path, `reorg_to` calls `perform_reorg` -- and each takes its own
+    /// guard. Only the outermost may toggle `chain_gen`, or the inner guard
+    /// would return it to even and advertise a settled chainstate from inside
+    /// a live mutation. Guarded mutators are serialized by `accept_lock`, so
+    /// this behaves as a per-thread depth; if one ever is not, the window
+    /// simply stays open until the last live mutation closes, which is the
+    /// safe direction.
+    mutation_depth: AtomicU32,
 
     connect_heartbeat: AtomicU64,
     /// Lock-free monotonic counter bumped on every iteration of the
@@ -533,18 +544,30 @@ impl ChainState {
 /// write. See [`ChainState::chain_gen`].
 pub(crate) struct ChainMutationGuard<'a> {
     chain_gen: &'a AtomicU64,
+    mutation_depth: &'a AtomicU32,
 }
 
 impl Drop for ChainMutationGuard<'_> {
     fn drop(&mut self) {
-        self.chain_gen.fetch_add(1, Ordering::Release);
+        if self.mutation_depth.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.chain_gen.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
-/// How many times [`ChainState::coherent_read`] retries before giving up.
-/// A connect that lands between the two samples costs one retry; the cap is
+/// How many times [`ChainState::coherent_read`] re-runs its read before giving
+/// up. A connect that lands between the two samples costs one retry; the cap is
 /// generous enough that only a chain advancing continuously exhausts it.
 const COHERENT_READ_ATTEMPTS: usize = 8;
+
+/// How long [`ChainState::coherent_read`] waits for an in-flight mutation to
+/// finish before giving up.
+///
+/// A wall-clock bound rather than a spin or yield count: what is being waited
+/// on is a store commit, whose duration has nothing to do with how fast this
+/// thread can loop. Long enough to outlast a slow commit, short enough that a
+/// mutator wedged mid-window cannot pin an RPC thread.
+const COHERENT_READ_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
@@ -673,6 +696,7 @@ impl ChainState {
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
                     chain_gen: AtomicU64::new(0),
+                    mutation_depth: AtomicU32::new(0),
                     connect_heartbeat: AtomicU64::new(0),
                     manager_heartbeat: AtomicU64::new(0),
                     connect_phases: std::sync::Arc::new(
@@ -782,6 +806,7 @@ impl ChainState {
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
             chain_gen: AtomicU64::new(0),
+            mutation_depth: AtomicU32::new(0),
             connect_heartbeat: AtomicU64::new(0),
             manager_heartbeat: AtomicU64::new(0),
             connect_phases: std::sync::Arc::new(
@@ -1521,7 +1546,7 @@ impl ChainState {
     /// had promised was consistent.
     fn set_tip(&self, hash: BlockHash, height: u32) {
         debug_assert!(
-            self.chain_gen.load(Ordering::Acquire) % 2 == 1,
+            self.mutation_depth.load(Ordering::Acquire) > 0,
             "tip moved to {hash} at height {height} outside a chain-mutation guard; \
              readers pairing a coin read with the tip cannot detect this change"
         );
@@ -1536,9 +1561,12 @@ impl ChainState {
     /// write; the returned guard closes the window when it drops.
     #[must_use = "the guard must outlive the tip write it covers"]
     pub(crate) fn begin_chain_mutation(&self) -> ChainMutationGuard<'_> {
-        self.chain_gen.fetch_add(1, Ordering::Release);
+        if self.mutation_depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.chain_gen.fetch_add(1, Ordering::Release);
+        }
         ChainMutationGuard {
             chain_gen: &self.chain_gen,
+            mutation_depth: &self.mutation_depth,
         }
     }
 
@@ -1555,13 +1583,29 @@ impl ChainState {
     /// tip is unchanged by construction and so proves nothing.
     pub fn coherent_read<T>(&self, read: impl Fn() -> T) -> Option<T> {
         for _ in 0..COHERENT_READ_ATTEMPTS {
-            let before = self.chain_gen.load(Ordering::Acquire);
-            if before % 2 == 1 {
-                // A mutator is mid-commit; its coins are visible under a tip
-                // that has not caught up yet. Nothing to do but wait it out.
-                std::hint::spin_loop();
-                continue;
-            }
+            // Wait out any mutation already in flight before starting a read.
+            //
+            // The guard is taken before the store commit, so this window is as
+            // long as a RocksDB batch write, not the few instructions up to
+            // the tip write. Spinning through the read attempts here would
+            // spend them all in nanoseconds and fail every caller that arrived
+            // during a commit -- a spurious `gettxout` retry, and a template
+            // that silently drops to coinbase-only and loses that poll's fees.
+            // Yield instead, and do not charge the wait to the read budget.
+            let deadline = std::time::Instant::now() + COHERENT_READ_WAIT;
+            let before = loop {
+                let generation = self.chain_gen.load(Ordering::Acquire);
+                if generation.is_multiple_of(2) {
+                    break generation;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // A mutator has been mid-commit for far longer than any
+                    // commit should take. Report "ask again" rather than block
+                    // an RPC thread on it indefinitely.
+                    return None;
+                }
+                std::thread::yield_now();
+            };
             let value = read();
             if self.chain_gen.load(Ordering::Acquire) == before {
                 return Some(value);
@@ -7855,6 +7899,82 @@ pub(crate) mod tests {
             cs.coherent_read(|| cs.tip_snapshot()),
             Some(before),
             "once the mutation closes, the same read must succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read that arrives during a commit must wait it out, not fail.
+    ///
+    /// The guard is taken before the store commit, so the window lasts as long
+    /// as a RocksDB batch write. Spending the read budget on that wait would
+    /// fail every caller that arrived mid-commit -- a spurious `gettxout`
+    /// retry, and a template that quietly drops to coinbase-only and loses
+    /// that poll's fees.
+    ///
+    /// Perturbation: charge the wait to the read attempts (spin and `continue`
+    /// in the outer loop) and this fails, because the window outlives them.
+    #[test]
+    fn a_read_waits_out_an_in_flight_commit_rather_than_failing() {
+        let (cs, dir) = make_chain_state();
+        let cs = std::sync::Arc::new(cs);
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+
+        let mutator = {
+            let cs = std::sync::Arc::clone(&cs);
+            std::thread::spawn(move || {
+                let guard = cs.begin_chain_mutation();
+                opened_tx.send(()).expect("reader is waiting");
+                // Stand in for a slow store commit, well inside
+                // `COHERENT_READ_WAIT` but far beyond what any spin would ride
+                // out.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(guard);
+            })
+        };
+
+        // The window is open for certain before the read starts.
+        opened_rx.recv().expect("mutator opened the window");
+        assert_eq!(
+            cs.coherent_read(|| cs.tip_snapshot()),
+            Some(cs.tip_snapshot()),
+            "a read arriving during a commit must wait for it, not give up"
+        );
+
+        mutator.join().expect("mutator finished");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mutators nest: `accept_block` calls `abort_reorg` from its commit error
+    /// path, and both take a guard. Only the outermost may close the window --
+    /// an inner guard that toggled the counter itself would advertise a
+    /// settled chainstate from inside a live mutation, and `set_tip` would
+    /// then fire its debug assertion on a perfectly legitimate path.
+    #[test]
+    fn a_nested_mutation_does_not_close_the_window_its_caller_opened() {
+        let (cs, dir) = make_chain_state();
+
+        let outer = cs.begin_chain_mutation();
+        {
+            let _inner = cs.begin_chain_mutation();
+            assert!(
+                cs.coherent_read(|| ()).is_none(),
+                "the window must stay open while a nested mutation runs"
+            );
+            assert!(
+                cs.mutation_depth.load(Ordering::Acquire) > 0,
+                "set_tip's precondition must hold inside the nested mutation"
+            );
+        }
+        assert!(
+            cs.coherent_read(|| ()).is_none(),
+            "the inner guard's drop must not close the outer guard's window"
+        );
+
+        drop(outer);
+        assert!(
+            cs.coherent_read(|| ()).is_some(),
+            "the outermost drop closes it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
