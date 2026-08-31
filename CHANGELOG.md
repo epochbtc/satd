@@ -54,6 +54,11 @@ set, taking the scoreboard to 10 tests.
 test framework at satd (see Added); each affects real Core-derived clients, not
 only tests.
 
+- `disconnectnode` now disconnects. It sent a ping to the named peer and
+  returned success, leaving the connection open, so an operator cutting off a
+  misbehaving peer was told it worked while the peer stayed connected. It also
+  gained Core's `nodeid` form, refuses both or neither selector, and reports a
+  peer it could not find instead of returning success.
 - `-uacomment` is honored instead of accepted and ignored. It appends comments
   to the advertised user agent (`/satd:0.5.1(comment1; comment2)/`), rejecting
   the delimiters `/`, `:`, `(` and `)` inside a comment and refusing a total

@@ -1605,14 +1605,44 @@ pub async fn start(
     })?;
 
     module.register_method("disconnectnode", |params, ctx, _extensions| {
-        let addr_str: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-            })?;
-        ctx.peer_manager.disconnect(&addr);
+        // Core takes the peer either by address or by id, and requires
+        // exactly one of the two -- `disconnectnode "" 3` is how its own test
+        // framework disconnects, so the address slot is present but empty.
+        let mut seq = params.sequence();
+        let addr_str: Option<String> = seq.optional_next().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Address must be a string", None::<()>)
+        })?;
+        let node_id: Option<u64> = seq.optional_next().map_err(|_| {
+            ErrorObjectOwned::owned(-1, "Node ID must be a number", None::<()>)
+        })?;
+
+        // Core's branch conditions verbatim (rpc/net.cpp): an address that was
+        // supplied at all -- including as the empty string -- takes the
+        // by-address path unless a nodeid came with it, and the "only one"
+        // error covers *neither* as well as both, because both guards fail.
+        let disconnected = match (&addr_str, node_id) {
+            (Some(addr), None) => ctx.peer_manager.disconnect_by_addr(addr),
+            (_, Some(id)) if addr_str.as_deref().unwrap_or("").is_empty() => {
+                ctx.peer_manager.disconnect_by_id(id)
+            }
+            _ => {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "Only one of address and nodeid should be provided.",
+                    None::<()>,
+                ));
+            }
+        };
+
+        // Core reports a peer it could not find rather than returning success
+        // for a disconnect that did not happen.
+        if !disconnected {
+            return Err(ErrorObjectOwned::owned(
+                -29,
+                "Node not found in connected nodes",
+                None::<()>,
+            ));
+        }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 

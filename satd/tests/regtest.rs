@@ -1310,6 +1310,141 @@ fn test_two_nodes_connect() {
     node_a.stop();
 }
 
+/// Whether `getpeerinfo` still lists this exact peer id.
+///
+/// Peer ids come from a monotonic per-process counter and are never reused, so
+/// this distinguishes "the peer we cut is gone" from "the peer count is back
+/// up because a `--connect` peer redialled", which it does every ten seconds.
+fn peer_id_present(node: &TestNode, id: u64) -> bool {
+    node.rpc_call("getpeerinfo")
+        .ok()
+        .and_then(|v| v["result"].as_array().cloned())
+        .is_some_and(|peers| peers.iter().any(|p| p["id"].as_u64() == Some(id)))
+}
+
+#[test]
+fn disconnectnode_actually_closes_the_connection() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "node A did not see a connection",
+    );
+
+    let peers = node_a.rpc_call("getpeerinfo").unwrap();
+    let addr = peers["result"][0]["addr"].as_str().unwrap().to_string();
+    let peer_id = peers["result"][0]["id"].as_u64().unwrap();
+
+    node_a
+        .rpc_call_with_params("disconnectnode", vec![serde_json::json!(addr)])
+        .unwrap();
+
+    // Node B was started with `--connect`, so it redials within ten seconds
+    // and the connection count comes straight back. Watch for *this* peer id
+    // going away instead: ids are allocated from a monotonic counter and never
+    // reused, so a reconnect is a different peer and cannot mask the drop.
+    poll_until(
+        || !peer_id_present(&node_a, peer_id),
+        Duration::from_secs(15),
+        "disconnectnode did not drop the peer",
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
+fn disconnectnode_takes_a_nodeid_and_enforces_exactly_one_selector() {
+    // Core's framework disconnects by id, passing an empty address in the
+    // first slot: disconnectnode("", 3).
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "node A did not see a connection",
+    );
+
+    let peers = node_a.rpc_call("getpeerinfo").unwrap();
+    let peer_id = peers["result"][0]["id"].as_u64().unwrap();
+    let addr = peers["result"][0]["addr"].as_str().unwrap().to_string();
+
+    // Both selectors, and neither, are refused rather than one silently winning.
+    let both = node_a.rpc_call_with_params(
+        "disconnectnode",
+        vec![serde_json::json!(addr), serde_json::json!(peer_id)],
+    );
+    assert!(both.is_err() || both.unwrap()["error"]["code"] == -32602);
+    let neither = node_a.rpc_call_with_params("disconnectnode", vec![]);
+    assert!(neither.is_err() || neither.unwrap()["error"]["code"] == -32602);
+
+    // An empty address with no id is NOT "neither": Core's first branch is
+    // `address && !node_id`, and an explicitly-passed empty string is still a
+    // supplied address. It takes the by-address path, matches no peer, and
+    // reports -29. An earlier version of this test asserted -32602 here and
+    // so pinned the divergence in place.
+    let empty_addr = node_a.rpc_call_with_params("disconnectnode", vec![serde_json::json!("")]);
+    assert!(empty_addr.is_err() || empty_addr.unwrap()["error"]["code"] == -29);
+
+    // Core never parses the address -- it string-compares against the name it
+    // reports for the peer -- so junk is "not found", not a parse error.
+    // p2p_disconnect_ban.py asserts exactly this with "221B Baker Street".
+    let junk = node_a.rpc_call_with_params(
+        "disconnectnode",
+        vec![serde_json::json!("221B Baker Street")],
+    );
+    assert!(
+        junk.is_err() || junk.unwrap()["error"]["code"] == -29,
+        "an unparseable address is Node not found, not a parse error"
+    );
+
+    assert_eq!(
+        get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0),
+        1,
+        "a refused disconnectnode must not drop the peer"
+    );
+
+    // An id that matches nothing is an error, not a silent success.
+    let missing = node_a.rpc_call_with_params(
+        "disconnectnode",
+        vec![serde_json::json!(""), serde_json::json!(9999)],
+    );
+    assert!(missing.is_err() || missing.unwrap()["error"]["code"] == -29);
+
+    // The form Core's own framework uses: named `nodeid` with no address at
+    // all, which the named-parameter layer turns into [null, id].
+    let named = node_a
+        .rpc_call_with_named_params(
+            "disconnectnode",
+            serde_json::json!({"nodeid": 9999}),
+        )
+        .unwrap();
+    assert_eq!(
+        named["error"]["code"], -29,
+        "named nodeid must reach the by-id path: {named}"
+    );
+
+    node_a
+        .rpc_call_with_params(
+            "disconnectnode",
+            vec![serde_json::json!(""), serde_json::json!(peer_id)],
+        )
+        .unwrap();
+    poll_until(
+        || !peer_id_present(&node_a, peer_id),
+        Duration::from_secs(15),
+        "disconnectnode by nodeid did not drop the peer",
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
 #[test]
 fn uacomment_appends_to_the_advertised_user_agent() {
     // -uacomment was accepted and ignored. Beyond losing the operator's label,
