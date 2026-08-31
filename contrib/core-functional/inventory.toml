@@ -133,9 +133,7 @@ file = "feature_dirsymlinks.py"
 status = "run"
 [[test]]
 file = "feature_discover.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "feature_fastprune.py"
@@ -889,9 +887,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_deprecated.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "rpc_deriveaddresses.py"
@@ -1053,9 +1049,7 @@ reason = "cache"
 
 [[test]]
 file = "rpc_uptime.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "rpc_users.py"

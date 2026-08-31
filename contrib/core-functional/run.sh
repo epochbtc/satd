@@ -156,10 +156,11 @@ fi
 
 TMPDIR_BASE="${SATD_CF_TMPDIR:-$(mktemp -d -t satd-core-functional-XXXXXX)}"
 mkdir -p "$TMPDIR_BASE"
-# Serial by default. Core's test_runner seeds a cached 199-block chain before
-# running anything when jobs > 1, and that seeding needs `setmocktime`, which
-# satd does not implement -- see the `cache` rows in inventory.toml. Raise
-# SATD_CF_JOBS once the cache lands.
+# Serial by default, but no longer forced to be: the cached 199-block chain
+# that test_runner seeds when jobs > 1 needs `setmocktime`, which satd now
+# implements, and a full-suite run at 8 jobs produced no port collisions.
+# Serial stays the default so a failure's logs are not interleaved with
+# fifteen other tests'; raise SATD_CF_JOBS for a sweep.
 JOBS="${SATD_CF_JOBS:-1}"
 [[ "$JOBS" -lt 1 ]] && JOBS=1
 
