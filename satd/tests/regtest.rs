@@ -1311,6 +1311,123 @@ fn test_two_nodes_connect() {
 }
 
 #[test]
+fn peers_exchange_keepalive_pings_without_being_asked() {
+    // Regression: satd had a `ping` RPC and answered an inbound ping, but
+    // nothing ever sent one on its own -- `ping_all()`'s only caller was the
+    // RPC. A link that goes quiet therefore produced no evidence it was still
+    // alive, `getpeerinfo` never reported a `pingtime`, and Bitcoin Core's
+    // test framework hung for its full timeout in `connect_nodes()`, which
+    // waits for a pong on BOTH sides of a new connection.
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+
+    poll_until(
+        || get_rpc_u64(&node_a, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(15),
+        "node A did not see a connection",
+    );
+
+    // Neither side is asked to ping: the keepalive fires on its own once the
+    // connection is set up. Both directions must measure a round trip, which
+    // is what proves each node pings rather than only answering.
+    let measured = |node: &TestNode| -> bool {
+        node.rpc_call("getpeerinfo")
+            .ok()
+            .and_then(|v| v["result"].as_array().cloned())
+            .is_some_and(|peers| {
+                peers
+                    .iter()
+                    .any(|p| p["pingtime"].as_f64().is_some_and(|t| t > 0.0))
+            })
+    };
+    poll_until(
+        || measured(&node_a),
+        Duration::from_secs(30),
+        "node A never measured a ping round trip",
+    );
+    poll_until(
+        || measured(&node_b),
+        Duration::from_secs(30),
+        "node B never measured a ping round trip",
+    );
+
+    // `minping` accompanies `pingtime`, and the pong is attributed to the
+    // right message type -- Core's framework gates `connect_nodes` on
+    // `bytesrecv_per_msg["pong"]`, not on the ping fields.
+    let peers = node_a.rpc_call("getpeerinfo").unwrap();
+    let peer = &peers["result"].as_array().unwrap()[0];
+    assert!(
+        peer["minping"].as_f64().is_some_and(|t| t > 0.0),
+        "minping should be set once a round trip is measured: {peer}"
+    );
+    let pong_bytes = peer["bytesrecv_per_msg"]["pong"].as_u64().unwrap_or(0);
+    assert!(
+        pong_bytes >= 29,
+        "pong bytes should be attributed to the pong message type, got {pong_bytes}: {peer}"
+    );
+
+    // The round trip must be a round trip, not a measure of how busy the node
+    // is. Over loopback the true figure is microseconds; matching the pong
+    // anywhere other than the peer's own connection task folds that task's
+    // scheduling delay in, and routing it through the manager loop -- which
+    // drains its queue on a 500ms timer -- would land this in the hundreds of
+    // milliseconds. 100ms is three orders of magnitude above the real value
+    // and still well under that floor.
+    let rtt = peer["pingtime"].as_f64().unwrap();
+    assert!(
+        rtt < 0.1,
+        "loopback ping time should be sub-millisecond, got {rtt}s -- \
+         the pong is being timed somewhere other than the connection task: {peer}"
+    );
+
+    // The `ping` RPC rides the same accounting, and its accounting must live
+    // on the peer's connection task. When the RPC task recorded the nonce
+    // itself, the queued ping could be transmitted and answered before that
+    // record landed; the pong was then discarded as unsolicited and the peer
+    // was dropped twenty minutes later for failing to answer it. A fresh
+    // measured round trip after the RPC -- the next periodic ping is 120s
+    // away, so it can only come from the RPC's ping -- proves the queued ping
+    // was matched to its pong.
+    let pings_sent = |node: &TestNode| -> u64 {
+        node.rpc_call("getpeerinfo")
+            .ok()
+            .and_then(|v| v["result"].as_array().cloned())
+            .and_then(|peers| peers.first().cloned())
+            .and_then(|p| p["bytessent_per_msg"]["ping"].as_u64())
+            .unwrap_or(0)
+    };
+    let sent_before = pings_sent(&node_a);
+    node_a.rpc_call("ping").unwrap();
+    poll_until(
+        || pings_sent(&node_a) > sent_before,
+        Duration::from_secs(10),
+        "the ping RPC never put a ping on the wire",
+    );
+    poll_until(
+        || {
+            node_a
+                .rpc_call("getpeerinfo")
+                .ok()
+                .and_then(|v| v["result"].as_array().cloned())
+                .and_then(|peers| peers.first().cloned())
+                .is_some_and(|p| {
+                    // A matched pong clears the outstanding nonce, so no
+                    // `pingwait` plus a measured `pingtime` means the RPC's
+                    // ping completed its round trip rather than being left
+                    // outstanding.
+                    p["pingwait"].is_null() && p["pingtime"].as_f64().is_some_and(|t| t > 0.0)
+                })
+        },
+        Duration::from_secs(10),
+        "the RPC ping's pong was never matched -- its nonce is still outstanding",
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
+#[test]
 fn test_block_sync_between_nodes() {
     let p2p_port_a = find_available_port();
     let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);

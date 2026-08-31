@@ -28,11 +28,13 @@ behaviour changes, never because a batch of rows was re-labelled.
 At the time this harness landed the run-set was deliberately tiny: two tests.
 That number is not a measure of how Core-compatible satd is — it is a measure of
 how much of Core's *test framework* satd can currently drive. The framework
-leans on two test-only facilities satd does not implement, `setmocktime` and
-`syncwithvalidationinterfacequeue`, and between them they account for 119 of the
-262 skipped rows. Every skip records what actually blocked it, so the queue of
-work is explicit rather than a guess; `contrib/core-functional/README.md` ranks
-it.
+leans on test-only facilities that satd had no reason to implement until the
+harness needed them — `setmocktime`, `syncwithvalidationinterfacequeue` and a
+periodic P2P ping, all of which have since landed. Clearing one rarely turns a
+row green on its own: the blockers are layered, and a test that gets past the
+framework's setup then stops on whatever its body needs next. Every skip records
+what actually blocked it *when it was last measured*, so the queue of work is
+explicit rather than a guess; `contrib/core-functional/README.md` ranks it.
 
 ## How to read a skip
 

@@ -37,8 +37,18 @@ def check(results_path: Path, expected: list[str]) -> list[str]:
         if status == "Skipped":
             problems.append(f"{name}: skipped at runtime, but its inventory row says 'run'")
 
+    # test_runner expands some tests into per-variant runs and reports each
+    # under a suffixed name -- "p2p_block_sync.py --v1transport". Those are the
+    # run, so a file is present if any of its variants is. A test file name
+    # never contains a space, so the first one starts the suffix.
+    #
+    # Matching exactly would fail every such test the moment it is flipped to
+    # `run`, which reads as "the harness did not execute it" when in fact it
+    # executed twice.
+    base_names = {name.split(" ", 1)[0] for name in seen}
+
     for name in expected:
-        if name not in seen:
+        if name not in base_names:
             problems.append(f"{name}: in the run-set but absent from the results")
 
     return problems
