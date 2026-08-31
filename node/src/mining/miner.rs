@@ -108,13 +108,34 @@ pub fn mine_block(
     let block = Block { header, txdata };
 
     // Accept the block
-    chain_state
+    let acceptance = chain_state
         .accept_block(&block)
         .map_err(|e| MineError::Rejected(e.to_string()))?;
 
-    mempool.remove_for_block(&block, chain_state.tip_height());
+    confirm_if_connected(chain_state, mempool, &block, &acceptance);
 
     Ok(block)
+}
+
+/// Purge the mempool for a freshly mined block — but only if it connected.
+///
+/// A sibling that arrived first leaves this block stored-but-not-connected. On
+/// that outcome the block confirms nothing: purging for it would drop live
+/// transactions as confirmed and report a confirming height they never
+/// reached. The height comes from the block's own index entry rather than
+/// `tip_height()`, which a later connect can already have moved on.
+///
+/// Regtest-only today (both callers gate on it), but the rule is the one the
+/// P2P and `submitblock` paths follow.
+fn confirm_if_connected(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    block: &Block,
+    acceptance: &crate::chain::state::BlockAcceptance,
+) {
+    if let Some(height) = chain_state.connected_height(acceptance) {
+        mempool.remove_for_block(block, height);
+    }
 }
 
 /// Mine multiple blocks, returning their hashes.
@@ -236,6 +257,59 @@ fn compute_witness_root(_coinbase: &Transaction, others: &[Transaction]) -> [u8;
 mod tests {
     use super::*;
     use bitcoin::Network;
+
+    use crate::chain::state::BlockAcceptance;
+    use crate::mempool::pool::QuarantineScope;
+
+    /// A block that was stored but never connected confirms nothing, so the
+    /// mempool must not be purged for it. Perturbation: drop the
+    /// `connected_height` guard in `confirm_if_connected` and the `Stored`
+    /// half fails — the transaction leaves the pool as if it had confirmed.
+    #[test]
+    fn a_block_that_only_stored_does_not_purge_the_mempool() {
+        let dir = std::env::temp_dir()
+            .join(format!("satd-miner-stored-{}", std::process::id()));
+        let store = Box::new(InMemoryStore::new());
+        let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
+        let cs = ChainState::new(
+            store,
+            flat_files,
+            Network::Regtest,
+            Box::new(NoopVerifier),
+            AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let mp = Mempool::new(1_000_000, 0);
+        let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        // Mine a real block so there is a genuine connected acceptance to
+        // compare against, then put its coinbase in the pool as the stand-in
+        // for a transaction the block would confirm.
+        let block = mine_block(&cs, &mp, addr).unwrap();
+        let tx = block.txdata[0].clone();
+
+        let txid = mp.insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
+        confirm_if_connected(&cs, &mp, &block, &BlockAcceptance::Stored(block.block_hash()));
+        assert!(
+            mp.get(&txid).is_some(),
+            "a stored-but-not-connected block confirms nothing; the pool must be untouched"
+        );
+
+        // The same block on the connected outcome does purge it — otherwise
+        // the assertion above would hold for the wrong reason.
+        confirm_if_connected(&cs, &mp, &block, &BlockAcceptance::Connected(block.block_hash()));
+        assert!(
+            mp.get(&txid).is_none(),
+            "a connected block must still purge what it confirmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
     use crate::chain::state::AssumeValid;

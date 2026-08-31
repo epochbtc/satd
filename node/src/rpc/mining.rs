@@ -27,28 +27,13 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
             // *confirmed* and tells every events subscriber so. Submitting an
             // ordinary stale sibling would have purged live transactions this
             // node would otherwise relay and mine.
-            if let Some(height) = connected_height(chain_state, &acceptance) {
+            if let Some(height) = chain_state.connected_height(&acceptance) {
                 mempool.remove_for_block(&block, height);
             }
             Value::Null
         }
         Err(e) => Value::String(e.to_string()),
     }
-}
-
-/// The height a just-connected block occupies, or `None` if it did not connect.
-///
-/// The block's own height, read from its index entry — not `tip_height()`. The
-/// tip is a separate read that a later connect can have moved on, and the value
-/// is what `LeaveConfirmed` reports to clients as the confirming height.
-pub(crate) fn connected_height(
-    chain_state: &ChainState,
-    acceptance: &crate::chain::state::BlockAcceptance,
-) -> Option<u32> {
-    if !acceptance.connected() {
-        return None;
-    }
-    chain_state.get_block_index(&acceptance.hash()).map(|e| e.height)
 }
 
 /// Handle the `generatetoaddress` RPC call (regtest only).

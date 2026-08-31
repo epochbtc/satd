@@ -497,6 +497,22 @@ impl BlockAcceptance {
         matches!(self, Self::Connected(_))
     }
 }
+
+impl ChainState {
+    /// The height a just-connected block occupies, or `None` if it did not
+    /// connect.
+    ///
+    /// The block's own height, read from its index entry — not `tip_height()`.
+    /// The tip is a separate read that a later connect can have moved on, and
+    /// the value is what `LeaveConfirmed` reports to clients as the confirming
+    /// height.
+    pub(crate) fn connected_height(&self, acceptance: &BlockAcceptance) -> Option<u32> {
+        if !acceptance.connected() {
+            return None;
+        }
+        self.get_block_index(&acceptance.hash()).map(|e| e.height)
+    }
+}
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.

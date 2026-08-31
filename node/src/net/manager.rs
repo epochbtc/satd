@@ -3573,7 +3573,7 @@ impl PeerManager {
                         // estimator would likewise sample a block that never
                         // confirmed.
                         if let Some(height) =
-                            crate::rpc::mining::connected_height(&chain_state, &acceptance)
+                            chain_state.connected_height(&acceptance)
                         {
                             fee_estimator.record_block(&fees);
                             mempool.remove_for_block(&block, height);
@@ -3595,10 +3595,7 @@ impl PeerManager {
                                             // iteration would re-read the same
                                             // tip and pull the same block
                                             // forever — stop instead.
-                                            let Some(h) = crate::rpc::mining::connected_height(
-                                                &chain_state,
-                                                &acc,
-                                            ) else {
+                                            let Some(h) = chain_state.connected_height(&acc) else {
                                                 break;
                                             };
                                             fee_estimator.record_block(&b_fees);
