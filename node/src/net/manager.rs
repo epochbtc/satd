@@ -3588,13 +3588,12 @@ impl PeerManager {
                                     match chain_state.accept_block(&b) {
                                         Ok(acc) => {
                                             chain_state.bump_connect_heartbeat();
-                                            // Same rule as above. A buffered
-                                            // block that stores without
-                                            // connecting also leaves the tip
-                                            // where it was, so the next
-                                            // iteration would re-read the same
-                                            // tip and pull the same block
-                                            // forever — stop instead.
+                                            // Same rule as above: a buffered
+                                            // block that stored without
+                                            // connecting confirmed nothing, so
+                                            // no purge or fee sample may run
+                                            // for it -- and the unmoved tip
+                                            // means this drain is done.
                                             let Some(h) = chain_state.connected_height(&acc) else {
                                                 break;
                                             };
@@ -3711,12 +3710,18 @@ impl PeerManager {
             if !chain_state.has_block_data(&hash) {
                 break;
             }
-            match chain_state.get_block_index(&hash) {
+            // The entry's height is the block's own (parent + 1), immutable
+            // and tip-independent -- the purge below must report it, not a
+            // tip re-read that a concurrent connect can already have moved.
+            let block_height = match chain_state.get_block_index(&hash) {
                 Some(entry)
                     if entry.status == crate::storage::blockindex::BlockStatus::DataStored
-                        && entry.header.prev_blockhash == chain_state.tip_hash() => {}
+                        && entry.header.prev_blockhash == chain_state.tip_hash() =>
+                {
+                    entry.height
+                }
                 _ => break,
-            }
+            };
             // The block bytes are needed regardless of outcome: fee rates
             // must be computed against the pre-connect UTXO view, and the
             // mempool/orphanage bookkeeping below needs the transactions.
@@ -3731,7 +3736,7 @@ impl PeerManager {
                         .warnings()
                         .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                     fee_estimator.record_block(&fees);
-                    mempool.remove_for_block(&block, chain_state.tip_height());
+                    mempool.remove_for_block(&block, block_height);
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
                     connected += 1;
                 }

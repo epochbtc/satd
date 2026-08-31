@@ -513,6 +513,7 @@ impl ChainState {
         self.get_block_index(&acceptance.hash()).map(|e| e.height)
     }
 }
+
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.
@@ -5429,7 +5430,6 @@ impl ChainState {
         );
         Ok(())
     }
-
 
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockAcceptance, ChainError> {
