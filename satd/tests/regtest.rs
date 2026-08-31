@@ -7482,6 +7482,8 @@ fn test_esplora_deep_page_resolves_the_right_blocks_past_the_walk_limit() {
             child["height"],
         );
     }
+
+    node.stop();
 }
 
 #[test]
