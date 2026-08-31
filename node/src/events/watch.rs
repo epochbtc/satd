@@ -1470,6 +1470,15 @@ impl WatchRegistry {
             // for an insufficiently-buried transaction never receives a
             // correction. Understating depth only delays an alarm to the next
             // tick; overstating it is unrecoverable.
+            //
+            // Residual race, known and accepted: the anchor check above and
+            // this tip read are still two live reads, so a reorg landing
+            // exactly between them can overstate depth by the reorg's height
+            // change for one tick. Closing it needs the anchor and tip read
+            // paired under `ChainState::coherent_read`, which `WatchChain`
+            // does not expose -- a trait change out of scope here. The clamp
+            // removes the unbounded variant (an arbitrarily stale queued
+            // event); the remaining window is one racing reorg wide.
             let effective_tip = tip.min(chain.tip_height());
             let cur_depth = effective_tip.saturating_sub(h) + 1;
             if cur_depth >= depth {
