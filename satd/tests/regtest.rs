@@ -1381,6 +1381,48 @@ fn peers_exchange_keepalive_pings_without_being_asked() {
          the pong is being timed somewhere other than the connection task: {peer}"
     );
 
+    // The `ping` RPC rides the same accounting, and its accounting must live
+    // on the peer's connection task. When the RPC task recorded the nonce
+    // itself, the queued ping could be transmitted and answered before that
+    // record landed; the pong was then discarded as unsolicited and the peer
+    // was dropped twenty minutes later for failing to answer it. A fresh
+    // measured round trip after the RPC -- the next periodic ping is 120s
+    // away, so it can only come from the RPC's ping -- proves the queued ping
+    // was matched to its pong.
+    let pings_sent = |node: &TestNode| -> u64 {
+        node.rpc_call("getpeerinfo")
+            .ok()
+            .and_then(|v| v["result"].as_array().cloned())
+            .and_then(|peers| peers.first().cloned())
+            .and_then(|p| p["bytessent_per_msg"]["ping"].as_u64())
+            .unwrap_or(0)
+    };
+    let sent_before = pings_sent(&node_a);
+    node_a.rpc_call("ping").unwrap();
+    poll_until(
+        || pings_sent(&node_a) > sent_before,
+        Duration::from_secs(10),
+        "the ping RPC never put a ping on the wire",
+    );
+    poll_until(
+        || {
+            node_a
+                .rpc_call("getpeerinfo")
+                .ok()
+                .and_then(|v| v["result"].as_array().cloned())
+                .and_then(|peers| peers.first().cloned())
+                .is_some_and(|p| {
+                    // A matched pong clears the outstanding nonce, so no
+                    // `pingwait` plus a measured `pingtime` means the RPC's
+                    // ping completed its round trip rather than being left
+                    // outstanding.
+                    p["pingwait"].is_null() && p["pingtime"].as_f64().is_some_and(|t| t > 0.0)
+                })
+        },
+        Duration::from_secs(10),
+        "the RPC ping's pong was never matched -- its nonce is still outstanding",
+    );
+
     node_b.stop();
     node_a.stop();
 }

@@ -413,10 +413,14 @@ mod tests {
         assert!(s.pong_received(1));
         let first = s.ping_time_us.load(Ordering::Relaxed);
 
-        // Force a deliberately slow second round trip by backdating the send.
+        // Force a deliberately slow second round trip by sleeping through it.
+        // Backdating `ping_sent_us` instead is not sound: `now_micros` counts
+        // from its first call, so early in the process the subtraction
+        // saturates to zero and the "slow" round trip collapses to the raw
+        // clock reading, which can tie with `first`. Sleeping past `first`
+        // guarantees the strict ordering the assertions need.
         s.ping_sent(2);
-        s.ping_sent_us
-            .store(now_micros().saturating_sub(first + 50_000), Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_micros(first + 1500));
         assert!(s.pong_received(2));
 
         assert!(

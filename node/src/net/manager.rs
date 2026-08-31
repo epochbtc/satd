@@ -1568,20 +1568,26 @@ impl PeerManager {
         let peers = self.peers.read();
         for (_, handle) in peers.iter() {
             if handle.info.state == PeerState::Connected {
+                // Best-effort skip; the authoritative accounting happens on
+                // the peer's task. Recording `ping_sent` here — on the RPC
+                // task — raced the write loop: the queued ping could be
+                // transmitted and answered before this task stored its nonce,
+                // and a pong that arrives before its ping is marked
+                // outstanding is discarded. The nonce then stays outstanding
+                // forever and the peer is dropped at PING_TIMEOUT for failing
+                // to answer a ping it answered. The write loop records the
+                // nonce when it actually transmits the message, on the same
+                // task that matches the pong, so no ordering is left to
+                // scheduling.
                 if handle.stats.ping_outstanding() {
                     continue;
                 }
                 // Nonce 0 is the "nothing outstanding" sentinel; Core
-                // likewise re-rolls until the nonce is non-zero.
+                // likewise re-rolls until the nonce is non-zero. A full queue
+                // drops the message, which is safe precisely because nothing
+                // is recorded until the write loop transmits it.
                 let nonce = rand::random::<u64>().max(1);
-                // Recorded only once the send is actually queued. A full
-                // queue drops the message, and marking a ping outstanding
-                // that never reached the wire would have the peer dropped at
-                // PING_TIMEOUT for failing to answer something it was never
-                // sent.
-                if handle.msg_tx.try_send(NetworkMessage::Ping(nonce)).is_ok() {
-                    handle.stats.ping_sent(nonce);
-                }
+                let _ = handle.msg_tx.try_send(NetworkMessage::Ping(nonce));
             }
         }
     }
@@ -5952,6 +5958,22 @@ impl PeerManager {
                 msg = msg_rx.recv() => {
                     match msg {
                         Some(msg) => {
+                            // A ping queued by the manager (the `ping` RPC)
+                            // is recorded here, at transmit, not where it was
+                            // queued. The RPC task recording it raced this
+                            // loop: the pong could arrive before the RPC task
+                            // stored the nonce, be discarded as unsolicited,
+                            // and leave the nonce outstanding until the peer
+                            // was dropped at PING_TIMEOUT for a ping it
+                            // answered. Recording at transmit puts every ping
+                            // state transition on this task, in order. If a
+                            // periodic ping is already in flight, the new
+                            // nonce overrides it and the older pong is
+                            // discarded as a mismatch — Core's behaviour when
+                            // an RPC ping lands on top of a keepalive.
+                            if let (NetworkMessage::Ping(nonce), Some(stats)) = (&msg, &stats) {
+                                stats.ping_sent(*nonce);
+                            }
                             writer.send(msg).await.map_err(|e| e.to_string())?;
                         }
                         None => {
