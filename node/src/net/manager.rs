@@ -667,10 +667,11 @@ impl PeerManager {
 
     /// Enable/disable all P2P networking (`-networkactive` /
     /// `setnetworkactive`). Disabling stops new inbound accepts and outbound
-    /// dials *and* disconnects every current peer — dropping a peer's handle
-    /// closes its `msg_rx`, which the peer write loop treats as a
-    /// disconnect-by-manager signal and tears the socket down. Re-enabling
-    /// lets the reconnect loop redial. A no-op if already in the target state.
+    /// dials *and* disconnects every current peer via [`Self::drop_all_peers`]
+    /// — each write loop is signalled and the handles dropped, tearing the
+    /// sockets down even where another task still holds a sender clone.
+    /// Re-enabling lets the reconnect loop redial. A no-op if already in the
+    /// target state.
     pub fn set_network_active(&self, active: bool) {
         if active {
             let was = self
@@ -694,7 +695,7 @@ impl PeerManager {
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
             if was {
                 let n = peers.len();
-                peers.clear();
+                Self::drop_all_peers(&mut peers);
                 tracing::info!(
                     disconnected = n,
                     "networkactive=false: disconnected all peers and paused P2P networking"
@@ -1496,6 +1497,21 @@ impl PeerManager {
         }
     }
 
+    /// Drop every peer handle, signalling each write loop first.
+    ///
+    /// `clear()` alone closes a peer's `msg_rx` only when the last sender
+    /// goes, and a `getcfilters` stream task can hold a clone of `msg_tx` --
+    /// leaving the socket open, and the peer feeding the node, after the
+    /// caller claimed to have disconnected everyone. Same reasoning as
+    /// `disconnect_by_id`, applied to the disconnect-all paths (shutdown,
+    /// `setnetworkactive false`).
+    fn drop_all_peers(peers: &mut HashMap<PeerId, PeerHandle>) {
+        for handle in peers.values() {
+            handle.disconnect.notify_one();
+        }
+        peers.clear();
+    }
+
     /// Get info about all connected peers.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
@@ -1784,7 +1800,14 @@ impl PeerManager {
             (false, None)
         };
         if should_ban {
-            peers.remove(&id);
+            // Signal, for the same reason `disconnect_by_id` does: dropping
+            // the handle closes the peer task's `msg_rx` only when the last
+            // sender goes, and a `getcfilters` stream task can hold a clone.
+            // Without the signal a banned peer stayed connected -- and kept
+            // feeding the node -- until that task drained.
+            if let Some(handle) = peers.remove(&id) {
+                handle.disconnect.notify_one();
+            }
             if let Some(addr) = ban_addr {
                 drop(peers); // release peers lock before acquiring banned_addrs lock
                 self.banned_addrs
@@ -1816,7 +1839,7 @@ impl PeerManager {
             if *shutdown.borrow() {
                 tracing::info!("P2P manager shutting down");
                 // Drop all peers to close connections
-                self.peers.write().clear();
+                Self::drop_all_peers(&mut self.peers.write());
                 return;
             }
             // Process up to 64 events per iteration, then yield for sync
@@ -6955,6 +6978,43 @@ mod tests {
             Ok(NetworkMessage::Tx(tx)) => assert_eq!(tx.compute_txid(), template_q),
             other => panic!("on-template tx must be served via getdata, got {other:?}"),
         }
+    }
+
+    /// Round 1 review: every path that removes a peer handle must fire the
+    /// handle's disconnect signal, not only `disconnect_by_id`. Dropping the
+    /// handle closes the peer task's `msg_rx` only when the *last* sender
+    /// goes, and a `getcfilters` stream task can hold a clone -- so without
+    /// the signal a banned peer (or every peer, on `setnetworkactive false`
+    /// and shutdown, which share `drop_all_peers`) kept its socket open and
+    /// kept feeding the node until that task drained. The held `msg_tx`
+    /// clone below is that scenario.
+    #[tokio::test]
+    async fn banning_and_disconnect_all_fire_the_disconnect_signal() {
+        let pm = empty_peer_manager();
+
+        // Ban path: crossing BAN_THRESHOLD removes the handle.
+        let addr: SocketAddr = "10.0.0.9:8333".parse().unwrap();
+        let handle = mk_handle(9, addr, Direction::Outbound, PeerState::Connected);
+        let notify = handle.disconnect.clone();
+        let _held_sender = handle.msg_tx.clone();
+        pm.peers.write().insert(9, handle);
+        pm.add_ban_score(9, BAN_THRESHOLD, "test");
+        assert!(pm.peers.read().is_empty(), "ban must remove the handle");
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("banning a peer must signal its write loop");
+
+        // Disconnect-all path (`setnetworkactive false`; shutdown shares it).
+        let addr2: SocketAddr = "10.0.0.10:8333".parse().unwrap();
+        let handle2 = mk_handle(10, addr2, Direction::Outbound, PeerState::Connected);
+        let notify2 = handle2.disconnect.clone();
+        let _held_sender2 = handle2.msg_tx.clone();
+        pm.peers.write().insert(10, handle2);
+        pm.set_network_active(false);
+        assert!(pm.peers.read().is_empty(), "pause must remove every handle");
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify2.notified())
+            .await
+            .expect("disconnecting all peers must signal each write loop");
     }
 
     fn empty_peer_manager() -> Arc<PeerManager> {
