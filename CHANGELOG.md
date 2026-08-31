@@ -23,6 +23,14 @@ item below is (or will be) written up in full in the in-development
 - `gettxout` pairs its coin read, `bestblock` and height as one consistent
   chain view; previously a concurrent connect could pair the parent tip with
   coins the new block had already spent or created (#640)
+- `getblockstats` fee fields (`totalfee`, `minfee`/`maxfee`, fee rates,
+  `medianfee`) are now computed from the block's undo data and so are real for
+  connected blocks — connecting a block removes exactly the coins it spends,
+  so the previous live-UTXO lookup made every fee field structurally zero;
+  `swtotal_size`/`swtotal_weight` are populated (#640)
+- `verifychain` walks the active chain by parent pointers under a consistent
+  view instead of trusting the height index, so a polluted index row can no
+  longer fail (or falsely pass) verification (#640)
 - `signrawtransactionwithkey` and `sat-cli`'s local PSBT signer can now spend untweaked
   P2TR outputs — the BIP 352 silent-payment shape — matching Bitcoin Core's key-path
   fallback (#609)

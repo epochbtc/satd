@@ -433,10 +433,10 @@ pub fn get_tx_out(
     chain_state: &ChainState,
     txid_str: &str,
     vout: u32,
-) -> Result<Value, String> {
+) -> Result<Value, (i32, String)> {
     let txid: bitcoin::Txid = txid_str
         .parse()
-        .map_err(|_| "Invalid txid".to_string())?;
+        .map_err(|_| (-5, "Invalid txid".to_string()))?;
 
     let outpoint = bitcoin::OutPoint { txid, vout };
 
@@ -458,9 +458,14 @@ pub fn get_tx_out(
         let (tip_hash, tip_height) = chain_state.tip_snapshot();
         (tip_hash, tip_height, chain_state.get_coin(&outpoint))
     }) else {
-        return Err(
+        // -32603 (internal error), NOT -5: -5 is what a permanently absent
+        // key returns, and a client that special-cases it would misread a
+        // retryable half-second window as "no such output". Same code
+        // `gettxoutsetinfo` uses for its cannot-read-consistently case.
+        return Err((
+            -32603,
             "chain is advancing faster than gettxout can answer consistently; retry".to_string(),
-        );
+        ));
     };
 
     // Bitcoin Core returns JSON `null` for a missing or spent outpoint — not an
@@ -647,10 +652,19 @@ pub fn get_block_stats(
             let coin = match spent.as_mut() {
                 // Undo data present: take the next coin in connect order. It
                 // runs out only if the undo row disagrees with the block, which
-                // is corruption rather than a missing prevout — stop pricing
-                // this block rather than silently misattribute coins to the
-                // wrong inputs.
-                Some(it) => it.next().cloned(),
+                // is corruption rather than a missing prevout — and the
+                // misalignment is only detectable here, after earlier inputs
+                // may already have been paired with the wrong coins. No fee
+                // figure from this block can be trusted, so refuse the call
+                // by name rather than answer with misattributed numbers.
+                Some(it) => match it.next() {
+                    Some(coin) => Some(coin.clone()),
+                    None => {
+                        return Err(format!(
+                            "undo data for block {hash} is inconsistent with the block;                              fee statistics unavailable"
+                        ));
+                    }
+                },
                 // No undo row (a block that never connected, or pruned undo).
                 // The live set is then the only source, and it is correct for
                 // exactly that case: the coins are still there.

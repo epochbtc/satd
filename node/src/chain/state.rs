@@ -354,10 +354,15 @@ pub struct ChainState {
     /// error path, `reorg_to` calls `perform_reorg` -- and each takes its own
     /// guard. Only the outermost may toggle `chain_gen`, or the inner guard
     /// would return it to even and advertise a settled chainstate from inside
-    /// a live mutation. Guarded mutators are serialized by `accept_lock`, so
-    /// this behaves as a per-thread depth; if one ever is not, the window
-    /// simply stays open until the last live mutation closes, which is the
-    /// safe direction.
+    /// a live mutation.
+    ///
+    /// The depth/parity pair REQUIRES top-level mutators to be serialized
+    /// (they all hold `accept_lock`; nesting only happens within one call
+    /// chain). Two unserialized mutators could interleave the depth bump and
+    /// the parity bump -- one entering between the other's `fetch_add`s
+    /// skips its own parity bump and commits under an even, unchanged
+    /// `chain_gen`, so a reader would certify its half-published coins as
+    /// settled. Any new mutator must take `accept_lock` first.
     mutation_depth: AtomicU32,
 
     connect_heartbeat: AtomicU64,
@@ -1604,7 +1609,11 @@ impl ChainState {
                     // an RPC thread on it indefinitely.
                     return None;
                 }
-                std::thread::yield_now();
+                // Park, don't spin: what is being waited on is a store
+                // commit measured in milliseconds, and a yield loop burns a
+                // full core per waiting reader for the whole of it. 100us
+                // granularity is noise against a RocksDB batch write.
+                std::thread::sleep(std::time::Duration::from_micros(100));
             };
             let value = read();
             if self.chain_gen.load(Ordering::Acquire) == before {
