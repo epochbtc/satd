@@ -20,6 +20,9 @@ item below is (or will be) written up in full in the in-development
   the race) no longer purges the mempool or reports a confirming height; every
   post-connect purge now reports the block's own height, never a tip re-read a
   later connect can have moved (#639)
+- `gettxout` pairs its coin read, `bestblock` and height as one consistent
+  chain view; previously a concurrent connect could pair the parent tip with
+  coins the new block had already spent or created (#640)
 - `signrawtransactionwithkey` and `sat-cli`'s local PSBT signer can now spend untweaked
   P2TR outputs — the BIP 352 silent-payment shape — matching Bitcoin Core's key-path
   fallback (#609)
