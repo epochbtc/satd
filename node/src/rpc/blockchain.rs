@@ -446,25 +446,21 @@ pub fn get_tx_out(
     // lets the reply name a block in which the coin was in fact spent -- an
     // answer no single chain state supports, which is worse than a stale one.
     //
-    // Pair them: snapshot the tip, read the coin, and confirm the tip did not
-    // move. The tip changes on every connect and disconnect and nothing else
-    // changes the UTXO set, so an unchanged tip means the coin and the block
-    // named beside it belong together. A handful of retries is ample -- this
-    // loses only to a node reorganising faster than it can answer one RPC.
-    let mut attempt = 0;
-    let (tip_hash, tip_height, coin) = loop {
+    // Sampling the tip on both sides of the coin read is not enough on its
+    // own. A connect commits its batch -- publishing the block's coins -- a
+    // moment before it moves the tip, and in that window both samples return
+    // the parent: the coin read is a block ahead of the height it would be
+    // reported under, and the pairing check cannot see it. `coherent_read`
+    // watches the mutation counter instead, which is bumped for the whole of
+    // that window, so it covers both the wide case (a connect that lands
+    // between the samples) and the narrow one.
+    let Some((tip_hash, tip_height, coin)) = chain_state.coherent_read(|| {
         let (tip_hash, tip_height) = chain_state.tip_snapshot();
-        let coin = chain_state.get_coin(&outpoint);
-        if chain_state.tip_snapshot() == (tip_hash, tip_height) {
-            break (tip_hash, tip_height, coin);
-        }
-        attempt += 1;
-        if attempt >= 8 {
-            return Err(
-                "chain is advancing faster than gettxout can answer consistently; retry"
-                    .to_string(),
-            );
-        }
+        (tip_hash, tip_height, chain_state.get_coin(&outpoint))
+    }) else {
+        return Err(
+            "chain is advancing faster than gettxout can answer consistently; retry".to_string(),
+        );
     };
 
     // Bitcoin Core returns JSON `null` for a missing or spent outpoint — not an

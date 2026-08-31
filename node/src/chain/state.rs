@@ -334,6 +334,21 @@ pub struct ChainState {
     /// might be holding. The watchdog observes a stalled value if and
     /// only if the connect path stopped completing — independent of
     /// what state the rest of the runtime is in.
+    /// Consistency token for readers that must pair a coin read with the tip.
+    ///
+    /// Even means settled. Odd means a mutator is between its store commit and
+    /// its tip write -- the window in which the new block's coins are already
+    /// visible (`absorb_batch` publishes them into the coin cache's dirty map)
+    /// while the tip still names the parent. A reader that samples the tip on
+    /// both sides of its coin read cannot see that window: both samples return
+    /// the old tip, and the coins it read are a block ahead of the height it
+    /// reports them under.
+    ///
+    /// Bumped by [`Self::begin_chain_mutation`], whose guard bumps it again on
+    /// drop -- including on an error-path unwind, so it cannot be stranded odd
+    /// by a mutator that fails between the two.
+    chain_gen: AtomicU64,
+
     connect_heartbeat: AtomicU64,
     /// Lock-free monotonic counter bumped on every iteration of the
     /// P2P manager's main `select!` loop. Complements
@@ -514,6 +529,23 @@ impl ChainState {
     }
 }
 
+/// Holds open the window between a chain mutator's store commit and its tip
+/// write. See [`ChainState::chain_gen`].
+pub(crate) struct ChainMutationGuard<'a> {
+    chain_gen: &'a AtomicU64,
+}
+
+impl Drop for ChainMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.chain_gen.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// How many times [`ChainState::coherent_read`] retries before giving up.
+/// A connect that lands between the two samples costs one retry; the cap is
+/// generous enough that only a chain advancing continuously exhausts it.
+const COHERENT_READ_ATTEMPTS: usize = 8;
+
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.
@@ -640,6 +672,7 @@ impl ChainState {
                     warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
                     mempool: std::sync::OnceLock::new(),
                     chain_event_tx: parking_lot::Mutex::new(None),
+                    chain_gen: AtomicU64::new(0),
                     connect_heartbeat: AtomicU64::new(0),
                     manager_heartbeat: AtomicU64::new(0),
                     connect_phases: std::sync::Arc::new(
@@ -748,6 +781,7 @@ impl ChainState {
             warnings: std::sync::Arc::new(crate::warnings::NodeWarnings::new()),
             mempool: std::sync::OnceLock::new(),
             chain_event_tx: parking_lot::Mutex::new(None),
+            chain_gen: AtomicU64::new(0),
             connect_heartbeat: AtomicU64::new(0),
             manager_heartbeat: AtomicU64::new(0),
             connect_phases: std::sync::Arc::new(
@@ -1165,11 +1199,10 @@ impl ChainState {
             chain_tx_puts: vec![(anchor.blockhash, anchor.nchaintx)],
             ..Default::default()
         };
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(tip_batch)?;
         {
-            let mut tip = self.tip.write();
-            tip.hash = anchor.blockhash;
-            tip.height = anchor.height;
+            self.set_tip(anchor.blockhash, anchor.height);
         }
         self.headers_tip_height
             .fetch_max(anchor.height, Ordering::Relaxed);
@@ -1199,13 +1232,12 @@ impl ChainState {
             tip: Some(genesis),
             ..Default::default()
         };
+        let _chain_mutation = self.begin_chain_mutation();
         if let Err(e) = self.store.write_batch(reset) {
             tracing::error!(error = %e, "snapshot rollback: tip reset failed");
         }
         {
-            let mut tip = self.tip.write();
-            tip.hash = genesis;
-            tip.height = 0;
+            self.set_tip(genesis, 0);
         }
     }
 
@@ -1477,6 +1509,65 @@ impl ChainState {
     pub fn tip_snapshot(&self) -> (BlockHash, u32) {
         let tip = self.tip.read();
         (tip.hash, tip.height)
+    }
+
+    /// Publish a new active-chain tip.
+    ///
+    /// Every tip write goes through here so the debug assertion below can
+    /// enforce -- across the whole test suite, rather than by audit -- that no
+    /// mutator moves the tip outside a [`Self::begin_chain_mutation`] guard.
+    /// A tip that moved without bumping `chain_gen` is invisible to
+    /// [`Self::coherent_read`], which would then hand back a coin/tip pair it
+    /// had promised was consistent.
+    fn set_tip(&self, hash: BlockHash, height: u32) {
+        debug_assert!(
+            self.chain_gen.load(Ordering::Acquire) % 2 == 1,
+            "tip moved to {hash} at height {height} outside a chain-mutation guard; \
+             readers pairing a coin read with the tip cannot detect this change"
+        );
+        let mut tip = self.tip.write();
+        tip.hash = hash;
+        tip.height = height;
+    }
+
+    /// Open the window in which this chainstate's coins and tip may disagree.
+    ///
+    /// Take it immediately before the store commit and hold it past the tip
+    /// write; the returned guard closes the window when it drops.
+    #[must_use = "the guard must outlive the tip write it covers"]
+    pub(crate) fn begin_chain_mutation(&self) -> ChainMutationGuard<'_> {
+        self.chain_gen.fetch_add(1, Ordering::Release);
+        ChainMutationGuard {
+            chain_gen: &self.chain_gen,
+        }
+    }
+
+    /// Run `read` against a chainstate that did not change underneath it.
+    ///
+    /// `read` may run more than once and must be side-effect free. Returns
+    /// `None` if the chain kept moving for [`COHERENT_READ_ATTEMPTS`] tries,
+    /// which callers should surface as "ask again" rather than answer from a
+    /// torn view -- an answer assembled from two different chainstates is
+    /// wrong in a way the caller cannot detect.
+    ///
+    /// This is strictly stronger than sampling `tip_snapshot()` on both sides
+    /// of the read: it also covers the commit-to-tip-write window, where the
+    /// tip is unchanged by construction and so proves nothing.
+    pub fn coherent_read<T>(&self, read: impl Fn() -> T) -> Option<T> {
+        for _ in 0..COHERENT_READ_ATTEMPTS {
+            let before = self.chain_gen.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                // A mutator is mid-commit; its coins are visible under a tip
+                // that has not caught up yet. Nothing to do but wait it out.
+                std::hint::spin_loop();
+                continue;
+            }
+            let value = read();
+            if self.chain_gen.load(Ordering::Acquire) == before {
+                return Some(value);
+            }
+        }
+        None
     }
 
     /// Initial-block-download heuristic from a tip timestamp. Matches the
@@ -3431,14 +3522,13 @@ impl ChainState {
 
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
         phases.enter(ConnectPhase::TipWrite);
         {
-            let mut tip = self.tip.write();
-            tip.hash = pre.hash;
-            tip.height = pre.height;
+            self.set_tip(pre.hash, pre.height);
         }
 
         // Update MTP cache
@@ -4095,14 +4185,13 @@ impl ChainState {
 
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(batch)?;
 
         // Update in-memory tip
         phases.enter(ConnectPhase::TipWrite);
         {
-            let mut tip = self.tip.write();
-            tip.hash = *hash;
-            tip.height = entry.height;
+            self.set_tip(*hash, entry.height);
         }
 
         // Update MTP cache with this block's timestamp
@@ -4663,10 +4752,9 @@ impl ChainState {
             filter_index: &self.filter_index,
             phase_tracker: None,
         })?;
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(batch)?;
-        let mut tip = self.tip.write();
-        tip.hash = pre.hash;
-        tip.height = pre.height;
+        self.set_tip(pre.hash, pre.height);
         Ok(())
     }
 
@@ -4759,10 +4847,9 @@ impl ChainState {
             filter_index: &self.filter_index,
             phase_tracker: None,
         })?;
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(batch)?;
-        let mut tip = self.tip.write();
-        tip.hash = hash;
-        tip.height = height;
+        self.set_tip(hash, height);
         Ok(())
     }
 
@@ -5163,12 +5250,11 @@ impl ChainState {
                 filter_index: &self.filter_index,
                 phase_tracker: None,
             })?;
+            let _chain_mutation = self.begin_chain_mutation();
             self.store.write_batch(batch)?;
 
             {
-                let mut tip = self.tip.write();
-                tip.hash = hash;
-                tip.height = height;
+                self.set_tip(hash, height);
             }
 
             // See note in `reindex_chainstate`: emit even though the
@@ -5809,11 +5895,10 @@ impl ChainState {
             filter_index: &self.filter_index,
                         phase_tracker: None,
                     })?;
+                    let _chain_mutation = self.begin_chain_mutation();
                     self.store.write_batch(batch)?;
                     {
-                        let mut tip = self.tip.write();
-                        tip.hash = *side_hash;
-                        tip.height = side_entry.height;
+                        self.set_tip(*side_hash, side_entry.height);
                     }
                     // Push the timestamp HERE, not after the loop. The next
                     // iteration calls `get_median_time_past` for the height
@@ -5976,6 +6061,7 @@ impl ChainState {
             }
         };
 
+        let _chain_mutation = self.begin_chain_mutation();
         if let Err(e) = self.store.write_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
                 tracing::warn!(
@@ -5995,9 +6081,7 @@ impl ChainState {
 
         // Update in-memory tip
         {
-            let mut tip = self.tip.write();
-            tip.hash = block_hash;
-            tip.height = new_height;
+            self.set_tip(block_hash, new_height);
         }
 
         // Reorg fully committed: the cache now holds a consistent
@@ -6237,6 +6321,10 @@ impl ChainState {
                 old_height,
             );
         };
+        // Covers the discard and the tip restore together: the discard is a
+        // coin mutation, and until the tip goes back a reader sees the
+        // post-discard coins under the reorg's tip.
+        let _chain_mutation = self.begin_chain_mutation();
         if let Err(refusal) = self.store.discard_uncommitted(excl) {
             self.fail_stop_on_unsafe_discard(&refusal.to_string(), old_tip, old_height);
         }
@@ -6259,9 +6347,7 @@ impl ChainState {
         // be polluted — is worth eleven index reads on a path that only runs
         // when a reorg has already failed.
         self.repopulate_mtp_cache_from(old_tip, old_height);
-        let mut tip = self.tip.write();
-        tip.hash = old_tip;
-        tip.height = old_height;
+        self.set_tip(old_tip, old_height);
     }
 
     /// A reorg needs to roll back and the coin cache cannot be attributed to
@@ -6396,13 +6482,12 @@ impl ChainState {
         }
 
         // Atomic commit of all disconnections
+        let _chain_mutation = self.begin_chain_mutation();
         self.store.write_batch(combined_batch)?;
 
         // Update in-memory tip to fork point
         {
-            let mut tip = self.tip.write();
-            tip.hash = fork_hash;
-            tip.height = fork_entry.height;
+            self.set_tip(fork_hash, fork_entry.height);
         }
 
         // Block order: walk reversed so oldest disconnected block comes
@@ -7195,11 +7280,10 @@ impl ChainState {
                     filter_index: &self.filter_index,
                     phase_tracker: None,
                 })?;
+                let _chain_mutation = self.begin_chain_mutation();
                 self.store.write_batch(batch)?;
                 {
-                    let mut tip = self.tip.write();
-                    tip.hash = *h;
-                    tip.height = e.height;
+                    self.set_tip(*h, e.height);
                 }
                 // Staged per block, for the same reason as the `accept_block`
                 // reorg: the next iteration's `get_median_time_past` window
@@ -7736,6 +7820,68 @@ pub(crate) mod tests {
 
     pub(crate) fn make_chain_state() -> (ChainState, std::path::PathBuf) {
         make_chain_state_with_store(Box::new(InMemoryStore::new()))
+    }
+
+    /// The commit-to-tip-write window is exactly the one a paired
+    /// `tip_snapshot()` check cannot see: the tip is unchanged on both sides
+    /// by construction, because the mutator has not written it yet. The
+    /// counter is what makes it visible.
+    ///
+    /// Perturbation: drop the `before % 2 == 1` arm from `coherent_read` and
+    /// the first assertion fails -- the reader answers from inside the window.
+    #[test]
+    fn a_reader_will_not_answer_from_inside_the_commit_to_tip_write_window() {
+        let (cs, dir) = make_chain_state();
+
+        let before = cs.tip_snapshot();
+        {
+            // Stand where a mutator stands after `write_batch` and before
+            // `set_tip`: coins already published, tip not yet moved.
+            let _mutation = cs.begin_chain_mutation();
+
+            assert_eq!(
+                cs.tip_snapshot(),
+                before,
+                "premise: the tip does not move inside this window, so sampling \
+                 it on both sides of a coin read proves nothing"
+            );
+            assert!(
+                cs.coherent_read(|| cs.tip_snapshot()).is_none(),
+                "a reader must refuse to answer while a mutation is open"
+            );
+        }
+
+        assert_eq!(
+            cs.coherent_read(|| cs.tip_snapshot()),
+            Some(before),
+            "once the mutation closes, the same read must succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mutation that opens and closes around the read is caught too -- the
+    /// counter has advanced by two, so the samples differ.
+    #[test]
+    fn a_mutation_that_completes_under_a_read_is_not_reported_as_coherent() {
+        let (cs, dir) = make_chain_state();
+        let seen = std::cell::Cell::new(0u32);
+
+        // Churn the counter on every read attempt, so no attempt ever closes.
+        let out = cs.coherent_read(|| {
+            seen.set(seen.get() + 1);
+            drop(cs.begin_chain_mutation());
+            cs.tip_snapshot()
+        });
+
+        assert!(out.is_none(), "a read the chain moved under is not coherent");
+        assert_eq!(
+            seen.get(),
+            COHERENT_READ_ATTEMPTS as u32,
+            "every attempt should have been spent before giving up"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// [`make_chain_state`] over a caller-supplied store, for tests that need
