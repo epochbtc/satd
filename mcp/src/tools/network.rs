@@ -46,11 +46,11 @@ pub fn manage_peer(ctx: &McpContext, action: &str, address: &str) -> String {
             json!({"result": if ok { "disconnected" } else { "peer not found" }}).to_string()
         }
         "ban" => {
-            ctx.peer_manager.set_ban(addr, true);
+            ctx.peer_manager.set_ban(addr.ip(), true);
             json!({"result": "banned"}).to_string()
         }
         "unban" => {
-            ctx.peer_manager.set_ban(addr, false);
+            ctx.peer_manager.set_ban(addr.ip(), false);
             json!({"result": "unbanned"}).to_string()
         }
         _ => json!({"error": format!("Unknown action: {}. Use: disconnect, ban, unban", action)})

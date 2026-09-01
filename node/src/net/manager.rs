@@ -296,7 +296,7 @@ pub struct PeerManager {
     /// host) would be hot-dialed every 10s with no backoff.
     onion_reconnect_backoff: RwLock<HashMap<String, ReconnectState>>,
     /// Banned addresses with ban expiry time.
-    banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
+    banned_addrs: RwLock<HashMap<std::net::IpAddr, Instant>>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
     #[allow(dead_code)]
     fee_estimator: Arc<FeeEstimator>,
@@ -1607,10 +1607,11 @@ impl PeerManager {
         banned
             .iter()
             .filter(|(_, expiry)| now < **expiry)
-            .map(|(addr, expiry)| {
+            .map(|(ip, expiry)| {
                 let remaining = expiry.duration_since(now).as_secs();
+                let mask = if ip.is_ipv4() { 32 } else { 128 };
                 serde_json::json!({
-                    "address": addr.to_string(),
+                    "address": format!("{ip}/{mask}"),
                     "ban_created": 0,
                     "banned_until": remaining,
                     "ban_duration": self.ban_duration_secs.load(Ordering::Relaxed),
@@ -1621,14 +1622,23 @@ impl PeerManager {
     }
 
     /// Manually ban or unban an address.
-    pub fn set_ban(&self, addr: SocketAddr, ban: bool) {
+    pub fn set_ban(&self, ip: std::net::IpAddr, ban: bool) {
         if ban {
             self.banned_addrs
                 .write()
-                
-                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                .insert(ip, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+            let to_drop: Vec<PeerId> = self
+                .peers
+                .read()
+                .iter()
+                .filter(|(_, h)| h.info.addr.ip() == ip)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in to_drop {
+                self.disconnect_by_id(id);
+            }
         } else {
-            self.banned_addrs.write().remove(&addr);
+            self.banned_addrs.write().remove(&ip);
         }
     }
 
@@ -1774,7 +1784,7 @@ impl PeerManager {
     /// Check if an address is currently banned.
     fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
         let banned = self.banned_addrs.read();
-        matches!(banned.get(addr), Some(expiry) if Instant::now() < *expiry)
+        matches!(banned.get(&addr.ip()), Some(expiry) if Instant::now() < *expiry)
     }
 
     /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
@@ -1791,7 +1801,7 @@ impl PeerManager {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                (true, Some(handle.info.addr))
+                (true, Some(handle.info.addr.ip()))
             } else {
                 tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
                 (false, None)
@@ -1808,12 +1818,11 @@ impl PeerManager {
             if let Some(handle) = peers.remove(&id) {
                 handle.disconnect.notify_one();
             }
-            if let Some(addr) = ban_addr {
-                drop(peers); // release peers lock before acquiring banned_addrs lock
+            if let Some(ip) = ban_addr {
+                drop(peers);
                 self.banned_addrs
                     .write()
-                    
-                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                    .insert(ip, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
             }
         }
     }

@@ -1214,8 +1214,10 @@ pub async fn start(
                 .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": true,
                         "vsize": vsize,
                         "fees": {
@@ -1225,8 +1227,10 @@ pub async fn start(
                 }
                 Err(e) => {
                     let txid = tx.compute_txid();
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": false,
                         "reject-reason": e.to_string(),
                     }));
@@ -1565,13 +1569,20 @@ pub async fn start(
         let command: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-            })?;
+        let ip: std::net::IpAddr = if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+            ip
+        } else if let Ok(sa) = addr_str.parse::<std::net::SocketAddr>() {
+            sa.ip()
+        } else {
+            return Err(ErrorObjectOwned::owned(
+                -30,
+                format!("Error: Invalid IP/Subnet: {addr_str}"),
+                None::<()>,
+            ));
+        };
         match command.as_str() {
-            "add" => ctx.peer_manager.set_ban(addr, true),
-            "remove" => ctx.peer_manager.set_ban(addr, false),
+            "add" => ctx.peer_manager.set_ban(ip, true),
+            "remove" => ctx.peer_manager.set_ban(ip, false),
             _ => return Err(ErrorObjectOwned::owned(-1, "Invalid command", None::<()>)),
         }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
