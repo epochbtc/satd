@@ -721,7 +721,7 @@ fn layer_b_local_submission_refused_for_relay_quarantine() {
         .expect("sendrawtransaction rpc");
     let err = &resp["error"];
     assert!(!err.is_null(), "expected §6.1 refusal, got: {resp}");
-    assert_eq!(err["code"], json!(-25), "refusal code: {resp}");
+    assert_eq!(err["code"], json!(-26), "refusal code: {resp}");
     let blob = err.to_string();
     assert!(
         blob.contains("txn-policy-quarantined"),
