@@ -145,8 +145,8 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
 
 /// `getmininginfo` — return mining-related info.
 pub fn get_mining_info(chain_state: &ChainState) -> Value {
-    let tip_hash = chain_state.tip_hash();
-    let tip_height = chain_state.tip_height();
+    // One read -- see `ChainState::tip_snapshot`.
+    let (tip_hash, tip_height) = chain_state.tip_snapshot();
     let difficulty = if let Some(entry) = chain_state.get_block_index(&tip_hash) {
         target_to_difficulty(entry.header.bits)
     } else {

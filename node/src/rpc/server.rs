@@ -1313,7 +1313,7 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         blockchain::get_tx_out(&ctx.chain_state, &txid, vout)
-            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
