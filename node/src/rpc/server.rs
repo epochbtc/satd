@@ -1679,7 +1679,26 @@ pub async fn start(
 
     // --- Control RPCs ---
 
-    module.register_method("help", |_params, _ctx, _extensions| {
+    module.register_method("echo", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        if args.len() >= 10
+            && let Some(serde_json::Value::String(s)) = args.last()
+            && s == "trigger_internal_bug"
+        {
+            let msg = "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\"";
+            return Err(ErrorObjectOwned::owned(-1, msg, None::<()>));
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("echojson", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("help", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let command: Option<String> = seq.optional_next().unwrap_or(None);
         let methods = vec![
             "addnode",
             "clearbanned",
@@ -1687,6 +1706,8 @@ pub async fn start(
             "decodescript",
             "disconnectnode",
             "dumptxoutset",
+            "echo",
+            "echojson",
             "estimatefees",
             "estimatesmartfee",
             "generateblock",
@@ -1752,9 +1773,22 @@ pub async fn start(
             "testmempoolaccept",
             "unsubscribemempool",
             "uptime",
+            "validateaddress",
             "verifychain",
         ];
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        if let Some(cmd) = command {
+            if cmd.is_empty() || methods.contains(&cmd.as_str()) {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")))
+            } else {
+                Err(ErrorObjectOwned::owned(
+                    -1,
+                    format!("help: unknown command: {cmd}"),
+                    None::<()>,
+                ))
+            }
+        } else {
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        }
     })?;
 
     // Core's version blocks until its serialized validation-callback queue has
@@ -2279,6 +2313,8 @@ pub async fn start(
     // jsonrpsee's library default.
     let server_cfg = ServerConfig::builder()
         .max_connections(RPC_MAX_CONNECTIONS)
+        .max_request_body_size(32 * 1024 * 1024)
+        .max_response_body_size(32 * 1024 * 1024)
         .build();
     // Methods is Arc-backed and cheap to clone — one copy is consumed
     // by each per-bind `Server::start()` call below, plus one to feed

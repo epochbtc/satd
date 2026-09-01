@@ -1002,9 +1002,7 @@ note = "needs the echo debug RPC; the first call is node.echo()"
 
 [[test]]
 file = "rpc_named_arguments.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the echo debug RPC; also help text format differs (expected getblockchaininfo prefix)"
+status = "run"
 
 [[test]]
 file = "rpc_net.py"
