@@ -61,6 +61,14 @@ impl HeadersSource for node::chain::state::ChainState {
 pub struct Subscriptions {
     scripthash_tasks: HashMap<Scripthash, JoinHandle<()>>,
     headers_task: Option<JoinHandle<()>>,
+    /// The connection's in-flight BIP 352 tweak stream, if any. One per
+    /// connection: while one is running a fresh `blockchain.tweaks.subscribe`
+    /// is **refused**, not superseded. Aborting the running task cannot retract
+    /// notification lines it has already pushed into the shared channel, so
+    /// they would land after the new subscribe's `result` and a client reading
+    /// the last key as its progress marker would skip everything in between.
+    /// See `dispatch::handle_tweaks_subscribe`.
+    tweaks_task: Option<JoinHandle<()>>,
     notify_tx: mpsc::Sender<String>,
     max_per_conn: usize,
 }
@@ -70,6 +78,7 @@ impl Subscriptions {
         Self {
             scripthash_tasks: HashMap::new(),
             headers_task: None,
+            tweaks_task: None,
             notify_tx,
             max_per_conn,
         }
@@ -83,6 +92,55 @@ impl Subscriptions {
     /// Whether this connection is subscribed to header updates.
     pub fn has_headers(&self) -> bool {
         self.headers_task.is_some()
+    }
+
+    /// Whether a tweak stream is still producing on this connection.
+    ///
+    /// A finished task does not count: the normal client loop is subscribe →
+    /// read to `{"message":"done"}` → subscribe again, and by the time `done`
+    /// has been read off the wire the task that sent it has exited.
+    pub fn tweaks_running(&self) -> bool {
+        self.tweaks_task.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Start the connection's tweak stream over `[from, last]`.
+    ///
+    /// Callers must check [`Self::tweaks_running`] first: a stream is replaced
+    /// here only when the previous one has already finished. Aborting a live
+    /// one would not be enough — `abort()` cannot retract the notification
+    /// lines it has already pushed into the connection's shared channel, so
+    /// those stale heights would be written *after* the new subscribe's result,
+    /// and a client that reads the map's last key as its progress marker would
+    /// jump forward past heights it never scanned.
+    ///
+    /// Unlike the scripthash and headers subscriptions this is not open-ended:
+    /// the task streams its chunk, sends `{"message":"done"}`, and exits. It does
+    /// not count against the per-connection subscription cap, because there is
+    /// only ever one and it is self-limiting (a chunk budget, then done).
+    pub fn add_tweaks(
+        &mut self,
+        src: crate::handlers::tweaks::TweakSource,
+        from: u32,
+        last: u32,
+        cut_through: bool,
+        activation: u32,
+    ) {
+        let tx = self.notify_tx.clone();
+        let handle = tokio::spawn(async move {
+            crate::handlers::tweaks::stream_chunk(
+                src,
+                from,
+                last,
+                cut_through,
+                activation,
+                tx,
+                crate::handlers::tweaks::CHUNK_BUDGET,
+            )
+            .await;
+        });
+        if let Some(prev) = self.tweaks_task.replace(handle) {
+            prev.abort();
+        }
     }
 
     /// Register a scripthash subscription. Idempotent: re-subscribing
@@ -169,6 +227,9 @@ impl Drop for Subscriptions {
             handle.abort();
         }
         if let Some(h) = self.headers_task.take() {
+            h.abort();
+        }
+        if let Some(h) = self.tweaks_task.take() {
             h.abort();
         }
     }
@@ -287,6 +348,41 @@ async fn forward_headers(
 
 #[cfg(test)]
 mod tests {
+    /// `tweaks_running` is what stops a second subscribe from superseding a
+    /// live stream. Superseding is unsafe: `abort()` cannot retract the
+    /// notification lines the old task already pushed onto this connection's
+    /// shared channel, so they would be written after the new subscribe's
+    /// result and a client reading the map's last key as its progress marker
+    /// would skip every height in between. A *finished* stream must not block a
+    /// resubscribe, though, or the normal
+    /// subscribe-read-to-done-subscribe-again loop deadlocks on itself.
+    #[tokio::test]
+    async fn tweaks_running_is_true_only_while_a_stream_is_live() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+        let mut subs = Subscriptions::new(tx, 8);
+        assert!(!subs.tweaks_running(), "no stream registered yet");
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        subs.tweaks_task = Some(tokio::spawn(async move {
+            let _ = release_rx.await;
+        }));
+        assert!(subs.tweaks_running(), "a live stream blocks a resubscribe");
+
+        let _ = release_tx.send(());
+        let handle = subs.tweaks_task.take().expect("task");
+        handle.await.expect("task joins");
+        subs.tweaks_task = Some(tokio::spawn(async {}));
+        // Let the trivial task complete before asking.
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            if !subs.tweaks_running() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!subs.tweaks_running(), "a finished stream must not block one");
+    }
+
     use super::*;
     use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash as _;

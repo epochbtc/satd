@@ -56,6 +56,12 @@ pub struct ElectrumConfig {
     /// `host:port` to bind. Defaults to loopback on the standard
     /// Electrum plain-TCP port (50001).
     pub bind: SocketAddr,
+    /// Server name reported by `server.version` and
+    /// `server.features.server_version`. `None` reports
+    /// `satd-electrs-compatible/<version>`.
+    /// Configurable because Cake Wallet gates its silent-payment probe on the
+    /// substring `electrs` appearing here; see the Electrum manual chapter.
+    pub server_name: Option<String>,
     /// Optional TLS bind. When `Some`, both `tls_cert_path` and
     /// `tls_key_path` MUST also be `Some`; the server validates this
     /// at construction time.
@@ -128,6 +134,7 @@ impl Default for ElectrumConfig {
             mtls_client_ca: None,
             mtls_client_allow: Vec::new(),
             banner: None,
+            server_name: None,
             donation_address: String::new(),
             max_history_entries: MAX_HISTORY_ENTRIES,
             max_headers_per_request: MAX_HEADERS_PER_REQUEST,

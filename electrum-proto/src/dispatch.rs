@@ -261,12 +261,90 @@ pub fn dispatch_with_subscriptions(
         "blockchain.headers.subscribe" => {
             handle_headers_subscribe(state, subs, headers_source, extras, &req)
         }
+        "blockchain.tweaks.subscribe" => handle_tweaks_subscribe(state, subs, &req),
         _ => return dispatch(state, req),
     };
     match outcome {
         Ok(result) => Response::success(id, result),
         Err(err) => Response::error(id, err),
     }
+}
+
+/// `blockchain.tweaks.subscribe` — a stream, not a call.
+///
+/// The synchronous half answers with the FIRST height's map; the rest of the
+/// requested range is streamed as notifications by a task this registers, ending
+/// in `{"message":"done"}`. Splitting it that way is not a satd choice: it is the
+/// shape the clients that consume this method (Cake Wallet, kiss-bdk) already
+/// expect, and a server that answered the whole range in `result` would leave
+/// them waiting for notifications that never come.
+fn handle_tweaks_subscribe(
+    state: &ElectrumState,
+    subs: &mut Subscriptions,
+    req: &Request,
+) -> Result<Value, JsonRpcError> {
+    use crate::handlers::tweaks;
+
+    let params = req.params.clone().unwrap_or(Value::Array(Vec::new()));
+    let treq = tweaks::parse_req(&params)?;
+    let src = tweaks::TweakSource::from_state(state)?;
+    let activation = src.activation_height();
+
+    // One stream per connection at a time. Superseding a live one is not
+    // possible safely: aborting the old task cannot retract notification lines
+    // it has already pushed into this connection's shared channel, so they
+    // would be written after the new subscribe's `result` and a client reading
+    // the last key as its progress marker would skip every height in between.
+    // Refusing is the safe direction and costs the normal client nothing — by
+    // the time it has read `{"message":"done"}` the task that sent it is gone.
+    if subs.tweaks_running() {
+        return Err(JsonRpcError::invalid_params(
+            "a tweak stream is already running on this connection; read it to \
+             {\"message\":\"done\"} before subscribing again",
+        ));
+    }
+
+    // A start above the tip is not an error: the client gets an empty map for
+    // that height and an immediate `done`, which is how a caught-up wallet
+    // polls. `last < from` makes the stream task a no-op plus `done`.
+    let last = treq.last_height(state.chain.tip_height()).unwrap_or(treq.start);
+    // `height_map` is the heaviest read on this surface: one index read, a full
+    // block read out of the flat files, and -- under cut-through, which is what
+    // Cake sends by default -- one UTXO lookup per taproot output of every
+    // eligible transaction in that block. `stream_chunk` already wraps the
+    // identical call in `spawn_blocking`; this synchronous first height was
+    // left on the API runtime's reactor, which is `max(2, cores/4)` workers
+    // shared with Esplora, events-gRPC and `/metrics`. On a small box that is
+    // two threads, and the per-request timeout in `server.rs` cannot preempt a
+    // synchronous body, so a client pipelining subscribes at dense heights
+    // could hold both. `block_in_place` moves this worker to the blocking pool
+    // for the duration and starts a replacement.
+    //
+    // Guarded because `block_in_place` panics on a current-thread runtime and
+    // outside a runtime altogether -- handler-level tests call this directly.
+    //
+    // Bounded, not just relocated: `block_in_place` moves the work off the
+    // reactor but nothing can interrupt it once started, and the per-request
+    // timeout wrapping this dispatch cannot fire while a synchronous body is
+    // running. So the cap has to be at admission. Refusing rather than queueing
+    // is the point -- waiting for a slot would hold this connection's request
+    // slot for exactly as long, and tell the client nothing.
+    let _slot = tweaks::try_claim_scan_slot().ok_or_else(tweaks::scan_slots_busy)?;
+    let read_first = || tweaks::height_map(&src, treq.start, treq.cut_through());
+    let first = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(read_first)
+        }
+        _ => read_first(),
+    }?;
+    subs.add_tweaks(
+        src,
+        treq.start.saturating_add(1),
+        last,
+        treq.cut_through(),
+        activation,
+    );
+    Ok(first)
 }
 
 fn handle_scripthash_subscribe(

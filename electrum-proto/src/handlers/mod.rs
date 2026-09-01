@@ -4,6 +4,7 @@
 //! - [`server_methods`] — `server.*`
 //! - [`blockchain`] — `blockchain.*`
 //! - [`mempool`] — `mempool.*`
+//! - [`tweaks`] — the BIP 352 `blockchain.tweaks.subscribe` stream
 //!
 //! Each handler is `fn(state, params) -> Result<Value, JsonRpcError>`,
 //! synchronous, no transport coupling. The dispatch layer
@@ -13,3 +14,4 @@
 pub mod blockchain;
 pub mod mempool;
 pub mod server_methods;
+pub mod tweaks;

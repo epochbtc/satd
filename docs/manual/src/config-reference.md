@@ -313,6 +313,7 @@ startup error.
 | `electrummaxbroadcastpackagetxs` | 25 | restart | satd | Max txs per `blockchain.transaction.broadcast_package`. |
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |
 | `electrumbanner` | `powered by satd <ver>` | restart | satd | Override for `server.banner`. |
+| `electrumservername` | `satd-electrs-compatible/<ver>` | restart | satd | Name reported by `server.version` and `server.features.server_version`. The default carries an `electrs` compatibility token because Electrum clients feature-detect by matching on this string (Cake Wallet probes silent-payment tweaks only when it contains `electrs`). Affects the Electrum surface only — the P2P user agent stays `/satd:<ver>/`. |
 
 ## Storage / pruning / reindex
 

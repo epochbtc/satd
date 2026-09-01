@@ -411,19 +411,14 @@ async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
 /// changed". The row on disk is untouched throughout; only the served view moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_tweak_cut_through_drops_spent_entries() {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::key::TapTweak;
-    use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
-    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-    use bitcoin::transaction::Version;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::OutPoint;
+    use crate::common::{build_signed_p2tr_keypath_spend, p2tr_keypath_output};
     use std::str::FromStr;
 
     let (sn, wallet) = matured_node_args(vec!["-silentpaymentindex=1"]).await;
     let secp = Secp256k1::new();
-    let kp = Keypair::from_seckey_slice(&secp, &[0x33; 32]).expect("taproot key");
-    let p2tr = ScriptBuf::new_p2tr(&secp, kp.x_only_public_key().0, None);
+    let (kp, p2tr) = p2tr_keypath_output(&secp, [0x33; 32]);
 
     // Funding: block-1's coinbase (P2WPKH) into a single taproot output. One
     // taproot output and one eligible input is the whole eligibility test, so
@@ -458,32 +453,15 @@ async fn sdk_tweak_cut_through_drops_spent_entries() {
 
     // Spend it, key-path, to a plain P2WPKH — so the spending transaction is not
     // itself silent-payment eligible and only the funding height carries a row.
-    let prevout = TxOut { value: Amount::from_sat(funded_value), script_pubkey: p2tr.clone() };
-    let mut spend = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint { txid: funded_txid, vout: 0 },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(funded_value - fee),
-            script_pubkey: DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
-        }],
-    };
-    let sighash = SighashCache::new(&spend)
-        .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::Default)
-        .expect("key-path sighash");
-    let sig = secp.sign_schnorr_no_aux_rand(
-        &Message::from_digest(sighash.to_byte_array()),
-        &kp.tap_tweak(&secp, None).to_keypair(),
+    let (raw_spend, _spend_txid) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        OutPoint { txid: funded_txid, vout: 0 },
+        p2tr.clone(),
+        funded_value,
+        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        fee,
     );
-    let mut witness = Witness::new();
-    witness.push(sig.as_ref());
-    spend.input[0].witness = witness;
-    let raw_spend = hex::encode(bitcoin::consensus::serialize(&spend));
     let rpc = sn.node.rpc_handle();
     tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_spend)).await.unwrap();
     mine_n(&sn, 1).await;

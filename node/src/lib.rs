@@ -13,6 +13,7 @@ pub mod net;
 pub mod perf;
 pub mod rpc;
 pub mod shutdown;
+pub mod sp_serve;
 pub mod stall_watchdog;
 pub mod startup_progress;
 pub mod time;

@@ -757,6 +757,20 @@ pub struct Config {
     /// composed at request time (`format!("powered by satd {}",
     /// version)`).
     pub electrum_banner: Option<String>,
+    /// Override for the server name reported by `server.version` and
+    /// `server.features.server_version`. `None` reports
+    /// `satd-electrs-compatible/<version>`.
+    ///
+    /// The reason the default carries `electrs`: Electrum has no capability
+    /// field, so clients feature-detect on this string, and Cake Wallet probes
+    /// `blockchain.tweaks.subscribe` only when it contains that substring. The
+    /// override exists for operators who would rather not advertise the token
+    /// — at the cost of those clients never probing — or who front satd with
+    /// tooling that keys off a name of their own.
+    ///
+    /// An empty value is treated as unset, with a warning: it would otherwise
+    /// advertise a nameless server and silently switch every gating client off.
+    pub electrum_server_name: Option<String>,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
@@ -2778,6 +2792,25 @@ impl Config {
             .or_else(|| file_get("electrumfeehistogramttl").and_then(|v| v.parse().ok()))
             .unwrap_or(10);
         let electrum_banner = cli.electrumbanner.or_else(|| file_get("electrumbanner"));
+        // A blank override (`electrumservername=` with nothing after it, the
+        // natural spelling for "leave this alone") would otherwise parse as a
+        // genuine `Some("")` and advertise a nameless server — switching off
+        // every client that feature-detects on the name, with nothing logged.
+        // Fall back to the default and say so.
+        let electrum_server_name = cli
+            .electrumservername
+            .or_else(|| file_get("electrumservername"))
+            .and_then(|name| {
+                if name.trim().is_empty() {
+                    eprintln!(
+                        "Warning: ignoring empty electrumservername; \
+                         reporting the default server name"
+                    );
+                    None
+                } else {
+                    Some(name)
+                }
+            });
 
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
@@ -3141,6 +3174,7 @@ impl Config {
             electrum_max_broadcast_package_txs,
             electrum_fee_histogram_ttl,
             electrum_banner,
+            electrum_server_name,
             blockfilterindex,
             peerblockfilters,
             prune,
@@ -4713,6 +4747,13 @@ pub struct CliArgs {
 
     #[arg(
         long,
+        value_name = "TEXT",
+        help = "Server name reported by server.version (default satd-electrs-compatible/<version>)"
+    )]
+    pub electrumservername: Option<String>,
+
+    #[arg(
+        long,
         value_name = "BOOL_OR_BASIC",
         value_parser = parse_blockfilterindex_arg,
         num_args = 0..=1,
@@ -5845,6 +5886,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrummaxbroadcastpackagetxs",
         "electrumfeehistogramttl",
         "electrumbanner",
+        "electrumservername",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -6528,6 +6570,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "electrummaxbroadcastpackagetxs",
     "electrumfeehistogramttl",
     "electrumbanner",
+    "electrumservername",
     // Storage / pruning / reindex
     "prune",
     "reindex",
@@ -8641,6 +8684,7 @@ testactivationheight=bip34@2
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            electrumservername: None,
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,
@@ -8928,6 +8972,7 @@ testactivationheight=bip34@2
             electrummaxbroadcastpackagetxs: None,
             electrumfeehistogramttl: None,
             electrumbanner: None,
+            electrumservername: None,
             blockfilterindex: None,
             peerblockfilters: None,
             prune: None,

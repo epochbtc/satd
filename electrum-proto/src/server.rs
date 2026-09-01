@@ -435,6 +435,11 @@ where
                     Err(FramingError::Closed) => return Ok(()),
                     Err(e) => return Err(e),
                 };
+                // `read_line_bounded` deliberately does not clear `buf` on
+                // entry: it is where a partially-read line survives this
+                // `select!` cancelling the read arm mid-line. Now that the line
+                // has been copied out, and only now, reset it for the next one.
+                buf.clear();
                 let response = match tokio::time::timeout(
                     request_timeout,
                     async { process_request(&mut dispatch, &line, max_batch) },

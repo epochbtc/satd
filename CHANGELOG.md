@@ -16,6 +16,14 @@ item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
 ### Added
+- `blockchain.tweaks.subscribe` on the Electrum server — the BIP 352 tweak stream
+  Cake Wallet and kiss-bdk already speak, served from the same index as the
+  streaming firehose. Requires `silentpaymentindex=1`; `historical_mode=false`
+  cuts through spent coins. A chunk serves at most 1000 heights and always
+  finishes the range it accepts, so `{"message":"done"}` means the same thing to
+  a client that reads it as "chunk ended" and one that reads it as "range
+  served"; a chunk that does stop early ends with an `incomplete` marker naming
+  the resume height instead
 - `tweak_unspent_only`, a cut-through filter on the streaming `tweaks` category:
   `BlockTweaks` entries whose taproot outputs are all already spent are dropped,
   so a balance scan skips the ECDH for coins that no longer exist. A surviving
@@ -23,6 +31,12 @@ item below is (or will be) written up in full in the in-development
   unaffected. Opt-in per
   subscription, in both SDKs; a wallet restoring transaction history must leave it
   off
+
+- `electrumservername=<name>`, overriding the server name reported by the
+  Electrum `server.version` and `server.features.server_version` methods. Clients
+  feature-detect on that string, so this is the lever for one that gates on a
+  name of its own. An override should not begin with `electrs` — BlueWallet
+  tests that prefix and permanently disables request batching on a match
 
 ### Changed
 - The BIP 352 client-side scan examples (Rust and Go) now run under the SDKs'
@@ -33,6 +47,11 @@ item below is (or will be) written up in full in the in-development
 - The Silent Payments and Rust SDK manual chapters state the commit-on-poll cursor
   contract the SDKs implement: persist the cursor of the last event you finished
   processing, never the one you were handed
+- The Electrum server name now reports `satd-electrs-compatible/<version>` from
+  `server.version` and `server.features.server_version`, instead of
+  `satd/<version>`. Electrum has no capability field, so clients feature-detect
+  on this string; Cake Wallet probes silent-payment tweaks only when it contains
+  `electrs`. `electrumservername=` overrides it. The P2P user agent is unchanged
 
 ### Fixed
 - A mined or submitted block that was stored without connecting (a sibling won
