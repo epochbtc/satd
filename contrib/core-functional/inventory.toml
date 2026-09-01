@@ -20,8 +20,8 @@ note = "satd accepts positional JSON-RPC parameters only; a named request fails 
 [[test]]
 file = "feature_addrman.py"
 status = "skip"
-reason = "core-log"
-note = "assert_debug_log expects 'Loaded 0 addresses from peers.dat'; satd logs a different message for the same event"
+reason = "feature-missing"
+note = "test writes/reads Core's peers.dat addrman format and checks corruption handling; satd has no addrman or peers.dat"
 
 [[test]]
 file = "feature_anchors.py"
@@ -165,7 +165,7 @@ note = "needs `generatetodescriptor`; the framework mines to MiniWallet's own de
 file = "feature_framework_startup_failures.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd takes longer than 3s to become RPC-ready in the test's abort-and-restart flow; harness timing issue"
+note = "clap's error format ('unexpected argument') doesn't match Core's ('Invalid parameter -nonexistentarg'); test regex-matches the exact error string"
 
 [[test]]
 file = "feature_framework_testshell.py"
@@ -745,7 +745,7 @@ note = "satd does not send a wtxidrelay message during handshake; test asserts g
 file = "p2p_leak_tx.py"
 status = "skip"
 reason = "feature-missing"
-note = "getpeerinfo permissions field has the wrong type (test indexes it as a string, satd returns a list)"
+note = "getrawmempool(verbose=false, mempool_sequence=true) returns a list instead of {txids, mempool_sequence}; satd has no mempool sequence counter"
 
 [[test]]
 file = "p2p_message_capture.py"
@@ -935,7 +935,7 @@ note = "estimatesmartfee with no args leaks a jsonrpsee ErrorObject Debug dump i
 file = "rpc_generate.py"
 status = "skip"
 reason = "feature-missing"
-note = "generatetoaddress rejects legacy P2PKH addresses (base58); also needs generateblock with combo() descriptor"
+note = "generatetoaddress error message is 'invalid address: validation error' where Core says 'Invalid address'; also needs generateblock with combo() descriptor"
 
 [[test]]
 file = "rpc_getblockfilter.py"
