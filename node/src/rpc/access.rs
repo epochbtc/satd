@@ -129,6 +129,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "help"
         | "echo"
         | "echojson"
+        | "generate"
         | "uptime"
         | "validateaddress"
         | "ping" => Read,

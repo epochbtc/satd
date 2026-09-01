@@ -179,9 +179,19 @@ pub(crate) fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
     block_height: Option<u32>,
+    confirmations: Option<i64>,
+) -> Value {
+    decode_transaction_verbose_net(tx, blockhash, block_height, confirmations, None)
+}
+
+pub(crate) fn decode_transaction_verbose_net(
+    tx: &bitcoin::Transaction,
+    blockhash: Option<&str>,
+    block_height: Option<u32>,
     // Signed: Core reports -1 for a transaction in a block that is not on the
     // active chain, the same convention as the block's own `confirmations`.
     confirmations: Option<i64>,
+    network: Option<bitcoin::Network>,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
@@ -226,14 +236,19 @@ pub(crate) fn decode_transaction_verbose(
         .enumerate()
         .map(|(n, output)| {
             let value = format_amount(output.value.to_sat(), unit);
+            let mut spk = serde_json::json!({
+                "asm": format!("{}", output.script_pubkey),
+                "hex": hex::encode(output.script_pubkey.as_bytes()),
+                "type": script_type(&output.script_pubkey),
+            });
+            if let Some(net) = network
+                && let Ok(addr) = bitcoin::Address::from_script(output.script_pubkey.as_script(), net) {
+                    spk["address"] = serde_json::Value::String(addr.to_string());
+            }
             json!({
                 "value": value,
                 "n": n,
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                    "type": script_type(&output.script_pubkey),
-                },
+                "scriptPubKey": spk,
             })
         })
         .collect();

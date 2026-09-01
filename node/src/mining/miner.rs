@@ -38,27 +38,28 @@ pub fn mine_block(
     mine_block_to_script(chain_state, mempool, addr.script_pubkey())
 }
 
-/// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
-pub fn mine_block_to_script(
+/// Build and solve a block paying to the given output script. Does NOT submit.
+pub fn build_block_to_script(
     chain_state: &ChainState,
     mempool: &Mempool,
     coinbase_script: ScriptBuf,
+    txs: Option<Vec<Transaction>>,
 ) -> Result<Block, MineError> {
     let template = create_template(chain_state, mempool);
 
-    // Build coinbase transaction
+    let other_txs: Vec<Transaction> = if let Some(explicit) = txs {
+        explicit
+    } else {
+        template.transactions.iter().map(|t| t.tx.clone()).collect()
+    };
+
     let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
 
-    // Assemble non-coinbase transactions
-    let other_txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();
-
-    // Check if any transaction has witness data
     let has_witness = other_txs.iter().any(|tx| {
         tx.input.iter().any(|i| !i.witness.is_empty())
     });
 
     if has_witness {
-        // Compute witness commitment (BIP 141)
         let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
         let witness_nonce = [0u8; 32];
         let mut commitment_preimage = [0u8; 64];
@@ -66,7 +67,6 @@ pub fn mine_block_to_script(
         commitment_preimage[32..].copy_from_slice(&witness_nonce);
         let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
 
-        // Add witness commitment output to coinbase
         let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
         commitment_script.extend_from_slice(&commitment.to_byte_array());
         coinbase_tx.output.push(TxOut {
@@ -74,18 +74,14 @@ pub fn mine_block_to_script(
             script_pubkey: ScriptBuf::from_bytes(commitment_script),
         });
 
-        // Set coinbase witness to single 32-byte zero item
         coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
     }
 
-    // Assemble final transaction list
     let mut txdata = vec![coinbase_tx];
     txdata.extend(other_txs);
 
-    // Compute merkle root (uses txids, not wtxids)
     let merkle_root = compute_merkle_root(&txdata);
 
-    // Build header
     let mut header = Header {
         version: Version::from_consensus(template.version),
         prev_blockhash: template.prev_hash,
@@ -95,8 +91,6 @@ pub fn mine_block_to_script(
         nonce: 0,
     };
 
-    // Mine: increment nonce until PoW valid
-    // On regtest (0x207fffff), almost any nonce works
     loop {
         let target = header.target();
         match header.validate_pow(target) {
@@ -104,16 +98,23 @@ pub fn mine_block_to_script(
             Err(_) => {
                 header.nonce += 1;
                 if header.nonce == 0 {
-                    // Wrapped around — try different time
                     header.time += 1;
                 }
             }
         }
     }
 
-    let block = Block { header, txdata };
+    Ok(Block { header, txdata })
+}
 
-    // Accept the block
+/// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
+pub fn mine_block_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+) -> Result<Block, MineError> {
+    let block = build_block_to_script(chain_state, mempool, coinbase_script, None)?;
+
     let acceptance = chain_state
         .accept_block(&block)
         .map_err(|e| MineError::Rejected(e.to_string()))?;

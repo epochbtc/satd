@@ -984,40 +984,70 @@ pub async fn start(
 
     module.register_method("generateblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
-        let address: String = seq
+        let output: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Core's `transactions` and `submit` are not implemented. Accepting and
-        // ignoring them is not a tolerable failure mode for either: `submit`
-        // false asks for a block to be built and NOT connected, and answering
-        // by mining and connecting it advances the chain the caller was told
-        // would not move — a test that asserts on the tip afterwards is then
-        // asserting against state it did not create. `transactions` asks for a
-        // specific block body and satd always builds from the mempool. Refuse
-        // both, so the gap is visible instead of silently wrong. (Ignoring them
-        // predates named parameters — a positional caller hit it too — but
-        // named arguments are how Core's own suite passes them.)
-        let transactions = seq.optional_next::<Vec<serde_json::Value>>();
-        let transactions_ok = matches!(&transactions, Ok(None))
-            || matches!(&transactions, Ok(Some(v)) if v.is_empty());
-        if !transactions_ok {
+        let raw_txs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
+        let submit: bool = seq.optional_next().unwrap_or(None).unwrap_or(true);
+
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
             return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: the 'transactions' argument is not supported by satd; \
-                 the block is built from the mempool",
-                None::<()>,
+                -1, "generateblock is only available in regtest mode", None::<()>,
             ));
         }
-        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: submit=false is not supported by satd; \
-                 a generated block is always submitted",
-                None::<()>,
-            ));
+
+        let coinbase_script = crate::rpc::descriptor::parse_descriptor(&output, ctx.chain_state.network)
+            .or_else(|_| {
+                let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output.parse()
+                    .map_err(|e| format!("{e}"))?;
+                let addr = addr.require_network(ctx.chain_state.network)
+                    .map_err(|e| format!("{e}"))?;
+                Ok::<_, String>(addr.script_pubkey())
+            })
+            .map_err(|e| ErrorObjectOwned::owned(-5, format!("Invalid address or descriptor: {e}"), None::<()>))?;
+
+        let explicit_txs = if let Some(raw) = raw_txs {
+            let mut txs = Vec::new();
+            for item in &raw {
+                let hex = item.as_str().ok_or_else(|| {
+                    ErrorObjectOwned::owned(-1, "transaction must be a string", None::<()>)
+                })?;
+                if hex.len() == 64 {
+                    let txid: bitcoin::Txid = hex.parse()
+                        .map_err(|_| ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>))?;
+                    let entry = ctx.mempool.get(&txid)
+                        .ok_or_else(|| ErrorObjectOwned::owned(-5, format!("Transaction {txid} not in mempool."), None::<()>))?;
+                    txs.push(entry.tx.clone());
+                } else {
+                    let tx_bytes = hex::decode(hex)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    txs.push(tx);
+                }
+            }
+            Some(txs)
+        } else {
+            None
+        };
+
+        let block = crate::mining::miner::build_block_to_script(
+            &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,
+        ).map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        let hash = block.block_hash().to_string();
+
+        if submit {
+            let acceptance = ctx.chain_state.accept_block(&block)
+                .map_err(|e| ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>))?;
+            if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
+                ctx.mempool.remove_for_block(&block, height);
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({ "hash": hash }))
+        } else {
+            let hex = hex::encode(bitcoin::consensus::serialize(&block));
+            Ok(serde_json::json!({ "hash": hash, "hex": hex }))
         }
-        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("getblocktemplate", |_params, ctx, _extensions| {
@@ -1679,6 +1709,14 @@ pub async fn start(
 
     // --- Control RPCs ---
 
+    module.register_method("generate", |_params, _ctx, _extensions| {
+        Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
+            -32601,
+            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n",
+            None::<()>,
+        ))
+    })?;
+
     module.register_method("echo", |params, _ctx, _extensions| {
         let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
         if args.len() >= 10
@@ -1777,7 +1815,11 @@ pub async fn start(
             "verifychain",
         ];
         if let Some(cmd) = command {
-            if cmd.is_empty() || methods.contains(&cmd.as_str()) {
+            if cmd == "generate" {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(
+                    "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+                ))
+            } else if cmd.is_empty() || methods.contains(&cmd.as_str()) {
                 Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")))
             } else {
                 Err(ErrorObjectOwned::owned(
