@@ -17,8 +17,19 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
     };
 
     match chain_state.accept_block(&block) {
-        Ok(_) => {
-            mempool.remove_for_block(&block, chain_state.tip_height());
+        Ok(acceptance) => {
+            // Only a block that joined the active chain confirms anything.
+            // `accept_block` also returns `Ok` for a block it stored without
+            // connecting — a side chain whose work does not beat the tip, a
+            // block far ahead during IBD, a reorg declined below an AssumeUTXO
+            // snapshot — and `remove_for_block` is not a no-op in that case: it
+            // deletes every transaction in the block from the mempool as
+            // *confirmed* and tells every events subscriber so. Submitting an
+            // ordinary stale sibling would have purged live transactions this
+            // node would otherwise relay and mine.
+            if let Some(height) = chain_state.connected_height(&acceptance) {
+                mempool.remove_for_block(&block, height);
+            }
             Value::Null
         }
         Err(e) => Value::String(e.to_string()),

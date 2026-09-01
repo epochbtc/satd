@@ -459,6 +459,61 @@ impl Drop for SnapshotLoadActive<'_> {
     }
 }
 
+/// What [`ChainState::accept_block`] did with a block it did not reject.
+///
+/// The distinction is load-bearing and used to be invisible: `accept_block`
+/// returned a bare `BlockHash` for both outcomes, so every caller that treated
+/// `Ok` as "this block is now the tip" was wrong on three paths — a side chain
+/// whose work does not beat the tip, a block far ahead of the tip during IBD,
+/// and a reorg declined because it would fork below an AssumeUTXO snapshot.
+///
+/// Getting it wrong is not cosmetic. The mempool's `remove_for_block` deletes
+/// every transaction in the block as *confirmed* and emits `LeaveConfirmed` to
+/// every events subscriber; running it for a block that never connected purges
+/// live transactions this node would otherwise relay and mine, and tells
+/// clients they confirmed in a block that `getblock` reports with
+/// `confirmations: -1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockAcceptance {
+    /// Connected: this block is on the active chain now, whether it extended
+    /// the tip directly or arrived via a reorg.
+    Connected(BlockHash),
+    /// Valid and stored, but **not** connected. The active chain is unchanged,
+    /// so nothing that follows a connect — mempool removal, fee sampling,
+    /// confirmation events — may run for it.
+    Stored(BlockHash),
+}
+
+impl BlockAcceptance {
+    /// The block's hash, whichever outcome this is.
+    pub fn hash(&self) -> BlockHash {
+        match self {
+            Self::Connected(h) | Self::Stored(h) => *h,
+        }
+    }
+
+    /// Whether the block joined the active chain.
+    pub fn connected(&self) -> bool {
+        matches!(self, Self::Connected(_))
+    }
+}
+
+impl ChainState {
+    /// The height a just-connected block occupies, or `None` if it did not
+    /// connect.
+    ///
+    /// The block's own height, read from its index entry — not `tip_height()`.
+    /// The tip is a separate read that a later connect can have moved on, and
+    /// the value is what `LeaveConfirmed` reports to clients as the confirming
+    /// height.
+    pub(crate) fn connected_height(&self, acceptance: &BlockAcceptance) -> Option<u32> {
+        if !acceptance.connected() {
+            return None;
+        }
+        self.get_block_index(&acceptance.hash()).map(|e| e.height)
+    }
+}
+
 impl ChainState {
     /// Create a new ChainState. If the store is empty, initializes with the genesis block.
     /// The store is wrapped in a CoinCache for in-memory UTXO batching.
@@ -5377,7 +5432,7 @@ impl ChainState {
     }
 
     /// Accept a new block into the chain.
-    pub fn accept_block(&self, block: &Block) -> Result<BlockHash, ChainError> {
+    pub fn accept_block(&self, block: &Block) -> Result<BlockAcceptance, ChainError> {
         // Serialize the whole accept→connect→commit critical section. The
         // connect thread already holds this implicitly (it is the sole P2P
         // writer); the guard exists to stop a concurrent `submitblock` /
@@ -5518,7 +5573,7 @@ impl ChainState {
                 .ok_or(ChainError::BadPrevBlock)?;
             if compare_u256(&new_chainwork, &tip_entry.chainwork) <= 0 {
                 // Side chain has less or equal work — don't reorg
-                return Ok(block_hash);
+                return Ok(BlockAcceptance::Stored(block_hash));
             }
 
             // During IBD, if the side chain is far ahead of our tip, don't attempt
@@ -5526,7 +5581,7 @@ impl ChainState {
             // This avoids expensive failed reorg attempts when blocks arrive
             // out of order from multiple peers.
             if new_height > tip_entry.height + 128 {
-                return Ok(block_hash);
+                return Ok(BlockAcceptance::Stored(block_hash));
             }
 
             // Side chain has more work — find fork point and reorg
@@ -5610,7 +5665,7 @@ impl ChainState {
                     new_height,
                     "AssumeUTXO: refusing reorg below the snapshot height"
                 );
-                return Ok(block_hash);
+                return Ok(BlockAcceptance::Stored(block_hash));
             }
 
             // Atomic-reorg durable checkpoint (issue #262). Flush the
@@ -6126,7 +6181,7 @@ impl ChainState {
         // against a stale work value.
         self.update_best_header(block_hash, new_chainwork);
 
-        Ok(block_hash)
+        Ok(BlockAcceptance::Connected(block_hash))
     }
 
     /// Abort an in-progress reorg atomically and infallibly (issue #262).
@@ -9181,7 +9236,7 @@ pub(crate) mod tests {
         let mut hashes = vec![genesis_hash];
         for i in 1..=6u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
             hashes.push(parent);
         }
 
@@ -9192,7 +9247,7 @@ pub(crate) mod tests {
         *cs.flat_files.lock() = FlatFileManager::new(cs.blocks_dir()).unwrap();
         for i in 7..=8u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
             hashes.push(parent);
         }
         assert_eq!(cs.tip_height(), 8);
@@ -10627,9 +10682,9 @@ pub(crate) mod tests {
         // Chain A: genesis -> A1 -> A2. Coins are FRESH — deliberately
         // never flushed, reproducing the unflushed-tip window.
         let a1 = build_test_block(genesis_hash, 1, 1_700_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_700_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         assert_eq!(cs.tip_height(), 2);
         assert_eq!(cs.tip_hash(), a2_hash);
 
@@ -10642,9 +10697,9 @@ pub(crate) mod tests {
         // are valid side blocks; B3 is the triggering block and is invalid
         // — it spends a non-existent outpoint, so it fails at connect.
         let b1 = build_test_block(genesis_hash, 1, 1_700_000_011);
-        let b1_hash = cs.accept_block(&b1).expect("store B1 side block");
+        let b1_hash = cs.accept_block(&b1).expect("store B1 side block").hash();
         let b2 = build_test_block(b1_hash, 2, 1_700_000_012);
-        let b2_hash = cs.accept_block(&b2).expect("store B2 side block");
+        let b2_hash = cs.accept_block(&b2).expect("store B2 side block").hash();
         // Tip is unchanged: B has only equal work so far.
         assert_eq!(cs.tip_hash(), a2_hash, "no reorg before B has more work");
 
@@ -10757,27 +10812,27 @@ pub(crate) mod tests {
 
         // Build chain A: genesis -> A1 -> A2
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
 
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
 
         assert_eq!(cs.tip_hash(), a2_hash);
         assert_eq!(cs.tip_height(), 2);
 
         // Build chain B: genesis -> B1 -> B2 -> B3 (different timestamps => different hashes)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         // B1 is a side chain block; tip should still be A2
         assert_eq!(cs.tip_hash(), a2_hash);
 
         let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         // Equal work (2 blocks each); no reorg
         assert_eq!(cs.tip_hash(), a2_hash);
 
         let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
         // B chain now has more work => reorg
         assert_eq!(cs.tip_hash(), b3_hash);
         assert_eq!(cs.tip_height(), 3);
@@ -10798,18 +10853,18 @@ pub(crate) mod tests {
 
         // Chain A: genesis -> A1 -> A2 (tip).
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         assert_eq!(cs.tip_hash(), a2_hash);
 
         // Chain B: genesis -> B1 -> B2 -> B3 outweighs A → reorg.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
         assert_eq!(cs.tip_hash(), b3_hash);
 
         // New tip's cumulative reflects the B chain from genesis.
@@ -10838,7 +10893,7 @@ pub(crate) mod tests {
 
         // Active chain: genesis -> A1 -> A2 (A1 is active at height 1).
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         cs.accept_block(&a2).expect("accept A2");
 
@@ -10893,9 +10948,9 @@ pub(crate) mod tests {
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let _a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let _a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         // After connect_block: height_hash[1] = A1.
         assert_eq!(cs.get_block_hash_by_height(1), Some(a1_hash));
 
@@ -10916,9 +10971,9 @@ pub(crate) mod tests {
         // Extend B with two more blocks via accept_block — heavier
         // chain than A.
         let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
 
         // Reorg must succeed: fork point is genesis, B3 is the new tip.
         // The previous height-index-based fork-point logic would have
@@ -10946,9 +11001,9 @@ pub(crate) mod tests {
 
         // Active chain: genesis -> A1 -> A2 (tip at height 2).
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
 
         // Inject a polluted height_hash[1] = B1 (store_block no longer clobbers
         // the active index — the fix), to prove the consumer reads the active
@@ -10995,9 +11050,9 @@ pub(crate) mod tests {
 
         // Active chain A: genesis -> A1 -> A2.
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
 
         // Drain pre-reorg connect events.
         let mut pre_events = Vec::new();
@@ -11008,11 +11063,11 @@ pub(crate) mod tests {
 
         // Heavier B: genesis -> B1 -> B2 -> B3 — triggers reorg on B3.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
 
         // Collect the events emitted during accept_block(B3). Side
         // chain blocks B1/B2 are stored as side-chain (no reorg),
@@ -11069,18 +11124,18 @@ pub(crate) mod tests {
 
         // Active chain A: genesis -> A1 -> A2.
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         assert_eq!(cs.tip_hash(), a2_hash);
 
         // Heavier B: genesis -> B1 -> B2 -> B3. Reorgs over A.
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
-        let b3_hash = cs.accept_block(&b3).expect("accept B3");
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
         assert_eq!(cs.tip_hash(), b3_hash);
         // Sanity: A2 was disconnected but its block-index status is
         // still Valid — exactly the condition the old fork-point
@@ -11092,11 +11147,11 @@ pub(crate) mod tests {
         // Now extend the previously-disconnected A branch with new
         // blocks A3 -> A4 -> A5, beating B's work.
         let a3 = build_test_block(a2_hash, 3, 1_300_000_020);
-        let a3_hash = cs.accept_block(&a3).expect("accept A3");
+        let a3_hash = cs.accept_block(&a3).expect("accept A3").hash();
         let a4 = build_test_block(a3_hash, 4, 1_300_000_021);
-        let a4_hash = cs.accept_block(&a4).expect("accept A4");
+        let a4_hash = cs.accept_block(&a4).expect("accept A4").hash();
         let a5 = build_test_block(a4_hash, 5, 1_300_000_022);
-        let a5_hash = cs.accept_block(&a5).expect("accept A5");
+        let a5_hash = cs.accept_block(&a5).expect("accept A5").hash();
 
         // Reorg should activate to A5 (the heavier chain).
         assert_eq!(cs.tip_hash(), a5_hash);
@@ -11117,11 +11172,11 @@ pub(crate) mod tests {
 
         // Build chain A: genesis -> A1 -> A2 -> A3
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         let a3 = build_test_block(a2_hash, 3, 1_300_000_003);
-        let a3_hash = cs.accept_block(&a3).expect("accept A3");
+        let a3_hash = cs.accept_block(&a3).expect("accept A3").hash();
 
         assert_eq!(cs.tip_hash(), a3_hash);
         assert_eq!(cs.tip_height(), 3);
@@ -11144,7 +11199,7 @@ pub(crate) mod tests {
 
         // Build chain A: genesis -> A1
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         assert_eq!(cs.tip_hash(), a1_hash);
 
         // Submit B1 forking from genesis (equal work)
@@ -11165,7 +11220,7 @@ pub(crate) mod tests {
 
         // Build chain A: genesis -> A1 -> A2
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a1_coinbase_txid = a1.txdata[0].compute_txid();
 
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
@@ -11180,11 +11235,11 @@ pub(crate) mod tests {
 
         // Build chain B: genesis -> B1 -> B2 -> B3 (more work => triggers reorg)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_003);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b1_coinbase_txid = b1.txdata[0].compute_txid();
 
         let b2 = build_test_block(b1_hash, 2, 1_300_000_004);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b2_coinbase_txid = b2.txdata[0].compute_txid();
 
         let b3 = build_test_block(b2_hash, 3, 1_300_000_005);
@@ -11271,6 +11326,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_equal_work_sibling_is_stored_and_never_reported_as_connected() {
+        // `accept_block` returned a bare `BlockHash` for both outcomes, so
+        // callers read `Ok` as "this block is the tip now". It is not: a side
+        // chain whose work does not beat the tip is stored and the active chain
+        // is untouched.
+        //
+        // Getting this wrong is not cosmetic. `submitblock` and the P2P connect
+        // path both followed `Ok` with `mempool.remove_for_block`, which deletes
+        // every transaction in the block from the mempool as *confirmed* and
+        // emits `LeaveConfirmed` to every events subscriber. An ordinary stale
+        // sibling -- equal work, so `compare_u256 <= 0` -- would purge live
+        // transactions this node would otherwise relay and mine, and tell
+        // clients they confirmed in a block `getblock` reports at
+        // `confirmations: -1`.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+
+        let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let first = cs.accept_block(&block1).expect("first block accepted");
+        assert!(first.connected(), "extending the tip connects");
+        assert_eq!(cs.tip_hash(), block1.block_hash());
+
+        // A sibling at the same height: same work, different hash. Valid, worth
+        // storing, but it does not win.
+        let sibling = build_test_block(genesis_hash, 1, 1_300_000_099);
+        assert_ne!(sibling.block_hash(), block1.block_hash(), "a genuine sibling");
+        let second = cs.accept_block(&sibling).expect("a valid sibling is accepted, not rejected");
+        assert!(
+            !second.connected(),
+            "an equal-work sibling is stored, not connected -- anything that \
+             follows a connect (mempool removal, fee sampling, confirmation \
+             events) must not run for it",
+        );
+        assert_eq!(second.hash(), sibling.block_hash(), "and it reports its own hash");
+        assert_eq!(
+            cs.tip_hash(),
+            block1.block_hash(),
+            "the active chain is unchanged",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_prune_blocks() {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
@@ -11280,7 +11379,7 @@ pub(crate) mod tests {
         let mut hashes = vec![genesis_hash];
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|_| panic!("accept block {}", i));
+            parent = cs.accept_block(&block).unwrap_or_else(|_| panic!("accept block {}", i)).hash();
             hashes.push(parent);
         }
         assert_eq!(cs.tip_height(), 5);
@@ -11307,7 +11406,7 @@ pub(crate) mod tests {
 
         // Build a single block
         let block1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let hash1 = cs.accept_block(&block1).unwrap();
+        let hash1 = cs.accept_block(&block1).unwrap().hash();
 
         // Manually mark it as pruned
         let mut entry = cs.get_block_index(&hash1).unwrap();
@@ -11701,10 +11800,10 @@ pub(crate) mod tests {
         let t3 = 1_300_000_150; // Out of order vs t2 to test sorting
 
         let b1 = build_test_block(genesis_hash, 1, t1);
-        let h1 = cs.accept_block(&b1).unwrap();
+        let h1 = cs.accept_block(&b1).unwrap().hash();
 
         let b2 = build_test_block(h1, 2, t2);
-        let h2 = cs.accept_block(&b2).unwrap();
+        let h2 = cs.accept_block(&b2).unwrap().hash();
 
         let b3 = build_test_block(h2, 3, t3);
         cs.accept_block(&b3).unwrap();
@@ -11741,7 +11840,7 @@ pub(crate) mod tests {
         let mut a_hashes = Vec::new();
         for i in 1..=10u32 {
             let block = build_test_block(parent_a, i, 1_400_000_000 + i);
-            parent_a = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept A{}: {}", i, e));
+            parent_a = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept A{}: {}", i, e)).hash();
             a_hashes.push(parent_a);
         }
         assert_eq!(cs.tip_height(), 10);
@@ -11764,7 +11863,7 @@ pub(crate) mod tests {
         let mut b_hashes = Vec::new();
         for i in 1..=11u32 {
             let block = build_test_block(parent_b, i, 1_500_000_000 + i);
-            parent_b = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept B{}: {}", i, e));
+            parent_b = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept B{}: {}", i, e)).hash();
             b_hashes.push(parent_b);
         }
 
@@ -11818,7 +11917,7 @@ pub(crate) mod tests {
 
         // Build chain A: genesis -> A1 -> A2 (each adds 1 coinbase UTXO)
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
         cs.accept_block(&a2).expect("accept A2");
 
@@ -11827,9 +11926,9 @@ pub(crate) mod tests {
 
         // Build chain B: genesis -> B1 -> B2 -> B3 (more work => reorg)
         let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
-        let b1_hash = cs.accept_block(&b1).expect("accept B1");
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
         let b2 = build_test_block(b1_hash, 2, 1_300_000_011);
-        let b2_hash = cs.accept_block(&b2).expect("accept B2");
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
         let b3 = build_test_block(b2_hash, 3, 1_300_000_012);
         cs.accept_block(&b3).expect("accept B3");
 
@@ -11946,7 +12045,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for (i, &ts) in timestamps.iter().enumerate() {
             let block = build_test_block(parent, (i + 1) as u32, ts);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i + 1, e));
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i + 1, e)).hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -11983,7 +12082,7 @@ pub(crate) mod tests {
         for i in 1..=12u32 {
             let ts = base_time + i * 100;
             let block = build_test_block(parent, i, ts);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
             block_timestamps.push(ts);
         }
         assert_eq!(cs.tip_height(), 12);
@@ -12137,9 +12236,9 @@ pub(crate) mod tests {
 
         // Active chain: genesis -> A1 -> A2.
         let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
-        let a1_hash = cs.accept_block(&a1).expect("accept A1");
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
         let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
-        let a2_hash = cs.accept_block(&a2).expect("accept A2");
+        let a2_hash = cs.accept_block(&a2).expect("accept A2").hash();
         assert_eq!(cs.tip_hash(), a2_hash);
 
         // A1 becomes a block this chainstate never connected. Its hash is
@@ -12239,11 +12338,11 @@ pub(crate) mod tests {
         );
         assert_ne!(a102.block_hash(), b102.block_hash());
 
-        let b102_hash = cs.accept_block(&b102).expect("accept B102");
+        let b102_hash = cs.accept_block(&b102).expect("accept B102").hash();
         let b103 = build_test_block(b102_hash, 103, 1_300_000_301);
-        let b103_hash = cs.accept_block(&b103).expect("accept B103");
+        let b103_hash = cs.accept_block(&b103).expect("accept B103").hash();
         let b104 = build_test_block(b103_hash, 104, 1_300_000_302);
-        let b104_hash = cs.accept_block(&b104).expect("accept B104");
+        let b104_hash = cs.accept_block(&b104).expect("accept B104").hash();
         assert_eq!(cs.tip_hash(), b104_hash, "B must have won");
 
         // Drop the index overlays so the height/txindex/chain_tx dimensions —
@@ -12293,9 +12392,9 @@ pub(crate) mod tests {
         // them, so both land in one batch.
 
         let b102 = build_test_block_spending(fork_point, 102, 1_300_000_300, mature);
-        let b102_hash = cs.accept_block(&b102).expect("accept B102");
+        let b102_hash = cs.accept_block(&b102).expect("accept B102").hash();
         let b103 = build_test_block(b102_hash, 103, 1_300_000_301);
-        let b103_hash = cs.accept_block(&b103).expect("accept B103");
+        let b103_hash = cs.accept_block(&b103).expect("accept B103").hash();
         let b104 = build_test_block(b103_hash, 104, 1_300_000_302);
         cs.accept_block(&b104).expect("accept B104");
 
@@ -12339,7 +12438,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for h in 1..=20u32 {
             let b = build_test_block(parent, h, BASE + 1000 * h);
-            parent = cs.accept_block(&b).expect("accept trunk");
+            parent = cs.accept_block(&b).expect("accept trunk").hash();
         }
         let fork_point = parent;
 
@@ -12349,7 +12448,7 @@ pub(crate) mod tests {
         for h in 21..=23u32 {
             let ts = BASE + 100_000 + 1000 * h;
             let b = build_test_block(a_parent, h, ts);
-            a_parent = cs.accept_block(&b).expect("accept A");
+            a_parent = cs.accept_block(&b).expect("accept A").hash();
             a_times.push(ts);
         }
         assert_eq!(cs.tip_height(), 23, "A must hold the tip");
@@ -12388,7 +12487,7 @@ pub(crate) mod tests {
         let mut b_parent = fork_point;
         for (i, h) in (21..=22u32).enumerate() {
             let b = build_test_block(b_parent, h, b_times[i]);
-            b_parent = cs.accept_block(&b).expect("accept B side block");
+            b_parent = cs.accept_block(&b).expect("accept B side block").hash();
         }
 
         // B23 carries the time-locked transaction. Its input does not exist,
@@ -12399,7 +12498,7 @@ pub(crate) mod tests {
             vout: 7,
         };
         let b23 = build_test_block_timelocked(b_parent, 23, b_times[2], bogus, lock_time);
-        b_parent = cs.accept_block(&b23).expect("store B23 as a side block");
+        b_parent = cs.accept_block(&b23).expect("store B23 as a side block").hash();
 
         // B24 gives B more work than A and triggers the reorg, which reconnects
         // B21, B22 and then B23 — where the MTP under test is read.
@@ -12507,7 +12606,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for h in 1..=3u32 {
             let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
-            parent = cs.accept_block(&b).expect("accept trunk");
+            parent = cs.accept_block(&b).expect("accept trunk").hash();
         }
         let fork_point = parent;
 
@@ -12516,7 +12615,7 @@ pub(crate) mod tests {
         let mut a_first = None;
         for h in 4..=5u32 {
             let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
-            a_parent = cs.accept_block(&b).expect("accept A");
+            a_parent = cs.accept_block(&b).expect("accept A").hash();
             a_first.get_or_insert(b.block_hash());
         }
         let b4 = build_test_block(fork_point, 4, 1_600_010_000);
@@ -12545,7 +12644,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for h in 1..=10u32 {
             let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
-            parent = cs.accept_block(&b).expect("accept trunk");
+            parent = cs.accept_block(&b).expect("accept trunk").hash();
         }
         let fork_point = parent;
 
@@ -12555,7 +12654,7 @@ pub(crate) mod tests {
         let mut a_blocks = Vec::new();
         for h in 11..=14u32 {
             let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
-            a_parent = cs.accept_block(&b).expect("accept A");
+            a_parent = cs.accept_block(&b).expect("accept A").hash();
             a_blocks.push(b);
         }
         assert_eq!(cs.tip_height(), 14);
@@ -12580,7 +12679,7 @@ pub(crate) mod tests {
         let mut parent = cs.tip_hash();
         for h in 14..=24u32 {
             let b = build_test_block(parent, h, 1_600_010_000 + h * 600);
-            parent = cs.accept_block(&b).expect("accept extension");
+            parent = cs.accept_block(&b).expect("accept extension").hash();
         }
 
         for height in 12..=25u32 {
@@ -12613,7 +12712,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for h in 1..=10u32 {
             let b = build_test_block(parent, h, 1_600_000_000 + h * 600);
-            parent = cs.accept_block(&b).expect("accept trunk");
+            parent = cs.accept_block(&b).expect("accept trunk").hash();
         }
         let fork_point = parent;
 
@@ -12621,7 +12720,7 @@ pub(crate) mod tests {
         let mut a_parent = fork_point;
         for h in 11..=13u32 {
             let b = build_test_block(a_parent, h, 1_700_000_000 + h * 600);
-            a_parent = cs.accept_block(&b).expect("accept A");
+            a_parent = cs.accept_block(&b).expect("accept A").hash();
         }
         assert_eq!(cs.tip_height(), 13);
 
@@ -12632,7 +12731,7 @@ pub(crate) mod tests {
         for h in 11..=14u32 {
             let ts = 1_600_010_000 + h * 600;
             let b = build_test_block(b_parent, h, ts);
-            b_parent = cs.accept_block(&b).expect("accept B");
+            b_parent = cs.accept_block(&b).expect("accept B").hash();
             b_times.push((h, ts));
         }
         assert_eq!(cs.tip_height(), 14, "B must have won");
@@ -12645,7 +12744,7 @@ pub(crate) mod tests {
         let mut parent = cs.tip_hash();
         for h in 15..=24u32 {
             let b = build_test_block(parent, h, 1_600_010_000 + h * 600);
-            parent = cs.accept_block(&b).expect("accept extension");
+            parent = cs.accept_block(&b).expect("accept extension").hash();
         }
 
         for height in 15..=25u32 {
@@ -12732,7 +12831,7 @@ pub(crate) mod tests {
                 } else {
                     build_test_block(parent, h, 1_300_001_000 + h)
                 };
-                parent = cs.accept_block(&block).expect("accept A");
+                parent = cs.accept_block(&block).expect("accept A").hash();
             }
             if flush_after_a {
                 cs.store_ref().flush().expect("flush A");
@@ -12748,7 +12847,7 @@ pub(crate) mod tests {
                 } else {
                     build_test_block(parent, h, 1_300_002_000 + h)
                 };
-                parent = cs.accept_block(&block).expect("accept B");
+                parent = cs.accept_block(&block).expect("accept B").hash();
                 if flush_mid_b && i == b_len / 2 {
                     cs.store_ref().flush().expect("flush mid-B");
                 }
@@ -13382,7 +13481,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).expect("accept_block");
+            parent = cs.accept_block(&block).expect("accept_block").hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -13509,7 +13608,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).expect("accept_block");
+            parent = cs.accept_block(&block).expect("accept_block").hash();
         }
         let real_tip = cs.tip_hash();
         assert_eq!(cs.tip_height(), 5);
@@ -13654,7 +13753,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -13729,7 +13828,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for i in 1..=5u32 {
             let block = build_test_block(parent, i, 1_300_000_000 + i);
-            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e));
+            parent = cs.accept_block(&block).unwrap_or_else(|e| panic!("accept block {}: {}", i, e)).hash();
         }
         assert_eq!(cs.tip_height(), 5);
 
@@ -13793,7 +13892,7 @@ pub(crate) mod tests {
         let mut parent = genesis.block_hash();
         for h in 1..=1200u32 {
             let block = build_test_block(parent, h, 1_300_000_000 + h);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
         }
 
         // Clear chainstate + reset in-memory tip so reindex starts fresh.
@@ -13882,7 +13981,7 @@ pub(crate) mod tests {
         let mut main_hashes = Vec::new();
         for h in 1..=3u32 {
             let b = build_test_block(parent, h, 1_709_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
         }
         let main_tip = parent;
@@ -13950,7 +14049,7 @@ pub(crate) mod tests {
         let mut main_hashes = Vec::new();
         for h in 1..=3u32 {
             let b = build_test_block(parent, h, 1_709_100_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
         }
 
@@ -14015,7 +14114,7 @@ pub(crate) mod tests {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let b1 = build_test_block(genesis_hash, 1, 1_709_200_001);
-        let h1 = cs.accept_block(&b1).expect("accept");
+        let h1 = cs.accept_block(&b1).expect("accept").hash();
 
         assert!(cs.get_block(&h1).is_some(), "readable before the hole");
         assert!(
@@ -14064,7 +14163,7 @@ pub(crate) mod tests {
         let mut blocks = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_700_100_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
             blocks.push(b);
         }
@@ -14074,7 +14173,7 @@ pub(crate) mod tests {
         // so connecting it on top of m3 would NOT fail — it would just add a
         // coinbase that never existed on the active chain.
         let stale = build_test_block(main_hashes[1], 3, 1_700_200_003);
-        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
         assert_eq!(cs.tip_hash(), main_tip, "equal work must not reorg the tip");
         let stale_coin = OutPoint {
             txid: stale.txdata[0].compute_txid(),
@@ -14145,10 +14244,10 @@ pub(crate) mod tests {
         // 101 blocks so block 1's coinbase is mature and spendable at 102.
         let mut parent = genesis_hash;
         let first = build_test_block(parent, 1, 1_700_300_001);
-        parent = cs.accept_block(&first).expect("accept block 1");
+        parent = cs.accept_block(&first).expect("accept block 1").hash();
         for h in 2..=101u32 {
             let b = build_test_block(parent, h, 1_700_300_000 + h);
-            parent = cs.accept_block(&b).expect("accept filler block");
+            parent = cs.accept_block(&b).expect("accept filler block").hash();
         }
         let mature = OutPoint {
             txid: first.txdata[0].compute_txid(),
@@ -14157,9 +14256,9 @@ pub(crate) mod tests {
 
         // Two competing blocks at height 102, both spending the same coin.
         let main = build_test_block_spending(parent, 102, 1_700_300_102, mature);
-        let main_hash = cs.accept_block(&main).expect("accept main 102");
+        let main_hash = cs.accept_block(&main).expect("accept main 102").hash();
         let stale = build_test_block_spending(parent, 102, 1_700_400_102, mature);
-        let stale_hash = cs.accept_block(&stale).expect("store stale 102");
+        let stale_hash = cs.accept_block(&stale).expect("store stale 102").hash();
         assert_ne!(main_hash, stale_hash);
         assert_eq!(cs.tip_hash(), main_hash, "equal work must not reorg the tip");
 
@@ -14196,7 +14295,7 @@ pub(crate) mod tests {
         let mut a_hashes = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_700_500_000 + h);
-            parent = cs.accept_block(&b).expect("accept A block");
+            parent = cs.accept_block(&b).expect("accept A block").hash();
             a_hashes.push(parent);
         }
         assert_eq!(cs.tip_height(), 5);
@@ -14206,7 +14305,7 @@ pub(crate) mod tests {
         let mut b_hashes = Vec::new();
         for h in 3..=8u32 {
             let b = build_test_block(parent, h, 1_700_600_000 + h);
-            parent = cs.accept_block(&b).expect("accept B block");
+            parent = cs.accept_block(&b).expect("accept B block").hash();
             b_hashes.push(parent);
         }
         let b_tip = parent;
@@ -14265,13 +14364,13 @@ pub(crate) mod tests {
         let mut main_hashes = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_701_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
         }
         let main_tip = *main_hashes.last().unwrap();
         // Stale sibling of block 3, stored but never on the active chain.
         let stale = build_test_block(main_hashes[1], 3, 1_701_100_003);
-        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
         assert_eq!(cs.tip_hash(), main_tip);
         let stale_coin = OutPoint {
             txid: stale.txdata[0].compute_txid(),
@@ -14339,7 +14438,7 @@ pub(crate) mod tests {
         let mut main_hashes = Vec::new();
         for h in 1..=4u32 {
             let b = build_test_block(parent, h, 1_704_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
         }
         let real_tip = *main_hashes.last().unwrap();
@@ -14350,7 +14449,7 @@ pub(crate) mod tests {
         // branches tie exactly on cumulative chainwork and the incumbent rule
         // is what decides.
         let sibling = build_test_block(main_hashes[2], 4, 1_704_000_999);
-        let sibling_hash = cs.accept_block(&sibling).expect("store tip sibling");
+        let sibling_hash = cs.accept_block(&sibling).expect("store tip sibling").hash();
         assert_ne!(sibling_hash, real_tip, "fixture must produce a distinct sibling");
         assert_eq!(cs.tip_hash(), real_tip, "equal work must not reorg the tip");
 
@@ -14412,9 +14511,9 @@ pub(crate) mod tests {
         // The planned block, and an equal-work sibling of it that is also on
         // disk — the wrong-but-well-formed record a corrupt position lands on.
         let planned = build_test_block(genesis_hash, 1, 1_705_000_001);
-        let planned_hash = cs.accept_block(&planned).expect("accept planned block");
+        let planned_hash = cs.accept_block(&planned).expect("accept planned block").hash();
         let wrong = build_test_block(genesis_hash, 1, 1_705_000_999);
-        let wrong_hash = cs.accept_block(&wrong).expect("store sibling");
+        let wrong_hash = cs.accept_block(&wrong).expect("store sibling").hash();
         assert_ne!(planned_hash, wrong_hash, "fixture must produce two records");
         assert_eq!(
             wrong.header.prev_blockhash, genesis_hash,
@@ -14556,7 +14655,7 @@ pub(crate) mod tests {
         let mut blocks = Vec::new();
         for h in 1..=3u32 {
             let b = build_test_block(parent, h, 1_707_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept block");
+            parent = cs.accept_block(&b).expect("accept block").hash();
             hashes.push(parent);
             blocks.push(b);
         }
@@ -14643,7 +14742,7 @@ pub(crate) mod tests {
         let mut hashes = Vec::new();
         for h in 1..=3u32 {
             let b = build_test_block(parent, h, 1_710_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept block");
+            parent = cs.accept_block(&b).expect("accept block").hash();
             hashes.push(parent);
         }
         let main_tip = parent;
@@ -14715,7 +14814,7 @@ pub(crate) mod tests {
         let mut hashes = vec![genesis_hash];
         for h in 1..=12u32 {
             let b = build_test_block(parent, h, BASE + 100 * h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             hashes.push(parent);
         }
 
@@ -14723,7 +14822,7 @@ pub(crate) mod tests {
         // median down when it usurps that height's row. It must still be
         // above its own ancestors' MTP or it would not have been storable.
         let stale = build_test_block(hashes[9], 10, BASE + 650);
-        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
         assert_eq!(cs.tip_hash(), hashes[12], "the sibling must not win the tip");
 
         // Block 13 goes on disk and into the index WITHOUT being connected —
@@ -14798,9 +14897,9 @@ pub(crate) mod tests {
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
         let b1 = build_test_block(genesis_hash, 1, 1_706_000_001);
-        let h1 = cs.accept_block(&b1).expect("accept block 1");
+        let h1 = cs.accept_block(&b1).expect("accept block 1").hash();
         let b2 = build_test_block(h1, 2, 1_706_000_002);
-        let h2 = cs.accept_block(&b2).expect("accept block 2");
+        let h2 = cs.accept_block(&b2).expect("accept block 2").hash();
 
         cs.flush_coin_cache().expect("flush before clearing");
         cs.store.flush().unwrap();
@@ -14871,7 +14970,7 @@ pub(crate) mod tests {
         let mut parent = genesis_hash;
         for h in 1..=6u32 {
             let b = build_test_block(parent, h, 1_703_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept block");
+            parent = cs.accept_block(&b).expect("accept block").hash();
         }
         let real_tip = cs.tip_hash();
         let real_height = cs.tip_height();
@@ -14940,7 +15039,7 @@ pub(crate) mod tests {
         let mut hashes = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_702_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             hashes.push(parent);
         }
         let main_tip = parent;
@@ -14990,13 +15089,13 @@ pub(crate) mod tests {
         let mut a_hashes = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_704_000_000 + h);
-            parent = cs.accept_block(&b).expect("accept A block");
+            parent = cs.accept_block(&b).expect("accept A block").hash();
             a_hashes.push(parent);
         }
         let mut parent = a_hashes[1];
         for h in 3..=8u32 {
             let b = build_test_block(parent, h, 1_704_100_000 + h);
-            parent = cs.accept_block(&b).expect("accept B block");
+            parent = cs.accept_block(&b).expect("accept B block").hash();
         }
         let b_tip = parent;
         assert_eq!(cs.tip_hash(), b_tip);
@@ -15037,7 +15136,7 @@ pub(crate) mod tests {
         let mut blocks = Vec::new();
         for h in 1..=5u32 {
             let b = build_test_block(parent, h, 1_700_900_000 + h);
-            parent = cs.accept_block(&b).expect("accept block");
+            parent = cs.accept_block(&b).expect("accept block").hash();
             blocks.push(b);
         }
         let main_tip = parent;
@@ -15082,11 +15181,11 @@ pub(crate) mod tests {
         let mut main_hashes = Vec::new();
         for h in 1..=6u32 {
             let b = build_test_block(parent, h, 1_700_700_000 + h);
-            parent = cs.accept_block(&b).expect("accept main block");
+            parent = cs.accept_block(&b).expect("accept main block").hash();
             main_hashes.push(parent);
         }
         let stale = build_test_block(main_hashes[1], 3, 1_700_800_003);
-        let stale_hash = cs.accept_block(&stale).expect("store stale sibling");
+        let stale_hash = cs.accept_block(&stale).expect("store stale sibling").hash();
 
         let re = reindexing_chain_state_over(&dir);
         re.reindex_from_flat_files(Some(4), None)
@@ -15115,7 +15214,7 @@ pub(crate) mod tests {
         let mut parent = genesis.block_hash();
         for h in 1..=300u32 {
             let block = build_test_block(parent, h, 1_300_000_000 + h);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
         }
         cs.store.flush().unwrap();
         let count_before = cs.coin_count();
@@ -15167,7 +15266,7 @@ pub(crate) mod tests {
         let mut parent = genesis.block_hash();
         for h in 1..=600u32 {
             let block = build_test_block(parent, h, 1_300_000_000 + h);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
         }
         cs.store.flush().unwrap();
         cs.store.clear_chainstate().unwrap();
@@ -15404,7 +15503,7 @@ pub(crate) mod tests {
         let mut parent = genesis.block_hash();
         for h in 1..=257u32 {
             let block = build_test_block(parent, h, 1_300_000_000 + h);
-            parent = cs.accept_block(&block).unwrap();
+            parent = cs.accept_block(&block).unwrap().hash();
         }
         cs.store.flush().unwrap();
         let plan = plan_replay_from_block_index(&*cs.store, genesis.block_hash(), None).unwrap();

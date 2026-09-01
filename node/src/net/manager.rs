@@ -3681,7 +3681,7 @@ impl PeerManager {
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
                 match chain_state.accept_block(&block) {
-                    Ok(_) => {
+                    Ok(acceptance) => {
                         chain_state.bump_connect_heartbeat();
                         // A successful steady-state connect disproves "the
                         // connector cannot make progress" no matter which
@@ -3691,9 +3691,28 @@ impl PeerManager {
                         chain_state
                             .warnings()
                             .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
-                        fee_estimator.record_block(&fees);
-                        mempool.remove_for_block(&block, chain_state.tip_height());
-                        reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
+                        // Everything below this point is "a block joined the
+                        // active chain" bookkeeping, and `accept_block` also
+                        // returns `Ok` for a block it stored WITHOUT connecting
+                        // — a side chain whose work does not beat the tip, a
+                        // block far ahead of the tip during IBD, a reorg
+                        // declined below an AssumeUTXO snapshot. Running it
+                        // then is not harmless: `remove_for_block` deletes
+                        // every transaction in the block from the mempool as
+                        // *confirmed* and emits `LeaveConfirmed` to every
+                        // subscriber, so an ordinary stale sibling would purge
+                        // live transactions this node would otherwise relay and
+                        // mine, and tell clients they confirmed in a block
+                        // `getblock` reports at `confirmations: -1`. The fee
+                        // estimator would likewise sample a block that never
+                        // confirmed.
+                        if let Some(height) =
+                            chain_state.connected_height(&acceptance)
+                        {
+                            fee_estimator.record_block(&fees);
+                            mempool.remove_for_block(&block, height);
+                            reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
+                        }
                         // Drain buffer
                         loop {
                             let tip = chain_state.tip_hash();
@@ -3701,10 +3720,19 @@ impl PeerManager {
                                 Some(b) => {
                                     let b_fees = Self::compute_block_fee_rates(&b, &chain_state);
                                     match chain_state.accept_block(&b) {
-                                        Ok(_) => {
+                                        Ok(acc) => {
                                             chain_state.bump_connect_heartbeat();
+                                            // Same rule as above: a buffered
+                                            // block that stored without
+                                            // connecting confirmed nothing, so
+                                            // no purge or fee sample may run
+                                            // for it -- and the unmoved tip
+                                            // means this drain is done.
+                                            let Some(h) = chain_state.connected_height(&acc) else {
+                                                break;
+                                            };
                                             fee_estimator.record_block(&b_fees);
-                                            mempool.remove_for_block(&b, chain_state.tip_height());
+                                            mempool.remove_for_block(&b, h);
                                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
                                         }
                                         Err(_) => break,
@@ -3816,12 +3844,18 @@ impl PeerManager {
             if !chain_state.has_block_data(&hash) {
                 break;
             }
-            match chain_state.get_block_index(&hash) {
+            // The entry's height is the block's own (parent + 1), immutable
+            // and tip-independent -- the purge below must report it, not a
+            // tip re-read that a concurrent connect can already have moved.
+            let block_height = match chain_state.get_block_index(&hash) {
                 Some(entry)
                     if entry.status == crate::storage::blockindex::BlockStatus::DataStored
-                        && entry.header.prev_blockhash == chain_state.tip_hash() => {}
+                        && entry.header.prev_blockhash == chain_state.tip_hash() =>
+                {
+                    entry.height
+                }
                 _ => break,
-            }
+            };
             // The block bytes are needed regardless of outcome: fee rates
             // must be computed against the pre-connect UTXO view, and the
             // mempool/orphanage bookkeeping below needs the transactions.
@@ -3836,7 +3870,7 @@ impl PeerManager {
                         .warnings()
                         .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                     fee_estimator.record_block(&fees);
-                    mempool.remove_for_block(&block, chain_state.tip_height());
+                    mempool.remove_for_block(&block, block_height);
                     reconsider_orphans_on_block(orphanage, mempool, chain_state, &block);
                     connected += 1;
                 }
@@ -7076,7 +7110,7 @@ mod tests {
         let (cs, dir) = make_chain_state();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let b1 = build_test_block(genesis, 1, 1_707_000_000);
-        let h1 = cs.accept_block(&b1).expect("connect block 1");
+        let h1 = cs.accept_block(&b1).expect("connect block 1").hash();
         let b2 = build_test_block(h1, 2, 1_707_000_001);
         let b3 = build_test_block(b2.block_hash(), 3, 1_707_000_002);
         // Exactly what a torn-down IBD scheduler leaves behind: headers
@@ -7181,7 +7215,7 @@ mod tests {
         let (cs, dir) = make_chain_state();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let b1 = build_test_block(genesis, 1, 1_707_000_000);
-        let h1 = cs.accept_block(&b1).expect("connect block 1");
+        let h1 = cs.accept_block(&b1).expect("connect block 1").hash();
         let b2 = build_test_block(h1, 2, 1_707_000_001);
         let b3 = build_test_block(b2.block_hash(), 3, 1_707_000_002);
         // Headers for both are already known, as on the stalled node
@@ -7241,7 +7275,7 @@ mod tests {
         let (cs, dir) = make_chain_state();
         let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let b1 = build_test_block(genesis, 1, 1_707_000_000);
-        let mut parent = cs.accept_block(&b1).expect("connect block 1");
+        let mut parent = cs.accept_block(&b1).expect("connect block 1").hash();
         let mut headers = Vec::new();
         let mut tail = Vec::new();
         for h in 2..=31u32 {
