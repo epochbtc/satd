@@ -10,6 +10,7 @@
 //! BDK / Mutiny clients deserialize identically. Block-summary JSON
 //! shape is `BlockHeaderJson` from `crate::encode`.
 
+use bitcoin::BlockHash;
 use axum::Json;
 use axum::extract::{Path, State};
 
@@ -65,20 +66,61 @@ pub async fn blocks_at_or_below(
 /// Walk down at most 10 active-chain blocks ending at `start_height`,
 /// emitting `BlockHeaderJson` for each. Stops at genesis or when no
 /// more height entries resolve.
+/// How far below the tip `/blocks/:start_height` will walk the active chain to
+/// resolve a page top.
+///
+/// Walking from the tip is the only way to name the active-chain block at a
+/// height without trusting the height index, but it costs one block-index read
+/// per height crossed. Unbounded, that is O(tip height) reads per request on a
+/// public endpoint -- `/blocks/0` on a synced mainnet node is ~950k of them,
+/// synchronously, and repeated requests for old heights are a cheap way to
+/// exhaust the server. Reorgs deeper than this bound do not happen in practice,
+/// so below it the height index is the only sane answer; above it the walk is
+/// bounded and exact.
+const ACTIVE_WALK_LIMIT: u32 = 200;
+
+/// Name the block a page should start from.
+///
+/// Within [`ACTIVE_WALK_LIMIT`] of the tip -- the range where a reorg could
+/// have left the height index naming a block that is no longer active -- this
+/// walks parent pointers from the tip and is exact. Deeper than that it takes
+/// the height index row, which is O(1). A stale row there would make the page
+/// start on a side branch, but the page would still be a contiguous run of that
+/// branch's ancestry, and the next request corrects it.
+fn resolve_page_top(state: &EsploraState, start_height: u32) -> Option<BlockHash> {
+    let (_, tip_height) = state.chain.tip_snapshot();
+    if start_height > tip_height {
+        return None;
+    }
+    if tip_height - start_height <= ACTIVE_WALK_LIMIT {
+        return state.chain.active_chain_hash_at_height(start_height);
+    }
+    state.chain.get_block_hash_by_height(start_height)
+}
+
 fn collect_blocks_descending(
     state: &EsploraState,
     start_height: u32,
 ) -> Result<Vec<BlockHeaderJson>, EsploraError> {
     const PAGE: u32 = 10;
     let mut out = Vec::with_capacity(PAGE as usize);
-    for offset in 0..PAGE {
-        let h = match start_height.checked_sub(offset) {
-            Some(h) => h,
-            None => break,
-        };
-        let Some(hash) = state.chain.get_block_hash_by_height(h) else {
-            break;
-        };
+
+    // Resolve the top of the page once, then follow parent pointers down.
+    //
+    // Resolving each height independently made the page ten unrelated lookups
+    // presented as one chain segment: a reorg part-way down, or a `height_hash`
+    // row naming a side-chain block (the index is "best known at height", which
+    // `accept_header` and `store_block` also populate), breaks the invariant a
+    // client actually renders -- `page[i].previousblockhash == page[i+1].id`.
+    // An explorer then draws a discontinuous chain and has no way to tell.
+    //
+    // Every entry after the first comes from its child's `prev_blockhash`, so
+    // the page is contiguous by construction however the top is resolved.
+    let Some(anchor) = resolve_page_top(state, start_height) else {
+        return Ok(out);
+    };
+    let mut hash = anchor;
+    for _ in 0..PAGE {
         let Some(entry) = state.chain.get_block_index(&hash) else {
             break;
         };
@@ -95,6 +137,7 @@ fn collect_blocks_descending(
         let mediantime = state
             .chain
             .get_median_time_past(entry.height.saturating_add(1));
+        let height = entry.height;
         out.push(block_header_json(
             &hash,
             &entry,
@@ -103,6 +146,10 @@ fn collect_blocks_descending(
             weight,
             mediantime,
         ));
+        if height == 0 {
+            break;
+        }
+        hash = entry.header.prev_blockhash;
     }
     Ok(out)
 }

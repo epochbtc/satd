@@ -31,6 +31,19 @@ item below is (or will be) written up in full in the in-development
 - `verifychain` walks the active chain by parent pointers under a consistent
   view instead of trusting the height index, so a polluted index row can no
   longer fail (or falsely pass) verification (#640)
+- `getblocktemplate` assembles its template under the same consistent view,
+  retrying if a block connects mid-assembly; if the chain advances through
+  every attempt it falls back to a coinbase-only template on one tip rather
+  than one assembled across two chains (#641)
+- Esplora `/blocks/:start_height` pages are contiguous single-chain slices:
+  the page top resolves by walking the active chain when the height is near
+  the tip (bounded at 200 reads), and every following entry comes from its
+  child's parent pointer, so a stale height-index row can no longer stitch
+  two branches into one page (#641)
+- A terminal `TxidFinalized` alarm computes its depth against the lower of
+  the event's tip and the live tip, so a stale queued event can no longer
+  fire the unrecoverable alarm for an insufficiently buried transaction
+  (#641)
 - `signrawtransactionwithkey` and `sat-cli`'s local PSBT signer can now spend untweaked
   P2TR outputs — the BIP 352 silent-payment shape — matching Bitcoin Core's key-path
   fallback (#609)

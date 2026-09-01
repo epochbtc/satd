@@ -1458,7 +1458,29 @@ impl WatchRegistry {
                 inner.armed.remove(&key);
                 continue;
             }
-            let cur_depth = tip.saturating_sub(h) + 1;
+            // The event's tip and the live tip, whichever is lower. The anchor
+            // check just above is a LIVE read, so it can pass while `tip` --
+            // carried on a `BlockConnected` event -- describes a chain the node
+            // has since reorged off. A higher-work but shorter chain lowers the
+            // tip, and depth taken from the stale event would then overstate how
+            // buried the transaction is.
+            //
+            // That matters more here than it would for a gauge: the fire below
+            // is terminal and evicts the entry, so a client told `TxidFinalized`
+            // for an insufficiently-buried transaction never receives a
+            // correction. Understating depth only delays an alarm to the next
+            // tick; overstating it is unrecoverable.
+            //
+            // Residual race, known and accepted: the anchor check above and
+            // this tip read are still two live reads, so a reorg landing
+            // exactly between them can overstate depth by the reorg's height
+            // change for one tick. Closing it needs the anchor and tip read
+            // paired under `ChainState::coherent_read`, which `WatchChain`
+            // does not expose -- a trait change out of scope here. The clamp
+            // removes the unbounded variant (an arbitrarily stale queued
+            // event); the remaining window is one racing reorg wide.
+            let effective_tip = tip.min(chain.tip_height());
+            let cur_depth = effective_tip.saturating_sub(h) + 1;
             if cur_depth >= depth {
                 let (id, txid, depth, kind) = key;
                 // Emit the REQUESTED threshold (`depth`), not the actual reached
@@ -1590,11 +1612,24 @@ pub trait DepthChainView {
     /// Confirming `(height, block_hash)` for a txid via the txindex, or `None`
     /// when txindex is disabled / the tx is unknown.
     fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)>;
+
+    /// The active chain's height right now.
+    ///
+    /// Depth decides whether a terminal, single-shot alarm fires, and the tick's
+    /// `tip` argument comes from a `BlockConnected` event that may be several
+    /// reorgs stale by the time it is processed. A reorg to a higher-work but
+    /// SHORTER chain lowers the tip, so the event's height can exceed the live
+    /// one while the anchor is still on the active chain -- and depth computed
+    /// from the event alone is then overstated.
+    fn tip_height(&self) -> u32;
 }
 
 impl DepthChainView for crate::chain::state::ChainState {
     fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
         crate::chain::state::ChainState::active_chain_hash_at_height(self, height)
+    }
+    fn tip_height(&self) -> u32 {
+        crate::chain::state::ChainState::tip_height(self)
     }
     fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)> {
         let bh = self.get_tx_location(txid)?;
@@ -2940,6 +2975,14 @@ mod tests {
     struct MockChain {
         active: HashMap<u32, BlockHash>,
         txloc: HashMap<Txid, (u32, BlockHash)>,
+        /// Live tip, when a test is modelling one. `None` means "this mock does
+        /// not model a tip": `tip_height` then answers `u32::MAX`, the identity
+        /// for the `min` in `tick_depths`, so the clamp is inert.
+        ///
+        /// Deriving it from `active` instead does not work -- these tests map
+        /// only the anchor height, not every height up to the tip, so the
+        /// maximum key is the anchor and depth would collapse to 1.
+        tip: Option<u32>,
     }
     impl DepthChainView for MockChain {
         fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
@@ -2947,6 +2990,9 @@ mod tests {
         }
         fn tx_confirmation(&self, txid: &Txid) -> Option<(u32, BlockHash)> {
             self.txloc.get(txid).copied()
+        }
+        fn tip_height(&self) -> u32 {
+            self.tip.unwrap_or(u32::MAX)
         }
     }
 
@@ -3128,6 +3174,50 @@ mod tests {
             }
             other => panic!("wrong: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_stale_event_tip_cannot_fire_a_terminal_alarm_early() {
+        // `tick_depths` takes its `tip` from a `BlockConnected` event, but
+        // re-reads anchor validity live. A reorg to a higher-work but SHORTER
+        // chain lowers the tip, so the event's height can exceed the live one
+        // while the anchor is still on the active chain -- and depth taken from
+        // the event alone is then overstated.
+        //
+        // The fire is terminal: it evicts the entry, so a client told
+        // `TxidFinalized` for an insufficiently-buried transaction never gets a
+        // correction. Understating depth only waits for the next tick.
+        let reg = Arc::new(WatchRegistry::new());
+        let (handle, mut rx) = reg.register(WATCH_CHANNEL_CAPACITY);
+        let tx = tx_with(0x51);
+        let txid = tx.compute_txid();
+        handle.add_tx_depths(&[(txid, 6)]);
+
+        let block = block_at(1, vec![tx]);
+        let mut chain = MockChain::default();
+        chain.active.insert(100, block.block_hash());
+        reg.arm_depths_for_block(&block, 100);
+
+        // The event says tip 105 -- six deep, enough to fire. The live chain has
+        // reorged to a shorter branch at 102, where the anchor is only three
+        // deep. The anchor itself is still active, so the reorg guard above does
+        // not catch this.
+        chain.tip = Some(102);
+        reg.tick_depths(105, &chain);
+        assert!(
+            rx.try_recv().is_err(),
+            "depth must come from the chain the node is actually on, not from a \
+             tip the event carried before the reorg",
+        );
+
+        // Once the chain really reaches that depth, it fires.
+        chain.tip = Some(105);
+        chain.active.insert(105, block_at(2, vec![]).block_hash());
+        reg.tick_depths(105, &chain);
+        assert!(
+            matches!(rx.try_recv(), Ok(WatchMatch::TxidDepthReached { depth: 6, .. })),
+            "and it is not lost -- it fires when the depth is genuinely reached",
+        );
     }
 
     #[test]

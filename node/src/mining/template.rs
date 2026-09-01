@@ -30,7 +30,52 @@ pub struct BlockTemplate {
 }
 
 /// Create a block template from the current chain state and mempool.
+///
+/// Assembly is a long read: the tip, the tip's index entry, the MTP, the
+/// mempool snapshot, and one UTXO lookup per input of every candidate, across a
+/// multi-pass selection loop. Nothing in that sequence pins the chain, so a
+/// block connecting part-way through is seen by some reads and not others.
+///
+/// That is not merely a stale template. Take a mempool holding parent X and
+/// child T. Assembly starts on tip H; mid-loop a block mines X. T is deferred
+/// on the first pass because X was in the `in_mempool` snapshot, but on a later
+/// pass `get_coin` now resolves X's output from the post-connect UTXO set, so T
+/// is included -- while X itself is excluded (it is no longer in the mempool).
+/// The emitted template builds on H, where X is unconfirmed, so the block is
+/// `bad-txns-inputs-missingorspent`. A miner that wins the race at the
+/// contested height submits an invalid block instead of a valid competing one.
+///
+/// So: assemble against a chainstate that held still, and rebuild if it did
+/// not. `coherent_read` is what decides that, rather than a `tip_snapshot()`
+/// on each side -- a connect publishes its coins at the store commit and moves
+/// the tip a moment later, and in between, the tip is unchanged while
+/// `get_coin` already answers from the new block. That is precisely the
+/// X-and-T case above, so the check has to cover the window rather than just
+/// the tip.
+///
+/// If the chain is moving faster than the node can assemble, fall back to a
+/// coinbase-only template -- less profitable for one poll, but a template with
+/// no transactions has no cross-chain inconsistency available to it.
 pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
+    if let Some(template) =
+        chain_state.coherent_read(|| assemble_template(chain_state, mempool, true))
+    {
+        return template;
+    }
+    tracing::warn!(
+        target: "mining::template",
+        "chain advanced during every template assembly attempt; \
+         emitting a coinbase-only template rather than one assembled across two chains"
+    );
+    assemble_template(chain_state, mempool, false)
+}
+
+/// One assembly pass. `include_mempool` false yields a coinbase-only template.
+fn assemble_template(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    include_mempool: bool,
+) -> BlockTemplate {
     let tip_hash = chain_state.tip_hash();
     let tip_entry = chain_state.get_block_index(&tip_hash).unwrap();
     let height = tip_entry.height + 1;
@@ -46,7 +91,7 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
     // fee_delta). Template assembly is scope-filtered: transactions
     // quarantined `on template` are held but never mined by this node
     // (design §2.4/§3), so they are excluded here.
-    let mut entries = mempool.get_template_entries();
+    let mut entries = if include_mempool { mempool.get_template_entries() } else { Vec::new() };
     entries.sort_by(|a, b| {
         // Saturating add: a corrupt persisted mempool could carry an
         // extreme fee_delta; it must not overflow the effective-fee sum
@@ -278,6 +323,54 @@ mod tests {
         assert_eq!(template.bits.to_consensus(), 0x207fffff);
         assert!(template.transactions.is_empty());
         assert_eq!(template.coinbase_value, 50 * 100_000_000); // 50 BTC subsidy
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_coinbase_only_fallback_is_a_valid_template_on_the_named_tip() {
+        // When the chain moves during every assembly attempt, `create_template`
+        // emits a coinbase-only template rather than one stitched from reads of
+        // two different chains. That fallback is only safe if it is itself
+        // well-formed and internally consistent -- it names a tip, a height and
+        // a subsidy, and carries nothing that could depend on a UTXO set that
+        // moved.
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xA1), coin_at(0))]);
+        let tx = tx_spending(confirmed_prev(0xA1), 50_000, 0x31, 0xffff_ffff, 0);
+        mp.insert_tx_weighted_for_test(tx, 100, 400, QuarantineScope::acting());
+
+        let full = assemble_template(&cs, &mp, true);
+        let fallback = assemble_template(&cs, &mp, false);
+
+        // Without this the comparison below is vacuous: an empty mempool makes
+        // both templates transaction-free and the fallback proves nothing.
+        assert!(
+            !full.transactions.is_empty(),
+            "premise: the ordinary template does carry a transaction",
+        );
+        assert!(
+            fallback.transactions.is_empty(),
+            "the fallback carries no transactions -- that is what makes it \
+             immune to a mixed view",
+        );
+        assert_eq!(
+            fallback.prev_hash, full.prev_hash,
+            "it still builds on the tip it names",
+        );
+        assert_eq!(fallback.height, full.height);
+        assert_eq!(fallback.bits, full.bits);
+        assert_eq!(
+            fallback.coinbase_value,
+            crate::chain::connect::block_subsidy(cs.network, fallback.height),
+            "no fees, so the coinbase is exactly the subsidy -- a miner that \
+             pays itself more than this produces an invalid block",
+        );
+        assert!(
+            full.coinbase_value > fallback.coinbase_value,
+            "and the fallback really is the cheaper option it claims to be, \
+             which is the whole cost of choosing it",
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

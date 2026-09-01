@@ -7431,6 +7431,62 @@ fn test_esplora_tip_hash_and_height_match_chain_state() {
 
 /// `/blocks` returns up to 10 most recent block summaries, descending.
 #[test]
+fn test_esplora_deep_page_resolves_the_right_blocks_past_the_walk_limit() {
+    // Past `ACTIVE_WALK_LIMIT` (200) the page top is resolved through the
+    // height index instead of a walk from the tip -- walking is O(tip height)
+    // block-index reads per request, which a public endpoint cannot afford.
+    // The deep path must still name the active chain's blocks and still hand
+    // back one contiguous segment.
+    let esplora_port = find_available_port();
+    let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
+    let mut node = TestNode::start(&["--esplora=1", &bind]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let _ = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(210), serde_json::json!(addr)],
+        )
+        .unwrap();
+
+    let r = esplora_get(esplora_port, "/blocks/5");
+    assert_eq!(r.status(), 200);
+    let arr: Vec<serde_json::Value> = r.json().unwrap();
+    assert_eq!(arr.len(), 6, "heights 5..=0, got {:?}", arr);
+    assert_eq!(
+        arr[0]["height"].as_i64(),
+        Some(5),
+        "the page must start at the requested height"
+    );
+
+    // Against the node's own answer for each height: a page top taken from a
+    // stale height-index row would show up here.
+    for entry in &arr {
+        let h = entry["height"].as_i64().expect("height");
+        let want = node
+            .rpc_call_with_params("getblockhash", vec![serde_json::json!(h)])
+            .unwrap()["result"]
+            .clone();
+        assert_eq!(
+            entry["id"].as_str(),
+            want.as_str(),
+            "esplora named the wrong block at height {h}"
+        );
+    }
+
+    for pair in arr.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        assert_eq!(
+            child["previousblockhash"].as_str(),
+            parent["id"].as_str(),
+            "deep page must stay contiguous at height {:?}",
+            child["height"],
+        );
+    }
+
+    node.stop();
+}
+
+#[test]
 fn test_esplora_blocks_recent_returns_descending_summaries() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
@@ -7459,6 +7515,27 @@ fn test_esplora_blocks_recent_returns_descending_summaries() {
         assert!(entry["timestamp"].as_u64().is_some());
         assert!(entry["tx_count"].as_u64().is_some());
         assert!(entry["nonce"].as_u64().is_some());
+    }
+
+    // The page is one chain segment, not ten independent lookups: every entry
+    // must name its successor's parent. The handler now walks `prev_blockhash`
+    // from a reorg-safe anchor, so this holds by construction; resolving each
+    // height separately could break it under a reorg mid-page or a `height_hash`
+    // row naming a side-chain block, and an explorer would draw a discontinuous
+    // chain with no way to tell.
+    for pair in arr.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        assert_eq!(
+            child["previousblockhash"].as_str(),
+            parent["id"].as_str(),
+            "block at height {:?} must name the next page entry as its parent",
+            child["height"],
+        );
+        assert_eq!(
+            child["height"].as_i64().unwrap() - 1,
+            parent["height"].as_i64().unwrap(),
+            "and the page must not skip a height",
+        );
     }
 
     node.stop();
