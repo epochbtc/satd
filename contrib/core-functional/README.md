@@ -166,6 +166,17 @@ target; the rest need Core-only binaries or internals.
   together built the 199-block cache for the first time and took the scoreboard
   from three to six.
 
+- `MAX_LOCATOR_SZ` enforcement: satd now disconnects peers that send a
+  `getheaders` or `getblocks` locator with more than 101 hashes, matching Core's
+  `net_processing.cpp`. Also added a basic `getblocks` response (respond with
+  `inv` for up to 500 blocks). This put `p2p_invalid_locator.py` in the run-set.
+- JSON-RPC 1.0 response normalization: the compat layer now strips `"jsonrpc"`,
+  adds `"error":null` to success responses and `"result":null` to error
+  responses, and adds a default `Content-Type: application/json` and `"id":null`
+  when missing from the request. Core's `authproxy` takes different code paths
+  for 1.0 vs 2.0 responses, and many Core tests assert `"error":null` in the
+  raw byte stream.
+
 Two rows that looked like satd defects were the harness's own: `shims/bitcoind`
 spawned satd as a child, so `node.process.pid` was the shim's. `get_bind_addrs`
 reads `/proc/<pid>/fd` to find a node's listening sockets and a shim owns none,

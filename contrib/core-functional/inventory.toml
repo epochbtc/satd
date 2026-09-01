@@ -721,9 +721,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "p2p_invalid_locator.py"
-status = "skip"
-reason = "feature-missing"
-note = "satd does not disconnect a peer that sends a locator with >101 hashes (Core's MAX_LOCATOR_SZ enforcement)"
+status = "run"
 
 [[test]]
 file = "p2p_invalid_messages.py"

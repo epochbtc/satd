@@ -430,7 +430,17 @@ where
         // completion; `self.inner` stays ready for the next call).
         let mut inner = self.inner.clone();
         Box::pin(async move {
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
+
+            // Core does not require a Content-Type header on RPC requests;
+            // jsonrpsee does (`application/json`). Add a default when the
+            // client omitted it, matching Core's leniency.
+            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
+                parts.headers.insert(
+                    hyper::header::CONTENT_TYPE,
+                    hyper::header::HeaderValue::from_static("application/json"),
+                );
+            }
 
             // Reject before reading a byte if the declared length already
             // exceeds the cap. Covers the common DoS shape (a client
@@ -488,6 +498,70 @@ where
             Ok(HttpResponse::from_parts(head, HttpBody::from(out_body)))
         })
     }
+}
+
+/// Normalize a JSON-RPC response body for Core compatibility.
+///
+/// jsonrpsee (JSON-RPC 2.0) omits `"error"` from success responses and
+/// always includes `"jsonrpc":"2.0"`. Core (JSON-RPC 1.0) always includes
+/// `"error":null` on success. Clients like Core's functional test suite
+/// assert `"error":null` is present in the byte stream.
+fn normalize_response_body_bytes(body: &[u8]) -> Vec<u8> {
+    if body.is_empty() {
+        return body.to_vec();
+    }
+
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+
+    let changed = match &mut value {
+        serde_json::Value::Object(_) => fix_response_object(&mut value),
+        serde_json::Value::Array(items) => {
+            let mut any = false;
+            for item in items.iter_mut() {
+                any |= fix_response_object(item);
+            }
+            any
+        }
+        _ => false,
+    };
+
+    if changed && let Ok(bytes) = serde_json::to_vec(&value) {
+        let mut out = bytes;
+        out.push(b'\n');
+        return out;
+    }
+
+    body.to_vec()
+}
+
+/// Rewrite a JSON-RPC 2.0 response to Core's 1.0 format: strip the
+/// `"jsonrpc"` member, add `"error":null` on success or `"result":null`
+/// on error. Core's `authproxy` takes the 1.0 path (null-checking
+/// `error`) when `"jsonrpc"` is absent; with `"jsonrpc":"2.0"` present
+/// it checks key existence, so an `"error":null` there would read as
+/// an error.
+fn fix_response_object(value: &mut serde_json::Value) -> bool {
+    let serde_json::Value::Object(map) = value else {
+        return false;
+    };
+    if !map.contains_key("result") && !map.contains_key("error") {
+        return false;
+    }
+    let mut changed = false;
+    if map.remove("jsonrpc").is_some() {
+        changed = true;
+    }
+    if map.contains_key("result") && !map.contains_key("error") {
+        map.insert("error".to_string(), serde_json::Value::Null);
+        changed = true;
+    }
+    if map.contains_key("error") && !map.contains_key("result") {
+        map.insert("result".to_string(), serde_json::Value::Null);
+        changed = true;
+    }
+    changed
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding

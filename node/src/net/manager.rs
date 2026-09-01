@@ -98,6 +98,10 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+
+/// Maximum entries in a getheaders/getblocks locator. Core disconnects
+/// peers that exceed this (net_processing.cpp `MAX_LOCATOR_SZ`).
+const MAX_LOCATOR_SZ: usize = 101;
 /// How long a `getblockfrompeer` request stays armed. A block arriving after
 /// this window is treated as an ordinary unsolicited block rather than a
 /// repair, so a peer that answers minutes late cannot divert a block the
@@ -2266,6 +2270,9 @@ impl PeerManager {
             }
             NetworkMessage::GetHeaders(msg) => {
                 self.handle_getheaders(id, msg);
+            }
+            NetworkMessage::GetBlocks(msg) => {
+                self.handle_getblocks(id, msg);
             }
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
@@ -5318,6 +5325,11 @@ impl PeerManager {
         id: PeerId,
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
         let mut start_height = None;
         for hash in &msg.locator_hashes {
             if let Some(entry) = self.chain_state.get_block_index(hash) {
@@ -5343,6 +5355,43 @@ impl PeerManager {
         // versions track silent-drops as soft misbehavior. Empty reply
         // signals "I have nothing newer than your locator."
         self.send_to_peer(id, NetworkMessage::Headers(headers));
+    }
+
+    fn handle_getblocks(
+        &self,
+        id: PeerId,
+        msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
+    ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
+        let mut start_height = None;
+        for hash in &msg.locator_hashes {
+            if let Some(entry) = self.chain_state.get_block_index(hash) {
+                start_height = Some(entry.height + 1);
+                break;
+            }
+        }
+
+        let start = start_height.unwrap_or(0);
+        let tip = self.chain_state.tip_height();
+        let end = std::cmp::min(start + 500, tip + 1);
+
+        let mut inv = Vec::new();
+        for h in start..end {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
+                inv.push(Inventory::Block(hash));
+                if hash == msg.stop_hash {
+                    break;
+                }
+            }
+        }
+
+        if !inv.is_empty() {
+            self.send_to_peer(id, NetworkMessage::Inv(inv));
+        }
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
