@@ -776,9 +776,11 @@ pub enum Event {
         height: u32,
         /// One entry per silent-payment-eligible transaction in the block.
         entries: Vec<TweakEntry>,
-        /// `true` when a `tweak_dust_limit` or `tweaks_only` filter dropped or
-        /// trimmed entries in this block (so an empty `entries` may mean
-        /// "filtered out", not "none present").
+        /// `true` when a subscription filter dropped entries from this block —
+        /// the `tweak_dust_limit` floor, or `tweak_unspent_only` cut-through —
+        /// so an empty `entries` may mean "filtered out", not "none present".
+        /// A surviving entry always carries its full taproot output set; no
+        /// filter trims one.
         filtered: bool,
     },
     /// One accepted-but-unconfirmed transaction's silent-payment tweak — the

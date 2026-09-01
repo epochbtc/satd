@@ -137,6 +137,45 @@ pub trait BlockScanSource: BlockCursorSource {
     /// order), or `None` if not held. Needed only when a script or prefix is
     /// watched; the caller skips fetching it otherwise.
     fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData>;
+
+    /// Whether `outpoint` is still unspent on the confirmed chain **right now**
+    /// — a live UTXO-set membership test, not a historical one. Backs the
+    /// silent-payment cut-through filter, whose whole point is "is this coin
+    /// still there at the moment I am serving it".
+    ///
+    /// Deliberately has no default: a `true`-by-default implementation would
+    /// turn cut-through into a silent no-op on any source that forgot to
+    /// override it, and the caller cannot tell that apart from a chain where
+    /// nothing is spent.
+    fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool;
+
+    /// A token identifying the chain state `is_unspent` is answering against,
+    /// or `None` if this source cannot provide one.
+    ///
+    /// Cut-through asks `is_unspent` once per taproot output and then makes an
+    /// **all-or-nothing** decision: an entry whose every output looks spent is
+    /// dropped whole. Those reads are independent, so a connect or a reorg
+    /// landing between them yields a mixed view — some outputs judged against
+    /// the old chain, some against the new — and a mixed view can report "all
+    /// spent" for an entry that is unspent on the chain we end up on. The
+    /// client then never sees the coin, which is the one failure a scanning
+    /// wallet cannot detect.
+    ///
+    /// Comparing this token before and after the loop is what rules that out.
+    /// `(tip hash, height)` is sufficient for the real implementation: the tip
+    /// moves on every connect and every disconnect, and nothing else changes
+    /// the UTXO set, so an unchanged tip proves the set held still. The hash
+    /// matters as well as the height — a reorg that replaces one block with
+    /// another leaves the height where it was.
+    ///
+    /// Defaults to `None` so this stays additive for out-of-tree implementors.
+    /// `None` means "no consistency guarantee", and the caller's obligation is
+    /// then to **skip cut-through** rather than to trust a possibly mixed read:
+    /// serving an entry that could have been cut costs the client some ECDH,
+    /// while cutting one that should have survived costs it a payment.
+    fn chain_snapshot(&self) -> Option<(BlockHash, u32)> {
+        None
+    }
 }
 
 impl BlockScanSource for crate::chain::state::ChainState {
@@ -146,6 +185,20 @@ impl BlockScanSource for crate::chain::state::ChainState {
 
     fn block_undo(&self, hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
         self.get_undo(hash)
+    }
+
+    fn chain_snapshot(&self) -> Option<(BlockHash, u32)> {
+        Some(self.tip_snapshot())
+    }
+
+    fn is_unspent(&self, outpoint: &bitcoin::OutPoint) -> bool {
+        // Membership in the UTXO set *is* unspentness: a connected spend removes
+        // the coin in the same batch that connects the block, and a disconnect
+        // restores it from undo. `has_coin` rather than `get_coin`: this runs
+        // once per taproot output of every eligible transaction a cut-through
+        // scan touches, and `get_coin` would promote each historical coin it
+        // reads into the clean LRU, evicting the coins validation is using.
+        self.has_coin(outpoint)
     }
 }
 
@@ -607,6 +660,10 @@ mod tests {
         }
         fn block_undo(&self, _hash: &BlockHash) -> Option<crate::storage::undo::UndoData> {
             None
+        }
+        // No bodies, so no outputs to ask about; range planning never calls this.
+        fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
+            false
         }
     }
 

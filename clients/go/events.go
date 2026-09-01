@@ -464,9 +464,10 @@ type BlockTweaks struct {
 	Height uint32
 	// Entries is one entry per silent-payment-eligible transaction in the block.
 	Entries []TweakEntry
-	// Filtered is true when a TweakDustLimit or TweaksOnly filter dropped or
-	// trimmed entries in this block - so an empty Entries may mean "filtered
-	// out", not "none present".
+	// Filtered is true when a subscription filter dropped entries from this
+	// block - the TweakDustLimit floor, or TweakUnspentOnly cut-through - so an
+	// empty Entries may mean "filtered out", not "none present". A surviving
+	// entry always carries its full taproot output set; no filter trims one.
 	Filtered bool
 }
 

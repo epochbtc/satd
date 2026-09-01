@@ -15,6 +15,15 @@ Bound for **0.5.1**, a patch release on the 0.5.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.1-pre.md`](docs/release-notes/0.5.1-pre.md).
 
+### Added
+- `tweak_unspent_only`, a cut-through filter on the streaming `tweaks` category:
+  `BlockTweaks` entries whose taproot outputs are all already spent are dropped,
+  so a balance scan skips the ECDH for coins that no longer exist. A surviving
+  entry still carries its full taproot output set, so BIP 352 `k` enumeration is
+  unaffected. Opt-in per
+  subscription, in both SDKs; a wallet restoring transaction history must leave it
+  off
+
 ### Changed
 - The BIP 352 client-side scan examples (Rust and Go) now run under the SDKs'
   `ResilientSubscription` with a file-backed cursor store, so an interrupted scan

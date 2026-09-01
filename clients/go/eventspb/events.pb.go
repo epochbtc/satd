@@ -2981,7 +2981,7 @@ type BlockTweaks struct {
 	BlockHash     []byte                 `protobuf:"bytes,1,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"` // 32 bytes, internal byte order
 	Height        uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
 	Entries       []*TweakEntry          `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`    // empty = indexed block, no eligible txs
-	Filtered      bool                   `protobuf:"varint,4,opt,name=filtered,proto3" json:"filtered,omitempty"` // true when a per-subscription dust limit dropped entries
+	Filtered      bool                   `protobuf:"varint,4,opt,name=filtered,proto3" json:"filtered,omitempty"` // true when a per-subscription filter dropped entries
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3313,9 +3313,29 @@ type SubscribeRequest struct {
 	// (failed_precondition). The server re-derives the outputs from the block at
 	// serve time — the on-disk index does not store them — so a cold-sync with
 	// this set reads each block (heavier than a lean cold-sync).
-	TweakOutputs  *bool `protobuf:"varint,7,opt,name=tweak_outputs,json=tweakOutputs,proto3,oneof" json:"tweak_outputs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TweakOutputs *bool `protobuf:"varint,7,opt,name=tweak_outputs,json=tweakOutputs,proto3,oneof" json:"tweak_outputs,omitempty"`
+	// Cut-through: drop BlockTweaks entries whose taproot outputs are all already
+	// spent on the confirmed chain as of serve time. A balance scan never has to
+	// run ECDH against a coin that is already gone; a RESTORE that needs
+	// transaction history must leave this off, because a payment received and
+	// later spent is omitted entirely. Default false = every eligible entry,
+	// spent or not.
+	//
+	// Spentness decides only whether an entry SURVIVES, never which outputs it
+	// carries: a surviving entry carries its full taproot output set, because BIP
+	// 352 scanning stops at the first k that does not match a carried output.
+	//
+	// A modifier on the `tweaks` category: setting it without bit 8 is rejected
+	// in-band (invalid_argument); a node with no block source rejects it
+	// (failed_precondition), since the outputs are re-derived from the block.
+	// Dropped entries set the block's `filtered` flag, exactly like the dust
+	// floor. Spentness is evaluated against the UTXO set at the moment the event
+	// is served, so the same historical block can yield fewer entries on a later
+	// scan; it never applies to MempoolTweak (an unconfirmed output is in no
+	// confirmed UTXO set, and filtering on that would drop every mempool tweak).
+	TweakUnspentOnly *bool `protobuf:"varint,8,opt,name=tweak_unspent_only,json=tweakUnspentOnly,proto3,oneof" json:"tweak_unspent_only,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SubscribeRequest) Reset() {
@@ -3393,6 +3413,13 @@ func (x *SubscribeRequest) GetMempoolTweaks() bool {
 func (x *SubscribeRequest) GetTweakOutputs() bool {
 	if x != nil && x.TweakOutputs != nil {
 		return *x.TweakOutputs
+	}
+	return false
+}
+
+func (x *SubscribeRequest) GetTweakUnspentOnly() bool {
+	if x != nil && x.TweakUnspentOnly != nil {
+		return *x.TweakUnspentOnly
 	}
 	return false
 }
@@ -5710,7 +5737,7 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\tmax_value\x18\x03 \x01(\x04R\bmaxValue\x12F\n" +
 	"\x0ftaproot_outputs\x18\x04 \x03(\v2\x1d.satd.events.v1.TaprootOutputR\x0etaprootOutputs\"@\n" +
 	"\fMempoolTweak\x120\n" +
-	"\x05entry\x18\x01 \x01(\v2\x1a.satd.events.v1.TweakEntryR\x05entry\"\xa5\x03\n" +
+	"\x05entry\x18\x01 \x01(\v2\x1a.satd.events.v1.TweakEntryR\x05entry\"\xef\x03\n" +
 	"\x10SubscribeRequest\x12\x1e\n" +
 	"\n" +
 	"categories\x18\x01 \x01(\rR\n" +
@@ -5722,14 +5749,16 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\vtweaks_only\x18\x05 \x01(\bH\x03R\n" +
 	"tweaksOnly\x88\x01\x01\x12*\n" +
 	"\x0emempool_tweaks\x18\x06 \x01(\bH\x04R\rmempoolTweaks\x88\x01\x01\x12(\n" +
-	"\rtweak_outputs\x18\a \x01(\bH\x05R\ftweakOutputs\x88\x01\x01B\f\n" +
+	"\rtweak_outputs\x18\a \x01(\bH\x05R\ftweakOutputs\x88\x01\x01\x121\n" +
+	"\x12tweak_unspent_only\x18\b \x01(\bH\x06R\x10tweakUnspentOnly\x88\x01\x01B\f\n" +
 	"\n" +
 	"_since_seqB\x0e\n" +
 	"\f_from_cursorB\x13\n" +
 	"\x11_tweak_dust_limitB\x0e\n" +
 	"\f_tweaks_onlyB\x11\n" +
 	"\x0f_mempool_tweaksB\x10\n" +
-	"\x0e_tweak_outputs\"}\n" +
+	"\x0e_tweak_outputsB\x15\n" +
+	"\x13_tweak_unspent_only\"}\n" +
 	"\x06Cursor\x12\x16\n" +
 	"\x06height\x18\x01 \x01(\rR\x06height\x12\x19\n" +
 	"\btx_index\x18\x02 \x01(\rR\atxIndex\x12\x1f\n" +

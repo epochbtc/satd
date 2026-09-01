@@ -369,6 +369,21 @@ type SubscribeOptions struct {
 	// modifier on [CategoryTweaks]; the server also rejects it if the node has
 	// no block source. A [MempoolTweak] carries its outputs regardless.
 	TweakOutputs bool
+	// TweakUnspentOnly cuts through spent coins: a [BlockTweaks] entry whose
+	// taproot outputs are ALL already spent on the confirmed chain is dropped.
+	// A balance scan then never runs ECDH against a coin that is already gone.
+	// A surviving entry carries its full taproot output set - spentness decides
+	// whether an entry survives, never which outputs it carries, so BIP 352 k
+	// enumeration is never truncated.
+	//
+	// A RESTORE that needs transaction history must leave this false: a payment
+	// received and later spent is omitted entirely, so the balance is right and
+	// the history is not. Spentness is evaluated when the event is served, so the
+	// same historical block can yield fewer entries on a later scan. Dropped
+	// entries set the block's Filtered flag. A modifier on [CategoryTweaks]; the
+	// server also rejects it if the node has no block source. Never applies to
+	// [MempoolTweak].
+	TweakUnspentOnly bool
 }
 
 func (o SubscribeOptions) toProto() *eventspb.SubscribeRequest {
@@ -397,6 +412,10 @@ func (o SubscribeOptions) toProto() *eventspb.SubscribeRequest {
 	if o.TweakOutputs {
 		t := true
 		req.TweakOutputs = &t
+	}
+	if o.TweakUnspentOnly {
+		t := true
+		req.TweakUnspentOnly = &t
 	}
 	return req
 }

@@ -32,7 +32,12 @@ async fn start_async(args: Vec<&'static str>) -> StreamingNode {
 /// Start a node and mine 101 blocks to the wallet so block-1's coinbase is
 /// mature and spendable.
 async fn matured_node() -> (StreamingNode, DeterministicWallet) {
-    let sn = start_async(vec![]).await;
+    matured_node_args(vec![]).await
+}
+
+/// [`matured_node`] with extra daemon arguments.
+async fn matured_node_args(args: Vec<&'static str>) -> (StreamingNode, DeterministicWallet) {
+    let sn = start_async(args).await;
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
     let rpc = sn.node.rpc_handle();
@@ -397,6 +402,137 @@ async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
         4,
         "a committed anchor resumes at the next unscanned block"
     );
+
+/// Cut-through (`tweak_unspent_only`): an entry disappears once its taproot
+/// outputs are spent, and the block says so with `filtered`.
+///
+/// The same height is scanned four times — before and after the spend, with the
+/// filter off and on — so the test separates "the view changed" from "the index
+/// changed". The row on disk is untouched throughout; only the served view moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_tweak_cut_through_drops_spent_entries() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::key::TapTweak;
+    use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use std::str::FromStr;
+
+    let (sn, wallet) = matured_node_args(vec!["-silentpaymentindex=1"]).await;
+    let secp = Secp256k1::new();
+    let kp = Keypair::from_seckey_slice(&secp, &[0x33; 32]).expect("taproot key");
+    let p2tr = ScriptBuf::new_p2tr(&secp, kp.x_only_public_key().0, None);
+
+    // Funding: block-1's coinbase (P2WPKH) into a single taproot output. One
+    // taproot output and one eligible input is the whole eligibility test, so
+    // the index writes an entry for this transaction.
+    let fee = 10_000u64;
+    let rpc = sn.node.rpc_handle();
+    let w = wallet.clone();
+    let spk = p2tr.clone();
+    let (raw, txid_str) = tokio::task::spawn_blocking(move || {
+        build_signed_p2wpkh_spend_seq(&rpc, &w, spk, fee, 0xffff_ffff)
+    })
+    .await
+    .unwrap();
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
+    mine_n(&sn, 1).await;
+    let funded_height = 102u32;
+    let funded_txid = bitcoin::Txid::from_str(&txid_str).expect("txid");
+    let funded_value = 50 * 100_000_000 - fee;
+
+    // While the coin is live, cut-through must keep the entry: this is the case
+    // a wallet actually needs, and dropping it here would lose a payment.
+    let client = connect(&sn).await;
+    let entries = tweaks_at(&client, funded_height, false, true).await;
+    assert_eq!(entries.0.len(), 1, "the eligible transaction is indexed");
+    assert!(!entries.1, "nothing filtered with cut-through off");
+    let (entries, filtered) = tweaks_at(&client, funded_height, true, true).await;
+    assert_eq!(entries.len(), 1, "an unspent taproot output survives cut-through");
+    assert!(!filtered, "nothing was dropped, so the block is not `filtered`");
+    assert_eq!(entries[0].taproot_outputs.len(), 1);
+    assert_eq!(entries[0].taproot_outputs[0].vout, 0);
+
+    // Spend it, key-path, to a plain P2WPKH — so the spending transaction is not
+    // itself silent-payment eligible and only the funding height carries a row.
+    let prevout = TxOut { value: Amount::from_sat(funded_value), script_pubkey: p2tr.clone() };
+    let mut spend = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: funded_txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(funded_value - fee),
+            script_pubkey: DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        }],
+    };
+    let sighash = SighashCache::new(&spend)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::Default)
+        .expect("key-path sighash");
+    let sig = secp.sign_schnorr_no_aux_rand(
+        &Message::from_digest(sighash.to_byte_array()),
+        &kp.tap_tweak(&secp, None).to_keypair(),
+    );
+    let mut witness = Witness::new();
+    witness.push(sig.as_ref());
+    spend.input[0].witness = witness;
+    let raw_spend = hex::encode(bitcoin::consensus::serialize(&spend));
+    let rpc = sn.node.rpc_handle();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_spend)).await.unwrap();
+    mine_n(&sn, 1).await;
+
+    // Same height, same row, spent coin: the entry is cut and the block admits
+    // it, so an empty `entries` is never read as "this block had none".
+    let (entries, filtered) = tweaks_at(&client, funded_height, true, true).await;
+    assert!(entries.is_empty(), "a fully spent entry is cut through");
+    assert!(filtered, "a dropped entry sets the block's `filtered` flag");
+
+    // Control: with the filter off the same height still serves the entry, so
+    // what changed is the view, not the index.
+    let (entries, filtered) = tweaks_at(&client, funded_height, false, true).await;
+    assert_eq!(entries.len(), 1, "the stored row is untouched by cut-through");
+    assert!(!filtered);
+}
+
+/// Replay `height` on a tweaks-only subscription and return that block's entries
+/// plus its `filtered` flag.
+async fn tweaks_at(
+    client: &StreamClient,
+    height: u32,
+    unspent_only: bool,
+    outputs: bool,
+) -> (Vec<satd_events_client::TweakEntry>, bool) {
+    let mut client = client.clone();
+    let mut stream = client
+        .subscribe(SubscribeOptions {
+            categories: Categories::TWEAKS,
+            // A cursor names the last height already delivered, so anchor one
+            // below the height under test.
+            from_cursor: Some(Cursor {
+                height: height - 1,
+                tx_index: 0,
+                mempool_seq: 0,
+                instance_id: 0,
+            }),
+            tweak_outputs: outputs,
+            tweak_unspent_only: unspent_only,
+            ..Default::default()
+        })
+        .await
+        .expect("tweaks subscribe");
+    let ev = next_matching(&mut stream, 20, |e| {
+        matches!(e, Event::BlockTweaks { height: h, .. } if *h == height)
+    })
+    .await;
+    let Event::BlockTweaks { entries, filtered, .. } = ev else { unreachable!() };
+    (entries, filtered)
 }
 
 /// The typed `Event::Status` path end to end: a real condition detected by a
