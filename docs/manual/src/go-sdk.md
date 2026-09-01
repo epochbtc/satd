@@ -421,7 +421,7 @@ go run ./tls_tail        -endpoint node.example:50051 -ca ./node-ca.pem
 | `health_watch` | node-health alerting, and why silence needs a deadline |
 | `prefix_privacy` | coarse buckets registered, real filtering done locally |
 | `sp_wallet` | BIP 352 scan-key watch (Tier 2) |
-| `sp_light_scan` | BIP 352 client-side scan (Tier 1), scan key never leaves the device |
+| `sp_light_scan` | BIP 352 client-side scan (Tier 1), scan key never leaves the device; durable cold-sync cursor |
 | `tls_tail` | TLS with a pinned self-signed node CA |
 | `mtls_tail` | mutual TLS against `eventsgrpcmtls=1` |
 

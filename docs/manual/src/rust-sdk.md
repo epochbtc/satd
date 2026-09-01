@@ -160,7 +160,10 @@ while let Some(event) = events.message().await? {
 instead of unwrapping nested `Option`s. As confirmed events flow, the stream
 captures their durable `Cursor`, and `events.cursor()` returns the latest.
 Persist it and present it again as `from_cursor` to resume exactly where you
-left off.
+left off — persist the cursor of the last event you have **finished
+processing**, since anything written ahead of the work it stands for is skipped
+outright after a crash. `resilient_subscribe` (below) does that sequencing for
+you.
 
 ## Durable firehose: `resilient_subscribe`
 
@@ -192,10 +195,16 @@ What it absorbs:
   an exponential-backoff reconnect (`Backoff`, capped, optionally bounded by
   `max_retries`). `next()` returns `Err` only on a permanent failure or
   exhausted retries.
-- **Cursor persistence.** Confirmed cursors are written to a `CursorStore`.
-  The default is `NoopCursorStore`; use `FileCursorStore` for restart-durable
-  resume, or your own impl over a database. A reconnect and a process restart
-  both resume from the stored anchor.
+- **Cursor persistence, committed on poll.** Confirmed cursors are written to a
+  `CursorStore`. The default is `NoopCursorStore`; use `FileCursorStore` for
+  restart-durable resume, or your own impl over a database. A reconnect and a
+  process restart both resume from the stored anchor. A delivered event's cursor
+  is persisted only when you call `next()` again — an implicit ack — so the store
+  never advances past an event you have not finished handling, and a crash
+  mid-processing replays it. That makes delivery **at-least-once, not
+  at-most-once**: dedup on your side if you need exactly-once. `commit()` writes
+  the pending anchor before a clean shutdown, so the last event handled is not
+  replayed on the next start.
 - **Lag recovery.** Under the default `LagPolicy::AutoResume`, a `Lagged`
   notice becomes a reconnect from its `resume_cursor`. `LagPolicy::Surface`
   hands the notice to you instead.

@@ -646,11 +646,22 @@ pub enum Event {
     /// **SDK-synthesized — not a wire event.** Emitted by
     /// [`ResilientSubscription`](crate::ResilientSubscription) when a durable
     /// replay was clamped by the server to the most recent `MAX_REPLAY_BLOCKS`
-    /// (10,000) blocks, so the confirmed history in `(resume_height,
-    /// first_height)` was skipped. The live stream continues correctly from
+    /// (10,000) blocks, so the confirmed history in `[resume_height,
+    /// first_height - 1]` was skipped. The live stream continues correctly from
     /// `first_height`; the gap is unrecoverable via this stream, so full-resync
     /// the skipped range from another source (e.g. RPC `getblock`). Emitted once
     /// per resume, immediately before the first replayed block.
+    ///
+    /// **Detection limit — absence of this event is not proof of a complete
+    /// scan.** It is synthesized by comparing the resume cursor against the
+    /// first *`BlockConnected`* delivered. A subscription that filtered chain
+    /// events out — a tweaks-only silent-payment scan, say — receives no
+    /// `BlockConnected`, so a clamp it suffered passes unremarked here. Such a
+    /// subscription is normally protected server-side instead (a tweaks-only
+    /// replay against a complete index is exempt from the clamp, and a node
+    /// whose index is incomplete refuses the subscribe outright rather than
+    /// clamping it), but that protection lives on the node, not in this event.
+    /// Do not treat this variant as a wallet's only guard against a silent hole.
     ReplayGap {
         /// The height the resume cursor expected next (`cursor.height + 1`).
         resume_height: u32,

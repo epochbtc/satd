@@ -122,7 +122,40 @@ impl CursorStore for FileCursorStore {
         // lost. Either way a power loss resurrects the previous cursor — or an
         // empty file — and surviving exactly that is the store's whole purpose.
         let res = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
+            // 0600: this file records how far a wallet has scanned, which on a
+            // shared machine says a silent-payment wallet lives here and when it
+            // last ran. `File::create` would leave it at 0644 under the usual
+            // umask; the Go store already sets 0600, and the two must not
+            // disagree about a privacy property.
+            //
+            // `create_new`, not `create`: the mode is applied by the kernel only
+            // when the open actually creates the file, so opening an existing
+            // path leaves whatever permissions it already had and the rename
+            // then installs them on the cursor. The temp name embeds our pid and
+            // a counter, which is predictable enough for someone with write
+            // access to the directory to pre-create it world-readable — and a
+            // stale temp from a previous run that reused the pid gets there
+            // without any malice at all. `create_new` also passes `O_EXCL`,
+            // which refuses to follow a symlink planted at that path.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut f = match opts.open(&tmp) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Ours to clear: the name is scoped to this pid and this
+                    // process's counter, so anything sitting there is a leftover.
+                    // Re-create exclusively rather than truncating in place, so a
+                    // hostile pre-creation cannot survive as permissions.
+                    std::fs::remove_file(&tmp)?;
+                    opts.open(&tmp)?
+                }
+                Err(e) => return Err(e),
+            };
             f.write_all(line.as_bytes())?;
             f.sync_all()?;
             drop(f);
@@ -626,6 +659,85 @@ impl ResilientSubscription {
 
 #[cfg(test)]
 mod tests {
+    /// The cursor file records how far a wallet has scanned. On a shared host a
+    /// world-readable one tells every other user that a silent-payment wallet
+    /// lives here and when it last ran, so the mode is part of the contract —
+    /// and it has to match the Go store, which sets 0600.
+    #[cfg(unix)]
+    #[test]
+    fn file_cursor_store_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "satd-cursor-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("scan.cursor");
+        let store = FileCursorStore::new(&path);
+        store
+            .save(Cursor { height: 7, ..Default::default() })
+            .expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "cursor file must not be group- or world-readable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_pre_existing_temp_file_cannot_smuggle_its_permissions_onto_the_cursor() {
+        // `OpenOptions::mode` is applied by the kernel only when the open
+        // creates the file. With `create(true)` an existing temp path keeps the
+        // permissions it already had, and the rename then installs them on the
+        // cursor -- so the 0600 the other test checks holds only on a clean
+        // directory. The temp name is `<path>.tmp.<pid>.<n>`, which anyone with
+        // write access to the directory can predict, and a crashed run whose pid
+        // is reused gets there without any malice at all.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "satd-cursor-tmp-reuse-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("scan.cursor");
+
+        // Plant a world-readable decoy at every temp name `save` might pick.
+        // The counter is process-local, so one of these is the one it takes.
+        const DECOYS: u64 = 128;
+        for n in 0..DECOYS {
+            let decoy = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+            std::fs::write(&decoy, b"stale").expect("plant decoy");
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o666))
+                .expect("chmod decoy");
+        }
+
+        FileCursorStore::new(&path)
+            .save(Cursor { height: 7, ..Default::default() })
+            .expect("save");
+
+        // Exactly one decoy is consumed -- renamed onto the cursor. If none was,
+        // the counter has run past the planted range and this test proves
+        // nothing, so say that rather than passing quietly.
+        let consumed = (0..DECOYS)
+            .filter(|n| {
+                !path.with_extension(format!("tmp.{}.{n}", std::process::id())).exists()
+            })
+            .count();
+        assert_eq!(
+            consumed, 1,
+            "expected save to take exactly one planted temp name; \
+             0 means the counter passed the decoy range and the test is vacuous",
+        );
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a reused temp path must not carry its permissions onto the cursor",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

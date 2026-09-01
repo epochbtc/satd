@@ -2,7 +2,8 @@
 // (Tier 1, zero-custody) mode — the recommended one.
 //
 //	export SATD_SP_SCAN_SECRET=<32-byte hex> SATD_SP_SPEND_SECRET=<32-byte hex>
-//	go run ./sp_light_scan -endpoint 127.0.0.1:50051
+//	go run ./sp_light_scan -endpoint 127.0.0.1:50051 \
+//	    -cursor /tmp/satd-sp.cursor -from-height 709632
 //
 // The secrets are read from the environment rather than from flags: a flag value
 // is world-readable in /proc/<pid>/cmdline and shows up in `ps` and in shell
@@ -32,6 +33,23 @@
 // transaction races eviction); TweakOutputs asks for them on the confirmed side
 // too, so both paths confirm in-band. A mempool hit and its later confirmed hit
 // share a txid, so a real scanner dedups on it.
+//
+// RESUME IS DURABLE, and the SDK owns the hard part. The scan runs under
+// ResilientSubscribe with a file-backed cursor store, which persists each block's
+// cursor COMMIT-ON-POLL: the write happens when this loop comes back for the next
+// event — that is, only once the block it belongs to has been scanned. A crash
+// mid-block replays that block instead of skipping it. Getting this backwards is
+// how a scanner silently loses a payment: persist the cursor of an event you have
+// not finished processing and a restart resumes past it. (The opposite slip —
+// persisting one event BEHIND — only costs a rescan, and is a real bug in a
+// shipped wallet: cake-tech/cake_wallet#3574.) Do not hand-roll it.
+//
+// COLD SYNC: -from-height is where the scan begins when the cursor file is empty
+// — taproot activation (709632 on mainnet) for a fresh wallet, which the server
+// replays in one unclamped, backpressured subscription. Once the file holds a
+// cursor it wins, so the flag seeds the first run only and is harmless to leave
+// in place. Omit it (or pass -1) to attach forward-only; 0 means height 0, i.e.
+// scan the whole chain, matching the Rust example's argument.
 package main
 
 import (
@@ -41,8 +59,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 
@@ -54,6 +72,8 @@ import (
 
 func main() {
 	endpoint := flag.String("endpoint", "127.0.0.1:50051", "satd gRPC endpoint")
+	cursorPath := flag.String("cursor", "/tmp/satd-sp.cursor", "file to persist the resume cursor in")
+	fromHeight := flag.Int("from-height", -1, "first height to scan on a cold start; -1 = live only, 0 = the whole chain")
 	scanHex := flag.String("scan-secret", "", "32-byte hex scan secret b_scan; prefer $SATD_SP_SCAN_SECRET")
 	spendHex := flag.String("spend-secret", "", "32-byte hex spend secret b_spend; prefer $SATD_SP_SPEND_SECRET")
 	probeK := flag.Uint("probe-k", 2, "how many output counters k to probe per transaction")
@@ -92,7 +112,7 @@ func main() {
 	}
 	defer func() { _ = client.Close() }()
 
-	stream, err := client.Subscribe(ctx, satdevents.SubscribeOptions{
+	opts := satdevents.SubscribeOptions{
 		// ONLY the tweaks category, explicitly — it is not in the default set.
 		Categories: satdevents.CategoryTweaks,
 		// Scan at mempool admission too (Tier 1.5).
@@ -101,10 +121,34 @@ func main() {
 		// path can also confirm a match without fetching anything. Drop this
 		// and BlockTweaks arrives lean, falling back to the candidate-key path.
 		TweakOutputs: true,
-	})
-	if err != nil {
-		log.Fatalf("subscribe: %v", err)
 	}
+	if *fromHeight >= 0 {
+		// A cursor names the last height already DONE, so anchoring at h-1
+		// makes h itself the first block replayed: -from-height 709632 scans
+		// block 709632 rather than skipping it. Seed only — the persisted
+		// cursor wins whenever the store has one.
+		//
+		// The sentinel is -1, not 0, and deliberately so: 0 is a height a user
+		// can legitimately mean ("scan everything"), and reading it as "live
+		// only" would attach forward-only and silently report an empty balance
+		// for a wallet that has been paid. This matches the Rust example, where
+		// the argument is absent for live-only and 0 replays the chain.
+		if *fromHeight > math.MaxUint32 {
+			log.Fatalf("-from-height %d is above the maximum block height", *fromHeight)
+		}
+		anchor := uint32(*fromHeight)
+		if anchor > 0 {
+			anchor--
+		}
+		opts.FromCursor = &satdevents.Cursor{Height: anchor}
+	}
+
+	// The file-backed store is what makes a restart resume instead of rescanning
+	// from scratch, and commit-on-poll is what makes it resume SAFELY.
+	sub := client.ResilientSubscribe(ctx, opts, satdevents.ResilientConfig{
+		CursorStore: satdevents.NewFileCursorStore(*cursorPath),
+	})
+	defer func() { _ = sub.Close() }()
 
 	scanner := &scanner{
 		scan:   scanSecret,
@@ -113,10 +157,20 @@ func main() {
 		labels: labels,
 	}
 
+	// Next reconnects and replays underneath, and commits the previous event's
+	// cursor on the way in. It returns an error only on a permanent failure.
 	for {
-		ev, err := stream.Recv()
+		ev, err := sub.Next(ctx)
 		if err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				// Ctrl-C. Commit-on-poll means the event handled last is still
+				// pending: without this the next start replays it. Harmless
+				// (at-least-once is the whole design) but avoidable on a clean
+				// exit, and the shutdown path is where a wallet should do it.
+				// Fresh context: ctx is already cancelled.
+				if cerr := sub.Commit(context.Background()); cerr != nil {
+					log.Printf("commit on shutdown: %v", cerr)
+				}
 				return
 			}
 			log.Fatalf("recv: %v", err)
@@ -136,6 +190,22 @@ func main() {
 			}
 		case *satdevents.MempoolTweak:
 			scanner.scanEntry(&e.Entry, "mempool")
+		case *satdevents.ReplayGap:
+			// A tweaks-only subscription against a COMPLETE index is exempt from
+			// the replay clamp, and a node whose index is incomplete refuses the
+			// subscribe outright, so this should be unreachable here — but do
+			// not rely on that. Note also the detection limit documented on
+			// ReplayGap: a clamped subscription that filtered chain events out
+			// gets no gap notice at all, so absence of this event is not proof
+			// of a complete scan.
+			//
+			// If it does arrive, blocks went unscanned — for a wallet that is
+			// missed money, not a warning. Stop rather than carry a hole. The
+			// range is inclusive of ResumeHeight and exclusive of FirstHeight;
+			// re-derive it with getblock before trusting the balance.
+			log.Fatalf("replay gap: blocks [%d, %d] were never scanned; re-derive that "+
+				"range via getblock before trusting this wallet's balance",
+				e.ResumeHeight, e.FirstHeight-1)
 		}
 	}
 }
