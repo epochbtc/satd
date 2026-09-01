@@ -66,7 +66,7 @@ note = "the framework skipped it; re-triage when the run-set grows"
 file = "feature_bip68_sequence.py"
 status = "skip"
 reason = "feature-missing"
-note = "non-BIP68-final rejection returns code -25 where Core returns -26; also needs MiniWallet (generatetodescriptor)"
+note = "gets past error-code check (-26 fixed), but tx with sequence locks not accepted into mempool; BIP68 sequence-lock enforcement gap in accept path"
 
 [[test]]
 file = "feature_block.py"
@@ -102,7 +102,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "feature_coinstatsindex.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "gettxoutsetinfo missing `disk_size` and `transactions` fields"
 
 [[test]]
 file = "feature_coinstatsindex_compatibility.py"
@@ -157,9 +157,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "feature_framework_miniwallet.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs `generatetodescriptor`; the framework mines to MiniWallet's own descriptor. satd now parses the `raw()` form it passes, so this is a mining-RPC gap rather than a descriptor one"
+status = "run"
 
 [[test]]
 file = "feature_framework_startup_failures.py"
@@ -273,7 +271,7 @@ note = "needs block-file pruning, which satd does not implement. Follow-up: prun
 file = "feature_rbf.py"
 status = "skip"
 reason = "feature-missing"
-note = "needs MiniWallet (generatetodescriptor) to create transactions; test never reaches RBF logic"
+note = "testmempoolaccept does not detect conflicting-spend (RBF); returns allowed:true with no reject-reason for a replacement tx"
 
 [[test]]
 file = "feature_reindex.py"
@@ -427,8 +425,8 @@ note = "`testmempoolaccept` results have no `wtxid` field"
 [[test]]
 file = "mempool_cluster.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+reason = "feature-missing"
+note = "getmempoolentry missing `optimal` cluster-linearization field (Core v31+)"
 
 [[test]]
 file = "mempool_compatibility.py"
@@ -472,8 +470,8 @@ note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v3
 [[test]]
 file = "mempool_package_rbf.py"
 status = "skip"
-reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+reason = "feature-missing"
+note = "needs `submitpackage` RPC and package-RBF policy"
 
 [[test]]
 file = "mempool_packages.py"
@@ -490,7 +488,7 @@ reason = "no-wallet"
 file = "mempool_reorg.py"
 status = "skip"
 reason = "feature-missing"
-note = "non-final rejection returns code -25 where Core returns -26; also needs MiniWallet (generatetodescriptor)"
+note = "error-code -26 fixed; fails later: disconnected-block txs not reclaimed into mempool after reorg (invalidateblock path)"
 
 [[test]]
 file = "mempool_resurrect.py"
@@ -517,8 +515,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "mempool_unbroadcast.py"
 status = "skip"
-reason = "feature-missing"
-note = "needs MiniWallet (generatetodescriptor) to create transactions and mine blocks"
+reason = "rpc-missing"
+note = "needs `mockscheduler` RPC and `unbroadcast` field in getmempoolentry"
 
 [[test]]
 file = "mempool_updatefromblock.py"
@@ -529,8 +527,8 @@ note = "uses Core v31 cluster-mempool option; satd targets Core v30 compatibilit
 [[test]]
 file = "mining_basic.py"
 status = "skip"
-reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+reason = "feature-missing"
+note = "getmininginfo fixed; fails on -blockversion=1337 (satd ignores -blockversion CLI arg in getblocktemplate)"
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
@@ -560,7 +558,7 @@ note = "getblocktemplate proposal mode returns the full template instead of null
 file = "p2p_1p1c_network.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "needs `getorphantxs` RPC"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -578,7 +576,7 @@ note = "needs the hidden Core RPC addconnection for outbound test connections"
 file = "p2p_addr_selfannouncement.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs generatetodescriptor; see feature_framework_miniwallet.py"
+note = "needs `addpeeraddress` RPC"
 
 [[test]]
 file = "p2p_addrfetch.py"
@@ -666,7 +664,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "p2p_getaddr_caching.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs generatetodescriptor; see feature_framework_miniwallet.py"
+note = "needs `addpeeraddress` RPC"
 
 [[test]]
 file = "p2p_getdata.py"
@@ -787,7 +785,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "p2p_orphan_handling.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+note = "needs `getorphantxs` RPC"
 
 [[test]]
 file = "p2p_outbound_eviction.py"
@@ -901,7 +899,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_createmultisig.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "needs `createmultisig` RPC (not a wallet-only method in Core)"
 
 [[test]]
 file = "rpc_decodescript.py"
@@ -1140,7 +1138,7 @@ reason = "no-tool"
 file = "tool_utxo_to_sqlite.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+note = "dumptxoutset trailing-characters parse error on positional params"
 
 [[test]]
 file = "tool_wallet.py"

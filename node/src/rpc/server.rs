@@ -970,6 +970,18 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    module.register_method("generatetodescriptor", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: u32 = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("generateblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let address: String = seq
@@ -1013,7 +1025,7 @@ pub async fn start(
     })?;
 
     module.register_method("getmininginfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state))
+        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state, &ctx.mempool))
     })?;
 
     module.register_method("getnetworkhashps", |params, ctx, _extensions| {
@@ -1679,6 +1691,7 @@ pub async fn start(
             "estimatesmartfee",
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "getaddednodeinfo",
             "getbestblockhash",
             "getblock",

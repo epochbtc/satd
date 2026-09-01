@@ -177,6 +177,17 @@ target; the rest need Core-only binaries or internals.
   for 1.0 vs 2.0 responses, and many Core tests assert `"error":null` in the
   raw byte stream.
 
+- `generatetodescriptor` RPC: parses `raw()` and `addr()` descriptors and mines
+  blocks paying to the derived output script. This is how Core's MiniWallet
+  mines; without it, every MiniWallet-based test failed before reaching its
+  real logic. Put `feature_framework_miniwallet.py` in the run-set.
+- `getmininginfo` now includes `currentblocktx`, `currentblockweight`, and a
+  live `pooledtx` count (was hardcoded 0).
+- Mempool rejection error codes: policy rejections (non-final, non-BIP68-final,
+  insufficient fee, dust, chain limits, conflicts) now return `-26`
+  (`RPC_VERIFY_REJECTED`) instead of `-25`. Core distinguishes consensus errors
+  (`-25`) from policy rejections (`-26`); satd mapped everything to `-25`.
+
 Two rows that looked like satd defects were the harness's own: `shims/bitcoind`
 spawned satd as a child, so `node.process.pid` was the shim's. `get_bind_addrs`
 reads `/proc/<pid>/fd` to find a node's listening sockets and a shim owns none,

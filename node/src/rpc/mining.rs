@@ -1,6 +1,7 @@
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
+use crate::rpc::descriptor::parse_descriptor;
 use crate::storage::blockindex::target_to_difficulty;
 use serde_json::{json, Value};
 
@@ -66,6 +67,26 @@ pub fn generate_to_address(
     }
 
     let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks)
+        .map_err(|e| (-1, e.to_string()))?;
+
+    Ok(json!(hashes))
+}
+
+/// Handle the `generatetodescriptor` RPC call (regtest only).
+pub fn generate_to_descriptor(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    nblocks: u32,
+    descriptor: &str,
+) -> Result<Value, (i32, String)> {
+    if chain_state.network != bitcoin::Network::Regtest {
+        return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
+    }
+
+    let script = parse_descriptor(descriptor, chain_state.network)
+        .map_err(|e| (-8, e))?;
+
+    let hashes = crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks)
         .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))
@@ -162,7 +183,7 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
 }
 
 /// `getmininginfo` — return mining-related info.
-pub fn get_mining_info(chain_state: &ChainState) -> Value {
+pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     // One read -- see `ChainState::tip_snapshot`.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
     let difficulty = if let Some(entry) = chain_state.get_block_index(&tip_hash) {
@@ -180,11 +201,21 @@ pub fn get_mining_info(chain_state: &ChainState) -> Value {
         bitcoin::Network::Bitcoin => "main",
     };
 
+    let pooledtx = mempool.info().size;
+    let template = create_template(chain_state, mempool);
+    let currentblocktx = template.transactions.len() as u64;
+    let currentblockweight: u64 = template.transactions.iter()
+        .map(|t| t.weight as u64)
+        .sum::<u64>()
+        + 8000; // Core's DEFAULT_BLOCK_RESERVED_WEIGHT for the coinbase
+
     json!({
         "blocks": tip_height,
         "difficulty": difficulty,
         "networkhashps": hashps,
-        "pooledtx": 0,
+        "pooledtx": pooledtx,
+        "currentblocktx": currentblocktx,
+        "currentblockweight": currentblockweight,
         "chain": chain,
         "warnings": "",
     })

@@ -118,6 +118,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
+        "generatetodescriptor" => &[("num_blocks", false), ("descriptor", false), ("maxtries", false)],
         "getaddednodeinfo" => &[("node", false)],
         "getaddressbalance" => &[("address", false)],
         "getaddresshistory" => &[("address", false)],
