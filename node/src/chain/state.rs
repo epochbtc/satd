@@ -12093,7 +12093,7 @@ pub(crate) mod tests {
         // Try to connect block 2 before block 1 — should fail
         let result = cs.connect_stored_block(&hash2);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
+            matches!(result, Err(ChainError::PrevBlockNotFound)),
             "Connecting height 2 before 1 should fail, got {:?}",
             result
         );
@@ -12152,8 +12152,8 @@ pub(crate) mod tests {
 
         let result = cs.accept_header(&block.header);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
-            "accept_header with unknown parent should return BadPrevBlock, got {:?}",
+            matches!(result, Err(ChainError::PrevBlockNotFound)),
+            "accept_header with unknown parent should return PrevBlockNotFound, got {:?}",
             result
         );
 
@@ -12785,7 +12785,7 @@ pub(crate) mod tests {
         // Try to connect block 3 (skipping block 2) — should fail with BadPrevBlock
         let result = cs.connect_stored_block(&hashes[2]);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
+            matches!(result, Err(ChainError::PrevBlockNotFound)),
             "Connecting block 3 before block 2 should fail with BadPrevBlock, got {:?}",
             result
         );
