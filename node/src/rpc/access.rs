@@ -126,6 +126,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getaddresshistory"
         | "getaddressutxos"
         | "listbanned"
+        | "echo"
+        | "echoipc"
+        | "echojson"
         | "help"
         | "uptime"
         | "validateaddress"
@@ -150,7 +153,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "testmempoolaccept" => Read,
 
         // --- Reads: fee estimation ---
-        "estimatefees" | "estimatesmartfee" => Read,
+        "estimatefees" | "estimaterawfee" | "estimatesmartfee" => Read,
 
         // --- Reads: long-poll waits + mempool subscription stream ---
         "waitforblock" | "waitforblockheight" | "waitfornewblock" => Read,
