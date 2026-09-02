@@ -13,7 +13,7 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let info = mempool.info();
     let unit = default_unit();
     let min_fee = format_feerate_sat_per_kvb(info.min_fee_rate, unit);
-    let incremental = format_feerate_sat_per_kvb(1_000, unit); // 1000 sat/kvB
+    let incremental = format_feerate_sat_per_kvb(info.incremental_relay_fee, unit);
 
     let mut response = json!({
         "loaded": true,

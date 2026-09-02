@@ -1270,12 +1270,16 @@ pub async fn start(
                 Err(e) => {
                     let txid = tx.compute_txid();
                     let wtxid = tx.compute_wtxid();
-                    results.push(serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "txid": txid.to_string(),
                         "wtxid": wtxid.to_string(),
                         "allowed": false,
-                        "reject-reason": e.to_string(),
-                    }));
+                        "reject-reason": e.reject_reason(),
+                    });
+                    if let Some(details) = e.reject_details() {
+                        entry["reject-details"] = serde_json::Value::String(details);
+                    }
+                    results.push(entry);
                 }
             }
         }
