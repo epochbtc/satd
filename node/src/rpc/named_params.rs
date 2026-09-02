@@ -141,6 +141,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getdifficulty" => &[],
         "getibdprogress" => &[],
         "getindexinfo" => &[("index_name", false)],
+        "getsatdindexinfo" => &[],
         "getmemoryinfo" => &[("mode", false)],
         "getmempoolancestors" => &[("txid", false), ("verbose", false)],
         "getmempooldescendants" => &[("txid", false), ("verbose", false)],

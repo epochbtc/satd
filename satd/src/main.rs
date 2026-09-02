@@ -2417,6 +2417,9 @@ async fn main() {
         config.silentpaymentindex,
         Some(sp_backfill_handle.clone()),
         Some(sp_backfill_cmd_tx.clone()),
+        config.txindex,
+        config.coinstatsindex,
+        config.txospenderindex,
         listener_status.clone(),
         // BIP 158 filter index: passed unconditionally because `node`'s
         // `block-filter-index` feature is always on in any workspace

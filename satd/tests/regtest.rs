@@ -3020,15 +3020,18 @@ fn test_getblockfilter_rejects_non_active_hash() {
 
 #[test]
 fn test_getindexinfo_includes_basic_block_filter_index_key() {
-    // With --blockfilterindex=basic, getindexinfo must surface the
-    // Bitcoin-Core-shaped key "basic block filter index" alongside
-    // "address". synced=true on a fresh-sync datadir.
+    // With --blockfilterindex=basic, the Core-compat getindexinfo must
+    // surface "basic block filter index" with synced=true on a fresh
+    // datadir. The satd-native getsatdindexinfo also carries it (with
+    // the richer backfill substructure).
     let mut node = TestNode::start(&["--blockfilterindex=basic"]);
+
+    // Core-compat surface
     let response = node.rpc_call("getindexinfo").unwrap();
     let result = &response["result"];
     assert!(
         result["basic block filter index"].is_object(),
-        "expected 'basic block filter index' key, got: {:?}",
+        "expected 'basic block filter index' key in getindexinfo, got: {:?}",
         result
     );
     assert!(
@@ -3036,6 +3039,15 @@ fn test_getindexinfo_includes_basic_block_filter_index_key() {
             .as_bool()
             .unwrap_or(false),
         "expected synced=true on fresh-sync datadir"
+    );
+
+    // satd-native surface
+    let response = node.rpc_call("getsatdindexinfo").unwrap();
+    let result = &response["result"];
+    assert!(
+        result["basic block filter index"].is_object(),
+        "expected 'basic block filter index' key in getsatdindexinfo, got: {:?}",
+        result
     );
 
     node.stop();
@@ -5351,7 +5363,7 @@ fn test_address_index_mempool_quiet_when_empty() {
 
 // ── Address-history index — backfill RPCs (M7) ────────────────────────
 
-/// `getindexinfo.silentpayments` reports `enabled` separately from
+/// `getsatdindexinfo.silentpayments` reports `enabled` separately from
 /// `synced`.
 ///
 /// Both are false when the index is off, and `synced` alone therefore
@@ -5363,7 +5375,7 @@ fn test_address_index_mempool_quiet_when_empty() {
 fn test_getindexinfo_silentpayments_reports_enabled_separately() {
     // Off by default.
     let mut node = TestNode::start(&[]);
-    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let resp = node.rpc_call("getsatdindexinfo").expect("rpc");
     let sp = &resp["result"]["silentpayments"];
     assert!(sp.is_object(), "silentpayments key missing: {}", resp);
     assert_eq!(
@@ -5377,7 +5389,7 @@ fn test_getindexinfo_silentpayments_reports_enabled_separately() {
 
     // On: `enabled` flips independently of `synced`.
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
-    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let resp = node.rpc_call("getsatdindexinfo").expect("rpc");
     let sp = &resp["result"]["silentpayments"];
     assert_eq!(
         sp["enabled"].as_bool(),
@@ -5402,14 +5414,15 @@ fn test_getindexinfo_silentpayments_reports_enabled_separately() {
     node.stop();
 }
 
-/// `getindexinfo` returns the wrapping `{"address": {...}}` envelope
-/// with nested `{address: {synced, best_block_height, backfill: {...}}}`.
+/// `getsatdindexinfo` returns the wrapping `{"address": {...}}`
+/// envelope with nested
+/// `{address: {synced, best_block_height, backfill: {...}}}`.
 /// The shape is constructed in `node/src/rpc/indexes.rs` and locked by
 /// `STABILITY_POLICY.md` Tier 2 so downstream tooling can rely on it.
 #[test]
 fn test_address_index_getindexinfo_shape() {
     let mut node = TestNode::start(&[]);
-    let resp = node.rpc_call("getindexinfo").expect("rpc");
+    let resp = node.rpc_call("getsatdindexinfo").expect("rpc");
     let addr = &resp["result"]["address"];
     assert!(addr.is_object(), "address key missing: {}", resp);
     // synced=true is correct for a non-AssumeUTXO datadir: every
@@ -5495,7 +5508,7 @@ fn poll_backfill_state(
     let start = Instant::now();
     let mut last = serde_json::Value::Null;
     while start.elapsed() < deadline {
-        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let r = node.rpc_call("getsatdindexinfo").expect("rpc");
         let bf = &r["result"]["address"]["backfill"];
         // Prefer the explicit state field (added in the round-1 fix);
         // fall back to active/synced inference for backwards compat
@@ -5545,7 +5558,7 @@ fn poll_sp_backfill_state(
     let start = Instant::now();
     let mut last = serde_json::Value::Null;
     while start.elapsed() < deadline {
-        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let r = node.rpc_call("getsatdindexinfo").expect("rpc");
         let bf = &r["result"]["silentpayments"]["backfill"];
         let state_str = bf["state"].as_str().unwrap_or("");
         for label in expected {
@@ -5581,7 +5594,7 @@ fn test_sp_index_from_genesis_reports_synced() {
         )
         .expect("rpc");
 
-    let r = node.rpc_call("getindexinfo").expect("rpc");
+    let r = node.rpc_call("getsatdindexinfo").expect("rpc");
     let spi = &r["result"]["silentpayments"];
     assert!(spi.is_object(), "expected silentpayments key, got: {}", r);
     assert!(
@@ -5697,7 +5710,7 @@ fn test_sp_index_enable_on_existing_datadir_backfills() {
     // false (open-time stamp only touches a never-set marker), so the
     // index must report not-synced until a backfill runs.
     node.restart_preserving_datadir(&["--silentpaymentindex=1"]);
-    let r = node.rpc_call("getindexinfo").expect("rpc");
+    let r = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert_eq!(
         r["result"]["silentpayments"]["synced"].as_bool(),
         Some(false),
@@ -5770,7 +5783,7 @@ fn test_sp_index_backfill_disabled_returns_error() {
 fn poll_for_nonzero_sp_eta(node: &TestNode, timeout: Duration) -> Option<u64> {
     let deadline = Instant::now() + timeout;
     loop {
-        let info = node.rpc_call("getindexinfo").expect("rpc");
+        let info = node.rpc_call("getsatdindexinfo").expect("rpc");
         let bf = &info["result"]["silentpayments"]["backfill"];
         if let Some(eta) = bf["estimated_remaining_seconds"].as_u64()
             && eta > 0
@@ -5840,7 +5853,7 @@ fn test_sp_index_backfill_pause_resume() {
     // has returned but the runner is still between batches.
     poll_sp_backfill_state(&node, &["paused"], Duration::from_secs(10));
 
-    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    let mid = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert_eq!(
         mid["result"]["silentpayments"]["backfill"]["active"].as_bool(),
         Some(true),
@@ -6308,7 +6321,7 @@ fn test_sp_index_backfill_rebuilds_live_rows_byte_identically() {
     );
 
     node_c.restart_preserving_datadir(&["--silentpaymentindex=1"]);
-    let info = node_c.rpc_call("getindexinfo").expect("getindexinfo");
+    let info = node_c.rpc_call("getsatdindexinfo").expect("getindexinfo");
     assert_eq!(
         info["result"]["silentpayments"]["synced"].as_bool(),
         Some(false),
@@ -6589,7 +6602,7 @@ fn test_address_index_backfill_pause_resume() {
     // Observe `active=true` (paused state still shows as active in the
     // RPC envelope — `synced` would be false because the cursor isn't
     // at snapshot_height yet).
-    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    let mid = node.rpc_call("getsatdindexinfo").expect("rpc");
     let bf_mid = &mid["result"]["address"]["backfill"];
     assert_eq!(bf_mid["active"].as_bool(), Some(true), "{}", mid);
 
@@ -6741,7 +6754,7 @@ fn test_address_index_backfill_persists_completed_across_restart() {
 
     // Restart against the same datadir.
     let node = TestNode::start_with_datadir(&datadir, rpcport, &[]);
-    let info = node.rpc_call("getindexinfo").expect("rpc");
+    let info = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         info["result"]["address"]["synced"]
             .as_bool()
@@ -7261,7 +7274,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     let mut final_state = String::new();
     let mut last_err = String::new();
     while Instant::now() < deadline {
-        let info = node_a.rpc_call("getindexinfo").expect("rpc");
+        let info = node_a.rpc_call("getsatdindexinfo").expect("rpc");
         if let Some(s) = info["result"]["address"]["backfill"]["state"].as_str()
             && s == "failed"
         {
@@ -10493,7 +10506,7 @@ fn poll_filter_backfill_state(
     let start = Instant::now();
     let mut last = serde_json::Value::Null;
     while start.elapsed() < deadline {
-        let r = node.rpc_call("getindexinfo").expect("rpc");
+        let r = node.rpc_call("getsatdindexinfo").expect("rpc");
         let bf = &r["result"]["basic block filter index"]["backfill"];
         let state_str = bf["state"].as_str().unwrap_or("");
         for label in expected {
@@ -10635,12 +10648,12 @@ fn test_filter_backfill_pause_resume() {
     poll_filter_backfill_state(&node, &["paused"], Duration::from_secs(10));
 
     // Confirm the cursor pins under pause.
-    let mid = node.rpc_call("getindexinfo").expect("rpc");
+    let mid = node.rpc_call("getsatdindexinfo").expect("rpc");
     let cursor1 = mid["result"]["basic block filter index"]["backfill"]["cursor_height"]
         .as_u64()
         .unwrap_or(0);
     std::thread::sleep(Duration::from_millis(700));
-    let mid2 = node.rpc_call("getindexinfo").expect("rpc");
+    let mid2 = node.rpc_call("getsatdindexinfo").expect("rpc");
     let cursor2 = mid2["result"]["basic block filter index"]["backfill"]["cursor_height"]
         .as_u64()
         .unwrap_or(0);
@@ -10685,7 +10698,7 @@ fn test_filter_backfill_cancel_drops_progress() {
         .expect("rpc");
     assert_eq!(r["result"]["cancelled"].as_bool(), Some(true));
     poll_filter_backfill_state(&node, &["cancelled"], Duration::from_secs(15));
-    let info = node.rpc_call("getindexinfo").expect("rpc");
+    let info = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         !info["result"]["basic block filter index"]["synced"]
             .as_bool()
@@ -10754,7 +10767,7 @@ fn test_filter_backfill_resume_after_restart() {
     // Restart the same datadir. The supervisor should auto-resume.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &["--blockfilterindex=basic"]);
     poll_filter_backfill_state(&node, &["completed"], Duration::from_secs(60));
-    let info = node.rpc_call("getindexinfo").expect("rpc");
+    let info = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         info["result"]["basic block filter index"]["synced"]
             .as_bool()
@@ -10771,7 +10784,7 @@ fn test_filter_backfill_resume_after_restart() {
 #[test]
 fn test_filter_index_getindexinfo_shape_when_disabled() {
     let mut node = TestNode::start(&[]);
-    let r = node.rpc_call("getindexinfo").expect("rpc");
+    let r = node.rpc_call("getsatdindexinfo").expect("rpc");
     let bfi = &r["result"]["basic block filter index"];
     assert!(!bfi.is_null(), "expected sibling key");
     assert_eq!(
@@ -10811,7 +10824,7 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
             vec![serde_json::json!(20), serde_json::json!(addr)],
         )
         .expect("rpc");
-    let info_a = node_a.rpc_call("getindexinfo").expect("rpc");
+    let info_a = node_a.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         info_a["result"]["basic block filter index"]["synced"]
             .as_bool()
@@ -10837,7 +10850,7 @@ fn test_filter_backfill_from_disabled_datadir_matches_connect_time() {
         )
         .expect("rpc");
     // With the index off, getindexinfo should report not-synced.
-    let info = node_pre.rpc_call("getindexinfo").expect("rpc");
+    let info = node_pre.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         !info["result"]["basic block filter index"]["synced"]
             .as_bool()
@@ -10923,7 +10936,7 @@ fn test_filter_backfill_tail_catchup_after_concurrent_live_block() {
     // stamped AND the post-snapshot tail is rewritten with correctly
     // chained headers. The byte-level header validation lives in PR-5
     // once `getblockfilter` returns the header hex.
-    let info = node_b.rpc_call("getindexinfo").expect("rpc");
+    let info = node_b.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         info["result"]["basic block filter index"]["synced"]
             .as_bool()
@@ -11222,7 +11235,7 @@ fn test_p2p_getcfheaders_returns_chain() {
     )
     .expect("rpc");
 
-    let info = node.rpc_call("getindexinfo").expect("rpc");
+    let info = node.rpc_call("getsatdindexinfo").expect("rpc");
     assert!(
         info["result"]["basic block filter index"]["synced"]
             .as_bool()

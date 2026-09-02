@@ -94,6 +94,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getdifficulty"
         | "getibdprogress"
         | "getindexinfo"
+        | "getsatdindexinfo"
         | "getmemoryinfo"
         | "getmempoolancestors"
         | "getmempooldescendants"

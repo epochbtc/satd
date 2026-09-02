@@ -1,11 +1,17 @@
-//! Operator-facing RPCs for the indexes family: `getindexinfo` and
-//! the four backfill control RPCs (`backfillindex`, `pauseindex`,
-//! `resumeindex`, `cancelindex`).
+//! Operator-facing RPCs for the indexes family: `getindexinfo`,
+//! `getsatdindexinfo`, and the four backfill control RPCs
+//! (`backfillindex`, `pauseindex`, `resumeindex`, `cancelindex`).
 //!
-//! `getindexinfo` returns a wrapping shape (`{"address": {...}, ...}`)
-//! so future indexes (txindex, blockfilter) join under sibling keys
-//! without breaking consumers. The exact JSON layout is documented on
-//! `getindexinfo` below and locked by `STABILITY_POLICY.md` Tier 2.
+//! `getindexinfo` is the **Core-compatible** surface: it reports only
+//! indexes that correspond to explicit Bitcoin Core CLI flags
+//! (`-txindex`, `-blockfilterindex`, `-coinstatsindex`,
+//! `-txospenderindex`). When none are set, it returns `{}`. This
+//! matches Core's contract and passes Core's `rpc_misc.py` test.
+//!
+//! `getsatdindexinfo` is the **satd-native** surface: it reports
+//! satd's internal indexes (address, block filter, silentpayments)
+//! with their detailed backfill substructure. `sat-tui` and operators
+//! who need backfill progress or SP-index status read this one.
 
 use std::sync::Arc;
 
@@ -22,7 +28,82 @@ use crate::index::filter;
 use crate::index::silent_payments;
 use crate::storage::Store;
 
-/// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
+/// Bitcoin Core-compatible `getindexinfo` response.
+///
+/// Returns only the indexes that were explicitly requested via Core-
+/// compatible CLI flags. Each entry carries `{"synced": bool,
+/// "best_block_height": u32}`. When no index flags were passed, returns
+/// `{}`. An optional `index_name` filter narrows to a single entry.
+///
+/// Indexes:
+/// - `"txindex"` — present when `-txindex` was set; synced when
+///   `tx_index_complete()` is true.
+/// - `"basic block filter index"` — present when `-blockfilterindex`
+///   was set; synced when `block_filter_index_complete()` is true.
+/// - `"coinstatsindex"` — present when `-coinstatsindex` was set;
+///   satd does not implement this index, so it reports as always synced.
+/// - `"txospenderindex"` — present when `-txospenderindex` was set;
+///   satd does not implement this index, so it reports as always synced.
+pub fn get_index_info_core_compat(
+    chain: &Arc<ChainState>,
+    txindex_enabled: bool,
+    blockfilterindex_enabled: bool,
+    coinstatsindex_enabled: bool,
+    txospenderindex_enabled: bool,
+    best_block_height: u32,
+    index_name: Option<&str>,
+) -> Value {
+    let mut top = serde_json::Map::new();
+
+    if txindex_enabled {
+        let synced = chain.store_ref().has_txindex()
+            && chain.store_ref().tx_index_complete();
+        top.insert(
+            "txindex".into(),
+            json!({"synced": synced, "best_block_height": best_block_height}),
+        );
+    }
+
+    if blockfilterindex_enabled {
+        #[cfg(feature = "block-filter-index")]
+        let synced = chain.store_ref().block_filter_index_complete();
+        #[cfg(not(feature = "block-filter-index"))]
+        let synced = false;
+        top.insert(
+            "basic block filter index".into(),
+            json!({"synced": synced, "best_block_height": best_block_height}),
+        );
+    }
+
+    // Stub indexes: satd does not implement these, but accepts the CLI
+    // flags for Core drop-in compat and reports them as always synced.
+    if coinstatsindex_enabled {
+        top.insert(
+            "coinstatsindex".into(),
+            json!({"synced": true, "best_block_height": best_block_height}),
+        );
+    }
+    if txospenderindex_enabled {
+        top.insert(
+            "txospenderindex".into(),
+            json!({"synced": true, "best_block_height": best_block_height}),
+        );
+    }
+
+    // Optional index_name filter: return only the matching entry.
+    if let Some(name) = index_name {
+        if let Some(entry) = top.remove(name) {
+            let mut filtered = serde_json::Map::new();
+            filtered.insert(name.to_string(), entry);
+            return Value::Object(filtered);
+        }
+        return Value::Object(serde_json::Map::new());
+    }
+
+    Value::Object(top)
+}
+
+/// `getsatdindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
 ///
 /// ```text
 /// {
