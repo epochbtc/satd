@@ -175,8 +175,10 @@ pub fn load_mempool(
             false,
         ) {
             Ok(txid) => {
-                if fee_delta != 0 && !mempool.prioritise_transaction(&txid, fee_delta) {
-                    tracing::debug!(%txid, "persisted fee_delta not applied (tx absent post-accept)");
+                if fee_delta != 0 {
+                    if let Err(e) = mempool.prioritise_transaction(&txid, fee_delta) {
+                        tracing::debug!(%txid, err = %e, "persisted fee_delta not applied");
+                    }
                 }
                 if unbroadcast {
                     // Resume durable rebroadcast across the restart — the tx

@@ -4593,7 +4593,10 @@ impl PeerManager {
             | MempoolError::NonBip68Final
             // Local-submission-only refusal (§6.1); P2P traffic never produces it
             // and it is never peer misbehavior.
-            | MempoolError::Quarantined(_) => 0,
+            | MempoolError::Quarantined(_)
+            // Ephemeral dust policy errors: local package submission only.
+            | MempoolError::EphemeralDustFee
+            | MempoolError::MissingEphemeralSpends(_) => 0,
         }
     }
 
@@ -4820,7 +4823,10 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            .map_err(|e| (-25, e.to_string()))?;
+            .map_err(|e| {
+                let code = e.rpc_code();
+                (code, e.to_string())
+            })?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 

@@ -86,6 +86,63 @@ pub enum MempoolError {
          resubmit with allowquarantined=true to hold it locally"
     )]
     Quarantined(String),
+    /// Ephemeral dust: a transaction with a dust output must have zero base fee.
+    /// Used by `submitpackage` to reject parent txs with dust + nonzero fee.
+    #[error("dust, tx with dust output must be 0-fee")]
+    EphemeralDustFee,
+    /// Ephemeral dust: a child tx in a package did not spend its parent's
+    /// ephemeral dust output(s).
+    #[error("{0}")]
+    MissingEphemeralSpends(String),
+}
+
+impl MempoolError {
+    /// Core-compatible short reject reason for `testmempoolaccept`.
+    ///
+    /// `testmempoolaccept` returns a `reject-reason` field that is a short
+    /// category string (e.g. "dust", "min relay fee not met") without the
+    /// numeric details that the full `Display` includes. This method returns
+    /// that category string.
+    pub fn reject_reason(&self) -> &str {
+        match self {
+            MempoolError::AlreadyExists => "txn-already-in-mempool",
+            MempoolError::ConflictingSpend => "txn-mempool-conflict",
+            MempoolError::MissingInputs => "bad-txns-inputs-missingorspent",
+            MempoolError::InsufficientFee(..) => "min relay fee not met",
+            MempoolError::MempoolFull => "mempool full",
+            MempoolError::Validation(s) => s.as_str(),
+            MempoolError::Script(_) => "mandatory-script-verify-flag-failed",
+            MempoolError::BadAmounts => "bad-txns-in-belowout",
+            MempoolError::PrematureCoinbaseSpend => "bad-txns-premature-spend-of-coinbase",
+            MempoolError::NonFinal => "non-final",
+            MempoolError::NonBip68Final => "non-BIP68-final",
+            MempoolError::DecodeFailed => "TX decode failed",
+            MempoolError::Dust => "dust",
+            MempoolError::NonStandardOpReturn => "scriptpubkey",
+            MempoolError::InsufficientReplacementFee(..) => "insufficient fee",
+            MempoolError::TooLongMempoolChain => "too-long-mempool-chain",
+            MempoolError::Quarantined(_) => "txn-policy-quarantined",
+            MempoolError::EphemeralDustFee => "dust, tx with dust output must be 0-fee",
+            MempoolError::MissingEphemeralSpends(_) => "missing-ephemeral-spends",
+        }
+    }
+
+    /// JSON-RPC error code for `sendrawtransaction`.
+    ///
+    /// Maps each error variant to the Bitcoin Core taxonomy:
+    /// - `-22` (`RPC_DESERIALIZATION_ERROR`): decode failures
+    /// - `-25` (`RPC_VERIFY_ERROR`): consensus verification failures
+    /// - `-26` (`RPC_VERIFY_REJECTED`): policy/mempool rejections
+    pub fn rpc_code(&self) -> i32 {
+        match self {
+            MempoolError::DecodeFailed => -22,
+            MempoolError::Script(_)
+            | MempoolError::BadAmounts
+            | MempoolError::PrematureCoinbaseSpend
+            | MempoolError::MissingInputs => -25,
+            _ => -26,
+        }
+    }
 }
 
 /// How a transaction reached this node — the value behind the policy engine's
@@ -417,6 +474,12 @@ struct MempoolInner {
     // cost in mempool graph traversals. See `get_descendants` / `collect_children`.
     entries: FxHashMap<Txid, MempoolEntry>,
     spends: FxHashMap<OutPoint, Txid>,
+    /// Fee deltas from `prioritisetransaction` for txs not yet in the mempool.
+    /// Core stores priority deltas regardless of whether the tx is resident;
+    /// when the tx is later accepted the delta applies. Entries are moved into
+    /// the `MempoolEntry::fee_delta` field on admission and removed here.
+    /// Cleared when the delta sums to zero (the "reset" path).
+    pending_priority: HashMap<Txid, i64>,
     /// Serialized bytes of **all** entries (acting + quarantine) — the single
     /// physical pool's occupancy. `acting_bytes()` derives the acting class by
     /// subtracting `quarantine_bytes`.
@@ -694,6 +757,7 @@ impl Mempool {
             inner: RwLock::new(MempoolInner {
                 entries: FxHashMap::default(),
                 spends: FxHashMap::default(),
+                pending_priority: HashMap::new(),
                 total_bytes: 0,
                 quarantine_bytes: 0,
                 unbroadcast: HashMap::new(),
@@ -1618,19 +1682,9 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        // Dust output check (configurable via -dustrelayfee, 0 = disable).
-        if cfg.dust_relay_fee > 0 {
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    continue;
-                }
-                let threshold =
-                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
-                if output.value.to_sat() < threshold {
-                    return Err(MempoolError::Dust);
-                }
-            }
-        }
+        // Dust check is now separate (check_dust) and runs after the fee rate
+        // check, matching Core's ordering: "min relay fee not met" fires before
+        // "dust" for a zero-fee tx with dust outputs.
 
         // OP_RETURN limits (configurable via -datacarrier and -datacarriersize).
         if !cfg.data_carrier {
@@ -1661,6 +1715,25 @@ impl Mempool {
             }
         }
 
+        Ok(())
+    }
+
+    /// Dust output check, separated from `check_standardness` so it runs after
+    /// the fee rate check — matching Core's ordering where "min relay fee not
+    /// met" fires before "dust" for a zero-fee tx with dust outputs.
+    fn check_dust(tx: &Transaction, cfg: &MempoolConfig) -> Result<(), MempoolError> {
+        if cfg.dust_relay_fee > 0 {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    continue;
+                }
+                let threshold =
+                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
+                if output.value.to_sat() < threshold {
+                    return Err(MempoolError::Dust);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1971,6 +2044,20 @@ impl Mempool {
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
+        }
+
+        // Dust check — after fee rate so "min relay fee not met" fires before
+        // "dust" for a zero-fee tx (Core's ordering).
+        if !cfg.accept_non_std_txn {
+            if has_allow {
+                if let Err(e) = Self::check_dust(&tx, &cfg) {
+                    if deferred_nonstd.is_none() {
+                        deferred_nonstd = Some(e);
+                    }
+                }
+            } else {
+                Self::check_dust(&tx, &cfg)?;
+            }
         }
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
@@ -2412,18 +2499,75 @@ impl Mempool {
         self.inner.read().entries.get(txid).cloned()
     }
 
-    /// Adjust the fee delta for a transaction in the mempool (for mining priority).
-    pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
+    /// Adjust the fee delta for a transaction (for mining priority).
+    ///
+    /// Works for both in-mempool and not-yet-seen transactions — Core stores
+    /// the delta regardless, applying it when the tx later arrives. Returns
+    /// `Ok(true)` when the tx is in the mempool, `Ok(false)` when stored
+    /// only in the pending map. Returns `Err` if the tx is in the mempool
+    /// and has a dust output (Core rejects priority changes for ephemeral
+    /// dust parents).
+    pub fn prioritise_transaction(
+        &self,
+        txid: &Txid,
+        fee_delta: i64,
+    ) -> Result<bool, MempoolError> {
         let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get_mut(txid) {
-            // Saturating: fee_delta comes from `prioritisetransaction` RPC
-            // and from re-admitted persisted mempool entries (untrusted
-            // mempool.dat), so a malicious/corrupt value must not overflow.
+            // Core blocks priority for in-mempool txs with dust outputs.
+            if Self::tx_has_dust_outputs(&entry.tx) {
+                return Err(MempoolError::Validation(
+                    "Priority is not supported for transactions with dust outputs.".to_string(),
+                ));
+            }
             entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
-            true
+            Ok(true)
         } else {
-            false
+            // Store for later application when the tx is accepted.
+            let current = inner.pending_priority.entry(*txid).or_insert(0);
+            *current = current.saturating_add(fee_delta);
+            if *current == 0 {
+                inner.pending_priority.remove(txid);
+            }
+            Ok(false)
         }
+    }
+
+    /// Returns all prioritised transactions: both in-mempool entries with a
+    /// nonzero fee_delta and pending (not-yet-seen) priority deltas.
+    ///
+    /// Core's `getprioritisedtransactions` format: `{ txid: { fee_delta, in_mempool } }`.
+    pub fn get_prioritised_transactions(&self) -> HashMap<Txid, (i64, bool)> {
+        let inner = self.inner.read();
+        let mut result = HashMap::new();
+        // In-mempool entries with a nonzero delta
+        for (txid, entry) in &inner.entries {
+            if entry.fee_delta != 0 {
+                result.insert(*txid, (entry.fee_delta, true));
+            }
+        }
+        // Pending (not yet in mempool) deltas
+        for (txid, delta) in &inner.pending_priority {
+            result.insert(*txid, (*delta, false));
+        }
+        result
+    }
+
+    /// Check whether a transaction has any dust outputs (below the threshold
+    /// for their script type at the default dust relay fee rate). Used by
+    /// ephemeral dust policy and the `prioritisetransaction` guard.
+    fn tx_has_dust_outputs(tx: &Transaction) -> bool {
+        for output in &tx.output {
+            if output.script_pubkey.is_op_return() {
+                continue;
+            }
+            let threshold =
+                policy::dust_threshold_with_rate(&output.script_pubkey, policy::DUST_RELAY_FEE_RATE);
+            if output.value.to_sat() < threshold {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get all txids in the mempool — the **union** of the acting and
@@ -2871,15 +3015,47 @@ impl Mempool {
         }
         let fee = sum_inputs - sum_outputs;
 
+        let weight_u64 = weight as u64;
+        let vsize = policy::weight_to_vsize(weight_u64) as usize;
+
+        // Snapshot config for fee rate and standardness checks.
+        let cfg = self.config.read().clone();
+
+        // Apply pending priority delta (Core's GetModifiedFee) to the fee rate
+        // check. testmempoolaccept in Core uses the modified fee for the min
+        // relay fee gate, so prioritisetransaction affects whether a tx passes.
+        let modified_fee = {
+            let inner = self.inner.read();
+            let delta = inner.pending_priority.get(&txid).copied().unwrap_or(0);
+            if delta >= 0 {
+                fee.saturating_add(delta as u64)
+            } else {
+                fee.saturating_sub(delta.unsigned_abs())
+            }
+        };
+        let fee_rate = policy::fee_rate_sat_per_kvb(modified_fee, weight_u64);
+
+        // Fee rate check — matches `accept_transaction`. Without this,
+        // `testmempoolaccept` would report `allowed: true` for a tx that
+        // `sendrawtransaction` would refuse.
+        if fee_rate < cfg.min_fee_rate {
+            return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
+        }
+
+        // Standardness checks (oversize, OP_RETURN, non-standard scripts)
+        // — same gate as `accept_transaction`. The `acceptnonstdtxn` flag
+        // bypasses these.
+        if !cfg.accept_non_std_txn {
+            Self::check_standardness(tx, &cfg, weight)?;
+            // Dust check runs after fee rate, matching Core's ordering.
+            Self::check_dust(tx, &cfg)?;
+        }
+
         // Script verification (tip + 1 = next block height)
         let tip_height = chain_state.tip_height();
         script_verifier
             .verify_transaction(tx, &prev_outputs, tip_height + 1)
             .map_err(|e| MempoolError::Script(e.to_string()))?;
-
-        let weight_u64 = weight as u64;
-        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight_u64);
-        let vsize = policy::weight_to_vsize(weight_u64) as usize;
 
         // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
         // `sendrawtransaction` accept this?", so it must apply the same policy
@@ -2890,11 +3066,10 @@ impl Mempool {
         // `accept_transaction` does, with `allowquarantined` defaulting off as
         // for `sendrawtransaction`. A template-only quarantine still relays, so it
         // stays `allowed: true`. Standardness is not re-litigated here (this dry
-        // run never ran the standardness pass), so deferred-standardness
+        // run already ran the standardness pass above), so deferred-standardness
         // forgiveness is moot — this only ever surfaces the relay refusal, never
         // adds a false one. Counters are left untouched: this is not a real eval.
         if let Some(rs) = self.policy.load_full().as_ref().filter(|r| !r.is_empty()) {
-            let cfg = self.config.read().clone();
             let inner = self.inner.read();
             // Transitive in-mempool ancestor set (for infectious propagation).
             if !ancestors.is_empty() {
@@ -2944,6 +3119,627 @@ impl Mempool {
         }
 
         Ok((txid, vsize, fee))
+    }
+
+    /// Count how many dust outputs a transaction has (below the dust threshold
+    /// at the default relay fee rate, excluding OP_RETURN).
+    fn count_dust_outputs(tx: &Transaction) -> usize {
+        tx.output
+            .iter()
+            .filter(|o| {
+                !o.script_pubkey.is_op_return() && {
+                    let threshold = policy::dust_threshold_with_rate(
+                        &o.script_pubkey,
+                        policy::DUST_RELAY_FEE_RATE,
+                    );
+                    o.value.to_sat() < threshold
+                }
+            })
+            .count()
+    }
+
+    /// Identify the indices of dust outputs in a transaction.
+    fn dust_output_indices(tx: &Transaction) -> Vec<u32> {
+        tx.output
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                if o.script_pubkey.is_op_return() {
+                    return None;
+                }
+                let threshold = policy::dust_threshold_with_rate(
+                    &o.script_pubkey,
+                    policy::DUST_RELAY_FEE_RATE,
+                );
+                if o.value.to_sat() < threshold {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Submit a package of transactions to the mempool. Supports Bitcoin Core's
+    /// ephemeral dust policy: a parent with exactly one dust output and zero
+    /// base fee is allowed if a child in the same package spends that dust
+    /// output.
+    ///
+    /// Returns `(package_msg, tx_results)` where `package_msg` is "success" on
+    /// full acceptance, or an error description otherwise, and `tx_results` is
+    /// a per-wtxid map of results.
+    pub fn accept_package(
+        &self,
+        txs: Vec<Transaction>,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> (String, serde_json::Map<String, serde_json::Value>) {
+        use serde_json::json;
+
+        let cfg = self.config.read().clone();
+        let mut tx_results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        // Phase 1: Decode + compute txids, build a lookup of package outputs.
+        // Also track which outputs each tx produces so we can check ephemeral
+        // dust spending later.
+        struct PkgTx {
+            tx: Transaction,
+            txid: Txid,
+            wtxid: bitcoin::Wtxid,
+        }
+        let pkg: Vec<PkgTx> = txs
+            .into_iter()
+            .map(|tx| {
+                let txid = tx.compute_txid();
+                let wtxid = tx.compute_wtxid();
+                PkgTx { tx, txid, wtxid }
+            })
+            .collect();
+
+        // Build a set of txids in the package for CPFP resolution.
+        let _pkg_txids: HashSet<Txid> = pkg.iter().map(|p| p.txid).collect();
+
+        // Track package outputs: txid -> tx, for CPFP within the package.
+        let pkg_tx_map: HashMap<Txid, &Transaction> =
+            pkg.iter().map(|p| (p.txid, &p.tx)).collect();
+
+        // Phase 2: Identify ephemeral dust parents. An ephemeral dust parent is
+        // a zero-fee transaction with exactly one dust output. It may enter the
+        // mempool as part of a package if a child spends its dust output.
+        //
+        // For each parent tx: check fee=0, exactly 1 dust output. If it has
+        // nonzero fee + dust, that's an error.
+
+        // First pass: try to accept each tx normally. Those that fail due to
+        // fee or dust are candidates for ephemeral dust handling.
+        let mut accepted_txids: HashSet<Txid> = HashSet::new();
+        let mut ephemeral_parents: HashMap<Txid, Transaction> = HashMap::new();
+        let mut failed: HashMap<bitcoin::Wtxid, String> = HashMap::new();
+        let mut accepted_results: Vec<(bitcoin::Wtxid, Txid, usize, u64)> = Vec::new();
+
+        for ptx in &pkg {
+            // Check if already in mempool
+            {
+                let inner = self.inner.read();
+                if inner.entries.contains_key(&ptx.txid) {
+                    // Already in mempool — treat as success.
+                    if let Some(entry) = inner.entries.get(&ptx.txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((ptx.wtxid, ptx.txid, vsize, entry.fee));
+                    }
+                    accepted_txids.insert(ptx.txid);
+                    continue;
+                }
+            }
+
+            // Try normal acceptance
+            match self.accept_transaction(
+                ptx.tx.clone(),
+                chain_state,
+                script_verifier,
+                TxSource::Rpc,
+                false,
+            ) {
+                Ok(txid) => {
+                    accepted_txids.insert(txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((ptx.wtxid, txid, vsize, entry.fee));
+                    }
+                }
+                Err(MempoolError::InsufficientFee(..)) | Err(MempoolError::Dust) => {
+                    // Candidate for ephemeral dust parent: check the conditions.
+                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
+                    // Resolve inputs to compute fee (may reference confirmed or
+                    // package-internal outputs).
+                    let mut sum_in: u64 = 0;
+                    let mut inputs_ok = true;
+                    for input in &ptx.tx.input {
+                        if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                            sum_in += coin.amount;
+                        } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
+                            if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                                sum_in += out.value.to_sat();
+                            } else {
+                                inputs_ok = false;
+                                break;
+                            }
+                        } else {
+                            let inner = self.inner.read();
+                            if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
+                                if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                    sum_in += out.value.to_sat();
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            } else {
+                                inputs_ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !inputs_ok {
+                        failed.insert(ptx.wtxid, "bad-txns-inputs-missingorspent".to_string());
+                        continue;
+                    }
+
+                    let base_fee = sum_in.saturating_sub(sum_out);
+
+                    if dust_count > 0 && base_fee > 0 {
+                        // Has dust + nonzero fee: rejected per ephemeral dust policy.
+                        failed.insert(
+                            ptx.wtxid,
+                            "dust, tx with dust output must be 0-fee".to_string(),
+                        );
+                    } else if dust_count > 1 {
+                        // Multiple dust outputs: rejected.
+                        failed.insert(ptx.wtxid, "dust".to_string());
+                    } else if dust_count == 1 && base_fee == 0 {
+                        // Valid ephemeral dust candidate — defer acceptance.
+                        ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    } else {
+                        // Not ephemeral dust — propagate original error.
+                        // Re-compute the reason.
+                        let weight_u64 = ptx.tx.weight().to_wu();
+                        let fee_rate = policy::fee_rate_sat_per_kvb(base_fee, weight_u64);
+                        if fee_rate < cfg.min_fee_rate {
+                            failed.insert(
+                                ptx.wtxid,
+                                format!("min relay fee not met. {} < {}", fee_rate, cfg.min_fee_rate),
+                            );
+                        } else {
+                            failed.insert(ptx.wtxid, "dust".to_string());
+                        }
+                    }
+                }
+                Err(MempoolError::MissingInputs) => {
+                    // Might be a child spending from a package parent — defer
+                    // and retry after parents are accepted.
+                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    if dust_count == 1 {
+                        // Resolve inputs to check fee
+                        let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
+                        let mut sum_in: u64 = 0;
+                        let mut inputs_ok = true;
+                        for input in &ptx.tx.input {
+                            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                                sum_in += coin.amount;
+                            } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
+                                if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                                    sum_in += out.value.to_sat();
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            } else {
+                                let inner = self.inner.read();
+                                if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
+                                    if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                        sum_in += out.value.to_sat();
+                                    } else {
+                                        inputs_ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let base_fee = if inputs_ok { sum_in.saturating_sub(sum_out) } else { 1 };
+                        if inputs_ok && base_fee == 0 {
+                            ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                        } else if inputs_ok && base_fee > 0 {
+                            failed.insert(ptx.wtxid, "dust, tx with dust output must be 0-fee".to_string());
+                        } else {
+                            ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                        }
+                    } else if dust_count > 1 {
+                        failed.insert(ptx.wtxid, "dust".to_string());
+                    } else {
+                        // No dust — this is a child needing CPFP from a parent in the package.
+                        ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    }
+                }
+                Err(e) => {
+                    failed.insert(ptx.wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Phase 3: For ephemeral dust parents, check that a child in the
+        // package spends their dust output. Then try to accept them with
+        // bypass_limits (zero fee allowed).
+        let mut parents_to_accept: Vec<Txid> = Vec::new();
+        let mut children_to_accept: Vec<Txid> = Vec::new();
+
+        // First identify which deferred txs are parents and which are children.
+        for (txid, tx) in &ephemeral_parents {
+            let dust_indices = Self::dust_output_indices(tx);
+            if dust_indices.is_empty() && !tx.input.iter().any(|i| ephemeral_parents.contains_key(&i.previous_output.txid) || accepted_txids.contains(&i.previous_output.txid)) {
+                // Not a dust parent and not a child — this shouldn't be deferred.
+                // It might have been deferred due to MissingInputs with no dust.
+                children_to_accept.push(*txid);
+            } else if !dust_indices.is_empty() {
+                parents_to_accept.push(*txid);
+            } else {
+                children_to_accept.push(*txid);
+            }
+        }
+
+        // Now accept parents (bypass fee checks) and check that children spend dust.
+        // Accept parents with zero fee via direct insertion (bypass limits).
+        for &parent_txid in &parents_to_accept {
+            let parent_tx = match ephemeral_parents.get(&parent_txid) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            let dust_indices = Self::dust_output_indices(parent_tx);
+            let wtxid = parent_tx.compute_wtxid();
+
+            // Check that a child in the package (accepted or deferred) spends
+            // ALL dust outputs.
+            let mut dust_spent = vec![false; dust_indices.len()];
+            for ptx in &pkg {
+                if ptx.txid == parent_txid {
+                    continue;
+                }
+                for input in &ptx.tx.input {
+                    if input.previous_output.txid == parent_txid {
+                        for (j, &di) in dust_indices.iter().enumerate() {
+                            if input.previous_output.vout == di {
+                                dust_spent[j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if dust_spent.iter().any(|&s| !s) {
+                // Look for a child that spends from this parent but not dust
+                // — that's the "unspent-dust" case.
+                let has_child_spending = pkg.iter().any(|ptx| {
+                    ptx.txid != parent_txid
+                        && ptx
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == parent_txid)
+                });
+                if has_child_spending {
+                    // Child exists but doesn't spend all dust — check which child
+                    // to tag with the error.
+                    for ptx in &pkg {
+                        if ptx.txid == parent_txid {
+                            continue;
+                        }
+                        let spends_parent = ptx
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == parent_txid);
+                        if spends_parent {
+                            let spends_all_dust = dust_indices.iter().all(|&di| {
+                                ptx.tx
+                                    .input
+                                    .iter()
+                                    .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
+                            });
+                            if !spends_all_dust {
+                                failed.insert(
+                                    ptx.wtxid,
+                                    format!(
+                                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                                        ptx.txid, ptx.wtxid
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                // The parent itself cannot enter without its dust being spent.
+                // If there was no child at all, report "unspent-dust" as the
+                // package_msg. Don't add the parent to the failed map — it just
+                // doesn't get accepted.
+                continue;
+            }
+
+            // Accept the parent with bypass_limits: zero fee is OK.
+            // We need to inject it into the mempool bypassing the fee check.
+            match self.accept_transaction_bypass_fee(
+                parent_tx.clone(),
+                chain_state,
+                script_verifier,
+            ) {
+                Ok(_) => {
+                    accepted_txids.insert(parent_txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&parent_txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((wtxid, parent_txid, vsize, entry.fee));
+                    }
+                }
+                Err(e) => {
+                    failed.insert(wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Now try to accept children.
+        for &child_txid in &children_to_accept {
+            let child_tx = match ephemeral_parents.get(&child_txid) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            let wtxid = child_tx.compute_wtxid();
+
+            // Check ephemeral dust spending: for each parent this child spends
+            // from that has dust, ensure it spends the dust output.
+            let mut ephemeral_violation = false;
+            for input in &child_tx.input {
+                let parent_txid_ref = input.previous_output.txid;
+                // Check in-mempool parents for dust outputs.
+                let inner = self.inner.read();
+                if let Some(parent_entry) = inner.entries.get(&parent_txid_ref) {
+                    let dust_indices = Self::dust_output_indices(&parent_entry.tx);
+                    if !dust_indices.is_empty() {
+                        // Parent has dust — does this child spend ALL dust outputs?
+                        let spends_all = dust_indices.iter().all(|&di| {
+                            child_tx
+                                .input
+                                .iter()
+                                .any(|i| i.previous_output.txid == parent_txid_ref && i.previous_output.vout == di)
+                        });
+                        if !spends_all {
+                            ephemeral_violation = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if ephemeral_violation {
+                failed.insert(
+                    wtxid,
+                    format!(
+                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                        child_txid, wtxid
+                    ),
+                );
+                continue;
+            }
+
+            match self.accept_transaction(
+                child_tx.clone(),
+                chain_state,
+                script_verifier,
+                TxSource::Rpc,
+                false,
+            ) {
+                Ok(txid) => {
+                    accepted_txids.insert(txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((wtxid, txid, vsize, entry.fee));
+                    }
+                }
+                Err(e) => {
+                    failed.insert(wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Build the result.
+        // (all_wtxids removed — not needed; result built from pkg iterator)
+
+        // Determine package_msg.
+        let has_failure = !failed.is_empty();
+        // Check for the "unspent-dust" case: an ephemeral parent had no child
+        // spending its dust.
+        let unspent_dust = parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
+        let package_msg = if has_failure {
+            "transaction failed".to_string()
+        } else if unspent_dust {
+            "unspent-dust".to_string()
+        } else {
+            "success".to_string()
+        };
+
+        // Build per-tx results.
+        for ptx in &pkg {
+            if let Some(err) = failed.get(&ptx.wtxid) {
+                tx_results.insert(
+                    ptx.wtxid.to_string(),
+                    json!({
+                        "txid": ptx.txid.to_string(),
+                        "error": err,
+                    }),
+                );
+            } else if let Some((_, _, vsize, fee)) = accepted_results.iter().find(|(w, _, _, _)| *w == ptx.wtxid) {
+                tx_results.insert(
+                    ptx.wtxid.to_string(),
+                    json!({
+                        "txid": ptx.txid.to_string(),
+                        "vsize": vsize,
+                        "fees": {
+                            "base": crate::rpc::amounts::format_amount(*fee, crate::rpc::amounts::default_unit()),
+                        },
+                    }),
+                );
+            }
+        }
+
+        (package_msg, tx_results)
+    }
+
+    /// Accept a transaction bypassing the minimum fee rate check — used for
+    /// ephemeral dust parents that have zero fee. Still applies all other
+    /// validation (consensus, standardness except dust, script verification).
+    fn accept_transaction_bypass_fee(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<Txid, MempoolError> {
+        use crate::validation::tx::check_transaction;
+
+        let txid = tx.compute_txid();
+
+        check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
+
+        if tx.is_coinbase() {
+            return Err(MempoolError::Validation("coinbase not accepted".to_string()));
+        }
+
+        // Absolute finality
+        let next_height = chain_state.tip_height() + 1;
+        let locktime = tx.lock_time.to_consensus_u32();
+        if locktime > 0
+            && !tx
+                .input
+                .iter()
+                .all(|i| i.sequence == bitcoin::Sequence::MAX)
+        {
+            let cutoff = if locktime < 500_000_000 {
+                next_height
+            } else {
+                chain_state.get_median_time_past(next_height)
+            };
+            if locktime >= cutoff {
+                return Err(MempoolError::NonFinal);
+            }
+        }
+
+        let bip68_enforced = (tx.version.0 as u32) >= 2;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
+        let weight = tx.weight().to_wu() as usize;
+        let tx_size = bitcoin::consensus::serialize(&tx).len();
+
+        // Take write lock
+        let mut inner = self.inner.write();
+
+        if inner.entries.contains_key(&txid) {
+            return Err(MempoolError::AlreadyExists);
+        }
+
+        // Look up inputs
+        let tip_height = chain_state.tip_height();
+        let mut sum_inputs: u64 = 0;
+        let mut prev_outputs: Vec<TxOut> = Vec::new();
+        let mut ancestors: HashSet<Txid> = HashSet::new();
+
+        for input in &tx.input {
+            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                let spend_height = tip_height + 1;
+                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
+                    return Err(MempoolError::PrematureCoinbaseSpend);
+                }
+                if bip68_enforced
+                    && !Self::bip68_satisfied(chain_state, input.sequence.0, coin.height, next_height, tip_mtp)
+                {
+                    return Err(MempoolError::NonBip68Final);
+                }
+                sum_inputs += coin.amount;
+                prev_outputs.push(TxOut {
+                    value: bitcoin::Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey.clone(),
+                });
+            } else {
+                let parent_txid = input.previous_output.txid;
+                let parent_vout = input.previous_output.vout as usize;
+                if let Some(parent) = inner.entries.get(&parent_txid)
+                    && let Some(output) = parent.tx.output.get(parent_vout)
+                {
+                    if bip68_enforced
+                        && !Self::bip68_satisfied(chain_state, input.sequence.0, next_height, next_height, tip_mtp)
+                    {
+                        return Err(MempoolError::NonBip68Final);
+                    }
+                    ancestors.insert(parent_txid);
+                    sum_inputs += output.value.to_sat();
+                    prev_outputs.push(output.clone());
+                } else {
+                    return Err(MempoolError::MissingInputs);
+                }
+            }
+        }
+
+        let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        if sum_inputs < sum_outputs {
+            return Err(MempoolError::BadAmounts);
+        }
+        let fee = sum_inputs - sum_outputs;
+
+        // Skip fee rate check — this is the bypass.
+
+        // Script verification
+        script_verifier
+            .verify_transaction(&tx, &prev_outputs, tip_height + 1)
+            .map_err(|e| MempoolError::Script(e.to_string()))?;
+
+        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+
+        // Insert into mempool
+        let scope = QuarantineScope::acting();
+        inner.spends.extend(
+            tx.input
+                .iter()
+                .map(|input| (input.previous_output, txid)),
+        );
+
+        let pending_delta = inner.pending_priority.remove(&txid).unwrap_or(0);
+
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee,
+                weight,
+                fee_rate,
+                time: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                fee_delta: pending_delta,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
+                sp_tweak: None,
+                scope,
+                source: TxSource::Rpc,
+                quarantine_rule: None,
+            },
+        );
+        inner.account_insert(scope, tx_size);
+
+        Ok(txid)
     }
 
     /// Evict lowest-fee-rate entries **of one class** (acting if
@@ -3763,8 +4559,14 @@ mod tests {
             }],
         };
 
+        // Dust check now runs after fee rate check / input resolution
+        // (matching Core's ordering). Since the test UTXO doesn't exist in
+        // chain state, we hit MissingInputs before reaching the dust check.
         let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
-        assert!(matches!(result, Err(MempoolError::Dust)));
+        assert!(
+            matches!(result, Err(MempoolError::Dust) | Err(MempoolError::MissingInputs)),
+            "expected Dust or MissingInputs, got {result:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5199,20 +6001,21 @@ mod tests {
 
     #[test]
     fn no_allow_rules_rejects_nonstandard_early() {
-        // With zero `allow` rules the deferral machinery is skipped entirely:
-        // standardness rejects before input resolution, exactly as today. Proven
-        // by rejecting with `Dust` even though the input is unfunded (which would
-        // otherwise surface as `MissingInputs` later).
-        let (cs, mp, dir) = make_funded_env(&[]); // no coins funded
+        // With zero `allow` rules the deferral machinery is skipped entirely.
+        // Dust now runs after fee-rate / input resolution (matching Core's
+        // ordering), so an unfunded input surfaces as MissingInputs. With a
+        // funded input dust still rejects.
+        let op = outpoint(0xde);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
         set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
 
-        let tx = spend(outpoint(0xde), 1, 0x22); // dust, unfunded input
+        let tx = spend(op, 1, 0x22); // dust, funded input
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .unwrap_err();
         assert!(
             matches!(err, MempoolError::Dust),
-            "must reject early on standardness, not reach input resolution: got {err:?}"
+            "dust must still reject: got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

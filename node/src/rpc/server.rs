@@ -1206,8 +1206,10 @@ pub async fn start(
                 .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": true,
                         "vsize": vsize,
                         "fees": {
@@ -1217,15 +1219,56 @@ pub async fn start(
                 }
                 Err(e) => {
                     let txid = tx.compute_txid();
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": false,
-                        "reject-reason": e.to_string(),
+                        "reject-reason": e.reject_reason(),
                     }));
                 }
             }
         }
         Ok::<_, ErrorObjectOwned>(serde_json::json!(results))
+    })?;
+
+    // --- submitpackage RPC ---
+    module.register_method("submitpackage", |params, ctx, _extensions| {
+        let rawtxs: Vec<String> = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        // Decode all transactions.
+        let mut txs = Vec::with_capacity(rawtxs.len());
+        for hex_tx in &rawtxs {
+            let tx_bytes = hex::decode(hex_tx)
+                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+                .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            txs.push(tx);
+        }
+
+        let (package_msg, tx_results) = ctx.mempool.accept_package(
+            txs,
+            &ctx.chain_state,
+            ctx.chain_state.script_verifier(),
+        );
+
+        // Announce any newly-accepted transactions to peers.
+        for (_wtxid, result) in &tx_results {
+            if result.get("error").is_none() {
+                if let Some(txid_str) = result.get("txid").and_then(|v| v.as_str()) {
+                    if let Ok(txid) = txid_str.parse::<bitcoin::Txid>() {
+                        ctx.peer_manager.announce_tx(txid);
+                    }
+                }
+            }
+        }
+
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "package_msg": package_msg,
+            "tx-results": tx_results,
+        }))
     })?;
 
     // --- PSBT RPCs ---
@@ -1600,8 +1643,25 @@ pub async fn start(
         let txid: bitcoin::Txid = txid_str
             .parse()
             .map_err(|_| ErrorObjectOwned::owned(-8, "Invalid txid", None::<()>))?;
-        let found = ctx.mempool.prioritise_transaction(&txid, fee_delta);
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(found))
+        match ctx.mempool.prioritise_transaction(&txid, fee_delta) {
+            Ok(_) => Ok::<_, ErrorObjectOwned>(serde_json::json!(true)),
+            Err(e) => Err(ErrorObjectOwned::owned(-8, e.to_string(), None::<()>)),
+        }
+    })?;
+
+    module.register_method("getprioritisedtransactions", |_params, ctx, _extensions| {
+        let prioritised = ctx.mempool.get_prioritised_transactions();
+        let mut result = serde_json::Map::new();
+        for (txid, (fee_delta, in_mempool)) in &prioritised {
+            result.insert(
+                txid.to_string(),
+                serde_json::json!({
+                    "fee_delta": fee_delta,
+                    "in_mempool": in_mempool,
+                }),
+            );
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(result))
     })?;
 
     module.register_method("disconnectnode", |params, ctx, _extensions| {
@@ -1688,6 +1748,7 @@ pub async fn start(
             "getnetworkinfo",
             "getorphaninfo",
             "getpeerinfo",
+            "getprioritisedtransactions",
             "getrawmempool",
             "getrawtransaction",
             "getreorghistory",
@@ -1715,6 +1776,7 @@ pub async fn start(
             "stop",
             "submitblock",
             "submitheader",
+            "submitpackage",
             "subscribemempool",
             "syncwithvalidationinterfacequeue",
             "testmempoolaccept",

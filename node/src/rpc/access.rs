@@ -157,7 +157,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "subscribemempool" | "unsubscribemempool" => Read,
 
         // --- Mempool submission (broadcast) ---
-        "sendrawtransaction" => MempoolSubmit,
+        "sendrawtransaction" | "submitpackage" => MempoolSubmit,
 
         // --- Control: node / peer management ---
         "stop"
@@ -172,6 +172,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getblockfrompeer"
         // mempool *policy* mutation (mining priority), not a submit
         | "prioritisetransaction"
+        // read-only priority delta inspection
+        | "getprioritisedtransactions"
         // operational flush of the mempool to disk
         | "savemempool"
         // moves the node clock on a mockable chain (regtest); additionally
@@ -255,6 +257,7 @@ mod tests {
             "logging",
             "getblockfrompeer",
             "prioritisetransaction",
+            "getprioritisedtransactions",
             "savemempool",
             "setmocktime",
             "syncwithvalidationinterfacequeue",
@@ -277,6 +280,8 @@ mod tests {
     fn mempool_submit_is_allowed_on_readonly() {
         assert_eq!(classify("sendrawtransaction"), Some(RpcAccess::MempoolSubmit));
         assert!(readonly_listener_allows("sendrawtransaction"));
+        assert_eq!(classify("submitpackage"), Some(RpcAccess::MempoolSubmit));
+        assert!(readonly_listener_allows("submitpackage"));
     }
 
     #[test]

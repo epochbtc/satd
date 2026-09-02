@@ -440,7 +440,8 @@ note = "satd accepts an output Core's dust rule rejects: `testmempoolaccept` rep
 [[test]]
 file = "mempool_ephemeral_dust.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "submitpackage + ephemeral dust policy partially implemented; mempool sync fails (no 1P1C P2P relay for zero-fee parents)"
 
 [[test]]
 file = "mempool_expiry.py"
