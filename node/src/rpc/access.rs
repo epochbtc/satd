@@ -129,6 +129,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "echo"
         | "echoipc"
         | "echojson"
+        | "generate"
         | "help"
         | "uptime"
         | "validateaddress"

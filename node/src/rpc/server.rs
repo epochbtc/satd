@@ -1430,15 +1430,14 @@ pub async fn start(
         };
 
         // Validate estimate_mode if provided
-        if let Some(ref mode) = mode_str {
-            let normalized = mode.to_lowercase();
-            if normalized != "unset" && normalized != "economical" && normalized != "conservative" {
-                return Err(ErrorObjectOwned::owned(
-                    -8,
-                    "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"",
-                    None::<()>,
-                ));
-            }
+        if let Some(ref mode) = mode_str
+            && EstimateMode::parse(Some(mode.as_str())).is_none()
+        {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\", \"mempool\"",
+                None::<()>,
+            ));
         }
 
         let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Historical);
