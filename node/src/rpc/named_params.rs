@@ -113,11 +113,17 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "decodescript" => &[("hexstring", false)],
         "disconnectnode" => &[("address", false), ("nodeid", false)],
         "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("options", false)],
+        "echo" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
+        "echoipc" => &[("arg", false)],
+        "echojson" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
         "estimatefees" => &[("targets", false), ("mode", false)],
+        "estimaterawfee" => &[("conf_target", false), ("threshold", false)],
         "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false)],
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
+        "generate" => &[],
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
+        "generatetodescriptor" => &[("num_blocks", false), ("descriptor", false), ("maxtries", false)],
         "getaddednodeinfo" => &[("node", false)],
         "getaddressbalance" => &[("address", false)],
         "getaddresshistory" => &[("address", false)],
@@ -204,6 +210,65 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         _ => return None,
     };
     Some(args)
+}
+
+/// Every method known to the named-parameter table, in the same order as the
+/// `match` arm above. Used by the `help("dump_all_command_conversions")` RPC
+/// to build the conversion table that Core's `rpc_help.py` test validates.
+const ALL_METHODS: &[&str] = &[
+    "addnode", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
+    "combinepsbt", "combinerawtransaction", "converttopsbt", "createpsbt",
+    "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
+    "disconnectnode", "dumptxoutset",
+    "echo", "echoipc", "echojson",
+    "estimatefees", "estimaterawfee", "estimatesmartfee",
+    "finalizepsbt", "generate", "generateblock", "generatetoaddress",
+    "generatetodescriptor",
+    "getaddednodeinfo", "getaddressbalance", "getaddresshistory",
+    "getaddressutxos", "getbestblockhash", "getblock", "getblockchaininfo",
+    "getblockcount", "getblockfileaudit", "getblockfilter", "getblockfrompeer",
+    "getblockhash", "getblockheader", "getblockstats", "getblocktemplate",
+    "getchainstates", "getchaintips", "getchaintxstats", "getconfig",
+    "getconnectioncount", "getdifficulty", "getibdprogress", "getindexinfo",
+    "getmemoryinfo",
+    "getmempoolancestors", "getmempooldescendants", "getmempoolentry",
+    "getmempoolhistory", "getmempoolinfo", "getmininginfo", "getnettotals",
+    "getnetworkhashps", "getnetworkinfo", "getorphaninfo", "getpeerinfo",
+    "getpolicyinfo", "getquarantineentry", "getquarantineinfo", "getrawmempool",
+    "getrawtransaction", "getreorghistory", "getrpcinfo", "getserverstatus",
+    "getsilentpaymentblockdata", "getsysteminfo", "gettxout", "gettxoutsetinfo",
+    "getwarnings",
+    "help", "invalidateblock", "joinpsbts", "listbanned",
+    "listquarantine", "loadtxoutset", "logging",
+    "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
+    "reconsiderblock", "resumeindex", "savemempool", "scantxoutset",
+    "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
+    "signrawtransactionwithkey", "stop", "submitblock", "submitheader",
+    "subscribemempool", "syncwithvalidationinterfacequeue",
+    "testmempoolaccept", "unsubscribemempool", "uptime",
+    "utxoupdatepsbt", "validateaddress", "verifychain",
+    "waitforblock", "waitforblockheight", "waitfornewblock",
+];
+
+/// Build the conversion table for `help("dump_all_command_conversions")`.
+///
+/// Returns a vec of `[method, index, name, is_string]` tuples. `is_string` is
+/// always `false` (JSON type, needs conversion) since satd does not track
+/// per-parameter type metadata; the comparison with Core's client-side
+/// conversion table is guarded by `is_wallet_compiled()` (false for satd) so
+/// the values are not validated in the no-wallet configuration.
+pub fn dump_all_command_conversions() -> Vec<(String, usize, String, bool)> {
+    let mut result = Vec::new();
+    for &method in ALL_METHODS {
+        if let Some(args) = arg_names(method) {
+            for (i, &(name, _named_only)) in args.iter().enumerate() {
+                // Strip alias alternatives (e.g. "verbosity|verbose" → "verbosity")
+                let canonical = name.split('|').next().unwrap_or(name);
+                result.push((method.to_string(), i, canonical.to_string(), false));
+            }
+        }
+    }
+    result
 }
 
 /// Map an object `params` onto `method`'s positional arguments.

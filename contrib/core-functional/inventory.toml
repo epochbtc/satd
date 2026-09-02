@@ -896,8 +896,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_estimatefee.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_generate.py"
@@ -944,8 +943,7 @@ note = "uses -txospenderindex (Core v31); satd targets Core v30 compatibility, s
 
 [[test]]
 file = "rpc_help.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"

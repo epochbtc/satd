@@ -34,16 +34,13 @@
 use http_body_util::{BodyExt, Limited};
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 
-/// jsonrpsee's default `max_request_body_size` (10 MiB). The shim must
-/// not buffer more than the engine would itself accept. The cap is
-/// enforced *while* reading the body (via `http_body_util::Limited`,
-/// plus a `Content-Length` pre-check), never after a full
-/// `collect()` — otherwise this middleware would itself be a memory-DoS
-/// vector, allocating the entire (authenticated or not) request body
-/// before the limit could reject it. An over-limit request is answered
-/// with `413 Payload Too Large`, the same outcome jsonrpsee gives for a
-/// request exceeding its own `max_request_body_size`.
-const MAX_NORMALIZE_BODY: usize = 10 * 1024 * 1024;
+/// Maximum request body size the compat shim will buffer for JSON-RPC
+/// version normalization. Must match (or exceed) jsonrpsee's configured
+/// `max_request_body_size` so the shim never rejects a request that the
+/// engine would accept. Raised from 10 MiB to accommodate Core's
+/// functional-test suite, which sends 16+ MiB echo payloads
+/// (`ARG_SZ_LARGE = 8 MiB` x 2 args in rpc_misc.py).
+const MAX_NORMALIZE_BODY: usize = 20 * 1024 * 1024;
 
 /// Rewrite a JSON-RPC request body so Core-style (`1.0` / `1.1` /
 /// absent) `jsonrpc` members become `2.0`. Returns `None` when the body
