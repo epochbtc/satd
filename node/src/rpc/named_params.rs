@@ -126,7 +126,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getbestblockhash" => &[],
         "getblock" => &[("blockhash", false), ("verbosity|verbose", false)],
         "getblockchaininfo" => &[],
-        "getdeploymentinfo" => &[],
+        "getdeploymentinfo" => &[("blockhash", false)],
         "getblockcount" => &[],
         "getblockfileaudit" => &[],
         "getblockfilter" => &[("blockhash", false), ("filtertype", false)],
