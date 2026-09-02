@@ -178,7 +178,8 @@ status = "run"
 [[test]]
 file = "feature_includeconf.py"
 status = "skip"
-reason = "cache"
+reason = "harness"
+note = "tracing writes all log output to stderr; the test's stop_node(expected_stderr=...) exact-matches a single warning line against the full tracing output. Fix: redirect tracing to debug.log (matching Core)"
 
 [[test]]
 file = "feature_index_prune.py"
@@ -350,7 +351,8 @@ reason = "no-wallet"
 [[test]]
 file = "interface_http.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "passes through pipelining + chunked transfer + 404/400 checks, but fails on -rpcservertimeout (line 191): satd does not implement HTTP idle-connection timeout. Follow-up: map -rpcservertimeout to hyper's connection timeout"
 
 [[test]]
 file = "interface_ipc.py"
@@ -428,8 +430,7 @@ reason = "prev-release"
 
 [[test]]
 file = "mempool_datacarrier.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "mempool_dust.py"

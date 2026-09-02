@@ -21,8 +21,16 @@ pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 /// 3000 sat/kvB = 3 sat/vB, matching Bitcoin Core's default.
 pub const DUST_RELAY_FEE_RATE: u64 = 3_000;
 
-/// Maximum size of an OP_RETURN output script (including OP_RETURN opcode).
+/// Historical maximum size of an OP_RETURN output script (including OP_RETURN
+/// opcode).  83 bytes was the hard cap through Bitcoin Core v30.
 pub const MAX_OP_RETURN_SIZE: usize = 83;
+
+/// Default OP_RETURN relay cap.  Core v31 changed the default from
+/// [`MAX_OP_RETURN_SIZE`] (83) to `MAX_STANDARD_TX_WEIGHT / 4` (100 000),
+/// making the relay effectively uncapped.  Match that so a default-config
+/// node reports `getmempoolinfo.maxdatacarriersize = 100000` and accepts
+/// large OP_RETURN outputs the same as Core.
+pub const DEFAULT_DATA_CARRIER_SIZE: usize = 100_000;
 
 /// Maximum number of in-mempool ancestors for a single transaction.
 pub const MAX_ANCESTOR_COUNT: usize = 25;

@@ -26,6 +26,8 @@ pub fn get_mempool_info(mempool: &Mempool) -> Value {
         "incrementalrelayfee": incremental,
         "unbroadcastcount": info.unbroadcast,
         "fullrbf": info.full_rbf,
+        "maxdatacarriersize": info.max_data_carrier_size,
+        "permitbaremultisig": info.permit_bare_multisig,
     });
     annotate_units(&mut response, unit);
     response
