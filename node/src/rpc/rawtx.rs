@@ -8,6 +8,17 @@ use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
 use serde_json::{json, Value};
 
+/// Parse a JSON value as f64, handling both float and integer representations.
+/// With `arbitrary_precision`, serde_json stores numbers as strings internally,
+/// so `as_f64()` can fail on integer values like `1`. This helper falls back
+/// through `as_i64()` / `as_u64()` and then attempts string parsing.
+fn json_number_as_f64(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|i| i as f64))
+        .or_else(|| v.as_u64().map(|u| u as f64))
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
+
 /// `getmempoolinfo` — return mempool statistics.
 pub fn get_mempool_info(mempool: &Mempool) -> Value {
     let info = mempool.info();
@@ -288,7 +299,9 @@ pub fn create_raw_transaction(
     inputs: &[Value],
     outputs: &Value,
     locktime: Option<u32>,
+    replaceable: Option<bool>,
 ) -> Result<Value, (i32, String)> {
+    let nlock = locktime.unwrap_or(0);
     let mut tx_inputs = Vec::new();
     for input in inputs {
         let txid: bitcoin::Txid = input["txid"]
@@ -299,9 +312,21 @@ pub fn create_raw_transaction(
         let vout = input["vout"]
             .as_u64()
             .ok_or((-8, "Missing vout".to_string()))? as u32;
+        // Core's default sequence logic:
+        //   rbf unspecified or true → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+        //   rbf false, locktime > 0 → 0xFFFFFFFE
+        //   rbf false, locktime == 0 → 0xFFFFFFFF
+        // An explicit per-input "sequence" field overrides.
+        let default_seq: u32 = if replaceable.unwrap_or(true) {
+            0xffff_fffd // MAX_BIP125_RBF_SEQUENCE
+        } else if nlock > 0 {
+            0xffff_fffe // MAX_SEQUENCE_NONFINAL
+        } else {
+            0xffff_ffff // SEQUENCE_FINAL
+        };
         let sequence = input["sequence"]
             .as_u64()
-            .unwrap_or(0xffff_fffd) as u32; // default: RBF-signaling
+            .unwrap_or(default_seq as u64) as u32;
 
         tx_inputs.push(TxIn {
             previous_output: OutPoint { txid, vout },
@@ -329,8 +354,7 @@ pub fn create_raw_transaction(
                     script_pubkey: script,
                 });
             } else {
-                let amount_btc = val
-                    .as_f64()
+                let amount_btc = json_number_as_f64(val)
                     .ok_or((-8, "Invalid amount".to_string()))?;
                 let amount_sat = (amount_btc * 100_000_000.0) as u64;
                 let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
@@ -361,7 +385,7 @@ pub fn create_raw_transaction(
                             script_pubkey: script,
                         });
                     } else {
-                        let amount_btc = val.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
+                        let amount_btc = json_number_as_f64(val).ok_or((-8, "Invalid amount".to_string()))?;
                         let amount_sat = (amount_btc * 100_000_000.0) as u64;
                         let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
                             .parse()
@@ -508,7 +532,7 @@ pub fn sign_raw_transaction_with_key(
             let script_pubkey = bitcoin::ScriptBuf::from_bytes(script_bytes);
 
             let amount = if let Some(amt) = prev.get("amount") {
-                let btc = amt.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
+                let btc = json_number_as_f64(amt).ok_or((-8, "Invalid amount".to_string()))?;
                 Amount::from_sat((btc * 100_000_000.0) as u64)
             } else {
                 Amount::ZERO

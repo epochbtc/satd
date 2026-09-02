@@ -41,6 +41,17 @@ fn now_unix_secs() -> u64 {
 
 /// Format a satoshi amount as a BTC string the way Core's `FormatMoney` does:
 /// 8 decimal digits, trailing zeros stripped but keeping at least 2 decimals.
+/// Compute the modified fee: base fee adjusted by `prioritisetransaction`
+/// delta. A negative delta that exceeds the base fee clamps to 0 — the
+/// modified fee is never negative (matching Bitcoin Core).
+fn modified_fee(base_fee: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        base_fee.saturating_add(delta as u64)
+    } else {
+        base_fee.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 fn format_btc(sats: u64) -> String {
     let whole = sats / 100_000_000;
     let frac = sats % 100_000_000;
@@ -596,6 +607,11 @@ struct MempoolInner {
     /// Always a subset of `entries`. This is satd's analogue of Core's
     /// `m_unbroadcast_txids`, surfaced as `getmempoolinfo.unbroadcastcount`.
     unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>>,
+    /// Pre-set fee deltas from `prioritisetransaction` — includes deltas for
+    /// txids not (yet) in the pool, matching Bitcoin Core's `mapDeltas`.
+    /// When a tx enters the pool any pre-existing delta here is applied to its
+    /// `MempoolEntry::fee_delta`; the entry remains so subsequent calls stack.
+    fee_deltas: FxHashMap<Txid, i64>,
 }
 
 impl MempoolInner {
@@ -855,6 +871,7 @@ impl Mempool {
                 total_bytes: 0,
                 quarantine_bytes: 0,
                 unbroadcast: HashMap::new(),
+                fee_deltas: FxHashMap::default(),
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
@@ -2097,6 +2114,18 @@ impl Mempool {
                 }
             }
 
+            // Too-many-replacements limit: reject if the replacement
+            // conflicts with more than 100 distinct clusters.
+            if conflicts.len() > 100 {
+                let detail = format!(
+                    "too many potential replacements, rejecting replacement {}; \
+                     too many conflicting clusters ({} > 100)",
+                    txid,
+                    conflicts.len(),
+                );
+                return Err(MempoolError::TooManyReplacements(detail));
+            }
+
             // Collect all txids that would be evicted (conflicts + descendants)
             // and sum their fees.
             let (all_evicted, conflict_fee_total) =
@@ -2115,14 +2144,18 @@ impl Mempool {
                 }
             }
 
-            // Compute new tx fee.
+            // Compute new tx fee (base), then apply any pre-set
+            // `prioritisetransaction` delta for this txid.
             let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             if sum_inputs < sum_outputs {
                 return Err(MempoolError::BadAmounts);
             }
-            let new_fee = sum_inputs - sum_outputs;
+            let new_base_fee = sum_inputs - sum_outputs;
+            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+            let new_fee = modified_fee(new_base_fee, new_delta);
 
-            // Check 1: new fee must be at least as much as all evicted fees.
+            // Check 1: new modified fee must be at least as much as all evicted
+            // modified fees.
             if new_fee < conflict_fee_total {
                 let detail = format!(
                     "insufficient fee, rejecting replacement {}, less fees than \
@@ -2157,13 +2190,38 @@ impl Mempool {
                 ));
             }
 
-            // Simplified feerate-diagram check: the replacement must have a
-            // strictly higher feerate than each direct conflict it replaces.
-            // This approximates Core v31's full cluster-mempool feerate diagram.
+            // Feerate-diagram check: the replacement (plus its non-evicted
+            // in-mempool ancestors) must have a strictly higher chunk feerate
+            // than each direct conflict it replaces. This approximates Core
+            // v31's full cluster-mempool feerate diagram by treating the
+            // replacement's ancestor set as a single chunk.
             let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
+
+            // Compute the ancestor-aware chunk feerate for the replacement.
+            // Include all in-mempool ancestors that are NOT being evicted.
+            let mut anc_fee_total: u64 = new_fee;
+            let mut anc_weight_total: u64 = weight as u64;
+            for anc_txid in &ancestors {
+                if !all_evicted.contains(anc_txid)
+                    && let Some(ae) = inner.entries.get(anc_txid)
+                {
+                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
+                    anc_weight_total += ae.weight as u64;
+                }
+            }
+            let ancestor_feerate =
+                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            // Use the lower of the individual and ancestor feerates as the
+            // effective feerate of the replacement "chunk".
+            let effective_feerate = new_feerate.min(ancestor_feerate);
+
             for conflict_txid in &conflicts {
                 if let Some(ce) = inner.entries.get(conflict_txid) {
-                    if new_feerate <= ce.fee_rate {
+                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
+                        modified_fee(ce.fee, ce.fee_delta),
+                        ce.weight as u64,
+                    );
+                    if effective_feerate <= conflict_mod_feerate {
                         return Err(MempoolError::DoesNotImproveFeerateDiagram(
                             "insufficient feerate: does not improve feerate diagram".to_string(),
                         ));
@@ -2475,6 +2533,8 @@ impl Mempool {
 
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
+        // Apply any pre-set `prioritisetransaction` delta for this txid.
+        let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -2483,7 +2543,7 @@ impl Mempool {
                 weight,
                 fee_rate,
                 time: now,
-                fee_delta: 0,
+                fee_delta: preset_delta,
                 sigop_cost,
                 prev_scripthashes,
                 prev_amounts,
@@ -2636,18 +2696,25 @@ impl Mempool {
         self.inner.read().entries.get(txid).cloned()
     }
 
-    /// Adjust the fee delta for a transaction in the mempool (for mining priority).
+    /// Adjust the fee delta for a transaction (for mining priority).
+    ///
+    /// Matches Bitcoin Core's `PrioritiseTransaction`: the delta is stored
+    /// even if the txid is not (yet) in the mempool — it will be applied
+    /// when the tx is later admitted. Successive calls stack
+    /// (saturating). Always returns `true` for Core RPC compat.
     pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
         let mut inner = self.inner.write();
-        if let Some(entry) = inner.entries.get_mut(txid) {
-            // Saturating: fee_delta comes from `prioritisetransaction` RPC
-            // and from re-admitted persisted mempool entries (untrusted
-            // mempool.dat), so a malicious/corrupt value must not overflow.
-            entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
-            true
-        } else {
-            false
+        // Update the persistent delta map (stacks on previous calls).
+        let stored = inner.fee_deltas.entry(*txid).or_insert(0);
+        *stored = stored.saturating_add(fee_delta);
+        if *stored == 0 {
+            inner.fee_deltas.remove(txid);
         }
+        // If the tx is already in the pool, update its live entry too.
+        if let Some(entry) = inner.entries.get_mut(txid) {
+            entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
+        }
+        true
     }
 
     /// Get all txids in the mempool — the **union** of the acting and
@@ -2877,8 +2944,9 @@ impl Mempool {
     }
 
     /// Collect all txids that would be evicted by replacing `conflicts` and
-    /// sum their fees. Returns `(all_evicted, total_fee)`. `all_evicted`
-    /// includes the direct conflicts and all their descendants.
+    /// sum their **modified** fees (base fee + `prioritisetransaction` delta).
+    /// Returns `(all_evicted, total_modified_fee)`. `all_evicted` includes the
+    /// direct conflicts and all their descendants.
     fn rbf_conflict_set(
         inner: &MempoolInner,
         conflicts: &HashSet<Txid>,
@@ -2898,7 +2966,7 @@ impl Mempool {
         let total_fee: u64 = all
             .iter()
             .filter_map(|txid| inner.entries.get(txid))
-            .map(|e| e.fee)
+            .map(|e| modified_fee(e.fee, e.fee_delta))
             .sum();
         (all, total_fee)
     }
@@ -2972,6 +3040,7 @@ impl Mempool {
         }
         let vsize = entry.weight / 4;
         let entry_fee = entry.fee;
+        let entry_fee_delta = entry.fee_delta;
         let entry_weight = entry.weight;
         let entry_time = entry.time;
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
@@ -3037,7 +3106,7 @@ impl Mempool {
         Some(serde_json::json!({
             "fees": {
                 "base": entry_fee as f64 / 100_000_000.0,
-                "modified": entry_fee as f64 / 100_000_000.0,
+                "modified": modified_fee(entry_fee, entry_fee_delta) as f64 / 100_000_000.0,
                 "ancestor": ancestor_fees as f64 / 100_000_000.0,
                 "descendant": descendant_fees as f64 / 100_000_000.0,
             },
@@ -3213,7 +3282,7 @@ impl Mempool {
                 }
             }
 
-            // Sum fees of conflicts + all their descendants.
+            // Sum modified fees of conflicts + all their descendants.
             let (all_evicted, conflict_fee_total) =
                 Self::rbf_conflict_set(&inner, &conflicts);
 
@@ -3229,15 +3298,20 @@ impl Mempool {
                 }
             }
 
-            // Check 1: new fee must exceed all evicted fees.
-            if fee < conflict_fee_total {
+            // Apply any pre-set `prioritisetransaction` delta for the
+            // replacement (it is not yet in the pool).
+            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+            let new_fee = modified_fee(fee, new_delta);
+
+            // Check 1: new modified fee must exceed all evicted modified fees.
+            if new_fee < conflict_fee_total {
                 let detail = format!(
                     "insufficient fee, rejecting replacement {}, less fees than \
                      conflicting txs; {} < {}",
-                    txid, format_btc(fee), format_btc(conflict_fee_total),
+                    txid, format_btc(new_fee), format_btc(conflict_fee_total),
                 );
                 return Err(MempoolError::InsufficientReplacementFee(
-                    fee,
+                    new_fee,
                     conflict_fee_total,
                     txid.to_string(),
                     detail,
@@ -3245,7 +3319,7 @@ impl Mempool {
             }
 
             // Check 2: additional fee must cover incremental relay fee.
-            let additional = fee - conflict_fee_total;
+            let additional = new_fee - conflict_fee_total;
             let min_relay = (cfg.incremental_relay_fee
                 * policy::weight_to_vsize(weight as u64))
                 .div_ceil(1000);
@@ -3256,18 +3330,37 @@ impl Mempool {
                     txid, format_btc(additional), format_btc(min_relay),
                 );
                 return Err(MempoolError::InsufficientReplacementFee(
-                    fee,
+                    new_fee,
                     conflict_fee_total + min_relay,
                     txid.to_string(),
                     detail,
                 ));
             }
 
-            // Simplified feerate-diagram check.
-            let new_feerate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+            // Feerate-diagram check — mirrors accept_transaction.
+            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
+
+            let mut anc_fee_total: u64 = new_fee;
+            let mut anc_weight_total: u64 = weight as u64;
+            for anc_txid in &ancestors {
+                if !all_evicted.contains(anc_txid)
+                    && let Some(ae) = inner.entries.get(anc_txid)
+                {
+                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
+                    anc_weight_total += ae.weight as u64;
+                }
+            }
+            let ancestor_feerate =
+                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            let effective_feerate = new_feerate.min(ancestor_feerate);
+
             for conflict_txid in &conflicts {
                 if let Some(ce) = inner.entries.get(conflict_txid) {
-                    if new_feerate <= ce.fee_rate {
+                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
+                        modified_fee(ce.fee, ce.fee_delta),
+                        ce.weight as u64,
+                    );
+                    if effective_feerate <= conflict_mod_feerate {
                         return Err(MempoolError::DoesNotImproveFeerateDiagram(
                             "insufficient feerate: does not improve feerate diagram".to_string(),
                         ));
@@ -4276,7 +4369,13 @@ mod tests {
         use bitcoin::transaction;
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
+        // Create mempool with data_carrier_size = 83 so a 91-byte
+        // OP_RETURN exceeds the limit without exceeding MAX_STANDARD_TX_WEIGHT.
         let (cs, mp, dir) = make_test_env();
+        mp.reload_policy(MempoolConfig {
+            data_carrier_size: 83,
+            ..Default::default()
+        });
 
         // Set a strict OP_RETURN size limit for this test (the global default
         // is 100 000, matching Core v31's uncapped behaviour).

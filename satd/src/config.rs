@@ -2317,10 +2317,13 @@ impl Config {
             None => file_fee_rate("minrelaytxfee")?,
         }
         .or(profile_defaults.minrelaytxfee)
-        .unwrap_or(1_000); // sat/kvB
+        .unwrap_or(100); // sat/kvB — Core v31 DEFAULT_MIN_RELAY_TX_FEE
 
-        let incrementalrelayfee = file_fee_rate("incrementalrelayfee")?
-            .unwrap_or(100); // 100 sat/kvB (Core v31 default: 0.000001 BTC/kvB)
+        let incrementalrelayfee = match cli.incrementalrelayfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("incrementalrelayfee")?,
+        }
+        .unwrap_or(100); // 100 sat/kvB (Core v31 default: 0.000001 BTC/kvB)
 
         // When incremental relay fee is higher than min relay fee, raise
         // min relay fee automatically (Core parity).
@@ -4425,6 +4428,14 @@ pub struct CliArgs {
         help = "Minimum relay fee rate, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00001) or a bare integer of sat/kvB (default: 1000)"
     )]
     pub minrelaytxfee: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Incremental relay fee rate for RBF, as BTC/kvB or sat/kvB (default: 100)"
+    )]
+    pub incrementalrelayfee: Option<u64>,
 
     #[arg(
         long,
@@ -8732,6 +8743,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
@@ -9021,6 +9033,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
