@@ -285,7 +285,7 @@ fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
     // Walk the object keys using a streaming approach.
     // serde_json's `Deserializer` with `MapAccess` would be ideal,
     // but the simplest approach: use a custom `Visitor` that detects duplicates.
-    let mut keys: Vec<String> = Vec::new();
+    let keys: Vec<String> = Vec::new();
     // Parse as a stream of key-value pairs by using the serde_json
     // `MapDeserializer`. We can use `serde_json::from_str` with a
     // custom type that collects all keys.
@@ -1194,6 +1194,10 @@ pub async fn start(
             Err(crate::mempool::pool::MempoolError::AlreadyExists) => {
                 // Already in mempool — we'll re-announce below.
             }
+            Err(crate::mempool::pool::MempoolError::Quarantined(_)) if allow_quarantined => {
+                // Quarantined but user overrode — skip pre-flight rejection,
+                // let broadcast_transaction handle the actual submission.
+            }
             Err(e) => {
                 let code = match &e {
                     crate::mempool::pool::MempoolError::DecodeFailed => -22,
@@ -1373,15 +1377,15 @@ pub async fn start(
         // silently deduplicates, but Core rejects duplicates.  We scan
         // the raw params JSON for the second positional element and check
         // for repeated keys.
-        if outputs.is_object() {
-            if let Some(dup) = detect_duplicate_output_key(&raw_params_json) {
-                let msg = if dup == "data" {
-                    "Invalid parameter, duplicate key: data".to_string()
-                } else {
-                    format!("Invalid parameter, duplicated address: {dup}")
-                };
-                return Err(ErrorObjectOwned::owned(-8, msg, None::<()>));
-            }
+        if outputs.is_object()
+            && let Some(dup) = detect_duplicate_output_key(&raw_params_json)
+        {
+            let msg = if dup == "data" {
+                "Invalid parameter, duplicate key: data".to_string()
+            } else {
+                format!("Invalid parameter, duplicated address: {dup}")
+            };
+            return Err(ErrorObjectOwned::owned(-8, msg, None::<()>));
         }
 
         // Core accepts either array or object for outputs; reject other types.
@@ -1417,7 +1421,7 @@ pub async fn start(
                 let v = n.as_i64().ok_or_else(|| ErrorObjectOwned::owned(
                     -8, "Invalid parameter, locktime out of range", None::<()>,
                 ))?;
-                if v < 0 || v > 0xFFFF_FFFF_i64 {
+                if !(0..=0xFFFF_FFFF_i64).contains(&v) {
                     return Err(ErrorObjectOwned::owned(
                         -8, "Invalid parameter, locktime out of range", None::<()>,
                     ));
@@ -1446,7 +1450,7 @@ pub async fn start(
                 let v32 = u32::try_from(v).map_err(|_| ErrorObjectOwned::owned(
                     -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
                 ))?;
-                if v32 < TX_VERSION_MIN || v32 > TX_VERSION_MAX {
+                if !(TX_VERSION_MIN..=TX_VERSION_MAX).contains(&v32) {
                     return Err(ErrorObjectOwned::owned(
                         -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
                     ));

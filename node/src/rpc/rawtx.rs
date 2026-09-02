@@ -483,13 +483,13 @@ pub(crate) fn decode_transaction_verbose(
     // block's median-time-past, mempool transactions (confirmations==0)
     // get the block's time too in Core, but we omit it for the mempool
     // case. When we have a block header (confirmed), set both.
-    if let Some((cs, _)) = chain_and_block {
-        if let Some(bh) = blockhash
-            && let Ok(block_hash) = bh.parse::<bitcoin::BlockHash>()
-            && let Some(entry) = cs.get_block_index(&block_hash) {
-                result["time"] = json!(entry.header.time);
-                result["blocktime"] = json!(entry.header.time);
-            }
+    if let Some((cs, _)) = chain_and_block
+        && let Some(bh) = blockhash
+        && let Ok(block_hash) = bh.parse::<bitcoin::BlockHash>()
+        && let Some(entry) = cs.get_block_index(&block_hash)
+    {
+        result["time"] = json!(entry.header.time);
+        result["blocktime"] = json!(entry.header.time);
     }
 
     result
@@ -514,11 +514,11 @@ fn resolve_prevouts(
 
     for (i, input) in tx.input.iter().enumerate() {
         // Intra-block: the prevout's tx is in the same block.
-        if let Some(prev_tx) = block_tx_map.get(&input.previous_output.txid) {
-            if let Some(out) = prev_tx.output.get(input.previous_output.vout as usize) {
-                result[i] = Some(out.clone());
-                continue;
-            }
+        if let Some(prev_tx) = block_tx_map.get(&input.previous_output.txid)
+            && let Some(out) = prev_tx.output.get(input.previous_output.vout as usize)
+        {
+            result[i] = Some(out.clone());
+            continue;
         }
         // Chain state: look up the UTXO or the full block containing the prevout.
         if let Some((cs, _)) = chain_and_block {
@@ -646,7 +646,7 @@ pub fn create_raw_transaction(
             if seq_val.is_null() {
                 default_sequence
             } else if let Some(n) = seq_val.as_i64() {
-                if n < 0 || n > 0xffff_ffff_i64 {
+                if !(0..=0xffff_ffff_i64).contains(&n) {
                     return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
                 }
                 n as u32
@@ -1478,7 +1478,7 @@ mod tests {
         let hex_tx = hex::encode(&raw);
 
         // Decode via the RPC function
-        let result = decode_raw_transaction(&hex_tx).unwrap();
+        let result = decode_raw_transaction(&hex_tx, None).unwrap();
 
         // Verify txid matches
         let expected_txid = tx.compute_txid().to_string();
