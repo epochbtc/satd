@@ -152,14 +152,13 @@ pub fn build_solved_block(
 ) -> Result<Block, MineError> {
     let template = create_template(chain_state, mempool);
 
-    // When explicit transactions are provided, compute the coinbase value
-    // as subsidy + the fees of the explicit transactions (not the mempool
-    // template transactions). When no explicit transactions are given, use
-    // the template's coinbase_value (subsidy + mempool fees).
-    let coinbase_value = if explicit_txs.is_empty() {
-        template.coinbase_value
-    } else {
+    // generateblock uses ONLY the explicit transaction list (no mempool).
+    // Coinbase value = subsidy + fees of the explicit transactions.
+    let coinbase_value = {
         let subsidy = crate::chain::connect::block_subsidy(chain_state.network, template.height);
+        if explicit_txs.is_empty() {
+            subsidy
+        } else {
         // Sum up fees: look up each input's value from the UTXO set,
         // then subtract the output total. For regtest mining this is the
         // straightforward path.
@@ -178,7 +177,8 @@ pub fn build_solved_block(
             let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             total_fees += input_sum.saturating_sub(output_sum);
         }
-        subsidy + total_fees
+            subsidy + total_fees
+        }
     };
 
     let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);

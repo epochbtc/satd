@@ -75,6 +75,27 @@ struct Cli {
     )]
     output: Option<String>,
 
+    /// Bitcoin Core compat: send arguments as named JSON-RPC params.
+    /// `key=value` pairs on the command line become `{"key": value}`.
+    #[arg(long, global = true)]
+    named: bool,
+
+    /// Bitcoin Core compat: cancel a preceding `-named`. Harmless no-op
+    /// when `-named` is not set; exists so `-nonamed -named` toggles work
+    /// the way Core's test framework expects.
+    #[arg(long, global = true)]
+    nonamed: bool,
+
+    /// Bitcoin Core compat: read RPC arguments from stdin, one per line.
+    /// Handled pre-parse; this flag is consumed before clap sees it.
+    #[arg(long, global = true, hide = true)]
+    stdin: bool,
+
+    /// Bitcoin Core compat: RPC client timeout in seconds (accepted and
+    /// ignored; sat-cli uses a fixed internal timeout).
+    #[arg(long, global = true)]
+    rpcclienttimeout: Option<u64>,
+
     #[command(subcommand)]
     command: Cmd,
 }
@@ -262,19 +283,16 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         "datadir",
         "rpcwait",
         "output",
+        "named",
+        "nonamed",
+        "stdin",
+        "rpcclienttimeout",
     ];
-
-    // Core CLI flags that control named-parameter handling on the client
-    // side. satd's server-side NamedParamsLayer handles this, so these
-    // are silently consumed and discarded.
-    let ignored_flags = ["named", "nonamed", "rpcclienttimeout"];
 
     args.into_iter()
         .filter(|arg| {
             if arg.starts_with('-') && !arg.starts_with("--") {
-                let rest = &arg[1..];
-                let flag_name = rest.split('=').next().unwrap_or(rest);
-                !ignored_flags.contains(&flag_name)
+                true
             } else {
                 true
             }
@@ -583,7 +601,23 @@ impl OutputFormat {
 #[tokio::main]
 async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
-    let normalized = normalize_args(raw_args);
+    let mut normalized = normalize_args(raw_args);
+
+    // `-stdin`: read method + args from stdin before clap parsing.
+    if normalized.iter().any(|a| a == "--stdin" || a == "-stdin") {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut stdin_args: Vec<String> = Vec::new();
+        for line in stdin.lock().lines() {
+            let line = line.unwrap_or_default();
+            if !line.is_empty() {
+                stdin_args.push(line);
+            }
+        }
+        normalized.retain(|a| a != "--stdin" && a != "-stdin");
+        normalized.extend(stdin_args);
+    }
+
     let cli = match Cli::try_parse_from(normalized) {
         Ok(c) => c,
         Err(e) => {
@@ -658,10 +692,58 @@ async fn main() {
         ));
     }
 
-    let rpcport = cli.rpcport.unwrap_or({
-        if cli.regtest {
+    // Detect chain and rpcport from bitcoin.conf when not explicitly set.
+    let (is_regtest, is_testnet, conf_rpcport) = {
+        let mut r = cli.regtest;
+        let mut t = cli.testnet;
+        let mut port: Option<u16> = None;
+        if let Some(ref datadir) = cli.datadir {
+            let conf = datadir.join("bitcoin.conf");
+            if let Ok(contents) = std::fs::read_to_string(&conf) {
+                if !r && !t {
+                    r = contents.lines().any(|l| {
+                        let l = l.trim();
+                        l == "regtest=1" || l == "regtest = 1"
+                    });
+                    t = contents.lines().any(|l| {
+                        let l = l.trim();
+                        l == "testnet=1" || l == "testnet = 1"
+                    });
+                }
+                if cli.rpcport.is_none() {
+                    let section = if r {
+                        "[regtest]"
+                    } else if t {
+                        "[testnet3]"
+                    } else {
+                        ""
+                    };
+                    let mut in_section = section.is_empty();
+                    for line in contents.lines() {
+                        let l = line.trim();
+                        if l.starts_with('[') {
+                            in_section = l == section;
+                            continue;
+                        }
+                        if !in_section {
+                            continue;
+                        }
+                        if let Some(rest) = l.strip_prefix("rpcport=")
+                            && let Ok(p) = rest.trim().parse::<u16>()
+                        {
+                            port = Some(p);
+                        }
+                    }
+                }
+            }
+        }
+        (r, t, port)
+    };
+
+    let rpcport = cli.rpcport.or(conf_rpcport).unwrap_or({
+        if is_regtest {
             18443
-        } else if cli.testnet {
+        } else if is_testnet {
             18332
         } else {
             8332
@@ -674,9 +756,9 @@ async fn main() {
     } else {
         let cookie_path = cli.rpccookiefile.clone().unwrap_or_else(|| {
             let base = cli.datadir.clone().unwrap_or_else(default_datadir);
-            let net_subdir = if cli.regtest {
+            let net_subdir = if is_regtest {
                 "regtest"
-            } else if cli.testnet {
+            } else if is_testnet {
                 "testnet3"
             } else {
                 ""
@@ -710,11 +792,32 @@ async fn main() {
     let output = OutputFormat::parse(cli.output.as_deref());
 
     let (method, params) = resolve_cmd(&cli.command);
+
+    let json_params: serde_json::Value = if cli.named {
+        if let Cmd::Raw(_) = &cli.command {
+            let mut obj = serde_json::Map::new();
+            for p in &params {
+                if let Some(s) = p.as_str()
+                    && let Some((k, v)) = s.split_once('=')
+                {
+                    let val: serde_json::Value = serde_json::from_str(v)
+                        .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+                    obj.insert(k.to_string(), val);
+                }
+            }
+            serde_json::Value::Object(obj)
+        } else {
+            serde_json::Value::Array(params)
+        }
+    } else {
+        serde_json::Value::Array(params)
+    };
+
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": "sat-cli",
         "method": method,
-        "params": params,
+        "params": json_params,
     });
 
     let client = reqwest::Client::new();
@@ -756,7 +859,7 @@ async fn main() {
                         .and_then(|m| m.as_str())
                         .unwrap_or("Unknown error");
                     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                    eprintln!("error code: {}: {}", code, msg);
+                    eprintln!("error code: {}\nerror message:\n{}", code, msg);
                     std::process::exit(1);
                 }
 

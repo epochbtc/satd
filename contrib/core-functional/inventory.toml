@@ -885,9 +885,7 @@ status = "run"
 
 [[test]]
 file = "rpc_deriveaddresses.py"
-status = "skip"
-reason = "cli-compat"
-note = "non-CLI variant passes; --usecli variant fails because sat-cli does not read bitcoin.conf to detect the network, so it cannot find the regtest cookie file"
+status = "run"
 
 [[test]]
 file = "rpc_dumptxoutset.py"
@@ -902,9 +900,7 @@ reason = "cache"
 
 [[test]]
 file = "rpc_generate.py"
-status = "skip"
-reason = "cli-compat"
-note = "descriptor and tx-inclusion tests pass; blocked by parallel generateblock test which uses sat-cli without -regtest (sat-cli does not read bitcoin.conf to detect the network)"
+status = "run"
 
 [[test]]
 file = "rpc_getblockfilter.py"

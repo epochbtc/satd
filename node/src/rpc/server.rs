@@ -1037,7 +1037,12 @@ pub async fn start(
             &output,
             ctx.chain_state.network,
         )
-        .or_else(|_| {
+        .or_else(|(code, msg)| {
+            // Only fall through to address parsing on parse failures (-5).
+            // Semantic errors (-8 ranged, -5 private keys) should propagate.
+            if code != -5 || msg.contains("private key") || msg.contains("Ranged") || msg.contains("Multipath") {
+                return Err((code, msg));
+            }
             let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output
                 .parse()
                 .map_err(|e| (-5i32, format!("Invalid address or descriptor: {e}")))?;
@@ -1047,7 +1052,7 @@ pub async fn start(
             Ok::<_, (i32, String)>(addr.script_pubkey())
         })
         .map_err(|(code, msg)| {
-            ErrorObjectOwned::owned(code, format!("Invalid address or descriptor: {msg}"), None::<()>)
+            ErrorObjectOwned::owned(code, msg, None::<()>)
         })?;
 
         // Resolve the transactions list: each entry is either a txid
