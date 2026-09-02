@@ -315,6 +315,8 @@ pub fn get_block(
                     Some(&block_hash_str),
                     Some(entry.height),
                     Some(confirmations),
+                    1,
+                    None,
                 )
             })
             .collect();

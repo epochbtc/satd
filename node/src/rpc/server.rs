@@ -34,6 +34,11 @@ use tokio::sync::watch;
 /// bounds can't drift. Also passed to the startup-status RPC.
 pub const RPC_MAX_CONNECTIONS: u32 = 100;
 
+/// Standard transaction version range — matches Core's `TX_MIN_STANDARD_VERSION`
+/// and `TX_MAX_STANDARD_VERSION` (src/policy/policy.h).
+const TX_VERSION_MIN: u32 = 1;
+const TX_VERSION_MAX: u32 = 3;
+
 /// Shared, mutable record of which optional listeners actually bound
 /// at startup. Updated by the listener wiring after each successful
 /// bind; read by `getserverstatus` to report runtime — not config —
@@ -246,6 +251,71 @@ fn optional_verbosity(
             ))
         }
     }
+}
+
+/// Scan the raw JSON params string for `createrawtransaction` and detect
+/// duplicate keys in the outputs object (the second positional element).
+///
+/// serde_json's `Map` silently deduplicates, but Core rejects them.
+/// This function extracts the second element of the params array using
+/// `serde_json::value::RawValue` and then iterates the object keys via a
+/// streaming deserializer to find duplicates.
+///
+/// Returns `Some(key)` if a duplicate is found, `None` otherwise.
+fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
+    // The params are a JSON array: [inputs, outputs, ...].
+    // We need to extract the second element as raw JSON.
+    let trimmed = raw_params.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+
+    // Use serde_json's streaming deserializer to walk the array without
+    // collapsing duplicate keys: parse each element as a RawValue.
+    let elements: Vec<&serde_json::value::RawValue> =
+        serde_json::from_str(trimmed).ok()?;
+    let outputs_raw = elements.get(1)?;
+    let outputs_str = outputs_raw.get();
+
+    // Only check objects (not arrays).
+    if !outputs_str.trim_start().starts_with('{') {
+        return None;
+    }
+
+    // Walk the object keys using a streaming approach.
+    // serde_json's `Deserializer` with `MapAccess` would be ideal,
+    // but the simplest approach: use a custom `Visitor` that detects duplicates.
+    let mut keys: Vec<String> = Vec::new();
+    // Parse as a stream of key-value pairs by using the serde_json
+    // `MapDeserializer`. We can use `serde_json::from_str` with a
+    // custom type that collects all keys.
+    struct DupKeyDetector {
+        keys: Vec<String>,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for DupKeyDetector {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if self.keys.contains(&key) {
+                    return Ok(Some(key));
+                }
+                self.keys.push(key);
+                // Skip value.
+                let _: serde::de::IgnoredAny = map.next_value()?;
+            }
+            Ok(None)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(outputs_str);
+    let visitor = DupKeyDetector { keys };
+    serde::Deserializer::deserialize_any(&mut de, visitor).ok().flatten()
 }
 
 pub struct RpcContext {
@@ -1041,29 +1111,126 @@ pub async fn start(
                 .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
                 .into_error_object()
         })?;
-        // `allowquarantined` (satd extension, opt-in): submit into the quarantine
-        // class even when a relay-scoped policy rule matches, instead of the §6.1
-        // refusal. Read from the second positional slot (Core's `maxfeerate`,
-        // which satd does not enforce); a numeric `maxfeerate` there fails the
-        // bool parse and is harmlessly treated as "not set" (default false), so
-        // Core clients are unaffected.
-        let allow_quarantined: bool = seq.optional_next::<bool>().ok().flatten().unwrap_or(false);
-        // Submit + announce is the shared core (`broadcast_transaction`);
-        // this handler only maps the error to the JSON-RPC taxonomy.
+        // Core's second arg is `maxfeerate` (numeric or string, BTC/kvB,
+        // default 0.10). We parse it as an f64 so both `0.001` and `"0.001"`
+        // work. We also accept a bool for satd's `allowquarantined` extension —
+        // a numeric value silently sets maxfeerate and leaves quarantine off.
+        let maxfeerate_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let (maxfeerate_btc_per_kvb, allow_quarantined) = match &maxfeerate_raw {
+            None | Some(serde_json::Value::Null) => (0.10_f64, false),
+            Some(serde_json::Value::Bool(b)) => (0.10, *b),
+            Some(serde_json::Value::Number(n)) => {
+                let f = n.as_f64().unwrap_or(0.10);
+                (f, false)
+            }
+            Some(serde_json::Value::String(s)) => {
+                let f: f64 = s.parse().unwrap_or(0.10);
+                (f, false)
+            }
+            _ => (0.10, false),
+        };
+        // Core's third arg is `maxburnamount` (numeric or string, BTC, default 0).
+        let maxburnamount_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let maxburnamount_sat: u64 = match &maxburnamount_raw {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(serde_json::Value::Number(n)) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                (f * 100_000_000.0).round() as u64
+            }
+            Some(serde_json::Value::String(s)) => {
+                let f: f64 = s.parse().unwrap_or(0.0);
+                (f * 100_000_000.0).round() as u64
+            }
+            _ => 0,
+        };
+
+        // Decode the transaction for pre-submit checks.
+        let tx_bytes = hex::decode(&hex_tx)
+            .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+            .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+
+        // maxburnamount check: Core checks each output individually — any
+        // single unspendable output whose value exceeds maxburnamount is
+        // rejected.
+        for txout in &tx.output {
+            if rawtx::is_burn_output(txout) && txout.value.to_sat() > maxburnamount_sat {
+                return Err(ErrorObjectOwned::owned(
+                    -25,
+                    "Unspendable output exceeds maximum configured by user (maxburnamount)",
+                    None::<()>,
+                ));
+            }
+        }
+
+        let maxfeerate_sat_per_kvb = (maxfeerate_btc_per_kvb * 100_000_000.0).round() as u64;
+
+        // Pre-flight: test_accept to get fee info for maxfeerate check,
+        // and to detect already-confirmed transactions.
+        let txid = tx.compute_txid();
+
+        // Check if already confirmed.
+        if ctx.chain_state.get_tx_location(&txid).is_some() {
+            return Err(ErrorObjectOwned::owned(
+                -27,
+                "Transaction outputs already in utxo set",
+                None::<()>,
+            ));
+        }
+
+        // test_accept to get fee/vsize without actually accepting.
+        match ctx.mempool.test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier()) {
+            Ok((_accepted_txid, vsize, fees)) => {
+                // maxfeerate check.
+                let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
+                if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
+                    return Err(ErrorObjectOwned::owned(
+                        -25,
+                        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+                        None::<()>,
+                    ));
+                }
+            }
+            Err(crate::mempool::pool::MempoolError::AlreadyExists) => {
+                // Already in mempool — we'll re-announce below.
+            }
+            Err(e) => {
+                let code = match &e {
+                    crate::mempool::pool::MempoolError::DecodeFailed => -22,
+                    _ => -25,
+                };
+                let (category, suggestion) = match code {
+                    -22 => (
+                        "rpc.input.parse",
+                        "Transaction hex failed to decode.",
+                    ),
+                    -25 => (
+                        "mempool.rejected",
+                        "Mempool rejected the tx.",
+                    ),
+                    _ => ("rpc.unknown", ""),
+                };
+                let mut err = crate::rpc::error::RpcError::new(code, category, e.to_string());
+                if !suggestion.is_empty() {
+                    err = err.with_suggestion(suggestion);
+                }
+                return Err(err.into_error_object());
+            }
+        }
+
+        // Actually submit and broadcast.
         let result = ctx
             .peer_manager
             .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
-                // Classify the mempool error by its code (Core taxonomy):
-                // -22 = decode failed, -25 = mempool acceptance failure.
                 let (category, suggestion) = match code {
                     -22 => (
                         "rpc.input.parse",
-                        "Transaction hex failed to decode. Ensure it's a valid raw tx (no 0x prefix, no whitespace).",
+                        "Transaction hex failed to decode.",
                     ),
                     -25 => (
                         "mempool.rejected",
-                        "Mempool rejected the tx. Check feerate (--minrelaytxfee), dust thresholds, and conflicts with existing mempool contents.",
+                        "Mempool rejected the tx.",
                     ),
                     _ => ("rpc.unknown", ""),
                 };
@@ -1072,8 +1239,7 @@ pub async fn start(
                     err = err.with_suggestion(suggestion);
                 }
                 err.into_error_object()
-            },
-        )?;
+            })?;
         Ok::<_, ErrorObjectOwned>(result)
     })?;
 
@@ -1102,10 +1268,6 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         // Core declares this NUM with a 0 default and accepts a bool for it.
-        // Verbosity 2 adds `fee` and per-input `prevout`, which satd's verbose
-        // form does not produce -- so it is refused by name rather than answered
-        // as though it were 1, which would silently omit fields the caller asked
-        // for.
         let verbosity = optional_verbosity(&mut seq, 0)?;
         if verbosity > 2 {
             return Err(ErrorObjectOwned::owned(
@@ -1115,35 +1277,187 @@ pub async fn start(
             ));
         }
         let verbose = verbosity >= 1;
-        let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
+        // blockhash: must be a string. Core returns -3 for type mismatches.
+        let blockhash_raw: Option<serde_json::Value> = seq.optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let blockhash: Option<String> = match blockhash_raw {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s),
+            Some(other) => {
+                let type_name = match &other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    _ => "unknown",
+                };
+                return Err(ErrorObjectOwned::owned(
+                    -3,
+                    format!("JSON value of type {type_name} is not of expected type string"),
+                    None::<()>,
+                ));
+            }
+        };
         rawtx::get_raw_transaction(
             &ctx.chain_state,
             &ctx.mempool,
             &txid,
             verbose,
+            verbosity,
             blockhash.as_deref(),
         )
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("decoderawtransaction", |params, _ctx, _extensions| {
-        let hex_tx: String = params
-            .one()
+        let mut seq = params.sequence();
+        let hex_tx: String = seq
+            .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        rawtx::decode_raw_transaction(&hex_tx)
+        let iswitness: Option<bool> = seq.optional_next().unwrap_or(None);
+        rawtx::decode_raw_transaction(&hex_tx, iswitness)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("createrawtransaction", |params, _ctx, _extensions| {
+        // Grab the raw JSON before the sequence parser touches it.
+        // We need this to detect duplicate keys in the outputs object,
+        // since serde_json silently deduplicates.
+        let raw_params_json = params.as_str().unwrap_or("").to_string();
         let mut seq = params.sequence();
-        let inputs: Vec<serde_json::Value> = seq
+        let inputs_raw: serde_json::Value = seq
             .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+            .map_err(|e| ErrorObjectOwned::owned(-1, format!("createrawtransaction {e}"), None::<()>))?;
+        let inputs: Vec<serde_json::Value> = match inputs_raw {
+            serde_json::Value::Array(arr) => {
+                // Validate each element is an object.
+                for item in &arr {
+                    if !item.is_object() {
+                        let type_name = match item {
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::Bool(_) => "bool",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Null => "null",
+                            _ => "unknown",
+                        };
+                        return Err(ErrorObjectOwned::owned(
+                            -3,
+                            format!("JSON value of type {type_name} is not of expected type object"),
+                            None::<()>,
+                        ));
+                    }
+                }
+                arr
+            }
+            other => {
+                let type_name = match &other {
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Null => "null",
+                    _ => "unknown",
+                };
+                return Err(ErrorObjectOwned::owned(
+                    -3,
+                    format!("JSON value of type {type_name} is not of expected type array"),
+                    None::<()>,
+                ));
+            }
+        };
         let outputs: serde_json::Value = seq
             .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+            .map_err(|e| ErrorObjectOwned::owned(-1, format!("createrawtransaction {e}"), None::<()>))?;
+        // Detect duplicate keys in the outputs JSON object. serde_json
+        // silently deduplicates, but Core rejects duplicates.  We scan
+        // the raw params JSON for the second positional element and check
+        // for repeated keys.
+        if outputs.is_object() {
+            if let Some(dup) = detect_duplicate_output_key(&raw_params_json) {
+                let msg = if dup == "data" {
+                    "Invalid parameter, duplicate key: data".to_string()
+                } else {
+                    format!("Invalid parameter, duplicated address: {dup}")
+                };
+                return Err(ErrorObjectOwned::owned(-8, msg, None::<()>));
+            }
+        }
+
+        // Core accepts either array or object for outputs; reject other types.
+        if !outputs.is_array() && !outputs.is_object() {
+            let type_name = match &outputs {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Null => "null",
+                _ => "unknown",
+            };
+            return Err(ErrorObjectOwned::owned(
+                -3,
+                format!("JSON value of type {type_name} is not of expected type array"),
+                None::<()>,
+            ));
+        }
+        let locktime: Option<serde_json::Value> = seq.optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let replaceable: Option<serde_json::Value> = seq.optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let version: Option<serde_json::Value> = seq.optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        // Reject extra arguments.
+        let extra: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        if extra.is_some() {
+            return Err(ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>));
+        }
+        // Parse locktime.
+        let locktime_val: Option<u32> = match &locktime {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(n)) => {
+                let v = n.as_i64().ok_or_else(|| ErrorObjectOwned::owned(
+                    -8, "Invalid parameter, locktime out of range", None::<()>,
+                ))?;
+                if v < 0 || v > 0xFFFF_FFFF_i64 {
+                    return Err(ErrorObjectOwned::owned(
+                        -8, "Invalid parameter, locktime out of range", None::<()>,
+                    ));
+                }
+                Some(v as u32)
+            }
+            Some(_) => return Err(ErrorObjectOwned::owned(
+                -3, "JSON value of type string is not of expected type number", None::<()>,
+            )),
+        };
+        // Parse replaceable (bool).
+        let replaceable_val: Option<bool> = match &replaceable {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Bool(b)) => Some(*b),
+            Some(_) => return Err(ErrorObjectOwned::owned(
+                -3, "JSON value of type string is not of expected type bool", None::<()>,
+            )),
+        };
+        // Parse version.
+        let version_val: Option<u32> = match &version {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(n)) => {
+                let v = n.as_u64().ok_or_else(|| ErrorObjectOwned::owned(
+                    -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
+                ))?;
+                let v32 = u32::try_from(v).map_err(|_| ErrorObjectOwned::owned(
+                    -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
+                ))?;
+                if v32 < TX_VERSION_MIN || v32 > TX_VERSION_MAX {
+                    return Err(ErrorObjectOwned::owned(
+                        -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
+                    ));
+                }
+                Some(v32)
+            }
+            Some(_) => return Err(ErrorObjectOwned::owned(
+                -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
+            )),
+        };
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime_val, replaceable_val, version_val)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1188,25 +1502,62 @@ pub async fn start(
         let rawtxs: Vec<String> = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        // Optional maxfeerate (BTC/kvB, default 0.10).
+        let maxfeerate_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let maxfeerate_sat_per_kvb: u64 = match &maxfeerate_raw {
+            None | Some(serde_json::Value::Null) => 10_000_000, // 0.10 BTC/kvB
+            Some(serde_json::Value::Number(n)) => {
+                let f = n.as_f64().unwrap_or(0.10);
+                (f * 100_000_000.0).round() as u64
+            }
+            Some(serde_json::Value::String(s)) => {
+                let f: f64 = s.parse().unwrap_or(0.10);
+                (f * 100_000_000.0).round() as u64
+            }
+            _ => 10_000_000,
+        };
         let mut results = Vec::new();
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
             let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+
+            // Check if tx is already confirmed.
+            let txid_check = tx.compute_txid();
+            if ctx.chain_state.get_coin(&bitcoin::OutPoint { txid: txid_check, vout: 0 }).is_some()
+                || ctx.chain_state.get_tx_location(&txid_check).is_some() {
+                results.push(serde_json::json!({
+                    "txid": txid_check.to_string(),
+                    "allowed": false,
+                    "reject-reason": "txn-already-known",
+                }));
+                continue;
+            }
+
             match ctx
                 .mempool
                 .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
-                    results.push(serde_json::json!({
-                        "txid": txid.to_string(),
-                        "allowed": true,
-                        "vsize": vsize,
-                        "fees": {
-                            "base": format_amount(fees, default_unit()),
-                        },
-                    }));
+                    // Check maxfeerate.
+                    let feerate_sat_per_kvb = fees.saturating_mul(1000) / (vsize as u64).max(1);
+                    if maxfeerate_sat_per_kvb > 0 && feerate_sat_per_kvb > maxfeerate_sat_per_kvb {
+                        results.push(serde_json::json!({
+                            "txid": txid.to_string(),
+                            "allowed": false,
+                            "reject-reason": "max-fee-exceeded",
+                        }));
+                    } else {
+                        results.push(serde_json::json!({
+                            "txid": txid.to_string(),
+                            "allowed": true,
+                            "vsize": vsize,
+                            "fees": {
+                                "base": format_amount(fees, default_unit()),
+                            },
+                        }));
+                    }
                 }
                 Err(e) => {
                     let txid = tx.compute_txid();

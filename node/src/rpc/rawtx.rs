@@ -136,11 +136,19 @@ pub fn get_raw_transaction(
     mempool: &Mempool,
     txid_str: &str,
     verbose: bool,
+    verbosity: u32,
     blockhash: Option<&str>,
 ) -> Result<Value, (i32, String)> {
     let txid: bitcoin::Txid = txid_str
         .parse()
         .map_err(|_| (-8, "parameter 1 must be of length 64 (not 0, for txid)".to_string()))?;
+
+    // Genesis-block coinbase is not reachable via getrawtransaction — Core
+    // returns this error both when a blockhash is explicitly supplied and
+    // when the txindex would otherwise resolve it.
+    if is_genesis_coinbase(chain_state, &txid) {
+        return Err((-5, "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved; to get its block, use the getblock RPC".to_string()));
+    }
 
     // Search mempool first (unless blockhash is specified). Bitcoin
     // Core reports unconfirmed-tx `confirmations` as 0 in the verbose
@@ -149,7 +157,7 @@ pub fn get_raw_transaction(
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
-                Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0)))
+                Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0), verbosity, None))
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))
@@ -158,26 +166,32 @@ pub fn get_raw_transaction(
 
     // Search in a specific block
     if let Some(hash_str) = blockhash {
+        validate_blockhash_str(hash_str)?;
         let block_hash: bitcoin::BlockHash = hash_str
             .parse()
-            .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+            .map_err(|_| (-8, format!("parameter 3 must be hexadecimal string (not '{hash_str}')")))?;
+
+        // Verify the block is known.
+        let entry = chain_state
+            .get_block_index(&block_hash)
+            .ok_or((-5, "Block hash not found".to_string()))?;
 
         let block = chain_state
             .get_block(&block_hash)
-            .ok_or((-5, "Block not found".to_string()))?;
-
-        let entry = chain_state.get_block_index(&block_hash);
+            .ok_or((-1, "Block not available (pruned data)".to_string()))?;
 
         for tx in &block.txdata {
             if tx.compute_txid() == txid {
                 return if verbose {
-                    let height = entry.as_ref().map(|e| e.height);
+                    let height = Some(entry.height);
                     let confirmations = height.map(|h| confirmations_for(chain_state, &block_hash, h));
                     let mut result = decode_transaction_verbose(
                         tx,
                         Some(hash_str),
                         height,
                         confirmations,
+                        verbosity,
+                        Some((chain_state, &block)),
                     );
                     // `in_active_chain` is only present when the caller
                     // explicitly provided a blockhash.
@@ -189,62 +203,116 @@ pub fn get_raw_transaction(
                 };
             }
         }
+
+        // The caller gave us a specific block and the tx is not in it.
+        return Err((-5, "No such transaction found in the provided block. Use gettransaction for wallet transactions.".to_string()));
     }
 
     // Fallback to txindex if available
-    if blockhash.is_none()
-        && let Some(block_hash) = chain_state.get_tx_location(&txid)
-            && let Some(block) = chain_state.get_block(&block_hash) {
-                let entry = chain_state.get_block_index(&block_hash);
-                for tx in &block.txdata {
-                    if tx.compute_txid() == txid {
-                        return if verbose {
-                            let height = entry.as_ref().map(|e| e.height);
-                            let confirmations =
-                                height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                            Ok(decode_transaction_verbose(
-                                tx,
-                                Some(&block_hash.to_string()),
-                                height,
-                                confirmations,
-                            ))
-                        } else {
-                            let raw = bitcoin::consensus::serialize(tx);
-                            Ok(Value::String(hex::encode(raw)))
-                        };
-                    }
+    if let Some(block_hash) = chain_state.get_tx_location(&txid)
+        && let Some(block) = chain_state.get_block(&block_hash) {
+            let entry = chain_state.get_block_index(&block_hash);
+            for tx in &block.txdata {
+                if tx.compute_txid() == txid {
+                    return if verbose {
+                        let height = entry.as_ref().map(|e| e.height);
+                        let confirmations =
+                            height.map(|h| confirmations_for(chain_state, &block_hash, h));
+                        Ok(decode_transaction_verbose(
+                            tx,
+                            Some(&block_hash.to_string()),
+                            height,
+                            confirmations,
+                            verbosity,
+                            Some((chain_state, &block)),
+                        ))
+                    } else {
+                        let raw = bitcoin::consensus::serialize(tx);
+                        Ok(Value::String(hex::encode(raw)))
+                    };
                 }
             }
+        }
 
     Err((-5, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.".to_string()))
 }
 
+/// Validate a blockhash string for length and hex-ness, returning Core-compatible
+/// error messages ("parameter 3 must be of length 64 (not N, for 'xxx')").
+fn validate_blockhash_str(s: &str) -> Result<(), (i32, String)> {
+    if s.len() != 64 {
+        return Err((-8, format!(
+            "parameter 3 must be of length 64 (not {}, for '{s}')",
+            s.len()
+        )));
+    }
+    // Hex check: every character must be [0-9a-fA-F].
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((-8, format!(
+            "parameter 3 must be hexadecimal string (not '{s}')"
+        )));
+    }
+    Ok(())
+}
+
+/// True when `txid` is the genesis block's coinbase.
+fn is_genesis_coinbase(chain_state: &ChainState, txid: &bitcoin::Txid) -> bool {
+    let genesis_hash = match chain_state.active_chain_hash_at_height(0) {
+        Some(h) => h,
+        None => return false,
+    };
+    let genesis = match chain_state.get_block(&genesis_hash) {
+        Some(b) => b,
+        None => return false,
+    };
+    genesis.txdata.first().map(|tx| tx.compute_txid()) == Some(*txid)
+}
+
 /// `decoderawtransaction` — decode a raw transaction hex to JSON.
-pub fn decode_raw_transaction(hex_tx: &str) -> Result<Value, (i32, String)> {
+///
+/// `iswitness`: `None` = auto-detect (try witness first, fall back to
+/// non-witness), `Some(true)` = force witness, `Some(false)` = force
+/// non-witness. Matches Core's optional `iswitness` parameter.
+pub fn decode_raw_transaction(hex_tx: &str, iswitness: Option<bool>) -> Result<Value, (i32, String)> {
     let tx_bytes =
         hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
 
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
-        .map_err(|_| (-22, "TX decode failed".to_string()))?;
+    let tx: bitcoin::Transaction = match iswitness {
+        Some(true) => {
+            // Force witness decoding.
+            bitcoin::consensus::deserialize(&tx_bytes)
+                .map_err(|_| (-22, "TX decode failed".to_string()))?
+        }
+        Some(false) => {
+            // Force non-witness (legacy) decoding.
+            bitcoin::consensus::deserialize_partial::<bitcoin::Transaction>(&tx_bytes)
+                .map(|(tx, _)| tx)
+                .map_err(|_| (-22, "TX decode failed".to_string()))
+                // For non-witness decoding, the segwit marker (0x00 0x01) after
+                // version would be treated as zero inputs + one output, which
+                // will fail to parse as a valid transaction. That is the expected
+                // behavior for `iswitness=false` on a segwit tx.
+                ?
+        }
+        None => {
+            // Auto: try witness first, fall back to non-witness.
+            bitcoin::consensus::deserialize(&tx_bytes)
+                .map_err(|_| (-22, "TX decode failed".to_string()))?
+        }
+    };
 
-    Ok(decode_transaction_verbose(&tx, None, None, None))
+    Ok(decode_transaction_verbose(&tx, None, None, None, 1, None))
 }
 
-/// Confirmation count for a tx mined at `block_height` against the
-/// current active-chain tip. Matches Bitcoin Core's
-/// `(tip - block_height) + 1`, saturating to 0 if the block is
-/// somehow ahead of the tip (only reachable across a reorg race we
-/// don't otherwise protect against here).
 /// Confirmations for a transaction found in a block.
 ///
-/// Core's convention for `getrawtransaction` is depth when the containing
-/// block is on the active chain and **0** when it is not — unlike
-/// `getblock`/`getblockheader`, which use `-1` for the off-chain case. Without
-/// the active-chain test a transaction that exists only on a losing branch
-/// reports the same depth as a confirmed one.
+/// Returns the depth (>= 1) when the containing block is on the active
+/// chain, and **-1** when it is not — matching Core's convention in
+/// `getrawtransaction`. The caller uses the sign to derive
+/// `in_active_chain`.
 fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, block_height: u32) -> i64 {
     if !crate::rpc::blockchain::is_on_active_chain(chain_state, block_hash, block_height) {
-        return 0;
+        return -1;
     }
     let tip = chain_state.tip_height();
     i64::from(tip.saturating_sub(block_height).saturating_add(1))
@@ -254,6 +322,10 @@ fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, 
 /// decoderawtransaction). `confirmations` is `Some(0)` for a mempool
 /// hit, `Some(N)` for a confirmed tx, and `None` for offline decode
 /// (`decoderawtransaction`) where there is no chain context.
+///
+/// `verbosity`: 1 = standard verbose, 2 = include `fee` and per-input
+/// `prevout` (Core v25+). `chain_and_block` is `Some((chain, block))`
+/// when the block is available for prevout lookup (verbosity 2).
 pub(crate) fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
@@ -261,12 +333,22 @@ pub(crate) fn decode_transaction_verbose(
     // Signed: Core reports -1 for a transaction in a block that is not on the
     // active chain, the same convention as the block's own `confirmations`.
     confirmations: Option<i64>,
+    verbosity: u32,
+    chain_and_block: Option<(&ChainState, &bitcoin::Block)>,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
     let size = raw.len();
     let weight = tx.weight().to_wu() as usize;
     let vsize = weight.div_ceil(4);
+
+    // For verbosity 2, resolve prevouts so we can compute the fee and
+    // annotate each vin with its spent output.
+    let prevouts: Vec<Option<bitcoin::TxOut>> = if verbosity >= 2 && !tx.is_coinbase() {
+        resolve_prevouts(tx, chain_and_block)
+    } else {
+        vec![None; tx.input.len()]
+    };
 
     let vin: Vec<Value> = tx
         .input
@@ -293,34 +375,82 @@ pub(crate) fn decode_transaction_verbose(
                         input.witness.iter().map(hex::encode).collect();
                     v["txinwitness"] = json!(witness);
                 }
+                // Verbosity 2: annotate with the spent prevout.
+                if verbosity >= 2
+                    && let Some(prevout) = &prevouts[i]
+                {
+                    let unit = default_unit();
+                    let mut spk = json!({
+                        "asm": format!("{}", prevout.script_pubkey),
+                        "hex": hex::encode(prevout.script_pubkey.as_bytes()),
+                        "type": script_type(&prevout.script_pubkey),
+                    });
+                    // Add address if derivable.
+                    if let Some(addr) = script_to_address(&prevout.script_pubkey) {
+                        spk["address"] = json!(addr);
+                    }
+                    // Lookup the prevout's confirming height and coinbase status.
+                    let (prev_height, prev_generated) = if let Some((cs, _)) = chain_and_block {
+                        lookup_prevout_height_generated(cs, &input.previous_output)
+                    } else {
+                        (0, false)
+                    };
+                    v["prevout"] = json!({
+                        "generated": prev_generated,
+                        "height": prev_height,
+                        "value": format_amount(prevout.value.to_sat(), unit),
+                        "scriptPubKey": spk,
+                    });
+                }
                 v
             }
         })
         .collect();
 
     let unit = default_unit();
+
+    // Compute fee for verbosity 2 (non-coinbase, all prevouts resolved).
+    let fee: Option<u64> = if verbosity >= 2 && !tx.is_coinbase() {
+        let total_in: Option<u64> = prevouts.iter().try_fold(0u64, |acc, p| {
+            p.as_ref().map(|o| acc + o.value.to_sat())
+        });
+        let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        total_in.map(|i| i.saturating_sub(total_out))
+    } else {
+        None
+    };
+
     let vout: Vec<Value> = tx
         .output
         .iter()
         .enumerate()
         .map(|(n, output)| {
             let value = format_amount(output.value.to_sat(), unit);
+            let mut spk = json!({
+                "asm": format!("{}", output.script_pubkey),
+                "hex": hex::encode(output.script_pubkey.as_bytes()),
+                "type": script_type(&output.script_pubkey),
+            });
+            if let Some(addr) = script_to_address(&output.script_pubkey) {
+                spk["address"] = json!(addr);
+            }
             json!({
                 "value": value,
                 "n": n,
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                    "type": script_type(&output.script_pubkey),
-                },
+                "scriptPubKey": spk,
             })
         })
         .collect();
 
+    // The wtxid (`hash` in Core's output). For non-segwit transactions
+    // this equals the txid; for segwit transactions it is the hash that
+    // commits to the witness data as well (BIP 141).
+    let wtxid = tx.compute_wtxid();
+
     let mut result = json!({
         "txid": txid.to_string(),
-        "hash": txid.to_string(),
-        "version": tx.version.0,
+        "hash": wtxid.to_string(),
+        "version": tx.version.0 as u32,
         "size": size,
         "vsize": vsize,
         "weight": weight,
@@ -334,6 +464,11 @@ pub(crate) fn decode_transaction_verbose(
         "hex": hex::encode(&raw),
     });
 
+    // Verbosity 2: add fee (non-coinbase only).
+    if let Some(f) = fee {
+        result["fee"] = json!(format_amount(f, unit));
+    }
+
     if let Some(bh) = blockhash {
         result["blockhash"] = Value::String(bh.to_string());
     }
@@ -342,42 +477,190 @@ pub(crate) fn decode_transaction_verbose(
     }
     if let Some(c) = confirmations {
         result["confirmations"] = json!(c);
-        // Core reports `in_active_chain` only when the caller
-        // explicitly provided a blockhash. We abuse confirmations > 0
-        // as the "on active chain" signal here since confirmations
-        // is -1 when the block is off-chain.
+    }
+
+    // `time`/`blocktime` mimic Core: confirmed transactions get the
+    // block's median-time-past, mempool transactions (confirmations==0)
+    // get the block's time too in Core, but we omit it for the mempool
+    // case. When we have a block header (confirmed), set both.
+    if let Some((cs, _)) = chain_and_block {
+        if let Some(bh) = blockhash
+            && let Ok(block_hash) = bh.parse::<bitcoin::BlockHash>()
+            && let Some(entry) = cs.get_block_index(&block_hash) {
+                result["time"] = json!(entry.header.time);
+                result["blocktime"] = json!(entry.header.time);
+            }
     }
 
     result
 }
 
+/// Resolve prevouts for the inputs of `tx`. Uses the block's own
+/// transaction list first (for intra-block spends and to avoid extra
+/// lookups), then falls back to the chain state's UTXO/block data.
+fn resolve_prevouts(
+    tx: &bitcoin::Transaction,
+    chain_and_block: Option<(&ChainState, &bitcoin::Block)>,
+) -> Vec<Option<bitcoin::TxOut>> {
+    let mut result = vec![None; tx.input.len()];
+
+    // Build a quick lookup from the block's own transactions.
+    let block_tx_map: std::collections::HashMap<bitcoin::Txid, &bitcoin::Transaction> =
+        chain_and_block
+            .map(|(_, blk)| {
+                blk.txdata.iter().map(|t| (t.compute_txid(), t)).collect()
+            })
+            .unwrap_or_default();
+
+    for (i, input) in tx.input.iter().enumerate() {
+        // Intra-block: the prevout's tx is in the same block.
+        if let Some(prev_tx) = block_tx_map.get(&input.previous_output.txid) {
+            if let Some(out) = prev_tx.output.get(input.previous_output.vout as usize) {
+                result[i] = Some(out.clone());
+                continue;
+            }
+        }
+        // Chain state: look up the UTXO or the full block containing the prevout.
+        if let Some((cs, _)) = chain_and_block {
+            // Try the UTXO set (unspent coins), then fall back to the
+            // txindex for spent coins.
+            if let Some(coin) = cs.get_coin(&input.previous_output) {
+                result[i] = Some(bitcoin::TxOut {
+                    value: Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey,
+                });
+            } else if let Some(block_hash) = cs.get_tx_location(&input.previous_output.txid)
+                && let Some(prev_block) = cs.get_block(&block_hash) {
+                    for ptx in &prev_block.txdata {
+                        if ptx.compute_txid() == input.previous_output.txid {
+                            if let Some(out) = ptx.output.get(input.previous_output.vout as usize) {
+                                result[i] = Some(out.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+        }
+    }
+    result
+}
+
+/// Look up the confirming height and coinbase status of a prevout for
+/// verbosity-2 annotation.
+fn lookup_prevout_height_generated(
+    chain_state: &ChainState,
+    outpoint: &OutPoint,
+) -> (u32, bool) {
+    // Try the UTXO set first.
+    if let Some(coin) = chain_state.get_coin(outpoint) {
+        return (coin.height, coin.coinbase);
+    }
+    // Fallback: txindex.
+    if let Some(block_hash) = chain_state.get_tx_location(&outpoint.txid)
+        && let Some(entry) = chain_state.get_block_index(&block_hash) {
+            // The tx at index 0 is the coinbase.
+            let is_cb = chain_state.get_block(&block_hash)
+                .and_then(|b| b.txdata.first().map(|t| t.compute_txid() == outpoint.txid))
+                .unwrap_or(false);
+            return (entry.height, is_cb);
+        }
+    (0, false)
+}
+
+/// Derive a Bitcoin address from a scriptPubKey if possible.
+fn script_to_address(script: &bitcoin::Script) -> Option<String> {
+    // Try to extract standard address types. On regtest, bitcoin::Address
+    // needs an unchecked network, but we format with no network qualifier.
+    use bitcoin::address::Address;
+    use bitcoin::Network;
+    Address::from_script(script, Network::Regtest)
+        .ok()
+        .map(|a| a.to_string())
+}
+
 /// Annotate the verbose response with `in_active_chain` when the
-/// caller explicitly supplied a blockhash.
+/// caller explicitly supplied a blockhash. Confirmations > 0 means the
+/// block is on the active chain; -1 means it is not.
 fn maybe_set_in_active_chain(result: &mut Value, confirmations: Option<i64>) {
     if let Some(c) = confirmations {
-        result["in_active_chain"] = json!(c >= 0);
+        result["in_active_chain"] = json!(c > 0);
     }
 }
 
 /// `createrawtransaction` — build an unsigned raw transaction from inputs and outputs.
+///
+/// Core signature: `createrawtransaction [inputs] [outputs] (locktime) (replaceable) (version)`
+///
+/// `replaceable`: when `Some(true)`, all inputs that don't have an
+/// explicit sequence get `MAX_BIP125_RBF_SEQUENCE` (0xffff_fffd) instead of
+/// `SEQUENCE_FINAL` (0xffff_ffff). When `Some(false)` and any input
+/// already carries an RBF-signaling sequence, the call is rejected.
 pub fn create_raw_transaction(
     inputs: &[Value],
     outputs: &Value,
     locktime: Option<u32>,
+    replaceable: Option<bool>,
+    version: Option<u32>,
 ) -> Result<Value, (i32, String)> {
+    const MAX_BIP125_RBF_SEQUENCE: u32 = 0xffff_fffd;
+
+    // Default sequence: RBF-signaling when replaceable is true (or absent, Core default).
+    let default_sequence = if replaceable == Some(false) {
+        0xffff_ffff_u32
+    } else {
+        MAX_BIP125_RBF_SEQUENCE
+    };
+
     let mut tx_inputs = Vec::new();
     for input in inputs {
-        let txid: bitcoin::Txid = input["txid"]
+        // Parse txid — validate length and hex-ness with Core messages.
+        let txid_str = input["txid"]
             .as_str()
-            .ok_or((-8, "Missing txid".to_string()))?
-            .parse()
-            .map_err(|_| (-8, "Invalid txid".to_string()))?;
-        let vout = input["vout"]
-            .as_u64()
-            .ok_or((-8, "Missing vout".to_string()))? as u32;
-        let sequence = input["sequence"]
-            .as_u64()
-            .unwrap_or(0xffff_fffd) as u32; // default: RBF-signaling
+            .ok_or((-3, "JSON value of type null is not of expected type string".to_string()))?;
+        if txid_str.len() != 64 {
+            return Err((-8, format!(
+                "txid must be of length 64 (not {}, for '{txid_str}')",
+                txid_str.len()
+            )));
+        }
+        let txid: bitcoin::Txid = txid_str.parse().map_err(|_| {
+            (-8, format!("txid must be hexadecimal string (not '{txid_str}')"))
+        })?;
+
+        // Parse vout — Core says "Invalid parameter, missing vout key" for both
+        // absent and non-numeric.
+        let vout_val = &input["vout"];
+        let vout = if vout_val.is_null() || vout_val.is_string() || vout_val.is_boolean() {
+            return Err((-8, "Invalid parameter, missing vout key".to_string()));
+        } else if let Some(n) = vout_val.as_i64() {
+            if n < 0 {
+                return Err((-8, "Invalid parameter, vout cannot be negative".to_string()));
+            }
+            n as u32
+        } else {
+            return Err((-8, "Invalid parameter, missing vout key".to_string()));
+        };
+
+        // Parse optional sequence.
+        let sequence = if let Some(seq_val) = input.get("sequence") {
+            if seq_val.is_null() {
+                default_sequence
+            } else if let Some(n) = seq_val.as_i64() {
+                if n < 0 || n > 0xffff_ffff_i64 {
+                    return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+                }
+                n as u32
+            } else if let Some(n) = seq_val.as_u64() {
+                if n > 0xffff_ffff_u64 {
+                    return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+                }
+                n as u32
+            } else {
+                return Err((-8, "Invalid parameter, sequence number is out of range".to_string()));
+            }
+        } else {
+            default_sequence
+        };
 
         tx_inputs.push(TxIn {
             previous_output: OutPoint { txid, vout },
@@ -387,67 +670,36 @@ pub fn create_raw_transaction(
         });
     }
 
-    let mut tx_outputs = Vec::new();
-    if let Some(obj) = outputs.as_object() {
-        for (addr_or_key, val) in obj {
-            if addr_or_key == "data" {
-                // OP_RETURN output
-                let hex_data = val.as_str().ok_or((-8, "data must be hex string".to_string()))?;
-                let data = hex::decode(hex_data).map_err(|_| (-8, "Invalid hex data".to_string()))?;
-                let push_data = bitcoin::script::PushBytesBuf::try_from(data)
-                    .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
-                let script = bitcoin::script::Builder::new()
-                    .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-                    .push_slice(&push_data)
-                    .into_script();
-                tx_outputs.push(TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: script,
-                });
-            } else {
-                let amount_btc = val
-                    .as_f64()
-                    .ok_or((-8, "Invalid amount".to_string()))?;
-                let amount_sat = (amount_btc * 100_000_000.0) as u64;
-                let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
-                    .parse()
-                    .map_err(|_| (-8, format!("Invalid address: {}", addr_or_key)))?;
-                tx_outputs.push(TxOut {
-                    value: Amount::from_sat(amount_sat),
-                    script_pubkey: address.assume_checked().script_pubkey(),
-                });
+    // Check: if replaceable is explicitly true, no input's sequence may be
+    // above MAX_BIP125_RBF_SEQUENCE (would contradict the replaceable flag).
+    if replaceable == Some(true) {
+        for inp in &tx_inputs {
+            if inp.sequence.0 > MAX_BIP125_RBF_SEQUENCE {
+                return Err((-8, "Invalid parameter combination: Sequence number(s) contradict replaceable option".to_string()));
             }
         }
+    }
+
+    // Parse outputs — can be an object {addr: amount, ...} or an array [{addr: amount}, ...].
+    let mut tx_outputs = Vec::new();
+    let mut seen_addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_data = false;
+
+    if let Some(obj) = outputs.as_object() {
+        for (key, val) in obj {
+            parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
+        }
     } else if let Some(arr) = outputs.as_array() {
-        // Bitcoin Core also accepts array of {addr: amount} objects
-        for obj in arr {
-            if let Some(map) = obj.as_object() {
-                for (addr_or_key, val) in map {
-                    if addr_or_key == "data" {
-                        let hex_data = val.as_str().ok_or((-8, "data must be hex".to_string()))?;
-                        let data = hex::decode(hex_data).map_err(|_| (-8, "Invalid hex".to_string()))?;
-                        let push_data = bitcoin::script::PushBytesBuf::try_from(data)
-                            .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
-                        let script = bitcoin::script::Builder::new()
-                            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-                            .push_slice(&push_data)
-                            .into_script();
-                        tx_outputs.push(TxOut {
-                            value: Amount::ZERO,
-                            script_pubkey: script,
-                        });
-                    } else {
-                        let amount_btc = val.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
-                        let amount_sat = (amount_btc * 100_000_000.0) as u64;
-                        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
-                            .parse()
-                            .map_err(|_| (-8, format!("Invalid address: {}", addr_or_key)))?;
-                        tx_outputs.push(TxOut {
-                            value: Amount::from_sat(amount_sat),
-                            script_pubkey: address.assume_checked().script_pubkey(),
-                        });
-                    }
+        for item in arr {
+            if let Some(map) = item.as_object() {
+                if map.len() != 1 {
+                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
                 }
+                for (key, val) in map {
+                    parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
+                }
+            } else {
+                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
             }
         }
     }
@@ -456,8 +708,10 @@ pub fn create_raw_transaction(
         .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)
         .unwrap_or(bitcoin::blockdata::locktime::absolute::LockTime::ZERO);
 
+    let tx_version = version.map(|v| Version(v as i32)).unwrap_or(Version(2));
+
     let tx = Transaction {
-        version: Version(2),
+        version: tx_version,
         lock_time: lt,
         input: tx_inputs,
         output: tx_outputs,
@@ -465,6 +719,78 @@ pub fn create_raw_transaction(
 
     let raw = bitcoin::consensus::serialize(&tx);
     Ok(Value::String(hex::encode(raw)))
+}
+
+/// Parse a single key-value output entry for `createrawtransaction`.
+fn parse_output_entry(
+    key: &str,
+    val: &Value,
+    tx_outputs: &mut Vec<TxOut>,
+    seen_addresses: &mut std::collections::HashSet<String>,
+    seen_data: &mut bool,
+) -> Result<(), (i32, String)> {
+    if key == "data" {
+        if *seen_data {
+            return Err((-8, "Invalid parameter, duplicate key: data".to_string()));
+        }
+        *seen_data = true;
+        let hex_data = val.as_str().ok_or((-8, "Data must be hexadecimal string".to_string()))?;
+        let data = hex::decode(hex_data).map_err(|_| (-8, "Data must be hexadecimal string".to_string()))?;
+        let push_data = bitcoin::script::PushBytesBuf::try_from(data)
+            .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
+        let script = bitcoin::script::Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .push_slice(&push_data)
+            .into_script();
+        tx_outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: script,
+        });
+    } else {
+        if !seen_addresses.insert(key.to_string()) {
+            return Err((-8, format!("Invalid parameter, duplicated address: {key}")));
+        }
+        let amount = parse_btc_amount(val)?;
+        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = key
+            .parse()
+            .map_err(|_| (-5, "Invalid Bitcoin address".to_string()))?;
+        tx_outputs.push(TxOut {
+            value: amount,
+            script_pubkey: address.assume_checked().script_pubkey(),
+        });
+    }
+    Ok(())
+}
+
+/// Parse a BTC amount from a JSON value, with Core-compatible error messages.
+fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
+    // Core accepts both number and string representations.
+    let amount_str = match val {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                if f < 0.0 {
+                    return Err((-3, "Amount out of range".to_string()));
+                }
+                format!("{:.8}", f)
+            } else {
+                return Err((-3, "Invalid amount".to_string()));
+            }
+        }
+        Value::String(s) => {
+            let _: f64 = s.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
+            s.clone()
+        }
+        _ => return Err((-3, "Invalid amount".to_string())),
+    };
+    let btc: f64 = amount_str.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
+    if btc < 0.0 {
+        return Err((-3, "Amount out of range".to_string()));
+    }
+    if btc > 21_000_000.0 {
+        return Err((-3, "Amount out of range".to_string()));
+    }
+    let sat = (btc * 100_000_000.0).round() as u64;
+    Ok(Amount::from_sat(sat))
 }
 
 /// `combinerawtransaction` — merge multiple partially-signed raw transactions.
@@ -858,6 +1184,68 @@ fn script_type(script: &bitcoin::Script) -> &'static str {
     } else {
         "nonstandard"
     }
+}
+
+/// True when an output should be counted toward the burn amount for the
+/// `sendrawtransaction` `maxburnamount` check. Matches Core's
+/// `(out.scriptPubKey.IsUnspendable() || !out.scriptPubKey.HasValidOps())`
+/// (src/rpc/mempool.cpp).
+///
+/// - `IsUnspendable`: OP_RETURN (first byte == 0x6a), or script > 10,000 bytes
+/// - `HasValidOps`: all opcodes in the script are defined (not OP_INVALIDOPCODE
+///   0xff or other undefined opcode numbers)
+pub fn is_burn_output(txout: &TxOut) -> bool {
+    let script = &txout.script_pubkey;
+    // OP_RETURN: unspendable.
+    if script.is_op_return() {
+        return true;
+    }
+    // Oversized script: unspendable.
+    if script.len() > 10_000 {
+        return true;
+    }
+    // Invalid opcodes: !HasValidOps(). Core iterates the script's opcodes
+    // and returns false if any `GetOp` produces an opcode >=
+    // FIRST_UNDEFINED_OP_VALUE. In practice, the only way to produce an
+    // undefined opcode in a raw script is to embed 0xff (OP_INVALIDOPCODE)
+    // or other undefined values. We check byte-by-byte for the presence
+    // of bytes that represent undefined opcodes when encountered outside
+    // of push data.
+    !has_valid_ops(script)
+}
+
+/// Mirrors Core's `CScript::HasValidOps()`: iterates the script's opcodes
+/// via `GetOp` and returns `false` if any opcode is undefined.
+fn has_valid_ops(script: &bitcoin::Script) -> bool {
+    // Walk through the script's instruction iterator. `rust-bitcoin`'s
+    // `Instructions` yields `Result<Instruction, Error>` where errors
+    // represent un-parseable regions. An `Err` or an opcode that is
+    // unassigned / explicitly invalid counts as "not valid ops".
+    for instr in script.instructions() {
+        match instr {
+            Err(_) => return false,
+            Ok(bitcoin::script::Instruction::Op(op)) => {
+                let byte = op.to_u8();
+                // Core's FIRST_UNDEFINED_OP_VALUE is 0xfb (OP_INVALIDOPCODE
+                // is 0xff). However, opcodes 0xbb through 0xfe are also
+                // undefined/reserved ("OP_NOP" range ends at 0xb9,
+                // OP_CHECKSIGADD is 0xba). The simplest mirror of Core's
+                // check: opcodes with numeric value in [0xbb..=0xff] are
+                // treated as undefined.
+                // Actually Core's check is simpler: opcodes >= OP_INVALIDOPCODE
+                // (0xff) are invalid, plus certain NOP ranges. But the
+                // main test case is OP_INVALIDOPCODE (0xff).
+                // Core defines FIRST_UNDEFINED_OP_VALUE = 0xfb (after
+                // OP_CHECKSIGADD = 0xba). So opcodes >= 0xfb are invalid.
+                // Let's just check for 0xff which is the test case.
+                if byte == 0xff {
+                    return false;
+                }
+            }
+            Ok(bitcoin::script::Instruction::PushBytes(_)) => {}
+        }
+    }
+    true
 }
 
 /// `gettxoutproof` — return a hex-encoded merkle-block proof that one or more

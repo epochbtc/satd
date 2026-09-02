@@ -4,7 +4,7 @@ use serde_json::json;
 
 /// Look up a transaction by txid from both chain and mempool.
 pub fn get_transaction(ctx: &McpContext, txid: &str, blockhash: Option<&str>) -> String {
-    match rawtx::get_raw_transaction(&ctx.chain_state, &ctx.mempool, txid, true, blockhash) {
+    match rawtx::get_raw_transaction(&ctx.chain_state, &ctx.mempool, txid, true, 1, blockhash) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
@@ -12,7 +12,7 @@ pub fn get_transaction(ctx: &McpContext, txid: &str, blockhash: Option<&str>) ->
 
 /// Parse a hex-encoded raw transaction into JSON.
 pub fn decode_raw_transaction(hex_tx: &str) -> String {
-    match rawtx::decode_raw_transaction(hex_tx) {
+    match rawtx::decode_raw_transaction(hex_tx, None) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
