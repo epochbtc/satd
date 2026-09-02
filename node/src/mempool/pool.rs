@@ -139,7 +139,9 @@ impl MempoolError {
             MempoolError::Script(_)
             | MempoolError::BadAmounts
             | MempoolError::PrematureCoinbaseSpend
-            | MempoolError::MissingInputs => -25,
+            | MempoolError::MissingInputs
+            | MempoolError::Quarantined(_)
+            | MempoolError::Validation(_) => -25,
             _ => -26,
         }
     }

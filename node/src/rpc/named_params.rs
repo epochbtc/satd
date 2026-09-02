@@ -193,7 +193,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "submitheader" => &[("hexdata", false)],
         "subscribemempool" => &[],
         "syncwithvalidationinterfacequeue" => &[],
-        "submitpackage" => &[("package", false)],
+        "submitpackage" => &[("package", false), ("maxfeerate", false), ("maxburnamount", false)],
         "testmempoolaccept" => &[("rawtxs", false), ("maxfeerate", false)],
         "unsubscribemempool" => &[],
         "uptime" => &[],
