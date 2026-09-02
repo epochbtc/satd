@@ -404,6 +404,7 @@ async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
     );
 }
 
+}
 /// Cut-through (`tweak_unspent_only`): an entry disappears once its taproot
 /// outputs are spent, and the block says so with `filtered`.
 ///
