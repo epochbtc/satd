@@ -1387,6 +1387,14 @@ impl Store for CoinCache {
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
+        // Guard: when the node is running without `-txindex`, the LRU
+        // may still hold entries from `connect_block`'s `tx_index_puts`
+        // (the coin cache absorbs them unconditionally), but exposing
+        // them makes `getrawtransaction` succeed on a non-txindex node
+        // — behaviour Core does not allow.
+        if !self.inner.has_txindex() {
+            return None;
+        }
         if let Some(&hash) = self.tx_index_cache.lock().get(txid) {
             return Some(hash);
         }

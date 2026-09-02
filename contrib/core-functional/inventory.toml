@@ -922,8 +922,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "rpc_getchaintips.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_getdescriptoractivity.py"
@@ -1038,8 +1037,7 @@ note = "needs `createmultisig`"
 
 [[test]]
 file = "rpc_txoutproof.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_uptime.py"

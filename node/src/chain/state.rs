@@ -5644,8 +5644,25 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // Structural + witness block validation
-        validation::block::check_block(block, self.network, new_height)?;
+        // Structural + witness block validation.  If the block already has a
+        // `HeaderOnly` index entry (submitted via `submitheader`) and fails
+        // body validation, mark it — and every descendant in the index — as
+        // `Invalid` so that `getchaintips` reports the correct status.
+        // This matches Core's `InvalidBlockFound`.
+        if let Err(e) = validation::block::check_block(block, self.network, new_height) {
+            if self
+                .store
+                .get_block_index(&block_hash)
+                .is_some_and(|ex| ex.status == BlockStatus::HeaderOnly)
+            {
+                // Flush pending writes first, as `mark_subtree_invalid`
+                // walks via `for_each_block_index` which reads from the
+                // inner store, not the cache overlay.
+                let _ = self.store.flush();
+                let _ = self.mark_subtree_invalid(block_hash);
+            }
+            return Err(e.into());
+        }
 
         // PoW validation
         validation::pow::check_proof_of_work(&block.header)?;
@@ -5692,6 +5709,7 @@ impl ChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
+        // ---- Connect-time validation passed. Write the block data. ----
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
@@ -6119,6 +6137,11 @@ impl ChainState {
                         Some((block_hash, new_height)),
                     );
                 }
+                // Mark the block (and its descendants) as Invalid so
+                // `getchaintips` reports them correctly — Core's
+                // `InvalidBlockFound`.
+                let _ = self.store.flush();
+                let _ = self.mark_subtree_invalid(block_hash);
                 return Err(e.into());
             }
         };

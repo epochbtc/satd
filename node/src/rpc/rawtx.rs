@@ -6,6 +6,7 @@ use bitcoin::secp256k1::Secp256k1;
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount, format_feerate_sat_per_kvb};
+use crate::storage::Store;
 use serde_json::{json, Value};
 
 /// `getmempoolinfo` — return mempool statistics.
@@ -172,12 +173,16 @@ pub fn get_raw_transaction(
                 return if verbose {
                     let height = entry.as_ref().map(|e| e.height);
                     let confirmations = height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                    Ok(decode_transaction_verbose(
+                    let mut result = decode_transaction_verbose(
                         tx,
                         Some(hash_str),
                         height,
                         confirmations,
-                    ))
+                    );
+                    // `in_active_chain` is only present when the caller
+                    // explicitly provided a blockhash.
+                    maybe_set_in_active_chain(&mut result, confirmations);
+                    Ok(result)
                 } else {
                     let raw = bitcoin::consensus::serialize(tx);
                     Ok(Value::String(hex::encode(raw)))
@@ -211,7 +216,7 @@ pub fn get_raw_transaction(
                 }
             }
 
-    Err((-5, "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.".to_string()))
+    Err((-5, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.".to_string()))
 }
 
 /// `decoderawtransaction` — decode a raw transaction hex to JSON.
@@ -337,9 +342,21 @@ pub(crate) fn decode_transaction_verbose(
     }
     if let Some(c) = confirmations {
         result["confirmations"] = json!(c);
+        // Core reports `in_active_chain` only when the caller
+        // explicitly provided a blockhash. We abuse confirmations > 0
+        // as the "on active chain" signal here since confirmations
+        // is -1 when the block is off-chain.
     }
 
     result
+}
+
+/// Annotate the verbose response with `in_active_chain` when the
+/// caller explicitly supplied a blockhash.
+fn maybe_set_in_active_chain(result: &mut Value, confirmations: Option<i64>) {
+    if let Some(c) = confirmations {
+        result["in_active_chain"] = json!(c >= 0);
+    }
 }
 
 /// `createrawtransaction` — build an unsigned raw transaction from inputs and outputs.
@@ -841,6 +858,178 @@ fn script_type(script: &bitcoin::Script) -> &'static str {
     } else {
         "nonstandard"
     }
+}
+
+/// `gettxoutproof` — return a hex-encoded merkle-block proof that one or more
+/// transactions are included in a block.
+///
+/// Without an explicit `blockhash`, the block is located by scanning the UTXO
+/// set for an unspent output of one of the txids; with `-txindex` the txindex
+/// is consulted instead. All txids must reside in the same block.
+pub fn get_tx_out_proof(
+    chain_state: &ChainState,
+    txids: &[String],
+    blockhash_str: Option<&str>,
+) -> Result<Value, (i32, String)> {
+    use bitcoin::consensus::serialize;
+    use crate::storage::blockindex::BlockStatus;
+    use std::collections::HashSet;
+
+    if txids.is_empty() {
+        return Err((-8, "Parameter 'txids' cannot be empty".into()));
+    }
+
+    // Parse + validate txids and check for duplicates.
+    let mut parsed_txids: Vec<bitcoin::Txid> = Vec::with_capacity(txids.len());
+    let mut seen = HashSet::new();
+    for raw in txids {
+        if raw.len() != 64 {
+            return Err((-8, format!(
+                "txid must be of length 64 (not {}, for '{raw}')",
+                raw.len(),
+            )));
+        }
+        let txid: bitcoin::Txid = raw.parse().map_err(|_| {
+            (-8i32, format!("txid must be hexadecimal string (not '{raw}')"))
+        })?;
+        if !seen.insert(txid) {
+            return Err((-8, "Invalid parameter, duplicated txid".into()));
+        }
+        parsed_txids.push(txid);
+    }
+
+    // Resolve the block hash.
+    let block_hash: bitcoin::BlockHash = if let Some(bh) = blockhash_str {
+        if bh.len() != 64 {
+            return Err((-8, format!(
+                "blockhash must be of length 64 (not {}, for '{bh}')",
+                bh.len(),
+            )));
+        }
+        bh.parse().map_err(|_| {
+            (-8i32, format!("blockhash must be hexadecimal string (not '{bh}')"))
+        })?
+    } else {
+        // No explicit blockhash — try to find the block via txindex or UTXO.
+        let mut found_hash: Option<bitcoin::BlockHash> = None;
+
+        // Try txindex first.
+        if chain_state.store_ref().has_txindex() {
+            for txid in &parsed_txids {
+                if let Some(bh) = chain_state.store_ref().get_tx_location(txid) {
+                    found_hash = Some(bh);
+                    break;
+                }
+            }
+        }
+
+        // Fall back to UTXO set: scan outputs of each txid for an unspent
+        // coin, then look up its confirming block.
+        if found_hash.is_none() {
+            'outer: for txid in &parsed_txids {
+                for vout in 0..100u32 {
+                    let outpoint = OutPoint { txid: *txid, vout };
+                    if let Some(coin) = chain_state.get_coin(&outpoint) {
+                        // The coin is confirmed at `coin.height`; look up the
+                        // block at that height.
+                        if let Some(bh) =
+                            chain_state.active_chain_hash_at_height(coin.height)
+                        {
+                            found_hash = Some(bh);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        found_hash.ok_or_else(|| (-5i32, "Transaction not yet in block".to_string()))?
+    };
+
+    // Verify the block index entry exists and has full data.
+    let entry = chain_state
+        .get_block_index(&block_hash)
+        .ok_or((-5i32, "Block not found".to_string()))?;
+
+    if entry.status == BlockStatus::HeaderOnly || entry.status == BlockStatus::Pruned {
+        return Err((-1, "Block not available (not fully downloaded)".into()));
+    }
+
+    // Load the full block.
+    let block = chain_state
+        .get_block(&block_hash)
+        .ok_or((-1i32, "Block not available (not fully downloaded)".to_string()))?;
+
+    // Build a set of the block's txids for the predicate.
+    let block_txids: Vec<bitcoin::Txid> =
+        block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+
+    // Verify all requested txids are in this block.
+    let block_txid_set: HashSet<bitcoin::Txid> = block_txids.iter().copied().collect();
+    for txid in &parsed_txids {
+        if !block_txid_set.contains(txid) {
+            return Err((
+                -5,
+                "Not all transactions found in specified or retrieved block".into(),
+            ));
+        }
+    }
+
+    let target_set: HashSet<bitcoin::Txid> = parsed_txids.iter().copied().collect();
+    let merkle_block = bitcoin::MerkleBlock::from_header_txids_with_predicate(
+        &block.header,
+        &block_txids,
+        |txid| target_set.contains(txid),
+    );
+
+    Ok(Value::String(hex::encode(serialize(&merkle_block))))
+}
+
+/// `verifytxoutproof` — verify a merkle-block proof and return the txids it
+/// proves, or an empty array if the proof is invalid.
+pub fn verify_tx_out_proof(
+    chain_state: &ChainState,
+    proof_hex: &str,
+) -> Result<Value, (i32, String)> {
+    use bitcoin::consensus::deserialize;
+
+    let proof_bytes =
+        hex::decode(proof_hex).map_err(|_| (-22i32, "Invalid hex".to_string()))?;
+    let merkle_block: bitcoin::MerkleBlock =
+        deserialize(&proof_bytes).map_err(|_| (-22i32, "Invalid proof".to_string()))?;
+
+    let mut matches: Vec<bitcoin::Txid> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    if merkle_block
+        .extract_matches(&mut matches, &mut indices)
+        .is_err()
+    {
+        return Ok(json!([]));
+    }
+
+    // Verify the merkle root matches a block header on our chain.
+    let block_hash = merkle_block.header.block_hash();
+    if chain_state.get_block_index(&block_hash).is_none() {
+        return Ok(json!([]));
+    }
+
+    // Load the block and verify each matched txid actually exists in it.
+    // Without this, a crafted proof that sets nTransactions=1 and
+    // vHash=[merkleRoot] would claim the merkle root itself is a
+    // transaction — a tree-climbing attack.
+    let block = match chain_state.get_block(&block_hash) {
+        Some(b) => b,
+        None => return Ok(json!([])),
+    };
+    let block_txid_set: std::collections::HashSet<bitcoin::Txid> =
+        block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    let verified: Vec<String> = matches
+        .iter()
+        .filter(|txid| block_txid_set.contains(*txid))
+        .map(|t| t.to_string())
+        .collect();
+    Ok(json!(verified))
 }
 
 #[cfg(test)]

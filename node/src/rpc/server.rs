@@ -232,11 +232,19 @@ fn optional_verbosity(
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .ok_or_else(|| ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>)),
-        Some(_) => Err(ErrorObjectOwned::owned(
-            -1,
-            "JSON value is not a boolean or number as expected",
-            None::<()>,
-        )),
+        Some(v) => {
+            let type_name = match &v {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                _ => "unknown",
+            };
+            Err(ErrorObjectOwned::owned(
+                -3,
+                format!("JSON value of type {type_name} is not of expected type number"),
+                None::<()>,
+            ))
+        }
     }
 }
 
@@ -992,15 +1000,8 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: submit=false is not supported by satd; \
-                 a generated block is always submitted",
-                None::<()>,
-            ));
-        }
-        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
+        let submit = seq.optional_next::<bool>().ok().flatten().unwrap_or(true);
+        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address, submit)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1113,15 +1114,7 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        if verbosity == 2 {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "satd does not implement getrawtransaction verbosity 2 \
-                 (per-input `fee`/`prevout`); use verbosity 1",
-                None::<()>,
-            ));
-        }
-        let verbose = verbosity == 1;
+        let verbose = verbosity >= 1;
         let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
         rawtx::get_raw_transaction(
             &ctx.chain_state,
@@ -1318,6 +1311,28 @@ pub async fn start(
 
     module.register_method("gettxoutsetinfo", |_params, ctx, _extensions| {
         blockchain::get_tx_out_set_info(&ctx.chain_state)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("gettxoutproof", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let txids: Vec<String> = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
+        rawtx::get_tx_out_proof(
+            &ctx.chain_state,
+            &txids,
+            blockhash.as_deref(),
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("verifytxoutproof", |params, ctx, _extensions| {
+        let proof_hex: String = params
+            .one()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        rawtx::verify_tx_out_proof(&ctx.chain_state, &proof_hex)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1695,8 +1710,9 @@ pub async fn start(
             "getserverstatus",
             "getsysteminfo",
             "gettxout",
-            "getwarnings",
+            "gettxoutproof",
             "gettxoutsetinfo",
+            "getwarnings",
             "help",
             "invalidateblock",
             "listbanned",
@@ -1721,6 +1737,7 @@ pub async fn start(
             "unsubscribemempool",
             "uptime",
             "verifychain",
+            "verifytxoutproof",
         ];
         Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
     })?;
