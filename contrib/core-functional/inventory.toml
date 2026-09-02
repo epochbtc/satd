@@ -886,7 +886,8 @@ status = "run"
 [[test]]
 file = "rpc_deriveaddresses.py"
 status = "skip"
-reason = "cache"
+reason = "cli-compat"
+note = "non-CLI variant passes; --usecli variant fails because sat-cli does not read bitcoin.conf to detect the network, so it cannot find the regtest cookie file"
 
 [[test]]
 file = "rpc_dumptxoutset.py"
@@ -902,7 +903,8 @@ reason = "cache"
 [[test]]
 file = "rpc_generate.py"
 status = "skip"
-reason = "cache"
+reason = "cli-compat"
+note = "descriptor and tx-inclusion tests pass; blocked by parallel generateblock test which uses sat-cli without -regtest (sat-cli does not read bitcoin.conf to detect the network)"
 
 [[test]]
 file = "rpc_getblockfilter.py"
@@ -933,8 +935,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_gettxspendingprevout.py"

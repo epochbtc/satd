@@ -48,7 +48,10 @@ pub fn generate_to_address(
     }
 
     let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks)
-        .map_err(|e| (-1, e.to_string()))?;
+        .map_err(|e| match &e {
+            crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
+            _ => (-1, e.to_string()),
+        })?;
 
     Ok(json!(hashes))
 }

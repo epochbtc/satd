@@ -148,7 +148,7 @@ pub fn get_raw_transaction(
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
-                Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0)))
+                Ok(decode_transaction_verbose_with_network(&entry.tx, None, None, Some(0), chain_state.network))
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))
@@ -172,11 +172,12 @@ pub fn get_raw_transaction(
                 return if verbose {
                     let height = entry.as_ref().map(|e| e.height);
                     let confirmations = height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                    Ok(decode_transaction_verbose(
+                    Ok(decode_transaction_verbose_with_network(
                         tx,
                         Some(hash_str),
                         height,
                         confirmations,
+                        chain_state.network,
                     ))
                 } else {
                     let raw = bitcoin::consensus::serialize(tx);
@@ -197,11 +198,12 @@ pub fn get_raw_transaction(
                             let height = entry.as_ref().map(|e| e.height);
                             let confirmations =
                                 height.map(|h| confirmations_for(chain_state, &block_hash, h));
-                            Ok(decode_transaction_verbose(
+                            Ok(decode_transaction_verbose_with_network(
                                 tx,
                                 Some(&block_hash.to_string()),
                                 height,
                                 confirmations,
+                                chain_state.network,
                             ))
                         } else {
                             let raw = bitcoin::consensus::serialize(tx);
@@ -257,6 +259,28 @@ pub(crate) fn decode_transaction_verbose(
     // active chain, the same convention as the block's own `confirmations`.
     confirmations: Option<i64>,
 ) -> Value {
+    decode_transaction_verbose_inner(tx, blockhash, block_height, confirmations, None)
+}
+
+/// Like `decode_transaction_verbose` but with an explicit network so the
+/// `address` field can be included in scriptPubKey objects.
+pub(crate) fn decode_transaction_verbose_with_network(
+    tx: &bitcoin::Transaction,
+    blockhash: Option<&str>,
+    block_height: Option<u32>,
+    confirmations: Option<i64>,
+    network: bitcoin::Network,
+) -> Value {
+    decode_transaction_verbose_inner(tx, blockhash, block_height, confirmations, Some(network))
+}
+
+fn decode_transaction_verbose_inner(
+    tx: &bitcoin::Transaction,
+    blockhash: Option<&str>,
+    block_height: Option<u32>,
+    confirmations: Option<i64>,
+    network: Option<bitcoin::Network>,
+) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
     let size = raw.len();
@@ -300,14 +324,20 @@ pub(crate) fn decode_transaction_verbose(
         .enumerate()
         .map(|(n, output)| {
             let value = format_amount(output.value.to_sat(), unit);
+            let mut spk = serde_json::json!({
+                "asm": format!("{}", output.script_pubkey),
+                "hex": hex::encode(output.script_pubkey.as_bytes()),
+                "type": script_type(&output.script_pubkey),
+            });
+            if let Some(net) = network
+                && let Ok(addr) = bitcoin::Address::from_script(&output.script_pubkey, net)
+            {
+                spk["address"] = serde_json::json!(addr.to_string());
+            }
             json!({
                 "value": value,
                 "n": n,
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                    "type": script_type(&output.script_pubkey),
-                },
+                "scriptPubKey": spk,
             })
         })
         .collect();

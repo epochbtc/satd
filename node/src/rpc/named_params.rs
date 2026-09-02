@@ -111,6 +111,9 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "decodepsbt" => &[("psbt", false)],
         "decoderawtransaction" => &[("hexstring", false), ("iswitness", false)],
         "decodescript" => &[("hexstring", false)],
+        // SATD_ONLY: deriveaddresses, getdescriptorinfo
+        "deriveaddresses" => &[("descriptor", false), ("range", false)],
+        "getdescriptorinfo" => &[("descriptor", false)],
         "disconnectnode" => &[("address", false), ("nodeid", false)],
         "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("options", false)],
         "estimatefees" => &[("targets", false), ("mode", false)],
@@ -118,6 +121,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
+        // SATD_ONLY: generatetodescriptor
+        "generatetodescriptor" => &[("num_blocks", false), ("descriptor", false), ("maxtries", false)],
         "getaddednodeinfo" => &[("node", false)],
         "getaddressbalance" => &[("address", false)],
         "getaddresshistory" => &[("address", false)],

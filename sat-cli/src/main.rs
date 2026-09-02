@@ -264,7 +264,21 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         "output",
     ];
 
+    // Core CLI flags that control named-parameter handling on the client
+    // side. satd's server-side NamedParamsLayer handles this, so these
+    // are silently consumed and discarded.
+    let ignored_flags = ["named", "nonamed", "rpcclienttimeout"];
+
     args.into_iter()
+        .filter(|arg| {
+            if arg.starts_with('-') && !arg.starts_with("--") {
+                let rest = &arg[1..];
+                let flag_name = rest.split('=').next().unwrap_or(rest);
+                !ignored_flags.contains(&flag_name)
+            } else {
+                true
+            }
+        })
         .map(|arg| {
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;

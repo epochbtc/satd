@@ -966,42 +966,146 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("generateblock", |params, ctx, _extensions| {
+    module.register_method("generatetodescriptor", |params, ctx, _extensions| {
         let mut seq = params.sequence();
-        let address: String = seq
+        let nblocks: u32 = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Core's `transactions` and `submit` are not implemented. Accepting and
-        // ignoring them is not a tolerable failure mode for either: `submit`
-        // false asks for a block to be built and NOT connected, and answering
-        // by mining and connecting it advances the chain the caller was told
-        // would not move — a test that asserts on the tip afterwards is then
-        // asserting against state it did not create. `transactions` asks for a
-        // specific block body and satd always builds from the mempool. Refuse
-        // both, so the gap is visible instead of silently wrong. (Ignoring them
-        // predates named parameters — a positional caller hit it too — but
-        // named arguments are how Core's own suite passes them.)
-        let transactions = seq.optional_next::<Vec<serde_json::Value>>();
-        let transactions_ok = matches!(&transactions, Ok(None))
-            || matches!(&transactions, Ok(Some(v)) if v.is_empty());
-        if !transactions_ok {
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
             return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: the 'transactions' argument is not supported by satd; \
-                 the block is built from the mempool",
-                None::<()>,
+                -1, "generatetodescriptor is only available in regtest mode", None::<()>,
             ));
         }
-        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
+
+        let coinbase_script = crate::rpc::descriptor::descriptor_to_coinbase_script(
+            &descriptor,
+            ctx.chain_state.network,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?;
+
+        let mut hashes = Vec::new();
+        for _ in 0..nblocks {
+            let block = crate::mining::miner::build_solved_block(
+                &ctx.chain_state,
+                &ctx.mempool,
+                coinbase_script.clone(),
+                Vec::new(),
+            )
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+            let acceptance = ctx.chain_state.accept_block(&block)
+                .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+            if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
+                ctx.mempool.remove_for_block(&block, height);
+            }
+            hashes.push(block.block_hash().to_string());
+        }
+
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(hashes))
+    })?;
+
+    module.register_method("generateblock", |params, ctx, _extensions| {
+        // Serialize generateblock calls. Core holds cs_main during
+        // block construction, which has the same effect. Without this,
+        // concurrent callers race to build on the same tip and most
+        // produce stale blocks.
+        static GENERATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GENERATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut seq = params.sequence();
+        let output: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let raw_txs: Vec<serde_json::Value> = seq
+            .optional_next()
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let submit: bool = seq.optional_next().unwrap_or(None).unwrap_or(true);
+
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
             return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: submit=false is not supported by satd; \
-                 a generated block is always submitted",
-                None::<()>,
+                -1, "generateblock is only available in regtest mode", None::<()>,
             ));
         }
-        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+
+        // Parse the output as a descriptor first, then fall back to address.
+        let coinbase_script = crate::rpc::descriptor::descriptor_to_coinbase_script(
+            &output,
+            ctx.chain_state.network,
+        )
+        .or_else(|_| {
+            let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output
+                .parse()
+                .map_err(|e| (-5i32, format!("Invalid address or descriptor: {e}")))?;
+            let addr = addr
+                .require_network(ctx.chain_state.network)
+                .map_err(|e| (-5i32, format!("Invalid address or descriptor: {e}")))?;
+            Ok::<_, (i32, String)>(addr.script_pubkey())
+        })
+        .map_err(|(code, msg)| {
+            ErrorObjectOwned::owned(code, format!("Invalid address or descriptor: {msg}"), None::<()>)
+        })?;
+
+        // Resolve the transactions list: each entry is either a txid
+        // (look up in mempool) or a raw hex transaction (decode it).
+        let mut explicit_txs = Vec::new();
+        for item in &raw_txs {
+            let hex = item.as_str().ok_or_else(|| {
+                ErrorObjectOwned::owned(-1, "transaction must be a string", None::<()>)
+            })?;
+
+            // If it looks like a 64-char hex txid, look it up in the mempool.
+            if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let txid: bitcoin::Txid = hex.parse().map_err(|_| {
+                    ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>)
+                })?;
+                let tx = ctx.mempool.get(&txid).map(|e| e.tx).ok_or_else(|| {
+                    ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>)
+                })?;
+                explicit_txs.push(tx);
+            } else {
+                // Try to decode as raw hex transaction.
+                let bytes = hex::decode(hex).map_err(|_| {
+                    ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>)
+                })?;
+                let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&bytes)
+                    .map_err(|_| {
+                        ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>)
+                    })?;
+                explicit_txs.push(tx);
+            }
+        }
+
+        // Build and solve the block.
+        let block = crate::mining::miner::build_solved_block(
+            &ctx.chain_state,
+            &ctx.mempool,
+            coinbase_script,
+            explicit_txs,
+        )
+        .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        if submit {
+            // Submit the block to the chain.
+            let acceptance = ctx.chain_state.accept_block(&block)
+                .map_err(|e| ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>))?;
+            if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
+                ctx.mempool.remove_for_block(&block, height);
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                "hash": block.block_hash().to_string()
+            }))
+        } else {
+            let hex = hex::encode(bitcoin::consensus::serialize(&block));
+            Ok(serde_json::json!({
+                "hash": block.block_hash().to_string(),
+                "hex": hex
+            }))
+        }
     })?;
 
     module.register_method("getblocktemplate", |_params, ctx, _extensions| {
@@ -1648,18 +1752,40 @@ pub async fn start(
 
     // --- Control RPCs ---
 
-    module.register_method("help", |_params, _ctx, _extensions| {
+    // `generate` is a hidden command that tells the caller to use `-generate`
+    // instead. Registered so it returns the right error, but NOT in the help
+    // listing (matches Core's behavior: hidden command).
+    module.register_method("generate", |_params, _ctx, _extensions| {
+        Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
+            -32601,
+            "generate\n\nhas been replaced by the -generate cli option. \
+             Refer to -help for more information.\n",
+            None::<()>,
+        ))
+    })?;
+
+    module.register_method("help", |params, _ctx, _extensions| {
+        // Check if a specific command was requested.
+        let cmd: Option<String> = params.sequence().optional_next().unwrap_or(None);
+        if cmd.as_deref() == Some("generate") {
+            return Ok::<_, ErrorObjectOwned>(serde_json::json!(
+                "generate\n\nhas been replaced by the -generate cli option. \
+                 Refer to -help for more information.\n"
+            ));
+        }
         let methods = vec![
             "addnode",
             "clearbanned",
             "decoderawtransaction",
             "decodescript",
+            "deriveaddresses",
             "disconnectnode",
             "dumptxoutset",
             "estimatefees",
             "estimatesmartfee",
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "getaddednodeinfo",
             "getbestblockhash",
             "getblock",
@@ -1674,6 +1800,7 @@ pub async fn start(
             "getchaintxstats",
             "getconfig",
             "getconnectioncount",
+            "getdescriptorinfo",
             "getdifficulty",
             "getibdprogress",
             "getmempoolancestors",
@@ -2122,6 +2249,46 @@ pub async fn start(
             .one()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         Ok::<_, ErrorObjectOwned>(util::validate_address(&address))
+    })?;
+
+    module.register_method("getdescriptorinfo", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let descriptor: String = seq.next().map_err(|e| {
+            let msg = e.to_string();
+            // Core returns -3 for type errors, -1 for missing params.
+            if msg.contains("not of expected type") || msg.contains("invalid type") {
+                ErrorObjectOwned::owned(
+                    -3,
+                    "JSON value of type number is not of expected type string",
+                    None::<()>,
+                )
+            } else {
+                ErrorObjectOwned::owned(
+                    -1,
+                    "getdescriptorinfo \"descriptor\"\n\n\
+                     Analyses a descriptor.\n\n\
+                     Arguments:\n\
+                     1. descriptor    (string, required) The descriptor.\n",
+                    None::<()>,
+                )
+            }
+        })?;
+        crate::rpc::descriptor::get_descriptor_info(&descriptor)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("deriveaddresses", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let range: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        crate::rpc::descriptor::derive_addresses(
+            &descriptor,
+            range.as_ref(),
+            ctx.chain_state.network,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     // --- Long-polling RPCs ---

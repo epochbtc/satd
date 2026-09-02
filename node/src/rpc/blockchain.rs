@@ -309,11 +309,12 @@ pub fn get_block(
             .txdata
             .iter()
             .map(|tx| {
-                crate::rpc::rawtx::decode_transaction_verbose(
+                crate::rpc::rawtx::decode_transaction_verbose_with_network(
                     tx,
                     Some(&block_hash_str),
                     Some(entry.height),
                     Some(confirmations),
+                    chain_state.network,
                 )
             })
             .collect();

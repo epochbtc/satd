@@ -21,6 +21,7 @@
 //! `require_checksum=false`) but verified when present, and always
 //! appended on output.
 
+use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::{Network, ScriptBuf, address::Address, opcodes::all as opcodes};
 
 /// Core's `INPUT_CHARSET`. Position in this string is a symbol's value;
@@ -265,6 +266,1056 @@ pub fn parse_descriptor(desc: &str, network: Network) -> Result<ScriptBuf, Strin
         "'{expr}' is not a valid descriptor function; \
          satd's scantxoutset supports raw(<hex script>) and addr(<address>)"
     ))
+}
+
+// ============================================================
+// Rich descriptor parsing — key-based descriptors + derivation
+// ============================================================
+//
+// The `parse_descriptor` above handles `raw()` and `addr()` for
+// scantxoutset. This section adds full key-based descriptor parsing
+// for `getdescriptorinfo`, `deriveaddresses`, and `generateblock`'s
+// `combo()` / `pkh()` / etc. support.
+
+/// Key origin info: `[fingerprint/path]`.
+#[derive(Clone, Debug)]
+struct KeyOrigin {
+    fingerprint: [u8; 4],
+    path: Vec<ChildNumber>,
+}
+
+/// An element in the derivation path following an extended key.
+#[derive(Clone, Debug)]
+enum DescPathElem {
+    /// A single child number.
+    Child(ChildNumber),
+    /// Wildcard `*` or `*h`.
+    Wildcard { hardened: bool },
+    /// Multipath element `<a;b;...>`.
+    Multipath(Vec<ChildNumber>),
+}
+
+/// The kind of key in a descriptor expression.
+#[derive(Clone, Debug)]
+enum DescKeyKind {
+    /// Hex-encoded public key (compressed or uncompressed).
+    Pubkey(bitcoin::PublicKey),
+    /// WIF-encoded private key.
+    PrivKey(bitcoin::PrivateKey),
+    /// Extended public key (xpub/tpub).
+    ExtPub(Xpub),
+    /// Extended private key (xprv/tprv).
+    ExtPriv(Xpriv),
+}
+
+/// A parsed key expression with optional origin and derivation path.
+#[derive(Clone, Debug)]
+struct DescKeyExpr {
+    origin: Option<KeyOrigin>,
+    key: DescKeyKind,
+    path: Vec<DescPathElem>,
+}
+
+/// A fully parsed output descriptor.
+#[derive(Clone, Debug)]
+enum FullDescriptor {
+    Pk(DescKeyExpr),
+    Pkh(DescKeyExpr),
+    Wpkh(DescKeyExpr),
+    Sh(Box<FullDescriptor>),
+    Wsh(Box<FullDescriptor>),
+    Combo(DescKeyExpr),
+    Multi {
+        threshold: u32,
+        keys: Vec<DescKeyExpr>,
+        sorted: bool,
+    },
+    Addr(bitcoin::Address),
+    Raw(ScriptBuf),
+}
+
+/// Result of parsing a descriptor string with full support.
+pub struct ParsedDescriptorSet {
+    /// The expanded descriptors (one per multipath branch, or just one).
+    descriptors: Vec<FullDescriptor>,
+    /// Whether any key in the original input was private.
+    pub has_private_keys: bool,
+    /// The payload (before `#`) of the input, for checksum computation.
+    pub input_payload: String,
+}
+
+// --- Key expression parsing ---
+
+/// Parse a child-number step like `0`, `1h`, `2'`, `44h`.
+fn parse_child_num(s: &str) -> Result<ChildNumber, String> {
+    let (num_str, hardened) = if let Some(n) = s.strip_suffix('h').or_else(|| s.strip_suffix('\'')) {
+        (n, true)
+    } else {
+        (s, false)
+    };
+    let num: u32 = num_str.parse().map_err(|_| format!("'{s}' is not a valid key path step"))?;
+    if hardened {
+        ChildNumber::from_hardened_idx(num)
+            .map_err(|_| format!("Key path value {num} is out of range"))
+    } else {
+        ChildNumber::from_normal_idx(num)
+            .map_err(|_| format!("Key path value {num} is out of range"))
+    }
+}
+
+/// Parse a key origin `[fingerprint/step/step/...]` from the start of `expr`.
+/// Returns `(origin, remaining)`.
+fn parse_origin(expr: &str) -> Result<(Option<KeyOrigin>, &str), String> {
+    let Some(rest) = expr.strip_prefix('[') else {
+        return Ok((None, expr));
+    };
+    let close = rest.find(']').ok_or("Key origin not closed with ']'")?;
+    let inside = &rest[..close];
+    let after = &rest[close + 1..];
+
+    let mut parts = inside.split('/');
+    let fp_str = parts.next().ok_or("Key origin missing fingerprint")?;
+    if fp_str.len() != 8 {
+        return Err(format!(
+            "Fingerprint must be 4 bytes (8 hex chars), got {} chars",
+            fp_str.len()
+        ));
+    }
+    let fp_bytes = hex::decode(fp_str).map_err(|_| "Fingerprint is not valid hex")?;
+    let mut fingerprint = [0u8; 4];
+    fingerprint.copy_from_slice(&fp_bytes);
+
+    let mut path = Vec::new();
+    for step in parts {
+        path.push(parse_child_num(step)?);
+    }
+
+    Ok((Some(KeyOrigin { fingerprint, path }), after))
+}
+
+/// Parse a derivation path element after the key. Handles `num`, `numh`,
+/// `num'`, `*`, `*h`, `*'`, `<a;b;...>`.
+fn parse_path_elem(s: &str) -> Result<DescPathElem, String> {
+    if s == "*" {
+        return Ok(DescPathElem::Wildcard { hardened: false });
+    }
+    if s == "*h" || s == "*'" {
+        return Ok(DescPathElem::Wildcard { hardened: true });
+    }
+    if let Some(inner) = s.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
+        let branches: Result<Vec<ChildNumber>, String> =
+            inner.split(';').map(parse_child_num).collect();
+        return Ok(DescPathElem::Multipath(branches?));
+    }
+    Ok(DescPathElem::Child(parse_child_num(s)?))
+}
+
+/// Parse a key expression: `[origin]key[/path...]`.
+///
+/// `ctx` is the descriptor function name for error messages, e.g.
+/// `"pk()"` or `"Multi:"`.
+fn parse_key_expr(expr: &str, ctx: &str) -> Result<DescKeyExpr, String> {
+    // Check for whitespace.
+    if expr.starts_with(' ') || expr.starts_with('\t')
+        || expr.ends_with(' ') || expr.ends_with('\t')
+    {
+        return Err(format!(
+            "{ctx} Key '{expr}' is invalid due to whitespace"
+        ));
+    }
+
+    let (origin, rest) = parse_origin(expr)?;
+
+    // Split on '/' to separate the key from derivation path steps.
+    let mut slash_parts: Vec<&str> = rest.split('/').collect();
+
+    // The first element is the key itself.
+    let key_str = slash_parts.remove(0);
+
+    // Try to parse the key.
+    let key = if key_str.starts_with("xpub")
+        || key_str.starts_with("tpub")
+        || key_str.starts_with("ypub")
+        || key_str.starts_with("zpub")
+    {
+        let xpub: Xpub = key_str
+            .parse()
+            .map_err(|e| format!("{ctx} Extended public key is invalid: {e}"))?;
+        DescKeyKind::ExtPub(xpub)
+    } else if key_str.starts_with("xprv")
+        || key_str.starts_with("tprv")
+        || key_str.starts_with("yprv")
+        || key_str.starts_with("zprv")
+    {
+        let xpriv: Xpriv = key_str
+            .parse()
+            .map_err(|e| format!("{ctx} Extended private key is invalid: {e}"))?;
+        DescKeyKind::ExtPriv(xpriv)
+    } else if key_str.chars().all(|c| c.is_ascii_hexdigit())
+        && (key_str.len() == 66 || key_str.len() == 130)
+    {
+        // Hex public key.
+        let bytes = hex::decode(key_str).map_err(|_| format!("{ctx} Public key hex is invalid"))?;
+        let pubkey = bitcoin::PublicKey::from_slice(&bytes)
+            .map_err(|e| format!("{ctx} Public key is invalid: {e}"))?;
+        DescKeyKind::Pubkey(pubkey)
+    } else {
+        // Try WIF private key.
+        let privkey = bitcoin::PrivateKey::from_wif(key_str)
+            .map_err(|_| format!("{ctx} Key '{key_str}' is not valid"))?;
+        DescKeyKind::PrivKey(privkey)
+    };
+
+    // Parse derivation path elements.
+    let mut path = Vec::new();
+    for step in slash_parts {
+        if step.is_empty() {
+            continue;
+        }
+        path.push(parse_path_elem(step)?);
+    }
+
+    // Hex pubkeys and WIF keys cannot have derivation paths.
+    if !path.is_empty() {
+        match &key {
+            DescKeyKind::Pubkey(_) | DescKeyKind::PrivKey(_) => {
+                return Err(format!(
+                    "{ctx} Non-extended key cannot have a derivation path"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(DescKeyExpr { origin, key, path })
+}
+
+// --- Descriptor parsing ---
+
+/// Split on commas at the top nesting level (respecting parentheses).
+fn split_top_level_commas(expr: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, ch) in expr.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(&expr[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(&expr[start..]);
+    result
+}
+
+/// Find the matching close paren for a function call, handling nesting.
+/// Returns `(inner, rest_after_close_paren)` where rest_after_close_paren
+/// should be empty for a well-formed descriptor.
+fn func_inner<'a>(name: &str, expr: &'a str) -> Option<&'a str> {
+    let rest = expr.strip_prefix(name)?.strip_prefix('(')?;
+    // Find the matching close paren (the last one, since the outermost
+    // function's close paren is always the last character).
+    rest.strip_suffix(')')
+}
+
+/// Parse a full descriptor expression (recursive for sh/wsh).
+fn parse_descriptor_expr(expr: &str) -> Result<FullDescriptor, String> {
+    if expr.is_empty() {
+        return Err("'' is not a valid descriptor function".to_string());
+    }
+
+    // raw() and addr()
+    if let Some(inner) = func_inner("raw", expr) {
+        if inner.is_empty() {
+            return Err("Raw script is not hex".to_string());
+        }
+        let bytes = hex::decode(inner).map_err(|_| "Raw script is not hex".to_string())?;
+        return Ok(FullDescriptor::Raw(ScriptBuf::from_bytes(bytes)));
+    }
+
+    if let Some(inner) = func_inner("addr", expr) {
+        let unchecked: Address<bitcoin::address::NetworkUnchecked> = inner
+            .parse()
+            .map_err(|_| "Address is not valid".to_string())?;
+        return Ok(FullDescriptor::Addr(unchecked.assume_checked()));
+    }
+
+    // Single-key descriptors.
+    if let Some(inner) = func_inner("pk", expr) {
+        let key = parse_key_expr(inner, "pk():")?;
+        return Ok(FullDescriptor::Pk(key));
+    }
+    if let Some(inner) = func_inner("pkh", expr) {
+        let key = parse_key_expr(inner, "pkh():")?;
+        return Ok(FullDescriptor::Pkh(key));
+    }
+    if let Some(inner) = func_inner("wpkh", expr) {
+        let key = parse_key_expr(inner, "wpkh():")?;
+        return Ok(FullDescriptor::Wpkh(key));
+    }
+    if let Some(inner) = func_inner("combo", expr) {
+        let key = parse_key_expr(inner, "combo():")?;
+        return Ok(FullDescriptor::Combo(key));
+    }
+
+    // Script wrappers.
+    if let Some(inner) = func_inner("sh", expr) {
+        let inner_desc = parse_descriptor_expr(inner)?;
+        return Ok(FullDescriptor::Sh(Box::new(inner_desc)));
+    }
+    if let Some(inner) = func_inner("wsh", expr) {
+        let inner_desc = parse_descriptor_expr(inner)?;
+        return Ok(FullDescriptor::Wsh(Box::new(inner_desc)));
+    }
+
+    // Multi/sortedmulti.
+    if let Some(inner) = func_inner("multi", expr) {
+        return parse_multi(inner, false);
+    }
+    if let Some(inner) = func_inner("sortedmulti", expr) {
+        return parse_multi(inner, true);
+    }
+
+    // If we get here, identify the function name for the error message.
+    if let Some(paren) = expr.find('(') {
+        let name = &expr[..paren];
+        return Err(format!("'{name}' is not a valid descriptor function"));
+    }
+    Err(format!("'{expr}' is not a valid descriptor function"))
+}
+
+fn parse_multi(inner: &str, sorted: bool) -> Result<FullDescriptor, String> {
+    let parts = split_top_level_commas(inner);
+    if parts.len() < 2 {
+        return Err("Multi: need threshold and at least one key".to_string());
+    }
+    let threshold: u32 = parts[0]
+        .parse()
+        .map_err(|_| "Multi: threshold is not a valid number".to_string())?;
+    let mut keys = Vec::new();
+    for part in &parts[1..] {
+        keys.push(parse_key_expr(part, "Multi:")?);
+    }
+    if threshold == 0 || threshold > keys.len() as u32 {
+        return Err(format!(
+            "Multi: threshold {} is invalid for {} keys",
+            threshold,
+            keys.len()
+        ));
+    }
+    Ok(FullDescriptor::Multi {
+        threshold,
+        keys,
+        sorted,
+    })
+}
+
+// --- Full descriptor parsing entry point ---
+
+/// Parse a descriptor string into a `ParsedDescriptorSet`.
+///
+/// If `require_checksum` is true, a missing checksum is an error
+/// (`deriveaddresses` requires it).
+pub fn parse_full_descriptor(
+    desc: &str,
+    require_checksum: bool,
+) -> Result<ParsedDescriptorSet, String> {
+    // Strip and verify checksum.
+    let mut parts = desc.splitn(3, '#');
+    let payload = parts.next().unwrap_or("");
+    let provided_checksum = parts.next();
+    if parts.next().is_some() {
+        return Err("Multiple '#' symbols".to_string());
+    }
+
+    if require_checksum && provided_checksum.is_none() {
+        return Err("Missing checksum".to_string());
+    }
+
+    if let Some(p) = provided_checksum {
+        if p.len() != 8 {
+            return Err(format!(
+                "Expected 8 character checksum, not {} characters",
+                p.len()
+            ));
+        }
+        let computed =
+            checksum(payload).ok_or_else(|| "Invalid characters in payload".to_string())?;
+        if p != computed {
+            return Err(format!(
+                "Provided checksum '{p}' does not match computed checksum '{computed}'"
+            ));
+        }
+    }
+
+    // Parse the descriptor body.
+    let base = parse_descriptor_expr(payload)?;
+
+    // Check for private keys.
+    let has_private_keys = descriptor_has_private_keys(&base);
+
+    // Expand multipath branches.
+    let descriptors = expand_multipath(base)?;
+
+    Ok(ParsedDescriptorSet {
+        descriptors,
+        has_private_keys,
+        input_payload: payload.to_string(),
+    })
+}
+
+/// Check if any key in a descriptor is private.
+fn descriptor_has_private_keys(desc: &FullDescriptor) -> bool {
+    match desc {
+        FullDescriptor::Pk(k)
+        | FullDescriptor::Pkh(k)
+        | FullDescriptor::Wpkh(k)
+        | FullDescriptor::Combo(k) => key_is_private(k),
+        FullDescriptor::Sh(inner) | FullDescriptor::Wsh(inner) => {
+            descriptor_has_private_keys(inner)
+        }
+        FullDescriptor::Multi { keys, .. } => keys.iter().any(key_is_private),
+        FullDescriptor::Addr(_) | FullDescriptor::Raw(_) => false,
+    }
+}
+
+fn key_is_private(key: &DescKeyExpr) -> bool {
+    matches!(key.key, DescKeyKind::PrivKey(_) | DescKeyKind::ExtPriv(_))
+}
+
+// --- Multipath expansion ---
+
+/// Count the number of multipath branches in a key expression.
+/// Returns 0 if no multipath elements, or the branch count if any.
+fn key_multipath_count(key: &DescKeyExpr) -> usize {
+    for elem in &key.path {
+        if let DescPathElem::Multipath(branches) = elem {
+            return branches.len();
+        }
+    }
+    0
+}
+
+/// Get the multipath branch count for a descriptor, or 0 if none.
+fn descriptor_multipath_count(desc: &FullDescriptor) -> Result<usize, String> {
+    let counts: Vec<usize> = match desc {
+        FullDescriptor::Pk(k)
+        | FullDescriptor::Pkh(k)
+        | FullDescriptor::Wpkh(k)
+        | FullDescriptor::Combo(k) => vec![key_multipath_count(k)],
+        FullDescriptor::Sh(inner) | FullDescriptor::Wsh(inner) => {
+            return descriptor_multipath_count(inner);
+        }
+        FullDescriptor::Multi { keys, .. } => {
+            keys.iter().map(key_multipath_count).collect()
+        }
+        FullDescriptor::Addr(_) | FullDescriptor::Raw(_) => return Ok(0),
+    };
+
+    let nonzero: Vec<usize> = counts.into_iter().filter(|&c| c > 0).collect();
+    if nonzero.is_empty() {
+        return Ok(0);
+    }
+    if !nonzero.windows(2).all(|w| w[0] == w[1]) {
+        return Err("All multipath elements must have the same number of branches".to_string());
+    }
+    Ok(nonzero[0])
+}
+
+/// Replace multipath elements in a key with the i-th branch.
+fn key_select_branch(key: &DescKeyExpr, branch: usize) -> DescKeyExpr {
+    let path = key
+        .path
+        .iter()
+        .map(|elem| match elem {
+            DescPathElem::Multipath(branches) => DescPathElem::Child(branches[branch]),
+            other => other.clone(),
+        })
+        .collect();
+    DescKeyExpr {
+        origin: key.origin.clone(),
+        key: key.key.clone(),
+        path,
+    }
+}
+
+fn descriptor_select_branch(desc: &FullDescriptor, branch: usize) -> FullDescriptor {
+    match desc {
+        FullDescriptor::Pk(k) => FullDescriptor::Pk(key_select_branch(k, branch)),
+        FullDescriptor::Pkh(k) => FullDescriptor::Pkh(key_select_branch(k, branch)),
+        FullDescriptor::Wpkh(k) => FullDescriptor::Wpkh(key_select_branch(k, branch)),
+        FullDescriptor::Combo(k) => FullDescriptor::Combo(key_select_branch(k, branch)),
+        FullDescriptor::Sh(inner) => {
+            FullDescriptor::Sh(Box::new(descriptor_select_branch(inner, branch)))
+        }
+        FullDescriptor::Wsh(inner) => {
+            FullDescriptor::Wsh(Box::new(descriptor_select_branch(inner, branch)))
+        }
+        FullDescriptor::Multi {
+            threshold,
+            keys,
+            sorted,
+        } => FullDescriptor::Multi {
+            threshold: *threshold,
+            keys: keys.iter().map(|k| key_select_branch(k, branch)).collect(),
+            sorted: *sorted,
+        },
+        FullDescriptor::Addr(a) => FullDescriptor::Addr(a.clone()),
+        FullDescriptor::Raw(s) => FullDescriptor::Raw(s.clone()),
+    }
+}
+
+/// Expand multipath elements, producing one descriptor per branch.
+fn expand_multipath(desc: FullDescriptor) -> Result<Vec<FullDescriptor>, String> {
+    let count = descriptor_multipath_count(&desc)?;
+    if count == 0 {
+        return Ok(vec![desc]);
+    }
+    Ok((0..count)
+        .map(|i| descriptor_select_branch(&desc, i))
+        .collect())
+}
+
+// --- Property queries ---
+
+impl FullDescriptor {
+    /// Whether this descriptor is ranged (contains a wildcard `*`).
+    fn is_range(&self) -> bool {
+        match self {
+            FullDescriptor::Pk(k)
+            | FullDescriptor::Pkh(k)
+            | FullDescriptor::Wpkh(k)
+            | FullDescriptor::Combo(k) => key_is_ranged(k),
+            FullDescriptor::Sh(inner) | FullDescriptor::Wsh(inner) => inner.is_range(),
+            FullDescriptor::Multi { keys, .. } => keys.iter().any(key_is_ranged),
+            FullDescriptor::Addr(_) | FullDescriptor::Raw(_) => false,
+        }
+    }
+
+    /// Whether the descriptor has enough info to produce output scripts.
+    /// Key-based descriptors are always solvable (we have the pubkey or
+    /// can derive it). `raw()` and `addr()` are not solvable in Core's
+    /// sense (no signing info), but the tests treat them differently.
+    fn is_solvable(&self) -> bool {
+        match self {
+            FullDescriptor::Pk(_)
+            | FullDescriptor::Pkh(_)
+            | FullDescriptor::Wpkh(_)
+            | FullDescriptor::Combo(_)
+            | FullDescriptor::Multi { .. } => true,
+            FullDescriptor::Sh(inner) | FullDescriptor::Wsh(inner) => inner.is_solvable(),
+            FullDescriptor::Addr(_) | FullDescriptor::Raw(_) => false,
+        }
+    }
+}
+
+fn key_is_ranged(key: &DescKeyExpr) -> bool {
+    key.path
+        .iter()
+        .any(|e| matches!(e, DescPathElem::Wildcard { .. }))
+}
+
+// --- Key derivation ---
+
+/// Derive the concrete public key from a key expression at the given
+/// position (for ranged descriptors). Returns the public key and whether
+/// it is compressed.
+fn derive_pubkey(
+    key: &DescKeyExpr,
+    pos: u32,
+) -> Result<bitcoin::PublicKey, String> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+
+    match &key.key {
+        DescKeyKind::Pubkey(pk) => {
+            // No derivation possible for raw pubkeys.
+            Ok(*pk)
+        }
+        DescKeyKind::PrivKey(pk) => Ok(pk.public_key(&secp)),
+        DescKeyKind::ExtPub(xpub) => {
+            let child_path = resolve_path(&key.path, pos)?;
+            // All path steps must be non-hardened for xpub derivation.
+            for cn in &child_path {
+                if let ChildNumber::Hardened { .. } = cn {
+                    return Err(
+                        "Cannot derive script without private keys".to_string()
+                    );
+                }
+            }
+            let derived = xpub
+                .derive_pub(&secp, &child_path)
+                .map_err(|e| format!("Key derivation failed: {e}"))?;
+            Ok(bitcoin::PublicKey::new(derived.public_key))
+        }
+        DescKeyKind::ExtPriv(xpriv) => {
+            let child_path = resolve_path(&key.path, pos)?;
+            let derived = xpriv
+                .derive_priv(&secp, &child_path)
+                .map_err(|e| format!("Key derivation failed: {e}"))?;
+            let xpub = Xpub::from_priv(&secp, &derived);
+            Ok(bitcoin::PublicKey::new(xpub.public_key))
+        }
+    }
+}
+
+/// Resolve a path with wildcards to concrete child numbers.
+fn resolve_path(path: &[DescPathElem], pos: u32) -> Result<Vec<ChildNumber>, String> {
+    let mut result = Vec::new();
+    for elem in path {
+        match elem {
+            DescPathElem::Child(cn) => result.push(*cn),
+            DescPathElem::Wildcard { hardened } => {
+                if *hardened {
+                    result.push(
+                        ChildNumber::from_hardened_idx(pos)
+                            .map_err(|_| "Position out of range for hardened derivation")?,
+                    );
+                } else {
+                    result.push(
+                        ChildNumber::from_normal_idx(pos)
+                            .map_err(|_| "Position out of range")?,
+                    );
+                }
+            }
+            DescPathElem::Multipath(_) => {
+                return Err(
+                    "Multipath elements should be expanded before derivation".to_string()
+                );
+            }
+        }
+    }
+    Ok(result)
+}
+
+// --- Script generation ---
+
+impl FullDescriptor {
+    /// Expand this descriptor at position `pos` into the output script(s).
+    ///
+    /// For most descriptors this returns one script. For `combo()` it
+    /// returns 2 (uncompressed) or 4 (compressed) scripts in Core's
+    /// order: P2PK, P2PKH, [P2WPKH, P2SH-P2WPKH].
+    #[allow(clippy::only_used_in_recursion)]
+    pub fn expand(
+        &self,
+        pos: u32,
+        network: Network,
+    ) -> Result<Vec<ScriptBuf>, String> {
+        match self {
+            FullDescriptor::Pk(key) => {
+                let pk = derive_pubkey(key, pos)?;
+                Ok(vec![make_p2pk_script(&pk)])
+            }
+            FullDescriptor::Pkh(key) => {
+                let pk = derive_pubkey(key, pos)?;
+                Ok(vec![ScriptBuf::new_p2pkh(&pk.pubkey_hash())])
+            }
+            FullDescriptor::Wpkh(key) => {
+                let pk = derive_pubkey(key, pos)?;
+                let wpkh = pk
+                    .wpubkey_hash()
+                    .map_err(|_| "Cannot create P2WPKH from uncompressed key".to_string())?;
+                Ok(vec![ScriptBuf::new_p2wpkh(&wpkh)])
+            }
+            FullDescriptor::Combo(key) => {
+                let pk = derive_pubkey(key, pos)?;
+                let mut scripts = Vec::new();
+                // P2PK
+                scripts.push(make_p2pk_script(&pk));
+                // P2PKH
+                scripts.push(ScriptBuf::new_p2pkh(&pk.pubkey_hash()));
+                // P2WPKH + P2SH-P2WPKH (compressed only)
+                if pk.compressed {
+                    let wpkh = pk.wpubkey_hash().expect("compressed key has wpubkey_hash");
+                    let p2wpkh = ScriptBuf::new_p2wpkh(&wpkh);
+                    let p2sh_p2wpkh = ScriptBuf::new_p2sh(&p2wpkh.script_hash());
+                    scripts.push(p2wpkh);
+                    scripts.push(p2sh_p2wpkh);
+                }
+                Ok(scripts)
+            }
+            FullDescriptor::Sh(inner) => {
+                let inner_scripts = inner.expand(pos, network)?;
+                if inner_scripts.len() != 1 {
+                    return Err("P2SH inner must produce exactly one script".to_string());
+                }
+                let redeem = &inner_scripts[0];
+                Ok(vec![ScriptBuf::new_p2sh(&redeem.script_hash())])
+            }
+            FullDescriptor::Wsh(inner) => {
+                let inner_scripts = inner.expand(pos, network)?;
+                if inner_scripts.len() != 1 {
+                    return Err("P2WSH inner must produce exactly one script".to_string());
+                }
+                let witness_script = &inner_scripts[0];
+                Ok(vec![ScriptBuf::new_p2wsh(&witness_script.wscript_hash())])
+            }
+            FullDescriptor::Multi {
+                threshold,
+                keys,
+                sorted,
+            } => {
+                let mut pubkeys: Vec<bitcoin::PublicKey> = Vec::new();
+                for k in keys {
+                    pubkeys.push(derive_pubkey(k, pos)?);
+                }
+                if *sorted {
+                    pubkeys.sort_by_key(|a| a.to_bytes());
+                }
+                Ok(vec![make_multisig_script(*threshold, &pubkeys)])
+            }
+            FullDescriptor::Addr(a) => Ok(vec![a.script_pubkey()]),
+            FullDescriptor::Raw(s) => Ok(vec![s.clone()]),
+        }
+    }
+}
+
+/// Build a P2PK script: `<push key> OP_CHECKSIG`.
+fn make_p2pk_script(pubkey: &bitcoin::PublicKey) -> ScriptBuf {
+    bitcoin::blockdata::script::Builder::new()
+        .push_key(pubkey)
+        .push_opcode(opcodes::OP_CHECKSIG)
+        .into_script()
+}
+
+/// Build a bare multisig script: `OP_m <key1>...<keyn> OP_n OP_CHECKMULTISIG`.
+fn make_multisig_script(threshold: u32, keys: &[bitcoin::PublicKey]) -> ScriptBuf {
+    let mut builder = bitcoin::blockdata::script::Builder::new()
+        .push_int(threshold as i64);
+    for key in keys {
+        builder = builder.push_key(key);
+    }
+    builder
+        .push_int(keys.len() as i64)
+        .push_opcode(opcodes::OP_CHECKMULTISIG)
+        .into_script()
+}
+
+// --- Canonical string output ---
+
+impl DescKeyExpr {
+    /// Convert this key expression to its canonical public string form.
+    fn to_public_string(&self) -> String {
+        let mut out = String::new();
+        if let Some(origin) = &self.origin {
+            out.push('[');
+            out.push_str(&hex::encode(origin.fingerprint));
+            for cn in &origin.path {
+                out.push('/');
+                out.push_str(&child_number_to_string(*cn));
+            }
+            out.push(']');
+        }
+
+        match &self.key {
+            DescKeyKind::Pubkey(pk) => {
+                out.push_str(&pk.to_string());
+            }
+            DescKeyKind::PrivKey(pk) => {
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let pubkey = pk.public_key(&secp);
+                out.push_str(&pubkey.to_string());
+            }
+            DescKeyKind::ExtPub(xpub) => {
+                out.push_str(&xpub.to_string());
+            }
+            DescKeyKind::ExtPriv(xpriv) => {
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let xpub = Xpub::from_priv(&secp, xpriv);
+                out.push_str(&xpub.to_string());
+            }
+        }
+
+        for elem in &self.path {
+            out.push('/');
+            match elem {
+                DescPathElem::Child(cn) => out.push_str(&child_number_to_string(*cn)),
+                DescPathElem::Wildcard { hardened } => {
+                    out.push('*');
+                    if *hardened {
+                        out.push('h');
+                    }
+                }
+                DescPathElem::Multipath(branches) => {
+                    out.push('<');
+                    for (i, cn) in branches.iter().enumerate() {
+                        if i > 0 {
+                            out.push(';');
+                        }
+                        out.push_str(&child_number_to_string(*cn));
+                    }
+                    out.push('>');
+                }
+            }
+        }
+
+        out
+    }
+}
+
+fn child_number_to_string(cn: ChildNumber) -> String {
+    match cn {
+        ChildNumber::Normal { index } => index.to_string(),
+        ChildNumber::Hardened { index } => format!("{index}h"),
+    }
+}
+
+impl FullDescriptor {
+    /// Convert to canonical public string form (without checksum).
+    fn to_public_payload(&self) -> String {
+        match self {
+            FullDescriptor::Pk(k) => format!("pk({})", k.to_public_string()),
+            FullDescriptor::Pkh(k) => format!("pkh({})", k.to_public_string()),
+            FullDescriptor::Wpkh(k) => format!("wpkh({})", k.to_public_string()),
+            FullDescriptor::Combo(k) => format!("combo({})", k.to_public_string()),
+            FullDescriptor::Sh(inner) => format!("sh({})", inner.to_public_payload()),
+            FullDescriptor::Wsh(inner) => format!("wsh({})", inner.to_public_payload()),
+            FullDescriptor::Multi {
+                threshold,
+                keys,
+                sorted,
+            } => {
+                let name = if *sorted { "sortedmulti" } else { "multi" };
+                let key_strs: Vec<String> =
+                    keys.iter().map(|k| k.to_public_string()).collect();
+                format!("{name}({threshold},{})", key_strs.join(","))
+            }
+            FullDescriptor::Addr(a) => format!("addr({a})"),
+            FullDescriptor::Raw(s) => format!("raw({})", hex::encode(s.as_bytes())),
+        }
+    }
+
+    /// Convert to canonical public string form with checksum.
+    pub fn to_public_string(&self) -> String {
+        add_checksum(&self.to_public_payload())
+    }
+}
+
+// --- Script selection for generateblock (Core's getScriptFromDescriptor) ---
+
+/// Given a descriptor, produce the single coinbase output script for
+/// `generateblock`. For combo() descriptors, selects P2WPKH for
+/// compressed keys and P2PKH for uncompressed, matching Core's
+/// `getScriptFromDescriptor`.
+pub fn descriptor_to_coinbase_script(
+    desc: &str,
+    network: Network,
+) -> Result<ScriptBuf, (i32, String)> {
+    let parsed = parse_full_descriptor(desc, false)
+        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+
+    if parsed.descriptors.len() > 1 {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            "Multipath descriptor not accepted".to_string(),
+        ));
+    }
+
+    let descriptor = &parsed.descriptors[0];
+
+    if descriptor.is_range() {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
+                .to_string(),
+        ));
+    }
+
+    let scripts = descriptor
+        .expand(0, network)
+        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+
+    // Core's getScriptFromDescriptor logic for combo().
+    let script = match scripts.len() {
+        1 => scripts.into_iter().next().unwrap(),
+        4 => {
+            // Compressed combo: P2PK, P2PKH, P2WPKH, P2SH-P2WPKH.
+            // Take P2WPKH (index 2).
+            scripts.into_iter().nth(2).unwrap()
+        }
+        2 => {
+            // Uncompressed combo: P2PK, P2PKH.
+            // Take P2PKH (index 1).
+            scripts.into_iter().nth(1).unwrap()
+        }
+        n => {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                format!("Unexpected number of scripts from descriptor: {n}"),
+            ));
+        }
+    };
+
+    Ok(script)
+}
+
+// --- RPC handler helpers ---
+
+/// Implements `getdescriptorinfo`.
+pub fn get_descriptor_info(descriptor: &str) -> Result<serde_json::Value, (i32, String)> {
+    let parsed = parse_full_descriptor(descriptor, false)
+        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+
+    let primary = &parsed.descriptors[0];
+
+    let mut result = serde_json::Map::new();
+
+    // Canonical public descriptor with checksum.
+    result.insert(
+        "descriptor".to_string(),
+        serde_json::Value::String(primary.to_public_string()),
+    );
+
+    // Multipath expansion.
+    if parsed.descriptors.len() > 1 {
+        let expansions: Vec<serde_json::Value> = parsed
+            .descriptors
+            .iter()
+            .map(|d| serde_json::Value::String(d.to_public_string()))
+            .collect();
+        result.insert(
+            "multipath_expansion".to_string(),
+            serde_json::Value::Array(expansions),
+        );
+    }
+
+    // Checksum of the input payload.
+    let cksum = checksum(&parsed.input_payload)
+        .ok_or_else(|| (RPC_INVALID_ADDRESS_OR_KEY, "Invalid characters in payload".to_string()))?;
+    result.insert(
+        "checksum".to_string(),
+        serde_json::Value::String(cksum),
+    );
+
+    result.insert(
+        "isrange".to_string(),
+        serde_json::Value::Bool(primary.is_range()),
+    );
+    result.insert(
+        "issolvable".to_string(),
+        serde_json::Value::Bool(primary.is_solvable()),
+    );
+    result.insert(
+        "hasprivatekeys".to_string(),
+        serde_json::Value::Bool(parsed.has_private_keys),
+    );
+
+    Ok(serde_json::Value::Object(result))
+}
+
+/// Implements `deriveaddresses`.
+pub fn derive_addresses(
+    descriptor: &str,
+    range: Option<&serde_json::Value>,
+    network: Network,
+) -> Result<serde_json::Value, (i32, String)> {
+    let parsed = parse_full_descriptor(descriptor, true)
+        .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+
+    let primary = &parsed.descriptors[0];
+
+    // Parse range.
+    let (range_begin, range_end) = if let Some(r) = range {
+        parse_derive_range(r)?
+    } else {
+        (0i64, 0i64)
+    };
+
+    // Check range vs ranged descriptor.
+    if !primary.is_range() && range.is_some() {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            "Range should not be specified for an un-ranged descriptor".to_string(),
+        ));
+    }
+    if primary.is_range() && range.is_none() {
+        return Err((
+            RPC_INVALID_PARAMETER,
+            "Range must be specified for a ranged descriptor".to_string(),
+        ));
+    }
+
+    // Derive addresses for the primary descriptor.
+    let derive_one = |desc: &FullDescriptor| -> Result<serde_json::Value, (i32, String)> {
+        let mut addresses = Vec::new();
+        for i in range_begin..=range_end {
+            let scripts = desc
+                .expand(i as u32, network)
+                .map_err(|e| (RPC_INVALID_ADDRESS_OR_KEY, e))?;
+
+            for script in &scripts {
+                // Skip P2PK in combo descriptors (no address).
+                if scripts.len() > 1 && p2pk_key(script).is_some() {
+                    continue;
+                }
+                let addr = Address::from_script(script, network).map_err(|_| {
+                    (
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Descriptor does not have a corresponding address".to_string(),
+                    )
+                })?;
+                addresses.push(serde_json::Value::String(addr.to_string()));
+            }
+        }
+
+        if addresses.is_empty() {
+            return Err((-1, "Unexpected empty result".to_string()));
+        }
+
+        Ok(serde_json::Value::Array(addresses))
+    };
+
+    if parsed.descriptors.len() == 1 {
+        derive_one(primary)
+    } else {
+        // Multipath: return array of arrays.
+        let mut result = Vec::new();
+        for desc in &parsed.descriptors {
+            result.push(derive_one(desc)?);
+        }
+        Ok(serde_json::Value::Array(result))
+    }
+}
+
+/// Parse the `range` argument for `deriveaddresses`.
+fn parse_derive_range(value: &serde_json::Value) -> Result<(i64, i64), (i32, String)> {
+    let invalid = |m: &str| (RPC_INVALID_PARAMETER, m.to_string());
+
+    let (low, high) = match value {
+        serde_json::Value::Number(n) => {
+            let high = n
+                .as_i64()
+                .ok_or_else(|| invalid("Range must be specified as end or as [begin,end]"))?;
+            (0i64, high)
+        }
+        serde_json::Value::Array(a) if a.len() == 2 && a.iter().all(|v| v.is_number()) => {
+            let low = a[0].as_i64().unwrap_or(i64::MIN);
+            let high = a[1].as_i64().unwrap_or(i64::MAX);
+            if low > high {
+                return Err(invalid(
+                    "Range specified as [begin,end] must not have begin after end",
+                ));
+            }
+            (low, high)
+        }
+        _ => return Err(invalid("Range must be specified as end or as [begin,end]")),
+    };
+
+    if low < 0 {
+        return Err(invalid("Range should be greater or equal than 0"));
+    }
+    if (high >> 31) != 0 {
+        return Err(invalid("End of range is too high"));
+    }
+    if high >= low.saturating_add(1_000_000) {
+        return Err(invalid("Range is too large"));
+    }
+
+    Ok((low, high))
 }
 
 /// Core's `CPubKey::IsValidNonHybrid` composed with the length check
