@@ -2693,6 +2693,164 @@ impl Mempool {
         }
     }
 
+    /// Remove mempool transactions invalidated by a chain reorganization.
+    ///
+    /// Mirrors Bitcoin Core's `removeForReorg`: after the active chain
+    /// changes, some previously-valid mempool transactions may have become
+    /// invalid because their locktime is no longer satisfied (MTP moved
+    /// backwards), they spend an immature coinbase (tip height decreased),
+    /// or their BIP 68 sequence locks are no longer met. This function
+    /// evicts those transactions and their in-mempool descendants.
+    ///
+    /// Called during reorg reconciliation after `remove_for_block` has
+    /// already evicted confirmations and conflicts from the reconnected
+    /// blocks, and after disconnected-block transactions have been
+    /// re-offered to the mempool.
+    pub fn remove_for_reorg(&self, chain_state: &ChainState) {
+        let tip_height = chain_state.tip_height();
+        let next_height = tip_height + 1;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
+        let mut directly_invalid: Vec<Txid> = Vec::new();
+        let mut all_to_remove: HashSet<Txid> = HashSet::new();
+        let mut evicted: Vec<Txid> = Vec::new();
+
+        {
+            let mut inner = self.inner.write();
+
+            // Pass 1: identify directly invalid transactions.
+            for (txid, entry) in &inner.entries {
+                let tx = &entry.tx;
+
+                // (a) Locktime finality (Core: CheckFinalTxAtTip).
+                let locktime = tx.lock_time.to_consensus_u32();
+                if locktime > 0
+                    && !tx
+                        .input
+                        .iter()
+                        .all(|i| i.sequence == bitcoin::Sequence::MAX)
+                {
+                    let cutoff = if locktime < 500_000_000 {
+                        next_height
+                    } else {
+                        tip_mtp
+                    };
+                    if locktime >= cutoff {
+                        directly_invalid.push(*txid);
+                        continue;
+                    }
+                }
+
+                let bip68_enforced = (tx.version.0 as u32) >= 2;
+                let mut invalid = false;
+
+                for input in &tx.input {
+                    // Inputs referencing mempool parents inherit validity
+                    // from the parent — cascade-removal handles them.
+                    if inner.entries.contains_key(&input.previous_output.txid) {
+                        // BIP 68 against a mempool parent: the unconfirmed
+                        // parent is treated as confirming at next_height
+                        // (matching accept_transaction's convention).
+                        if bip68_enforced
+                            && !Self::bip68_satisfied(
+                                chain_state,
+                                input.sequence.0,
+                                next_height,
+                                next_height,
+                                tip_mtp,
+                            )
+                        {
+                            invalid = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Input from chain state.
+                    if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                        // (b) Coinbase maturity.
+                        if coin.coinbase
+                            && next_height.saturating_sub(coin.height) < COINBASE_MATURITY
+                        {
+                            invalid = true;
+                            break;
+                        }
+                        // (c) BIP 68 sequence locks.
+                        if bip68_enforced
+                            && !Self::bip68_satisfied(
+                                chain_state,
+                                input.sequence.0,
+                                coin.height,
+                                next_height,
+                                tip_mtp,
+                            )
+                        {
+                            invalid = true;
+                            break;
+                        }
+                    } else {
+                        // UTXO not found and not a mempool parent — the
+                        // input no longer exists after the reorg.
+                        invalid = true;
+                        break;
+                    }
+                }
+
+                if invalid {
+                    directly_invalid.push(*txid);
+                }
+            }
+
+            // Pass 2: walk descendants of each directly-invalid tx so
+            // the whole subgraph is removed atomically.
+            for txid in &directly_invalid {
+                all_to_remove.insert(*txid);
+                let mut queue = vec![*txid];
+                let mut buf: Vec<Txid> = Vec::new();
+                while let Some(current) = queue.pop() {
+                    buf.clear();
+                    Self::collect_children(&inner, &current, &mut buf);
+                    for &child in &buf {
+                        if inner.entries.contains_key(&child) && all_to_remove.insert(child) {
+                            queue.push(child);
+                        }
+                    }
+                }
+            }
+
+            // Pass 3: remove.
+            for txid in &all_to_remove {
+                if let Some(entry) = inner.entries.remove(txid) {
+                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.account_remove(entry.scope, tx_size);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    inner.unbroadcast.remove(txid);
+                    if entry.scope.is_acting() {
+                        evicted.push(*txid);
+                    }
+                }
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+
+        // Emit events outside the lock.
+        for txid in &evicted {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::Reorg,
+            });
+        }
+
+        if !all_to_remove.is_empty() {
+            tracing::info!(
+                count = all_to_remove.len(),
+                "Removed invalid transactions after reorg"
+            );
+        }
+    }
+
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().entries.get(txid).cloned()
