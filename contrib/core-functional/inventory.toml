@@ -610,8 +610,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "p2p_disconnect_ban.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "p2p_dns_seeds.py"

@@ -1520,13 +1520,22 @@ impl PeerManager {
         peers.clear();
     }
 
-    /// Get info about all connected peers.
+    /// Get info about all connected peers, sorted by id (ascending).
+    ///
+    /// Bitcoin Core's `getpeerinfo` returns entries sorted by `CNode::GetId()`,
+    /// and the Core functional test suite relies on that: `getpeerinfo()[0]` is
+    /// the first-connected (lowest-id) peer.  A `HashMap` iteration gives no
+    /// ordering guarantee, so we must sort explicitly.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
-        peers
-            .values()
-            .filter(|h| h.info.state == PeerState::Connected)
-            .map(|h| h.info.to_rpc_json(&h.stats))
+        let mut entries: Vec<_> = peers
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected)
+            .collect();
+        entries.sort_by_key(|(id, _)| **id);
+        entries
+            .into_iter()
+            .map(|(_, h)| h.info.to_rpc_json(&h.stats))
             .collect()
     }
 
