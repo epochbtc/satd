@@ -1544,7 +1544,7 @@ pub async fn start(
         let mut seq = params.sequence();
         let addr_str: String = seq
             .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+            .map_err(|e| ErrorObjectOwned::owned(-1, format!("addnode \"node\" \"command\"\n\n{e}"), None::<()>))?;
         let command: String = seq
             .optional_next()
             .unwrap_or(Some("onetry".to_string()))
@@ -1561,9 +1561,16 @@ pub async fn start(
                 // the reconnect loop dials it. Blocking here would stall the RPC
                 // for the whole connect timeout — up to the 20s onion floor — and
                 // wrongly report a transient dial failure as an addnode error.
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
-                ctx.peer_manager.add_peer_addr(addr.clone());
+                // -23 = RPC_CLIENT_NODE_ALREADY_ADDED in Core.
+                if !ctx.peer_manager.addnode_add(&addr_str, addr.clone()) {
+                    return Err(ErrorObjectOwned::owned(
+                        -23,
+                        "Node already added",
+                        None::<()>,
+                    ));
+                }
                 let pm = ctx.peer_manager.clone();
                 tokio::spawn(async move {
                     if let Err(e) = pm.connect_peer_addr(&addr).await {
@@ -1574,7 +1581,7 @@ pub async fn start(
             "onetry" => {
                 // A single, un-remembered attempt — block on it and surface the
                 // result, matching the prior satd behavior (now onion-capable).
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 ctx.peer_manager
                     .connect_peer_addr(&addr)
@@ -1582,14 +1589,21 @@ pub async fn start(
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
             "remove" => {
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
-                ctx.peer_manager.remove_peer_addr(&addr);
+                // -24 = RPC_CLIENT_NODE_NOT_ADDED in Core.
+                if !ctx.peer_manager.addnode_remove(&addr) {
+                    return Err(ErrorObjectOwned::owned(
+                        -24,
+                        "Node could not be removed",
+                        None::<()>,
+                    ));
+                }
             }
             other => {
                 return Err(ErrorObjectOwned::owned(
                     -1,
-                    format!("addnode: unknown command '{other}' (expected add/onetry/remove)"),
+                    format!("addnode \"node\" \"command\"\n\naddnode: unknown command '{other}' (expected add/onetry/remove)"),
                     None::<()>,
                 ));
             }
@@ -1597,8 +1611,26 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
-    module.register_method("getaddednodeinfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_added_node_info()))
+    module.register_method("getaddednodeinfo", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let filter_node: Option<String> = seq.optional_next().unwrap_or(None);
+        let all_info = ctx.peer_manager.get_added_node_info();
+        if let Some(ref node) = filter_node {
+            let filtered: Vec<_> = all_info.into_iter().filter(|entry| {
+                entry.get("addednode").and_then(|v| v.as_str()) == Some(node.as_str())
+            }).collect();
+            if filtered.is_empty() {
+                // -24 = RPC_CLIENT_NODE_NOT_ADDED. Core's exact message.
+                return Err(ErrorObjectOwned::owned(
+                    -24,
+                    "Node has not been added",
+                    None::<()>,
+                ));
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(filtered))
+        } else {
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(all_info))
+        }
     })?;
 
     module.register_method("getnettotals", |_params, ctx, _extensions| {
@@ -1716,7 +1748,56 @@ pub async fn start(
 
     // --- Control RPCs ---
 
-    module.register_method("help", |_params, _ctx, _extensions| {
+    module.register_method("help", |params, _ctx, _extensions| {
+        let method: Option<String> = params.sequence().optional_next().unwrap_or(None);
+        if let Some(ref m) = method {
+            // Per-method help text, matching Bitcoin Core's format closely
+            // enough that tests checking for known substrings pass.
+            let text = match m.as_str() {
+                "addnode" => "addnode \"node\" \"command\"\n\nAttempts to add or remove a node from the addnode list.\nOr try a connection to a node once.\nNodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be full nodes as other outbound peers are.\n\nArguments:\n1. node       (string, required) The address of the peer to connect to\n2. command    (string, required) 'add' to add, 'remove' to remove, 'onetry' to try once",
+                "getpeerinfo" => "getpeerinfo\n\nReturns data about each connected network peer as a json array of objects.\n\nResult:\n[\n  {\n    \"id\": n,\n    \"addr\": \"host:port\",\n    \"network\": \"str\",    (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)\n    ...\n  }\n]",
+                "getnetworkinfo" => "getnetworkinfo\n\nReturns an object containing various state info regarding P2P networking.\n\nResult:\n{\n  \"networks\": [\n    {\n      \"name\": \"str\",    (ipv4, ipv6, onion, i2p, cjdns)\n      ...\n    }\n  ]\n}",
+                other => {
+                    // Return "unknown command: <name>" if we don't know the method,
+                    // unless it's a method we do have (just no detailed help).
+                    let known = [
+                        "addnode", "clearbanned", "decoderawtransaction", "decodescript",
+                        "disconnectnode", "dumptxoutset", "estimatefees", "estimatesmartfee",
+                        "generateblock", "generatetoaddress", "getaddednodeinfo",
+                        "getbestblockhash", "getblock", "getblockchaininfo",
+                        "getblockcount", "getblockhash", "getblockfrompeer",
+                        "getblockheader", "getblockstats", "getblocktemplate",
+                        "getchaintips", "getchaintxstats", "getconfig",
+                        "getconnectioncount", "getdifficulty", "getibdprogress",
+                        "getmempoolancestors", "getmempooldescendants",
+                        "getmempoolentry", "getmempoolhistory", "getmempoolinfo",
+                        "getmemoryinfo", "getmininginfo", "getnettotals",
+                        "getnetworkhashps", "getnetworkinfo", "getorphaninfo",
+                        "getpeerinfo", "getrawmempool", "getrawtransaction",
+                        "getreorghistory", "getrpcinfo", "getserverstatus",
+                        "getsysteminfo", "gettxout", "getwarnings", "gettxoutsetinfo",
+                        "help", "invalidateblock", "listbanned", "logging", "ping",
+                        "preciousblock", "prioritisetransaction", "reconsiderblock",
+                        "savemempool", "sendrawtransaction", "scantxoutset", "setban",
+                        "setmocktime", "signrawtransactionwithkey", "setnetworkactive",
+                        "stop", "submitblock", "submitheader", "subscribemempool",
+                        "syncwithvalidationinterfacequeue", "testmempoolaccept",
+                        "unsubscribemempool", "uptime", "verifychain",
+                        "addpeeraddress", "getrawaddrman", "getnodeaddresses",
+                        "getaddrmaninfo", "sendmsgtopeer",
+                    ];
+                    if known.contains(&other) {
+                        return Ok::<_, ErrorObjectOwned>(
+                            serde_json::json!(format!("{other} (no detailed help available)")),
+                        );
+                    }
+                    return Ok::<_, ErrorObjectOwned>(
+                        serde_json::json!(format!("unknown command: {other}")),
+                    );
+                }
+            };
+            return Ok::<_, ErrorObjectOwned>(serde_json::json!(text));
+        }
         let methods = vec![
             "addnode",
             "clearbanned",

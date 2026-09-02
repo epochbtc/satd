@@ -267,6 +267,14 @@ pub struct PeerManager {
     block_refetch: RwLock<HashMap<bitcoin::BlockHash, (PeerId, Instant)>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Addresses that should be tagged as manual (addnode-initiated) when
+    /// they connect. Includes both persistent addnode entries and onetry
+    /// connections. Onetry entries are removed after the connect completes.
+    manual_addrs: RwLock<HashSet<SocketAddr>>,
+    /// User-provided address strings for addnode RPC, paired with the
+    /// resolved address. Stored so `getaddednodeinfo` can return the
+    /// original string the operator typed, matching Core.
+    addnode_entries: RwLock<Vec<(String, PeerAddr)>>,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`). Advertised in `getaddr` responses and used as the
     /// version message's `addr_from`. Set once at startup.
@@ -518,13 +526,15 @@ impl PeerManager {
             peers: RwLock::new(HashMap::new()),
             chain_state: chain_state.clone(),
             mempool: mempool.clone(),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(0),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
+            manual_addrs: RwLock::new(HashSet::new()),
+            addnode_entries: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             whitelist: RwLock::new(Vec::new()),
@@ -678,7 +688,9 @@ impl PeerManager {
                 .network_active
                 .swap(true, std::sync::atomic::Ordering::Relaxed);
             if !was {
-                tracing::info!("networkactive=true: P2P networking resumed");
+                // Core logs "SetNetworkActive: true" — test harness
+                // `assert_debug_log` checks this exact string.
+                tracing::info!("SetNetworkActive: true");
             }
         } else {
             // Flip the flag AND clear peers under the same `peers` write lock
@@ -696,10 +708,12 @@ impl PeerManager {
             if was {
                 let n = peers.len();
                 Self::drop_all_peers(&mut peers);
-                tracing::info!(
-                    disconnected = n,
-                    "networkactive=false: disconnected all peers and paused P2P networking"
-                );
+                // Core logs "SetNetworkActive: false\n" — test harness
+                // `assert_debug_log` checks this exact substring including
+                // the trailing newline, so no structured fields may follow
+                // the message text on this line.
+                tracing::info!("SetNetworkActive: false");
+                tracing::debug!(disconnected = n, "paused P2P networking");
             }
         }
     }
@@ -1028,36 +1042,74 @@ impl PeerManager {
         self.addrman.write().set_group_fn(f);
     }
 
-    /// Register a PeerAddr (socket or .onion) for auto-reconnect. Same
-    /// dedup rationale as `add_connect_addr`.
-    pub fn add_peer_addr(&self, addr: PeerAddr) {
+    /// Register a peer for auto-reconnect. Returns `true` if the address
+    /// was newly added, `false` if it was already in the set (duplicate).
+    pub fn add_peer_addr(&self, addr: PeerAddr) -> bool {
         match &addr {
             PeerAddr::Socket(sa) => {
                 let mut addrs = self.connect_addrs.write();
-                if !addrs.contains(sa) {
-                    addrs.push(*sa);
+                if addrs.contains(sa) {
+                    return false;
                 }
+                addrs.push(*sa);
+                // Also mark as manual so spawn_peer tags it correctly.
+                self.manual_addrs.write().insert(*sa);
+                true
             }
             PeerAddr::Onion { .. } => {
                 let mut addrs = self.connect_peer_addrs.write();
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
+                if addrs.contains(&addr) {
+                    return false;
                 }
+                addrs.push(addr);
+                true
             }
         }
+    }
+
+    /// Register a peer via the addnode RPC, tracking the user-provided
+    /// string for `getaddednodeinfo`. Returns `true` if newly added.
+    pub fn addnode_add(&self, user_str: &str, addr: PeerAddr) -> bool {
+        if !self.add_peer_addr(addr.clone()) {
+            return false;
+        }
+        self.addnode_entries
+            .write()
+            .push((user_str.to_string(), addr));
+        true
+    }
+
+    /// Remove a peer registered via addnode, by resolved address. Returns
+    /// `true` if found and removed.
+    pub fn addnode_remove(&self, addr: &PeerAddr) -> bool {
+        if !self.remove_peer_addr(addr) {
+            return false;
+        }
+        let mut entries = self.addnode_entries.write();
+        if let Some(pos) = entries.iter().position(|(_, a)| a == addr) {
+            entries.remove(pos);
+        }
+        true
     }
 
     /// Drop a PeerAddr from the auto-reconnect set (the inverse of
     /// [`add_peer_addr`]). Used by `addnode <node> remove`. Like Bitcoin Core,
     /// this only stops future reconnect attempts; it does not force-disconnect
-    /// an already-established peer.
-    pub fn remove_peer_addr(&self, addr: &PeerAddr) {
+    /// an already-established peer. Returns `true` if the address was found
+    /// and removed, `false` if it was not in the set.
+    pub fn remove_peer_addr(&self, addr: &PeerAddr) -> bool {
         match addr {
             PeerAddr::Socket(sa) => {
-                self.connect_addrs.write().retain(|a| a != sa);
+                let mut addrs = self.connect_addrs.write();
+                let before = addrs.len();
+                addrs.retain(|a| a != sa);
+                addrs.len() < before
             }
             PeerAddr::Onion { .. } => {
-                self.connect_peer_addrs.write().retain(|a| a != addr);
+                let mut addrs = self.connect_peer_addrs.write();
+                let before = addrs.len();
+                addrs.retain(|a| a != addr);
+                addrs.len() < before
             }
         }
     }
@@ -1277,8 +1329,19 @@ impl PeerManager {
 
     /// Connect to a PeerAddr (either socket or .onion).
     pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        // Connections from addnode RPC (including onetry) are manual.
+        // Mark the address so spawn_peer tags the peer correctly.
         match addr {
-            PeerAddr::Socket(sa) => self.connect_outbound(*sa).await,
+            PeerAddr::Socket(sa) => {
+                self.manual_addrs.write().insert(*sa);
+                let result = self.connect_outbound(*sa).await;
+                // onetry: remove the manual marker after connect.
+                // Persistent addnode entries remain in connect_addrs.
+                if !self.connect_addrs.read().contains(sa) {
+                    self.manual_addrs.write().remove(sa);
+                }
+                result
+            }
             PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port).await,
         }
     }
@@ -1529,13 +1592,18 @@ impl PeerManager {
         peers.clear();
     }
 
-    /// Get info about all connected peers.
+    /// Get info about all peers (connected or connecting). Matches Bitcoin
+    /// Core, which lists peers from the moment the TCP connection is
+    /// accepted, before the version handshake completes.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
-        peers
-            .values()
-            .filter(|h| h.info.state == PeerState::Connected)
-            .map(|h| h.info.to_rpc_json(&h.stats))
+        let mut entries: Vec<_> = peers.iter().collect();
+        // Sort by peer ID so the order is deterministic and matches
+        // Bitcoin Core's ascending-id convention.
+        entries.sort_by_key(|(id, _)| **id);
+        entries
+            .into_iter()
+            .map(|(_, h)| h.info.to_rpc_json(&h.stats))
             .collect()
     }
 
@@ -1690,43 +1758,33 @@ impl PeerManager {
         }
     }
 
-    /// Get the list of configured connect addresses (clearnet sockets and
-    /// `.onion` peers added via `-addnode` / the addnode RPC).
+    /// Get the list of addnode-registered peers, matching Core's
+    /// `getaddednodeinfo` output. Returns the original user-provided
+    /// address string (without port normalisation) as `addednode`.
     pub fn get_added_node_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
+        let entries = self.addnode_entries.read();
+
         let mut out: Vec<serde_json::Value> = Vec::new();
 
-        for addr in self.connect_addrs.read().iter() {
-            let connected = peers
-                .values()
-                .any(|h| h.info.addr == *addr && h.info.state == PeerState::Connected);
+        for (user_str, addr) in entries.iter() {
+            let connected = match addr {
+                PeerAddr::Socket(sa) => peers.values().any(|h| {
+                    h.info.addr == *sa && h.info.state == PeerState::Connected
+                }),
+                PeerAddr::Onion { host, .. } => peers.values().any(|h| {
+                    h.info.onion_host.as_deref() == Some(host.as_str())
+                        && h.info.state == PeerState::Connected
+                }),
+            };
             out.push(serde_json::json!({
-                "addednode": addr.to_string(),
+                "addednode": user_str,
                 "connected": connected,
                 "addresses": [{
-                    "address": addr.to_string(),
+                    "address": user_str,
                     "connected": if connected { "outbound" } else { "false" },
                 }],
             }));
-        }
-
-        // Onion added-nodes live in a separate list (the addrman is
-        // SocketAddr-keyed). Match them on the connected peer's onion_host.
-        for addr in self.connect_peer_addrs.read().iter() {
-            if let PeerAddr::Onion { host, .. } = addr {
-                let connected = peers.values().any(|h| {
-                    h.info.onion_host.as_deref() == Some(host.as_str())
-                        && h.info.state == PeerState::Connected
-                });
-                out.push(serde_json::json!({
-                    "addednode": addr.to_string(),
-                    "connected": connected,
-                    "addresses": [{
-                        "address": addr.to_string(),
-                        "connected": if connected { "outbound" } else { "false" },
-                    }],
-                }));
-            }
         }
 
         out
@@ -5586,7 +5644,8 @@ impl PeerManager {
         // Mark peers from `addnode` / `-connect` so getpeerinfo reports
         // connection_type = "manual" instead of "outbound-full-relay".
         if direction == Direction::Outbound {
-            info.is_addnode = self.connect_addrs.read().contains(&addr);
+            info.is_addnode = self.connect_addrs.read().contains(&addr)
+                || self.manual_addrs.read().contains(&addr);
         }
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
         // peer this is the socket to the proxy, not a clearnet listener.

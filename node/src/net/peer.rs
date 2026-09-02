@@ -28,6 +28,13 @@ impl PeerAddr {
     /// Try to parse a string as a PeerAddr.
     /// Handles "host:port" where host can be a .onion address or IP.
     pub fn parse(s: &str) -> Result<Self, String> {
+        Self::parse_with_default_port(s, 8333)
+    }
+
+    /// Parse an address string, using `default_port` when the input has no port.
+    /// Matches Core's `LookupHost` which resolves shorthand IPs and appends the
+    /// network's default port when none is specified.
+    pub fn parse_with_default_port(s: &str, default_port: u16) -> Result<Self, String> {
         // Check if it's a .onion address
         if let Some((host, port_str)) = s.rsplit_once(':') {
             if host.ends_with(".onion") {
@@ -43,10 +50,29 @@ impl PeerAddr {
             return Err(format!("onion address missing port: {}", s));
         }
 
-        // Try as regular SocketAddr
-        s.parse::<SocketAddr>()
-            .map(PeerAddr::Socket)
-            .map_err(|e| format!("invalid address '{}': {}", s, e))
+        // Try as regular SocketAddr (strict numeric IP:port).
+        if let Ok(sa) = s.parse::<SocketAddr>() {
+            return Ok(PeerAddr::Socket(sa));
+        }
+        // Fallback: DNS / host resolution (matches Core's `LookupHost`).
+        // Handles shorthand notations like "127.1:8333" which the strict
+        // parse rejects but getaddrinfo resolves to 127.0.0.1:8333.
+        use std::net::ToSocketAddrs;
+        if let Some(sa) = s.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+            return Ok(PeerAddr::Socket(sa));
+        }
+        // If no port was specified, try appending the default port.
+        if !s.contains(':') {
+            let with_port = format!("{}:{}", s, default_port);
+            if let Some(sa) = with_port.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+                return Ok(PeerAddr::Socket(sa));
+            }
+            // Try as bare IP address with default port.
+            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                return Ok(PeerAddr::Socket(SocketAddr::new(ip, default_port)));
+            }
+        }
+        Err(format!("invalid address '{}': could not resolve", s))
     }
 }
 
@@ -175,19 +201,19 @@ impl PeerInfo {
             state: PeerState::Connecting,
             version: None,
             services: ServiceFlags::NONE,
-            best_height: 0,
+            best_height: -1,
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
             prefers_headers: false,
             wants_addrv2: false,
             fee_filter: 0,
-            conn_time: SystemTime::now(),
+            conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
             is_addnode: false,
-            relay_txes: true,
+            relay_txes: false,
         }
     }
 
@@ -537,5 +563,16 @@ mod onion_addr_tests {
         assert!(onion_host_to_torv3_pubkey(bad).is_none());
         // Empty / suffix only.
         assert!(onion_host_to_torv3_pubkey(".onion").is_none());
+    }
+}
+
+/// Default P2P port for each network, matching Bitcoin Core's chainparams.
+pub fn default_p2p_port(network: bitcoin::Network) -> u16 {
+    match network {
+        bitcoin::Network::Bitcoin => 8333,
+        bitcoin::Network::Testnet => 18333,
+        bitcoin::Network::Testnet4 => 48333,
+        bitcoin::Network::Signet => 38333,
+        bitcoin::Network::Regtest => 18444,
     }
 }
