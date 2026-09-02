@@ -6443,7 +6443,7 @@ impl ConfigFile {
             let mut included = ConfigFile::parse_file(&inc_path).map_err(|_e| {
                 format!(
                     "Error reading configuration file: \
-                     Failed to include configuration file {rel}"
+                     includeconf: failed to include {rel}"
                 )
             })?;
             // No recursion: drain any includeconf the included file
