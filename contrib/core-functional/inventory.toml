@@ -265,8 +265,7 @@ note = "needs block-file pruning, which satd does not implement. Follow-up: prun
 
 [[test]]
 file = "feature_rbf.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "feature_reindex.py"
