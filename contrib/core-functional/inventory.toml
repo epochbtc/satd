@@ -540,8 +540,7 @@ note = "`prioritisetransaction` with no arguments answers `-1` with a Rust `Erro
 
 [[test]]
 file = "mining_template_verification.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "p2p_1p1c_network.py"

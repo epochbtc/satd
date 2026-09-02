@@ -95,7 +95,7 @@ pub enum ConnectError {
 /// those bytes as a little-endian integer. Early BIP 34 blocks sometimes used
 /// non-minimal pushes (e.g., 4-byte push for a 3-byte height), so we only
 /// compare the decoded value, not the encoding length.
-fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn decode_coinbase_height(bytes: &[u8]) -> Option<u32> {
     // Callers guard against an empty scriptSig, but return None rather than
     // index-panic so this helper is safe to call on any input.
     let first = *bytes.first()?;

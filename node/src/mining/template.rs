@@ -203,20 +203,27 @@ fn assemble_template(
         remaining = deferred;
     }
 
-    // Timestamp: max of current time and parent time + 1. Reads the node
-    // clock, not the system one, so a mocked chain mines at the mocked time --
-    // which is how Core's tests get deterministic block timestamps.
+    // Timestamp: max of current time and MTP + 1. Core's `UpdateTime` uses
+    // `max(GetAdjustedTime(), pindexPrev->GetMedianTimePast() + 1)` — the
+    // median-time-past floor ensures the block satisfies the consensus
+    // `time-too-old` check without the miner having to care about MTP.
+    //
+    // Reads the node clock, not the system one, so a mocked chain mines at the
+    // mocked time — which is how Core's tests get deterministic block
+    // timestamps.
+    //
     // Clamp before the narrowing cast. `setmocktime` accepts anything up to
     // i64::MAX/1e9 (Core's range), so a mock above u32::MAX would otherwise
     // *wrap*: 6_094_967_296 truncates to 1_800_000_000, the block is stamped in
     // 2027, the future-block check compares against the untruncated mock and
     // passes, and the block is accepted. Clearing the mock then leaves a
     // datadir whose tip is decades ahead, so every subsequent template is
-    // `tip.time + 1` -- rejected as time-too-new -- until real time catches up.
+    // `MTP + 1` — rejected as time-too-new — until real time catches up.
     // Saturating keeps the value in range so the future-block check can do its
     // job on it.
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
-    let cur_time = std::cmp::max(now, tip_entry.header.time + 1);
+    let mtp = chain_state.get_median_time_past(height);
+    let cur_time = std::cmp::max(now, mtp + 1);
 
     BlockTemplate {
         version: 0x20000000, // BIP 9 version bits
