@@ -428,6 +428,10 @@ pub async fn start(
     // TLS surfaces as a single node-wide RPC work budget.
     rpc_threads: usize,
     rpc_workqueue: usize,
+    // Per-connection header-read timeout (Bitcoin Core `-rpcservertimeout`).
+    // `None` disables; `Some(dur)` causes hyper to close the TCP connection
+    // if a complete HTTP request header is not received within `dur`.
+    header_read_timeout: Option<Duration>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
     peer_manager: Arc<PeerManager>,
@@ -2303,6 +2307,7 @@ pub async fn start(
             None,
             // Not the startup listener: this is the full RPC server.
             None,
+            header_read_timeout,
         )
         .await?;
         plain_handles.push(handle);
@@ -2337,7 +2342,7 @@ pub async fn start(
     // runtime, behind the read-only method filter, with their own admission
     // budget and source-address allowlist.
     let readonly_handles = if let Some(ro) = readonly {
-        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer).await?
+        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer, header_read_timeout).await?
     } else {
         Vec::new()
     };
@@ -2364,6 +2369,7 @@ async fn spawn_readonly_listeners(
     auth: &Arc<RpcAuth>,
     methods: &Methods,
     shutdown_tx: &watch::Sender<bool>,
+    header_read_timeout: Option<Duration>,
 ) -> Result<Vec<ServerHandle>, Box<dyn std::error::Error + Send + Sync>> {
     // Fail-closed completeness audit: every registered method must be
     // classified in `rpc::access`, otherwise it would be silently rejected
@@ -2420,6 +2426,7 @@ async fn spawn_readonly_listeners(
                 Some(ReadOnlyLayer::new()),
                 // Not the startup listener.
                 None,
+                header_read_timeout,
             )
             .await;
             let _ = tx.send(res);
@@ -2536,19 +2543,25 @@ async fn spawn_tls_surface(
     // Building once side-steps an HRTB inference quirk that bites if
     // you defer the `.build()` call into the per-connection `async`
     // block.
-    // AdmissionLayer is outermost so an over-budget request is shed (429)
-    // before any auth/compat work. AuthLayer is next so an unauthenticated
-    // request is rejected before the compat layer buffers its body;
-    // JsonRpcCompatLayer then normalizes Core-style (`jsonrpc` 1.0/1.1/
-    // absent) requests to 2.0 so jsonrpsee accepts them (see `compat.rs`).
-    // When the surface honors bearer tokens, install the capability filter at
-    // the RPC layer so scoped tokens are gated per method; the operator
-    // principal has all capabilities, so this is a no-op for legacy clients.
+    // JsonRpcCompatLayer is outermost so the Core-compatible HTTP
+    // surface checks (404 for non-root paths, 400 for long URIs,
+    // Content-Type injection) run before auth — matching Core's
+    // libevent httpserver which rejects bad paths unauthenticated.
+    // The body-normalization path inside the compat layer reads the
+    // body only for requests that pass the path/URI checks and is
+    // bounded (`Limited`, Content-Length pre-check), so it does not
+    // create an unbounded memory-DoS surface before auth.
+    // AdmissionLayer is next so an over-budget request is shed (429)
+    // before auth/compat work. AuthLayer is innermost so auth runs
+    // after admission. When the surface honors bearer tokens,
+    // install the capability filter at the RPC layer so scoped
+    // tokens are gated per method; the operator principal has all
+    // capabilities, so this is a no-op for legacy clients.
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
+        .layer(JsonRpcCompatLayer::new())
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth, bearer))
-        .layer(JsonRpcCompatLayer::new());
+        .layer(AuthLayer::new(auth, bearer));
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
@@ -2767,6 +2780,12 @@ pub async fn spawn_plain_surface(
     // node comes up: answers every other method with Core's `-28 RPC in
     // warmup` instead of `-32601 Method not found`. `None` elsewhere.
     warmup: Option<crate::rpc::warmup::WarmupLayer>,
+    // Per-connection HTTP header-read timeout (`-rpcservertimeout`).
+    // `None` disables (hyper's default). When set, hyper closes any
+    // connection whose client does not complete the HTTP request
+    // header within this window — the Core libevent equivalent of
+    // `evhttp_set_timeout`.
+    header_read_timeout: Option<Duration>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2780,9 +2799,9 @@ pub async fn spawn_plain_surface(
 
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
+        .layer(JsonRpcCompatLayer::new())
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth, bearer))
-        .layer(JsonRpcCompatLayer::new());
+        .layer(AuthLayer::new(auth, bearer));
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)
@@ -2913,10 +2932,11 @@ pub async fn spawn_plain_surface(
             // and awaits the serve task's JoinHandle (whose type doesn't
             // name the service's HRTB lifetime); the permit drops when the
             // connection ends.
-            let serve = tokio::spawn(serve_with_graceful_shutdown(
+            let serve = tokio::spawn(serve_http_connection(
                 stream,
                 svc,
                 conn_stop.shutdown(),
+                header_read_timeout,
             ));
             tokio::spawn(async move {
                 let _permit = permit;
@@ -2926,4 +2946,56 @@ pub async fn spawn_plain_surface(
     });
 
     Ok(server_handle)
+}
+
+/// Serve a single HTTP connection with an optional header-read timeout.
+///
+/// This is the plain-HTTP equivalent of jsonrpsee's
+/// [`serve_with_graceful_shutdown`], with one addition: when
+/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1
+/// builder is configured with a matching `header_read_timeout` (plus
+/// the required timer), so a client that opens a TCP connection but
+/// never completes the HTTP request headers gets disconnected rather
+/// than holding a connection slot forever.  This wires Bitcoin Core's
+/// `-rpcservertimeout` knob.
+async fn serve_http_connection<S, B>(
+    io: tokio::net::TcpStream,
+    service: S,
+    stopped: impl std::future::Future<Output = ()>,
+    header_read_timeout: Option<Duration>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tower::Service<
+            jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
+            Response = jsonrpsee::server::HttpResponse<B>,
+            Error = tower::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
+    B::Error: Into<tower::BoxError>,
+{
+    let service = hyper_util::service::TowerToHyperService::new(service);
+    let io = hyper_util::rt::TokioIo::new(io);
+
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if let Some(timeout) = header_read_timeout {
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(timeout);
+    }
+    let conn = builder.serve_connection_with_upgrades(io, service);
+
+    tokio::pin!(stopped, conn);
+
+    tokio::select! {
+        result = &mut conn => result,
+        () = stopped => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    }
 }

@@ -350,9 +350,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "interface_http.py"
-status = "skip"
-reason = "feature-missing"
-note = "passes through pipelining + chunked transfer + 404/400 checks, but fails on -rpcservertimeout (line 191): satd does not implement HTTP idle-connection timeout. Follow-up: map -rpcservertimeout to hyper's connection timeout"
+status = "run"
 
 [[test]]
 file = "interface_ipc.py"
