@@ -4823,7 +4823,7 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            .map_err(|e| (-26, e.sendrawtransaction_msg()))?;
+            .map_err(|e| (e.rpc_code(), e.sendrawtransaction_msg()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 

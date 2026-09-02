@@ -196,6 +196,33 @@ impl MempoolError {
             self.reject_reason()
         }
     }
+
+    /// RPC error code: -25 for verification failures, -26 for policy rejections.
+    pub fn rpc_code(&self) -> i32 {
+        match self {
+            Self::BadAmounts
+            | Self::Script(_)
+            | Self::MissingInputs
+            | Self::DecodeFailed
+            | Self::PrematureCoinbaseSpend
+            | Self::Quarantined(_)
+            | Self::Validation(_) => -25,
+
+            Self::AlreadyExists
+            | Self::ConflictingSpend
+            | Self::InsufficientFee(..)
+            | Self::MempoolFull
+            | Self::NonFinal
+            | Self::NonBip68Final
+            | Self::Dust
+            | Self::NonStandardOpReturn
+            | Self::InsufficientReplacementFee(..)
+            | Self::SpendsConflictingTx(_)
+            | Self::TooManyReplacements(_)
+            | Self::DoesNotImproveFeerateDiagram(_)
+            | Self::TooLongMempoolChain => -26,
+        }
+    }
 }
 
 /// How a transaction reached this node — the value behind the policy engine's
@@ -2046,16 +2073,16 @@ impl Mempool {
         if !conflicts.is_empty() {
             // Opt-in RBF: each direct conflict must signal replaceability.
             for conflict_txid in &conflicts {
-                if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
-                    if !cfg.full_rbf {
-                        let signals_rbf = conflict_entry
-                            .tx
-                            .input
-                            .iter()
-                            .any(|i| i.sequence.0 < 0xffff_fffe);
-                        if !signals_rbf {
-                            return Err(MempoolError::ConflictingSpend);
-                        }
+                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
+                    && !cfg.full_rbf
+                {
+                    let signals_rbf = conflict_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.sequence.0 < 0xffff_fffe);
+                    if !signals_rbf {
+                        return Err(MempoolError::ConflictingSpend);
                     }
                 }
             }
@@ -2193,10 +2220,10 @@ impl Mempool {
         // Apply deferred dust error now that the fee rate check has passed.
         // A non-zero-fee tx with dust is rejected as "dust"; a zero-fee tx
         // was already rejected above as "min relay fee not met".
-        if !has_allow {
-            if let Some(e) = deferred_nonstd.take() {
-                return Err(e);
-            }
+        if !has_allow
+            && let Some(e) = deferred_nonstd.take()
+        {
+            return Err(e);
         }
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
@@ -3214,16 +3241,16 @@ impl Mempool {
 
             // Opt-in RBF signaling check.
             for conflict_txid in &conflicts {
-                if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
-                    if !cfg.full_rbf {
-                        let signals_rbf = conflict_entry
-                            .tx
-                            .input
-                            .iter()
-                            .any(|i| i.sequence.0 < 0xffff_fffe);
-                        if !signals_rbf {
-                            return Err(MempoolError::ConflictingSpend);
-                        }
+                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
+                    && !cfg.full_rbf
+                {
+                    let signals_rbf = conflict_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.sequence.0 < 0xffff_fffe);
+                    if !signals_rbf {
+                        return Err(MempoolError::ConflictingSpend);
                     }
                 }
             }
