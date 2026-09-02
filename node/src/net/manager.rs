@@ -4585,6 +4585,9 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::SpendsConflictingTx(..)
+            | MempoolError::TooManyReplacements(..)
+            | MempoolError::DoesNotImproveFeerateDiagram(..)
             | MempoolError::TooLongMempoolChain
             // Non-final for the *next* block is tip-relative, not misbehavior:
             // a peer one block behind (or ahead) legitimately relays these.
@@ -4820,7 +4823,7 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            .map_err(|e| (-25, e.to_string()))?;
+            .map_err(|e| (-26, e.sendrawtransaction_msg()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
@@ -6513,7 +6516,7 @@ mod tests {
             MempoolError::AlreadyExists,
             MempoolError::ConflictingSpend,
             MempoolError::NonStandardOpReturn,
-            MempoolError::InsufficientReplacementFee(1, 2),
+            MempoolError::InsufficientReplacementFee(1, 2, String::new(), String::new()),
             MempoolError::TooLongMempoolChain,
             MempoolError::PrematureCoinbaseSpend,
             MempoolError::Validation("nonstandard".into()),

@@ -24,11 +24,13 @@ pub const DUST_RELAY_FEE_RATE: u64 = 3_000;
 /// Maximum size of an OP_RETURN output script (including OP_RETURN opcode).
 pub const MAX_OP_RETURN_SIZE: usize = 83;
 
-/// Maximum number of in-mempool ancestors for a single transaction.
-pub const MAX_ANCESTOR_COUNT: usize = 25;
+/// Maximum cluster size (ancestor+descendant count) for a single
+/// transaction. Raised to 64 for Core v31 cluster-mempool parity.
+pub const MAX_ANCESTOR_COUNT: usize = 64;
 
-/// Maximum number of in-mempool descendants for a single transaction.
-pub const MAX_DESCENDANT_COUNT: usize = 25;
+/// Maximum cluster size (ancestor+descendant count) for a single
+/// transaction. Raised to 64 for Core v31 cluster-mempool parity.
+pub const MAX_DESCENDANT_COUNT: usize = 64;
 
 /// Mempool expiry time in seconds (14 days).
 pub const MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;

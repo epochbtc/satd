@@ -590,6 +590,7 @@ pub struct Config {
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
     pub minrelaytxfee: u64,
+    pub incrementalrelayfee: u64,
     pub dustrelayfee: u64,
     pub datacarriersize: usize,
     pub datacarrier: bool,
@@ -2290,6 +2291,13 @@ impl Config {
         .or(profile_defaults.minrelaytxfee)
         .unwrap_or(1_000); // sat/kvB
 
+        let incrementalrelayfee = file_fee_rate("incrementalrelayfee")?
+            .unwrap_or(100); // 100 sat/kvB (Core v31 default: 0.000001 BTC/kvB)
+
+        // When incremental relay fee is higher than min relay fee, raise
+        // min relay fee automatically (Core parity).
+        let minrelaytxfee = minrelaytxfee.max(incrementalrelayfee);
+
         let dustrelayfee = match cli.dustrelayfee {
             Some(v) => Some(v),
             None => file_fee_rate("dustrelayfee")?,
@@ -2309,12 +2317,12 @@ impl Config {
         let limitancestorcount = cli
             .limitancestorcount
             .or_else(|| file_get("limitancestorcount").and_then(|v| v.parse().ok()))
-            .unwrap_or(25);
+            .unwrap_or(64);
 
         let limitdescendantcount = cli
             .limitdescendantcount
             .or_else(|| file_get("limitdescendantcount").and_then(|v| v.parse().ok()))
-            .unwrap_or(25);
+            .unwrap_or(64);
 
         let mempoolexpiry = cli
             .mempoolexpiry
@@ -3124,6 +3132,7 @@ impl Config {
             quarantinemempool,
             policyfile,
             minrelaytxfee,
+            incrementalrelayfee,
             dustrelayfee,
             datacarriersize,
             datacarrier,
