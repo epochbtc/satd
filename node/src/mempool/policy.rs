@@ -9,10 +9,10 @@ pub const DEFAULT_MAX_MEMPOOL_SIZE: usize = 300 * 1_000_000;
 pub const DEFAULT_QUARANTINE_MEMPOOL_SIZE: usize = 50 * 1_000_000;
 
 /// Default minimum relay fee rate in sat/kvB (sat per 1000 *virtual* bytes),
-/// matching Bitcoin Core's `DEFAULT_MIN_RELAY_TX_FEE`. 1000 sat/kvB = 1 sat/vB.
-/// Fee rates are always per vbyte, never per weight unit — derive them with
-/// [`fee_rate_sat_per_kvb`].
-pub const DEFAULT_MIN_RELAY_FEE_RATE: u64 = 1_000;
+/// matching Bitcoin Core v31's `DEFAULT_MIN_RELAY_TX_FEE` (100 sat/kvB,
+/// lowered from 1000 in Core v28). Fee rates are always per vbyte, never per
+/// weight unit — derive them with [`fee_rate_sat_per_kvb`].
+pub const DEFAULT_MIN_RELAY_FEE_RATE: u64 = 100;
 
 /// Maximum standard transaction weight (400,000 weight units).
 pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
@@ -22,7 +22,9 @@ pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 pub const DUST_RELAY_FEE_RATE: u64 = 3_000;
 
 /// Maximum size of an OP_RETURN output script (including OP_RETURN opcode).
-pub const MAX_OP_RETURN_SIZE: usize = 83;
+/// Core v31 raised this from 83 to `MAX_STANDARD_TX_WEIGHT / 4` (100 000)
+/// so that a single OP_RETURN can fill an entire standard transaction.
+pub const MAX_OP_RETURN_SIZE: usize = MAX_STANDARD_TX_WEIGHT / 4;
 
 /// Maximum cluster size (ancestor+descendant count) for a single
 /// transaction. Raised to 64 for Core v31 cluster-mempool parity.
@@ -138,11 +140,12 @@ mod tests {
         assert_eq!(fee_rate_sat_per_kvb(412, 1108), 1487);
         assert!(fee_rate_sat_per_kvb(412, 1108) >= DEFAULT_MIN_RELAY_FEE_RATE);
         // For contrast, the old formula divided by weight (1108) not vsize (277),
-        // giving 371 — below the floor. `black_box` keeps it a runtime check.
+        // giving 371 — below the 1000 sat/kvB floor that was in effect when the
+        // bug was discovered. `black_box` keeps it a runtime check.
         let buggy_weight_based = std::hint::black_box(412u64) * 1000 / 1108;
         assert_eq!(buggy_weight_based, 371);
-        assert!(buggy_weight_based < DEFAULT_MIN_RELAY_FEE_RATE);
-        // Exactly 1 sat/vB sits right on the floor.
+        assert!(buggy_weight_based < 1_000); // < old DEFAULT_MIN_RELAY_FEE_RATE
+        // Exactly 1 sat/vB sits at 1000 sat/kvB.
         assert_eq!(fee_rate_sat_per_kvb(277, 1108), 1000);
         // vsize rounds up (ceil), matching Core's GetVirtualTransactionSize.
         assert_eq!(weight_to_vsize(1109), 278);

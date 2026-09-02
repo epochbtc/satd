@@ -1151,7 +1151,8 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+        let replaceable: Option<bool> = seq.optional_next().unwrap_or(None);
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime, replaceable)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
