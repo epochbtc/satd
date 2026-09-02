@@ -289,6 +289,8 @@ SATD_ONLY = {
     "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "echoipc": [["arg", False]],
+    "generate": [],
+    "generatetodescriptor": [["num_blocks", False], ["descriptor", False], ["maxtries", False]],
     # Subscription pair: jsonrpsee owns the subscription-id argument and Core
     # has no equivalent, so neither declares a nameable parameter.
     "subscribemempool": [],
