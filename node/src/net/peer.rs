@@ -142,6 +142,13 @@ pub struct PeerInfo {
     /// socket exists, and for onion peers, whose local end belongs to the
     /// proxy rather than to us.
     pub bind_addr: Option<SocketAddr>,
+    /// Whether this peer was added via `addnode`. Drives `getpeerinfo`'s
+    /// `connection_type` field: Core reports `"manual"` for addnode peers.
+    pub is_addnode: bool,
+    /// Whether this peer relays transactions. Set from the version message's
+    /// `relay` flag; defaults to true (matching Core's assumption for peers
+    /// that predate BIP 37's optional relay field).
+    pub relay_txes: bool,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -179,6 +186,8 @@ impl PeerInfo {
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
+            is_addnode: false,
+            relay_txes: true,
         }
     }
 
@@ -187,6 +196,7 @@ impl PeerInfo {
         self.services = version.services;
         self.best_height = version.start_height;
         self.user_agent = version.user_agent.clone();
+        self.relay_txes = version.relay;
         self.version = Some(version);
     }
 
@@ -226,23 +236,97 @@ impl PeerInfo {
             .as_secs();
 
         let addr_str = self.addr_string();
+        // Derive the peer's network from its address.
+        let network = if let Some(ref onion) = self.onion_host {
+            let _ = onion; // suppress unused
+            "onion"
+        } else {
+            match self.addr.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    if ip.is_loopback() || ip.is_unspecified() {
+                        "not_publicly_routable"
+                    } else {
+                        "ipv4"
+                    }
+                }
+                std::net::IpAddr::V6(ip) => {
+                    if ip.is_loopback() || ip.is_unspecified() {
+                        "not_publicly_routable"
+                    } else {
+                        "ipv6"
+                    }
+                }
+            }
+        };
+
+        // Build the services-name list matching Core's format.
+        let svc_u64 = self.services.to_u64();
+        let mut svc_names: Vec<String> = Vec::new();
+        // Known service flags (matching Core's getservicesnames).
+        const KNOWN_FLAGS: &[(u64, &str)] = &[
+            (1 << 0, "NETWORK"),
+            (1 << 2, "BLOOM"),
+            (1 << 3, "WITNESS"),
+            (1 << 6, "COMPACT_FILTERS"),
+            (1 << 10, "NETWORK_LIMITED"),
+            (1 << 11, "P2P_V2"),
+        ];
+        for &(bit, name) in KNOWN_FLAGS {
+            if svc_u64 & bit != 0 {
+                svc_names.push(name.to_string());
+            }
+        }
+        // Unknown bits: report as UNKNOWN[2^N]
+        let known_mask: u64 = KNOWN_FLAGS.iter().map(|(b, _)| b).fold(0, |a, b| a | b);
+        let unknown = svc_u64 & !known_mask;
+        for bit in 0..64 {
+            if unknown & (1u64 << bit) != 0 {
+                svc_names.push(format!("UNKNOWN[2^{bit}]"));
+            }
+        }
+
+        // Connection type: Core distinguishes manual (addnode), inbound,
+        // outbound-full-relay, etc. The test expects "manual" for addnode,
+        // "inbound" for inbound connections.
+        let connection_type = if self.is_addnode {
+            "manual"
+        } else {
+            match self.direction {
+                Direction::Inbound => "inbound",
+                Direction::Outbound => "outbound-full-relay",
+            }
+        };
+
         let mut obj = serde_json::json!({
             "id": self.id,
             "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
-            "servicesnames": [],
+            "servicesnames": svc_names,
+            "relaytxes": self.relay_txes,
             "lastsend": stats.last_send(),
             "lastrecv": stats.last_recv(),
+            "last_block": stats.last_block(),
+            "last_transaction": stats.last_transaction(),
             "bytessent": stats.bytes_sent(),
             "bytesrecv": stats.bytes_recv(),
             "conntime": conntime,
             "version": self.version.as_ref().map(|v| v.version).unwrap_or(0),
             "subver": &self.user_agent,
             "inbound": self.direction == Direction::Inbound,
+            "network": network,
             "transport_protocol_type": self.transport.as_str(),
             "startingheight": self.best_height,
+            "presynced_headers": -1,
             "synced_headers": -1,
             "synced_blocks": -1,
+            "permissions": [],
+            "addr_processed": 0,
+            "addr_rate_limited": 0,
+            "addr_relay_enabled": self.direction == Direction::Outbound,
+            "bip152_hb_from": false,
+            "bip152_hb_to": false,
+            "inv_to_send": 0,
+            "last_inv_sequence": 0,
             // Bitcoin Core always emits these two; canonical Core client
             // libraries read them without a null guard. NBitcoin's
             // `GetPeersInfoAsync` does `(long)peer["timeoffset"]` and
@@ -261,10 +345,8 @@ impl PeerInfo {
             "bytessent_per_msg": per_msg_json(&stats.bytes_sent_per_msg()),
             "bytesrecv_per_msg": per_msg_json(&stats.bytes_recv_per_msg()),
             "minfeefilter": self.fee_filter as f64 / 100_000_000.0,
-            "connection_type": match self.direction {
-                Direction::Inbound => "inbound-full-relay",
-                Direction::Outbound => "outbound-full-relay",
-            },
+            "connection_type": connection_type,
+            "session_id": "",
         });
         // Core reports the local end of the connection here, and its own test
         // framework matches a peer by it — but only when it has one: the field

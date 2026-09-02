@@ -800,6 +800,11 @@ impl PeerManager {
         self.onion_proxy.clone().or_else(|| self.proxy.clone())
     }
 
+    /// Whether this node is in prune mode (`-prune` > 0).
+    pub fn is_pruning(&self) -> bool {
+        self.prune_target_mb > 0
+    }
+
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
     /// when randomization is off. Tor uses the username/password as its
     /// stream-isolation key (`IsolateSOCKSAuth`), so a unique pair per dial
@@ -1092,6 +1097,18 @@ impl PeerManager {
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
+                    && h.info.state == PeerState::Connected
+            })
+            .count()
+    }
+
+    /// Number of inbound peers currently connected.
+    pub fn inbound_count(&self) -> usize {
+        let peers = self.peers.read();
+        peers
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Inbound
                     && h.info.state == PeerState::Connected
             })
             .count()
@@ -2250,9 +2267,15 @@ impl PeerManager {
                 self.handle_headers(id, headers);
             }
             NetworkMessage::Block(block) => {
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_block();
+                }
                 self.handle_block(id, block);
             }
             NetworkMessage::Tx(tx) => {
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_transaction();
+                }
                 self.handle_tx(id, tx);
             }
             NetworkMessage::GetHeaders(msg) => {
@@ -5560,6 +5583,11 @@ impl PeerManager {
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
         info.onion_host = onion_host.map(str::to_string);
+        // Mark peers from `addnode` / `-connect` so getpeerinfo reports
+        // connection_type = "manual" instead of "outbound-full-relay".
+        if direction == Direction::Outbound {
+            info.is_addnode = self.connect_addrs.read().contains(&addr);
+        }
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
         // peer this is the socket to the proxy, not a clearnet listener.
         info.bind_addr = match &transport {
@@ -5652,33 +5680,43 @@ impl PeerManager {
 
     /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
     /// configured), bounded by Core's `-timeout`.
+    ///
+    /// Loopback addresses (127.0.0.0/8, `::1`) always connect directly,
+    /// bypassing any configured proxy. Bitcoin Core does the same: the
+    /// proxy is for reaching the public internet (especially via Tor),
+    /// and routing localhost connections through it is both unnecessary
+    /// and breaks regtest/functional-test topologies where the proxy is a
+    /// placeholder that never accepts connections.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let use_proxy = self.proxy.is_some() && !addr.ip().is_loopback();
         if let Some(ref proxy_addr) = self.proxy {
-            // Per-dial random SOCKS credentials isolate this peer on its own Tor
-            // circuit (see `socks_cred`).
-            let cred = self.socks_cred();
-            let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} via proxy timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })?
-                .map_err(|e| e.to_string())
-        } else {
-            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })?
-                .map_err(|e| format!("connect failed: {}", e))
+            if use_proxy {
+                // Per-dial random SOCKS credentials isolate this peer on its own Tor
+                // circuit (see `socks_cred`).
+                let cred = self.socks_cred();
+                let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+                return tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "connect to {addr} via proxy timed out after {}ms",
+                            connect_timeout.as_millis()
+                        )
+                    })?
+                    .map_err(|e| e.to_string());
+            }
+            let _ = proxy_addr; // suppress unused warning on the loopback path
         }
+        tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                format!(
+                    "connect to {addr} timed out after {}ms",
+                    connect_timeout.as_millis()
+                )
+            })?
+            .map_err(|e| format!("connect failed: {}", e))
     }
 
     /// Dial a .onion outbound peer through the configured SOCKS5 proxy,

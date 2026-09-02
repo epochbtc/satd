@@ -160,8 +160,7 @@ note = "needs `generatetodescriptor`; the framework mines to MiniWallet's own de
 
 [[test]]
 file = "feature_framework_startup_failures.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "feature_framework_testshell.py"

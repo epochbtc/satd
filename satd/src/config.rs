@@ -1259,6 +1259,38 @@ impl Config {
         // compatibility). Unrecognized options stay in place so clap still
         // rejects typos.
         let (normalized, cli_warnings) = filter_unsupported_core_cli_args(normalized)?;
+        // Pre-flight: any single-dashed *multi-character* arg that survived
+        // normalize_args (which converts known satd flags to `--long`) and
+        // filter_unsupported_core_cli_args (which drops/errors on
+        // known-Core-but-unsupported flags) is a genuinely unknown Core-style
+        // parameter. Catch it here and report it in Bitcoin Core's format
+        // ("Error: Error parsing command line arguments: Invalid parameter <arg>")
+        // rather than letting clap decompose `-foobar` into short flags (`-f`)
+        // and produce a different error message.
+        //
+        // Single-character flags like `-h` (clap short flags) are exempt: they
+        // are legitimate clap short forms that normalize_args doesn't handle.
+        // `-flag=value` args (containing `=`) are also multi-character and are
+        // caught; the flag name is in the part before `=`.
+        {
+            let mut past_separator = false;
+            for (i, arg) in normalized.iter().enumerate() {
+                if i == 0 { continue; } // binary name
+                if arg == "--" { past_separator = true; continue; }
+                if past_separator { continue; } // after `--`, everything is positional
+                if arg.starts_with("--") || !arg.starts_with('-') { continue; }
+                // The flag part is everything after the dash, up to `=`.
+                let flag = &arg[1..];
+                let flag_name = flag.split('=').next().unwrap_or(flag);
+                // Single-character flags pass through to clap (e.g. `-h`, `-V`).
+                if flag_name.len() <= 1 { continue; }
+                // Multi-character, single-dashed arg that nothing recognised.
+                eprintln!(
+                    "Error: Error parsing command line arguments: Invalid parameter {arg}"
+                );
+                std::process::exit(1);
+            }
+        }
         let cli = match CliArgs::try_parse_from(normalized) {
             Ok(c) => c,
             Err(e) => {
@@ -1281,15 +1313,11 @@ impl Config {
                     std::process::exit(0);
                 }
                 // Bitcoin Core reports a bad command line as
-                // "Error parsing command line arguments: <detail>". Emit that
-                // shape verbatim -- the caller's generic `Error: {e}` wrapper
-                // would give "Error: parsing ...", which is close enough to
-                // read the same and different enough to break anything
-                // matching on Core's wording. Exiting here rather than
-                // returning mirrors the help/version paths just above; this
-                // function runs once at startup and never on the SIGHUP reload
-                // path, which goes through `from_cli` and never exits.
-                eprintln!("Error parsing command line arguments: {e}");
+                // "Error: Error parsing command line arguments: <detail>".
+                // The `Error: ` prefix is required -- test_node.py embeds stderr
+                // verbatim into the FailedToStartError message, and Core's tests
+                // match on the "Error: Error parsing" shape.
+                eprintln!("Error: Error parsing command line arguments: {e}");
                 std::process::exit(1);
             }
         };

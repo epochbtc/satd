@@ -283,10 +283,20 @@ pub fn get_block(
         .get_block_index(&hash)
         .ok_or("Block not found")?;
 
+    // Map a missing block body to Core's status-dependent error message.
+    let block_unavailable_msg = || -> String {
+        use crate::storage::blockindex::BlockStatus;
+        match entry.status {
+            BlockStatus::Pruned => "Block not available (pruned data)".to_string(),
+            BlockStatus::HeaderOnly => "Block not available (not fully downloaded)".to_string(),
+            _ => "Block data not available".to_string(),
+        }
+    };
+
     if verbosity == 0 {
         let block = chain_state
             .get_block(&hash)
-            .ok_or("Block data not available")?;
+            .ok_or_else(block_unavailable_msg)?;
         let raw = serialize(&block);
         return Ok(Value::String(hex::encode(raw)));
     }
@@ -294,7 +304,7 @@ pub fn get_block(
     // verbosity >= 1: JSON response
     let block = chain_state
         .get_block(&hash)
-        .ok_or("Block data not available")?;
+        .ok_or_else(block_unavailable_msg)?;
 
     let confirmations = block_confirmations(chain_state, &hash, entry.height);
 
@@ -771,19 +781,21 @@ pub fn get_block_stats(
 }
 
 /// `getchaintips` — return chain tip info.
+///
+/// Walks the entire block index to find all tips (blocks that are not a parent
+/// of any other block) and classifies them by their relationship to the active
+/// chain: `active`, `valid-fork`, `valid-headers`, `headers-only`, or
+/// `invalid`.
 pub fn get_chain_tips(chain_state: &ChainState) -> Value {
-    // One read: `tip_snapshot`'s own docs require it of any caller needing both
-    // fields, because two reads can straddle a connect and report a height
-    // alongside the hash of a different block.
-    let (tip_hash, tip_height) = chain_state.tip_snapshot();
-
-    // Currently we only track the active chain tip
-    json!([{
-        "height": tip_height,
-        "hash": tip_hash.to_string(),
-        "branchlen": 0,
-        "status": "active",
-    }])
+    let tips = chain_state.chain_tips();
+    json!(tips.iter().map(|t| {
+        json!({
+            "height": t.height,
+            "hash": t.hash.to_string(),
+            "branchlen": t.branch_len,
+            "status": t.status,
+        })
+    }).collect::<Vec<_>>())
 }
 
 /// `getchaintxstats` — return tx rate statistics over a window.
