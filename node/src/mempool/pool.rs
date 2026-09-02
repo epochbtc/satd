@@ -71,7 +71,7 @@ pub enum MempoolError {
     DecodeFailed,
     #[error("dust")]
     Dust,
-    #[error("scriptpubkey")]
+    #[error("datacarrier")]
     NonStandardOpReturn,
     #[error("insufficient fee for RBF. {0} < {1}")]
     InsufficientReplacementFee(u64, u64),
@@ -251,6 +251,13 @@ pub struct MempoolInfo {
     pub full_rbf: bool,
     /// Count of locally-originated txs not yet confirmed propagated.
     pub unbroadcast: usize,
+    /// Effective OP_RETURN relay cap: 0 when `-datacarrier=0`, otherwise
+    /// the configured `-datacarriersize` (default: Core v31's uncapped
+    /// `MAX_STANDARD_TX_WEIGHT / 4` = 100 000).  Surfaced by
+    /// `getmempoolinfo.maxdatacarriersize`.
+    pub max_data_carrier_size: usize,
+    /// Whether bare multisig outputs are relayed (`-permitbaremultisig`).
+    pub permit_bare_multisig: bool,
 }
 
 /// Outcome of a ruleset re-placement pass ([`Mempool::reapply_policy`], §8).
@@ -579,7 +586,7 @@ impl Default for MempoolConfig {
             full_rbf: true,
             dust_relay_fee: policy::DUST_RELAY_FEE_RATE,
             data_carrier: true,
-            data_carrier_size: policy::MAX_OP_RETURN_SIZE,
+            data_carrier_size: policy::DEFAULT_DATA_CARRIER_SIZE,
             max_ancestor_count: policy::MAX_ANCESTOR_COUNT,
             max_descendant_count: policy::MAX_DESCENDANT_COUNT,
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
@@ -3149,9 +3156,14 @@ impl Mempool {
     pub fn info(&self) -> MempoolInfo {
         // Snapshot policy first (lock released) so the policy lock is never held
         // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
-        let (max_size, min_fee_rate, full_rbf) = {
+        let (max_size, min_fee_rate, full_rbf, max_data_carrier_size, permit_bare_multisig) = {
             let cfg = self.config.read();
-            (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
+            let dcs = if cfg.data_carrier {
+                cfg.data_carrier_size
+            } else {
+                0
+            };
+            (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf, dcs, cfg.permit_bare_multisig)
         };
         let inner = self.inner.read();
         // Standard surface (design §6.1/§10): report the **acting class** only,
@@ -3183,7 +3195,15 @@ impl Mempool {
             min_fee_rate,
             full_rbf,
             unbroadcast,
+            max_data_carrier_size,
+            permit_bare_multisig,
         }
+    }
+
+    /// Test-only: override the OP_RETURN size cap.
+    #[cfg(test)]
+    pub(crate) fn set_data_carrier_size(&self, size: usize) {
+        self.config.write().data_carrier_size = size;
     }
 
     /// Test-only: insert a synthetic entry keyed by `txid` so unit tests can
@@ -3833,6 +3853,10 @@ mod tests {
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
         let (cs, mp, dir) = make_test_env();
+
+        // Set a strict OP_RETURN size limit for this test (the global default
+        // is 100 000, matching Core v31's uncapped behaviour).
+        mp.set_data_carrier_size(83);
 
         // Build an OP_RETURN output > 83 bytes
         let mut op_return_script = vec![0x6a]; // OP_RETURN

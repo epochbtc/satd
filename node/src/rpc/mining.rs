@@ -11,10 +11,28 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
         Err(_) => return Value::String("Block decode failed".to_string()),
     };
 
-    let block: bitcoin::Block = match bitcoin::consensus::deserialize(&block_bytes) {
-        Ok(b) => b,
-        Err(_) => return Value::String("Block decode failed".to_string()),
+    // Use a cursor-based decode that tolerates trailing bytes, matching
+    // Core's CBlock::Unserialize (which reads exactly one block and
+    // ignores any trailing data). `consensus::deserialize` is strict
+    // and rejects trailing bytes — a problem for the functional test
+    // `interface_http.py`, which sends a 4 MB garbage payload that
+    // still starts with a decodable (all-zeros) header + 0 txs.
+    let block: bitcoin::Block = {
+        use bitcoin::consensus::Decodable;
+        let mut cursor = std::io::Cursor::new(&block_bytes);
+        match bitcoin::Block::consensus_decode(&mut cursor) {
+            Ok(b) => b,
+            Err(_) => return Value::String("Block decode failed".to_string()),
+        }
     };
+
+    // Check PoW before looking up the parent, matching Core's
+    // `CheckBlockHeader` → `AcceptBlock` flow. If the header fails PoW,
+    // Core returns "high-hash" without ever searching the block index
+    // for the parent.
+    if let Err(e) = crate::validation::pow::check_proof_of_work(&block.header) {
+        return Value::String(e.to_string());
+    }
 
     match chain_state.accept_block(&block) {
         Ok(acceptance) => {

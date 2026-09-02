@@ -1506,10 +1506,17 @@ impl Config {
         // rule: every recognised key is honoured or explicitly rejected,
         // never accepted-and-ignored.
         if !cli.includeconf.is_empty() {
+            // Format the value exactly as Bitcoin Core does: boolean-like
+            // values (`true`/`false`) are bare, file paths are quoted.
+            let val = &cli.includeconf[0];
+            let display_val = if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
+                format!("-includeconf={val}")
+            } else {
+                format!("-includeconf=\"{val}\"")
+            };
             return Err(format!(
-                "-includeconf cannot be used from commandline; -includeconf={} \
-                 (includeconf is only honoured inside a config file, matching Bitcoin Core)",
-                cli.includeconf[0]
+                "Error parsing command line arguments: \
+                 -includeconf cannot be used from commandline; {display_val}",
             ));
         }
 
@@ -2296,10 +2303,15 @@ impl Config {
         }
         .unwrap_or(3_000); // sat/kvB
 
+        // Core v31 changed the default from 83 (MAX_OP_RETURN_RELAY, the
+        // historical value) to MAX_STANDARD_TX_WEIGHT / 4 = 100 000,
+        // making the relay cap effectively uncapped.  Match that default
+        // so `getmempoolinfo.maxdatacarriersize` reports the same value
+        // and the `mempool_datacarrier` functional test passes.
         let datacarriersize = cli
             .datacarriersize
             .or_else(|| file_get("datacarriersize").and_then(|v| v.parse().ok()))
-            .unwrap_or(83);
+            .unwrap_or(100_000);
 
         let datacarrier = cli
             .datacarrier
@@ -6055,6 +6067,34 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                     return format!("--{flag}=0");
                 }
             }
+
+            // Special handling for `-noincludeconf` negation, matching
+            // Bitcoin Core's `ParseParameters`.  `includeconf` is not in
+            // `NEGATABLE_BOOL_FLAGS` (it is a Vec<String>), but Core
+            // interprets `-noincludeconf=0` as "don't NOT include" →
+            // `-includeconf=true` (double negation).  The command-line
+            // check will then reject it with the right error message.
+            if arg.starts_with('-') {
+                let stripped = arg.trim_start_matches('-');
+                if let Some(rest) = stripped.strip_prefix("noincludeconf") {
+                    // `-noincludeconf` (no value) → includeconf disabled,
+                    // but includeconf is a file path, not a boolean.
+                    // `-noincludeconf=0` → double negation → includeconf=true
+                    // `-noincludeconf=1` → negation with 1 → includeconf=false → empty
+                    // For all forms: Core resolves and rejects at the
+                    // "cannot be used from commandline" gate, showing the
+                    // resolved value.  Convert to `--includeconf=<resolved>`.
+                    if rest.is_empty() || rest == "=1" {
+                        // negation active → nothing to include, but Core
+                        // still errors on the presence of the flag
+                        return "--includeconf".to_string();
+                    } else if rest == "=0" {
+                        // double negation → true
+                        return "--includeconf=true".to_string();
+                    }
+                }
+            }
+
             // Skip the binary name or already double-dashed args
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
@@ -6367,16 +6407,28 @@ impl ConfigFile {
             } else {
                 datadir.join(&rel)
             };
-            let mut included = ConfigFile::parse_file(&inc_path).map_err(|e| {
-                format!("includeconf='{rel}' (resolved to {}): {e}", inc_path.display())
+            let mut included = ConfigFile::parse_file(&inc_path).map_err(|_e| {
+                format!(
+                    "Error reading configuration file: \
+                     Failed to include configuration file {rel}"
+                )
             })?;
             // No recursion: drain any includeconf the included file
             // carries (global or any section) and warn, matching Core.
+            // The warning goes to stderr in Core's exact format so
+            // `stop_node(expected_stderr=...)` in the functional tests
+            // can match it verbatim.
             let mut nested = included.global.remove("includeconf").unwrap_or_default();
             for s in included.sections.values_mut() {
                 if let Some(v) = s.remove("includeconf") {
                     nested.extend(v);
                 }
+            }
+            for n in &nested {
+                eprintln!(
+                    "warning: -includeconf cannot be used from included \
+                     files; ignoring -includeconf={n}"
+                );
             }
             for n in nested {
                 notes.push(ConfigNote {

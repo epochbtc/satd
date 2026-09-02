@@ -4820,7 +4820,15 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            .map_err(|e| (-25, e.to_string()))?;
+            .map_err(|e| {
+                // Core's taxonomy: -25 = RPC_TRANSACTION_ERROR (tx already
+                // in chain, missing inputs); -26 = RPC_TRANSACTION_REJECTED
+                // (policy/standardness rejections like dust, datacarrier,
+                // scriptpubkey, non-final, etc.). Use -26 for mempool
+                // rejections since that is what Core returns for
+                // `sendrawtransaction` policy failures.
+                (-26, e.to_string())
+            })?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
