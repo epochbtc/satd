@@ -119,6 +119,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "estimatefees" => &[("targets", false), ("mode", false)],
         "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false)],
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
+        "generate" => &[],
         "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
         // SATD_ONLY: generatetodescriptor

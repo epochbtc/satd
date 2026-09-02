@@ -286,6 +286,7 @@ SATD_ONLY = {
     ],
     "listquarantine": [["rule", False], ["count", False], ["skip", False]],
     "policytest": [["rawtx", False]],
+    "generate": [],
     # Subscription pair: jsonrpsee owns the subscription-id argument and Core
     # has no equivalent, so neither declares a nameable parameter.
     "subscribemempool": [],
