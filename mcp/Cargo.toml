@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 node = { path = "../node" }
+ipnet = "2.12"
 rmcp = { workspace = true }
 bitcoin = { workspace = true }
 tokio = { workspace = true }

@@ -506,6 +506,10 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(&ctx.chain_state))
     })?;
 
+    module.register_method("getdeploymentinfo", |_params, ctx, _extensions| {
+        Ok::<_, ErrorObjectOwned>(blockchain::get_deployment_info(&ctx.chain_state))
+    })?;
+
     module.register_method("getnetworkinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(network::get_network_info(&ctx.peer_manager))
     })?;
@@ -966,6 +970,18 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
+    module.register_method("generatetodescriptor", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let nblocks: u32 = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
     module.register_method("generateblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let address: String = seq
@@ -1054,13 +1070,14 @@ pub async fn start(
             .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
-                // -22 = decode failed, -25 = mempool acceptance failure.
+                // -22 = decode failed, -26 = mempool acceptance failure
+                // (RPC_VERIFY_REJECTED).
                 let (category, suggestion) = match code {
                     -22 => (
                         "rpc.input.parse",
                         "Transaction hex failed to decode. Ensure it's a valid raw tx (no 0x prefix, no whitespace).",
                     ),
-                    -25 => (
+                    -26 => (
                         "mempool.rejected",
                         "Mempool rejected the tx. Check feerate (--minrelaytxfee), dust thresholds, and conflicts with existing mempool contents.",
                     ),
@@ -1551,19 +1568,50 @@ pub async fn start(
 
     module.register_method("setban", |params, ctx, _extensions| {
         let mut seq = params.sequence();
-        let addr_str: String = seq
+        let subnet_str: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         let command: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-            })?;
+        let bantime: Option<u64> = seq.optional_next().unwrap_or(None);
+        let absolute: Option<bool> = seq.optional_next().unwrap_or(None);
+
+        let target = crate::net::ban::parse_ban_target(&subnet_str)
+            .map_err(|e| ErrorObjectOwned::owned(-30, e, None::<()>))?;
+
         match command.as_str() {
-            "add" => ctx.peer_manager.set_ban(addr, true),
-            "remove" => ctx.peer_manager.set_ban(addr, false),
+            "add" => {
+                let now = crate::time::now_secs();
+                let default_duration = ctx.peer_manager.default_ban_duration_secs();
+                let (ban_created, banned_until) = if absolute.unwrap_or(false) {
+                    // bantime is an absolute Unix timestamp.
+                    let abs = bantime.unwrap_or(now + default_duration);
+                    if abs <= now {
+                        return Err(ErrorObjectOwned::owned(
+                            -8,
+                            "Error: Absolute timestamp is in the past",
+                            None::<()>,
+                        ));
+                    }
+                    (now, abs)
+                } else {
+                    // bantime is a relative duration in seconds (0 = default).
+                    let duration = match bantime {
+                        Some(0) | None => default_duration,
+                        Some(d) => d,
+                    };
+                    (now, now + duration)
+                };
+                ctx.peer_manager
+                    .set_ban_subnet(&target, true, ban_created, banned_until)
+                    .map_err(|e| ErrorObjectOwned::owned(-23, e, None::<()>))?;
+            }
+            "remove" => {
+                ctx.peer_manager
+                    .set_ban_subnet(&target, false, 0, 0)
+                    .map_err(|e| ErrorObjectOwned::owned(-30, e, None::<()>))?;
+            }
             _ => return Err(ErrorObjectOwned::owned(-1, "Invalid command", None::<()>)),
         }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
@@ -1660,6 +1708,7 @@ pub async fn start(
             "estimatesmartfee",
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "getaddednodeinfo",
             "getbestblockhash",
             "getblock",
@@ -1674,6 +1723,7 @@ pub async fn start(
             "getchaintxstats",
             "getconfig",
             "getconnectioncount",
+            "getdeploymentinfo",
             "getdifficulty",
             "getibdprogress",
             "getmempoolancestors",

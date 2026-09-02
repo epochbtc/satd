@@ -3347,6 +3347,7 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
                 RustReason::Expiry => pb::EvictReason::Expiry as i32,
                 RustReason::BlockConflict => pb::EvictReason::BlockConflict as i32,
                 RustReason::Policy => pb::EvictReason::Policy as i32,
+                RustReason::NonFinal => pb::EvictReason::Policy as i32, // wire as policy for now
             },
         }),
         Mp::LeaveReplaced {

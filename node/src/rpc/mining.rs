@@ -30,7 +30,15 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
             if let Some(height) = chain_state.connected_height(&acceptance) {
                 mempool.remove_for_block(&block, height);
             }
-            Value::Null
+            // Core returns `null` when the block joined the active chain, and
+            // `"inconclusive"` when it was valid and stored but did not
+            // connect (e.g. side chain, future block). Tests rely on the
+            // distinction.
+            if acceptance.connected() {
+                Value::Null
+            } else {
+                Value::String("inconclusive".to_string())
+            }
         }
         Err(e) => Value::String(e.to_string()),
     }
@@ -49,6 +57,27 @@ pub fn generate_to_address(
 
     let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks)
         .map_err(|e| (-1, e.to_string()))?;
+
+    Ok(json!(hashes))
+}
+
+/// Handle the `generatetodescriptor` RPC call (regtest only).
+pub fn generate_to_descriptor(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    nblocks: u32,
+    descriptor: &str,
+) -> Result<Value, (i32, String)> {
+    if chain_state.network != bitcoin::Network::Regtest {
+        return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
+    }
+
+    let script = crate::rpc::descriptor::parse_descriptor(descriptor, chain_state.network)
+        .map_err(|e| (-5, e))?;
+
+    let hashes =
+        crate::mining::miner::mine_blocks_to_script(chain_state, mempool, &script, nblocks)
+            .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))
 }

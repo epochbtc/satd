@@ -30,6 +30,10 @@ pub enum EvictReason {
     /// held set. Distinct from `FullPool` (the acting class) so per-class
     /// pressure is legible. Inert until a policy is loaded (PR 4c).
     Policy,
+    /// Evicted because a reorg or `invalidateblock` changed the chain tip
+    /// and the transaction's BIP68 sequence locks or absolute locktime are
+    /// no longer satisfied.
+    NonFinal,
 }
 
 impl EvictReason {
@@ -40,6 +44,7 @@ impl EvictReason {
             EvictReason::Expiry => "expiry",
             EvictReason::BlockConflict => "block_conflict",
             EvictReason::Policy => "policy",
+            EvictReason::NonFinal => "non_final",
         }
     }
 }

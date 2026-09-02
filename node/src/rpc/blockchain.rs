@@ -149,6 +149,44 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     })
 }
 
+/// `getdeploymentinfo` — report the activation status of buried softfork
+/// deployments.
+///
+/// Core models both BIP 9 (versionbits) and buried (height-gated)
+/// deployments. satd has no BIP 9 deployments — everything is buried — so
+/// the output is a static map of `{ name: { type, active, height } }`.
+///
+/// `active` follows Core's rule: a buried deployment is active for the
+/// *next* block, i.e. `tip_height + 1 >= activation_height`.
+pub fn get_deployment_info(chain_state: &ChainState) -> Value {
+    let tip_height = chain_state.tip_height();
+    let next_height = tip_height + 1;
+    let heights = crate::validation::script::activation_heights(chain_state.network);
+
+    // Helper: one deployment object.
+    let buried = |height: u32| -> Value {
+        json!({
+            "type": "buried",
+            "active": next_height >= height.max(1),
+            "height": height,
+        })
+    };
+
+    let mut map = serde_json::Map::new();
+    map.insert("bip34".to_string(), buried(heights.bip34));
+    map.insert("dersig".to_string(), buried(heights.dersig));
+    map.insert("cltv".to_string(), buried(heights.cltv));
+    map.insert("csv".to_string(), buried(heights.csv));
+    map.insert("segwit".to_string(), buried(heights.segwit));
+    map.insert("taproot".to_string(), buried(heights.taproot));
+
+    json!({
+        "deployments": map,
+        "hash": chain_state.tip_hash().to_string(),
+        "height": tip_height,
+    })
+}
+
 /// `getchainstates` — Core 27+ RPC describing the active chainstate(s).
 ///
 /// A node with no loaded AssumeUTXO snapshot runs a single, fully

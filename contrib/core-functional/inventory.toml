@@ -62,8 +62,7 @@ note = "the framework skipped it; re-triage when the run-set grows"
 
 [[test]]
 file = "feature_bip68_sequence.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "feature_block.py"

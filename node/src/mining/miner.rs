@@ -27,8 +27,6 @@ pub fn mine_block(
     mempool: &Mempool,
     address: &str,
 ) -> Result<Block, MineError> {
-    let template = create_template(chain_state, mempool);
-
     // Parse address and get script_pubkey
     let addr: Address<bitcoin::address::NetworkUnchecked> = address
         .parse()
@@ -38,7 +36,16 @@ pub fn mine_block(
         .require_network(chain_state.network)
         .map_err(|e| MineError::BadAddress(format!("{}", e)))?;
 
-    let coinbase_script = addr.script_pubkey();
+    mine_block_to_script(chain_state, mempool, &addr.script_pubkey())
+}
+
+/// Mine a single block on regtest, paying the coinbase to the given script.
+pub fn mine_block_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: &ScriptBuf,
+) -> Result<Block, MineError> {
+    let template = create_template(chain_state, mempool);
 
     // Build coinbase transaction
     let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
@@ -148,6 +155,21 @@ pub fn mine_blocks(
     let mut hashes = Vec::new();
     for _ in 0..count {
         let block = mine_block(chain_state, mempool, address)?;
+        hashes.push(block.block_hash().to_string());
+    }
+    Ok(hashes)
+}
+
+/// Mine multiple blocks to a script, returning their hashes.
+pub fn mine_blocks_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    script: &ScriptBuf,
+    count: u32,
+) -> Result<Vec<String>, MineError> {
+    let mut hashes = Vec::new();
+    for _ in 0..count {
+        let block = mine_block_to_script(chain_state, mempool, script)?;
         hashes.push(block.block_hash().to_string());
     }
     Ok(hashes)

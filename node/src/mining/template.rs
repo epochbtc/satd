@@ -187,6 +187,15 @@ fn assemble_template(
             if total_weight + entry.weight > MAX_BLOCK_WEIGHT {
                 continue; // weight only grows; this can never fit later
             }
+            // Skip transactions whose effective fee is non-positive (a
+            // negative `prioritisetransaction` delta can drive the fee to
+            // zero). Core's miner does not include zero-fee transactions
+            // in the template and tests rely on `prioritisetransaction`
+            // with a negative delta to keep a tx out of the next block.
+            let effective_fee = (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64;
+            if effective_fee == 0 {
+                continue;
+            }
             total_weight += entry.weight;
             total_fees += entry.fee;
             included.insert(txid);

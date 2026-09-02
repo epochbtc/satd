@@ -2407,6 +2407,143 @@ impl Mempool {
         }
     }
 
+    /// Evict mempool transactions whose BIP68 sequence locks are no
+    /// longer met against the current chain tip. Called after a reorg or
+    /// `invalidateblock`: a previously-confirmed parent may now be
+    /// unconfirmed, turning a child's satisfied sequence lock into an
+    /// unsatisfied one.
+    ///
+    /// Core does this in `DisconnectedBlockTransactions::UpdateMempoolForReorg`
+    /// via `CheckFinalTxAtTip` + `CheckSequenceLocksAtTip`. This is the
+    /// satd equivalent: walk every mempool entry, resolve each input, and
+    /// re-check BIP68. Evicted txids are emitted as
+    /// `LeaveEvicted { NonFinal }`.
+    pub fn remove_non_final(
+        &self,
+        chain_state: &crate::chain::state::ChainState,
+    ) {
+        let next_height = chain_state.tip_height() + 1;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
+        let mut to_evict: Vec<Txid> = Vec::new();
+        {
+            let inner = self.inner.read();
+            for (txid, entry) in &inner.entries {
+                // Absolute finality (locktime).
+                let locktime = entry.tx.lock_time.to_consensus_u32();
+                if locktime > 0
+                    && !entry
+                        .tx
+                        .input
+                        .iter()
+                        .all(|i| i.sequence == bitcoin::Sequence::MAX)
+                {
+                    let cutoff = if locktime < 500_000_000 {
+                        next_height
+                    } else {
+                        tip_mtp
+                    };
+                    if locktime >= cutoff {
+                        to_evict.push(*txid);
+                        continue;
+                    }
+                }
+
+                // BIP 68.
+                let bip68_enforced = (entry.tx.version.0 as u32) >= 2;
+                if !bip68_enforced {
+                    continue;
+                }
+                let mut evict = false;
+                for input in &entry.tx.input {
+                    if input.sequence == bitcoin::Sequence::MAX {
+                        continue;
+                    }
+                    // Determine the prevout's confirmation height.
+                    let prev_height = if let Some(coin) =
+                        chain_state.get_coin(&input.previous_output)
+                    {
+                        coin.height
+                    } else if inner.entries.contains_key(&input.previous_output.txid) {
+                        // Unconfirmed parent: treat as confirming at
+                        // next_height (mempool-height convention).
+                        next_height
+                    } else {
+                        // Input is gone entirely; tx is unminable.
+                        evict = true;
+                        break;
+                    };
+                    if !Self::bip68_satisfied(
+                        chain_state,
+                        input.sequence.0,
+                        prev_height,
+                        next_height,
+                        tip_mtp,
+                    ) {
+                        evict = true;
+                        break;
+                    }
+                }
+                if evict {
+                    to_evict.push(*txid);
+                }
+            }
+        }
+
+        if to_evict.is_empty() {
+            return;
+        }
+
+        // Also collect descendants of evicted txs, since their inputs
+        // will be missing.
+        let mut all_evict: std::collections::HashSet<Txid> = std::collections::HashSet::new();
+        {
+            let inner = self.inner.read();
+            // Iteratively expand: any tx spending an evicted tx is also evicted.
+            let mut frontier: Vec<Txid> = to_evict.clone();
+            while let Some(parent) = frontier.pop() {
+                if !all_evict.insert(parent) {
+                    continue;
+                }
+                for (child_txid, child_entry) in &inner.entries {
+                    if all_evict.contains(child_txid) {
+                        continue;
+                    }
+                    if child_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.previous_output.txid == parent)
+                    {
+                        frontier.push(*child_txid);
+                    }
+                }
+            }
+        }
+
+        // Evict.
+        {
+            let mut inner = self.inner.write();
+            for txid in &all_evict {
+                if let Some(entry) = inner.entries.remove(txid) {
+                    let sz = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.account_remove(entry.scope, sz);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    inner.unbroadcast.remove(txid);
+                }
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+        for txid in &all_evict {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::NonFinal,
+            });
+        }
+    }
+
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().entries.get(txid).cloned()

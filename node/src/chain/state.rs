@@ -6219,6 +6219,13 @@ impl ChainState {
                     }
                 }
             }
+
+            // After re-adding disconnected-block txs, evict any mempool
+            // entries whose BIP68 sequence locks or absolute locktimes are
+            // no longer satisfied against the new tip. A parent that was
+            // confirmed before the reorg is now unconfirmed, so a child's
+            // relative lock on it may be unmet.
+            mempool.remove_non_final(self);
         }
 
         // Reorg chain-event emission is deferred until here — past
@@ -7402,6 +7409,12 @@ impl ChainState {
                     );
                 }
             }
+
+            // Evict mempool entries whose BIP68 or absolute locks are no
+            // longer satisfied against the new tip. Same reasoning as the
+            // accept_block reorg path; this is the invalidateblock /
+            // reconsiderblock equivalent.
+            mempool.remove_non_final(self);
         }
 
         // Chain events, in the canonical order (Reorg marker → disconnect
