@@ -6407,10 +6407,10 @@ impl ConfigFile {
             } else {
                 datadir.join(&rel)
             };
-            let mut included = ConfigFile::parse_file(&inc_path).map_err(|_e| {
+            let mut included = ConfigFile::parse_file(&inc_path).map_err(|e| {
                 format!(
                     "Error reading configuration file: \
-                     includeconf: failed to include {rel}"
+                     includeconf: failed to include {rel}: {e}"
                 )
             })?;
             // No recursion: drain any includeconf the included file
