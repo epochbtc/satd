@@ -286,10 +286,10 @@ pub fn named_to_positional(
     params: Map<String, Value>,
 ) -> Result<Vec<Value>, ErrorObjectOwned> {
     // By value: both callers own the map and drop it immediately after, so a
-    // clone here only doubled peak memory. `max_request_body_size` is 10 MiB by
-    // default, and a body of nothing but array elements expands to an order of
-    // magnitude more `Value` tree than that -- duplicated, once per concurrent
-    // connection, for nothing.
+    // clone here only doubled peak memory. `max_request_body_size` is
+    // `RPC_MAX_BODY_SIZE`, and a body of nothing but array elements expands to
+    // an order of magnitude more `Value` tree than that -- duplicated, once per
+    // concurrent connection, for nothing.
     let mut args_in = params;
     let mut out: Vec<Value> = Vec::with_capacity(specs.len());
 

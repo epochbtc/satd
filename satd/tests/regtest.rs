@@ -233,16 +233,16 @@ fn test_rpc_accepts_jsonrpc_1_0_and_missing_version() {
 /// The JSON-RPC compatibility shim buffers the request body to rewrite
 /// the `jsonrpc` member, so it must enforce the size cap *while* reading
 /// — never allocate an arbitrarily large body first. An over-cap request
-/// (here ~11 MiB, above the 10 MiB limit) must be rejected with `413
-/// Payload Too Large` and must not hang or OOM the daemon. Regression
-/// guard for the round-1 review finding on `compat.rs`.
+/// (here ~21 MiB, above the 20 MiB `RPC_MAX_BODY_SIZE`) must be rejected
+/// with `413 Payload Too Large` and must not hang or OOM the daemon.
+/// Regression guard for the round-1 review finding on `compat.rs`.
 #[test]
 fn test_rpc_oversized_body_rejected_413() {
     let mut node = TestNode::start(&[]);
-    // 11 MiB of filler inside an otherwise-valid-looking request. The
-    // body exceeds the 10 MiB cap, so it is rejected before the full
+    // 21 MiB of filler inside an otherwise-valid-looking request. The
+    // body exceeds the 20 MiB cap, so it is rejected before the full
     // body is materialized for normalization.
-    let big = "a".repeat(11 * 1024 * 1024);
+    let big = "a".repeat(21 * 1024 * 1024);
     let body = format!(
         r#"{{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":["{big}"]}}"#
     );
