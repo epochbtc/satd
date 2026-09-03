@@ -2365,12 +2365,12 @@ impl Config {
         let limitancestorcount = cli
             .limitancestorcount
             .or_else(|| file_get("limitancestorcount").and_then(|v| v.parse().ok()))
-            .unwrap_or(64);
+            .unwrap_or(25);
 
         let limitdescendantcount = cli
             .limitdescendantcount
             .or_else(|| file_get("limitdescendantcount").and_then(|v| v.parse().ok()))
-            .unwrap_or(64);
+            .unwrap_or(25);
 
         let mempoolexpiry = cli
             .mempoolexpiry
