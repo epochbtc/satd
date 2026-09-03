@@ -970,42 +970,84 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("generateblock", |params, ctx, _extensions| {
+    module.register_method("generatetodescriptor", |params, ctx, _extensions| {
         let mut seq = params.sequence();
-        let address: String = seq
+        let nblocks: u32 = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Core's `transactions` and `submit` are not implemented. Accepting and
-        // ignoring them is not a tolerable failure mode for either: `submit`
-        // false asks for a block to be built and NOT connected, and answering
-        // by mining and connecting it advances the chain the caller was told
-        // would not move — a test that asserts on the tip afterwards is then
-        // asserting against state it did not create. `transactions` asks for a
-        // specific block body and satd always builds from the mempool. Refuse
-        // both, so the gap is visible instead of silently wrong. (Ignoring them
-        // predates named parameters — a positional caller hit it too — but
-        // named arguments are how Core's own suite passes them.)
-        let transactions = seq.optional_next::<Vec<serde_json::Value>>();
-        let transactions_ok = matches!(&transactions, Ok(None))
-            || matches!(&transactions, Ok(Some(v)) if v.is_empty());
-        if !transactions_ok {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: the 'transactions' argument is not supported by satd; \
-                 the block is built from the mempool",
-                None::<()>,
-            ));
-        }
-        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: submit=false is not supported by satd; \
-                 a generated block is always submitted",
-                None::<()>,
-            ));
-        }
-        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("generateblock", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let output: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let raw_txs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
+        let submit: bool = seq.optional_next().unwrap_or(None).unwrap_or(true);
+
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
+            return Err(ErrorObjectOwned::owned(
+                -1, "generateblock is only available in regtest mode", None::<()>,
+            ));
+        }
+
+        let coinbase_script = crate::rpc::descriptor::parse_descriptor(&output, ctx.chain_state.network)
+            .or_else(|_| {
+                let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output.parse()
+                    .map_err(|e| format!("{e}"))?;
+                let addr = addr.require_network(ctx.chain_state.network)
+                    .map_err(|e| format!("{e}"))?;
+                Ok::<_, String>(addr.script_pubkey())
+            })
+            .map_err(|e| ErrorObjectOwned::owned(-5, format!("Invalid address or descriptor: {e}"), None::<()>))?;
+
+        let explicit_txs = if let Some(raw) = raw_txs {
+            let mut txs = Vec::new();
+            for item in &raw {
+                let hex = item.as_str().ok_or_else(|| {
+                    ErrorObjectOwned::owned(-1, "transaction must be a string", None::<()>)
+                })?;
+                if hex.len() == 64 {
+                    let txid: bitcoin::Txid = hex.parse()
+                        .map_err(|_| ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>))?;
+                    let entry = ctx.mempool.get(&txid)
+                        .ok_or_else(|| ErrorObjectOwned::owned(-5, format!("Transaction {txid} not in mempool."), None::<()>))?;
+                    txs.push(entry.tx.clone());
+                } else {
+                    let tx_bytes = hex::decode(hex)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    txs.push(tx);
+                }
+            }
+            Some(txs)
+        } else {
+            None
+        };
+
+        let block = crate::mining::miner::build_block_to_script(
+            &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,
+        ).map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        let hash = block.block_hash().to_string();
+
+        if submit {
+            let acceptance = ctx.chain_state.accept_block(&block)
+                .map_err(|e| ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>))?;
+            if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
+                ctx.mempool.remove_for_block(&block, height);
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({ "hash": hash }))
+        } else {
+            let hex = hex::encode(bitcoin::consensus::serialize(&block));
+            Ok(serde_json::json!({ "hash": hash, "hex": hex }))
+        }
     })?;
 
     module.register_method("getblocktemplate", |_params, ctx, _extensions| {
@@ -1013,7 +1055,7 @@ pub async fn start(
     })?;
 
     module.register_method("getmininginfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state))
+        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state, &ctx.mempool))
     })?;
 
     module.register_method("getnetworkhashps", |params, ctx, _extensions| {
@@ -1214,8 +1256,10 @@ pub async fn start(
                 .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": true,
                         "vsize": vsize,
                         "fees": {
@@ -1225,8 +1269,10 @@ pub async fn start(
                 }
                 Err(e) => {
                     let txid = tx.compute_txid();
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": false,
                         "reject-reason": e.to_string(),
                     }));
@@ -1565,13 +1611,20 @@ pub async fn start(
         let command: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let addr: std::net::SocketAddr =
-            addr_str.parse().map_err(|e: std::net::AddrParseError| {
-                ErrorObjectOwned::owned(-1, e.to_string(), None::<()>)
-            })?;
+        let ip: std::net::IpAddr = if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+            ip
+        } else if let Ok(sa) = addr_str.parse::<std::net::SocketAddr>() {
+            sa.ip()
+        } else {
+            return Err(ErrorObjectOwned::owned(
+                -30,
+                format!("Error: Invalid IP/Subnet: {addr_str}"),
+                None::<()>,
+            ));
+        };
         match command.as_str() {
-            "add" => ctx.peer_manager.set_ban(addr, true),
-            "remove" => ctx.peer_manager.set_ban(addr, false),
+            "add" => ctx.peer_manager.set_ban(ip, true),
+            "remove" => ctx.peer_manager.set_ban(ip, false),
             _ => return Err(ErrorObjectOwned::owned(-1, "Invalid command", None::<()>)),
         }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
@@ -1656,7 +1709,34 @@ pub async fn start(
 
     // --- Control RPCs ---
 
-    module.register_method("help", |_params, _ctx, _extensions| {
+    module.register_method("generate", |_params, _ctx, _extensions| {
+        Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
+            -32601,
+            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n",
+            None::<()>,
+        ))
+    })?;
+
+    module.register_method("echo", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        if args.len() >= 10
+            && let Some(serde_json::Value::String(s)) = args.last()
+            && s == "trigger_internal_bug"
+        {
+            let msg = "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\"";
+            return Err(ErrorObjectOwned::owned(-1, msg, None::<()>));
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("echojson", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("help", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let command: Option<String> = seq.optional_next().unwrap_or(None);
         let methods = vec![
             "addnode",
             "clearbanned",
@@ -1664,10 +1744,13 @@ pub async fn start(
             "decodescript",
             "disconnectnode",
             "dumptxoutset",
+            "echo",
+            "echojson",
             "estimatefees",
             "estimatesmartfee",
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "getaddednodeinfo",
             "getbestblockhash",
             "getblock",
@@ -1728,9 +1811,26 @@ pub async fn start(
             "testmempoolaccept",
             "unsubscribemempool",
             "uptime",
+            "validateaddress",
             "verifychain",
         ];
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        if let Some(cmd) = command {
+            if cmd == "generate" {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(
+                    "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+                ))
+            } else if cmd.is_empty() || methods.contains(&cmd.as_str()) {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")))
+            } else {
+                Err(ErrorObjectOwned::owned(
+                    -1,
+                    format!("help: unknown command: {cmd}"),
+                    None::<()>,
+                ))
+            }
+        } else {
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        }
     })?;
 
     // Core's version blocks until its serialized validation-callback queue has
@@ -2255,6 +2355,8 @@ pub async fn start(
     // jsonrpsee's library default.
     let server_cfg = ServerConfig::builder()
         .max_connections(RPC_MAX_CONNECTIONS)
+        .max_request_body_size(32 * 1024 * 1024)
+        .max_response_body_size(32 * 1024 * 1024)
         .build();
     // Methods is Arc-backed and cheap to clone — one copy is consumed
     // by each per-bind `Server::start()` call below, plus one to feed

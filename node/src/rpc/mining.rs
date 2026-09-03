@@ -1,6 +1,7 @@
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
+use crate::rpc::descriptor::parse_descriptor;
 use crate::storage::blockindex::target_to_difficulty;
 use serde_json::{json, Value};
 
@@ -66,6 +67,29 @@ pub fn generate_to_address(
     }
 
     let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks)
+        .map_err(|e| match &e {
+            crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
+            _ => (-1, e.to_string()),
+        })?;
+
+    Ok(json!(hashes))
+}
+
+/// Handle the `generatetodescriptor` RPC call (regtest only).
+pub fn generate_to_descriptor(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    nblocks: u32,
+    descriptor: &str,
+) -> Result<Value, (i32, String)> {
+    if chain_state.network != bitcoin::Network::Regtest {
+        return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
+    }
+
+    let script = parse_descriptor(descriptor, chain_state.network)
+        .map_err(|e| (-8, e))?;
+
+    let hashes = crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks)
         .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))
@@ -162,7 +186,7 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
 }
 
 /// `getmininginfo` — return mining-related info.
-pub fn get_mining_info(chain_state: &ChainState) -> Value {
+pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     // One read -- see `ChainState::tip_snapshot`.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
     let difficulty = if let Some(entry) = chain_state.get_block_index(&tip_hash) {
@@ -180,14 +204,30 @@ pub fn get_mining_info(chain_state: &ChainState) -> Value {
         bitcoin::Network::Bitcoin => "main",
     };
 
-    json!({
+    let pooledtx = mempool.info().size;
+
+    let mut out = json!({
         "blocks": tip_height,
         "difficulty": difficulty,
         "networkhashps": hashps,
-        "pooledtx": 0,
+        "pooledtx": pooledtx,
         "chain": chain,
         "warnings": "",
-    })
+    });
+
+    // `currentblocktx` / `currentblockweight` describe the last template that
+    // was actually assembled, and are absent until one has been. Core reads
+    // them straight off `BlockAssembler::m_last_block_num_txs` /
+    // `m_last_block_weight` and pushes each key only when set — it does not
+    // assemble a template to answer `getmininginfo`, and neither should we:
+    // this is a hot `Read` RPC that monitoring polls, and assembling walks
+    // the whole mempool.
+    if let Some((num_txs, weight)) = crate::mining::template::last_block_stats() {
+        out["currentblocktx"] = json!(num_txs);
+        out["currentblockweight"] = json!(weight);
+    }
+
+    out
 }
 
 /// `getnetworkhashps` — estimate network hash rate from recent blocks.

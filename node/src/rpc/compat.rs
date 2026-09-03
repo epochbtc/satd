@@ -430,7 +430,17 @@ where
         // completion; `self.inner` stays ready for the next call).
         let mut inner = self.inner.clone();
         Box::pin(async move {
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
+
+            // Core does not require a Content-Type header on RPC requests;
+            // jsonrpsee does (`application/json`). Add a default when the
+            // client omitted it, matching Core's leniency.
+            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
+                parts.headers.insert(
+                    hyper::header::CONTENT_TYPE,
+                    hyper::header::HeaderValue::from_static("application/json"),
+                );
+            }
 
             // Reject before reading a byte if the declared length already
             // exceeds the cap. Covers the common DoS shape (a client

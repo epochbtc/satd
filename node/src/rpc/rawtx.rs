@@ -46,88 +46,12 @@ pub fn get_raw_mempool(mempool: &Mempool, verbose: bool) -> Value {
         return json!(txids);
     }
 
-    // Local lookup so ancestor/descendant rollups don't re-lock the
-    // mempool per hop. Single snapshot → O(N) verbose build instead of
-    // O(N) RwLock re-entries.
-    let entry_map: std::collections::HashMap<bitcoin::Txid, (usize, u64)> = entries
-        .iter()
-        .map(|(txid, e)| (*txid, (e.weight, e.fee)))
-        .collect();
-
     let mut result = serde_json::Map::new();
-    let unit = default_unit();
-    for (txid, entry) in &entries {
-        let vsize = if entry.weight > 0 {
-            entry.weight.div_ceil(4)
-        } else {
-            0
-        };
-        let fee = format_amount(entry.fee, unit);
-
-        // Restrict the graph to the acting class (`entry_map` keys): an acting
-        // tx never has a quarantined ancestor (§3 infectious propagation) but
-        // can have a quarantined descendant, so filter both to keep the counts
-        // invisible to the quarantine class.
-        let ancestors: std::collections::HashSet<bitcoin::Txid> = mempool
-            .get_ancestors(txid)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| entry_map.contains_key(a))
-            .collect();
-        let descendants: std::collections::HashSet<bitcoin::Txid> = mempool
-            .get_descendants(txid)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|d| entry_map.contains_key(d))
-            .collect();
-
-        let ancestor_count = ancestors.len() + 1;
-        let ancestor_size: usize = ancestors
-            .iter()
-            .filter_map(|a| entry_map.get(a))
-            .map(|(w, _)| if *w > 0 { w.div_ceil(4) } else { 0 })
-            .sum::<usize>()
-            + vsize;
-        let ancestor_fees: u64 = ancestors
-            .iter()
-            .filter_map(|a| entry_map.get(a))
-            .map(|(_, f)| *f)
-            .sum::<u64>()
-            + entry.fee;
-
-        let descendant_count = descendants.len() + 1;
-        let descendant_size: usize = descendants
-            .iter()
-            .filter_map(|d| entry_map.get(d))
-            .map(|(w, _)| if *w > 0 { w.div_ceil(4) } else { 0 })
-            .sum::<usize>()
-            + vsize;
-        let descendant_fees: u64 = descendants
-            .iter()
-            .filter_map(|d| entry_map.get(d))
-            .map(|(_, f)| *f)
-            .sum::<u64>()
-            + entry.fee;
-
-        result.insert(
-            txid.to_string(),
-            json!({
-                "vsize": vsize,
-                "weight": entry.weight,
-                "time": entry.time,
-                "fees": {
-                    "base": fee,
-                },
-                "ancestorcount": ancestor_count,
-                "ancestorsize": ancestor_size,
-                "ancestorfees": ancestor_fees,
-                "descendantcount": descendant_count,
-                "descendantsize": descendant_size,
-                "descendantfees": descendant_fees,
-            }),
-        );
+    for (txid, _entry) in &entries {
+        if let Some(verbose) = mempool.get_entry_verbose(txid) {
+            result.insert(txid.to_string(), verbose);
+        }
     }
-
     Value::Object(result)
 }
 
@@ -255,9 +179,19 @@ pub(crate) fn decode_transaction_verbose(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,
     block_height: Option<u32>,
+    confirmations: Option<i64>,
+) -> Value {
+    decode_transaction_verbose_net(tx, blockhash, block_height, confirmations, None)
+}
+
+pub(crate) fn decode_transaction_verbose_net(
+    tx: &bitcoin::Transaction,
+    blockhash: Option<&str>,
+    block_height: Option<u32>,
     // Signed: Core reports -1 for a transaction in a block that is not on the
     // active chain, the same convention as the block's own `confirmations`.
     confirmations: Option<i64>,
+    network: Option<bitcoin::Network>,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
@@ -302,14 +236,19 @@ pub(crate) fn decode_transaction_verbose(
         .enumerate()
         .map(|(n, output)| {
             let value = format_amount(output.value.to_sat(), unit);
+            let mut spk = serde_json::json!({
+                "asm": format!("{}", output.script_pubkey),
+                "hex": hex::encode(output.script_pubkey.as_bytes()),
+                "type": script_type(&output.script_pubkey),
+            });
+            if let Some(net) = network
+                && let Ok(addr) = bitcoin::Address::from_script(output.script_pubkey.as_script(), net) {
+                    spk["address"] = serde_json::Value::String(addr.to_string());
+            }
             json!({
                 "value": value,
                 "n": n,
-                "scriptPubKey": {
-                    "asm": format!("{}", output.script_pubkey),
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                    "type": script_type(&output.script_pubkey),
-                },
+                "scriptPubKey": spk,
             })
         })
         .collect();

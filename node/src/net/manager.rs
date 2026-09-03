@@ -98,6 +98,10 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+
+/// Maximum entries in a getheaders/getblocks locator. Core disconnects
+/// peers that exceed this (net_processing.cpp `MAX_LOCATOR_SZ`).
+const MAX_LOCATOR_SZ: usize = 101;
 /// How long a `getblockfrompeer` request stays armed. A block arriving after
 /// this window is treated as an ordinary unsolicited block rather than a
 /// repair, so a peer that answers minutes late cannot divert a block the
@@ -296,7 +300,7 @@ pub struct PeerManager {
     /// host) would be hot-dialed every 10s with no backoff.
     onion_reconnect_backoff: RwLock<HashMap<String, ReconnectState>>,
     /// Banned addresses with ban expiry time.
-    banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
+    banned_addrs: RwLock<HashMap<std::net::IpAddr, Instant>>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
     #[allow(dead_code)]
     fee_estimator: Arc<FeeEstimator>,
@@ -1607,10 +1611,11 @@ impl PeerManager {
         banned
             .iter()
             .filter(|(_, expiry)| now < **expiry)
-            .map(|(addr, expiry)| {
+            .map(|(ip, expiry)| {
                 let remaining = expiry.duration_since(now).as_secs();
+                let mask = if ip.is_ipv4() { 32 } else { 128 };
                 serde_json::json!({
-                    "address": addr.to_string(),
+                    "address": format!("{ip}/{mask}"),
                     "ban_created": 0,
                     "banned_until": remaining,
                     "ban_duration": self.ban_duration_secs.load(Ordering::Relaxed),
@@ -1621,14 +1626,23 @@ impl PeerManager {
     }
 
     /// Manually ban or unban an address.
-    pub fn set_ban(&self, addr: SocketAddr, ban: bool) {
+    pub fn set_ban(&self, ip: std::net::IpAddr, ban: bool) {
         if ban {
             self.banned_addrs
                 .write()
-                
-                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                .insert(ip, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+            let to_drop: Vec<PeerId> = self
+                .peers
+                .read()
+                .iter()
+                .filter(|(_, h)| h.info.addr.ip() == ip)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in to_drop {
+                self.disconnect_by_id(id);
+            }
         } else {
-            self.banned_addrs.write().remove(&addr);
+            self.banned_addrs.write().remove(&ip);
         }
     }
 
@@ -1774,7 +1788,7 @@ impl PeerManager {
     /// Check if an address is currently banned.
     fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
         let banned = self.banned_addrs.read();
-        matches!(banned.get(addr), Some(expiry) if Instant::now() < *expiry)
+        matches!(banned.get(&addr.ip()), Some(expiry) if Instant::now() < *expiry)
     }
 
     /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
@@ -1791,7 +1805,7 @@ impl PeerManager {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                (true, Some(handle.info.addr))
+                (true, Some(handle.info.addr.ip()))
             } else {
                 tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
                 (false, None)
@@ -1808,12 +1822,11 @@ impl PeerManager {
             if let Some(handle) = peers.remove(&id) {
                 handle.disconnect.notify_one();
             }
-            if let Some(addr) = ban_addr {
-                drop(peers); // release peers lock before acquiring banned_addrs lock
+            if let Some(ip) = ban_addr {
+                drop(peers);
                 self.banned_addrs
                     .write()
-                    
-                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                    .insert(ip, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
             }
         }
     }
@@ -2257,6 +2270,9 @@ impl PeerManager {
             }
             NetworkMessage::GetHeaders(msg) => {
                 self.handle_getheaders(id, msg);
+            }
+            NetworkMessage::GetBlocks(msg) => {
+                self.handle_getblocks(id, msg);
             }
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
@@ -5309,6 +5325,11 @@ impl PeerManager {
         id: PeerId,
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
         let mut start_height = None;
         for hash in &msg.locator_hashes {
             if let Some(entry) = self.chain_state.get_block_index(hash) {
@@ -5334,6 +5355,43 @@ impl PeerManager {
         // versions track silent-drops as soft misbehavior. Empty reply
         // signals "I have nothing newer than your locator."
         self.send_to_peer(id, NetworkMessage::Headers(headers));
+    }
+
+    fn handle_getblocks(
+        &self,
+        id: PeerId,
+        msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
+    ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
+        let mut start_height = None;
+        for hash in &msg.locator_hashes {
+            if let Some(entry) = self.chain_state.get_block_index(hash) {
+                start_height = Some(entry.height + 1);
+                break;
+            }
+        }
+
+        let start = start_height.unwrap_or(0);
+        let tip = self.chain_state.tip_height();
+        let end = std::cmp::min(start + 500, tip + 1);
+
+        let mut inv = Vec::new();
+        for h in start..end {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
+                inv.push(Inventory::Block(hash));
+                if hash == msg.stop_hash {
+                    break;
+                }
+            }
+        }
+
+        if !inv.is_empty() {
+            self.send_to_peer(id, NetworkMessage::Inv(inv));
+        }
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {

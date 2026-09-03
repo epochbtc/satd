@@ -27,9 +27,6 @@ pub fn mine_block(
     mempool: &Mempool,
     address: &str,
 ) -> Result<Block, MineError> {
-    let template = create_template(chain_state, mempool);
-
-    // Parse address and get script_pubkey
     let addr: Address<bitcoin::address::NetworkUnchecked> = address
         .parse()
         .map_err(|e| MineError::BadAddress(format!("{}", e)))?;
@@ -38,21 +35,47 @@ pub fn mine_block(
         .require_network(chain_state.network)
         .map_err(|e| MineError::BadAddress(format!("{}", e)))?;
 
-    let coinbase_script = addr.script_pubkey();
+    mine_block_to_script(chain_state, mempool, addr.script_pubkey())
+}
 
-    // Build coinbase transaction
-    let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
+/// Build and solve a block paying to the given output script. Does NOT submit.
+pub fn build_block_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+    txs: Option<Vec<Transaction>>,
+) -> Result<Block, MineError> {
+    let template = create_template(chain_state, mempool);
 
-    // Assemble non-coinbase transactions
-    let other_txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();
+    // When the caller supplies the transaction list, the template's fee
+    // total no longer describes the block being built: those fees belong to
+    // mempool transactions that are not going in. Claiming them over-claims
+    // the coinbase, and `connect_block` rejects the result `bad-cb-amount`
+    // — so `generateblock` would fail on any node whose mempool holds a
+    // fee-paying transaction.
+    //
+    // Core sidesteps this by building `generateblock`'s template with
+    // `use_mempool = false` (`src/rpc/mining.cpp`), so its coinbase carries
+    // the subsidy alone before the caller's transactions are appended; the
+    // fees those transactions pay are simply not claimed. Match that.
+    let (other_txs, coinbase_value) = match txs {
+        Some(explicit) => (
+            explicit,
+            crate::chain::connect::block_subsidy(chain_state.network, template.height),
+        ),
+        None => (
+            template.transactions.iter().map(|t| t.tx.clone()).collect(),
+            template.coinbase_value,
+        ),
+    };
 
-    // Check if any transaction has witness data
+    let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
+
     let has_witness = other_txs.iter().any(|tx| {
         tx.input.iter().any(|i| !i.witness.is_empty())
     });
 
     if has_witness {
-        // Compute witness commitment (BIP 141)
         let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
         let witness_nonce = [0u8; 32];
         let mut commitment_preimage = [0u8; 64];
@@ -60,7 +83,6 @@ pub fn mine_block(
         commitment_preimage[32..].copy_from_slice(&witness_nonce);
         let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
 
-        // Add witness commitment output to coinbase
         let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
         commitment_script.extend_from_slice(&commitment.to_byte_array());
         coinbase_tx.output.push(TxOut {
@@ -68,18 +90,14 @@ pub fn mine_block(
             script_pubkey: ScriptBuf::from_bytes(commitment_script),
         });
 
-        // Set coinbase witness to single 32-byte zero item
         coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
     }
 
-    // Assemble final transaction list
     let mut txdata = vec![coinbase_tx];
     txdata.extend(other_txs);
 
-    // Compute merkle root (uses txids, not wtxids)
     let merkle_root = compute_merkle_root(&txdata);
 
-    // Build header
     let mut header = Header {
         version: Version::from_consensus(template.version),
         prev_blockhash: template.prev_hash,
@@ -89,8 +107,6 @@ pub fn mine_block(
         nonce: 0,
     };
 
-    // Mine: increment nonce until PoW valid
-    // On regtest (0x207fffff), almost any nonce works
     loop {
         let target = header.target();
         match header.validate_pow(target) {
@@ -98,16 +114,23 @@ pub fn mine_block(
             Err(_) => {
                 header.nonce += 1;
                 if header.nonce == 0 {
-                    // Wrapped around — try different time
                     header.time += 1;
                 }
             }
         }
     }
 
-    let block = Block { header, txdata };
+    Ok(Block { header, txdata })
+}
 
-    // Accept the block
+/// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
+pub fn mine_block_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+) -> Result<Block, MineError> {
+    let block = build_block_to_script(chain_state, mempool, coinbase_script, None)?;
+
     let acceptance = chain_state
         .accept_block(&block)
         .map_err(|e| MineError::Rejected(e.to_string()))?;
@@ -148,6 +171,21 @@ pub fn mine_blocks(
     let mut hashes = Vec::new();
     for _ in 0..count {
         let block = mine_block(chain_state, mempool, address)?;
+        hashes.push(block.block_hash().to_string());
+    }
+    Ok(hashes)
+}
+
+/// Mine multiple blocks paying to an arbitrary output script, returning their hashes.
+pub fn mine_blocks_to_script(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    script: ScriptBuf,
+    count: u32,
+) -> Result<Vec<String>, MineError> {
+    let mut hashes = Vec::new();
+    for _ in 0..count {
+        let block = mine_block_to_script(chain_state, mempool, script.clone())?;
         hashes.push(block.block_hash().to_string());
     }
     Ok(hashes)
