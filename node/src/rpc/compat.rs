@@ -506,6 +506,43 @@ where
 /// always includes `"jsonrpc":"2.0"`. Core (JSON-RPC 1.0) always includes
 /// `"error":null` on success. Clients like Core's functional test suite
 /// assert `"error":null` is present in the byte stream.
+/// Whether the *request* explicitly spoke JSON-RPC 2.0.
+///
+/// The response normalization below rewrites replies into Core's 1.0 shape.
+/// That is right for Core-derived clients, which is what the compatibility
+/// surface exists for — but it must not be applied to a client that asked for
+/// 2.0. A 2.0 response is defined by its `jsonrpc` member, and 2.0 forbids
+/// carrying `result` and `error` together; handing a 2.0 client the 1.0 shape
+/// breaks strict parsers, jsonrpsee's own `http-client` (which this workspace
+/// ships and tests against) among them.
+///
+/// A batch counts as 2.0 only when *every* request object in it declares 2.0.
+fn request_declared_2_0(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    fn is_2_0(v: &serde_json::Value) -> Option<bool> {
+        let obj = v.as_object()?;
+        // Only request objects carry a verdict; anything else abstains.
+        obj.get("method")?;
+        Some(obj.get("jsonrpc").and_then(|j| j.as_str()) == Some("2.0"))
+    }
+    match &value {
+        serde_json::Value::Array(items) => {
+            let mut saw_request = false;
+            for item in items {
+                match is_2_0(item) {
+                    Some(true) => saw_request = true,
+                    Some(false) => return false,
+                    None => {}
+                }
+            }
+            saw_request
+        }
+        other => is_2_0(other).unwrap_or(false),
+    }
+}
+
 fn normalize_response_body_bytes(body: &[u8]) -> Vec<u8> {
     if body.is_empty() {
         return body.to_vec();

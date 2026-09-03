@@ -205,23 +205,29 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     };
 
     let pooledtx = mempool.info().size;
-    let template = create_template(chain_state, mempool);
-    let currentblocktx = template.transactions.len() as u64;
-    let currentblockweight: u64 = template.transactions.iter()
-        .map(|t| t.weight as u64)
-        .sum::<u64>()
-        + 8000; // Core's DEFAULT_BLOCK_RESERVED_WEIGHT for the coinbase
 
-    json!({
+    let mut out = json!({
         "blocks": tip_height,
         "difficulty": difficulty,
         "networkhashps": hashps,
         "pooledtx": pooledtx,
-        "currentblocktx": currentblocktx,
-        "currentblockweight": currentblockweight,
         "chain": chain,
         "warnings": "",
-    })
+    });
+
+    // `currentblocktx` / `currentblockweight` describe the last template that
+    // was actually assembled, and are absent until one has been. Core reads
+    // them straight off `BlockAssembler::m_last_block_num_txs` /
+    // `m_last_block_weight` and pushes each key only when set — it does not
+    // assemble a template to answer `getmininginfo`, and neither should we:
+    // this is a hot `Read` RPC that monitoring polls, and assembling walks
+    // the whole mempool.
+    if let Some((num_txs, weight)) = crate::mining::template::last_block_stats() {
+        out["currentblocktx"] = json!(num_txs);
+        out["currentblockweight"] = json!(weight);
+    }
+
+    out
 }
 
 /// `getnetworkhashps` — estimate network hash rate from recent blocks.

@@ -47,13 +47,29 @@ pub fn build_block_to_script(
 ) -> Result<Block, MineError> {
     let template = create_template(chain_state, mempool);
 
-    let other_txs: Vec<Transaction> = if let Some(explicit) = txs {
-        explicit
-    } else {
-        template.transactions.iter().map(|t| t.tx.clone()).collect()
+    // When the caller supplies the transaction list, the template's fee
+    // total no longer describes the block being built: those fees belong to
+    // mempool transactions that are not going in. Claiming them over-claims
+    // the coinbase, and `connect_block` rejects the result `bad-cb-amount`
+    // — so `generateblock` would fail on any node whose mempool holds a
+    // fee-paying transaction.
+    //
+    // Core sidesteps this by building `generateblock`'s template with
+    // `use_mempool = false` (`src/rpc/mining.cpp`), so its coinbase carries
+    // the subsidy alone before the caller's transactions are appended; the
+    // fees those transactions pay are simply not claimed. Match that.
+    let (other_txs, coinbase_value) = match txs {
+        Some(explicit) => (
+            explicit,
+            crate::chain::connect::block_subsidy(chain_state.network, template.height),
+        ),
+        None => (
+            template.transactions.iter().map(|t| t.tx.clone()).collect(),
+            template.coinbase_value,
+        ),
     };
 
-    let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
+    let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
 
     let has_witness = other_txs.iter().any(|tx| {
         tx.input.iter().any(|i| !i.witness.is_empty())
