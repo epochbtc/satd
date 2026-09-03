@@ -14,9 +14,17 @@ on:
 
 # Cancel superseded runs on the same PR. Avoids burning hosted-runner
 # minutes on stale commits when a contributor pushes rapid fixups.
+#
+# Cancellation is scoped to pull requests. Master pushes share one ref, so a
+# blanket `cancel-in-progress` made each merge cancel the post-merge
+# verification of the merge before it — and merges routinely land minutes
+# apart. The `seed-cache` job that runs on master is the only thing that
+# compiles master's tree after a merge, so cancelling it left breakage that no
+# PR run could see: a PR is tested as head-merged-into-base *at event time*,
+# which is a different tree from the one the next merge produces.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
