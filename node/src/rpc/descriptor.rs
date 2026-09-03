@@ -330,7 +330,11 @@ enum FullDescriptor {
         keys: Vec<DescKeyExpr>,
         sorted: bool,
     },
-    Addr(bitcoin::Address),
+    /// Held unchecked: the network is not known at parse time, so validation
+    /// happens in `expand`, which has it. Core gets this for free — its
+    /// `DecodeDestination` is chain-params-aware, so an address for another
+    /// network simply fails to decode and reports "Address is not valid".
+    Addr(bitcoin::Address<bitcoin::address::NetworkUnchecked>),
     Raw(ScriptBuf),
 }
 
@@ -633,7 +637,7 @@ fn parse_descriptor_expr(expr: &str, ctx: ParseCtx) -> Result<FullDescriptor, St
         let unchecked: Address<bitcoin::address::NetworkUnchecked> = inner
             .parse()
             .map_err(|_| "Address is not valid".to_string())?;
-        return Ok(FullDescriptor::Addr(unchecked.assume_checked()));
+        return Ok(FullDescriptor::Addr(unchecked));
     }
 
     // Single-key descriptors. `pk()` is legal in every context; the rest are
@@ -1139,7 +1143,17 @@ impl FullDescriptor {
                 }
                 Ok(vec![make_multisig_script(*threshold, &pubkeys)])
             }
-            FullDescriptor::Addr(a) => Ok(vec![a.script_pubkey()]),
+            FullDescriptor::Addr(a) => {
+                // The network check the previous parser did at parse time.
+                // Without it, `deriveaddresses("addr(<testnet address>)")` on
+                // mainnet re-encodes the payload as its mainnet twin and hands
+                // it back as a valid destination.
+                let checked = a
+                    .clone()
+                    .require_network(network)
+                    .map_err(|_| "Address is not valid".to_string())?;
+                Ok(vec![checked.script_pubkey()])
+            }
             FullDescriptor::Raw(s) => Ok(vec![s.clone()]),
         }
     }
@@ -1255,7 +1269,9 @@ impl FullDescriptor {
                     keys.iter().map(|k| k.to_public_string()).collect();
                 format!("{name}({threshold},{})", key_strs.join(","))
             }
-            FullDescriptor::Addr(a) => format!("addr({a})"),
+            // Re-rendering the descriptor is not the place to enforce the
+            // network — `expand` does that — so show the address as written.
+            FullDescriptor::Addr(a) => format!("addr({})", a.clone().assume_checked()),
             FullDescriptor::Raw(s) => format!("raw({})", hex::encode(s.as_bytes())),
         }
     }
@@ -1829,6 +1845,33 @@ mod tests {
     /// exhausts the stack, and a Rust stack overflow aborts the process — it
     /// is not a catchable panic, so there is no recovering from it on an RPC
     /// any read-only caller can reach.
+    /// Core's `addr()` decodes through `DecodeDestination`, which is
+    /// chain-params-aware — an address for another network is simply not
+    /// valid. Without the equivalent check `deriveaddresses` re-encodes the
+    /// payload as the *current* network's twin and returns it as a real
+    /// destination, which is a way to lose money.
+    #[test]
+    fn addr_descriptors_are_rejected_for_the_wrong_network() {
+        // A regtest/signet bech32 address must not resolve on mainnet.
+        let testnet_addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let err = parse_descriptor(&format!("addr({testnet_addr})"), Network::Bitcoin)
+            .expect_err("a testnet address must not be valid on mainnet");
+        assert!(err.contains("Address is not valid"), "{err}");
+
+        // And a mainnet address must not resolve on testnet.
+        let mainnet_addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let err = parse_descriptor(&format!("addr({mainnet_addr})"), Network::Testnet)
+            .expect_err("a mainnet address must not be valid on testnet");
+        assert!(err.contains("Address is not valid"), "{err}");
+
+        // The matching network still works, and yields that address's script.
+        let script = parse_descriptor(&format!("addr({mainnet_addr})"), Network::Bitcoin)
+            .expect("a mainnet address on mainnet");
+        let expected: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+            mainnet_addr.parse().unwrap();
+        assert_eq!(script, expected.assume_checked().script_pubkey());
+    }
+
     #[test]
     fn descriptor_nesting_is_bounded_by_context_like_core() {
         const K: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
