@@ -1858,9 +1858,9 @@ mod tests {
         );
         for (desc, want) in [
             (format!("wsh(sh(pkh({K})))"), "Can only have sh() at top level"),
-            (format!("sh(addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080))"),
+            ("sh(addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080))".to_string(),
              "Can only have addr() at top level"),
-            (format!("wsh(raw(51))"), "Can only have raw() at top level"),
+            ("wsh(raw(51))".to_string(), "Can only have raw() at top level"),
             (format!("sh(combo({K}))"), "Can only have combo() at top level"),
         ] {
             assert_eq!(parse_full_descriptor(&desc, false).unwrap_err(), want, "{desc}");
