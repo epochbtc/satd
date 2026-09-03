@@ -160,8 +160,20 @@ impl BanList {
         Ok(())
     }
 
-    /// Insert a ban entry. Returns `Err` if the address is already banned
-    /// (either exactly, or the IP falls within an existing subnet).
+    /// Insert a ban entry, or extend an existing one whose expiry is sooner.
+    ///
+    /// Core's `BanMan::Ban` is `if (m_banned[sub_net].nBanUntil < ban_entry
+    /// .nBanUntil) m_banned[sub_net] = ban_entry;` — a missing key
+    /// default-constructs with `nBanUntil = 0`, so a fresh ban always
+    /// inserts and a repeat ban extends. Refusing a duplicate *here*
+    /// instead broke the automatic path: `add_ban_score` discards the
+    /// error, `prune_expired` does not run on a node that is not looking
+    /// for peers, and so a peer whose ban had lapsed but whose entry was
+    /// still in the map could misbehave forever without being re-banned,
+    /// and sustained misbehaviour never extended an active ban.
+    ///
+    /// The operator-facing "already banned" refusal belongs to `setban`,
+    /// which is where Core checks it — see [`BanList::already_banned`].
     pub fn add(
         &mut self,
         target: &BanTarget,
@@ -170,28 +182,12 @@ impl BanList {
     ) -> Result<(), String> {
         let key = target.normalised();
 
-        // Check if already banned: exact match, or (for Net targets) IP is
-        // contained in an existing banned subnet.
-        if self.entries.contains_key(&key) {
-            return Err("IP/Subnet already banned".to_string());
-        }
-
-        // For single-host bans (/32 or /128): check if the IP falls
-        // within an existing banned subnet. Core only does this
-        // containment check for single hosts, not for subnet-to-subnet
-        // overlap, so banning both 127.0.0.0/32 and 127.0.0.0/24 is
-        // allowed.
-        if let BanTarget::Net(net) = target
-            && net.prefix_len() == net.max_prefix_len()
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|e| e.banned_until >= banned_until)
         {
-            let addr = net.addr();
-            for existing in self.entries.values() {
-                if let Ok(existing_net) = existing.address.parse::<IpNet>()
-                    && existing_net.contains(&addr)
-                {
-                    return Err("IP/Subnet already banned".to_string());
-                }
-            }
+            return Ok(());
         }
 
         self.entries.insert(
@@ -205,6 +201,33 @@ impl BanList {
 
         self.dump().map_err(|e| format!("failed to persist ban: {e}"))?;
         Ok(())
+    }
+
+    /// Core's `setban` duplicate check: expiry-aware, and sensitive to
+    /// whether the operator wrote CIDR notation.
+    ///
+    /// `src/rpc/net.cpp` does `isSubnet ? IsBanned(subNet) : IsBanned(netAddr)`.
+    /// A subnet argument therefore matches only an exact existing entry, while
+    /// a bare IP also matches any subnet containing it — which is why banning
+    /// `127.0.0.0/32` after `127.0.0.0/24` is allowed but banning the bare
+    /// `127.0.0.0` is not. Both forms skip expired entries, so a ban that has
+    /// lapsed never blocks a fresh one.
+    pub fn already_banned(&self, target: &BanTarget, is_subnet: bool, now: u64) -> bool {
+        let key = target.normalised();
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|e| !e.is_expired(now))
+        {
+            return true;
+        }
+        if is_subnet {
+            return false;
+        }
+        match target {
+            BanTarget::Net(net) => self.is_banned(&net.addr(), now),
+            BanTarget::Onion(host) => self.is_onion_banned(host, now),
+        }
     }
 
     /// Remove a ban entry by exact key match. Returns `Err` if no such

@@ -1070,14 +1070,16 @@ pub async fn start(
             .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
-                // -22 = decode failed, -26 = mempool acceptance failure
-                // (RPC_VERIFY_REJECTED).
+                // -22 = decode failed; -25 (RPC_VERIFY_ERROR, in practice
+                // missing inputs) and -26 (RPC_VERIFY_REJECTED, every other
+                // invalid-or-rejected verdict) are both mempool acceptance
+                // failures and want the same operator advice.
                 let (category, suggestion) = match code {
                     -22 => (
                         "rpc.input.parse",
                         "Transaction hex failed to decode. Ensure it's a valid raw tx (no 0x prefix, no whitespace).",
                     ),
-                    -26 => (
+                    -25 | -26 => (
                         "mempool.rejected",
                         "Mempool rejected the tx. Check feerate (--minrelaytxfee), dust thresholds, and conflicts with existing mempool contents.",
                     ),
@@ -1574,20 +1576,40 @@ pub async fn start(
         let command: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let bantime: Option<u64> = seq.optional_next().unwrap_or(None);
-        let absolute: Option<bool> = seq.optional_next().unwrap_or(None);
+        // Surface a mistyped optional argument instead of swallowing it: a
+        // `ParamsSequence` that fails to deserialize one element yields `None`
+        // for every element after it, so `setban(ip, "add", "soon", true)`
+        // would silently drop `absolute` and ban for the default duration.
+        let bantime: Option<u64> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let absolute: Option<bool> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
 
         let target = crate::net::ban::parse_ban_target(&subnet_str)
             .map_err(|e| ErrorObjectOwned::owned(-30, e, None::<()>))?;
+        // Core keys the duplicate check off the *notation* the operator used,
+        // not the normalised form: `isSubnet = str.find('/') != npos`.
+        let is_subnet = subnet_str.contains('/');
 
         match command.as_str() {
             "add" => {
                 let now = crate::time::now_secs();
                 let default_duration = ctx.peer_manager.default_ban_duration_secs();
+                if ctx.peer_manager.is_already_banned(&target, is_subnet) {
+                    return Err(ErrorObjectOwned::owned(
+                        -23,
+                        "IP/Subnet already banned",
+                        None::<()>,
+                    ));
+                }
                 let (ban_created, banned_until) = if absolute.unwrap_or(false) {
-                    // bantime is an absolute Unix timestamp.
-                    let abs = bantime.unwrap_or(now + default_duration);
-                    if abs <= now {
+                    // bantime is an absolute Unix timestamp. Core's guard is
+                    // `banTime < GetTime()`, so a timestamp of exactly now is
+                    // accepted (and expires immediately).
+                    let abs = bantime.unwrap_or_else(|| now.saturating_add(default_duration));
+                    if abs < now {
                         return Err(ErrorObjectOwned::owned(
                             -8,
                             "Error: Absolute timestamp is in the past",
@@ -1597,11 +1619,14 @@ pub async fn start(
                     (now, abs)
                 } else {
                     // bantime is a relative duration in seconds (0 = default).
+                    // Saturating: `bantime` is operator-supplied and `u64::MAX`
+                    // would otherwise panic in debug and wrap to an
+                    // already-expired ban in release.
                     let duration = match bantime {
                         Some(0) | None => default_duration,
                         Some(d) => d,
                     };
-                    (now, now + duration)
+                    (now, now.saturating_add(duration))
                 };
                 ctx.peer_manager
                     .set_ban_subnet(&target, true, ban_created, banned_until)

@@ -1308,6 +1308,16 @@ impl PeerManager {
         }
         let ip = addr.ip();
         let perms = self.whitelist_permissions(ip).union(bind_perms);
+        // A ban has to cover the inbound direction or it covers nothing: a
+        // banned host simply dials us instead of waiting to be dialled, and
+        // `setban` becomes advisory. Core drops the socket here too, before a
+        // `CNode` exists (`src/net.cpp`: `if (!HasFlag(permission_flags,
+        // NoBan) && banned) { ... return; }`), with the same NoBan exemption
+        // so `-whitelist`/`-whitebind` peers stay reachable.
+        if !perms.noban && self.is_addr_banned(&addr) {
+            tracing::debug!(%addr, "banned peer: refusing inbound connection");
+            return;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg_rx = {
             let mut peers = self.peers.write();
@@ -1658,6 +1668,16 @@ impl PeerManager {
             self.ban_list.write().remove(target)?;
         }
         Ok(())
+    }
+
+    /// Core's `setban add` duplicate pre-check. Separate from
+    /// [`crate::net::ban::BanList::add`] because the automatic misbehaviour
+    /// path must be able to re-arm and extend bans, while an operator asking
+    /// twice gets `-23`.
+    pub fn is_already_banned(&self, target: &crate::net::ban::BanTarget, is_subnet: bool) -> bool {
+        self.ban_list
+            .read()
+            .already_banned(target, is_subnet, crate::time::now_secs())
     }
 
     /// Disconnect every peer whose IP falls within `target`.
