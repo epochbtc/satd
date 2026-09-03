@@ -1,9 +1,18 @@
 name: CI
 
-# PR-triggered build + test + lint. Runs on GitHub-hosted runners so that
-# untrusted fork PRs cannot execute arbitrary code on a maintainer-owned
-# self-hosted machine. Tag-cut release builds live in `release.yml` (also
-# hosted); reproducible-build verification lives in `nix.yml`.
+# Build + test + lint, on pull requests and on every push to master. Runs on
+# GitHub-hosted runners so that untrusted fork PRs cannot execute arbitrary
+# code on a maintainer-owned self-hosted machine. Tag-cut release builds live
+# in `release.yml` (also hosted); reproducible-build verification lives in
+# `nix.yml`.
+#
+# `Tests` and `Lint` run on master pushes as well as PRs, and deliberately so.
+# A PR is tested as head-merged-into-base at event time, which is not the tree
+# the merge actually produces; and a merge that outruns its own checks — or
+# bypasses them — leaves nothing else to notice. Master went two days with a
+# tree that did not compile because the only master-push job was `seed-cache`,
+# and it was found by an unrelated PR rather than by CI. These two jobs are
+# the detection net for that.
 
 on:
   push:
@@ -14,9 +23,17 @@ on:
 
 # Cancel superseded runs on the same PR. Avoids burning hosted-runner
 # minutes on stale commits when a contributor pushes rapid fixups.
+#
+# Cancellation is scoped to pull requests. Master pushes share one ref, so a
+# blanket `cancel-in-progress` made each merge cancel the post-merge
+# verification of the merge before it — and merges routinely land minutes
+# apart. The `seed-cache` job that runs on master is the only thing that
+# compiles master's tree after a merge, so cancelling it left breakage that no
+# PR run could see: a PR is tested as head-merged-into-base *at event time*,
+# which is a different tree from the one the next merge produces.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -27,7 +44,6 @@ jobs:
     name: "Tests"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
-    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
@@ -222,7 +238,6 @@ jobs:
     name: "Lint"
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
