@@ -1313,13 +1313,13 @@ pub async fn start(
         .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("decoderawtransaction", |params, _ctx, _extensions| {
+    module.register_method("decoderawtransaction", |params, ctx, _extensions| {
         let mut seq = params.sequence();
         let hex_tx: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         let iswitness: Option<bool> = seq.optional_next().unwrap_or(None);
-        rawtx::decode_raw_transaction(&hex_tx, iswitness)
+        rawtx::decode_raw_transaction(&hex_tx, iswitness, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

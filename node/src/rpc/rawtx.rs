@@ -157,7 +157,15 @@ pub fn get_raw_transaction(
     if blockhash.is_none()
         && let Some(entry) = mempool.get(&txid).filter(|e| e.scope.is_acting()) {
             return if verbose {
-                Ok(decode_transaction_verbose(&entry.tx, None, None, Some(0), verbosity, None))
+                Ok(decode_transaction_verbose(
+                    &entry.tx,
+                    None,
+                    None,
+                    Some(0),
+                    verbosity,
+                    None,
+                    chain_state.network,
+                ))
             } else {
                 let raw = bitcoin::consensus::serialize(&entry.tx);
                 Ok(Value::String(hex::encode(raw)))
@@ -192,6 +200,7 @@ pub fn get_raw_transaction(
                         confirmations,
                         verbosity,
                         Some((chain_state, &block)),
+                        chain_state.network,
                     );
                     // `in_active_chain` is only present when the caller
                     // explicitly provided a blockhash.
@@ -225,6 +234,7 @@ pub fn get_raw_transaction(
                             confirmations,
                             verbosity,
                             Some((chain_state, &block)),
+                            chain_state.network,
                         ))
                     } else {
                         let raw = bitcoin::consensus::serialize(tx);
@@ -273,7 +283,11 @@ fn is_genesis_coinbase(chain_state: &ChainState, txid: &bitcoin::Txid) -> bool {
 /// `iswitness`: `None` = auto-detect (try witness first, fall back to
 /// non-witness), `Some(true)` = force witness, `Some(false)` = force
 /// non-witness. Matches Core's optional `iswitness` parameter.
-pub fn decode_raw_transaction(hex_tx: &str, iswitness: Option<bool>) -> Result<Value, (i32, String)> {
+pub fn decode_raw_transaction(
+    hex_tx: &str,
+    iswitness: Option<bool>,
+    network: bitcoin::Network,
+) -> Result<Value, (i32, String)> {
     let tx_bytes =
         hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
 
@@ -301,7 +315,7 @@ pub fn decode_raw_transaction(hex_tx: &str, iswitness: Option<bool>) -> Result<V
         }
     };
 
-    Ok(decode_transaction_verbose(&tx, None, None, None, 1, None))
+    Ok(decode_transaction_verbose(&tx, None, None, None, 1, None, network))
 }
 
 /// Confirmations for a transaction found in a block.
@@ -335,6 +349,7 @@ pub(crate) fn decode_transaction_verbose(
     confirmations: Option<i64>,
     verbosity: u32,
     chain_and_block: Option<(&ChainState, &bitcoin::Block)>,
+    network: bitcoin::Network,
 ) -> Value {
     let txid = tx.compute_txid();
     let raw = bitcoin::consensus::serialize(tx);
@@ -386,7 +401,7 @@ pub(crate) fn decode_transaction_verbose(
                         "type": script_type(&prevout.script_pubkey),
                     });
                     // Add address if derivable.
-                    if let Some(addr) = script_to_address(&prevout.script_pubkey) {
+                    if let Some(addr) = script_to_address(&prevout.script_pubkey, network) {
                         spk["address"] = json!(addr);
                     }
                     // Lookup the prevout's confirming height and coinbase status.
@@ -431,7 +446,7 @@ pub(crate) fn decode_transaction_verbose(
                 "hex": hex::encode(output.script_pubkey.as_bytes()),
                 "type": script_type(&output.script_pubkey),
             });
-            if let Some(addr) = script_to_address(&output.script_pubkey) {
+            if let Some(addr) = script_to_address(&output.script_pubkey, network) {
                 spk["address"] = json!(addr);
             }
             json!({
@@ -568,12 +583,14 @@ fn lookup_prevout_height_generated(
 }
 
 /// Derive a Bitcoin address from a scriptPubKey if possible.
-fn script_to_address(script: &bitcoin::Script) -> Option<String> {
-    // Try to extract standard address types. On regtest, bitcoin::Address
-    // needs an unchecked network, but we format with no network qualifier.
-    use bitcoin::address::Address;
-    use bitcoin::Network;
-    Address::from_script(script, Network::Regtest)
+///
+/// The network is not cosmetic and there is no "unqualified" address form:
+/// it picks the bech32 HRP and the base58 version byte, so rendering a
+/// mainnet output under `Regtest` returns `bcrt1…` for something that only
+/// exists as `bc1…`. This field is read by explorers and copied by people, so
+/// it takes the node's own network.
+fn script_to_address(script: &bitcoin::Script, network: bitcoin::Network) -> Option<String> {
+    bitcoin::address::Address::from_script(script, network)
         .ok()
         .map(|a| a.to_string())
 }
@@ -1478,7 +1495,7 @@ mod tests {
         let hex_tx = hex::encode(&raw);
 
         // Decode via the RPC function
-        let result = decode_raw_transaction(&hex_tx, None).unwrap();
+        let result = decode_raw_transaction(&hex_tx, None, bitcoin::Network::Regtest).unwrap();
 
         // Verify txid matches
         let expected_txid = tx.compute_txid().to_string();

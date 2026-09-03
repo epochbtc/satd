@@ -317,6 +317,7 @@ pub fn get_block(
                     Some(confirmations),
                     1,
                     None,
+                    chain_state.network,
                 )
             })
             .collect();
