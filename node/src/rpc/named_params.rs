@@ -214,7 +214,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
 /// Every method known to the named-parameter table, in the same order as the
 /// `match` arm above. Used by the `help("dump_all_command_conversions")` RPC
 /// to build the conversion table that Core's `rpc_help.py` test validates.
-const ALL_METHODS: &[&str] = &[
+pub(crate) const ALL_METHODS: &[&str] = &[
     "addnode", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
     "combinepsbt", "combinerawtransaction", "converttopsbt", "createpsbt",
     "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
