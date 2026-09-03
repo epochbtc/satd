@@ -1,9 +1,18 @@
 name: CI
 
-# PR-triggered build + test + lint. Runs on GitHub-hosted runners so that
-# untrusted fork PRs cannot execute arbitrary code on a maintainer-owned
-# self-hosted machine. Tag-cut release builds live in `release.yml` (also
-# hosted); reproducible-build verification lives in `nix.yml`.
+# Build + test + lint, on pull requests and on every push to master. Runs on
+# GitHub-hosted runners so that untrusted fork PRs cannot execute arbitrary
+# code on a maintainer-owned self-hosted machine. Tag-cut release builds live
+# in `release.yml` (also hosted); reproducible-build verification lives in
+# `nix.yml`.
+#
+# `Tests` and `Lint` run on master pushes as well as PRs, and deliberately so.
+# A PR is tested as head-merged-into-base at event time, which is not the tree
+# the merge actually produces; and a merge that outruns its own checks — or
+# bypasses them — leaves nothing else to notice. Master went two days with a
+# tree that did not compile because the only master-push job was `seed-cache`,
+# and it was found by an unrelated PR rather than by CI. These two jobs are
+# the detection net for that.
 
 on:
   push:
@@ -35,7 +44,6 @@ jobs:
     name: "Tests"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
-    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
@@ -230,7 +238,6 @@ jobs:
     name: "Lint"
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout sources
