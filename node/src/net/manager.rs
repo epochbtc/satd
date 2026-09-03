@@ -7179,6 +7179,34 @@ mod tests {
         PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
     }
 
+    /// `getaddednodeinfo` reports the added-node list, and Core keeps config
+    /// `-addnode` entries and RPC-added ones in the *same* list
+    /// (`CConnman::m_added_nodes`). Recording an address without recording the
+    /// entry dials the peer but hides it from the RPC, so pin the distinction
+    /// here: only `addnode_add` makes a peer an *added node*.
+    #[test]
+    fn only_addnode_add_registers_an_added_node() {
+        let pm = empty_peer_manager();
+        assert!(pm.get_added_node_info().is_empty());
+
+        // A dial candidate is not an added node — this is the path gossiped
+        // and seeded addresses take, and they must not show up here.
+        let gossiped: SocketAddr = "127.0.0.1:18445".parse().unwrap();
+        pm.add_peer_addr(PeerAddr::Socket(gossiped));
+        assert!(
+            pm.get_added_node_info().is_empty(),
+            "a plain dial candidate must not appear in getaddednodeinfo"
+        );
+
+        // Whereas an added node is, and keeps the operator's own spelling of
+        // the address rather than the resolved form.
+        assert!(pm.addnode_add("localhost:18444", PeerAddr::Socket("127.0.0.1:18444".parse().unwrap())));
+        let info = pm.get_added_node_info();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0]["addednode"], "localhost:18444");
+        assert_eq!(info[0]["connected"], false);
+    }
+
     /// A real PeerManager over a caller-supplied chain state — spawns the
     /// real block_processor thread. No peers are ever attached, so any
     /// chain progress observed by these tests is self-driven.
