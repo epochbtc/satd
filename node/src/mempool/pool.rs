@@ -89,25 +89,40 @@ pub enum MempoolError {
 }
 
 impl MempoolError {
-    /// Core's `sendrawtransaction` error taxonomy: `-25`
-    /// (`RPC_VERIFY_ERROR`) for verification failures — the transaction is
-    /// invalid or unverifiable against current state — and `-26`
-    /// (`RPC_VERIFY_REJECTED`) for policy/standardness rejections of an
-    /// otherwise-valid transaction.
+    /// Core's `sendrawtransaction` error code for this rejection.
     ///
-    /// A relay-scoped quarantine refusal (design §6.1) is a *verification*
-    /// outcome, not a fee/standardness one: it stays `-25`.
+    /// The split is narrower than "consensus vs policy". `HandleATMPError`
+    /// (`src/node/transaction.cpp`) turns *every* invalid
+    /// `AcceptToMemoryPool` outcome except `TX_MISSING_INPUTS` into
+    /// `MEMPOOL_REJECTED`, and `RPCErrorFromTransactionError`
+    /// (`src/rpc/util.cpp`) maps that to `-26` (`RPC_VERIFY_REJECTED`). So
+    /// the `-25` default is reached, in practice, only by missing inputs.
+    ///
+    /// Core's own suite says the same thing: `rpc_rawtransaction.py:354` is
+    /// the single `sendrawtransaction` case asserting `-25`
+    /// (`bad-txns-inputs-missingorspent`), while script, amount, maturity
+    /// and standardness failures all assert `-26` (`feature_nulldummy.py`,
+    /// `feature_segwit.py`, `feature_rbf.py`).
     pub fn rpc_code(&self) -> i32 {
         match self {
+            // Core reaches the `-25` default essentially only here:
+            // `TX_MISSING_INPUTS` is the one invalid result `HandleATMPError`
+            // does not fold into `MEMPOOL_REJECTED`.
+            Self::MissingInputs => -25,
+
+            // satd-only, and not a verdict about the transaction: the node
+            // declined to relay it (design §6.1). `satd/tests/policy.rs`
+            // pins this code.
+            Self::Quarantined(_) => -25,
+
+            // Everything else is an "invalid or rejected" verdict, which
+            // Core funnels through `MEMPOOL_REJECTED` -> `-26`.
             Self::BadAmounts
             | Self::Script(_)
-            | Self::MissingInputs
             | Self::DecodeFailed
             | Self::PrematureCoinbaseSpend
-            | Self::Quarantined(_)
-            | Self::Validation(_) => -25,
-
-            Self::AlreadyExists
+            | Self::Validation(_)
+            | Self::AlreadyExists
             | Self::ConflictingSpend
             | Self::InsufficientFee(..)
             | Self::MempoolFull
