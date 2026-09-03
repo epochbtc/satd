@@ -335,6 +335,7 @@ enum FullDescriptor {
 }
 
 /// Result of parsing a descriptor string with full support.
+#[derive(Debug)]
 pub struct ParsedDescriptorSet {
     /// The expanded descriptors (one per multipath branch, or just one).
     descriptors: Vec<FullDescriptor>,
@@ -403,9 +404,27 @@ fn parse_path_elem(s: &str) -> Result<DescPathElem, String> {
         return Ok(DescPathElem::Wildcard { hardened: true });
     }
     if let Some(inner) = s.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
-        let branches: Result<Vec<ChildNumber>, String> =
-            inner.split(';').map(parse_child_num).collect();
-        return Ok(DescPathElem::Multipath(branches?));
+        let branches: Vec<ChildNumber> = inner
+            .split(';')
+            .map(parse_child_num)
+            .collect::<Result<_, String>>()?;
+        // Core's `ParseKeyPath` rejects both of these by name. The first also
+        // keeps `key_select_branch` in range: it maps every multipath element
+        // through one branch index, so two specifiers of different lengths
+        // would index past the shorter one and panic out of the RPC handler.
+        if branches.len() < 2 {
+            return Err("Multipath key path specifiers must have at least two items".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for b in &branches {
+            if !seen.insert(*b) {
+                return Err(format!(
+                    "Duplicated key path value {} in multipath specifier",
+                    u32::from(*b)
+                ));
+            }
+        }
+        return Ok(DescPathElem::Multipath(branches));
     }
     Ok(DescPathElem::Child(parse_child_num(s)?))
 }
@@ -414,7 +433,11 @@ fn parse_path_elem(s: &str) -> Result<DescPathElem, String> {
 ///
 /// `ctx` is the descriptor function name for error messages, e.g.
 /// `"pk()"` or `"Multi:"`.
-fn parse_key_expr(expr: &str, ctx: &str) -> Result<DescKeyExpr, String> {
+fn parse_key_expr(
+    expr: &str,
+    ctx: &str,
+    permit_uncompressed: bool,
+) -> Result<DescKeyExpr, String> {
     // Check for whitespace.
     if expr.starts_with(' ') || expr.starts_with('\t')
         || expr.ends_with(' ') || expr.ends_with('\t')
@@ -487,6 +510,31 @@ fn parse_key_expr(expr: &str, ctx: &str) -> Result<DescKeyExpr, String> {
         }
     }
 
+    // One multipath specifier per key, as Core requires. Everything downstream
+    // assumes it: `key_multipath_count` reports the first element's length and
+    // `key_select_branch` applies that one index to every element.
+    if path
+        .iter()
+        .filter(|e| matches!(e, DescPathElem::Multipath(_)))
+        .count()
+        > 1
+    {
+        return Err(format!("{ctx} Multiple multipath key path specifiers found"));
+    }
+
+    // An uncompressed key cannot go under a witness program: the script would
+    // be unspendable. Core gates this on the parse context.
+    if !permit_uncompressed {
+        let uncompressed = match &key {
+            DescKeyKind::Pubkey(pk) => !pk.compressed,
+            DescKeyKind::PrivKey(sk) => !sk.compressed,
+            _ => false,
+        };
+        if uncompressed {
+            return Err(format!("{ctx} Uncompressed keys are not allowed"));
+        }
+    }
+
     Ok(DescKeyExpr { origin, key, path })
 }
 
@@ -522,14 +570,55 @@ fn func_inner<'a>(name: &str, expr: &'a str) -> Option<&'a str> {
     rest.strip_suffix(')')
 }
 
+/// Bitcoin Core's `MAX_PUBKEYS_PER_MULTISIG` (`src/script/script.h`).
+const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
+/// Bitcoin Core's `MAX_SCRIPT_ELEMENT_SIZE` (`src/script/script.h`).
+const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+/// Where in a descriptor a sub-expression sits — Core's `ParseScriptContext`.
+///
+/// This is not a convenience: it is what bounds the parser. Every descriptor
+/// function is legal in only some contexts, and because `sh()` is top-level
+/// only and `wsh()` is top-level or inside `sh()`, the maximum nesting depth a
+/// well-formed descriptor can reach is three. Without the rule the recursion
+/// below has no bound at all, and a nested string long enough to exhaust the
+/// stack aborts the process — a Rust stack overflow is not a catchable panic.
+///
+/// It is also what stops the parser building scripts that cannot be spent:
+/// `wsh(wpkh(k))` yields a P2WSH address whose witnessScript is itself a
+/// witness program, which fails CLEANSTACK. Core refuses it by context, and
+/// `deriveaddresses` is exactly the RPC people use to make receive addresses.
+///
+/// satd implements no `tr()`, so Core's `P2TR` context has no counterpart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParseCtx {
+    /// Script goes straight into the scriptPubKey.
+    Top,
+    /// Inside `sh()` — the script becomes a P2SH redeemScript.
+    P2sh,
+    /// Inside `wsh()` — the script becomes a v0 witness script.
+    P2wsh,
+}
+
+impl ParseCtx {
+    /// Core's `permit_uncompressed`: an uncompressed pubkey is only allowed
+    /// where no witness program will carry it (`src/script/descriptor.cpp`).
+    fn permits_uncompressed(self) -> bool {
+        matches!(self, Self::Top | Self::P2sh)
+    }
+}
+
 /// Parse a full descriptor expression (recursive for sh/wsh).
-fn parse_descriptor_expr(expr: &str) -> Result<FullDescriptor, String> {
+fn parse_descriptor_expr(expr: &str, ctx: ParseCtx) -> Result<FullDescriptor, String> {
     if expr.is_empty() {
         return Err("'' is not a valid descriptor function".to_string());
     }
 
     // raw() and addr()
     if let Some(inner) = func_inner("raw", expr) {
+        if ctx != ParseCtx::Top {
+            return Err("Can only have raw() at top level".to_string());
+        }
         if inner.is_empty() {
             return Err("Raw script is not hex".to_string());
         }
@@ -538,46 +627,66 @@ fn parse_descriptor_expr(expr: &str) -> Result<FullDescriptor, String> {
     }
 
     if let Some(inner) = func_inner("addr", expr) {
+        if ctx != ParseCtx::Top {
+            return Err("Can only have addr() at top level".to_string());
+        }
         let unchecked: Address<bitcoin::address::NetworkUnchecked> = inner
             .parse()
             .map_err(|_| "Address is not valid".to_string())?;
         return Ok(FullDescriptor::Addr(unchecked.assume_checked()));
     }
 
-    // Single-key descriptors.
+    // Single-key descriptors. `pk()` is legal in every context; the rest are
+    // gated exactly as Core gates them.
     if let Some(inner) = func_inner("pk", expr) {
-        let key = parse_key_expr(inner, "pk():")?;
+        let key = parse_key_expr(inner, "pk():", ctx.permits_uncompressed())?;
         return Ok(FullDescriptor::Pk(key));
     }
     if let Some(inner) = func_inner("pkh", expr) {
-        let key = parse_key_expr(inner, "pkh():")?;
+        let key = parse_key_expr(inner, "pkh():", ctx.permits_uncompressed())?;
         return Ok(FullDescriptor::Pkh(key));
     }
     if let Some(inner) = func_inner("wpkh", expr) {
-        let key = parse_key_expr(inner, "wpkh():")?;
+        if !matches!(ctx, ParseCtx::Top | ParseCtx::P2sh) {
+            return Err("Can only have wpkh() at top level or inside sh()".to_string());
+        }
+        // Core parses this key in `P2WPKH` context, which never permits an
+        // uncompressed key regardless of where the wpkh() itself sits.
+        let key = parse_key_expr(inner, "wpkh():", false)?;
         return Ok(FullDescriptor::Wpkh(key));
     }
     if let Some(inner) = func_inner("combo", expr) {
-        let key = parse_key_expr(inner, "combo():")?;
+        if ctx != ParseCtx::Top {
+            return Err("Can only have combo() at top level".to_string());
+        }
+        let key = parse_key_expr(inner, "combo():", true)?;
         return Ok(FullDescriptor::Combo(key));
     }
 
-    // Script wrappers.
+    // Script wrappers. These two are what bound the recursion: `sh()` only at
+    // the top, `wsh()` only at the top or inside `sh()`, so the deepest legal
+    // descriptor is sh(wsh(...)) — three levels.
     if let Some(inner) = func_inner("sh", expr) {
-        let inner_desc = parse_descriptor_expr(inner)?;
+        if ctx != ParseCtx::Top {
+            return Err("Can only have sh() at top level".to_string());
+        }
+        let inner_desc = parse_descriptor_expr(inner, ParseCtx::P2sh)?;
         return Ok(FullDescriptor::Sh(Box::new(inner_desc)));
     }
     if let Some(inner) = func_inner("wsh", expr) {
-        let inner_desc = parse_descriptor_expr(inner)?;
+        if !matches!(ctx, ParseCtx::Top | ParseCtx::P2sh) {
+            return Err("Can only have wsh() at top level or inside sh()".to_string());
+        }
+        let inner_desc = parse_descriptor_expr(inner, ParseCtx::P2wsh)?;
         return Ok(FullDescriptor::Wsh(Box::new(inner_desc)));
     }
 
     // Multi/sortedmulti.
     if let Some(inner) = func_inner("multi", expr) {
-        return parse_multi(inner, false);
+        return parse_multi(inner, false, ctx);
     }
     if let Some(inner) = func_inner("sortedmulti", expr) {
-        return parse_multi(inner, true);
+        return parse_multi(inner, true, ctx);
     }
 
     // If we get here, identify the function name for the error message.
@@ -588,25 +697,87 @@ fn parse_descriptor_expr(expr: &str) -> Result<FullDescriptor, String> {
     Err(format!("'{expr}' is not a valid descriptor function"))
 }
 
-fn parse_multi(inner: &str, sorted: bool) -> Result<FullDescriptor, String> {
+/// Serialized length of the pubkey this expression will produce.
+///
+/// Feeds the P2SH redeem-script size check. Extended keys always derive
+/// compressed, so only a literal key or WIF can be 65 bytes.
+fn key_serialized_len(key: &DescKeyExpr) -> usize {
+    match &key.key {
+        DescKeyKind::Pubkey(pk) if !pk.compressed => 65,
+        DescKeyKind::PrivKey(sk) if !sk.compressed => 65,
+        _ => 33,
+    }
+}
+
+fn parse_multi(inner: &str, sorted: bool, ctx: ParseCtx) -> Result<FullDescriptor, String> {
+    // `multi()` produces a bare script, so it cannot sit under a wpkh() or at
+    // any depth Core does not reach.
+    if !matches!(ctx, ParseCtx::Top | ParseCtx::P2sh | ParseCtx::P2wsh) {
+        return Err("Can only have multi/sortedmulti at top level, in sh(), or in wsh()".to_string());
+    }
+
     let parts = split_top_level_commas(inner);
     if parts.len() < 2 {
         return Err("Multi: need threshold and at least one key".to_string());
     }
+    // Core parses the threshold with `ToIntegral<uint32_t>`, which rejects a
+    // sign; Rust's `u32::from_str` accepts a leading '+'.
+    if parts[0].starts_with('+') {
+        return Err("Multi: threshold is not a valid number".to_string());
+    }
     let threshold: u32 = parts[0]
         .parse()
         .map_err(|_| "Multi: threshold is not a valid number".to_string())?;
+
     let mut keys = Vec::new();
+    let mut script_size = 0usize;
     for part in &parts[1..] {
-        keys.push(parse_key_expr(part, "Multi:")?);
+        let key = parse_key_expr(part, "Multi:", ctx.permits_uncompressed())?;
+        // Core accumulates `pubkey_size + 1` per key: the push opcode plus the
+        // key itself.
+        script_size += key_serialized_len(&key) + 1;
+        keys.push(key);
     }
-    if threshold == 0 || threshold > keys.len() as u32 {
+
+    if keys.is_empty() || keys.len() > MAX_PUBKEYS_PER_MULTISIG {
         return Err(format!(
-            "Multi: threshold {} is invalid for {} keys",
+            "Cannot have {} keys in multisig; must have between 1 and {} keys, inclusive",
+            keys.len(),
+            MAX_PUBKEYS_PER_MULTISIG
+        ));
+    }
+    if threshold < 1 {
+        return Err(format!(
+            "Multisig threshold cannot be {threshold}, must be at least 1"
+        ));
+    }
+    if threshold as usize > keys.len() {
+        return Err(format!(
+            "Multisig threshold cannot be larger than the number of keys; \
+             threshold is {} but only {} keys specified",
             threshold,
             keys.len()
         ));
     }
+    if ctx == ParseCtx::Top && keys.len() > 3 {
+        return Err(format!(
+            "Cannot have {} pubkeys in bare multisig; only at most 3 pubkeys",
+            keys.len()
+        ));
+    }
+    if ctx == ParseCtx::P2sh {
+        // The redeemScript must fit in one stack element or it can never be
+        // supplied, so the coins would be unspendable. Core caps compressed
+        // keys at 15 this way. `+3` is OP_m, OP_n and OP_CHECKMULTISIG.
+        if script_size + 3 > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err(format!(
+                "P2SH script is too large, {} bytes is larger than {} bytes",
+                script_size + 3,
+                MAX_SCRIPT_ELEMENT_SIZE
+            ));
+        }
+    }
+
     Ok(FullDescriptor::Multi {
         threshold,
         keys,
@@ -653,7 +824,7 @@ pub fn parse_full_descriptor(
     }
 
     // Parse the descriptor body.
-    let base = parse_descriptor_expr(payload)?;
+    let base = parse_descriptor_expr(payload, ParseCtx::Top)?;
 
     // Check for private keys.
     let has_private_keys = descriptor_has_private_keys(&base);
@@ -1651,6 +1822,144 @@ mod tests {
         assert!(
             infer_descriptor(script(&bad2).as_script(), Network::Regtest).starts_with("raw("),
         );
+    }
+
+    /// The parser must refuse nesting Core refuses, which is what bounds its
+    /// own recursion. Without the context rule a long enough `sh(sh(sh(...)))`
+    /// exhausts the stack, and a Rust stack overflow aborts the process — it
+    /// is not a catchable panic, so there is no recovering from it on an RPC
+    /// any read-only caller can reach.
+    #[test]
+    fn descriptor_nesting_is_bounded_by_context_like_core() {
+        const K: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+        // The pathological input. 20k levels is far below what a 10 MiB body
+        // allows and far above what any stack survives.
+        let deep = format!("{}raw(51){}", "sh(".repeat(20_000), ")".repeat(20_000));
+        let err = parse_full_descriptor(&deep, false).unwrap_err();
+        assert_eq!(err, "Can only have sh() at top level", "got {err}");
+
+        // The three legal shapes still parse.
+        for ok in [
+            format!("sh(wsh(pkh({K})))"),
+            format!("wsh(pkh({K}))"),
+            format!("sh(wpkh({K}))"),
+        ] {
+            assert!(parse_full_descriptor(&ok, false).is_ok(), "{ok} should parse");
+        }
+
+        // wsh(wpkh(k)) builds a P2WSH whose witnessScript is itself a witness
+        // program: it fails CLEANSTACK, so anything paid to that address is
+        // unspendable. `deriveaddresses` is what people use to make receive
+        // addresses, so accepting this loses money.
+        assert_eq!(
+            parse_full_descriptor(&format!("wsh(wpkh({K}))"), false).unwrap_err(),
+            "Can only have wpkh() at top level or inside sh()"
+        );
+        for (desc, want) in [
+            (format!("wsh(sh(pkh({K})))"), "Can only have sh() at top level"),
+            (format!("sh(addr(bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080))"),
+             "Can only have addr() at top level"),
+            (format!("wsh(raw(51))"), "Can only have raw() at top level"),
+            (format!("sh(combo({K}))"), "Can only have combo() at top level"),
+        ] {
+            assert_eq!(parse_full_descriptor(&desc, false).unwrap_err(), want, "{desc}");
+        }
+    }
+
+    /// Core's four multisig bounds, plus the two that depend on context. Each
+    /// one it drops produces a descriptor whose coins cannot be spent.
+    #[test]
+    fn multisig_key_and_size_limits_match_core() {
+        const K: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let keys = |n: usize| vec![K; n].join(",");
+
+        // 21 keys: above MAX_PUBKEYS_PER_MULTISIG, so consensus-invalid.
+        assert_eq!(
+            parse_full_descriptor(&format!("wsh(multi(1,{}))", keys(21)), false).unwrap_err(),
+            "Cannot have 21 keys in multisig; must have between 1 and 20 keys, inclusive"
+        );
+        // Threshold bounds.
+        assert_eq!(
+            parse_full_descriptor(&format!("wsh(multi(0,{K}))"), false).unwrap_err(),
+            "Multisig threshold cannot be 0, must be at least 1"
+        );
+        assert!(
+            parse_full_descriptor(&format!("wsh(multi(3,{}))", keys(2)), false)
+                .unwrap_err()
+                .starts_with("Multisig threshold cannot be larger than the number of keys")
+        );
+        // A leading '+' parses as a number in Rust but not in Core.
+        assert_eq!(
+            parse_full_descriptor(&format!("wsh(multi(+1,{K}))"), false).unwrap_err(),
+            "Multi: threshold is not a valid number"
+        );
+
+        // Bare multisig above 3 keys is non-standard, so it would never relay.
+        assert_eq!(
+            parse_full_descriptor(&format!("multi(1,{})", keys(4)), false).unwrap_err(),
+            "Cannot have 4 pubkeys in bare multisig; only at most 3 pubkeys"
+        );
+        assert!(parse_full_descriptor(&format!("multi(1,{})", keys(3)), false).is_ok());
+
+        // 16 compressed keys give a 547-byte redeemScript. Above the 520-byte
+        // push limit it can never be supplied, so the coins are unspendable —
+        // 15 is the most that fits.
+        assert_eq!(
+            parse_full_descriptor(&format!("sh(multi(1,{}))", keys(16)), false).unwrap_err(),
+            "P2SH script is too large, 547 bytes is larger than 520 bytes"
+        );
+        assert!(parse_full_descriptor(&format!("sh(multi(1,{}))", keys(15)), false).is_ok());
+        // The same 16 keys are fine under wsh(), which has no such cap.
+        assert!(parse_full_descriptor(&format!("wsh(multi(1,{}))", keys(16)), false).is_ok());
+    }
+
+    /// A second multipath specifier used to walk off the end of the shorter
+    /// one and panic out of the RPC handler.
+    #[test]
+    fn multipath_specifiers_are_refused_like_core() {
+        const X: &str = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B";
+
+        // The panicking input: lengths 3 and 2.
+        assert!(
+            parse_full_descriptor(&format!("wpkh({X}/<0;1;2>/<0;1>/*)"), false)
+                .unwrap_err()
+                .contains("Multiple multipath key path specifiers found")
+        );
+        // Equal lengths silently returned 2 of 6 expansions; also refused.
+        assert!(
+            parse_full_descriptor(&format!("wpkh({X}/<0;1>/<2;3>/*)"), false)
+                .unwrap_err()
+                .contains("Multiple multipath key path specifiers found")
+        );
+        assert_eq!(
+            parse_full_descriptor(&format!("wpkh({X}/<0>/*)"), false).unwrap_err(),
+            "Multipath key path specifiers must have at least two items"
+        );
+        assert_eq!(
+            parse_full_descriptor(&format!("wpkh({X}/<0;0>/*)"), false).unwrap_err(),
+            "Duplicated key path value 0 in multipath specifier"
+        );
+        // One well-formed specifier still expands.
+        assert!(parse_full_descriptor(&format!("wpkh({X}/<0;1>/*)"), false).is_ok());
+    }
+
+    /// An uncompressed key under a witness program is unspendable, so Core
+    /// permits it only where no witness program will carry it.
+    #[test]
+    fn uncompressed_keys_are_refused_under_witness_programs() {
+        const U: &str = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+
+        assert!(parse_full_descriptor(&format!("pkh({U})"), false).is_ok());
+        assert!(parse_full_descriptor(&format!("sh(pkh({U}))"), false).is_ok());
+        for desc in [format!("wsh(pkh({U}))"), format!("wpkh({U})"), format!("sh(wpkh({U}))")] {
+            assert!(
+                parse_full_descriptor(&desc, false)
+                    .unwrap_err()
+                    .contains("Uncompressed keys are not allowed"),
+                "{desc} should refuse an uncompressed key"
+            );
+        }
     }
 
     #[test]
