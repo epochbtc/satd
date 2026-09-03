@@ -883,18 +883,27 @@ pub async fn start(
         // explicitly requested via CLI flags, matching Bitcoin Core's
         // behavior. Optional index_name parameter filters the response.
         let mut seq = params.sequence();
-        let index_name: Option<String> = seq.optional_next().unwrap_or(None);
+        // Core's `RPCHelpMan` argument loop rejects a wrongly-typed argument
+        // with RPC_TYPE_ERROR (-3) rather than ignoring it. Swallowing the
+        // error here would answer `getindexinfo(5)` with the full index list.
+        let index_name: Option<String> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
         #[cfg(feature = "block-filter-index")]
         let bfi_enabled = ctx.blockfilterindex_enabled;
         #[cfg(not(feature = "block-filter-index"))]
         let bfi_enabled = false;
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info_core_compat(
             &ctx.chain_state,
-            ctx.txindex_enabled,
-            bfi_enabled,
-            ctx.coinstatsindex_enabled,
-            ctx.txospenderindex_enabled,
+            indexes::CoreIndexFlags {
+                txindex_enabled: ctx.txindex_enabled,
+                blockfilterindex_enabled: bfi_enabled,
+                coinstatsindex_enabled: ctx.coinstatsindex_enabled,
+                txospenderindex_enabled: ctx.txospenderindex_enabled,
+            },
             ctx.chain_state.tip_height(),
+            #[cfg(feature = "block-filter-index")]
+            ctx.filter_backfill.as_ref(),
             index_name.as_deref(),
         ))
     })?;

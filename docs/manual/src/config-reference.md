@@ -248,6 +248,8 @@ startup error.
 | `blockfilterindex` | off | restart | core | BIP 158 compact-block-filter index (`basic`/`0`/`1`, or no value for `basic`). |
 | `peerblockfilters` | off | hot | core | Advertise `NODE_COMPACT_FILTERS` and serve BIP 157 filters; implies `blockfilterindex=basic`. |
 | `silentpaymentindex` | off | restart | satd | BIP 352 silent-payment tweak index (`sp_tweaks`); backs the streaming `tweaks` firehose and scan-key-watch rescan. Backfill an existing datadir with `backfillindex silentpayment`. |
+| `coinstatsindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd implements no UTXO-set hash index: the key sets nothing, and `getindexinfo` reports the index as never synced rather than claiming a readiness it cannot deliver. |
+| `txospenderindex` | off | restart | core | Accepted so a Core `bitcoin.conf` drops in unchanged. satd has no separate spender index; `getindexinfo` answers from the `outpoint_spend` index that actually backs `gettxspendingprevout`. |
 
 ## Mempool / relay policy
 

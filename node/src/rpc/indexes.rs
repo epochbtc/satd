@@ -5,8 +5,16 @@
 //! `getindexinfo` is the **Core-compatible** surface: it reports only
 //! indexes that correspond to explicit Bitcoin Core CLI flags
 //! (`-txindex`, `-blockfilterindex`, `-coinstatsindex`,
-//! `-txospenderindex`). When none are set, it returns `{}`. This
-//! matches Core's contract and passes Core's `rpc_misc.py` test.
+//! `-txospenderindex`). When none are set, it returns `{}`, matching
+//! Core's contract in `src/rpc/node.cpp`.
+//!
+//! One semantic difference is worth stating plainly: Core's indexes
+//! catch up on their own, so `synced` there is a "wait for it" flag.
+//! satd's `synced` reads an on-disk completeness marker and an
+//! operator-driven backfill, so an index that is behind stays behind
+//! until someone runs `backfillindex`. A client that polls `synced`
+//! expecting Core's automatic catch-up will wait forever rather than
+//! briefly.
 //!
 //! `getsatdindexinfo` is the **satd-native** surface: it reports
 //! satd's internal indexes (address, block filter, silentpayments)
@@ -28,6 +36,23 @@ use crate::index::filter;
 use crate::index::silent_payments;
 use crate::storage::Store;
 
+/// Which Core index flags the node was started with.
+///
+/// `getindexinfo` reports an index only when its flag is set, so these four
+/// booleans decide the whole response. Grouped rather than passed loose so the
+/// call site cannot silently transpose two of them.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreIndexFlags {
+    /// `-txindex`.
+    pub txindex_enabled: bool,
+    /// `-blockfilterindex`.
+    pub blockfilterindex_enabled: bool,
+    /// `-coinstatsindex`.
+    pub coinstatsindex_enabled: bool,
+    /// `-txospenderindex`.
+    pub txospenderindex_enabled: bool,
+}
+
 /// Bitcoin Core-compatible `getindexinfo` response.
 ///
 /// Returns only the indexes that were explicitly requested via Core-
@@ -39,68 +64,100 @@ use crate::storage::Store;
 /// - `"txindex"` — present when `-txindex` was set; synced when
 ///   `tx_index_complete()` is true.
 /// - `"basic block filter index"` — present when `-blockfilterindex`
-///   was set; synced when `block_filter_index_complete()` is true.
-/// - `"coinstatsindex"` — present when `-coinstatsindex` was set;
-///   satd does not implement this index, so it reports as always synced.
+///   was set; synced on the same predicate `getsatdindexinfo` uses, so
+///   the two surfaces cannot disagree about one index.
 /// - `"txospenderindex"` — present when `-txospenderindex` was set;
-///   satd does not implement this index, so it reports as always synced.
+///   synced when `outpoint_spend_complete()` is true. satd has no
+///   separate spender index, but `outpoint_spend` is what actually
+///   backs `gettxspendingprevout`, so that marker is the honest answer.
+/// - `"coinstatsindex"` — present when `-coinstatsindex` was set.
+///   satd implements no UTXO-set hash index, so this never reports
+///   synced; see the note on the entry itself.
 pub fn get_index_info_core_compat(
     chain: &Arc<ChainState>,
-    txindex_enabled: bool,
-    blockfilterindex_enabled: bool,
-    coinstatsindex_enabled: bool,
-    txospenderindex_enabled: bool,
-    best_block_height: u32,
+    flags: CoreIndexFlags,
+    tip_height: u32,
+    #[cfg(feature = "block-filter-index")] filter_backfill: Option<&Arc<filter::BackfillHandle>>,
     index_name: Option<&str>,
 ) -> Value {
+    let CoreIndexFlags {
+        txindex_enabled,
+        blockfilterindex_enabled,
+        coinstatsindex_enabled,
+        txospenderindex_enabled,
+    } = flags;
     let mut top = serde_json::Map::new();
 
     if txindex_enabled {
-        let synced = chain.store_ref().has_txindex()
-            && chain.store_ref().tx_index_complete();
-        top.insert(
-            "txindex".into(),
-            json!({"synced": synced, "best_block_height": best_block_height}),
-        );
+        let synced = chain.store_ref().has_txindex() && chain.store_ref().tx_index_complete();
+        top.insert("txindex".into(), index_entry(synced, tip_height));
     }
 
     if blockfilterindex_enabled {
         #[cfg(feature = "block-filter-index")]
-        let synced = chain.store_ref().block_filter_index_complete();
+        let (synced, height) = {
+            // Same call `getsatdindexinfo` makes, so `synced` carries the
+            // "no backfill mid-flight" term too. Without it, re-running
+            // `backfillindex` over an already-complete index left one RPC
+            // saying synced and the other saying not.
+            let report = filter::render_status(
+                filter_backfill.map(|h| h.as_ref()),
+                true,
+                chain.store_ref().block_filter_index_complete(),
+            );
+            (report.synced, report.cursor_height)
+        };
         #[cfg(not(feature = "block-filter-index"))]
-        let synced = false;
+        let (synced, height) = (false, 0u32);
         top.insert(
             "basic block filter index".into(),
-            json!({"synced": synced, "best_block_height": best_block_height}),
+            index_entry(synced, if synced { tip_height } else { height }),
         );
     }
 
-    // Stub indexes: satd does not implement these, but accepts the CLI
-    // flags for Core drop-in compat and reports them as always synced.
     if coinstatsindex_enabled {
-        top.insert(
-            "coinstatsindex".into(),
-            json!({"synced": true, "best_block_height": best_block_height}),
-        );
+        // satd accepts `-coinstatsindex` so a Core `bitcoin.conf` drops in
+        // unchanged, but implements no UTXO-set hash index: `gettxoutsetinfo`
+        // ignores `hash_type`, `hash_or_height` and `use_index` and answers
+        // for the tip only. Reporting `synced: true` here would tell a client
+        // following Core's documented pattern — poll `synced`, then query the
+        // index — that data it is about to get wrong is ready. It never
+        // reports synced, so that client stops at the poll instead.
+        top.insert("coinstatsindex".into(), index_entry(false, 0));
     }
     if txospenderindex_enabled {
+        let synced = chain.store_ref().outpoint_spend_complete();
         top.insert(
             "txospenderindex".into(),
-            json!({"synced": true, "best_block_height": best_block_height}),
+            index_entry(synced, if synced { tip_height } else { 0 }),
         );
     }
 
-    // Optional index_name filter: return only the matching entry.
-    if let Some(name) = index_name {
-        if let Some(entry) = top.remove(name) {
+    // Optional `index_name` filter. Core's `SummaryToJSON` skips the filter
+    // when the name is empty (`!index_name.empty() && index_name != name`),
+    // so `getindexinfo("")` returns every index rather than nothing.
+    match index_name {
+        Some(name) if !name.is_empty() => {
             let mut filtered = serde_json::Map::new();
-            filtered.insert(name.to_string(), entry);
-            return Value::Object(filtered);
+            if let Some(entry) = top.remove(name) {
+                filtered.insert(name.to_string(), entry);
+            }
+            Value::Object(filtered)
         }
-        return Value::Object(serde_json::Map::new());
+        _ => Value::Object(top),
     }
+}
 
-    Value::Object(top)
+/// One `getindexinfo` entry.
+///
+/// Core's `BaseIndex::GetSummary()` reports the height the index has
+/// itself reached, falling back to 0 when it has no best block yet — not
+/// the chain tip. Mid-backfill is precisely when the field carries
+/// information, so answering with the tip would tell a progress meter
+/// (`best_block_height / getblockcount`) that the work was finished
+/// before it started.
+fn index_entry(synced: bool, best_block_height: u32) -> Value {
+    json!({"synced": synced, "best_block_height": best_block_height})
 }
 
 /// `getsatdindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
