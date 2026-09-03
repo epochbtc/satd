@@ -88,6 +88,39 @@ pub enum MempoolError {
     Quarantined(String),
 }
 
+impl MempoolError {
+    /// Core's `sendrawtransaction` error taxonomy: `-25`
+    /// (`RPC_VERIFY_ERROR`) for verification failures — the transaction is
+    /// invalid or unverifiable against current state — and `-26`
+    /// (`RPC_VERIFY_REJECTED`) for policy/standardness rejections of an
+    /// otherwise-valid transaction.
+    ///
+    /// A relay-scoped quarantine refusal (design §6.1) is a *verification*
+    /// outcome, not a fee/standardness one: it stays `-25`.
+    pub fn rpc_code(&self) -> i32 {
+        match self {
+            Self::BadAmounts
+            | Self::Script(_)
+            | Self::MissingInputs
+            | Self::DecodeFailed
+            | Self::PrematureCoinbaseSpend
+            | Self::Quarantined(_)
+            | Self::Validation(_) => -25,
+
+            Self::AlreadyExists
+            | Self::ConflictingSpend
+            | Self::InsufficientFee(..)
+            | Self::MempoolFull
+            | Self::NonFinal
+            | Self::NonBip68Final
+            | Self::Dust
+            | Self::NonStandardOpReturn
+            | Self::InsufficientReplacementFee(..)
+            | Self::TooLongMempoolChain => -26,
+        }
+    }
+}
+
 /// How a transaction reached this node — the value behind the policy engine's
 /// `tx.source` attribute (design §4.3). Recorded on every [`MempoolEntry`] at
 /// admission. As of PR 4a it is *recorded but unused*; PR 4c feeds it to the

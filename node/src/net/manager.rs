@@ -4887,7 +4887,12 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            .map_err(|e| (-26, e.to_string()))?;
+            // Core's taxonomy: -25 = RPC_VERIFY_ERROR (invalid or
+            // unverifiable against current state); -26 = RPC_VERIFY_REJECTED
+            // (policy/standardness rejections like dust, datacarrier, fee,
+            // non-final). `rpc_code` maps each variant to the code Core
+            // returns for it.
+            .map_err(|e| (e.rpc_code(), e.to_string()))?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
