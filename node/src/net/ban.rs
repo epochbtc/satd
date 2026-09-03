@@ -337,15 +337,36 @@ mod tests {
         assert!(target.contains_addr(&ip));
     }
 
+    /// The duplicate refusal moved from `add` to the `setban` RPC, where Core
+    /// checks it — `add` itself must always insert or extend, or the
+    /// misbehaviour path can never re-arm an expired ban.
     #[test]
     fn already_banned_within_subnet() {
         let mut list = BanList::default();
         let subnet = parse_ban_target("127.0.0.0/24").unwrap();
         list.add(&subnet, 1000, 2000).unwrap();
 
-        // Banning a specific IP within the subnet should fail.
+        // A bare IP inside a banned subnet is a duplicate: Core's `setban`
+        // takes the `IsBanned(netAddr)` branch, which scans for a containing
+        // subnet.
         let ip = parse_ban_target("127.0.0.1").unwrap();
-        assert!(list.add(&ip, 1000, 2000).is_err());
+        assert!(list.already_banned(&ip, false, 1500));
+
+        // Written as CIDR it is not: Core's `isSubnet` branch looks for an
+        // exact entry only, which is why `127.0.0.1/32` after `127.0.0.0/24`
+        // is allowed.
+        let cidr = parse_ban_target("127.0.0.1/32").unwrap();
+        assert!(!list.already_banned(&cidr, true, 1500));
+
+        // Expiry is part of the question. Once the subnet ban has lapsed it
+        // blocks nothing.
+        assert!(!list.already_banned(&ip, false, 2001));
+
+        // And `add` itself never refuses — it inserts, or extends a shorter
+        // ban, so a re-ban after expiry always takes.
+        assert!(list.add(&ip, 1000, 2000).is_ok());
+        list.add(&ip, 3000, 9000).unwrap();
+        assert!(list.is_banned(&"127.0.0.1".parse().unwrap(), 5000));
     }
 
     #[test]
