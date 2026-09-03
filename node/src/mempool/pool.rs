@@ -177,6 +177,8 @@ impl MempoolError {
             | Self::TooManyReplacements(..)
             | Self::DoesNotImproveFeerateDiagram(..)
             | Self::TooLongMempoolChain => -26,
+        }
+    }
 
     /// Short reject reason label for `testmempoolaccept` (Core parity).
     /// This is the `reject-reason` field; the full `Display` form goes
@@ -241,33 +243,6 @@ impl MempoolError {
             detail
         } else {
             self.reject_reason()
-        }
-    }
-
-    /// RPC error code: -25 for verification failures, -26 for policy rejections.
-    pub fn rpc_code(&self) -> i32 {
-        match self {
-            Self::BadAmounts
-            | Self::Script(_)
-            | Self::MissingInputs
-            | Self::DecodeFailed
-            | Self::PrematureCoinbaseSpend
-            | Self::Quarantined(_)
-            | Self::Validation(_) => -25,
-
-            Self::AlreadyExists
-            | Self::ConflictingSpend
-            | Self::InsufficientFee(..)
-            | Self::MempoolFull
-            | Self::NonFinal
-            | Self::NonBip68Final
-            | Self::Dust
-            | Self::NonStandardOpReturn
-            | Self::InsufficientReplacementFee(..)
-            | Self::SpendsConflictingTx(_)
-            | Self::TooManyReplacements(_)
-            | Self::DoesNotImproveFeerateDiagram(_)
-            | Self::TooLongMempoolChain => -26,
         }
     }
 }
