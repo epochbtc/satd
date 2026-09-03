@@ -9,7 +9,7 @@ use crate::rpc::amounts::{
 };
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::compat::JsonRpcCompatLayer;
+use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::CapabilityLayer;
 use crate::rpc::named_params::NamedParamsLayer;
 use crate::rpc::readonly::ReadOnlyLayer;
@@ -2546,25 +2546,24 @@ async fn spawn_tls_surface(
     // Building once side-steps an HRTB inference quirk that bites if
     // you defer the `.build()` call into the per-connection `async`
     // block.
-    // JsonRpcCompatLayer is outermost so the Core-compatible HTTP
-    // surface checks (404 for non-root paths, 400 for long URIs,
-    // Content-Type injection) run before auth — matching Core's
-    // libevent httpserver which rejects bad paths unauthenticated.
-    // The body-normalization path inside the compat layer reads the
-    // body only for requests that pass the path/URI checks and is
-    // bounded (`Limited`, Content-Length pre-check), so it does not
-    // create an unbounded memory-DoS surface before auth.
+    // CoreHttpPreludeLayer is outermost: the Core-compatible checks that
+    // need only the request head (404 for non-root paths, 400 for long
+    // URIs, Content-Type injection) run before auth, matching Core's
+    // libevent httpserver, which answers those unauthenticated.
     // AdmissionLayer is next so an over-budget request is shed (429)
-    // before auth/compat work. AuthLayer is innermost so auth runs
-    // after admission. When the surface honors bearer tokens,
+    // before any auth work. AuthLayer follows, and JsonRpcCompatLayer is
+    // innermost — deliberately: it is the layer that buffers and JSON-parses
+    // the request body, and an unauthenticated caller must never be able to
+    // make us do that. When the surface honors bearer tokens,
     // install the capability filter at the RPC layer so scoped
     // tokens are gated per method; the operator principal has all
     // capabilities, so this is a no-op for legacy clients.
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
-        .layer(JsonRpcCompatLayer::new())
+        .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth, bearer));
+        .layer(AuthLayer::new(auth, bearer))
+        .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
@@ -2802,9 +2801,10 @@ pub async fn spawn_plain_surface(
 
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
-        .layer(JsonRpcCompatLayer::new())
+        .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
-        .layer(AuthLayer::new(auth, bearer));
+        .layer(AuthLayer::new(auth, bearer))
+        .layer(JsonRpcCompatLayer::new());
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)

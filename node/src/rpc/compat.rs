@@ -151,6 +151,45 @@ fn normalize_response_content_type(headers: &mut hyper::HeaderMap) {
     }
 }
 
+/// Whether the *request* explicitly spoke JSON-RPC 2.0.
+///
+/// The response normalization below rewrites replies into Core's 1.0 shape.
+/// That is right for Core-derived clients, which is what the compatibility
+/// surface exists for — but it must not be applied to a client that asked for
+/// 2.0. A 2.0 response is defined by its `jsonrpc` member, and 2.0 forbids
+/// carrying `result` and `error` together; handing a 2.0 client the 1.0 shape
+/// breaks strict parsers, jsonrpsee's own `http-client` (which this workspace
+/// ships and tests against) among them.
+///
+/// A batch counts as 2.0 only when *every* request object in it declares 2.0;
+/// a mixed batch is treated as Core-shaped, which is the conservative choice
+/// because Core is the only thing that sends one.
+fn request_declared_2_0(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    fn is_2_0(v: &serde_json::Value) -> Option<bool> {
+        let obj = v.as_object()?;
+        // Only request objects carry a verdict; anything else abstains.
+        obj.get("method")?;
+        Some(obj.get("jsonrpc").and_then(|j| j.as_str()) == Some("2.0"))
+    }
+    match &value {
+        serde_json::Value::Array(items) => {
+            let mut saw_request = false;
+            for item in items {
+                match is_2_0(item) {
+                    Some(true) => saw_request = true,
+                    Some(false) => return false,
+                    None => {}
+                }
+            }
+            saw_request
+        }
+        other => is_2_0(other).unwrap_or(false),
+    }
+}
+
 /// Normalize a JSON-RPC response body for Core compatibility.
 ///
 /// jsonrpsee (JSON-RPC 2.0) omits `"error"` from success responses and
@@ -249,6 +288,93 @@ fn rewrite_response_object(value: &serde_json::Value) -> Option<Vec<u8>> {
     Some(out.into_bytes())
 }
 
+/// Tower layer for the Core-compatible parts of the HTTP surface that can be
+/// decided from the request *head* alone.
+///
+/// This is deliberately a separate layer from [`JsonRpcCompatLayer`]. Core's
+/// libevent httpserver answers a bad path or an over-long URI without
+/// authenticating, and `interface_http.py` checks that — so these checks have
+/// to sit outside the auth layer. Reading the request *body* must not:
+/// buffering and JSON-parsing megabytes for an unauthenticated caller is a
+/// memory-amplification surface on a port that is frequently exposed, and it
+/// is why the auth layer used to be outermost. Splitting the two gets both
+/// properties: Core's unauthenticated 400/404, and no pre-auth body handling.
+#[derive(Clone, Default)]
+pub struct CoreHttpPreludeLayer;
+
+impl CoreHttpPreludeLayer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> tower::Layer<S> for CoreHttpPreludeLayer {
+    type Service = CoreHttpPrelude<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        CoreHttpPrelude { inner }
+    }
+}
+
+/// Tower service applying Core's head-only HTTP behaviour.
+#[derive(Clone)]
+pub struct CoreHttpPrelude<S> {
+    inner: S,
+}
+
+impl<S, B> tower::Service<HttpRequest<B>> for CoreHttpPrelude<S>
+where
+    S: tower::Service<HttpRequest<B>, Response = HttpResponse<HttpBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+
+            // Bitcoin Core's libevent httpserver rejects excessively long
+            // URIs (> MAX_HEADERS_SIZE = 8192) with 400 Bad Request, and any
+            // non-root path with 404 Not Found (there is no REST surface on
+            // the RPC port). jsonrpsee returns 405 Method Not Allowed for
+            // non-POST requests, which breaks `interface_http.py`.
+            let uri_len =
+                parts.uri.path().len() + parts.uri.query().map_or(0, |q| q.len() + 1);
+            if uri_len > MAX_URI_LENGTH {
+                return Ok(bad_request());
+            }
+            if parts.uri.path() != "/" {
+                return Ok(not_found());
+            }
+
+            // Core does not require a Content-Type header on RPC requests;
+            // jsonrpsee does (`application/json`). Add a default when the
+            // client omitted it, matching Core's leniency.
+            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
+                parts.headers.insert(
+                    hyper::header::CONTENT_TYPE,
+                    hyper::header::HeaderValue::from_static("application/json"),
+                );
+            }
+
+            inner.call(HttpRequest::from_parts(parts, body)).await
+        })
+    }
+}
+
 /// Tower layer installing the JSON-RPC version-compatibility shim.
 #[derive(Clone, Default)]
 pub struct JsonRpcCompatLayer;
@@ -304,32 +430,7 @@ where
         // completion; `self.inner` stays ready for the next call).
         let mut inner = self.inner.clone();
         Box::pin(async move {
-            let (mut parts, body) = req.into_parts();
-
-            // Bitcoin Core's libevent httpserver rejects excessively long
-            // URIs (> MAX_HEADERS_SIZE = 8192) with 400 Bad Request, and
-            // any non-root path with 404 Not Found (there is no REST
-            // surface on the RPC port).  jsonrpsee returns 405 Method Not
-            // Allowed for non-POST requests, which breaks the Core
-            // functional test `interface_http.py`.  Intercept early.
-            let uri_len = parts.uri.path().len()
-                + parts.uri.query().map_or(0, |q| q.len() + 1);
-            if uri_len > MAX_URI_LENGTH {
-                return Ok(bad_request());
-            }
-            if parts.uri.path() != "/" {
-                return Ok(not_found());
-            }
-
-            // Core does not require a Content-Type header on RPC requests;
-            // jsonrpsee does (`application/json`). Add a default when the
-            // client omitted it, matching Core's leniency.
-            if !parts.headers.contains_key(hyper::header::CONTENT_TYPE) {
-                parts.headers.insert(
-                    hyper::header::CONTENT_TYPE,
-                    hyper::header::HeaderValue::from_static("application/json"),
-                );
-            }
+            let (parts, body) = req.into_parts();
 
             // Reject before reading a byte if the declared length already
             // exceeds the cap. Covers the common DoS shape (a client
@@ -359,6 +460,10 @@ where
                 Err(_) => bytes::Bytes::new(),
             };
 
+            // Decide the response shape from what the client actually spoke,
+            // before the request is rewritten to 2.0 for jsonrpsee's benefit.
+            let client_spoke_2_0 = request_declared_2_0(&collected);
+
             let new_body = match normalize_jsonrpc_version(&collected) {
                 Some(rewritten) => HttpBody::from(rewritten),
                 None => HttpBody::from(collected.to_vec()),
@@ -373,7 +478,13 @@ where
                 Ok(b) => b.to_bytes(),
                 Err(_) => bytes::Bytes::new(),
             };
-            let out_body = normalize_response_body_bytes(&resp_bytes);
+            // Core-shaped request in, Core-shaped response out. A client that
+            // asked for 2.0 gets jsonrpsee's 2.0 reply untouched.
+            let out_body = if client_spoke_2_0 {
+                resp_bytes.to_vec()
+            } else {
+                normalize_response_body_bytes(&resp_bytes)
+            };
             Ok(HttpResponse::from_parts(head, HttpBody::from(out_body)))
         })
     }
@@ -577,5 +688,42 @@ mod tests {
         let out = normalize_response_body_bytes(input);
         assert_eq!(out, br#"{"result":"ok","error":null}
 "#);
+    }
+
+    #[test]
+    fn response_shape_follows_the_request_version() {
+        // Core-shaped requests: no `jsonrpc` member, or 1.0/1.1.
+        for body in [
+            br#"{"method":"getblockcount","params":[],"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"1.1","method":"getblockcount","params":[],"id":1}"#.as_slice(),
+        ] {
+            assert!(
+                !request_declared_2_0(body),
+                "Core-shaped request must get the 1.0 response shape: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        // A client that explicitly speaks 2.0 must not have its response
+        // rewritten — 2.0 forbids `result` and `error` together and requires
+        // the `jsonrpc` member that the rewrite strips.
+        assert!(request_declared_2_0(
+            br#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}"#
+        ));
+
+        // Batches: all-2.0 is 2.0; anything else is Core-shaped.
+        assert!(request_declared_2_0(
+            br#"[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":2}]"#
+        ));
+        assert!(!request_declared_2_0(
+            br#"[{"jsonrpc":"2.0","method":"a","id":1},{"method":"b","id":2}]"#
+        ));
+
+        // Junk abstains rather than claiming 2.0, so the compatibility
+        // rewrite stays the default for anything we cannot read.
+        assert!(!request_declared_2_0(b"not json"));
+        assert!(!request_declared_2_0(b""));
+        assert!(!request_declared_2_0(br#"{"jsonrpc":"2.0","id":1}"#));
     }
 }
