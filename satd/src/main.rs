@@ -188,10 +188,11 @@ async fn main() {
     }
 
     // `-mocktime=N`: install the mock clock at startup (regtest only).
-    if let Some(t) = config.mocktime {
-        if t > 0 && node::time::clock_is_mockable(config.network) {
-            node::time::set_mock_time(Some(t));
-        }
+    if let Some(t) = config.mocktime
+        && t > 0
+        && node::time::clock_is_mockable(config.network)
+    {
+        node::time::set_mock_time(Some(t));
     }
 
     // Base log filter (see `config::build_env_filter` for the full precedence

@@ -97,7 +97,7 @@ pub fn parse_ban_target(s: &str) -> Result<BanTarget, String> {
         return Ok(BanTarget::Net(net));
     }
 
-    Err(format!("Error: Invalid IP/Subnet"))
+    Err("Error: Invalid IP/Subnet".to_string())
 }
 
 /// The ban list: a map from normalised address string to ban entry.
@@ -155,7 +155,7 @@ impl BanList {
         };
         let entries: Vec<&BanEntry> = self.entries.values().collect();
         let json = serde_json::to_string_pretty(&entries)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)?;
         Ok(())
     }
@@ -181,15 +181,15 @@ impl BanList {
         // containment check for single hosts, not for subnet-to-subnet
         // overlap, so banning both 127.0.0.0/32 and 127.0.0.0/24 is
         // allowed.
-        if let BanTarget::Net(net) = target {
-            if net.prefix_len() == net.max_prefix_len() {
-                let addr = net.addr();
-                for existing in self.entries.values() {
-                    if let Ok(existing_net) = existing.address.parse::<IpNet>() {
-                        if existing_net.contains(&addr) {
-                            return Err("IP/Subnet already banned".to_string());
-                        }
-                    }
+        if let BanTarget::Net(net) = target
+            && net.prefix_len() == net.max_prefix_len()
+        {
+            let addr = net.addr();
+            for existing in self.entries.values() {
+                if let Ok(existing_net) = existing.address.parse::<IpNet>()
+                    && existing_net.contains(&addr)
+                {
+                    return Err("IP/Subnet already banned".to_string());
                 }
             }
         }
@@ -252,10 +252,10 @@ impl BanList {
             if entry.address.ends_with(".onion") {
                 continue;
             }
-            if let Ok(net) = entry.address.parse::<IpNet>() {
-                if net.contains(addr) {
-                    return true;
-                }
+            if let Ok(net) = entry.address.parse::<IpNet>()
+                && net.contains(addr)
+            {
+                return true;
             }
         }
         false

@@ -48,7 +48,7 @@ pub fn mine_block_to_script(
     let template = create_template(chain_state, mempool);
 
     // Build coinbase transaction
-    let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, &coinbase_script);
+    let mut coinbase_tx = build_coinbase(template.height, template.coinbase_value, coinbase_script);
 
     // Assemble non-coinbase transactions
     let other_txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();

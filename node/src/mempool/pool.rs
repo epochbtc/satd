@@ -3452,7 +3452,7 @@ impl Mempool {
             txid,
             MempoolEntry {
                 tx,
-                fee: 0,
+                fee: fee_rate,
                 weight: 4,
                 fee_rate,
                 time: 0,
