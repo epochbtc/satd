@@ -1058,14 +1058,17 @@ pub async fn start(
             .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
-                // -22 = decode failed, -26 = mempool acceptance failure
-                // (RPC_TRANSACTION_REJECTED).
+                // -22 = decode failed; -25 (RPC_TRANSACTION_ERROR, in
+                // practice missing inputs) and -26
+                // (RPC_TRANSACTION_REJECTED, every other invalid-or-rejected
+                // verdict) are both mempool acceptance failures and want the
+                // same operator advice.
                 let (category, suggestion) = match code {
                     -22 => (
                         "rpc.input.parse",
                         "Transaction hex failed to decode. Ensure it's a valid raw tx (no 0x prefix, no whitespace).",
                     ),
-                    -26 => (
+                    -25 | -26 => (
                         "mempool.rejected",
                         "Mempool rejected the tx. Check feerate (--minrelaytxfee), dust thresholds, and conflicts with existing mempool contents.",
                     ),
