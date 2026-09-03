@@ -266,16 +266,39 @@ fn validate_blockhash_str(s: &str) -> Result<(), (i32, String)> {
 }
 
 /// True when `txid` is the genesis block's coinbase.
+///
+/// The genesis block is a compile-time constant of the network, so this
+/// answers from `bitcoin::constants` rather than reading and deserializing
+/// the block from the flat files. `getrawtransaction` is a hot, `Read`-classified
+/// RPC that monitoring polls; it must not do block I/O to answer a question
+/// whose answer cannot change.
 fn is_genesis_coinbase(chain_state: &ChainState, txid: &bitcoin::Txid) -> bool {
-    let genesis_hash = match chain_state.active_chain_hash_at_height(0) {
-        Some(h) => h,
-        None => return false,
-    };
-    let genesis = match chain_state.get_block(&genesis_hash) {
-        Some(b) => b,
-        None => return false,
-    };
-    genesis.txdata.first().map(|tx| tx.compute_txid()) == Some(*txid)
+    *txid == genesis_coinbase_txid(chain_state.network)
+}
+
+/// The genesis coinbase txid for a network, computed once per process.
+fn genesis_coinbase_txid(network: bitcoin::Network) -> bitcoin::Txid {
+    use std::sync::OnceLock;
+    fn cell(network: bitcoin::Network) -> &'static OnceLock<bitcoin::Txid> {
+        static MAINNET: OnceLock<bitcoin::Txid> = OnceLock::new();
+        static TESTNET: OnceLock<bitcoin::Txid> = OnceLock::new();
+        static TESTNET4: OnceLock<bitcoin::Txid> = OnceLock::new();
+        static SIGNET: OnceLock<bitcoin::Txid> = OnceLock::new();
+        static REGTEST: OnceLock<bitcoin::Txid> = OnceLock::new();
+        match network {
+            bitcoin::Network::Bitcoin => &MAINNET,
+            bitcoin::Network::Testnet4 => &TESTNET4,
+            bitcoin::Network::Signet => &SIGNET,
+            bitcoin::Network::Regtest => &REGTEST,
+            // `Network` is non_exhaustive; Testnet3 and anything added later
+            // share a cell, which is correct as long as one process serves one
+            // network — which satd does.
+            _ => &TESTNET,
+        }
+    }
+    *cell(network).get_or_init(|| {
+        bitcoin::constants::genesis_block(network).txdata[0].compute_txid()
+    })
 }
 
 /// `decoderawtransaction` — decode a raw transaction hex to JSON.
@@ -491,7 +514,12 @@ pub(crate) fn decode_transaction_verbose(
         result["blockheight"] = json!(h);
     }
     if let Some(c) = confirmations {
-        result["confirmations"] = json!(c);
+        // `confirmations_for` returns -1 as an internal sentinel for "this
+        // block is not on the active chain", which the caller turns into
+        // `in_active_chain`. Core never puts a negative number on the wire:
+        // `TxToJSON` pushes `0` for a block the active chain does not
+        // contain, and a positive count otherwise.
+        result["confirmations"] = json!(c.max(0));
     }
 
     // `time`/`blocktime` mimic Core: confirmed transactions get the
@@ -621,11 +649,26 @@ pub fn create_raw_transaction(
 ) -> Result<Value, (i32, String)> {
     const MAX_BIP125_RBF_SEQUENCE: u32 = 0xffff_fffd;
 
-    // Default sequence: RBF-signaling when replaceable is true (or absent, Core default).
-    let default_sequence = if replaceable == Some(false) {
-        0xffff_ffff_u32
-    } else {
+    // Default sequence, exactly Core's three cases in `ConstructTransaction`
+    // (`src/rpc/rawtransaction_util.cpp`):
+    //
+    //     if (rbf.value_or(true))  MAX_BIP125_RBF_SEQUENCE   // FINAL - 2
+    //     else if (nLockTime)      MAX_SEQUENCE_NONFINAL     // FINAL - 1
+    //     else                     SEQUENCE_FINAL
+    //
+    // The middle case is not cosmetic. A transaction is final — and its
+    // nLockTime therefore unenforced — when *every* input is at
+    // SEQUENCE_FINAL. Handing back 0xffff_ffff for a caller who asked for a
+    // locktime would silently produce a transaction spendable immediately,
+    // which is the opposite of what they requested.
+    const SEQUENCE_FINAL: u32 = 0xffff_ffff;
+    const MAX_SEQUENCE_NONFINAL: u32 = SEQUENCE_FINAL - 1;
+    let default_sequence = if replaceable != Some(false) {
         MAX_BIP125_RBF_SEQUENCE
+    } else if locktime.unwrap_or(0) != 0 {
+        MAX_SEQUENCE_NONFINAL
+    } else {
+        SEQUENCE_FINAL
     };
 
     let mut tx_inputs = Vec::new();
@@ -2057,6 +2100,77 @@ mod tests {
             entry["descendantcount"],
             json!(1),
             "the quarantined child is hidden from the parent's descendantcount"
+        );
+    }
+
+    /// Core's `ConstructTransaction` picks the default sequence from three
+    /// cases, not two. The middle one decides whether a requested locktime is
+    /// enforceable at all.
+    #[test]
+    fn create_raw_transaction_sequence_matches_core_three_cases() {
+        let inputs = vec![json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        })];
+        let outputs = json!({});
+
+        let seq_of = |locktime: Option<u32>, replaceable: Option<bool>| -> u64 {
+            let v = create_raw_transaction(&inputs, &outputs, locktime, replaceable, None)
+                .expect("well-formed request");
+            let hex = v.as_str().expect("hex string");
+            let raw = hex::decode(hex).expect("valid hex");
+            let tx: bitcoin::Transaction =
+                bitcoin::consensus::deserialize(&raw).expect("valid tx");
+            u64::from(tx.input[0].sequence.0)
+        };
+
+        // rbf true, or absent (Core's default is true): FINAL - 2.
+        assert_eq!(seq_of(None, Some(true)), 0xffff_fffd);
+        assert_eq!(seq_of(None, None), 0xffff_fffd);
+        assert_eq!(seq_of(Some(500), None), 0xffff_fffd);
+
+        // rbf false with no locktime: FINAL.
+        assert_eq!(seq_of(None, Some(false)), 0xffff_ffff);
+        assert_eq!(seq_of(Some(0), Some(false)), 0xffff_ffff);
+
+        // rbf false *with* a locktime: FINAL - 1. At FINAL the transaction
+        // would be final regardless of nLockTime, so the caller's timelock
+        // would not be enforced.
+        assert_eq!(
+            seq_of(Some(500), Some(false)),
+            0xffff_fffe,
+            "an explicit locktime must not be silently disabled by a final sequence"
+        );
+    }
+
+    /// The genesis coinbase txid is answered from network constants rather
+    /// than a block read; pin it against the known mainnet value so that
+    /// swap can never drift.
+    #[test]
+    fn genesis_coinbase_txid_matches_the_known_constants() {
+        assert_eq!(
+            genesis_coinbase_txid(bitcoin::Network::Bitcoin).to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+        // Testnet3, signet and regtest reuse Satoshi's coinbase verbatim, so
+        // they share mainnet's txid even though their block hashes differ.
+        for n in [
+            bitcoin::Network::Testnet,
+            bitcoin::Network::Signet,
+            bitcoin::Network::Regtest,
+        ] {
+            assert_eq!(
+                genesis_coinbase_txid(n),
+                genesis_coinbase_txid(bitcoin::Network::Bitcoin),
+                "{n:?} reuses the mainnet genesis coinbase"
+            );
+        }
+
+        // Testnet4 does not: it carries its own coinbase message, which is
+        // why the cache is keyed per network rather than computed once.
+        assert_eq!(
+            genesis_coinbase_txid(bitcoin::Network::Testnet4).to_string(),
+            "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
         );
     }
 }
