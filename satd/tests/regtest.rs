@@ -12802,19 +12802,25 @@ fn named_rpc_params_are_accepted_like_core() {
         "satd-only RPCs need nameable arguments too: {resp}"
     );
 
-    // `submit=false` asks for a block that is built and NOT connected. satd
-    // does not implement it, and used to ignore it and mine anyway — moving a
-    // chain the caller was told would not move. Refusing is the honest answer.
+    // `submit=false` asks for a block that is built and NOT connected. It
+    // used to be ignored, and the block mined anyway — moving a chain the
+    // caller was told would not move. Now it returns the serialized block
+    // and leaves the tip alone, as Core does.
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":[],"submit":false}}}}"#
     );
     let before = node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
     let resp = node.rpc_call_raw_body(&body).unwrap();
-    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert!(resp["error"].is_null(), "got {resp}");
+    assert!(resp["result"]["hash"].is_string(), "got {resp}");
+    assert!(
+        resp["result"]["hex"].is_string(),
+        "submit=false returns the serialized block: {resp}"
+    );
     assert_eq!(
         node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap(),
         before,
-        "a refused generateblock must not have mined anything"
+        "submit=false must not have mined anything"
     );
 }
 

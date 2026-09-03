@@ -290,13 +290,6 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
     ];
 
     args.into_iter()
-        .filter(|arg| {
-            if arg.starts_with('-') && !arg.starts_with("--") {
-                true
-            } else {
-                true
-            }
-        })
         .map(|arg| {
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
