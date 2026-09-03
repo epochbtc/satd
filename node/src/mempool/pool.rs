@@ -745,6 +745,85 @@ pub struct Mempool {
     mempool_tweaks_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
 }
 
+/// Bitcoin Core's `MAX_PACKAGE_COUNT` (`src/policy/packages.h`).
+const MAX_PACKAGE_COUNT: usize = 25;
+/// Bitcoin Core's `MAX_PACKAGE_WEIGHT` (`src/policy/packages.h`).
+const MAX_PACKAGE_WEIGHT: u64 = 404_000;
+
+/// Core's `IsWellFormedPackage`, returning its exact reject string.
+///
+/// Every check here bounds work that happens later, so it runs before any of
+/// it. Order matches Core's so the reported reason matches too.
+fn check_well_formed_package<T>(pkg: &[T]) -> Result<(), &'static str>
+where
+    T: PackageMember,
+{
+    if pkg.len() > MAX_PACKAGE_COUNT {
+        return Err("package-too-many-transactions");
+    }
+
+    // Core reports a single oversized transaction against the per-transaction
+    // limit instead, which is the more specific message.
+    if pkg.len() > 1 {
+        let total: u64 = pkg.iter().map(|p| p.tx().weight().to_wu()).sum();
+        if total > MAX_PACKAGE_WEIGHT {
+            return Err("package-too-large");
+        }
+    }
+
+    // Keyed by txid, so this also catches duplicate wtxids and
+    // same-txid-different-witness pairs.
+    let mut later: HashSet<Txid> = pkg.iter().map(|p| p.txid()).collect();
+    if later.len() != pkg.len() {
+        return Err("package-contains-duplicates");
+    }
+
+    // Parents must precede children. An unsorted package would fail anyway on
+    // missing-inputs, but that reason is ambiguous — it also means an orphan
+    // or a nonexistent coin.
+    for p in pkg {
+        later.remove(&p.txid());
+        if p
+            .tx()
+            .input
+            .iter()
+            .any(|i| later.contains(&i.previous_output.txid))
+        {
+            return Err("package-not-sorted");
+        }
+    }
+
+    // Two members spending one outpoint would otherwise both be accepted and
+    // leave the mempool holding a double spend.
+    let mut spent: HashSet<bitcoin::OutPoint> = HashSet::new();
+    for p in pkg {
+        for input in &p.tx().input {
+            if !spent.insert(input.previous_output) {
+                return Err("conflict-in-package");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Lets `check_well_formed_package` read the package without knowing the
+/// shape of the caller's per-transaction bookkeeping.
+trait PackageMember {
+    fn tx(&self) -> &Transaction;
+    fn txid(&self) -> Txid;
+}
+
+/// So the checks can be exercised against a plain transaction list.
+impl PackageMember for Transaction {
+    fn tx(&self) -> &Transaction {
+        self
+    }
+    fn txid(&self) -> Txid {
+        self.compute_txid()
+    }
+}
+
 impl Mempool {
     pub fn new(max_size_bytes: usize, min_fee_rate: u64) -> Self {
         Self::with_config(MempoolConfig {
@@ -3189,6 +3268,14 @@ impl Mempool {
             txid: Txid,
             wtxid: bitcoin::Wtxid,
         }
+        impl PackageMember for PkgTx {
+            fn tx(&self) -> &Transaction {
+                &self.tx
+            }
+            fn txid(&self) -> Txid {
+                self.txid
+            }
+        }
         let pkg: Vec<PkgTx> = txs
             .into_iter()
             .map(|tx| {
@@ -3197,6 +3284,21 @@ impl Mempool {
                 PkgTx { tx, txid, wtxid }
             })
             .collect();
+
+        // Core's `IsWellFormedPackage` (`src/policy/packages.cpp`), run before
+        // any per-transaction work.
+        //
+        // These are not cosmetic parity: without the count and weight caps, a
+        // 10 MiB request body is roughly 80,000 minimal transactions, and the
+        // phases below are O(N^2) in the package while repeatedly taking the
+        // mempool write lock — on the API runtime shared with Esplora,
+        // Electrum and gRPC. Without the sort check, an out-of-order package
+        // reports a spurious `missing-inputs` because the child is attempted
+        // before its parent. Without the conflict check, two members spending
+        // one outpoint reach the accept path together.
+        if let Err(reason) = check_well_formed_package(&pkg) {
+            return (reason.to_string(), tx_results);
+        }
 
         // Build a set of txids in the package for CPFP resolution.
         let _pkg_txids: HashSet<Txid> = pkg.iter().map(|p| p.txid).collect();
@@ -3648,6 +3750,28 @@ impl Mempool {
 
         if inner.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyExists);
+        }
+
+        // No two mempool entries may spend the same outpoint.
+        //
+        // `accept_transaction` enforces this by collecting conflicts from
+        // `inner.spends` and putting them through the RBF gate. This path had
+        // neither check and simply `extend`ed `inner.spends` below, so the
+        // second of two conflicting package members overwrote the first's
+        // entry while both stayed in `entries` — the mempool then held a
+        // double spend. `assemble_template` resolves inputs against the UTXO
+        // set and has no cross-transaction check of its own precisely because
+        // it relies on that invariant, so it would emit a template containing
+        // both and hand a miner a block that fails
+        // `bad-txns-inputs-missingorspent`.
+        //
+        // Refusing rather than replacing is what Core does here: this path is
+        // reachable only from `accept_package`, and Core rejects the whole
+        // package at `IsConsistentPackage` with `conflict-in-package`.
+        for input in &tx.input {
+            if inner.spends.contains_key(&input.previous_output) {
+                return Err(MempoolError::ConflictingSpend);
+            }
         }
 
         // Look up inputs
@@ -4170,6 +4294,93 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Core's `IsWellFormedPackage`, check by check. Each of these bounds work
+    /// that happens after it, so a missing one is a DoS or a wrong answer, not
+    /// a cosmetic divergence.
+    #[test]
+    fn package_well_formedness_matches_core() {
+        use bitcoin::hashes::Hash as _;
+        fn tx_spending(prevs: &[(u8, u32)], out_value: u64) -> Transaction {
+            Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: prevs
+                    .iter()
+                    .map(|(seed, vout)| bitcoin::TxIn {
+                        previous_output: OutPoint {
+                            txid: Txid::from_raw_hash(
+                                bitcoin::hashes::sha256d::Hash::from_byte_array([*seed; 32]),
+                            ),
+                            vout: *vout,
+                        },
+                        script_sig: bitcoin::ScriptBuf::new(),
+                        sequence: bitcoin::Sequence::MAX,
+                        witness: bitcoin::Witness::new(),
+                    })
+                    .collect(),
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(out_value),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            }
+        }
+
+        // A plain parent-then-child package is well formed.
+        let parent = tx_spending(&[(1, 0)], 1000);
+        let child = Transaction {
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            ..tx_spending(&[(2, 0)], 900)
+        };
+        assert!(check_well_formed_package(&[parent.clone(), child.clone()]).is_ok());
+
+        // Child before parent: Core reports the sort, not the ambiguous
+        // missing-inputs the attempt would otherwise produce.
+        assert_eq!(
+            check_well_formed_package(&[child.clone(), parent.clone()]),
+            Err("package-not-sorted")
+        );
+
+        // Two members spending one outpoint. Without this the accept path
+        // takes both and the mempool holds a double spend.
+        let a = tx_spending(&[(9, 0)], 500);
+        let b = tx_spending(&[(9, 0)], 400);
+        assert_ne!(a.compute_txid(), b.compute_txid());
+        assert_eq!(check_well_formed_package(&[a, b]), Err("conflict-in-package"));
+
+        // Duplicates are caught by txid, which also covers a same-txid,
+        // different-witness pair.
+        assert_eq!(
+            check_well_formed_package(&[parent.clone(), parent.clone()]),
+            Err("package-contains-duplicates")
+        );
+
+        // 26 distinct transactions is one over MAX_PACKAGE_COUNT.
+        let many: Vec<Transaction> =
+            (0u8..26).map(|i| tx_spending(&[(i, 0)], 100)).collect();
+        assert_eq!(
+            check_well_formed_package(&many),
+            Err("package-too-many-transactions")
+        );
+        assert!(check_well_formed_package(&many[..25]).is_ok());
+
+        // Weight: many inputs, still under the count cap. Core reports a lone
+        // oversized transaction against the per-tx limit instead, so the
+        // package cap only applies from two members up.
+        let heavy: Vec<Transaction> = (0u8..2)
+            .map(|i| {
+                let prevs: Vec<(u8, u32)> = (0..1600).map(|v| (i, v)).collect();
+                tx_spending(&prevs, 100)
+            })
+            .collect();
+        assert_eq!(check_well_formed_package(&heavy), Err("package-too-large"));
+        assert!(check_well_formed_package(&heavy[..1]).is_ok());
+    }
     use super::*;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
