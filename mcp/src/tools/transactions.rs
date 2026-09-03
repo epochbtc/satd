@@ -11,8 +11,8 @@ pub fn get_transaction(ctx: &McpContext, txid: &str, blockhash: Option<&str>) ->
 }
 
 /// Parse a hex-encoded raw transaction into JSON.
-pub fn decode_raw_transaction(hex_tx: &str) -> String {
-    match rawtx::decode_raw_transaction(hex_tx, None) {
+pub fn decode_raw_transaction(ctx: &McpContext, hex_tx: &str) -> String {
+    match rawtx::decode_raw_transaction(hex_tx, None, ctx.chain_state.network) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
