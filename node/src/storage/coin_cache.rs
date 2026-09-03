@@ -953,9 +953,19 @@ impl CoinCache {
             }
         }
         {
+            // `connect_block` fills `tx_index_puts` regardless of whether
+            // `-txindex` is on, and the inner store drops them when it is
+            // off. Absorbing them here anyway would make this cache the only
+            // place those rows exist: `get_tx_location` would answer from the
+            // LRU on a node that never wrote the index, letting
+            // `getrawtransaction` resolve an arbitrary txid until the entry
+            // aged out. Mirror the inner store instead — removes still apply,
+            // so a stale row can never outlive its block.
             let mut ti = self.tx_index_cache.lock();
-            for &(txid, hash) in &batch.tx_index_puts {
-                ti.put(txid, hash);
+            if self.inner.has_txindex() {
+                for &(txid, hash) in &batch.tx_index_puts {
+                    ti.put(txid, hash);
+                }
             }
             for txid in &batch.tx_index_removes {
                 ti.pop(txid);
@@ -1320,11 +1330,38 @@ impl Store for CoinCache {
     /// rows, so without this passthrough the blockfile audit would
     /// silently report an empty `block_index` (same shape bug as
     /// PR #193's per-CF diagnostics).
+    /// Scans the inner store with the pending block-index writes overlaid.
+    ///
+    /// Rows still buffered here have not reached the inner store, and the
+    /// callers that exist build a parent -> children map out of the scan, so a
+    /// bare passthrough silently truncates any subtree whose rows this cache
+    /// is still holding. Snapshot the pending state and drop the lock before
+    /// the scan: it can be long, and holding the batch lock across it would
+    /// stall every writer.
+    ///
+    /// Overlaying here is what lets a caller mid-write scan the index without
+    /// forcing a flush first — a flush the reorg path cannot even take,
+    /// because it holds the flush exclusion while it runs.
     fn for_each_block_index(
         &self,
         visit: &mut dyn FnMut(BlockHash, BlockIndexEntry),
     ) -> Result<crate::storage::BlockIndexScanStats, StoreError> {
-        self.inner.for_each_block_index(visit)
+        let overlaid: std::collections::HashMap<BlockHash, BlockIndexEntry> = {
+            let pending = self.pending_batch.lock();
+            // A Vec of puts may name the same hash twice; the last write wins,
+            // which is what `collect` into a map gives.
+            pending.block_index_puts.iter().cloned().collect()
+        };
+        let stats = self.inner.for_each_block_index(&mut |h, entry| {
+            if overlaid.contains_key(&h) {
+                return;
+            }
+            visit(h, entry);
+        })?;
+        for (h, entry) in overlaid {
+            visit(h, entry);
+        }
+        Ok(stats)
     }
 
     /// Scans the inner store with the pending batch overlaid.
@@ -1387,14 +1424,12 @@ impl Store for CoinCache {
     }
 
     fn get_tx_location(&self, txid: &Txid) -> Option<BlockHash> {
-        // Guard: when the node is running without `-txindex`, the LRU
-        // may still hold entries from `connect_block`'s `tx_index_puts`
-        // (the coin cache absorbs them unconditionally), but exposing
-        // them makes `getrawtransaction` succeed on a non-txindex node
-        // — behaviour Core does not allow.
-        if !self.inner.has_txindex() {
-            return None;
-        }
+        // A faithful view of the inner store: the LRU is only populated when
+        // the inner store actually writes the index (see `write_batch`), so
+        // this never reports a row the store does not hold. That matters
+        // beyond `getrawtransaction` — `verify_chainstate` counts absent rows
+        // through here, and a filter applied at read time would make every
+        // row on a non-txindex node read as absent.
         if let Some(&hash) = self.tx_index_cache.lock().get(txid) {
             return Some(hash);
         }

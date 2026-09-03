@@ -5655,10 +5655,6 @@ impl ChainState {
                 .get_block_index(&block_hash)
                 .is_some_and(|ex| ex.status == BlockStatus::HeaderOnly)
             {
-                // Flush pending writes first, as `mark_subtree_invalid`
-                // walks via `for_each_block_index` which reads from the
-                // inner store, not the cache overlay.
-                let _ = self.store.flush();
                 let _ = self.mark_subtree_invalid(block_hash);
             }
             return Err(e.into());
@@ -6139,8 +6135,10 @@ impl ChainState {
                 }
                 // Mark the block (and its descendants) as Invalid so
                 // `getchaintips` reports them correctly — Core's
-                // `InvalidBlockFound`.
-                let _ = self.store.flush();
+                // `InvalidBlockFound`. This buffers into the coin cache's
+                // pending batch; it must not flush, because `reorg_excl` (if
+                // held) makes an external flush block forever on this very
+                // thread.
                 let _ = self.mark_subtree_invalid(block_hash);
                 return Err(e.into());
             }
