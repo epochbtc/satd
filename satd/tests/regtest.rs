@@ -12802,19 +12802,25 @@ fn named_rpc_params_are_accepted_like_core() {
         "satd-only RPCs need nameable arguments too: {resp}"
     );
 
-    // `submit=false` asks for a block that is built and NOT connected. satd
-    // does not implement it, and used to ignore it and mine anyway — moving a
-    // chain the caller was told would not move. Refusing is the honest answer.
+    // `submit=false` asks for a block that is built and NOT connected. It
+    // used to be ignored, and the block mined anyway — moving a chain the
+    // caller was told would not move. Now it returns the serialized block
+    // and leaves the tip alone, as Core does.
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":[],"submit":false}}}}"#
     );
     let before = node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
     let resp = node.rpc_call_raw_body(&body).unwrap();
-    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "got {resp}");
+    assert!(resp["error"].is_null(), "got {resp}");
+    assert!(resp["result"]["hash"].is_string(), "got {resp}");
+    assert!(
+        resp["result"]["hex"].is_string(),
+        "submit=false returns the serialized block: {resp}"
+    );
     assert_eq!(
         node.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap(),
         before,
-        "a refused generateblock must not have mined anything"
+        "submit=false must not have mined anything"
     );
 }
 
@@ -12905,14 +12911,21 @@ fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
     ));
     assert!(r["result"].is_string(), "default verbosity is 0: {r}");
 
-    // Verbosity 2 adds fields satd does not produce, so it is refused by name
-    // rather than answered as though it were 1.
+    // Verbosity 2 is answered, not refused: it is verbosity 1 plus `fee` and
+    // per-input `prevout`. A coinbase has neither (no inputs to price), so
+    // this call proves the argument is accepted and routed, and the shape is
+    // still the verbose object rather than hex.
     let r = named(format!(
         r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
             "params":{{"txid":"{cb1}","verbosity":2,"blockhash":"{hash1}"}}}}"#
     ));
-    let msg = r["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("verbosity 2"), "{r}");
+    assert!(r["error"].is_null(), "verbosity 2 is supported: {r}");
+    assert!(r["result"].is_object(), "verbosity 2 is verbose: {r}");
+    assert_eq!(r["result"]["txid"], serde_json::json!(cb1));
+    assert!(
+        r["result"]["fee"].is_null(),
+        "a coinbase has no fee to report: {r}"
+    );
 }
 
 /// `setmocktime` moves the node clock that block templates, the future-block
