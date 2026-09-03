@@ -1256,12 +1256,11 @@ pub async fn start(
 
         // Announce any newly-accepted transactions to peers.
         for (_wtxid, result) in &tx_results {
-            if result.get("error").is_none() {
-                if let Some(txid_str) = result.get("txid").and_then(|v| v.as_str()) {
-                    if let Ok(txid) = txid_str.parse::<bitcoin::Txid>() {
-                        ctx.peer_manager.announce_tx(txid);
-                    }
-                }
+            if result.get("error").is_none()
+                && let Some(txid_str) = result.get("txid").and_then(|v| v.as_str())
+                && let Ok(txid) = txid_str.parse::<bitcoin::Txid>()
+            {
+                ctx.peer_manager.announce_tx(txid);
             }
         }
 

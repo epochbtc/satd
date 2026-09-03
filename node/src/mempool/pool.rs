@@ -2052,10 +2052,10 @@ impl Mempool {
         // "dust" for a zero-fee tx (Core's ordering).
         if !cfg.accept_non_std_txn {
             if has_allow {
-                if let Err(e) = Self::check_dust(&tx, &cfg) {
-                    if deferred_nonstd.is_none() {
-                        deferred_nonstd = Some(e);
-                    }
+                if let Err(e) = Self::check_dust(&tx, &cfg)
+                    && deferred_nonstd.is_none()
+                {
+                    deferred_nonstd = Some(e);
                 }
             } else {
                 Self::check_dust(&tx, &cfg)?;
