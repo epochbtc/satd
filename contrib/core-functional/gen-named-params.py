@@ -274,6 +274,8 @@ SATD_ONLY = {
     "getorphaninfo": [],
     "getpolicyinfo": [],
     "getquarantineinfo": [],
+    # satd-native index view; `getindexinfo` is the Core-compatible surface.
+    "getsatdindexinfo": [],
     "getserverstatus": [],
     "getsysteminfo": [],
     "getwarnings": [],
