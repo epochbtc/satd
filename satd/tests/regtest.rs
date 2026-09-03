@@ -6166,16 +6166,25 @@ fn sp_active_chain_hex(node: &TestNode) -> Vec<String> {
 /// `submitblock` reports a rejection in `result` as a reason string and leaves
 /// `error` null, so checking only `error` would let a silently-rejected chain
 /// through.
+///
+/// `null` and `"inconclusive"` both mean accepted. Core returns `null` only
+/// when the block ran through `ConnectBlock`, and `"inconclusive"` when it was
+/// stored without connecting — which is every block of a competing chain until
+/// the one that finally overtakes the active tip. Feeding a whole fork here is
+/// the point of these fixtures, so a run of `inconclusive` is the expected
+/// shape; anything else is a real rejection reason. What proves the chain
+/// landed is the caller's `getblockcount` assertion, not these per-block
+/// results. Core's own `rpc_preciousblock.py` accepts the same pair.
 fn sp_submit_chain(node: &TestNode, chain: &[String]) {
     for (i, hex) in chain.iter().enumerate() {
         let resp = node
             .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
             .expect("submitblock");
         assert!(resp["error"].is_null(), "submitblock at index {i}: {resp}");
+        let result = &resp["result"];
         assert!(
-            resp["result"].is_null(),
-            "submitblock rejected the block at index {i}: {}",
-            resp["result"]
+            result.is_null() || result == &serde_json::json!("inconclusive"),
+            "submitblock rejected the block at index {i}: {result}"
         );
     }
 }
