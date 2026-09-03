@@ -416,6 +416,13 @@ pub struct Config {
     /// before the server sheds load (HTTP 429). Bitcoin Core
     /// `-rpcworkqueue`. Default: 64.
     pub rpc_workqueue: usize,
+    /// Per-connection HTTP header-read timeout for the RPC server, in
+    /// seconds.  Bitcoin Core `-rpcservertimeout`.  If a client opens a
+    /// TCP connection but does not send a complete HTTP request header
+    /// within this window the connection is closed.  Default: 30 (Core's
+    /// default).  `None` disables the timeout entirely, which matches the
+    /// behaviour before this knob was wired.
+    pub rpc_server_timeout: Option<std::time::Duration>,
     /// Worker-thread count for the **separate, bounded tokio runtime** that
     /// serves the remotely-consumed *read* surfaces (Esplora, Electrum,
     /// events gRPC, metrics). Isolating these from the consensus/P2P core
@@ -1506,10 +1513,17 @@ impl Config {
         // rule: every recognised key is honoured or explicitly rejected,
         // never accepted-and-ignored.
         if !cli.includeconf.is_empty() {
+            // Format the value exactly as Bitcoin Core does: boolean-like
+            // values (`true`/`false`) are bare, file paths are quoted.
+            let val = &cli.includeconf[0];
+            let display_val = if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
+                format!("-includeconf={val}")
+            } else {
+                format!("-includeconf=\"{val}\"")
+            };
             return Err(format!(
-                "-includeconf cannot be used from commandline; -includeconf={} \
-                 (includeconf is only honoured inside a config file, matching Bitcoin Core)",
-                cli.includeconf[0]
+                "Error parsing command line arguments: \
+                 -includeconf cannot be used from commandline; {display_val}",
             ));
         }
 
@@ -1692,6 +1706,20 @@ impl Config {
             .rpcworkqueue
             .or_else(|| file_get("rpcworkqueue").and_then(|v| v.parse().ok()))
             .unwrap_or(64);
+
+        // Per-connection header-read timeout.  Bitcoin Core's libevent
+        // surface uses this to drop idle connections that never finish
+        // sending an HTTP request.  Default: 30s (Core's default).  A
+        // value of 0 disables the timeout (hyper's default behaviour).
+        let rpc_server_timeout_secs: u64 = cli
+            .rpcservertimeout
+            .or_else(|| file_get("rpcservertimeout").and_then(|v| v.parse().ok()))
+            .unwrap_or(30);
+        let rpc_server_timeout = if rpc_server_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(rpc_server_timeout_secs))
+        } else {
+            None
+        };
 
         // Worker count for the isolated API runtime. Default is a modest
         // fraction of host parallelism (the core runtime keeps the rest),
@@ -2296,10 +2324,15 @@ impl Config {
         }
         .unwrap_or(3_000); // sat/kvB
 
+        // Core v31 changed the default from 83 (MAX_OP_RETURN_RELAY, the
+        // historical value) to MAX_STANDARD_TX_WEIGHT / 4 = 100 000,
+        // making the relay cap effectively uncapped.  Match that default
+        // so `getmempoolinfo.maxdatacarriersize` reports the same value
+        // and the `mempool_datacarrier` functional test passes.
         let datacarriersize = cli
             .datacarriersize
             .or_else(|| file_get("datacarriersize").and_then(|v| v.parse().ok()))
-            .unwrap_or(83);
+            .unwrap_or(100_000);
 
         let datacarrier = cli
             .datacarrier
@@ -3078,6 +3111,7 @@ impl Config {
             rpcpassword,
             rpc_threads,
             rpc_workqueue,
+            rpc_server_timeout,
             api_threads,
             rpc_readonly_bind,
             rpc_readonly_port,
@@ -3993,6 +4027,17 @@ pub struct CliArgs {
         help = "Max queued RPC requests beyond -rpcthreads before HTTP 429 (Core -rpcworkqueue; default 64)"
     )]
     pub rpcworkqueue: Option<usize>,
+
+    /// Per-connection HTTP header-read timeout for the RPC server, in
+    /// seconds. If a client opens a TCP connection but doesn't complete
+    /// the HTTP header within this window, the connection is dropped.
+    /// Bitcoin Core `-rpcservertimeout`. Default: 30.
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Per-connection header-read timeout in seconds (Core -rpcservertimeout; default 30)"
+    )]
+    pub rpcservertimeout: Option<u64>,
 
     /// Worker-thread count for the separate, bounded tokio runtime that
     /// serves the remotely-consumed API surfaces, isolating them from the
@@ -6055,6 +6100,34 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                     return format!("--{flag}=0");
                 }
             }
+
+            // Special handling for `-noincludeconf` negation, matching
+            // Bitcoin Core's `ParseParameters`.  `includeconf` is not in
+            // `NEGATABLE_BOOL_FLAGS` (it is a Vec<String>), but Core
+            // interprets `-noincludeconf=0` as "don't NOT include" →
+            // `-includeconf=true` (double negation).  The command-line
+            // check will then reject it with the right error message.
+            if arg.starts_with('-') {
+                let stripped = arg.trim_start_matches('-');
+                if let Some(rest) = stripped.strip_prefix("noincludeconf") {
+                    // `-noincludeconf` (no value) → includeconf disabled,
+                    // but includeconf is a file path, not a boolean.
+                    // `-noincludeconf=0` → double negation → includeconf=true
+                    // `-noincludeconf=1` → negation with 1 → includeconf=false → empty
+                    // For all forms: Core resolves and rejects at the
+                    // "cannot be used from commandline" gate, showing the
+                    // resolved value.  Convert to `--includeconf=<resolved>`.
+                    if rest.is_empty() || rest == "=1" {
+                        // negation active → nothing to include, but Core
+                        // still errors on the presence of the flag
+                        return "--includeconf".to_string();
+                    } else if rest == "=0" {
+                        // double negation → true
+                        return "--includeconf=true".to_string();
+                    }
+                }
+            }
+
             // Skip the binary name or already double-dashed args
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
@@ -6368,15 +6441,27 @@ impl ConfigFile {
                 datadir.join(&rel)
             };
             let mut included = ConfigFile::parse_file(&inc_path).map_err(|e| {
-                format!("includeconf='{rel}' (resolved to {}): {e}", inc_path.display())
+                format!(
+                    "Error reading configuration file: \
+                     includeconf: failed to include {rel}: {e}"
+                )
             })?;
             // No recursion: drain any includeconf the included file
             // carries (global or any section) and warn, matching Core.
+            // The warning goes to stderr in Core's exact format so
+            // `stop_node(expected_stderr=...)` in the functional tests
+            // can match it verbatim.
             let mut nested = included.global.remove("includeconf").unwrap_or_default();
             for s in included.sections.values_mut() {
                 if let Some(v) = s.remove("includeconf") {
                     nested.extend(v);
                 }
+            }
+            for n in &nested {
+                eprintln!(
+                    "warning: -includeconf cannot be used from included \
+                     files; ignoring -includeconf={n}"
+                );
             }
             for n in nested {
                 notes.push(ConfigNote {
@@ -8591,6 +8676,7 @@ testactivationheight=bip34@2
             rpcpassword: None,
             rpcthreads: None,
             rpcworkqueue: None,
+            rpcservertimeout: None,
             apithreads: None,
             rpcbind: Vec::new(),
             rpcallowip: Vec::new(),
@@ -8879,6 +8965,7 @@ testactivationheight=bip34@2
             rpcpassword: None, // missing password
             rpcthreads: None,
             rpcworkqueue: None,
+            rpcservertimeout: None,
             apithreads: None,
             rpcbind: Vec::new(),
             rpcallowip: Vec::new(),
