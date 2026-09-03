@@ -4601,6 +4601,9 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::SpendsConflictingTx(..)
+            | MempoolError::TooManyReplacements(..)
+            | MempoolError::DoesNotImproveFeerateDiagram(..)
             | MempoolError::TooLongMempoolChain
             // Non-final for the *next* block is tip-relative, not misbehavior:
             // a peer one block behind (or ahead) legitimately relays these.
@@ -4837,12 +4840,13 @@ impl PeerManager {
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
             .map_err(|e| {
-                // Core's taxonomy: -25 = RPC_VERIFY_ERROR (invalid or
-                // unverifiable against current state); -26 =
-                // RPC_VERIFY_REJECTED (policy/standardness rejections like
-                // dust, datacarrier, fee, non-final). `rpc_code` maps each
-                // variant to the code Core returns for it.
-                (e.rpc_code(), e.to_string())
+                // Core's taxonomy: -25 = RPC_VERIFY_ERROR (in practice only
+                // missing inputs); -26 = RPC_VERIFY_REJECTED (every other
+                // invalid-or-rejected verdict). `rpc_code` maps each variant
+                // to the code Core returns for it, and
+                // `sendrawtransaction_msg` supplies Core's reject-reason
+                // string plus any RBF detail.
+                (e.rpc_code(), e.sendrawtransaction_msg())
             })?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
@@ -6578,7 +6582,7 @@ mod tests {
             MempoolError::AlreadyExists,
             MempoolError::ConflictingSpend,
             MempoolError::NonStandardOpReturn,
-            MempoolError::InsufficientReplacementFee(1, 2),
+            MempoolError::InsufficientReplacementFee(1, 2, String::new(), String::new()),
             MempoolError::TooLongMempoolChain,
             MempoolError::PrematureCoinbaseSpend,
             MempoolError::Validation("nonstandard".into()),

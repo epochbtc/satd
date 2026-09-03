@@ -269,9 +269,7 @@ note = "needs block-file pruning, which satd does not implement. Follow-up: prun
 
 [[test]]
 file = "feature_rbf.py"
-status = "skip"
-reason = "feature-missing"
-note = "testmempoolaccept does not detect conflicting-spend (RBF); returns allowed:true with no reject-reason for a replacement tx"
+status = "run"
 
 [[test]]
 file = "feature_reindex.py"

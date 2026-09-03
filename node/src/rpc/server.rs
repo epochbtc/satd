@@ -1200,7 +1200,8 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+        let replaceable: Option<bool> = seq.optional_next().unwrap_or(None);
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime, replaceable)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1270,12 +1271,16 @@ pub async fn start(
                 Err(e) => {
                     let txid = tx.compute_txid();
                     let wtxid = tx.compute_wtxid();
-                    results.push(serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "txid": txid.to_string(),
                         "wtxid": wtxid.to_string(),
                         "allowed": false,
-                        "reject-reason": e.to_string(),
-                    }));
+                        "reject-reason": e.reject_reason(),
+                    });
+                    if let Some(details) = e.reject_details() {
+                        entry["reject-details"] = serde_json::Value::String(details);
+                    }
+                    results.push(entry);
                 }
             }
         }

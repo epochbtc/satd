@@ -597,6 +597,7 @@ pub struct Config {
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
     pub minrelaytxfee: u64,
+    pub incrementalrelayfee: u64,
     pub dustrelayfee: u64,
     pub datacarriersize: usize,
     pub datacarrier: bool,
@@ -2311,12 +2312,34 @@ impl Config {
                 .transpose()
         };
 
-        let minrelaytxfee = match cli.minrelaytxfee {
+        // sat/kvB — Core v31 DEFAULT_MIN_RELAY_TX_FEE. Kept as an `Option` so
+        // the raise below can tell "the operator asked for this value" from
+        // "nobody said", which is the distinction Core's rule turns on.
+        const DEFAULT_MIN_RELAY_TX_FEE: u64 = 100;
+        let minrelaytxfee_explicit = match cli.minrelaytxfee {
             Some(v) => Some(v),
             None => file_fee_rate("minrelaytxfee")?,
         }
-        .or(profile_defaults.minrelaytxfee)
-        .unwrap_or(1_000); // sat/kvB
+        .or(profile_defaults.minrelaytxfee);
+
+        let incrementalrelayfee = match cli.incrementalrelayfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("incrementalrelayfee")?,
+        }
+        .unwrap_or(100); // 100 sat/kvB (Core v31 default: 0.000001 BTC/kvB)
+
+        // Core raises `minrelaytxfee` to match a higher `incrementalrelayfee`
+        // only when `-minrelaytxfee` was not supplied — `ApplyArgsManOptions`
+        // in `src/node/mempool_args.cpp` spells it as an `else if`, with the
+        // comment "Allow only setting incremental fee to control both".
+        //
+        // Applying it unconditionally would silently overrule an operator who
+        // asked for a specific floor: `-minrelaytxfee=0` would come back up to
+        // 100 sat/kvB. Core's functional tests rely on exactly that setting.
+        let minrelaytxfee = match minrelaytxfee_explicit {
+            Some(v) => v,
+            None => DEFAULT_MIN_RELAY_TX_FEE.max(incrementalrelayfee),
+        };
 
         let dustrelayfee = match cli.dustrelayfee {
             Some(v) => Some(v),
@@ -3158,6 +3181,7 @@ impl Config {
             quarantinemempool,
             policyfile,
             minrelaytxfee,
+            incrementalrelayfee,
             dustrelayfee,
             datacarriersize,
             datacarrier,
@@ -4416,6 +4440,14 @@ pub struct CliArgs {
         help = "Minimum relay fee rate, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00001) or a bare integer of sat/kvB (default: 1000)"
     )]
     pub minrelaytxfee: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Incremental relay fee rate for RBF, as BTC/kvB or sat/kvB (default: 100)"
+    )]
+    pub incrementalrelayfee: Option<u64>,
 
     #[arg(
         long,
@@ -7785,6 +7817,66 @@ bind=127.0.0.1:9002
         assert_eq!(cfg.minrelaytxfee, 2000);
     }
 
+    /// Core raises `minrelaytxfee` to a higher `incrementalrelayfee` only when
+    /// `-minrelaytxfee` was not supplied (`ApplyArgsManOptions`, an `else if`).
+    /// Doing it unconditionally silently overrules an operator who asked for a
+    /// specific floor — `-minrelaytxfee=0` being the case Core's own
+    /// functional tests depend on.
+    #[test]
+    fn minrelaytxfee_is_only_raised_when_it_was_not_set() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = |extra: &[&str]| -> Config {
+            let mut argv: Vec<String> = vec![
+                "satd".into(),
+                "--regtest".into(),
+                "--datadir".into(),
+                dir.path().to_str().unwrap().into(),
+            ];
+            argv.extend(extra.iter().map(|s| (*s).to_string()));
+            Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).expect("config")
+        };
+
+        // Neither set: Core's DEFAULT_MIN_RELAY_TX_FEE.
+        assert_eq!(base(&[]).minrelaytxfee, 100);
+
+        // Only incrementalrelayfee set, and higher: the raise applies. This is
+        // the "allow only setting incremental fee to control both" case.
+        assert_eq!(base(&["--incrementalrelayfee=0.00001"]).minrelaytxfee, 1_000);
+
+        // Both set: the operator's floor stands, even below the incremental.
+        assert_eq!(
+            base(&["--minrelaytxfee=0.000005", "--incrementalrelayfee=0.00001"]).minrelaytxfee,
+            500
+        );
+
+        // The case that matters: an explicit zero must survive.
+        assert_eq!(
+            base(&["--minrelaytxfee=0", "--incrementalrelayfee=0.00001"]).minrelaytxfee,
+            0,
+            "an explicit -minrelaytxfee=0 must not be raised to the incremental fee"
+        );
+        assert_eq!(base(&["--minrelaytxfee=0"]).minrelaytxfee, 0);
+
+        // Set from the config file rather than the command line: same rule.
+        let confdir = tempfile::tempdir().expect("tempdir");
+        let conf = confdir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\nminrelaytxfee=0\nincrementalrelayfee=0.00001\n")
+            .unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                confdir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .expect("config");
+        assert_eq!(cfg.minrelaytxfee, 0);
+    }
+
     /// Core reads `blockfilterindex=` (empty) as "on" and hard-errors on a
     /// value it cannot name. Silently disabling the index instead is only
     /// discovered when a light client finds no NODE_COMPACT_FILTERS.
@@ -8723,6 +8815,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
@@ -9012,6 +9105,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
