@@ -49,7 +49,15 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
             if let Some(height) = chain_state.connected_height(&acceptance) {
                 mempool.remove_for_block(&block, height);
             }
-            Value::Null
+            // Core returns `null` when the block joined the active chain, and
+            // `"inconclusive"` when it was valid and stored but did not
+            // connect (e.g. side chain, future block). Tests rely on the
+            // distinction.
+            if acceptance.connected() {
+                Value::Null
+            } else {
+                Value::String("inconclusive".to_string())
+            }
         }
         Err(e) => Value::String(e.to_string()),
     }

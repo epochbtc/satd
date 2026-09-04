@@ -187,6 +187,14 @@ async fn main() {
             .expect("test activation overrides installed twice");
     }
 
+    // `-mocktime=N`: install the mock clock at startup (regtest only).
+    if let Some(t) = config.mocktime
+        && t > 0
+        && node::time::clock_is_mockable(config.network)
+    {
+        node::time::set_mock_time(Some(t));
+    }
+
     // Base log filter (see `config::build_env_filter` for the full precedence
     // rules). The filter is wrapped in a `reload::Layer` so SIGHUP can change
     // log verbosity live (`reload::LogReloadHandle`). Only the EnvFilter is
@@ -1844,6 +1852,15 @@ async fn main() {
     // with learned peers so we don't have to re-bootstrap from DNS seeds
     // on every restart.
     peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
+
+    // Load the persistent ban list (banlist.json).
+    match peer_manager.load_banlist(&net_datadir) {
+        Ok(true) => tracing::info!("Recreating the banlist database"),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("Failed to load banlist: {e}");
+        }
+    }
 
     // -externalip: addresses advertised to peers.
     if !config.externalip.is_empty() {

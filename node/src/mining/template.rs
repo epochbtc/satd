@@ -128,6 +128,18 @@ fn assemble_template(
         eff_b.cmp(&eff_a)
     });
 
+    // Effective fee per txid, built before the selection loop consumes
+    // `entries`. Only the zero-fee package check below reads it.
+    let effective_fee_by_txid: std::collections::HashMap<bitcoin::Txid, u64> = entries
+        .iter()
+        .map(|(txid, e)| {
+            (
+                *txid,
+                (e.fee as i64).saturating_add(e.fee_delta).max(0) as u64,
+            )
+        })
+        .collect();
+
     // The (height, MTP) this block will be validated under — the MTP
     // context of `height` is the 11 blocks strictly below it, i.e. the
     // tip's MTP.
@@ -211,6 +223,22 @@ fn assemble_template(
             }
             if total_weight + entry.weight > MAX_BLOCK_WEIGHT {
                 continue; // weight only grows; this can never fit later
+            }
+            // A transaction whose own effective fee is zero — a negative
+            // `prioritisetransaction` delta, or a genuinely free tx — is
+            // worth mining only when something spending it pays.
+            //
+            // Core makes this call on the *chunk* (package) feerate, never
+            // the individual one: `src/node/miner.cpp` compares
+            // `chunk_feerate_vsize` against `blockMinFeeRate`, so a zero-fee
+            // parent rides in on its child's fee (CPFP) and only a package
+            // paying nothing is skipped. Judging it per-transaction dropped
+            // the parent here and then stranded the paying child, which
+            // defers forever behind a parent that is never included — so
+            // CPFP lost *both* transactions rather than mining both.
+            let effective_fee = (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64;
+            if effective_fee == 0 && !package_pays(mempool, &effective_fee_by_txid, &txid) {
+                continue;
             }
             total_weight += entry.weight;
             total_fees += entry.fee;
@@ -332,6 +360,26 @@ pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
     let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     script.extend_from_slice(&commitment.to_byte_array());
     hex::encode(script)
+}
+
+/// Whether anything spending `txid` pays a fee — the CPFP half of Core's
+/// chunk-feerate test.
+///
+/// Core excludes a package whose *whole chunk* earns less than
+/// `blockMinFeeRate`; the case that matters in practice is a zero-fee
+/// transaction with no paying descendant. Only consulted when the
+/// transaction's own effective fee is zero, so the mempool read costs
+/// nothing on the common path.
+fn package_pays(
+    mempool: &Mempool,
+    effective_fee_by_txid: &std::collections::HashMap<bitcoin::Txid, u64>,
+    txid: &bitcoin::Txid,
+) -> bool {
+    mempool
+        .get_descendants(txid)
+        .into_iter()
+        .flatten()
+        .any(|d| effective_fee_by_txid.get(&d).is_some_and(|&f| f > 0))
 }
 
 #[cfg(test)]

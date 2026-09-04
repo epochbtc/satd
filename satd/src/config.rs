@@ -593,6 +593,8 @@ pub struct Config {
     /// block is validated. `None` on every other network (the option is
     /// rejected there, as Core rejects it).
     pub test_activation_overrides: Option<node::validation::script::TestActivationOverrides>,
+    /// `-mocktime=N`: set the mock clock at startup (regtest only).
+    pub mocktime: Option<u64>,
     // Mempool policy
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
@@ -2262,6 +2264,10 @@ impl Config {
             }
         };
 
+        let mocktime = cli
+            .mocktime
+            .or_else(|| file_get("mocktime").and_then(|v| v.parse().ok()));
+
         // Mempool policy: CLI > config file > defaults
         let mempoolfullrbf = cli
             .mempoolfullrbf
@@ -3176,6 +3182,7 @@ impl Config {
             assumevalidage,
             stopatheight,
             test_activation_overrides,
+            mocktime,
             mempoolfullrbf,
             maxmempool,
             quarantinemempool,
@@ -4400,6 +4407,10 @@ pub struct CliArgs {
         help = "Regtest only: override a buried softfork deployment's activation height (repeatable; names: bip34, dersig, cltv, csv, segwit; matches Core's -testactivationheight)"
     )]
     pub testactivationheight: Vec<String>,
+
+    /// Regtest only: set the mock clock at startup.
+    #[arg(long, value_name = "TIME")]
+    pub mocktime: Option<u64>,
 
     // Mempool policy flags (Bitcoin Core compatible + extensions)
     #[arg(
@@ -8810,6 +8821,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            mocktime: None,
             mempoolfullrbf: None,
             maxmempool: None,
             quarantinemempool: None,
@@ -9100,6 +9112,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            mocktime: None,
             mempoolfullrbf: None,
             maxmempool: None,
             quarantinemempool: None,

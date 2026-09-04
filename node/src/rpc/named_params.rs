@@ -142,6 +142,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getchaintxstats" => &[("nblocks", false), ("blockhash", false)],
         "getconfig" => &[],
         "getconnectioncount" => &[],
+        "getdeploymentinfo" => &[("blockhash", false)],
         "getdifficulty" => &[],
         "getibdprogress" => &[],
         "getindexinfo" => &[("index_name", false)],
