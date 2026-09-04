@@ -36,13 +36,27 @@ cargo build --release --bin satd --bin sat-cli   # from the repo root
 
 `--candidate` ignores inventory status and does not touch the scoreboard.
 
-`run.sh` is not a `cargo test`: it needs built binaries and real ports, and runs
-nightly.
+`run.sh` is not a `cargo test`: it needs built binaries and real ports.
 
-It is not reachable from a pull request. The job builds and executes the
-checked-out tree, so PR code would run on the runner host; a label gate does not
-help, because the label outlives the push it was applied to. Push a branch to
-this repo and use `workflow_dispatch` on that ref.
+It runs in CI twice, for different reasons.
+
+**The PR gate** is the `core-functional` job in `canary.yml`, on a hosted
+runner. It downloads the same `satd-canary-binaries` artifact the nine canaries
+share, so the release build is paid for once per run, and the suite itself is
+under a minute at `SATD_CF_JOBS=4`. This is what stops a merge: without it, a
+`skip` -> `run` flip is never validated by pull-request CI, and any later change
+can silently un-pass a row the scoreboard still advertises.
+
+**The nightly run** is the `Run` job in `core-functional.yml`, on the
+self-hosted runner. It is where the run set gets widened and where a
+`--candidate` measurement can run unattended.
+
+The nightly job is deliberately **not** reachable from a pull request: it builds
+and executes the checked-out tree, so PR code would run on the runner host, and
+a label gate does not help because the label outlives the push it was applied
+to. Push a branch to this repo and use `workflow_dispatch` on that ref. The PR
+gate does not have that exposure -- a hosted runner is ephemeral and carries no
+credentials of ours.
 
 ## Rules
 

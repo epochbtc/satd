@@ -116,3 +116,19 @@ cargo build --release --bin satd --bin sat-cli   # from the repo root
 Nothing in the harness assumes a particular machine: the satd binaries, the
 Core checkout location, the scratch directory and the job count are all
 environment overrides, documented in `contrib/core-functional/README.md`.
+
+## In CI
+
+The run set gates every pull request. The build is the only slow part of it,
+and it is shared: the `core-functional` job downloads the same release binaries
+the third-party canary fleet uses, so the suite adds about a minute and sits off
+the critical path. A red run set blocks the merge.
+
+A second, nightly run on a dedicated runner is where the run set gets widened
+and where a `--candidate` measurement runs unattended. That one is not reachable
+from a pull request, because it builds and executes the branch under test.
+
+The split matters: for a while the suite ran only nightly, so a test could be
+marked `run` in one pull request and quietly stop passing in the next, with the
+published scoreboard still claiming it. That is not hypothetical -- it is how
+the count came to read 30 while four of those thirty were failing.

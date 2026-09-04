@@ -4,9 +4,13 @@ name: Core functional tests
 # See contrib/core-functional/README.md for what the harness may and may not do
 # to make a test pass.
 #
-# Nightly first, not PR-gating. Promote to a PR gate once the run-set has been
-# stable for ~2 weeks; when that happens, a flake gets its downstream pinned or
-# a `flaky-quarantine` row with an issue behind it -- never a weakened gate.
+# The PR gate lives in canary.yml's `core-functional` job, on a hosted runner
+# reusing the shared release build. This workflow keeps the *nightly* run: it
+# is where the run set gets widened and where a candidate measurement can run
+# unattended, on the self-hosted runner the suite was built against.
+#
+# A flake in the gated run set gets its downstream pinned or a
+# `flaky-quarantine` row with an issue behind it -- never a weakened gate.
 
 on:
   schedule:
