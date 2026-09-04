@@ -12914,14 +12914,21 @@ fn verbosity_accepts_core_s_bool_and_number_without_eating_later_args() {
     ));
     assert!(r["result"].is_string(), "default verbosity is 0: {r}");
 
-    // Verbosity 2 adds fields satd does not produce, so it is refused by name
-    // rather than answered as though it were 1.
+    // Verbosity 2 is answered, not refused: it is verbosity 1 plus `fee` and
+    // per-input `prevout`. A coinbase has neither (no inputs to price), so
+    // this call proves the argument is accepted and routed, and the shape is
+    // still the verbose object rather than hex.
     let r = named(format!(
         r#"{{"jsonrpc":"2.0","id":"t","method":"getrawtransaction",
             "params":{{"txid":"{cb1}","verbosity":2,"blockhash":"{hash1}"}}}}"#
     ));
-    let msg = r["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("verbosity 2"), "{r}");
+    assert!(r["error"].is_null(), "verbosity 2 is supported: {r}");
+    assert!(r["result"].is_object(), "verbosity 2 is verbose: {r}");
+    assert_eq!(r["result"]["txid"], serde_json::json!(cb1));
+    assert!(
+        r["result"]["fee"].is_null(),
+        "a coinbase has no fee to report: {r}"
+    );
 }
 
 /// `setmocktime` moves the node clock that block templates, the future-block

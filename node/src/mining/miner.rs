@@ -140,6 +140,71 @@ pub fn mine_block_to_script(
     Ok(block)
 }
 
+/// Mine a single block WITHOUT submitting it (Core's `generateblock
+/// submit=false`). Returns the built block for the caller to serialize.
+pub fn mine_block_only(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    output: &str,
+) -> Result<Block, MineError> {
+    let template = create_template(chain_state, mempool);
+
+    let coinbase_script = resolve_output_descriptor(output, chain_state.network)?;
+
+    let mut coinbase_tx =
+        build_coinbase(template.height, template.coinbase_value, &coinbase_script);
+
+    let other_txs: Vec<Transaction> =
+        template.transactions.iter().map(|t| t.tx.clone()).collect();
+    let has_witness = other_txs
+        .iter()
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
+
+    if has_witness {
+        let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
+        let witness_nonce = [0u8; 32];
+        let mut commitment_preimage = [0u8; 64];
+        commitment_preimage[..32].copy_from_slice(&witness_root);
+        commitment_preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment.to_byte_array());
+        coinbase_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(commitment_script),
+        });
+        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
+    }
+
+    let mut txdata = vec![coinbase_tx];
+    txdata.extend(other_txs);
+    let merkle_root = compute_merkle_root(&txdata);
+
+    let mut header = Header {
+        version: Version::from_consensus(template.version),
+        prev_blockhash: template.prev_hash,
+        merkle_root,
+        time: template.cur_time,
+        bits: template.bits,
+        nonce: 0,
+    };
+
+    loop {
+        let target = header.target();
+        match header.validate_pow(target) {
+            Ok(_) => break,
+            Err(_) => {
+                header.nonce += 1;
+                if header.nonce == 0 {
+                    header.time += 1;
+                }
+            }
+        }
+    }
+
+    Ok(Block { header, txdata })
+}
+
 /// Purge the mempool for a freshly mined block — but only if it connected.
 ///
 /// A sibling that arrived first leaves this block stored-but-not-connected. On
@@ -189,6 +254,34 @@ pub fn mine_blocks_to_script(
         hashes.push(block.block_hash().to_string());
     }
     Ok(hashes)
+}
+
+/// Resolve an output descriptor or address to a `ScriptBuf`.
+///
+/// Handles:
+/// - `raw(hex)` — raw script hex (Core's `generateblock` descriptor)
+/// - `addr(address)` — wrapped address
+/// - bare address — parsed directly
+fn resolve_output_descriptor(
+    desc: &str,
+    network: bitcoin::Network,
+) -> Result<ScriptBuf, MineError> {
+    if let Some(inner) = desc.strip_prefix("raw(").and_then(|s| s.strip_suffix(')')) {
+        let bytes = hex::decode(inner)
+            .map_err(|e| MineError::BadAddress(format!("bad raw() hex: {e}")))?;
+        return Ok(ScriptBuf::from_bytes(bytes));
+    }
+    let addr_str = desc
+        .strip_prefix("addr(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(desc);
+    let addr: Address<bitcoin::address::NetworkUnchecked> = addr_str
+        .parse()
+        .map_err(|e| MineError::BadAddress(format!("{e}")))?;
+    let addr = addr
+        .require_network(network)
+        .map_err(|e| MineError::BadAddress(format!("{e}")))?;
+    Ok(addr.script_pubkey())
 }
 
 /// Build a coinbase transaction for the given height and value.

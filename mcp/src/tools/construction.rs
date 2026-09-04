@@ -9,7 +9,7 @@ pub fn create_transaction(inputs: &Value, outputs: &Value, locktime: Option<u32>
         None => return json!({"error": "inputs must be an array"}).to_string(),
     };
 
-    match rawtx::create_raw_transaction(input_slice, outputs, locktime, None) {
+    match rawtx::create_raw_transaction(input_slice, outputs, locktime, None, None) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }

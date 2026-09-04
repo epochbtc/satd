@@ -88,6 +88,18 @@ pub enum ConnectError {
     SpIndexEmit(String),
 }
 
+impl ConnectError {
+    /// Whether this rejection is mutation-class and so must never be persisted
+    /// against the block hash. See [`crate::validation::ValidationError::is_mutation_class`].
+    ///
+    /// Only the wrapped structural errors can be mutation-class: everything
+    /// else here is a verdict about the block's *contents*, which the proof of
+    /// work does commit to.
+    pub fn is_mutation_class(&self) -> bool {
+        matches!(self, Self::TxValidation(e) if e.is_mutation_class())
+    }
+}
+
 /// Decode the block height from a BIP 34 coinbase scriptSig.
 ///
 /// BIP 34 requires the coinbase scriptSig to start with a CScript push of the

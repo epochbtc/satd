@@ -349,11 +349,24 @@ fn test_e2e_jsonrpc_tx_broadcast_and_mempool() {
     // 1 confirmation. This same call also returns `blockheight: 102`
     // (the spend lands in block 102, mined just above); both fields
     // are part of the Core-compatible verbose response.
+    //
+    // This node runs without `-txindex`, so the confirming block hash is
+    // required — Core answers a confirmed txid from the index or from a
+    // caller-supplied block, never from neither. The block just mined is
+    // the one the spend landed in.
+    let confirming_hash = rpc_post(rpcport, &cookie, "getbestblockhash", &[])["result"]
+        .as_str()
+        .expect("getbestblockhash")
+        .to_string();
     let raw = rpc_post(
         rpcport,
         &cookie,
         "getrawtransaction",
-        &[serde_json::json!(txid_hex), serde_json::json!(true)],
+        &[
+            serde_json::json!(txid_hex),
+            serde_json::json!(true),
+            serde_json::json!(confirming_hash),
+        ],
     );
     assert_eq!(
         raw["result"]["confirmations"], 1,

@@ -108,15 +108,25 @@ pub fn generate_block(
     chain_state: &ChainState,
     mempool: &Mempool,
     address: &str,
+    submit: bool,
 ) -> Result<Value, (i32, String)> {
     if chain_state.network != bitcoin::Network::Regtest {
         return Err((-1, "generateblock is only available in regtest mode".to_string()));
     }
 
-    let block = crate::mining::miner::mine_block(chain_state, mempool, address)
-        .map_err(|e| (-1, e.to_string()))?;
-
-    Ok(json!({ "hash": block.block_hash().to_string() }))
+    if submit {
+        let block = crate::mining::miner::mine_block(chain_state, mempool, address)
+            .map_err(|e| (-1, e.to_string()))?;
+        let block_hash = block.block_hash();
+        let hex = hex::encode(bitcoin::consensus::serialize(&block));
+        Ok(json!({ "hash": block_hash.to_string(), "hex": hex }))
+    } else {
+        let block = crate::mining::miner::mine_block_only(chain_state, mempool, address)
+            .map_err(|e| (-1, e.to_string()))?;
+        let block_hash = block.block_hash();
+        let hex = hex::encode(bitcoin::consensus::serialize(&block));
+        Ok(json!({ "hash": block_hash.to_string(), "hex": hex }))
+    }
 }
 
 /// Handle the `getblocktemplate` RPC call.
@@ -285,8 +295,15 @@ pub fn get_network_hash_ps(
 /// `submitheader` — accept a block header.
 pub fn submit_header(chain_state: &ChainState, hex_header: &str) -> Result<Value, String> {
     let header_bytes = hex::decode(hex_header).map_err(|_| "Invalid hex".to_string())?;
+    if header_bytes.len() < 80 {
+        return Err("Header decode failed".to_string());
+    }
+    // Core's `submitheader` accepts the full block hex (or just the 80-byte
+    // header). `bitcoin::consensus::deserialize` enforces an exact-size
+    // match, so trim to the first 80 bytes.
     let header: bitcoin::block::Header =
-        bitcoin::consensus::deserialize(&header_bytes).map_err(|_| "Header decode failed".to_string())?;
+        bitcoin::consensus::deserialize(&header_bytes[..80])
+            .map_err(|_| "Header decode failed".to_string())?;
     chain_state
         .accept_header(&header)
         .map_err(|e| e.to_string())?;

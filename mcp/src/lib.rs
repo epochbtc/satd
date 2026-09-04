@@ -271,7 +271,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Decode a hex-encoded raw transaction into JSON with all inputs, outputs, and witness data.")]
     fn decode_raw_transaction(&self, Parameters(p): Parameters<DecodeRawTransactionParams>) -> String {
-        tools::transactions::decode_raw_transaction(&p.hex_tx)
+        tools::transactions::decode_raw_transaction(&self.ctx, &p.hex_tx)
     }
 
     #[tool(description = "Decode a hex-encoded script into human-readable opcodes, type classification, and addresses.")]

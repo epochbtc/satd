@@ -5644,8 +5644,29 @@ impl ChainState {
 
         let new_height = parent.height + 1;
 
-        // Structural + witness block validation
-        validation::block::check_block(block, self.network, new_height)?;
+        // Structural + witness block validation.  If the block already has a
+        // `HeaderOnly` index entry (submitted via `submitheader`) and fails
+        // body validation, mark it — and every descendant in the index — as
+        // `Invalid` so that `getchaintips` reports the correct status.
+        // This matches Core's `InvalidBlockFound`.
+        //
+        // Except for mutation-class rejections, which Core deliberately
+        // excludes from that marking (CVE-2012-2459): the block hash does not
+        // commit to the data we just rejected, so the verdict may belong to a
+        // malleated copy of a block that is actually valid. Writing it down
+        // would bar the honest block — and, via the parent-status guard, its
+        // whole descendant chain — until an operator ran `reconsiderblock`.
+        if let Err(e) = validation::block::check_block(block, self.network, new_height) {
+            if !e.is_mutation_class()
+                && self
+                    .store
+                    .get_block_index(&block_hash)
+                    .is_some_and(|ex| ex.status == BlockStatus::HeaderOnly)
+            {
+                let _ = self.mark_subtree_invalid(block_hash);
+            }
+            return Err(e.into());
+        }
 
         // PoW validation
         validation::pow::check_proof_of_work(&block.header)?;
@@ -5692,6 +5713,7 @@ impl ChainState {
             return Err(ChainError::CheckpointMismatch(new_height));
         }
 
+        // ---- Connect-time validation passed. Write the block data. ----
         // Write raw block to flat file, durably enough that the index entry
         // below can never outlive the bytes it points at.
         let block_data = serialize(block);
@@ -6118,6 +6140,19 @@ impl ChainState {
                         &e,
                         Some((block_hash, new_height)),
                     );
+                }
+                // Mark the block (and its descendants) as Invalid so
+                // `getchaintips` reports them correctly — Core's
+                // `InvalidBlockFound`. This buffers into the coin cache's
+                // pending batch; it must not flush, because `reorg_excl` (if
+                // held) makes an external flush block forever on this very
+                // thread.
+                //
+                // Core's `InvalidBlockFound` skips the marking entirely for a
+                // mutation-class verdict, and so do we — see the equivalent
+                // guard on `check_block` above.
+                if !e.is_mutation_class() {
+                    let _ = self.mark_subtree_invalid(block_hash);
                 }
                 return Err(e.into());
             }
@@ -8644,6 +8679,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_mutated_block_never_writes_invalid_against_its_hash() {
+        // CVE-2012-2459. A merkle tree whose trailing subtree is duplicated
+        // hashes to the same root as the honest tree, so `[cb, t1, t2, t2]`
+        // and `[cb, t1, t2]` share a block hash. An attacker can therefore
+        // hand us a malleated copy of a block that is perfectly valid.
+        //
+        // Rejecting the copy is right; writing the rejection down against the
+        // hash is not. `Invalid` is sticky, and the parent-status guard
+        // rejects every descendant of an invalid entry — so persisting a
+        // verdict here would bar the honest block and fork the node off the
+        // real chain until an operator ran `reconsiderblock`. Core spells the
+        // exclusion out in `InvalidBlockFound`: no `BLOCK_FAILED_VALID` when
+        // the result is `BLOCK_MUTATED`.
+        use bitcoin::hashes::Hash as _;
+
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let parent = blocks.last().unwrap().block_hash();
+
+        // A block body with an odd number of merkle leaves, which is what
+        // makes the duplication attack possible in the first place.
+        let mut honest = build_test_block(parent, 4, 1_300_000_004);
+        let filler = |n: u8| bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([n; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        honest.txdata.push(filler(1));
+        honest.txdata.push(filler(2));
+        honest.header.merkle_root = honest.compute_merkle_root().unwrap();
+        grind_test_pow(&mut honest);
+
+        // The malleated twin: duplicate the trailing transaction. Same merkle
+        // root, therefore the same header and the same block hash.
+        let mut malleated = honest.clone();
+        malleated.txdata.push(malleated.txdata.last().unwrap().clone());
+        assert_eq!(
+            malleated.block_hash(),
+            honest.block_hash(),
+            "the whole point of the attack is that the hash is unchanged"
+        );
+
+        // Give the hash a HeaderOnly index entry, the state in which the
+        // marking path is live.
+        cs.accept_header(&honest.header).unwrap();
+        let hash = honest.block_hash();
+        assert_eq!(
+            cs.get_block_index(&hash).unwrap().status,
+            BlockStatus::HeaderOnly
+        );
+
+        let err = cs
+            .accept_block(&malleated)
+            .expect_err("a merkle-mutated block must be rejected");
+        assert!(
+            err.to_string().contains("bad-txns-duplicate"),
+            "expected the mutation reject reason, got: {err}"
+        );
+
+        // The verdict must not have been written down.
+        assert_eq!(
+            cs.get_block_index(&hash).unwrap().status,
+            BlockStatus::HeaderOnly,
+            "a mutation-class rejection must not persist Invalid against the \
+             block hash — the honest block shares it (CVE-2012-2459)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn accept_header_does_not_clobber_active_height_index_with_subtip_fork() {
         // The 951k bad-cb-height root cause: a competing fork announced *below*
         // the active tip was accepted as headers, and the unconditional
@@ -10756,6 +10874,26 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-solve a block's proof of work after its body (and therefore its
+    /// merkle root and hash) has been edited. Same grind `build_test_block`
+    /// does, factored out so tests that rewrite `txdata` can reuse it.
+    pub(crate) fn grind_test_pow(block: &mut Block) {
+        use bitcoin::hashes::Hash as _;
+        let target = crate::storage::blockindex::target_from_compact(block.header.bits);
+        for nonce in 0u32..1_000_000 {
+            block.header.nonce = nonce;
+            let hash_bytes = *block.block_hash().as_raw_hash().as_byte_array();
+            let mut hash_be = [0u8; 32];
+            for i in 0..32 {
+                hash_be[i] = hash_bytes[31 - i];
+            }
+            if hash_be <= target {
+                return;
+            }
+        }
+        panic!("failed to solve regtest proof of work in 1e6 nonces");
     }
 
     /// Build a valid regtest block at the given height with the given parent hash and timestamp.
