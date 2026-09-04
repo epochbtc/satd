@@ -426,6 +426,18 @@ pub struct RpcContext {
     /// Channel to the SP-index backfill supervisor task.
     pub sp_backfill_cmd_tx:
         Option<tokio::sync::mpsc::Sender<crate::index::silent_payments::BackfillCommand>>,
+    /// Whether `-txindex` was explicitly enabled at runtime. Used by
+    /// `getindexinfo` to decide whether to include the `"txindex"`
+    /// entry in the Core-compatible response.
+    pub txindex_enabled: bool,
+    /// Whether `-coinstatsindex` was explicitly enabled at runtime.
+    /// satd does not implement this index; the flag is accepted for
+    /// Core compat and reported as always-synced in `getindexinfo`.
+    pub coinstatsindex_enabled: bool,
+    /// Whether `-txospenderindex` was explicitly enabled at runtime.
+    /// satd does not implement this index; the flag is accepted for
+    /// Core compat and reported as always-synced in `getindexinfo`.
+    pub txospenderindex_enabled: bool,
     /// Runtime listener status — read by `getserverstatus`. Mutated by
     /// the satd binary after each optional listener (Esplora,
     /// Electrum, Electrum TLS) successfully binds.
@@ -588,6 +600,9 @@ pub async fn start(
     sp_backfill_cmd_tx: Option<
         tokio::sync::mpsc::Sender<crate::index::silent_payments::BackfillCommand>,
     >,
+    txindex_enabled: bool,
+    coinstatsindex_enabled: bool,
+    txospenderindex_enabled: bool,
     listener_status: Arc<ServerListenerStatus>,
     #[cfg(feature = "block-filter-index")] blockfilterindex_enabled: bool,
     #[cfg(feature = "block-filter-index")] filter_index: Option<
@@ -629,6 +644,9 @@ pub async fn start(
         sp_index_enabled,
         sp_backfill,
         sp_backfill_cmd_tx,
+        txindex_enabled,
+        coinstatsindex_enabled,
+        txospenderindex_enabled,
         listener_status,
         #[cfg(feature = "block-filter-index")]
         blockfilterindex_enabled,
@@ -1028,7 +1046,41 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("getindexinfo", |_params, ctx, _extensions| {
+    module.register_method("getindexinfo", |params, ctx, _extensions| {
+        // Core-compatible getindexinfo: only report indexes that were
+        // explicitly requested via CLI flags, matching Bitcoin Core's
+        // behavior. Optional index_name parameter filters the response.
+        let mut seq = params.sequence();
+        // Core's `RPCHelpMan` argument loop rejects a wrongly-typed argument
+        // with RPC_TYPE_ERROR (-3) rather than ignoring it. Swallowing the
+        // error here would answer `getindexinfo(5)` with the full index list.
+        let index_name: Option<String> = seq
+            .optional_next()
+            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        #[cfg(feature = "block-filter-index")]
+        let bfi_enabled = ctx.blockfilterindex_enabled;
+        #[cfg(not(feature = "block-filter-index"))]
+        let bfi_enabled = false;
+        Ok::<_, ErrorObjectOwned>(indexes::get_index_info_core_compat(
+            &ctx.chain_state,
+            indexes::CoreIndexFlags {
+                txindex_enabled: ctx.txindex_enabled,
+                blockfilterindex_enabled: bfi_enabled,
+                coinstatsindex_enabled: ctx.coinstatsindex_enabled,
+                txospenderindex_enabled: ctx.txospenderindex_enabled,
+            },
+            ctx.chain_state.tip_height(),
+            #[cfg(feature = "block-filter-index")]
+            ctx.filter_backfill.as_ref(),
+            index_name.as_deref(),
+        ))
+    })?;
+
+    // satd-specific index info: address-index backfill, SP-index status,
+    // block-filter-index backfill. Preserves the detailed satd-native
+    // shape that sat-tui and operators rely on; `getindexinfo` above is
+    // the Core-compatible surface.
+    module.register_method("getsatdindexinfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(indexes::get_index_info(
             ctx.backfill.as_ref(),
             &ctx.chain_state,

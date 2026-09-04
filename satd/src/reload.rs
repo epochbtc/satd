@@ -740,6 +740,8 @@ fn field_specs() -> Vec<FieldSpec> {
             .addr_sub_registry
             .set_max_subs(c.addrindexsubscriptions)),
         restart!("blockfilterindex", blockfilterindex),
+        restart!("coinstatsindex", coinstatsindex),
+        restart!("txospenderindex", txospenderindex),
         live!("peerblockfilters", peerblockfilters, |c, h| h
             .peer_manager
             .set_peer_serve_filters(c.peerblockfilters)),

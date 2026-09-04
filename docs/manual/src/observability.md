@@ -64,7 +64,7 @@ serve, and what its deferred backfill is doing. The silent-payment family:
 | Metric | Meaning |
 |---|---|
 | `satd_spindex_enabled` | 1 if the silent-payment tweak index is enabled at runtime |
-| `satd_spindex_synced` | 1 if the tweak-serving surfaces will return data — enabled, complete on disk, and no backfill in flight. Matches `getindexinfo`'s `silentpayments.synced` |
+| `satd_spindex_synced` | 1 if the tweak-serving surfaces will return data — enabled, complete on disk, and no backfill in flight. Matches `getsatdindexinfo`'s `silentpayments.synced` |
 | `satd_spindex_backfill_state{state="…"}` | one series per lifecycle state, exactly one of them 1 |
 | `satd_spindex_backfill_progress_ratio` | fraction of the deferred backfill walked, over `[taproot activation, snapshot]` |
 
@@ -73,7 +73,7 @@ The address and block-filter indexes export the same readiness shape —
 (alongside the existing `satd_addrindex_enabled` and row counters), and
 `satd_filterindex_enabled` / `satd_filterindex_synced` /
 `satd_filterindex_backfill_state{state="…"}`. `synced` matches the
-corresponding `getindexinfo` predicate in each case: for the address index it
+corresponding `getsatdindexinfo` predicate in each case: for the address index it
 means the Electrum / Esplora address surfaces will serve; for the filter index
 it means BIP 157 peers and `getblockfilter` will be served. A failed or stuck
 backfill on any of the three is alertable with the same rules shown below —

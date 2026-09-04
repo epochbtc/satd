@@ -170,6 +170,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getrawtransaction" => &[("txid", false), ("verbosity|verbose", false), ("blockhash", false)],
         "getreorghistory" => &[("since_secs", false)],
         "getrpcinfo" => &[],
+        "getsatdindexinfo" => &[],
         "getserverstatus" => &[],
         "getsilentpaymentblockdata" => &[("blockhash", false), ("verbosity", false), ("dust_limit", false)],
         "getsysteminfo" => &[],

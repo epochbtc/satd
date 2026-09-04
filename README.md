@@ -145,7 +145,7 @@ cargo run --bin satd -- --blockfilterindex=basic --peerblockfilters=1
 ### Querying & Stopping
 ```sh
 cargo run --bin sat-cli -- --regtest getblockchaininfo
-cargo run --bin sat-cli -- --regtest getindexinfo
+cargo run --bin sat-cli -- --regtest getsatdindexinfo
 cargo run --bin sat-cli -- --regtest getserverstatus
 cargo run --bin sat-cli -- --regtest stop
 ```

@@ -127,7 +127,7 @@ controls (`pauseindex` / `resumeindex` / `cancelindex silentpayment`). It
 refuses to start with less than 6 GiB of free disk. Progress is visible three
 ways, all reporting the same walk-relative ratio:
 
-- `getindexinfo` → the `silentpayments` section: `enabled`, `synced`, and a
+- `getsatdindexinfo` → the `silentpayments` section: `enabled`, `synced`, and a
   `backfill` object with `state`, `cursor_height`, `snapshot_height`,
   `progress_ratio`, and `estimated_remaining_seconds`. Use the reported
   `progress_ratio`, not `cursor_height / snapshot_height` — the latter measures

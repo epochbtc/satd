@@ -1504,7 +1504,7 @@ pub fn compute_tweak(tx: &amp;Transaction, prevout_spks: &amp;[ScriptBuf]) -&gt;
 //!   caught by the per-batch reorg check above and aborts the run.</code></pre></div>
     <p>The one way the partition breaks is a reorg dragging the anchor off the active chain — so the runner re-verifies the anchor by walking back from the live tip <em>before and after every single-block batch</em>, and the cursor advance rides the same batch as the rows it describes, making resume-after-<code>kill&nbsp;-9</code> exact. Pre-flight disk checks refuse to start under known mainnet footprints: 80 GB free for address (the temp CF peaks ~56 GB), 10 GB for filters (~6 GB of blobs), 6 GB for SP tweaks (~3.9 GB).</p>
     <h3>stint.rs: an ETA that refuses to lie</h3>
-    <p>The shared rate meter behind <code>getindexinfo</code>'s time-remaining estimate is a bug story in module form — the old formula divided wall-clock-since-first-start by progress, so a 48-hour pause was extrapolated as if the walk had been grinding through it:</p>
+    <p>The shared rate meter behind <code>getsatdindexinfo</code>'s time-remaining estimate is a bug story in module form — the old formula divided wall-clock-since-first-start by progress, so a 48-hour pause was extrapolated as if the walk had been grinding through it:</p>
     <div class="code"><div class="code-head"><span class="path">node/src/index/stint.rs:23</span><span>why nothing is persisted</span></div>
 <pre><code class="lang-rust">//! ## Why nothing is persisted
 //!
