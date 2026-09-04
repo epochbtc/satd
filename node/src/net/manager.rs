@@ -5496,7 +5496,11 @@ impl PeerManager {
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
         if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
-            self.add_ban_score(id, 100, "oversized locator");
+            // Core disconnects, it does not ban: `net_processing.cpp` sets
+            // `pfrom.fDisconnect = true` and returns, with no misbehaviour
+            // score. Banning the address here would refuse the peer's next
+            // connection too, which Core allows.
+            self.disconnect_by_id(id);
             return;
         }
 
@@ -5533,7 +5537,11 @@ impl PeerManager {
         msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
     ) {
         if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
-            self.add_ban_score(id, 100, "oversized locator");
+            // Core disconnects, it does not ban: `net_processing.cpp` sets
+            // `pfrom.fDisconnect = true` and returns, with no misbehaviour
+            // score. Banning the address here would refuse the peer's next
+            // connection too, which Core allows.
+            self.disconnect_by_id(id);
             return;
         }
 
@@ -7262,6 +7270,44 @@ mod tests {
         match rx1.try_recv() {
             Ok(NetworkMessage::Tx(tx)) => assert_eq!(tx.compute_txid(), template_q),
             other => panic!("on-template tx must be served via getdata, got {other:?}"),
+        }
+    }
+
+    /// Core disconnects a peer that sends an oversized locator; it does not
+    /// ban it (`net_processing.cpp` sets `pfrom.fDisconnect = true` and
+    /// returns, with no misbehaviour score). satd scored 100 here, which is
+    /// `BAN_THRESHOLD`, so the address was banned and the peer's *next*
+    /// connection refused -- which is what p2p_invalid_locator.py trips over
+    /// when it opens a second connection. Core's functional suite is nightly,
+    /// so this is the PR-gated guard.
+    #[tokio::test]
+    async fn oversized_locator_disconnects_without_banning() {
+        use bitcoin::BlockHash;
+        use bitcoin::hashes::Hash;
+        use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage};
+
+        // getheaders and getblocks share the check; both must behave.
+        for use_getheaders in [true, false] {
+            let pm = empty_peer_manager();
+            let addr: SocketAddr = "10.0.0.11:8333".parse().unwrap();
+            let handle = mk_handle(11, addr, Direction::Inbound, PeerState::Connected);
+            pm.peers.write().insert(11, handle);
+
+            let locator: Vec<BlockHash> = (0..=MAX_LOCATOR_SZ as u32)
+                .map(|i| BlockHash::from_byte_array([i as u8; 32]))
+                .collect();
+            assert!(locator.len() > MAX_LOCATOR_SZ);
+            let stop = BlockHash::from_byte_array([0u8; 32]);
+            if use_getheaders {
+                pm.handle_getheaders(11, GetHeadersMessage::new(locator, stop));
+            } else {
+                pm.handle_getblocks(11, GetBlocksMessage::new(locator, stop));
+            }
+
+            assert!(
+                !pm.is_addr_banned(&addr),
+                "an oversized locator must disconnect, not ban (getheaders={use_getheaders})"
+            );
         }
     }
 

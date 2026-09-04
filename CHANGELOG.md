@@ -61,6 +61,18 @@ item below is (or will be) written up in full in the in-development
   `electrs`. `electrumservername=` overrides it. The P2P user agent is unchanged
 
 ### Fixed
+- Mempool admission is gated on Bitcoin Core v31's cluster limit
+  (`-limitclustercount`, default and maximum 64) instead of the deprecated
+  ancestor/descendant counts, and reports Core's `too-large-cluster`; chains of
+  up to 64 connected transactions are now accepted, where 26 was refused (#676)
+- An `OP_RETURN` output over the `-datacarriersize` budget is rejected as
+  `datacarrier`, Core's reason, not `scriptpubkey` (#676)
+- An oversized `getheaders`/`getblocks` locator disconnects the peer without
+  banning it, as Core does; the address is no longer refused on reconnect (#676)
+- `getindexinfo("txindex").synced` reports ready whenever `-txindex` is set,
+  matching what satd actually maintains; on a datadir first synced without the
+  flag it reported unsynced forever, hanging Core's documented poll-then-query
+  pattern (#676)
 - A mined or submitted block that was stored without connecting (a sibling won
   the race) no longer purges the mempool or reports a confirming height; every
   post-connect purge now reports the block's own height, never a tip re-read a

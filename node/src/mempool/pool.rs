@@ -117,7 +117,10 @@ pub enum MempoolError {
     /// Field: detail message.
     #[error("insufficient feerate: does not improve feerate diagram")]
     DoesNotImproveFeerateDiagram(String),
-    #[error("too-long-mempool-chain")]
+    /// The transaction's connected component would exceed the cluster limit.
+    /// Core v31's reject string (`validation.cpp`, `CheckMemPoolPolicyLimits`);
+    /// the pre-cluster `too-long-mempool-chain` no longer exists in Core.
+    #[error("too-large-cluster")]
     TooLongMempoolChain,
     /// A locally-submitted transaction drew a relay-scoped quarantine verdict
     /// (design §6.1): refused rather than silently held, with the rule named.
@@ -212,7 +215,10 @@ impl MempoolError {
             MempoolError::NonBip68Final => "non-BIP68-final".to_string(),
             MempoolError::DecodeFailed => "TX decode failed".to_string(),
             MempoolError::Dust => "dust".to_string(),
-            MempoolError::NonStandardOpReturn => "scriptpubkey".to_string(),
+            // `policy.cpp` `IsStandardTx`: a NULL_DATA output over the
+            // datacarrier budget reports "datacarrier"; "scriptpubkey" is
+            // reserved for an output that is not a standard type at all.
+            MempoolError::NonStandardOpReturn => "datacarrier".to_string(),
             MempoolError::InsufficientReplacementFee(..) => "insufficient fee".to_string(),
             MempoolError::SpendsConflictingTx(..) => {
                 "bad-txns-spends-conflicting-tx".to_string()
@@ -223,7 +229,7 @@ impl MempoolError {
             MempoolError::DoesNotImproveFeerateDiagram(..) => {
                 "insufficient feerate: does not improve feerate diagram".to_string()
             }
-            MempoolError::TooLongMempoolChain => "too-long-mempool-chain".to_string(),
+            MempoolError::TooLongMempoolChain => "too-large-cluster".to_string(),
             // `ephemeral_policy.cpp`: reason "dust", debug "tx with dust
             // output must be 0-fee" — the detail goes to `reject_details`.
             MempoolError::EphemeralDustFee => "dust".to_string(),
@@ -5450,6 +5456,45 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reject strings Bitcoin Core v31 actually emits, for the errors
+    /// where satd once emitted a different one. Core's functional suite
+    /// asserts on these by substring, but its `run` job is nightly, so
+    /// nothing in a pull request would otherwise catch a change here.
+    #[test]
+    fn reject_reasons_match_core_v31_strings() {
+        // `policy.cpp` `IsStandardTx`: a NULL_DATA output over the
+        // datacarrier budget is "datacarrier". "scriptpubkey" is reserved
+        // for an output that is not a standard type at all -- reporting it
+        // here tells a client its script was unrecognised when in fact its
+        // data was merely too big (mempool_datacarrier.py).
+        assert_eq!(MempoolError::NonStandardOpReturn.reject_reason(), "datacarrier");
+
+        // `validation.cpp` `CheckMemPoolPolicyLimits`. The pre-cluster
+        // "too-long-mempool-chain" does not appear anywhere in Core v31's
+        // source (feature_rbf.py).
+        assert_eq!(
+            MempoolError::TooLongMempoolChain.reject_reason(),
+            "too-large-cluster"
+        );
+
+        // Both are policy failures, so both carry -26. Only missing inputs
+        // (and satd's own quarantine verdict) answer -25.
+        assert_eq!(MempoolError::NonStandardOpReturn.rpc_code(), -26);
+        assert_eq!(MempoolError::TooLongMempoolChain.rpc_code(), -26);
+    }
+
+    /// Core v31 gates admission on the cluster limit, not on the deprecated
+    /// ancestor/descendant counts. 64 is both the default and the maximum
+    /// (`txgraph.h` `MAX_CLUSTER_COUNT_LIMIT`), so a chain of 40 -- which
+    /// feature_rbf.py builds -- has to be accepted.
+    #[test]
+    fn default_chain_limit_is_the_cluster_limit() {
+        assert_eq!(policy::MAX_CLUSTER_COUNT, 64);
+        let cfg = MempoolConfig::default();
+        assert_eq!(cfg.max_ancestor_count, policy::MAX_CLUSTER_COUNT);
+        assert_eq!(cfg.max_descendant_count, policy::MAX_CLUSTER_COUNT);
     }
 
     #[test]

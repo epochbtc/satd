@@ -61,8 +61,8 @@ pub struct CoreIndexFlags {
 /// `{}`. An optional `index_name` filter narrows to a single entry.
 ///
 /// Indexes:
-/// - `"txindex"` — present when `-txindex` was set; synced when
-///   `tx_index_complete()` is true.
+/// - `"txindex"` — present when `-txindex` was set; synced whenever the
+///   flag is on, since satd writes the index inline during `connect_block`.
 /// - `"basic block filter index"` — present when `-blockfilterindex`
 ///   was set; synced on the same predicate `getsatdindexinfo` uses, so
 ///   the two surfaces cannot disagree about one index.
@@ -89,7 +89,15 @@ pub fn get_index_info_core_compat(
     let mut top = serde_json::Map::new();
 
     if txindex_enabled {
-        let synced = chain.store_ref().has_txindex() && chain.store_ref().tx_index_complete();
+        // satd writes txindex entries inline during `connect_block`, so with
+        // the flag on the index is current for every block this node
+        // connects. `tx_index_complete()` is the *historical-backfill*
+        // marker: it stays false on a datadir first synced without
+        // `-txindex`, and satd has no background builder to flip it. Core
+        // has one, so `synced` there eventually goes true either way, and
+        // its documented pattern -- poll `synced`, then query -- hangs
+        // forever against the stricter predicate (#649).
+        let synced = chain.store_ref().has_txindex();
         top.insert("txindex".into(), index_entry(synced, tip_height));
     }
 

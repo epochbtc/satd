@@ -605,6 +605,13 @@ pub struct Config {
     pub datacarrier: bool,
     pub limitancestorcount: usize,
     pub limitdescendantcount: usize,
+    /// Core v31's `-limitclustercount`: the acceptance limit over a
+    /// transaction's whole connected component. This is what actually gates
+    /// admission; `-limitancestorcount` / `-limitdescendantcount` are the
+    /// deprecated pre-cluster settings Core now uses only for wallet coin
+    /// selection. Default and maximum are both 64 (`txgraph.h`
+    /// `MAX_CLUSTER_COUNT_LIMIT`), so the option can only lower it.
+    pub limitclustercount: usize,
     pub mempoolexpiry: u64,
     /// Bitcoin Core's `-persistmempool`: save the mempool to
     /// `<datadir>/<chain>/mempool.dat` on clean shutdown and re-admit
@@ -2414,6 +2421,20 @@ impl Config {
             .or_else(|| file_get("limitdescendantcount").and_then(|v| v.parse().ok()))
             .unwrap_or(25);
 
+        // Core clamps rather than defaults: `mempool_args.cpp` errors when the
+        // requested count exceeds MAX_CLUSTER_COUNT_LIMIT, so a value above 64
+        // is a configuration mistake, not a bigger mempool.
+        let limitclustercount = cli
+            .limitclustercount
+            .or_else(|| file_get("limitclustercount").and_then(|v| v.parse().ok()))
+            .unwrap_or(node::mempool::policy::MAX_CLUSTER_COUNT);
+        if limitclustercount > node::mempool::policy::MAX_CLUSTER_COUNT {
+            return Err(format!(
+                "limitclustercount must be less than or equal to {}",
+                node::mempool::policy::MAX_CLUSTER_COUNT
+            ));
+        }
+
         let mempoolexpiry = cli
             .mempoolexpiry
             .or_else(|| file_get("mempoolexpiry").and_then(|v| v.parse().ok()))
@@ -3241,6 +3262,7 @@ impl Config {
             datacarrier,
             limitancestorcount,
             limitdescendantcount,
+            limitclustercount,
             mempoolexpiry,
             persistmempool: cli
                 .persistmempool
@@ -4547,6 +4569,14 @@ pub struct CliArgs {
         help = "Maximum unconfirmed descendant count (default: 25)"
     )]
     pub limitdescendantcount: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Do not accept transactions connected to N or more other \
+                unconfirmed transactions (default: 64, maximum: 64)"
+    )]
+    pub limitclustercount: Option<usize>,
 
     #[arg(
         long,
@@ -6003,6 +6033,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "datacarrier",
         "limitancestorcount",
         "limitdescendantcount",
+        "limitclustercount",
         "mempoolexpiry",
         "persistmempool",
         "permitbaremultisig",
@@ -6730,6 +6761,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "datacarriersize",
     "limitancestorcount",
     "limitdescendantcount",
+    "limitclustercount",
     "mempoolexpiry",
     "persistmempool",
     "permitbaremultisig",
@@ -8907,6 +8939,7 @@ testactivationheight=bip34@2
             datacarrier: None,
             limitancestorcount: None,
             limitdescendantcount: None,
+            limitclustercount: None,
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,
@@ -9200,6 +9233,7 @@ testactivationheight=bip34@2
             datacarrier: None,
             limitancestorcount: None,
             limitdescendantcount: None,
+            limitclustercount: None,
             mempoolexpiry: None,
             persistmempool: None,
             permitbaremultisig: None,

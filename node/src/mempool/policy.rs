@@ -32,11 +32,31 @@ pub const MAX_OP_RETURN_SIZE: usize = 83;
 /// large OP_RETURN outputs the same as Core.
 pub const DEFAULT_DATA_CARRIER_SIZE: usize = 100_000;
 
+/// Maximum number of transactions in one connected mempool cluster.
+///
+/// Core v31 replaced the ancestor/descendant package limits with a single
+/// limit over a transaction's whole connected component
+/// (`DEFAULT_CLUSTER_LIMIT{64}`, `src/policy/policy.h`). The older
+/// `DEFAULT_ANCESTOR_LIMIT{25}` / `DEFAULT_DESCENDANT_LIMIT{25}` still
+/// exist, but v31's own `-limitancestorcount` help calls them
+/// "Deprecated ... replaced by cluster limits (see -limitclustercount) and
+/// only used by wallet for coin selection": no acceptance path reads them,
+/// and the reject string they produced (`too-long-mempool-chain`) is gone
+/// from Core's source entirely.
+///
+/// satd tracks the transitive ancestor and descendant sets rather than a
+/// true cluster. For the linear chains this limit actually governs the two
+/// coincide, so the cluster bound is applied to each — a real cluster
+/// implementation is separate work.
+pub const MAX_CLUSTER_COUNT: usize = 64;
+
 /// Maximum number of in-mempool ancestors for a single transaction.
-pub const MAX_ANCESTOR_COUNT: usize = 25;
+/// See [`MAX_CLUSTER_COUNT`] for why this is the cluster bound.
+pub const MAX_ANCESTOR_COUNT: usize = MAX_CLUSTER_COUNT;
 
 /// Maximum number of in-mempool descendants for a single transaction.
-pub const MAX_DESCENDANT_COUNT: usize = 25;
+/// See [`MAX_CLUSTER_COUNT`] for why this is the cluster bound.
+pub const MAX_DESCENDANT_COUNT: usize = MAX_CLUSTER_COUNT;
 
 /// Mempool expiry time in seconds (14 days).
 pub const MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
