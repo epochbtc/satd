@@ -1214,7 +1214,30 @@ pub async fn start(
         }
     })?;
 
-    module.register_method("getblocktemplate", |_params, ctx, _extensions| {
+    module.register_method("getblocktemplate", |params, ctx, _extensions| {
+        // The optional first positional argument is the template_request
+        // object. When it contains `"mode": "proposal"` and `"data"`, run
+        // proposal-mode validation instead of returning a new template.
+        let mut seq = params.sequence();
+        let request: Option<serde_json::Value> = seq
+            .optional_next()
+            .unwrap_or(None);
+        if let Some(ref req) = request
+            && req.get("mode").and_then(|m| m.as_str()) == Some("proposal")
+        {
+            let data = req
+                .get("data")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -8,
+                        "\"data\" is required for proposal mode",
+                        None::<()>,
+                    )
+                })?;
+            return mining::get_block_template_proposal(&ctx.chain_state, data)
+                .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>));
+        }
         Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
     })?;
 
@@ -1650,13 +1673,39 @@ pub async fn start(
             }
             _ => 10_000_000,
         };
-        let mut results = Vec::new();
+
+        // Pre-decode all transactions and check for package-level duplicates
+        // (Core: "package-contains-duplicates"). A package with two copies of
+        // the same transaction is invalid regardless of whether each copy is
+        // individually valid.
+        let mut decoded: Vec<bitcoin::Transaction> = Vec::with_capacity(rawtxs.len());
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
             let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            decoded.push(tx);
+        }
 
+        if decoded.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(decoded.len());
+            let has_dups = decoded.iter().any(|tx| !seen.insert(tx.compute_txid()));
+            if has_dups {
+                let results: Vec<serde_json::Value> = decoded
+                    .iter()
+                    .map(|tx| {
+                        serde_json::json!({
+                            "txid": tx.compute_txid().to_string(),
+                            "package-error": "package-contains-duplicates",
+                        })
+                    })
+                    .collect();
+                return Ok(serde_json::json!(results));
+            }
+        }
+
+        let mut results = Vec::new();
+        for tx in &decoded {
             // Check if tx is already confirmed.
             let txid_check = tx.compute_txid();
             if ctx.chain_state.get_coin(&bitcoin::OutPoint { txid: txid_check, vout: 0 }).is_some()
@@ -1668,10 +1717,9 @@ pub async fn start(
                 }));
                 continue;
             }
-
             match ctx
                 .mempool
-                .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
+                .test_accept(tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
                     let wtxid = tx.compute_wtxid();

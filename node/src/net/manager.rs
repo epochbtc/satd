@@ -2812,7 +2812,8 @@ impl PeerManager {
         if let Some(e) = err {
             match e {
                 crate::chain::state::ChainError::Duplicate => {}
-                crate::chain::state::ChainError::BadPrevBlock => {
+                crate::chain::state::ChainError::PrevBlockNotFound
+                | crate::chain::state::ChainError::BadPrevBlock => {
                     // The announced header builds on a chain we haven't seen —
                     // a competing/longer chain forking below our knowledge. Ask
                     // this peer for the connecting headers (headers-first
@@ -3326,7 +3327,8 @@ impl PeerManager {
                     }
                 }
             }
-            Err(crate::chain::state::ChainError::BadPrevBlock) => {
+            Err(crate::chain::state::ChainError::PrevBlockNotFound)
+            | Err(crate::chain::state::ChainError::BadPrevBlock) => {
                 // Parent header not yet accepted — normal during swarm IBD.
                 // Don't penalize the peer; the block may become valid later.
                 tracing::debug!(%hash, "IBD block store: parent unknown, skipping");
@@ -3350,7 +3352,8 @@ impl PeerManager {
                     self.note_bg_block_stored(entry.height);
                 }
             }
-            Err(crate::chain::state::ChainError::BadPrevBlock) => {
+            Err(crate::chain::state::ChainError::PrevBlockNotFound)
+            | Err(crate::chain::state::ChainError::BadPrevBlock) => {
                 tracing::debug!(%hash, "bg catch-up block store: parent unknown, skipping");
             }
             Err(e) => {
@@ -3936,7 +3939,8 @@ impl PeerManager {
                         }
                     }
                     Err(crate::chain::state::ChainError::Duplicate) => {}
-                    Err(crate::chain::state::ChainError::BadPrevBlock) => {
+                    Err(crate::chain::state::ChainError::PrevBlockNotFound)
+                    | Err(crate::chain::state::ChainError::BadPrevBlock) => {
                         if block_buffer.len() < 8192 {
                             block_buffer.insert(block.header.prev_blockhash, block);
                         }
@@ -4505,10 +4509,12 @@ impl PeerManager {
                             // pulls the fork (missing_blocks_for_best_header_
                             // chain) and runs ActivateBestChain — exactly what
                             // a restart would do, without the restart.
-                            if matches!(e, crate::chain::state::ChainError::BadPrevBlock)
+                            if matches!(e,
+                                    crate::chain::state::ChainError::PrevBlockNotFound
+                                    | crate::chain::state::ChainError::BadPrevBlock)
                                 && chain_state.best_header_beats_active_tip()
                             {
-                                // Gate on BadPrevBlock specifically: best_header_
+                                // Gate on PrevBlockNotFound/BadPrevBlock specifically: best_header_
                                 // beats_active_tip() is true for ~all of IBD, so
                                 // without the variant check ANY persistent connect
                                 // error (invalid block, I/O fault) would be masked

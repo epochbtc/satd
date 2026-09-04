@@ -544,9 +544,7 @@ note = "`prioritisetransaction` with no arguments answers `-1` with a Rust `Erro
 
 [[test]]
 file = "mining_template_verification.py"
-status = "skip"
-reason = "feature-missing"
-note = "getblocktemplate proposal mode returns the full template instead of null for a valid proposal"
+status = "run"
 
 [[test]]
 file = "p2p_1p1c_network.py"
