@@ -1212,15 +1212,40 @@ pub async fn start(
             ));
         }
 
-        let coinbase_script = crate::rpc::descriptor::parse_descriptor(&output, ctx.chain_state.network)
-            .or_else(|_| {
-                let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output.parse()
-                    .map_err(|e| format!("{e}"))?;
-                let addr = addr.require_network(ctx.chain_state.network)
-                    .map_err(|e| format!("{e}"))?;
-                Ok::<_, String>(addr.script_pubkey())
-            })
-            .map_err(|e| ErrorObjectOwned::owned(-5, format!("Invalid address or descriptor: {e}"), None::<()>))?;
+        // Core's `getScriptFromDescriptor`: `output` is either an address or a
+        // full output descriptor. A string containing `(` is a descriptor, and
+        // its own error must reach the caller — `rpc_generate.py` asserts on
+        // `-8 Ranged descriptor not accepted...` and `-5 Cannot derive script
+        // without private keys`, both of which the resolver already produces.
+        // Only a string that is not a descriptor at all falls through to the
+        // address parser; otherwise a descriptor failure was reported as a
+        // base58 error for something that was never an address.
+        let coinbase_script = if output.contains('(') {
+            crate::rpc::descriptor::descriptor_to_coinbase_script(
+                &output,
+                ctx.chain_state.network,
+            )
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))?
+        } else {
+            let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output
+                .parse()
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(
+                        -5,
+                        format!("Invalid address or descriptor: {e}"),
+                        None::<()>,
+                    )
+                })?;
+            addr.require_network(ctx.chain_state.network)
+                .map_err(|e| {
+                    ErrorObjectOwned::owned(
+                        -5,
+                        format!("Invalid address or descriptor: {e}"),
+                        None::<()>,
+                    )
+                })?
+                .script_pubkey()
+        };
 
         let explicit_txs = if let Some(raw) = raw_txs {
             let mut txs = Vec::new();
@@ -1246,6 +1271,14 @@ pub async fn start(
         } else {
             None
         };
+
+        // Build and submit under the same lock the other mining RPCs hold:
+        // two concurrent callers reading the same tip would otherwise build
+        // byte-identical blocks and the second would be rejected as
+        // `duplicate` (rpc_generate.py mines from six threads at once).
+        let _mining_guard = crate::mining::miner::MINING_SUBMIT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let block = crate::mining::miner::build_block_to_script(
             &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,

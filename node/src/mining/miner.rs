@@ -124,11 +124,24 @@ pub fn build_block_to_script(
 }
 
 /// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
+/// Serialises "build a block on the current tip, then submit it".
+///
+/// Core does this implicitly: every mining RPC holds `cs_main` across
+/// template construction and `ProcessNewBlock`. satd's build and submit are
+/// separate calls, so two concurrent `generateblock` callers could read the
+/// same tip, construct byte-identical empty blocks, and have the second
+/// rejected as `duplicate`. `rpc_generate.py` drives exactly that, with six
+/// threads mining fifty blocks each.
+///
+/// Regtest-only paths, so the contention is irrelevant; correctness is not.
+pub static MINING_SUBMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn mine_block_to_script(
     chain_state: &ChainState,
     mempool: &Mempool,
     coinbase_script: ScriptBuf,
 ) -> Result<Block, MineError> {
+    let _guard = MINING_SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let block = build_block_to_script(chain_state, mempool, coinbase_script, None)?;
 
     let acceptance = chain_state

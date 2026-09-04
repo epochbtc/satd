@@ -138,7 +138,6 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "uptime"
         | "validateaddress"
         | "deriveaddresses"
-        | "generate"
         | "getdescriptorinfo"
         | "ping" => Read,
 
