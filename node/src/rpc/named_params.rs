@@ -111,6 +111,8 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "decodepsbt" => &[("psbt", false)],
         "decoderawtransaction" => &[("hexstring", false), ("iswitness", false)],
         "decodescript" => &[("hexstring", false)],
+        // SATD_ONLY: deriveaddresses, getdescriptorinfo
+        "deriveaddresses" => &[("descriptor", false), ("range", false)],
         "disconnectnode" => &[("address", false), ("nodeid", false)],
         "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("options", false)],
         "echo" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
@@ -145,6 +147,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getconfig" => &[],
         "getconnectioncount" => &[],
         "getdeploymentinfo" => &[("blockhash", false)],
+        "getdescriptorinfo" => &[("descriptor", false)],
         "getdifficulty" => &[],
         "getibdprogress" => &[],
         "getindexinfo" => &[("index_name", false)],

@@ -136,6 +136,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "help"
         | "uptime"
         | "validateaddress"
+        | "deriveaddresses"
+        | "generate"
+        | "getdescriptorinfo"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---

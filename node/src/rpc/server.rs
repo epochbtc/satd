@@ -2553,8 +2553,10 @@ pub async fn start(
             ("signrawtransactionwithkey", "Rawtransactions"),
             ("testmempoolaccept", "Rawtransactions"),
             // == Util ==
+            ("deriveaddresses", "Util"),
             ("estimaterawfee", "Util"),
             ("estimatesmartfee", "Util"),
+            ("getdescriptorinfo", "Util"),
             ("getindexinfo", "Util"),
             ("validateaddress", "Util"),
         ];
@@ -3082,6 +3084,46 @@ pub async fn start(
             .one()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         Ok::<_, ErrorObjectOwned>(util::validate_address(&address))
+    })?;
+
+    module.register_method("getdescriptorinfo", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let descriptor: String = seq.next().map_err(|e| {
+            let msg = e.to_string();
+            // Core returns -3 for type errors, -1 for missing params.
+            if msg.contains("not of expected type") || msg.contains("invalid type") {
+                ErrorObjectOwned::owned(
+                    -3,
+                    "JSON value of type number is not of expected type string",
+                    None::<()>,
+                )
+            } else {
+                ErrorObjectOwned::owned(
+                    -1,
+                    "getdescriptorinfo \"descriptor\"\n\n\
+                     Analyses a descriptor.\n\n\
+                     Arguments:\n\
+                     1. descriptor    (string, required) The descriptor.\n",
+                    None::<()>,
+                )
+            }
+        })?;
+        crate::rpc::descriptor::get_descriptor_info(&descriptor)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
+    })?;
+
+    module.register_method("deriveaddresses", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let descriptor: String = seq
+            .next()
+            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let range: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        crate::rpc::descriptor::derive_addresses(
+            &descriptor,
+            range.as_ref(),
+            ctx.chain_state.network,
+        )
+        .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     // --- Long-polling RPCs ---

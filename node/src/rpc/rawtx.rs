@@ -300,6 +300,10 @@ fn confirmations_for(chain_state: &ChainState, block_hash: &bitcoin::BlockHash, 
 /// `verbosity`: 1 = standard verbose, 2 = include `fee` and per-input
 /// `prevout` (Core v25+). `chain_and_block` is `Some((chain, block))`
 /// when the block is available for prevout lookup (verbosity 2).
+/// Render a transaction as Core's verbose JSON.
+///
+/// `verbosity` >= 2 adds prevout data (Core's `getrawtransaction` verbosity 2);
+/// `chain_and_block` supplies the chain context that needs.
 pub(crate) fn decode_transaction_verbose_net(
     tx: &bitcoin::Transaction,
     blockhash: Option<&str>,

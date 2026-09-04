@@ -905,9 +905,7 @@ status = "run"
 
 [[test]]
 file = "rpc_deriveaddresses.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs deriveaddresses RPC; also, sat-cli rejects the -n flag Core's CLI uses"
+status = "run"
 
 [[test]]
 file = "rpc_dumptxoutset.py"
@@ -921,9 +919,7 @@ status = "run"
 
 [[test]]
 file = "rpc_generate.py"
-status = "skip"
-reason = "feature-missing"
-note = "generatetoaddress error message is 'invalid address: validation error' where Core says 'Invalid address'; also needs generateblock with combo() descriptor"
+status = "run"
 
 [[test]]
 file = "rpc_getblockfilter.py"
@@ -954,9 +950,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs getdescriptorinfo RPC"
+status = "run"
 
 [[test]]
 file = "rpc_gettxspendingprevout.py"
