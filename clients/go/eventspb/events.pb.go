@@ -32,6 +32,10 @@ const (
 	// Evicted from the quarantine class because its byte budget overflowed
 	// (fee-rate eviction within the held set). Inert until a policy is loaded.
 	EvictReason_EVICT_REASON_POLICY EvictReason = 4
+	// Evicted because a chain reorganization made the transaction invalid
+	// (locktime no longer satisfied, coinbase became immature, or BIP 68
+	// sequence lock unsatisfied). Mirrors Bitcoin Core's removeForReorg.
+	EvictReason_EVICT_REASON_REORG EvictReason = 5
 )
 
 // Enum value maps for EvictReason.
@@ -42,6 +46,7 @@ var (
 		2: "EVICT_REASON_EXPIRY",
 		3: "EVICT_REASON_BLOCK_CONFLICT",
 		4: "EVICT_REASON_POLICY",
+		5: "EVICT_REASON_REORG",
 	}
 	EvictReason_value = map[string]int32{
 		"EVICT_REASON_UNSPECIFIED":    0,
@@ -49,6 +54,7 @@ var (
 		"EVICT_REASON_EXPIRY":         2,
 		"EVICT_REASON_BLOCK_CONFLICT": 3,
 		"EVICT_REASON_POLICY":         4,
+		"EVICT_REASON_REORG":          5,
 	}
 )
 
@@ -5914,13 +5920,14 @@ const file_satd_events_v1_events_proto_rawDesc = "" +
 	"\x16silent_payment_matched\x18\x1d \x01(\v2$.satd.events.v1.SilentPaymentMatchedH\x00R\x14silentPaymentMatched\x12C\n" +
 	"\rmempool_tweak\x18\x1e \x01(\v2\x1c.satd.events.v1.MempoolTweakH\x00R\fmempoolTweak\x125\n" +
 	"\x06status\x18\x1f \x01(\v2\x1b.satd.events.v1.StatusEventH\x00R\x06statusB\x06\n" +
-	"\x04bodyJ\x04\b\x0f\x10\x10R\x1adescriptor_needs_addresses*\x9a\x01\n" +
+	"\x04bodyJ\x04\b\x0f\x10\x10R\x1adescriptor_needs_addresses*\xb2\x01\n" +
 	"\vEvictReason\x12\x1c\n" +
 	"\x18EVICT_REASON_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16EVICT_REASON_FULL_POOL\x10\x01\x12\x17\n" +
 	"\x13EVICT_REASON_EXPIRY\x10\x02\x12\x1f\n" +
 	"\x1bEVICT_REASON_BLOCK_CONFLICT\x10\x03\x12\x17\n" +
-	"\x13EVICT_REASON_POLICY\x10\x04*\xd7\x01\n" +
+	"\x13EVICT_REASON_POLICY\x10\x04\x12\x16\n" +
+	"\x12EVICT_REASON_REORG\x10\x05*\xd7\x01\n" +
 	"\n" +
 	"StatusKind\x12\x1b\n" +
 	"\x17STATUS_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +

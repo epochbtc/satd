@@ -416,6 +416,13 @@ pub struct Config {
     /// before the server sheds load (HTTP 429). Bitcoin Core
     /// `-rpcworkqueue`. Default: 64.
     pub rpc_workqueue: usize,
+    /// Per-connection HTTP header-read timeout for the RPC server, in
+    /// seconds.  Bitcoin Core `-rpcservertimeout`.  If a client opens a
+    /// TCP connection but does not send a complete HTTP request header
+    /// within this window the connection is closed.  Default: 30 (Core's
+    /// default).  `None` disables the timeout entirely, which matches the
+    /// behaviour before this knob was wired.
+    pub rpc_server_timeout: Option<std::time::Duration>,
     /// Worker-thread count for the **separate, bounded tokio runtime** that
     /// serves the remotely-consumed *read* surfaces (Esplora, Electrum,
     /// events gRPC, metrics). Isolating these from the consensus/P2P core
@@ -590,6 +597,7 @@ pub struct Config {
     pub mempoolfullrbf: bool,
     pub maxmempool: usize,
     pub minrelaytxfee: u64,
+    pub incrementalrelayfee: u64,
     pub dustrelayfee: u64,
     pub datacarriersize: usize,
     pub datacarrier: bool,
@@ -1506,10 +1514,17 @@ impl Config {
         // rule: every recognised key is honoured or explicitly rejected,
         // never accepted-and-ignored.
         if !cli.includeconf.is_empty() {
+            // Format the value exactly as Bitcoin Core does: boolean-like
+            // values (`true`/`false`) are bare, file paths are quoted.
+            let val = &cli.includeconf[0];
+            let display_val = if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
+                format!("-includeconf={val}")
+            } else {
+                format!("-includeconf=\"{val}\"")
+            };
             return Err(format!(
-                "-includeconf cannot be used from commandline; -includeconf={} \
-                 (includeconf is only honoured inside a config file, matching Bitcoin Core)",
-                cli.includeconf[0]
+                "Error parsing command line arguments: \
+                 -includeconf cannot be used from commandline; {display_val}",
             ));
         }
 
@@ -1692,6 +1707,20 @@ impl Config {
             .rpcworkqueue
             .or_else(|| file_get("rpcworkqueue").and_then(|v| v.parse().ok()))
             .unwrap_or(64);
+
+        // Per-connection header-read timeout.  Bitcoin Core's libevent
+        // surface uses this to drop idle connections that never finish
+        // sending an HTTP request.  Default: 30s (Core's default).  A
+        // value of 0 disables the timeout (hyper's default behaviour).
+        let rpc_server_timeout_secs: u64 = cli
+            .rpcservertimeout
+            .or_else(|| file_get("rpcservertimeout").and_then(|v| v.parse().ok()))
+            .unwrap_or(30);
+        let rpc_server_timeout = if rpc_server_timeout_secs > 0 {
+            Some(std::time::Duration::from_secs(rpc_server_timeout_secs))
+        } else {
+            None
+        };
 
         // Worker count for the isolated API runtime. Default is a modest
         // fraction of host parallelism (the core runtime keeps the rest),
@@ -2283,12 +2312,34 @@ impl Config {
                 .transpose()
         };
 
-        let minrelaytxfee = match cli.minrelaytxfee {
+        // sat/kvB — Core v31 DEFAULT_MIN_RELAY_TX_FEE. Kept as an `Option` so
+        // the raise below can tell "the operator asked for this value" from
+        // "nobody said", which is the distinction Core's rule turns on.
+        const DEFAULT_MIN_RELAY_TX_FEE: u64 = 100;
+        let minrelaytxfee_explicit = match cli.minrelaytxfee {
             Some(v) => Some(v),
             None => file_fee_rate("minrelaytxfee")?,
         }
-        .or(profile_defaults.minrelaytxfee)
-        .unwrap_or(1_000); // sat/kvB
+        .or(profile_defaults.minrelaytxfee);
+
+        let incrementalrelayfee = match cli.incrementalrelayfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("incrementalrelayfee")?,
+        }
+        .unwrap_or(100); // 100 sat/kvB (Core v31 default: 0.000001 BTC/kvB)
+
+        // Core raises `minrelaytxfee` to match a higher `incrementalrelayfee`
+        // only when `-minrelaytxfee` was not supplied — `ApplyArgsManOptions`
+        // in `src/node/mempool_args.cpp` spells it as an `else if`, with the
+        // comment "Allow only setting incremental fee to control both".
+        //
+        // Applying it unconditionally would silently overrule an operator who
+        // asked for a specific floor: `-minrelaytxfee=0` would come back up to
+        // 100 sat/kvB. Core's functional tests rely on exactly that setting.
+        let minrelaytxfee = match minrelaytxfee_explicit {
+            Some(v) => v,
+            None => DEFAULT_MIN_RELAY_TX_FEE.max(incrementalrelayfee),
+        };
 
         let dustrelayfee = match cli.dustrelayfee {
             Some(v) => Some(v),
@@ -2296,10 +2347,15 @@ impl Config {
         }
         .unwrap_or(3_000); // sat/kvB
 
+        // Core v31 changed the default from 83 (MAX_OP_RETURN_RELAY, the
+        // historical value) to MAX_STANDARD_TX_WEIGHT / 4 = 100 000,
+        // making the relay cap effectively uncapped.  Match that default
+        // so `getmempoolinfo.maxdatacarriersize` reports the same value
+        // and the `mempool_datacarrier` functional test passes.
         let datacarriersize = cli
             .datacarriersize
             .or_else(|| file_get("datacarriersize").and_then(|v| v.parse().ok()))
-            .unwrap_or(83);
+            .unwrap_or(100_000);
 
         let datacarrier = cli
             .datacarrier
@@ -3078,6 +3134,7 @@ impl Config {
             rpcpassword,
             rpc_threads,
             rpc_workqueue,
+            rpc_server_timeout,
             api_threads,
             rpc_readonly_bind,
             rpc_readonly_port,
@@ -3124,6 +3181,7 @@ impl Config {
             quarantinemempool,
             policyfile,
             minrelaytxfee,
+            incrementalrelayfee,
             dustrelayfee,
             datacarriersize,
             datacarrier,
@@ -3994,6 +4052,17 @@ pub struct CliArgs {
     )]
     pub rpcworkqueue: Option<usize>,
 
+    /// Per-connection HTTP header-read timeout for the RPC server, in
+    /// seconds. If a client opens a TCP connection but doesn't complete
+    /// the HTTP header within this window, the connection is dropped.
+    /// Bitcoin Core `-rpcservertimeout`. Default: 30.
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Per-connection header-read timeout in seconds (Core -rpcservertimeout; default 30)"
+    )]
+    pub rpcservertimeout: Option<u64>,
+
     /// Worker-thread count for the separate, bounded tokio runtime that
     /// serves the remotely-consumed API surfaces, isolating them from the
     /// consensus/P2P core runtime. Default: `max(2, cores/4)`.
@@ -4371,6 +4440,14 @@ pub struct CliArgs {
         help = "Minimum relay fee rate, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00001) or a bare integer of sat/kvB (default: 1000)"
     )]
     pub minrelaytxfee: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Incremental relay fee rate for RBF, as BTC/kvB or sat/kvB (default: 100)"
+    )]
+    pub incrementalrelayfee: Option<u64>,
 
     #[arg(
         long,
@@ -6055,6 +6132,34 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                     return format!("--{flag}=0");
                 }
             }
+
+            // Special handling for `-noincludeconf` negation, matching
+            // Bitcoin Core's `ParseParameters`.  `includeconf` is not in
+            // `NEGATABLE_BOOL_FLAGS` (it is a Vec<String>), but Core
+            // interprets `-noincludeconf=0` as "don't NOT include" →
+            // `-includeconf=true` (double negation).  The command-line
+            // check will then reject it with the right error message.
+            if arg.starts_with('-') {
+                let stripped = arg.trim_start_matches('-');
+                if let Some(rest) = stripped.strip_prefix("noincludeconf") {
+                    // `-noincludeconf` (no value) → includeconf disabled,
+                    // but includeconf is a file path, not a boolean.
+                    // `-noincludeconf=0` → double negation → includeconf=true
+                    // `-noincludeconf=1` → negation with 1 → includeconf=false → empty
+                    // For all forms: Core resolves and rejects at the
+                    // "cannot be used from commandline" gate, showing the
+                    // resolved value.  Convert to `--includeconf=<resolved>`.
+                    if rest.is_empty() || rest == "=1" {
+                        // negation active → nothing to include, but Core
+                        // still errors on the presence of the flag
+                        return "--includeconf".to_string();
+                    } else if rest == "=0" {
+                        // double negation → true
+                        return "--includeconf=true".to_string();
+                    }
+                }
+            }
+
             // Skip the binary name or already double-dashed args
             if !arg.starts_with('-') || arg.starts_with("--") {
                 return arg;
@@ -6368,15 +6473,27 @@ impl ConfigFile {
                 datadir.join(&rel)
             };
             let mut included = ConfigFile::parse_file(&inc_path).map_err(|e| {
-                format!("includeconf='{rel}' (resolved to {}): {e}", inc_path.display())
+                format!(
+                    "Error reading configuration file: \
+                     includeconf: failed to include {rel}: {e}"
+                )
             })?;
             // No recursion: drain any includeconf the included file
             // carries (global or any section) and warn, matching Core.
+            // The warning goes to stderr in Core's exact format so
+            // `stop_node(expected_stderr=...)` in the functional tests
+            // can match it verbatim.
             let mut nested = included.global.remove("includeconf").unwrap_or_default();
             for s in included.sections.values_mut() {
                 if let Some(v) = s.remove("includeconf") {
                     nested.extend(v);
                 }
+            }
+            for n in &nested {
+                eprintln!(
+                    "warning: -includeconf cannot be used from included \
+                     files; ignoring -includeconf={n}"
+                );
             }
             for n in nested {
                 notes.push(ConfigNote {
@@ -7700,6 +7817,66 @@ bind=127.0.0.1:9002
         assert_eq!(cfg.minrelaytxfee, 2000);
     }
 
+    /// Core raises `minrelaytxfee` to a higher `incrementalrelayfee` only when
+    /// `-minrelaytxfee` was not supplied (`ApplyArgsManOptions`, an `else if`).
+    /// Doing it unconditionally silently overrules an operator who asked for a
+    /// specific floor — `-minrelaytxfee=0` being the case Core's own
+    /// functional tests depend on.
+    #[test]
+    fn minrelaytxfee_is_only_raised_when_it_was_not_set() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = |extra: &[&str]| -> Config {
+            let mut argv: Vec<String> = vec![
+                "satd".into(),
+                "--regtest".into(),
+                "--datadir".into(),
+                dir.path().to_str().unwrap().into(),
+            ];
+            argv.extend(extra.iter().map(|s| (*s).to_string()));
+            Config::from_cli(CliArgs::try_parse_from(&argv).unwrap()).expect("config")
+        };
+
+        // Neither set: Core's DEFAULT_MIN_RELAY_TX_FEE.
+        assert_eq!(base(&[]).minrelaytxfee, 100);
+
+        // Only incrementalrelayfee set, and higher: the raise applies. This is
+        // the "allow only setting incremental fee to control both" case.
+        assert_eq!(base(&["--incrementalrelayfee=0.00001"]).minrelaytxfee, 1_000);
+
+        // Both set: the operator's floor stands, even below the incremental.
+        assert_eq!(
+            base(&["--minrelaytxfee=0.000005", "--incrementalrelayfee=0.00001"]).minrelaytxfee,
+            500
+        );
+
+        // The case that matters: an explicit zero must survive.
+        assert_eq!(
+            base(&["--minrelaytxfee=0", "--incrementalrelayfee=0.00001"]).minrelaytxfee,
+            0,
+            "an explicit -minrelaytxfee=0 must not be raised to the incremental fee"
+        );
+        assert_eq!(base(&["--minrelaytxfee=0"]).minrelaytxfee, 0);
+
+        // Set from the config file rather than the command line: same rule.
+        let confdir = tempfile::tempdir().expect("tempdir");
+        let conf = confdir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\nminrelaytxfee=0\nincrementalrelayfee=0.00001\n")
+            .unwrap();
+        let cfg = Config::from_cli(
+            CliArgs::try_parse_from([
+                "satd",
+                "--datadir",
+                confdir.path().to_str().unwrap(),
+                "--conf",
+                conf.to_str().unwrap(),
+            ])
+            .unwrap(),
+        )
+        .expect("config");
+        assert_eq!(cfg.minrelaytxfee, 0);
+    }
+
     /// Core reads `blockfilterindex=` (empty) as "on" and hard-errors on a
     /// value it cannot name. Silently disabling the index instead is only
     /// discovered when a light client finds no NODE_COMPACT_FILTERS.
@@ -8591,6 +8768,7 @@ testactivationheight=bip34@2
             rpcpassword: None,
             rpcthreads: None,
             rpcworkqueue: None,
+            rpcservertimeout: None,
             apithreads: None,
             rpcbind: Vec::new(),
             rpcallowip: Vec::new(),
@@ -8637,6 +8815,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,
@@ -8879,6 +9058,7 @@ testactivationheight=bip34@2
             rpcpassword: None, // missing password
             rpcthreads: None,
             rpcworkqueue: None,
+            rpcservertimeout: None,
             apithreads: None,
             rpcbind: Vec::new(),
             rpcallowip: Vec::new(),
@@ -8925,6 +9105,7 @@ testactivationheight=bip34@2
             quarantinemempool: None,
             policyfile: None,
             minrelaytxfee: None,
+            incrementalrelayfee: None,
             dustrelayfee: None,
             datacarriersize: None,
             datacarrier: None,

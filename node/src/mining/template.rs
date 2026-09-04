@@ -19,6 +19,31 @@ pub struct TemplateTx {
 }
 
 /// Block template ready for mining.
+/// Statistics of the most recently assembled block template.
+///
+/// `getmininginfo` reports `currentblocktx` / `currentblockweight` from the
+/// last template that was actually built, and omits both fields when none has
+/// been. Core keeps exactly these two values as statics on `BlockAssembler`
+/// (`m_last_block_num_txs` / `m_last_block_weight`, set at the end of
+/// `CreateNewBlock`) — deliberately, so that reporting them costs nothing.
+/// Assembling a fresh template per `getmininginfo` call would walk the mempool
+/// on a hot, `Read`-classified RPC that monitoring polls.
+///
+/// `u64::MAX` is the "no template assembled yet" sentinel.
+static LAST_BLOCK_NUM_TXS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static LAST_BLOCK_WEIGHT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The last assembled template's transaction count and weight, or `None` when
+/// no template has been assembled since startup.
+pub fn last_block_stats() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let txs = LAST_BLOCK_NUM_TXS.load(Ordering::Relaxed);
+    let weight = LAST_BLOCK_WEIGHT.load(Ordering::Relaxed);
+    (txs != u64::MAX && weight != u64::MAX).then_some((txs, weight))
+}
+
 pub struct BlockTemplate {
     pub version: i32,
     pub prev_hash: BlockHash,
@@ -218,6 +243,15 @@ fn assemble_template(
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
     let cur_time = std::cmp::max(now, tip_entry.header.time + 1);
 
+    // Core sets these at the end of `CreateNewBlock`; `getmininginfo`
+
+    // reads them instead of assembling a template of its own.
+
+    LAST_BLOCK_NUM_TXS.store(transactions.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    LAST_BLOCK_WEIGHT.store(total_weight as u64, std::sync::atomic::Ordering::Relaxed);
+
+
     BlockTemplate {
         version: 0x20000000, // BIP 9 version bits
         prev_hash: tip_hash,
@@ -323,6 +357,47 @@ mod tests {
         assert_eq!(template.bits.to_consensus(), 0x207fffff);
         assert!(template.transactions.is_empty());
         assert_eq!(template.coinbase_value, 50 * 100_000_000); // 50 BTC subsidy
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `generateblock` supplies its own transaction list, so the mempool
+    /// template's fee total describes a block that is not being built.
+    /// Claiming it over-claims the coinbase and `connect_block` answers
+    /// `bad-cb-amount` — meaning `generateblock` would fail on any node whose
+    /// mempool holds a fee-paying transaction. Core builds that template with
+    /// `use_mempool = false`, so its coinbase carries the subsidy alone.
+    #[test]
+    fn an_explicit_tx_list_claims_only_the_subsidy() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xB2), coin_at(0))]);
+        let tx = tx_spending(confirmed_prev(0xB2), 50_000, 0x42, 0xffff_ffff, 0);
+        mp.insert_tx_weighted_for_test(tx, 100, 400, QuarantineScope::acting());
+
+        let subsidy = crate::chain::connect::block_subsidy(cs.network, cs.tip_height() + 1);
+        let script = bitcoin::ScriptBuf::new();
+
+        // The mempool has a fee-paying transaction, so the ordinary template
+        // claims strictly more than the subsidy.
+        let mined = crate::mining::miner::build_block_to_script(&cs, &mp, script.clone(), None)
+            .expect("template block");
+        let normal_claim: u64 = mined.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
+        assert!(
+            normal_claim > subsidy,
+            "fixture should have a fee-paying mempool tx: {normal_claim} vs {subsidy}"
+        );
+
+        // With an explicit list those fees are not ours to claim.
+        let generated =
+            crate::mining::miner::build_block_to_script(&cs, &mp, script, Some(Vec::new()))
+                .expect("generateblock-style block");
+        let claim: u64 = generated.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
+        assert_eq!(
+            claim, subsidy,
+            "an explicit transaction list must claim the subsidy alone, not the \
+             mempool template's fees"
+        );
+        assert_eq!(generated.txdata.len(), 1, "only the coinbase was requested");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

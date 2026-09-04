@@ -98,34 +98,35 @@ Every reason came from running the test, not from reading it. Ranked by tests
 unblocked, which is a map of the framework's demands rather than a priority
 order.
 
-**The cache now builds**, and the 23 tests `scantxoutset` was blocking have been
-measured one blocker deeper. The 50 rows still marked `cache` in the inventory
-name a blocker that no longer applies: they reach their test bodies and stop on
-something of satd's own. Re-triaging them the same way is the next piece of work;
-until that lands this ranking is only as complete as the measured rows below plus
-the older entries under them.
+**No `cache` rows remain.** Every test that was blocked by the framework cache
+has been measured to its real blocker. Ranked by tests unblocked:
 
 | Tests | Blocker |
 |---:|---|
-| 22 | No periodic P2P ping. `connect_nodes()` waits for a `pong` in both directions. satd has no keepalive: `ping_all()` runs only from the `ping` RPC, there is no inactivity disconnect, and `-peertimeout` is unimplemented. An availability gap before it is a test blocker. |
-| 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` (9) where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS` (1032), inviting requests for blocks it does not have. |
-| 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one; its invalid-port error also differs from Core's wording. |
-| 1 | Core's automatic onion bind: `127.0.0.1:<port + 1>` with `-listen` and no `-bind`. Not adopted — an extra listening socket on every default node is a decision about what a stock satd exposes, not a parsing fix. |
-
-From the 23 rows re-triaged after `scantxoutset` landed. Small individually, but
-each is now a measured cause rather than a guess:
-
-| Tests | Blocker |
-|---:|---|
-| 4 | `generatetodescriptor`. The framework mines to MiniWallet's own descriptor. satd already parses the `raw()` form it passes, so this is a mining-RPC gap, not a descriptor one. `generateblock` has the same shape: Core's `output` is an address *or* a descriptor, satd's is an address (1 more test). |
-| 1 each | Missing RPCs: `getprioritisedtransactions`, `getorphantxs`, `createmultisig`. |
-| 1 each | Missing fields on RPCs satd has: `getmempoolinfo.permitbaremultisig`, `testmempoolaccept.wtxid`, and `getnetworkinfo.localrelay` (always true; Core reports false under `-blocksonly`). |
-| 1 | `OP_RETURN` output size. satd rejects a ~20000-byte `OP_RETURN` as a nonstandard `scriptpubkey`; Core v31's `-datacarriersize` defaults to `MAX_STANDARD_TX_WEIGHT/4`, so MiniWallet's padding output is standard there. |
+| 5 | Missing `addconnection` hidden RPC. The framework uses it for outbound test connections; five P2P tests cannot proceed without it. |
+| 4 | `generatetodescriptor`. The framework mines to MiniWallet's own descriptor. satd already parses the `raw()` form it passes, so this is a mining-RPC gap, not a descriptor one. `generateblock` has the same shape (1 more test). |
+| 4 | Debug-log message mismatches (`assert_debug_log`). Tests grep for Core-specific phrasing that satd either does not log or words differently. |
+| 2 | `-blockfilterindex=1` accepted but not activated. `getindexinfo` never reports `synced:true`, so tests that poll for index sync time out. |
+| 2 | `setban` / ban persistence. satd now accepts bare IPs and disconnects matching peers, but bans are in-memory only; the test restarts the node and checks the ban survives (`banlist.json`). |
+| 2 | `getchaintips` only reports the active tip. Fork tips (headers-valid, valid-fork) are not tracked or returned. |
+| 2 | Handshake protocol: satd does not send `wtxidrelay` or `sendtxrcncl` (BIP 330 erlay) during the version handshake. |
+| 2 | `getpeerinfo` permissions field type mismatch (list vs string). |
+| 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS`. |
+| 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one. |
+| 1 | Core's automatic onion bind. Not adopted — an extra listening socket on every default node is a design decision. |
+| 1 | `MAX_LOCATOR_SZ` enforcement. satd does not disconnect peers that send oversized locators. |
+| 1 | tx download scheduling for `WTX` inv. satd does not send GETDATA after receiving a wtxid-based announcement. |
+| 1 | `OP_RETURN` output size. satd rejects a ~20000-byte `OP_RETURN` as nonstandard; Core v31's `-datacarriersize` defaults to `MAX_STANDARD_TX_WEIGHT/4`. |
 | 1 | `sendrawtransaction` returns the right rejection reason under the wrong code: `-25` where Core returns `-26`. |
 | 1 | Dust policy: satd allows an output Core's dust rule rejects. |
 | 1 | Sigop-equivalent vsize differs by one (satd 344, Core 345). |
 | 1 | `prioritisetransaction` with no arguments leaks a Rust `ErrorObject { .. }` Debug rendering where Core returns its help text. |
-| 1 | Key-based descriptors — `pkh()`, `combo()`, `sh(multi())`, `tr()`, and ranged xpub derivation — which `rpc_scantxoutset.py` needs and satd's `raw()`/`addr()` subset does not cover. |
+| 1 | Key-based descriptors — `pkh()`, `combo()`, `sh(multi())`, `tr()`, and ranged xpub derivation — which `rpc_scantxoutset.py` needs. |
+
+Missing RPCs not in the table above (1 test each): `echo` (×2 tests),
+`deriveaddresses`, `getdescriptorinfo`, `gettxoutproof`/`verifytxoutproof`,
+`scanblocks`, `dump_all_command_conversions`, `getprioritisedtransactions`,
+`getorphantxs`, `createmultisig`.
 
 Nine rows are outside the compatibility target: six use Core v31 options
 (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
@@ -164,6 +165,28 @@ target; the rest need Core-only binaries or internals.
 - `syncwithvalidationinterfacequeue`, draining the event bridges. These three
   together built the 199-block cache for the first time and took the scoreboard
   from three to six.
+
+- `MAX_LOCATOR_SZ` enforcement: satd now disconnects peers that send a
+  `getheaders` or `getblocks` locator with more than 101 hashes, matching Core's
+  `net_processing.cpp`. Also added a basic `getblocks` response (respond with
+  `inv` for up to 500 blocks). This put `p2p_invalid_locator.py` in the run-set.
+- JSON-RPC 1.0 response normalization: the compat layer now strips `"jsonrpc"`,
+  adds `"error":null` to success responses and `"result":null` to error
+  responses, and adds a default `Content-Type: application/json` and `"id":null`
+  when missing from the request. Core's `authproxy` takes different code paths
+  for 1.0 vs 2.0 responses, and many Core tests assert `"error":null` in the
+  raw byte stream.
+
+- `generatetodescriptor` RPC: parses `raw()` and `addr()` descriptors and mines
+  blocks paying to the derived output script. This is how Core's MiniWallet
+  mines; without it, every MiniWallet-based test failed before reaching its
+  real logic. Put `feature_framework_miniwallet.py` in the run-set.
+- `getmininginfo` now includes `currentblocktx`, `currentblockweight`, and a
+  live `pooledtx` count (was hardcoded 0).
+- Mempool rejection error codes: policy rejections (non-final, non-BIP68-final,
+  insufficient fee, dust, chain limits, conflicts) now return `-26`
+  (`RPC_VERIFY_REJECTED`) instead of `-25`. Core distinguishes consensus errors
+  (`-25`) from policy rejections (`-26`); satd mapped everything to `-25`.
 
 Two rows that looked like satd defects were the harness's own: `shims/bitcoind`
 spawned satd as a child, so `node.process.pid` was the shim's. `get_bind_addrs`
