@@ -4,10 +4,12 @@ name: Core functional tests
 # See contrib/core-functional/README.md for what the harness may and may not do
 # to make a test pass.
 #
-# The PR gate lives in canary.yml's `core-functional` job, on a hosted runner
-# reusing the shared release build. This workflow keeps the *nightly* run: it
-# is where the run set gets widened and where a candidate measurement can run
-# unattended, on the self-hosted runner the suite was built against.
+# The PR gate lives in canary.yml's `core-functional` job, which reuses the
+# release build already shared with the canary fleet. This workflow keeps the
+# *nightly* run, which pays for its own build and is where the run set gets
+# widened and a candidate measurement runs unattended.
+#
+# Every job here runs on GitHub-hosted runners. satd is public.
 #
 # A flake in the gated run set gets its downstream pinned or a
 # `flaky-quarantine` row with an issue behind it -- never a weakened gate.
@@ -18,8 +20,9 @@ on:
     - cron: "37 4 * * *"
   workflow_dispatch:
   pull_request:
-    # Only the hosted `inventory` job runs on PRs. The self-hosted `run` job
-    # must never execute PR code -- see its comment below.
+    # Only the cheap `inventory` job runs on PRs; the PR gate that actually
+    # runs the suite is canary.yml's `core-functional`, which shares the
+    # fleet's build instead of paying for its own.
     types: [opened, synchronize, reopened]
 
 concurrency:
@@ -85,20 +88,19 @@ jobs:
 
   run:
     name: "Run"
-    # Self-hosted: the suite starts real nodes on real ports and is far too
-    # slow for a hosted runner.
+    # GitHub-hosted, like every other job in this public repository. This job
+    # builds and executes the checked-out tree -- `cargo build` alone runs
+    # every dependency's build.rs, and the harness then runs run.sh, the shims
+    # and Core's python. On a maintainer-owned machine that is arbitrary code
+    # execution with that host's filesystem and credentials; on a hosted
+    # runner it is a disposable VM. See ci.yml's header: satd moved its
+    # PR-triggered jobs off self-hosted for this reason in #149, and this job
+    # was the last one that had not followed.
     #
-    # Deliberately NOT reachable from `pull_request`. This job builds and
-    # executes the checked-out tree -- `cargo build` alone runs every
-    # dependency's build.rs, and the harness then runs run.sh, the shims and
-    # Core's python -- so a pull_request run would execute contributor code
-    # on the runner host with its filesystem and credentials. A label gate
-    # does not fix that: the label survives later pushes, so `labeled` on a
-    # reviewed diff followed by `synchronize` on a rewritten one re-runs with
-    # the new code. To exercise a branch here, push it to this repo and use
-    # workflow_dispatch on that ref.
-    runs-on: [self-hosted, linux]
-    timeout-minutes: 90
+    # The suite itself is under a minute; the release build is the cost, and
+    # nightly is where it can be afforded without a shared artifact.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     needs: inventory
     if: >-
       github.event_name == 'schedule' ||
@@ -107,8 +109,52 @@ jobs:
       # Keep datadirs inside the workspace so the cleanup step below can
       # remove them even when a test fails or the job times out.
       SATD_CF_TMPDIR: ${{ github.workspace }}/.core-functional-tmp
+      SATD_CF_JOBS: 4
+      RUST_TOOLCHAIN: '1.93.0'
     steps:
       - uses: actions/checkout@v7
+
+      - name: Free disk space
+        # Hosted ubuntu-24.04 ships ~30 GB of pre-installed SDKs we don't
+        # use. Reclaim before the release build mid-links.
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Linux build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master as of 2026-08-05
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo registry + git
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-corefunc-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-corefunc-cargo-
+
+      - name: Cache target directory
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-corefunc-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-corefunc-target-
 
       - name: Build satd and sat-cli
         run: cargo build --release --locked --bin satd --bin sat-cli

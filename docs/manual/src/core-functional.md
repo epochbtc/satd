@@ -124,9 +124,10 @@ and it is shared: the `core-functional` job downloads the same release binaries
 the third-party canary fleet uses, so the suite adds about a minute and sits off
 the critical path. A red run set blocks the merge.
 
-A second, nightly run on a dedicated runner is where the run set gets widened
-and where a `--candidate` measurement runs unattended. That one is not reachable
-from a pull request, because it builds and executes the branch under test.
+A second, nightly run pays for its own build and is where the run set gets
+widened and where a `--candidate` measurement runs unattended.
+
+Both run on GitHub-hosted runners, as does every other job in this repository.
 
 The split matters: for a while the suite ran only nightly, so a test could be
 marked `run` in one pull request and quietly stop passing in the next, with the

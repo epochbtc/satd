@@ -47,16 +47,17 @@ under a minute at `SATD_CF_JOBS=4`. This is what stops a merge: without it, a
 `skip` -> `run` flip is never validated by pull-request CI, and any later change
 can silently un-pass a row the scoreboard still advertises.
 
-**The nightly run** is the `Run` job in `core-functional.yml`, on the
-self-hosted runner. It is where the run set gets widened and where a
-`--candidate` measurement can run unattended.
+**The nightly run** is the `Run` job in `core-functional.yml`. It pays for its
+own build rather than sharing an artifact, and it is where the run set gets
+widened and where a `--candidate` measurement runs unattended. To exercise a
+branch there, push it to this repo and use `workflow_dispatch` on that ref.
 
-The nightly job is deliberately **not** reachable from a pull request: it builds
-and executes the checked-out tree, so PR code would run on the runner host, and
-a label gate does not help because the label outlives the push it was applied
-to. Push a branch to this repo and use `workflow_dispatch` on that ref. The PR
-gate does not have that exposure -- a hosted runner is ephemeral and carries no
-credentials of ours.
+Both run on **GitHub-hosted runners**, as does every other job in this
+repository. satd is public, and these jobs build and execute the checked-out
+tree -- `cargo build` alone runs every dependency's `build.rs`, and the harness
+then runs `run.sh`, the shims and Core's python. On a maintainer-owned machine
+that is arbitrary code execution with that host's filesystem and credentials.
+A hosted runner is a disposable VM.
 
 ## Rules
 

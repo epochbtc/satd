@@ -716,14 +716,11 @@ jobs:
 
   # Bitcoin Core's functional run set, PR-gating.
   #
-  # The nightly `Run` job in core-functional.yml is deliberately unreachable
-  # from `pull_request`: it is self-hosted, and a fork PR would execute
-  # contributor code on the runner host. That constraint is about the runner,
-  # not the tests -- and the build, not the suite, was ever the slow part. The
-  # run set is ~40s wall at SATD_CF_JOBS=4; the release build it needs is
-  # already paid for once per run by `build` above and shared with nine
-  # canaries. So the suite belongs here, on a disposable hosted runner, where
-  # it costs a couple of minutes off the critical path and can gate a merge.
+  # The suite was nightly-only because building satd is slow, not because the
+  # tests are: the run set is ~45s wall at SATD_CF_JOBS=4, and the release
+  # build it needs is already paid for once per run by `build` above and
+  # shared with nine canaries. As a tenth consumer of that artifact it costs
+  # about a minute, sits well off the critical path, and can gate a merge.
   #
   # Without this, a `skip` -> `run` flip is never validated by pull-request CI
   # and any later change can silently un-pass a row the scoreboard still
