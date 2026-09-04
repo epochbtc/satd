@@ -261,8 +261,9 @@ startup error.
 | `dustrelayfee` | 3000 sat/kvB | hot | core | Dust relay fee rate. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00003` = 3000 sat/kvB). |
 | `datacarrier` | on | hot | core | Accept `OP_RETURN` outputs. |
 | `datacarriersize` | 83 bytes | hot | core | Maximum `OP_RETURN` size in bytes (`0` = reject all). |
-| `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. |
-| `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. |
+| `limitclustercount` | 64 | hot | core | Do not accept a transaction directly or indirectly connected to this many or more other unconfirmed transactions. 64 is both the default and the maximum, so the option can only lower it; a larger value is a startup error. Exceeding the limit is rejected as `too-large-cluster`. |
+| `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `limitclustercount`; accepted for config compatibility but no longer gates admission. |
+| `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. Deprecated alongside `limitancestorcount`, and likewise no longer gates admission. |
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `rebroadcastinterval` | 0 (auto) | hot | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers take it (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time; the pending set is persisted in `mempool.dat` so it also survives restarts. A SIGHUP interval change applies after the in-flight sleep completes. |
