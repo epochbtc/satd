@@ -18,6 +18,15 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+/// A chain tip as reported by `getchaintips`.
+#[derive(Debug, Clone)]
+pub struct ChainTipInfo {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub branch_len: u32,
+    pub status: String,
+}
+
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
 /// moves it on a mockable chain; off regtest that is always the system clock.
@@ -1981,6 +1990,108 @@ impl ChainState {
 
     pub fn get_block_hash_by_height(&self, height: u32) -> Option<BlockHash> {
         self.store.get_block_hash_by_height(height)
+    }
+
+    /// Compute all chain tips by walking the full block index.
+    ///
+    /// A tip is any block whose hash is not the `prev_blockhash` of any other
+    /// block in the index. Each tip is classified by its relationship to the
+    /// active chain:
+    ///
+    /// - `"active"` — the current best chain tip
+    /// - `"valid-fork"` — fully validated but not on the active chain
+    /// - `"valid-headers"` — headers received, data stored but not connected
+    /// - `"headers-only"` — only the header is known (no block data)
+    /// - `"invalid"` — explicitly marked invalid
+    ///
+    /// `branchlen` is the number of blocks since the fork point from the
+    /// active chain (0 for the active tip itself).
+    pub fn chain_tips(&self) -> Vec<ChainTipInfo> {
+        use std::collections::{HashMap, HashSet};
+
+        let (tip_hash, _tip_height) = self.tip_snapshot();
+
+        // Collect every entry and record which hashes are referenced as a parent.
+        let mut entries: HashMap<BlockHash, BlockIndexEntry> = HashMap::new();
+        let mut has_child: HashSet<BlockHash> = HashSet::new();
+        let _ = self.store.for_each_block_index(&mut |hash, entry| {
+            has_child.insert(entry.header.prev_blockhash);
+            entries.insert(hash, entry);
+        });
+
+        // Build the set of active-chain hashes for fork-point detection.
+        let mut active_hashes: HashSet<BlockHash> = HashSet::new();
+        {
+            let mut cur = tip_hash;
+            loop {
+                active_hashes.insert(cur);
+                if let Some(e) = entries.get(&cur) {
+                    if e.header.prev_blockhash == BlockHash::all_zeros() {
+                        break;
+                    }
+                    cur = e.header.prev_blockhash;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Tips: blocks with no children in the index.
+        let mut tips: Vec<ChainTipInfo> = Vec::new();
+        for (hash, entry) in &entries {
+            if has_child.contains(hash) {
+                continue;
+            }
+
+            // Classify.
+            let (status, branch_len) = if *hash == tip_hash {
+                ("active", 0u32)
+            } else {
+                // Walk back to the fork point (the first ancestor on the active chain).
+                let mut depth = 0u32;
+                let mut cur = *hash;
+                loop {
+                    if active_hashes.contains(&cur) {
+                        break;
+                    }
+                    if let Some(e) = entries.get(&cur) {
+                        if e.header.prev_blockhash == BlockHash::all_zeros() {
+                            depth += 1;
+                            break;
+                        }
+                        cur = e.header.prev_blockhash;
+                        depth += 1;
+                    } else {
+                        depth += 1;
+                        break;
+                    }
+                }
+
+                let status_str = match entry.status {
+                    BlockStatus::Invalid => "invalid",
+                    BlockStatus::HeaderOnly => "headers-only",
+                    BlockStatus::DataStored => "valid-headers",
+                    BlockStatus::Valid | BlockStatus::Pruned => "valid-fork",
+                };
+                (status_str, depth)
+            };
+
+            tips.push(ChainTipInfo {
+                height: entry.height,
+                hash: *hash,
+                branch_len,
+                status: status.to_string(),
+            });
+        }
+
+        // Sort: active first, then by descending height.
+        tips.sort_by(|a, b| {
+            let a_active = a.status == "active";
+            let b_active = b.status == "active";
+            b_active.cmp(&a_active).then(b.height.cmp(&a.height))
+        });
+
+        tips
     }
 
     /// Direct store handle for tests that need to construct index states the

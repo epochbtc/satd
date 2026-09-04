@@ -236,6 +236,53 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
 
 /// *and every argument after it disappears* -- `getrawtransaction` would answer
 /// a numeric `verbosity` as non-verbose and drop the caller's `blockhash`. Going
+/// Reformat a jsonrpsee type-mismatch error into Bitcoin Core's
+/// `RPC_TYPE_ERROR` (-3) shape. Core says:
+///
+///   "JSON value of type <actual> is not of expected type <expected>"
+///
+/// jsonrpsee's serde errors look like:
+///
+///   "invalid type: integer `1234`, expected a string at line 1 column 4"
+///
+/// We parse that format and produce Core's wording; for any error we
+/// cannot parse we fall back to the raw error message.
+fn core_type_error(e: &ErrorObjectOwned, expected: &str) -> ErrorObjectOwned {
+    let msg = e.message();
+    let data_str = e
+        .data()
+        .and_then(|d| serde_json::from_str::<String>(d.get()).ok())
+        .unwrap_or_default();
+
+    // Try parsing serde's "invalid type: <actual>, expected <expected>" pattern
+    // from the data field.
+    let formatted = if let Some(rest) = data_str.strip_prefix("invalid type: ") {
+        // e.g. "integer `1234`, expected a string at line 1 column 4"
+        let actual_type = if rest.starts_with("integer") {
+            "number"
+        } else if rest.starts_with("string") {
+            "string"
+        } else if rest.starts_with("boolean") {
+            "bool"
+        } else if rest.starts_with("map") || rest.starts_with("sequence") {
+            "object"
+        } else {
+            // Unknown type — just use the message as-is
+            return ErrorObjectOwned::owned(
+                -3,
+                format!("JSON value of type unknown is not of expected type {expected}"),
+                None::<()>,
+            );
+        };
+        format!("JSON value of type {actual_type} is not of expected type {expected}")
+    } else {
+        // Doesn't match the serde format; use a reasonable fallback.
+        format!("{msg}: {data_str}")
+    };
+
+    ErrorObjectOwned::owned(-3, formatted, None::<()>)
+}
+
 /// through `Value` cannot fail on type, so the sequence is never poisoned.
 fn optional_verbosity(
     seq: &mut jsonrpsee::types::params::ParamsSequence<'_>,
@@ -645,7 +692,13 @@ pub async fn start(
         // a hex string, not an object.
         let verbosity = optional_verbosity(&mut seq, 1)?;
         blockchain::get_block(&ctx.chain_state, &hash, verbosity)
-            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+            .map_err(|e| {
+                // "Block not available (...)" errors use RPC_MISC_ERROR (-1),
+                // matching Bitcoin Core; all others (e.g. "Block not found",
+                // "Invalid block hash") use RPC_INVALID_ADDRESS_OR_KEY (-5).
+                let code = if e.starts_with("Block not available") { -1 } else { -5 };
+                ErrorObjectOwned::owned(code, e, None::<()>)
+            })
     })?;
 
     module.register_method("getblockheader", |params, ctx, _extensions| {
@@ -662,20 +715,35 @@ pub async fn start(
         let mut seq = params.sequence();
         let hash: String = seq
             .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Optional as a satd extension; Core requires it. See
-        // `network::get_block_from_peer`.
-        //
-        // The error is propagated, not collapsed into `None`:
-        // `optional_next` returns `Err` for a *type mismatch* as well as
-        // `Ok(None)` for an absent argument, so `unwrap_or(None)` would turn
-        // `getblockfrompeer(hash, "3")` into "no peer named" and silently
-        // send the request to an arbitrary peer instead. For an RPC whose
-        // whole point is that the operator chose the peer, redirecting on a
-        // typo is the wrong failure mode — and Core rejects those calls.
-        let peer_id: Option<crate::net::peer::PeerId> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+            .map_err(|e| core_type_error(&e, "string"))?;
+        // Parse peer_id as a raw JSON value first so we can distinguish
+        // between "wrong type" (string where number expected → -3) and
+        // "negative number" (valid JSON number that represents no peer →
+        // pass through to the peer-lookup code as None, which yields -1
+        // "Peer does not exist"). Core accepts negative peer_ids at the
+        // deserialization layer and rejects them in the lookup.
+        let peer_id: Option<crate::net::peer::PeerId> = {
+            let raw: Option<serde_json::Value> = seq
+                .optional_next()
+                .map_err(|e| core_type_error(&e, "number"))?;
+            match raw {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(n)) => {
+                    // Negative or too-large numbers are valid JSON but map
+                    // to no existing peer — pass them through as an
+                    // impossibly large id so the lookup fails with "Peer
+                    // does not exist" (matching Core).
+                    Some(n.as_u64().unwrap_or(u64::MAX))
+                }
+                Some(_) => {
+                    return Err(ErrorObjectOwned::owned(
+                        -3,
+                        "JSON value of type string is not of expected type number",
+                        None::<()>,
+                    ));
+                }
+            }
+        };
         network::get_block_from_peer(&ctx.chain_state, &ctx.peer_manager, &hash, peer_id)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -2062,7 +2130,7 @@ pub async fn start(
         let mut seq = params.sequence();
         let addr_str: String = seq
             .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+            .map_err(|e| ErrorObjectOwned::owned(-1, format!("addnode \"node\" \"command\"\n\n{e}"), None::<()>))?;
         let command: String = seq
             .optional_next()
             .unwrap_or(Some("onetry".to_string()))
@@ -2079,9 +2147,16 @@ pub async fn start(
                 // the reconnect loop dials it. Blocking here would stall the RPC
                 // for the whole connect timeout — up to the 20s onion floor — and
                 // wrongly report a transient dial failure as an addnode error.
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
-                ctx.peer_manager.add_peer_addr(addr.clone());
+                // -23 = RPC_CLIENT_NODE_ALREADY_ADDED in Core.
+                if !ctx.peer_manager.addnode_add(&addr_str, addr.clone()) {
+                    return Err(ErrorObjectOwned::owned(
+                        -23,
+                        "Node already added",
+                        None::<()>,
+                    ));
+                }
                 let pm = ctx.peer_manager.clone();
                 tokio::spawn(async move {
                     if let Err(e) = pm.connect_peer_addr(&addr).await {
@@ -2092,7 +2167,7 @@ pub async fn start(
             "onetry" => {
                 // A single, un-remembered attempt — block on it and surface the
                 // result, matching the prior satd behavior (now onion-capable).
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 ctx.peer_manager
                     .connect_peer_addr(&addr)
@@ -2100,14 +2175,21 @@ pub async fn start(
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
             "remove" => {
-                let addr = crate::net::peer::PeerAddr::parse(&addr_str)
+                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
-                ctx.peer_manager.remove_peer_addr(&addr);
+                // -24 = RPC_CLIENT_NODE_NOT_ADDED in Core.
+                if !ctx.peer_manager.addnode_remove(&addr) {
+                    return Err(ErrorObjectOwned::owned(
+                        -24,
+                        "Node could not be removed",
+                        None::<()>,
+                    ));
+                }
             }
             other => {
                 return Err(ErrorObjectOwned::owned(
                     -1,
-                    format!("addnode: unknown command '{other}' (expected add/onetry/remove)"),
+                    format!("addnode \"node\" \"command\"\n\naddnode: unknown command '{other}' (expected add/onetry/remove)"),
                     None::<()>,
                 ));
             }
@@ -2115,8 +2197,26 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Null)
     })?;
 
-    module.register_method("getaddednodeinfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.get_added_node_info()))
+    module.register_method("getaddednodeinfo", |params, ctx, _extensions| {
+        let mut seq = params.sequence();
+        let filter_node: Option<String> = seq.optional_next().unwrap_or(None);
+        let all_info = ctx.peer_manager.get_added_node_info();
+        if let Some(ref node) = filter_node {
+            let filtered: Vec<_> = all_info.into_iter().filter(|entry| {
+                entry.get("addednode").and_then(|v| v.as_str()) == Some(node.as_str())
+            }).collect();
+            if filtered.is_empty() {
+                // -24 = RPC_CLIENT_NODE_NOT_ADDED. Core's exact message.
+                return Err(ErrorObjectOwned::owned(
+                    -24,
+                    "Node has not been added",
+                    None::<()>,
+                ));
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(filtered))
+        } else {
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(all_info))
+        }
     })?;
 
     module.register_method("getnettotals", |_params, ctx, _extensions| {

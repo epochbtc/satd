@@ -159,9 +159,7 @@ status = "run"
 
 [[test]]
 file = "feature_framework_startup_failures.py"
-status = "skip"
-reason = "feature-missing"
-note = "clap's error format ('unexpected argument') doesn't match Core's ('Invalid parameter -nonexistentarg'); test regex-matches the exact error string"
+status = "run"
 
 [[test]]
 file = "feature_framework_testshell.py"

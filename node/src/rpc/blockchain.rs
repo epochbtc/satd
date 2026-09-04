@@ -322,10 +322,20 @@ pub fn get_block(
         .get_block_index(&hash)
         .ok_or("Block not found")?;
 
+    // Map a missing block body to Core's status-dependent error message.
+    let block_unavailable_msg = || -> String {
+        use crate::storage::blockindex::BlockStatus;
+        match entry.status {
+            BlockStatus::Pruned => "Block not available (pruned data)".to_string(),
+            BlockStatus::HeaderOnly => "Block not available (not fully downloaded)".to_string(),
+            _ => "Block data not available".to_string(),
+        }
+    };
+
     if verbosity == 0 {
         let block = chain_state
             .get_block(&hash)
-            .ok_or("Block data not available")?;
+            .ok_or_else(block_unavailable_msg)?;
         let raw = serialize(&block);
         return Ok(Value::String(hex::encode(raw)));
     }
@@ -333,7 +343,7 @@ pub fn get_block(
     // verbosity >= 1: JSON response
     let block = chain_state
         .get_block(&hash)
-        .ok_or("Block data not available")?;
+        .ok_or_else(block_unavailable_msg)?;
 
     let confirmations = block_confirmations(chain_state, &hash, entry.height);
 

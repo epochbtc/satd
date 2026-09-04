@@ -45,9 +45,16 @@ pub fn get_block_from_peer(
     hash_str: &str,
     peer_id: Option<PeerId>,
 ) -> Result<Value, (i32, String)> {
-    let hash: BlockHash = hash_str
-        .parse()
-        .map_err(|_| (RPC_INVALID_PARAMETER, "blockhash must be of length 64 (hex characters)".to_string()))?;
+    let hash: BlockHash = hash_str.parse().map_err(|_| {
+        (
+            RPC_INVALID_PARAMETER,
+            format!(
+                "hash must be of length 64 (not {}, for '{}')",
+                hash_str.len(),
+                hash_str
+            ),
+        )
+    })?;
 
     // We must already hold the header: it is what authenticates whatever the
     // peer sends back (see `repair_block_data`).
@@ -59,15 +66,29 @@ pub fn get_block_from_peer(
         return Err((RPC_MISC_ERROR, "Block already downloaded".to_string()));
     }
 
+    // In prune mode, refuse to fetch blocks we haven't synced past yet.
+    // Core rejects these because the node can't verify the block without
+    // the preceding UTXO state, and it would be pruned immediately anyway.
+    if peer_manager.is_pruning() && entry.height > chain_state.tip_height() {
+        return Err((
+            RPC_MISC_ERROR,
+            "In prune mode, only blocks that the node has already synced \
+             previously can be fetched from a peer"
+                .to_string(),
+        ));
+    }
+
     // Refuse statuses the arrival path will refuse anyway, *before* spending a
     // round trip and a block download on them. Without this the operator gets
     // an empty-object success, the block is fetched, and the repair is then
     // rejected with nothing but a log line to show for it.
     match entry.status {
         crate::storage::blockindex::BlockStatus::Pruned => {
+            // Match Bitcoin Core's pruned-block error for pruneblockchain'd blocks
+            // that were already synced past.
             return Err((
                 RPC_MISC_ERROR,
-                "Block is pruned; satd does not repopulate pruned block data".to_string(),
+                "Block not available (pruned data)".to_string(),
             ));
         }
         crate::storage::blockindex::BlockStatus::Invalid => {
@@ -105,6 +126,8 @@ pub fn get_block_from_peer(
 /// Build the `getnetworkinfo` response with live connection data.
 pub fn get_network_info(peer_manager: &PeerManager) -> Value {
     let connections = peer_manager.connection_count();
+    let connections_in = peer_manager.inbound_count();
+    let connections_out = peer_manager.outbound_count();
     let onion_reachable = peer_manager.onion_routing_available();
     let randomize = peer_manager.proxy_randomize();
     let clearnet_proxy = peer_manager.proxy_addr().unwrap_or_default();
@@ -138,8 +161,8 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
         "timeoffset": 0,
         "networkactive": peer_manager.is_network_active(),
         "connections": connections,
-        "connections_in": 0,
-        "connections_out": connections,
+        "connections_in": connections_in,
+        "connections_out": connections_out,
         "networks": [
             {
                 "name": "ipv4",

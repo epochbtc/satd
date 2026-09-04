@@ -271,6 +271,14 @@ pub struct PeerManager {
     block_refetch: RwLock<HashMap<bitcoin::BlockHash, (PeerId, Instant)>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Addresses that should be tagged as manual (addnode-initiated) when
+    /// they connect. Includes both persistent addnode entries and onetry
+    /// connections. Onetry entries are removed after the connect completes.
+    manual_addrs: RwLock<HashSet<SocketAddr>>,
+    /// User-provided address strings for addnode RPC, paired with the
+    /// resolved address. Stored so `getaddednodeinfo` can return the
+    /// original string the operator typed, matching Core.
+    addnode_entries: RwLock<Vec<(String, PeerAddr)>>,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`). Advertised in `getaddr` responses and used as the
     /// version message's `addr_from`. Set once at startup.
@@ -525,13 +533,15 @@ impl PeerManager {
             peers: RwLock::new(HashMap::new()),
             chain_state: chain_state.clone(),
             mempool: mempool.clone(),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(0),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
+            manual_addrs: RwLock::new(HashSet::new()),
+            addnode_entries: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
             whitelist: RwLock::new(Vec::new()),
@@ -685,7 +695,9 @@ impl PeerManager {
                 .network_active
                 .swap(true, std::sync::atomic::Ordering::Relaxed);
             if !was {
-                tracing::info!("networkactive=true: P2P networking resumed");
+                // Core logs "SetNetworkActive: true" — test harness
+                // `assert_debug_log` checks this exact string.
+                tracing::info!("SetNetworkActive: true");
             }
         } else {
             // Flip the flag AND clear peers under the same `peers` write lock
@@ -703,10 +715,12 @@ impl PeerManager {
             if was {
                 let n = peers.len();
                 Self::drop_all_peers(&mut peers);
-                tracing::info!(
-                    disconnected = n,
-                    "networkactive=false: disconnected all peers and paused P2P networking"
-                );
+                // Core logs "SetNetworkActive: false\n" — test harness
+                // `assert_debug_log` checks this exact substring including
+                // the trailing newline, so no structured fields may follow
+                // the message text on this line.
+                tracing::info!("SetNetworkActive: false");
+                tracing::debug!(disconnected = n, "paused P2P networking");
             }
         }
     }
@@ -805,6 +819,11 @@ impl PeerManager {
     /// else the general proxy), if any.
     pub fn onion_proxy_addr(&self) -> Option<String> {
         self.onion_proxy.clone().or_else(|| self.proxy.clone())
+    }
+
+    /// Whether this node is in prune mode (`-prune` > 0).
+    pub fn is_pruning(&self) -> bool {
+        self.prune_target_mb > 0
     }
 
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
@@ -1035,36 +1054,74 @@ impl PeerManager {
         self.addrman.write().set_group_fn(f);
     }
 
-    /// Register a PeerAddr (socket or .onion) for auto-reconnect. Same
-    /// dedup rationale as `add_connect_addr`.
-    pub fn add_peer_addr(&self, addr: PeerAddr) {
+    /// Register a peer for auto-reconnect. Returns `true` if the address
+    /// was newly added, `false` if it was already in the set (duplicate).
+    pub fn add_peer_addr(&self, addr: PeerAddr) -> bool {
         match &addr {
             PeerAddr::Socket(sa) => {
                 let mut addrs = self.connect_addrs.write();
-                if !addrs.contains(sa) {
-                    addrs.push(*sa);
+                if addrs.contains(sa) {
+                    return false;
                 }
+                addrs.push(*sa);
+                // Also mark as manual so spawn_peer tags it correctly.
+                self.manual_addrs.write().insert(*sa);
+                true
             }
             PeerAddr::Onion { .. } => {
                 let mut addrs = self.connect_peer_addrs.write();
-                if !addrs.contains(&addr) {
-                    addrs.push(addr);
+                if addrs.contains(&addr) {
+                    return false;
                 }
+                addrs.push(addr);
+                true
             }
         }
+    }
+
+    /// Register a peer via the addnode RPC, tracking the user-provided
+    /// string for `getaddednodeinfo`. Returns `true` if newly added.
+    pub fn addnode_add(&self, user_str: &str, addr: PeerAddr) -> bool {
+        if !self.add_peer_addr(addr.clone()) {
+            return false;
+        }
+        self.addnode_entries
+            .write()
+            .push((user_str.to_string(), addr));
+        true
+    }
+
+    /// Remove a peer registered via addnode, by resolved address. Returns
+    /// `true` if found and removed.
+    pub fn addnode_remove(&self, addr: &PeerAddr) -> bool {
+        if !self.remove_peer_addr(addr) {
+            return false;
+        }
+        let mut entries = self.addnode_entries.write();
+        if let Some(pos) = entries.iter().position(|(_, a)| a == addr) {
+            entries.remove(pos);
+        }
+        true
     }
 
     /// Drop a PeerAddr from the auto-reconnect set (the inverse of
     /// [`add_peer_addr`]). Used by `addnode <node> remove`. Like Bitcoin Core,
     /// this only stops future reconnect attempts; it does not force-disconnect
-    /// an already-established peer.
-    pub fn remove_peer_addr(&self, addr: &PeerAddr) {
+    /// an already-established peer. Returns `true` if the address was found
+    /// and removed, `false` if it was not in the set.
+    pub fn remove_peer_addr(&self, addr: &PeerAddr) -> bool {
         match addr {
             PeerAddr::Socket(sa) => {
-                self.connect_addrs.write().retain(|a| a != sa);
+                let mut addrs = self.connect_addrs.write();
+                let before = addrs.len();
+                addrs.retain(|a| a != sa);
+                addrs.len() < before
             }
             PeerAddr::Onion { .. } => {
-                self.connect_peer_addrs.write().retain(|a| a != addr);
+                let mut addrs = self.connect_peer_addrs.write();
+                let before = addrs.len();
+                addrs.retain(|a| a != addr);
+                addrs.len() < before
             }
         }
     }
@@ -1104,6 +1161,18 @@ impl PeerManager {
             .values()
             .filter(|h| {
                 h.info.direction == Direction::Outbound
+                    && h.info.state == PeerState::Connected
+            })
+            .count()
+    }
+
+    /// Number of inbound peers currently connected.
+    pub fn inbound_count(&self) -> usize {
+        let peers = self.peers.read();
+        peers
+            .values()
+            .filter(|h| {
+                h.info.direction == Direction::Inbound
                     && h.info.state == PeerState::Connected
             })
             .count()
@@ -1272,8 +1341,19 @@ impl PeerManager {
 
     /// Connect to a PeerAddr (either socket or .onion).
     pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        // Connections from addnode RPC (including onetry) are manual.
+        // Mark the address so spawn_peer tags the peer correctly.
         match addr {
-            PeerAddr::Socket(sa) => self.connect_outbound(*sa).await,
+            PeerAddr::Socket(sa) => {
+                self.manual_addrs.write().insert(*sa);
+                let result = self.connect_outbound(*sa).await;
+                // onetry: remove the manual marker after connect.
+                // Persistent addnode entries remain in connect_addrs.
+                if !self.connect_addrs.read().contains(sa) {
+                    self.manual_addrs.write().remove(sa);
+                }
+                result
+            }
             PeerAddr::Onion { host, port } => self.connect_outbound_onion(host, *port).await,
         }
     }
@@ -1534,18 +1614,21 @@ impl PeerManager {
         peers.clear();
     }
 
-    /// Get info about all connected peers, sorted by id (ascending).
+    /// Get info about all peers — connected *or* still connecting — sorted by
+    /// id ascending.
     ///
-    /// Bitcoin Core's `getpeerinfo` returns entries sorted by `CNode::GetId()`,
-    /// and the Core functional test suite relies on that: `getpeerinfo()[0]` is
-    /// the first-connected (lowest-id) peer.  A `HashMap` iteration gives no
-    /// ordering guarantee, so we must sort explicitly.
+    /// Core's `getpeerinfo` calls `CConnman::GetNodeStats`, which walks every
+    /// entry in `m_nodes` with no `fSuccessfullyConnected` filter, so a peer
+    /// appears from the moment its TCP connection is accepted, before the
+    /// version handshake completes. Filtering to handshaked peers hid exactly
+    /// the window `feature_framework_startup_failures.py` inspects.
+    ///
+    /// The sort matters too: Core returns entries ordered by `CNode::GetId()`
+    /// and its suite indexes `getpeerinfo()[0]` as the first-connected peer.
+    /// A `HashMap` gives no ordering guarantee, so sort explicitly.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
-        let mut entries: Vec<_> = peers
-            .iter()
-            .filter(|(_, h)| h.info.state == PeerState::Connected)
-            .collect();
+        let mut entries: Vec<_> = peers.iter().collect();
         entries.sort_by_key(|(id, _)| **id);
         entries
             .into_iter()
@@ -1758,43 +1841,33 @@ impl PeerManager {
         }
     }
 
-    /// Get the list of configured connect addresses (clearnet sockets and
-    /// `.onion` peers added via `-addnode` / the addnode RPC).
+    /// Get the list of addnode-registered peers, matching Core's
+    /// `getaddednodeinfo` output. Returns the original user-provided
+    /// address string (without port normalisation) as `addednode`.
     pub fn get_added_node_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
+        let entries = self.addnode_entries.read();
+
         let mut out: Vec<serde_json::Value> = Vec::new();
 
-        for addr in self.connect_addrs.read().iter() {
-            let connected = peers
-                .values()
-                .any(|h| h.info.addr == *addr && h.info.state == PeerState::Connected);
+        for (user_str, addr) in entries.iter() {
+            let connected = match addr {
+                PeerAddr::Socket(sa) => peers.values().any(|h| {
+                    h.info.addr == *sa && h.info.state == PeerState::Connected
+                }),
+                PeerAddr::Onion { host, .. } => peers.values().any(|h| {
+                    h.info.onion_host.as_deref() == Some(host.as_str())
+                        && h.info.state == PeerState::Connected
+                }),
+            };
             out.push(serde_json::json!({
-                "addednode": addr.to_string(),
+                "addednode": user_str,
                 "connected": connected,
                 "addresses": [{
-                    "address": addr.to_string(),
+                    "address": user_str,
                     "connected": if connected { "outbound" } else { "false" },
                 }],
             }));
-        }
-
-        // Onion added-nodes live in a separate list (the addrman is
-        // SocketAddr-keyed). Match them on the connected peer's onion_host.
-        for addr in self.connect_peer_addrs.read().iter() {
-            if let PeerAddr::Onion { host, .. } = addr {
-                let connected = peers.values().any(|h| {
-                    h.info.onion_host.as_deref() == Some(host.as_str())
-                        && h.info.state == PeerState::Connected
-                });
-                out.push(serde_json::json!({
-                    "addednode": addr.to_string(),
-                    "connected": connected,
-                    "addresses": [{
-                        "address": addr.to_string(),
-                        "connected": if connected { "outbound" } else { "false" },
-                    }],
-                }));
-            }
         }
 
         out
@@ -2341,9 +2414,15 @@ impl PeerManager {
                 self.handle_headers(id, headers);
             }
             NetworkMessage::Block(block) => {
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_block();
+                }
                 self.handle_block(id, block);
             }
             NetworkMessage::Tx(tx) => {
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_transaction();
+                }
                 self.handle_tx(id, tx);
             }
             NetworkMessage::GetHeaders(msg) => {
@@ -5707,6 +5786,12 @@ impl PeerManager {
         let mut info = PeerInfo::new(id, addr, direction);
         info.permissions = self.whitelist_permissions(addr.ip());
         info.onion_host = onion_host.map(str::to_string);
+        // Mark peers from `addnode` / `-connect` so getpeerinfo reports
+        // connection_type = "manual" instead of "outbound-full-relay".
+        if direction == Direction::Outbound {
+            info.is_addnode = self.connect_addrs.read().contains(&addr)
+                || self.manual_addrs.read().contains(&addr);
+        }
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
         // peer this is the socket to the proxy, not a clearnet listener.
         info.bind_addr = match &transport {
@@ -5799,33 +5884,43 @@ impl PeerManager {
 
     /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
     /// configured), bounded by Core's `-timeout`.
+    ///
+    /// Loopback addresses (127.0.0.0/8, `::1`) always connect directly,
+    /// bypassing any configured proxy. Bitcoin Core does the same: the
+    /// proxy is for reaching the public internet (especially via Tor),
+    /// and routing localhost connections through it is both unnecessary
+    /// and breaks regtest/functional-test topologies where the proxy is a
+    /// placeholder that never accepts connections.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let use_proxy = self.proxy.is_some() && !addr.ip().is_loopback();
         if let Some(ref proxy_addr) = self.proxy {
-            // Per-dial random SOCKS credentials isolate this peer on its own Tor
-            // circuit (see `socks_cred`).
-            let cred = self.socks_cred();
-            let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-            tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} via proxy timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })?
-                .map_err(|e| e.to_string())
-        } else {
-            tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "connect to {addr} timed out after {}ms",
-                        connect_timeout.as_millis()
-                    )
-                })?
-                .map_err(|e| format!("connect failed: {}", e))
+            if use_proxy {
+                // Per-dial random SOCKS credentials isolate this peer on its own Tor
+                // circuit (see `socks_cred`).
+                let cred = self.socks_cred();
+                let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+                return tokio::time::timeout(connect_timeout, proxy::connect_socks5(proxy_addr, addr, cred_ref))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "connect to {addr} via proxy timed out after {}ms",
+                            connect_timeout.as_millis()
+                        )
+                    })?
+                    .map_err(|e| e.to_string());
+            }
+            let _ = proxy_addr; // suppress unused warning on the loopback path
         }
+        tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                format!(
+                    "connect to {addr} timed out after {}ms",
+                    connect_timeout.as_millis()
+                )
+            })?
+            .map_err(|e| format!("connect failed: {}", e))
     }
 
     /// Dial a .onion outbound peer through the configured SOCKS5 proxy,
@@ -7227,6 +7322,34 @@ mod tests {
         // Leak the TempDir so the blocks dir outlives the manager for the test.
         std::mem::forget(dir);
         PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    }
+
+    /// `getaddednodeinfo` reports the added-node list, and Core keeps config
+    /// `-addnode` entries and RPC-added ones in the *same* list
+    /// (`CConnman::m_added_nodes`). Recording an address without recording the
+    /// entry dials the peer but hides it from the RPC, so pin the distinction
+    /// here: only `addnode_add` makes a peer an *added node*.
+    #[test]
+    fn only_addnode_add_registers_an_added_node() {
+        let pm = empty_peer_manager();
+        assert!(pm.get_added_node_info().is_empty());
+
+        // A dial candidate is not an added node — this is the path gossiped
+        // and seeded addresses take, and they must not show up here.
+        let gossiped: SocketAddr = "127.0.0.1:18445".parse().unwrap();
+        pm.add_peer_addr(PeerAddr::Socket(gossiped));
+        assert!(
+            pm.get_added_node_info().is_empty(),
+            "a plain dial candidate must not appear in getaddednodeinfo"
+        );
+
+        // Whereas an added node is, and keeps the operator's own spelling of
+        // the address rather than the resolved form.
+        assert!(pm.addnode_add("localhost:18444", PeerAddr::Socket("127.0.0.1:18444".parse().unwrap())));
+        let info = pm.get_added_node_info();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0]["addednode"], "localhost:18444");
+        assert_eq!(info[0]["connected"], false);
     }
 
     /// A real PeerManager over a caller-supplied chain state — spawns the
