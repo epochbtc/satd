@@ -64,9 +64,7 @@ note = "the framework skipped it; re-triage when the run-set grows"
 
 [[test]]
 file = "feature_bip68_sequence.py"
-status = "skip"
-reason = "feature-missing"
-note = "gets past error-code check (-26 fixed), but tx with sequence locks not accepted into mempool; BIP68 sequence-lock enforcement gap in accept path"
+status = "run"
 
 [[test]]
 file = "feature_block.py"
@@ -624,9 +622,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "p2p_disconnect_ban.py"
-status = "skip"
-reason = "feature-missing"
-note = "setban needs banlist.json persistence (bans are in-memory only); the test restarts the node and checks the ban survives"
+status = "run"
 
 [[test]]
 file = "p2p_dns_seeds.py"

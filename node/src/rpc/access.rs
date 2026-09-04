@@ -81,6 +81,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "getbestblockhash"
         | "getblock"
         | "getblockchaininfo"
+        | "getdeploymentinfo"
         | "getblockcount"
         | "getblockfilter"
         | "getblockhash"
