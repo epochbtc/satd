@@ -948,9 +948,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "rpc_getchaintips.py"
-status = "skip"
-reason = "feature-missing"
-note = "getchaintips only reports the active tip; fork tips (headers-valid, valid-fork) not tracked"
+status = "run"
 
 [[test]]
 file = "rpc_getdescriptoractivity.py"
@@ -1070,9 +1068,7 @@ note = "needs `createmultisig`"
 
 [[test]]
 file = "rpc_txoutproof.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs gettxoutproof and verifytxoutproof RPCs"
+status = "run"
 
 [[test]]
 file = "rpc_uptime.py"

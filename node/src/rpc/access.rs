@@ -120,6 +120,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getsilentpaymentblockdata"
         | "getsysteminfo"
         | "gettxout"
+        // Merkle-proof build/verify over stored blocks; neither mutates state.
+        | "gettxoutproof"
+        | "verifytxoutproof"
         | "gettxoutsetinfo"
         | "getwarnings"
         | "getaddednodeinfo"

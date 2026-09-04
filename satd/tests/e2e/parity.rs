@@ -1258,8 +1258,13 @@ async fn parity_reorg_disconnects_and_renarrates() {
 /// named in a spec that has to be written before the node is driven.
 #[tokio::test(flavor = "multi_thread")]
 async fn parity_lifecycle_and_depth_alarms() {
+    // `-txindex` is load-bearing here, not incidental. Both watches name a txid
+    // that confirmed BEFORE registration, so arming them depends on the
+    // one-shot txindex probe resolving the anchor; with the index off the
+    // probe finds nothing and the entry waits for a live observation that
+    // never comes (see `no_txindex_waits_for_live_observation`).
     let Some(run) = parity_begin(
-        &[],
+        &["--txindex=1"],
         |i| Spec {
             // The chain is at 101, so block 1's coinbase sits at depth 101.
             // Both thresholds are ahead of that and fire as the scenario mines.

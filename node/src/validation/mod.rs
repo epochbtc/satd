@@ -72,3 +72,38 @@ pub enum ValidationError {
     #[error("time-timewarp-attack")]
     TimewarpAttack,
 }
+
+impl ValidationError {
+    /// Whether this rejection is *mutation-class*: the block's data did not
+    /// match what the proof of work commits to, so a different — possibly
+    /// honest — block can share this block hash.
+    ///
+    /// A verdict from one of these must never be written down against the
+    /// hash. Core states the rule in `Chainstate::InvalidBlockFound`
+    /// (`src/validation.cpp`), which skips `BLOCK_FAILED_VALID` entirely when
+    /// `state.GetResult() == BlockValidationResult::BLOCK_MUTATED`, and
+    /// repeats it at the `ActivateBestChainStep` and `AcceptBlock` call sites.
+    /// The reason is CVE-2012-2459: a merkle tree that duplicates a trailing
+    /// subtree hashes to the same root as the honest tree, so an attacker can
+    /// hand us a malleated copy of a valid block. Persisting `Invalid` for it
+    /// would make the honest block permanently unacceptable — and because the
+    /// parent-status guard rejects descendants too, the node would wedge off
+    /// the real chain until an operator ran `reconsiderblock`.
+    ///
+    /// The set matches Core's five `BLOCK_MUTATED` sites one for one.
+    pub fn is_mutation_class(&self) -> bool {
+        matches!(
+            self,
+            // "bad-txnmrklroot"
+            Self::BadMerkleRoot
+                // "bad-txns-duplicate"
+                | Self::BadTxDuplicate
+                // "bad-witness-merkle-match"
+                | Self::BadWitnessCommitment
+                // "bad-witness-nonce-size"
+                | Self::BadWitnessNonceSize
+                // "unexpected-witness"
+                | Self::UnexpectedWitness
+        )
+    }
+}

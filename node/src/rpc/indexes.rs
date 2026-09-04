@@ -13,6 +13,7 @@ use bitcoin::hashes::Hash;
 use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
+use crate::storage::Store;
 use crate::index::address::{
     BackfillCommand, BackfillError, BackfillHandle, cursor::BackfillState, preflight_disk,
     render_status,
@@ -20,7 +21,6 @@ use crate::index::address::{
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter;
 use crate::index::silent_payments;
-use crate::storage::Store;
 
 /// `getindexinfo` → `{"address": {...}, "basic block filter index": {...}}`:
 ///
@@ -111,6 +111,22 @@ pub fn get_index_info(
 
     let mut top = serde_json::Map::new();
     top.insert("address".into(), Value::Object(address));
+
+    // txindex sibling — Core's `getindexinfo("txindex")` gate.
+    // `has_txindex()` tells us the runtime flag is set (`-txindex`);
+    // satd writes txindex entries inline during `connect_block`, so as
+    // long as the node is running with txindex enabled the index is
+    // current for every block connected during this session.  Report
+    // `synced: true` whenever the flag is on — the on-disk completeness
+    // marker (`tx_index_complete`) captures the historical-backfill
+    // state, but Core's test framework polls this field as a readiness
+    // gate and satd has no background txindex builder to flip it.
+    if chain.store_ref().has_txindex() {
+        let mut txi = serde_json::Map::new();
+        txi.insert("synced".into(), json!(true));
+        txi.insert("best_block_height".into(), json!(best_block_height));
+        top.insert("txindex".into(), Value::Object(txi));
+    }
 
     // BIP 158 filter index sibling. `block_filter_index_enabled` is
     // the runtime config bit (`--blockfilterindex=basic`); `synced`

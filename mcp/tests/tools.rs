@@ -264,7 +264,8 @@ mod transactions {
         let hex = "0200000001000000000000000000000000000000000000000000000000000000\
                    0000000000ffffffff0100f2052a0100000017a91489abcdefabbaabbaabbaab\
                    baabbaabbaabbaabba8700000000";
-        let result = tx::decode_raw_transaction(hex);
+        let (ctx, _dir) = make_test_ctx();
+        let result = tx::decode_raw_transaction(&ctx, hex);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Either decoded successfully or returned an error
         assert!(json["txid"].is_string() || json["error"].is_string());
@@ -272,7 +273,8 @@ mod transactions {
 
     #[test]
     fn test_decode_raw_transaction_invalid() {
-        let result = tx::decode_raw_transaction("deadbeef");
+        let (ctx, _dir) = make_test_ctx();
+        let result = tx::decode_raw_transaction(&ctx, "deadbeef");
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }

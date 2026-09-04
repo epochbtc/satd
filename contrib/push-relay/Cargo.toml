@@ -1,0 +1,51 @@
+[package]
+name = "satd-push-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Reference relay: satd alert webhooks -> APNs / FCM push notifications"
+
+# Deliberately NOT a member of the satd workspace (see the `exclude` entry in
+# the root Cargo.toml). Push providers drag in JWT, OAuth, and their transitive
+# crypto stacks; none of that belongs in a Bitcoin node's dependency tree or its
+# cargo-deny surface. This project is built and tested by its own CI job.
+
+[dependencies]
+axum = "0.8"
+# Server-side hardening. `axum::serve` sets no read/write/idle timeout of its
+# own, so without these a single unauthenticated peer can hold connections open
+# indefinitely (slowloris) or park the per-connection body buffer on each of
+# them — all of it before a byte of HMAC is computed.
+tower = { version = "0.5", features = ["limit", "util"] }
+# Direct hyper access: `axum::serve` exposes no header-read timeout, which is
+# the only place a header-phase slowloris can be bounded (a tower layer sees a
+# request only after hyper has parsed its head).
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio"] }
+tower-http = { version = "0.6", features = ["timeout"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+# `http2` is NOT implied by `json` or `rustls-tls`, and `default-features =
+# false` drops it. Apple's provider API is HTTP/2-only, so without it every APNs
+# push fails at the transport layer — with the flagship use case (an iOS
+# lock-screen alert) silently dead and only a generic error in the log.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2.6"
+# v10 moved signing behind a provider feature and picks none by default: with
+# neither `rust_crypto` nor `aws_lc_rs` enabled it builds fine and then panics
+# inside `encode`, so every push dies at the first provider token. `rust_crypto`
+# is pure Rust — `aws_lc_rs` drags in a C/asm build that does not play well with
+# the static-musl targets satd ships.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

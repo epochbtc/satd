@@ -1089,9 +1089,19 @@ impl RpcHandle {
     }
 
     /// Broadcast a raw transaction hex, returning the txid.
+    ///
+    /// `maxfeerate` is passed as `0`, Core's documented way to switch the
+    /// client-side fee guard off. Hand-built fixtures here spend a whole
+    /// coinbase and pay the remainder to fee, which is orders of magnitude
+    /// past the 0.10 BTC/kvB default — a guard aimed at a wallet's fat-finger,
+    /// not at a test that chose its own fee. Assert the guard in a test that
+    /// is about the guard.
     pub fn send_raw_tx(&self, raw_hex: &str) -> String {
         let res = self
-            .call("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+            .call(
+                "sendrawtransaction",
+                vec![serde_json::json!(raw_hex), serde_json::json!(0)],
+            )
             .expect("sendrawtransaction");
         res["result"]
             .as_str()
