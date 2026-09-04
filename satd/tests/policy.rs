@@ -482,7 +482,9 @@ fn layer_a_cheap_bulk_opreturn_quarantined_but_high_fee_passes() {
     let (mut node, wallet, _pf) = start_funded(Some(COOKBOOK_NO_ALLOW), &[]);
 
     // Matching: 84-byte OP_RETURN payload (> 83) at a low fee (< min_relay*3).
-    let (raw_low, _) = build_spend(&node, &wallet, 1, vec![op_return_output(84)], 200);
+    // min_relay_fee = 100 sat/kvB, so the threshold is 300 sat/kvB.
+    // A 50-sat fee on a ~206 vB tx gives ~242 sat/kvB, below the threshold.
+    let (raw_low, _) = build_spend(&node, &wallet, 1, vec![op_return_output(84)], 50);
     let res = policytest(&node, &raw_low);
     assert_quarantined(&res, "cheap-bulk-opreturn", true, true);
 

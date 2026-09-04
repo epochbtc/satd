@@ -128,6 +128,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getaddressutxos"
         | "listbanned"
         | "help"
+        | "echo"
+        | "echojson"
+        | "generate"
         | "uptime"
         | "validateaddress"
         | "ping" => Read,

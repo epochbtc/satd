@@ -30,10 +30,12 @@ pub enum EvictReason {
     /// held set. Distinct from `FullPool` (the acting class) so per-class
     /// pressure is legible. Inert until a policy is loaded (PR 4c).
     Policy,
-    /// Evicted because a reorg or `invalidateblock` changed the chain tip
-    /// and the transaction's BIP68 sequence locks or absolute locktime are
-    /// no longer satisfied.
-    NonFinal,
+    /// Evicted by `remove_for_reorg` because a chain reorganization made the
+    /// transaction invalid — locktime no longer satisfied (MTP moved
+    /// backwards), coinbase input became immature, BIP 68 sequence lock
+    /// unsatisfied, or an input no longer exists in the UTXO set. Mirrors
+    /// Bitcoin Core's `removeForReorg`.
+    Reorg,
 }
 
 impl EvictReason {
@@ -44,7 +46,7 @@ impl EvictReason {
             EvictReason::Expiry => "expiry",
             EvictReason::BlockConflict => "block_conflict",
             EvictReason::Policy => "policy",
-            EvictReason::NonFinal => "non_final",
+            EvictReason::Reorg => "reorg",
         }
     }
 }
@@ -192,6 +194,7 @@ mod tests {
             (EvictReason::FullPool, "full_pool"),
             (EvictReason::Expiry, "expiry"),
             (EvictReason::BlockConflict, "block_conflict"),
+            (EvictReason::Reorg, "reorg"),
         ] {
             let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason };
             let j = serde_json::to_value(&ev).unwrap();

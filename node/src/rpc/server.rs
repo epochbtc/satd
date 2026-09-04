@@ -9,7 +9,7 @@ use crate::rpc::amounts::{
 };
 use crate::rpc::admission::{AdmissionLayer, AdmissionState};
 use crate::rpc::auth::{AuthLayer, RpcAuth};
-use crate::rpc::compat::JsonRpcCompatLayer;
+use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::CapabilityLayer;
 use crate::rpc::named_params::NamedParamsLayer;
 use crate::rpc::readonly::ReadOnlyLayer;
@@ -428,6 +428,10 @@ pub async fn start(
     // TLS surfaces as a single node-wide RPC work budget.
     rpc_threads: usize,
     rpc_workqueue: usize,
+    // Per-connection header-read timeout (Bitcoin Core `-rpcservertimeout`).
+    // `None` disables; `Some(dur)` causes hyper to close the TCP connection
+    // if a complete HTTP request header is not received within `dur`.
+    header_read_timeout: Option<Duration>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
     peer_manager: Arc<PeerManager>,
@@ -984,40 +988,70 @@ pub async fn start(
 
     module.register_method("generateblock", |params, ctx, _extensions| {
         let mut seq = params.sequence();
-        let address: String = seq
+        let output: String = seq
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Core's `transactions` and `submit` are not implemented. Accepting and
-        // ignoring them is not a tolerable failure mode for either: `submit`
-        // false asks for a block to be built and NOT connected, and answering
-        // by mining and connecting it advances the chain the caller was told
-        // would not move — a test that asserts on the tip afterwards is then
-        // asserting against state it did not create. `transactions` asks for a
-        // specific block body and satd always builds from the mempool. Refuse
-        // both, so the gap is visible instead of silently wrong. (Ignoring them
-        // predates named parameters — a positional caller hit it too — but
-        // named arguments are how Core's own suite passes them.)
-        let transactions = seq.optional_next::<Vec<serde_json::Value>>();
-        let transactions_ok = matches!(&transactions, Ok(None))
-            || matches!(&transactions, Ok(Some(v)) if v.is_empty());
-        if !transactions_ok {
+        let raw_txs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
+        let submit: bool = seq.optional_next().unwrap_or(None).unwrap_or(true);
+
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
             return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: the 'transactions' argument is not supported by satd; \
-                 the block is built from the mempool",
-                None::<()>,
+                -1, "generateblock is only available in regtest mode", None::<()>,
             ));
         }
-        if seq.optional_next::<bool>().ok().flatten() == Some(false) {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "generateblock: submit=false is not supported by satd; \
-                 a generated block is always submitted",
-                None::<()>,
-            ));
+
+        let coinbase_script = crate::rpc::descriptor::parse_descriptor(&output, ctx.chain_state.network)
+            .or_else(|_| {
+                let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = output.parse()
+                    .map_err(|e| format!("{e}"))?;
+                let addr = addr.require_network(ctx.chain_state.network)
+                    .map_err(|e| format!("{e}"))?;
+                Ok::<_, String>(addr.script_pubkey())
+            })
+            .map_err(|e| ErrorObjectOwned::owned(-5, format!("Invalid address or descriptor: {e}"), None::<()>))?;
+
+        let explicit_txs = if let Some(raw) = raw_txs {
+            let mut txs = Vec::new();
+            for item in &raw {
+                let hex = item.as_str().ok_or_else(|| {
+                    ErrorObjectOwned::owned(-1, "transaction must be a string", None::<()>)
+                })?;
+                if hex.len() == 64 {
+                    let txid: bitcoin::Txid = hex.parse()
+                        .map_err(|_| ErrorObjectOwned::owned(-5, format!("Transaction {hex} not in mempool."), None::<()>))?;
+                    let entry = ctx.mempool.get(&txid)
+                        .ok_or_else(|| ErrorObjectOwned::owned(-5, format!("Transaction {txid} not in mempool."), None::<()>))?;
+                    txs.push(entry.tx.clone());
+                } else {
+                    let tx_bytes = hex::decode(hex)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+                        .map_err(|_| ErrorObjectOwned::owned(-22, format!("Transaction decode failed for {hex}"), None::<()>))?;
+                    txs.push(tx);
+                }
+            }
+            Some(txs)
+        } else {
+            None
+        };
+
+        let block = crate::mining::miner::build_block_to_script(
+            &ctx.chain_state, &ctx.mempool, coinbase_script, explicit_txs,
+        ).map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+
+        let hash = block.block_hash().to_string();
+
+        if submit {
+            let acceptance = ctx.chain_state.accept_block(&block)
+                .map_err(|e| ErrorObjectOwned::owned(-25, format!("TestBlockValidity failed: {e}"), None::<()>))?;
+            if let Some(height) = ctx.chain_state.connected_height(&acceptance) {
+                ctx.mempool.remove_for_block(&block, height);
+            }
+            Ok::<_, ErrorObjectOwned>(serde_json::json!({ "hash": hash }))
+        } else {
+            let hex = hex::encode(bitcoin::consensus::serialize(&block));
+            Ok(serde_json::json!({ "hash": hash, "hex": hex }))
         }
-        mining::generate_block(&ctx.chain_state, &ctx.mempool, &address)
-            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("getblocktemplate", |_params, ctx, _extensions| {
@@ -1025,7 +1059,7 @@ pub async fn start(
     })?;
 
     module.register_method("getmininginfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state))
+        Ok::<_, ErrorObjectOwned>(mining::get_mining_info(&ctx.chain_state, &ctx.mempool))
     })?;
 
     module.register_method("getnetworkhashps", |params, ctx, _extensions| {
@@ -1070,10 +1104,11 @@ pub async fn start(
             .broadcast_transaction(&hex_tx, crate::mempool::pool::TxSource::Rpc, allow_quarantined)
             .map_err(|(code, msg)| {
                 // Classify the mempool error by its code (Core taxonomy):
-                // -22 = decode failed; -25 (RPC_VERIFY_ERROR, in practice
-                // missing inputs) and -26 (RPC_VERIFY_REJECTED, every other
-                // invalid-or-rejected verdict) are both mempool acceptance
-                // failures and want the same operator advice.
+                // -22 = decode failed; -25 (RPC_TRANSACTION_ERROR, in
+                // practice missing inputs) and -26
+                // (RPC_TRANSACTION_REJECTED, every other invalid-or-rejected
+                // verdict) are both mempool acceptance failures and want the
+                // same operator advice.
                 let (category, suggestion) = match code {
                     -22 => (
                         "rpc.input.parse",
@@ -1169,7 +1204,8 @@ pub async fn start(
             .next()
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
         let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime)
+        let replaceable: Option<bool> = seq.optional_next().unwrap_or(None);
+        rawtx::create_raw_transaction(&inputs, &outputs, locktime, replaceable)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1225,8 +1261,10 @@ pub async fn start(
                 .test_accept(&tx, &ctx.chain_state, ctx.chain_state.script_verifier())
             {
                 Ok((txid, vsize, fees)) => {
+                    let wtxid = tx.compute_wtxid();
                     results.push(serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": true,
                         "vsize": vsize,
                         "fees": {
@@ -1236,11 +1274,17 @@ pub async fn start(
                 }
                 Err(e) => {
                     let txid = tx.compute_txid();
-                    results.push(serde_json::json!({
+                    let wtxid = tx.compute_wtxid();
+                    let mut entry = serde_json::json!({
                         "txid": txid.to_string(),
+                        "wtxid": wtxid.to_string(),
                         "allowed": false,
-                        "reject-reason": e.to_string(),
-                    }));
+                        "reject-reason": e.reject_reason(),
+                    });
+                    if let Some(details) = e.reject_details() {
+                        entry["reject-details"] = serde_json::Value::String(details);
+                    }
+                    results.push(entry);
                 }
             }
         }
@@ -1721,7 +1765,34 @@ pub async fn start(
 
     // --- Control RPCs ---
 
-    module.register_method("help", |_params, _ctx, _extensions| {
+    module.register_method("generate", |_params, _ctx, _extensions| {
+        Err::<serde_json::Value, _>(ErrorObjectOwned::owned(
+            -32601,
+            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n",
+            None::<()>,
+        ))
+    })?;
+
+    module.register_method("echo", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        if args.len() >= 10
+            && let Some(serde_json::Value::String(s)) = args.last()
+            && s == "trigger_internal_bug"
+        {
+            let msg = "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\"";
+            return Err(ErrorObjectOwned::owned(-1, msg, None::<()>));
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("echojson", |params, _ctx, _extensions| {
+        let args: Vec<serde_json::Value> = params.parse().unwrap_or_default();
+        Ok::<_, ErrorObjectOwned>(serde_json::json!(args))
+    })?;
+
+    module.register_method("help", |params, _ctx, _extensions| {
+        let mut seq = params.sequence();
+        let command: Option<String> = seq.optional_next().unwrap_or(None);
         let methods = vec![
             "addnode",
             "clearbanned",
@@ -1729,6 +1800,8 @@ pub async fn start(
             "decodescript",
             "disconnectnode",
             "dumptxoutset",
+            "echo",
+            "echojson",
             "estimatefees",
             "estimatesmartfee",
             "generateblock",
@@ -1795,9 +1868,26 @@ pub async fn start(
             "testmempoolaccept",
             "unsubscribemempool",
             "uptime",
+            "validateaddress",
             "verifychain",
         ];
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        if let Some(cmd) = command {
+            if cmd == "generate" {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(
+                    "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+                ))
+            } else if cmd.is_empty() || methods.contains(&cmd.as_str()) {
+                Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")))
+            } else {
+                Err(ErrorObjectOwned::owned(
+                    -1,
+                    format!("help: unknown command: {cmd}"),
+                    None::<()>,
+                ))
+            }
+        } else {
+            Ok::<_, ErrorObjectOwned>(serde_json::json!(methods.join("\n")))
+        }
     })?;
 
     // Core's version blocks until its serialized validation-callback queue has
@@ -2322,6 +2412,8 @@ pub async fn start(
     // jsonrpsee's library default.
     let server_cfg = ServerConfig::builder()
         .max_connections(RPC_MAX_CONNECTIONS)
+        .max_request_body_size(32 * 1024 * 1024)
+        .max_response_body_size(32 * 1024 * 1024)
         .build();
     // Methods is Arc-backed and cheap to clone — one copy is consumed
     // by each per-bind `Server::start()` call below, plus one to feed
@@ -2377,6 +2469,7 @@ pub async fn start(
             None,
             // Not the startup listener: this is the full RPC server.
             None,
+            header_read_timeout,
         )
         .await?;
         plain_handles.push(handle);
@@ -2411,7 +2504,7 @@ pub async fn start(
     // runtime, behind the read-only method filter, with their own admission
     // budget and source-address allowlist.
     let readonly_handles = if let Some(ro) = readonly {
-        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer).await?
+        spawn_readonly_listeners(ro, &server_cfg, &auth, &methods, &shutdown_tx_outer, header_read_timeout).await?
     } else {
         Vec::new()
     };
@@ -2438,6 +2531,7 @@ async fn spawn_readonly_listeners(
     auth: &Arc<RpcAuth>,
     methods: &Methods,
     shutdown_tx: &watch::Sender<bool>,
+    header_read_timeout: Option<Duration>,
 ) -> Result<Vec<ServerHandle>, Box<dyn std::error::Error + Send + Sync>> {
     // Fail-closed completeness audit: every registered method must be
     // classified in `rpc::access`, otherwise it would be silently rejected
@@ -2494,6 +2588,7 @@ async fn spawn_readonly_listeners(
                 Some(ReadOnlyLayer::new()),
                 // Not the startup listener.
                 None,
+                header_read_timeout,
             )
             .await;
             let _ = tx.send(res);
@@ -2610,16 +2705,21 @@ async fn spawn_tls_surface(
     // Building once side-steps an HRTB inference quirk that bites if
     // you defer the `.build()` call into the per-connection `async`
     // block.
-    // AdmissionLayer is outermost so an over-budget request is shed (429)
-    // before any auth/compat work. AuthLayer is next so an unauthenticated
-    // request is rejected before the compat layer buffers its body;
-    // JsonRpcCompatLayer then normalizes Core-style (`jsonrpc` 1.0/1.1/
-    // absent) requests to 2.0 so jsonrpsee accepts them (see `compat.rs`).
-    // When the surface honors bearer tokens, install the capability filter at
-    // the RPC layer so scoped tokens are gated per method; the operator
-    // principal has all capabilities, so this is a no-op for legacy clients.
+    // CoreHttpPreludeLayer is outermost: the Core-compatible checks that
+    // need only the request head (404 for non-root paths, 400 for long
+    // URIs, Content-Type injection) run before auth, matching Core's
+    // libevent httpserver, which answers those unauthenticated.
+    // AdmissionLayer is next so an over-budget request is shed (429)
+    // before any auth work. AuthLayer follows, and JsonRpcCompatLayer is
+    // innermost — deliberately: it is the layer that buffers and JSON-parses
+    // the request body, and an unauthenticated caller must never be able to
+    // make us do that. When the surface honors bearer tokens,
+    // install the capability filter at the RPC layer so scoped
+    // tokens are gated per method; the operator principal has all
+    // capabilities, so this is a no-op for legacy clients.
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let tls_middleware = tower::ServiceBuilder::new()
+        .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth, bearer))
         .layer(JsonRpcCompatLayer::new());
@@ -2841,6 +2941,12 @@ pub async fn spawn_plain_surface(
     // node comes up: answers every other method with Core's `-28 RPC in
     // warmup` instead of `-32601 Method not found`. `None` elsewhere.
     warmup: Option<crate::rpc::warmup::WarmupLayer>,
+    // Per-connection HTTP header-read timeout (`-rpcservertimeout`).
+    // `None` disables (hyper's default). When set, hyper closes any
+    // connection whose client does not complete the HTTP request
+    // header within this window — the Core libevent equivalent of
+    // `evhttp_set_timeout`.
+    header_read_timeout: Option<Duration>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
     // rather than a silently-dropped task that never accepts.
@@ -2854,6 +2960,7 @@ pub async fn spawn_plain_surface(
 
     let capability_filter = bearer.as_ref().map(|_| CapabilityLayer::new());
     let plain_middleware = tower::ServiceBuilder::new()
+        .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth, bearer))
         .layer(JsonRpcCompatLayer::new());
@@ -2987,10 +3094,11 @@ pub async fn spawn_plain_surface(
             // and awaits the serve task's JoinHandle (whose type doesn't
             // name the service's HRTB lifetime); the permit drops when the
             // connection ends.
-            let serve = tokio::spawn(serve_with_graceful_shutdown(
+            let serve = tokio::spawn(serve_http_connection(
                 stream,
                 svc,
                 conn_stop.shutdown(),
+                header_read_timeout,
             ));
             tokio::spawn(async move {
                 let _permit = permit;
@@ -3000,4 +3108,56 @@ pub async fn spawn_plain_surface(
     });
 
     Ok(server_handle)
+}
+
+/// Serve a single HTTP connection with an optional header-read timeout.
+///
+/// This is the plain-HTTP equivalent of jsonrpsee's
+/// [`serve_with_graceful_shutdown`], with one addition: when
+/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1
+/// builder is configured with a matching `header_read_timeout` (plus
+/// the required timer), so a client that opens a TCP connection but
+/// never completes the HTTP request headers gets disconnected rather
+/// than holding a connection slot forever.  This wires Bitcoin Core's
+/// `-rpcservertimeout` knob.
+async fn serve_http_connection<S, B>(
+    io: tokio::net::TcpStream,
+    service: S,
+    stopped: impl std::future::Future<Output = ()>,
+    header_read_timeout: Option<Duration>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tower::Service<
+            jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
+            Response = jsonrpsee::server::HttpResponse<B>,
+            Error = tower::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
+    B::Error: Into<tower::BoxError>,
+{
+    let service = hyper_util::service::TowerToHyperService::new(service);
+    let io = hyper_util::rt::TokioIo::new(io);
+
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if let Some(timeout) = header_read_timeout {
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(timeout);
+    }
+    let conn = builder.serve_connection_with_upgrades(io, service);
+
+    tokio::pin!(stopped, conn);
+
+    tokio::select! {
+        result = &mut conn => result,
+        () = stopped => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    }
 }

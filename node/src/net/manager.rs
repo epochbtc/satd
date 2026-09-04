@@ -98,6 +98,10 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+
+/// Maximum entries in a getheaders/getblocks locator. Core disconnects
+/// peers that exceed this (net_processing.cpp `MAX_LOCATOR_SZ`).
+const MAX_LOCATOR_SZ: usize = 101;
 /// How long a `getblockfrompeer` request stays armed. A block arriving after
 /// this window is treated as an ordinary unsolicited block rather than a
 /// repair, so a peer that answers minutes late cannot divert a block the
@@ -1872,7 +1876,7 @@ impl PeerManager {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                (true, Some(handle.info.addr))
+                (true, Some(handle.info.addr.ip()))
             } else {
                 tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
                 (false, None)
@@ -1894,7 +1898,7 @@ impl PeerManager {
                 let now = crate::time::now_secs();
                 let duration = self.ban_duration_secs.load(Ordering::Relaxed);
                 let target = crate::net::ban::BanTarget::Net(
-                    ipnet::IpNet::from(addr.ip()),
+                    ipnet::IpNet::from(addr),
                 );
                 // Best-effort: misbehaviour bans are fire-and-forget; if the
                 // entry already exists (e.g. repeated misbehaviour) the add
@@ -2344,6 +2348,9 @@ impl PeerManager {
             }
             NetworkMessage::GetHeaders(msg) => {
                 self.handle_getheaders(id, msg);
+            }
+            NetworkMessage::GetBlocks(msg) => {
+                self.handle_getblocks(id, msg);
             }
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
@@ -4672,6 +4679,9 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::SpendsConflictingTx(..)
+            | MempoolError::TooManyReplacements(..)
+            | MempoolError::DoesNotImproveFeerateDiagram(..)
             | MempoolError::TooLongMempoolChain
             // Non-final for the *next* block is tip-relative, not misbehavior:
             // a peer one block behind (or ahead) legitimately relays these.
@@ -4907,12 +4917,15 @@ impl PeerManager {
             .map_err(|_| (-22, "TX decode failed".to_string()))?;
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
-            // Core's taxonomy: -25 = RPC_VERIFY_ERROR (invalid or
-            // unverifiable against current state); -26 = RPC_VERIFY_REJECTED
-            // (policy/standardness rejections like dust, datacarrier, fee,
-            // non-final). `rpc_code` maps each variant to the code Core
-            // returns for it.
-            .map_err(|e| (e.rpc_code(), e.to_string()))?;
+            .map_err(|e| {
+                // Core's taxonomy: -25 = RPC_VERIFY_ERROR (in practice only
+                // missing inputs); -26 = RPC_VERIFY_REJECTED (every other
+                // invalid-or-rejected verdict). `rpc_code` maps each variant
+                // to the code Core returns for it, and
+                // `sendrawtransaction_msg` supplies Core's reject-reason
+                // string plus any RBF detail.
+                (e.rpc_code(), e.sendrawtransaction_msg())
+            })?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
 
@@ -5394,6 +5407,11 @@ impl PeerManager {
         id: PeerId,
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
         let mut start_height = None;
         for hash in &msg.locator_hashes {
             if let Some(entry) = self.chain_state.get_block_index(hash) {
@@ -5419,6 +5437,43 @@ impl PeerManager {
         // versions track silent-drops as soft misbehavior. Empty reply
         // signals "I have nothing newer than your locator."
         self.send_to_peer(id, NetworkMessage::Headers(headers));
+    }
+
+    fn handle_getblocks(
+        &self,
+        id: PeerId,
+        msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
+    ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
+        let mut start_height = None;
+        for hash in &msg.locator_hashes {
+            if let Some(entry) = self.chain_state.get_block_index(hash) {
+                start_height = Some(entry.height + 1);
+                break;
+            }
+        }
+
+        let start = start_height.unwrap_or(0);
+        let tip = self.chain_state.tip_height();
+        let end = std::cmp::min(start + 500, tip + 1);
+
+        let mut inv = Vec::new();
+        for h in start..end {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
+                inv.push(Inventory::Block(hash));
+                if hash == msg.stop_hash {
+                    break;
+                }
+            }
+        }
+
+        if !inv.is_empty() {
+            self.send_to_peer(id, NetworkMessage::Inv(inv));
+        }
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
@@ -6605,7 +6660,7 @@ mod tests {
             MempoolError::AlreadyExists,
             MempoolError::ConflictingSpend,
             MempoolError::NonStandardOpReturn,
-            MempoolError::InsufficientReplacementFee(1, 2),
+            MempoolError::InsufficientReplacementFee(1, 2, String::new(), String::new()),
             MempoolError::TooLongMempoolChain,
             MempoolError::PrematureCoinbaseSpend,
             MempoolError::Validation("nonstandard".into()),

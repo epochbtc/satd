@@ -2417,6 +2417,7 @@ async fn main() {
         },
         config.rpc_threads,
         config.rpc_workqueue,
+        config.rpc_server_timeout,
         chain_state.clone(),
         mempool.clone(),
         peer_manager.clone(),
@@ -3854,6 +3855,9 @@ async fn start_startup_rpc(
             // `-32601 Method not found` -- `-28` is what a Core-compatible
             // client polls on while a node comes up.
             Some(node::rpc::warmup::WarmupLayer::new(warmup_status.clone())),
+            // The startup RPC uses the same header-read timeout as the full
+            // server.  Core's default (30s) applies.
+            Some(std::time::Duration::from_secs(30)),
         )
         .await
         .unwrap_or_else(|e| {
