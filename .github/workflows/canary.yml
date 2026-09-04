@@ -713,3 +713,69 @@ jobs:
           path: /tmp/satd-canary-cln.*/satd.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Bitcoin Core's functional run set, PR-gating.
+  #
+  # The suite was nightly-only because building satd is slow, not because the
+  # tests are: the run set is ~45s wall at SATD_CF_JOBS=4, and the release
+  # build it needs is already paid for once per run by `build` above and
+  # shared with nine canaries. As a tenth consumer of that artifact it costs
+  # about a minute, sits well off the critical path, and can gate a merge.
+  #
+  # Without this, a `skip` -> `run` flip is never validated by pull-request CI
+  # and any later change can silently un-pass a row the scoreboard still
+  # advertises -- which is exactly how master came to claim 30/30 while
+  # passing 26 (#676).
+  #
+  # The nightly job stays as it is: it is where the run set gets widened, and
+  # it is the only place a candidate measurement can safely run unattended.
+  core-functional:
+    name: Core functional
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      # Keep datadirs in the workspace so the runner's own cleanup takes them,
+      # and so an upload-on-failure step can find them by a stable path.
+      SATD_CF_TMPDIR: ${{ github.workspace }}/.core-functional-tmp
+      # The suite is I/O-light and short; 4 jobs keeps it under a minute
+      # without crowding a 4-vCPU hosted runner.
+      SATD_CF_JOBS: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Fetch the pinned Core tree
+        run: contrib/core-functional/fetch-core.sh
+
+      - name: Preflight
+        run: contrib/core-functional/run.sh --dry-run
+
+      - name: Run the inventory's run-set
+        run: contrib/core-functional/run.sh
+
+      - name: Scoreboard
+        if: always()
+        run: contrib/core-functional/check_inventory.py --summary >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failing test datadirs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-functional-logs
+          # Core's runner keeps only a failing test's datadir, so this is
+          # bounded by the failures rather than by the run set.
+          path: ${{ github.workspace }}/.core-functional-tmp/**/test_framework.log
+          if-no-files-found: ignore
+          retention-days: 7
