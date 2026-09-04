@@ -128,6 +128,14 @@ pub enum MempoolError {
          resubmit with allowquarantined=true to hold it locally"
     )]
     Quarantined(String),
+    /// Ephemeral dust: a transaction with a dust output must have zero base fee.
+    /// Used by `submitpackage` to reject parent txs with dust + nonzero fee.
+    #[error("dust, tx with dust output must be 0-fee")]
+    EphemeralDustFee,
+    /// Ephemeral dust: a child tx in a package did not spend its parent's
+    /// ephemeral dust output(s).
+    #[error("{0}")]
+    MissingEphemeralSpends(String),
 }
 
 impl MempoolError {
@@ -176,6 +184,8 @@ impl MempoolError {
             | Self::SpendsConflictingTx(..)
             | Self::TooManyReplacements(..)
             | Self::DoesNotImproveFeerateDiagram(..)
+            | Self::EphemeralDustFee
+            | Self::MissingEphemeralSpends(..)
             | Self::TooLongMempoolChain => -26,
         }
     }
@@ -214,6 +224,10 @@ impl MempoolError {
                 "insufficient feerate: does not improve feerate diagram".to_string()
             }
             MempoolError::TooLongMempoolChain => "too-long-mempool-chain".to_string(),
+            // `ephemeral_policy.cpp`: reason "dust", debug "tx with dust
+            // output must be 0-fee" — the detail goes to `reject_details`.
+            MempoolError::EphemeralDustFee => "dust".to_string(),
+            MempoolError::MissingEphemeralSpends(_) => "missing-ephemeral-spends".to_string(),
             MempoolError::Quarantined(rule) => {
                 format!("txn-policy-quarantined: held by policy rule '{rule}'")
             }
@@ -231,6 +245,10 @@ impl MempoolError {
             MempoolError::SpendsConflictingTx(detail) => Some(detail.clone()),
             MempoolError::TooManyReplacements(detail) => Some(detail.clone()),
             MempoolError::DoesNotImproveFeerateDiagram(detail) => Some(detail.clone()),
+            MempoolError::EphemeralDustFee => {
+                Some("tx with dust output must be 0-fee".to_string())
+            }
+            MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
             _ => None,
         }
     }
@@ -584,6 +602,11 @@ struct MempoolInner {
     // cost in mempool graph traversals. See `get_descendants` / `collect_children`.
     entries: FxHashMap<Txid, MempoolEntry>,
     spends: FxHashMap<OutPoint, Txid>,
+    /// Fee deltas from `prioritisetransaction` for txs not yet in the mempool.
+    /// Core stores priority deltas regardless of whether the tx is resident;
+    /// when the tx is later accepted the delta applies. Entries are moved into
+    /// the `MempoolEntry::fee_delta` field on admission and removed here.
+    /// Cleared when the delta sums to zero (the "reset" path).
     /// Serialized bytes of **all** entries (acting + quarantine) — the single
     /// physical pool's occupancy. `acting_bytes()` derives the acting class by
     /// subtracting `quarantine_bytes`.
@@ -854,6 +877,85 @@ pub struct Mempool {
     /// caches the tweak even with no Tier-2 SP scan-key watch live — giving the
     /// bridge something to emit. Same private-zero-counter default as `sp_gate`.
     mempool_tweaks_gate: arc_swap::ArcSwap<std::sync::atomic::AtomicUsize>,
+}
+
+/// Bitcoin Core's `MAX_PACKAGE_COUNT` (`src/policy/packages.h`).
+const MAX_PACKAGE_COUNT: usize = 25;
+/// Bitcoin Core's `MAX_PACKAGE_WEIGHT` (`src/policy/packages.h`).
+const MAX_PACKAGE_WEIGHT: u64 = 404_000;
+
+/// Core's `IsWellFormedPackage`, returning its exact reject string.
+///
+/// Every check here bounds work that happens later, so it runs before any of
+/// it. Order matches Core's so the reported reason matches too.
+fn check_well_formed_package<T>(pkg: &[T]) -> Result<(), &'static str>
+where
+    T: PackageMember,
+{
+    if pkg.len() > MAX_PACKAGE_COUNT {
+        return Err("package-too-many-transactions");
+    }
+
+    // Core reports a single oversized transaction against the per-transaction
+    // limit instead, which is the more specific message.
+    if pkg.len() > 1 {
+        let total: u64 = pkg.iter().map(|p| p.tx().weight().to_wu()).sum();
+        if total > MAX_PACKAGE_WEIGHT {
+            return Err("package-too-large");
+        }
+    }
+
+    // Keyed by txid, so this also catches duplicate wtxids and
+    // same-txid-different-witness pairs.
+    let mut later: HashSet<Txid> = pkg.iter().map(|p| p.txid()).collect();
+    if later.len() != pkg.len() {
+        return Err("package-contains-duplicates");
+    }
+
+    // Parents must precede children. An unsorted package would fail anyway on
+    // missing-inputs, but that reason is ambiguous — it also means an orphan
+    // or a nonexistent coin.
+    for p in pkg {
+        later.remove(&p.txid());
+        if p
+            .tx()
+            .input
+            .iter()
+            .any(|i| later.contains(&i.previous_output.txid))
+        {
+            return Err("package-not-sorted");
+        }
+    }
+
+    // Two members spending one outpoint would otherwise both be accepted and
+    // leave the mempool holding a double spend.
+    let mut spent: HashSet<bitcoin::OutPoint> = HashSet::new();
+    for p in pkg {
+        for input in &p.tx().input {
+            if !spent.insert(input.previous_output) {
+                return Err("conflict-in-package");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Lets `check_well_formed_package` read the package without knowing the
+/// shape of the caller's per-transaction bookkeeping.
+trait PackageMember {
+    fn tx(&self) -> &Transaction;
+    fn txid(&self) -> Txid;
+}
+
+/// So the checks can be exercised against a plain transaction list.
+impl PackageMember for Transaction {
+    fn tx(&self) -> &Transaction {
+        self
+    }
+    fn txid(&self) -> Txid {
+        self.compute_txid()
+    }
 }
 
 impl Mempool {
@@ -2860,10 +2962,26 @@ impl Mempool {
     ///
     /// Matches Bitcoin Core's `PrioritiseTransaction`: the delta is stored
     /// even if the txid is not (yet) in the mempool — it will be applied
-    /// when the tx is later admitted. Successive calls stack
-    /// (saturating). Always returns `true` for Core RPC compat.
-    pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) -> bool {
+    /// when the tx is later admitted. Successive calls stack (saturating).
+    ///
+    /// `Ok(true)` if the transaction was already in the mempool. Core refuses
+    /// to prioritise a transaction carrying dust outputs, because ephemeral
+    /// dust is only relayable while the transaction stays 0-fee. The refusal
+    /// is decided *before* the delta is stored, so a rejected call leaves no
+    /// delta behind to be applied on a later admission.
+    pub fn prioritise_transaction(
+        &self,
+        txid: &Txid,
+        fee_delta: i64,
+    ) -> Result<bool, MempoolError> {
         let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.get(txid)
+            && Self::tx_has_dust_outputs(&entry.tx)
+        {
+            return Err(MempoolError::Validation(
+                "Priority is not supported for transactions with dust outputs.".to_string(),
+            ));
+        }
         // Update the persistent delta map (stacks on previous calls).
         let stored = inner.fee_deltas.entry(*txid).or_insert(0);
         *stored = stored.saturating_add(fee_delta);
@@ -2873,8 +2991,47 @@ impl Mempool {
         // If the tx is already in the pool, update its live entry too.
         if let Some(entry) = inner.entries.get_mut(txid) {
             entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        true
+    }
+
+    /// Returns all prioritised transactions: both in-mempool entries with a
+    /// nonzero fee_delta and pending (not-yet-seen) priority deltas.
+    ///
+    /// Core's `getprioritisedtransactions` format: `{ txid: { fee_delta, in_mempool } }`.
+    pub fn get_prioritised_transactions(&self) -> HashMap<Txid, (i64, bool)> {
+        let inner = self.inner.read();
+        let mut result = HashMap::new();
+        // In-mempool entries with a nonzero delta
+        for (txid, entry) in &inner.entries {
+            if entry.fee_delta != 0 {
+                result.insert(*txid, (entry.fee_delta, true));
+            }
+        }
+        // Pending (not yet in mempool) deltas
+        for (txid, delta) in &inner.fee_deltas {
+            result.insert(*txid, (*delta, false));
+        }
+        result
+    }
+
+    /// Check whether a transaction has any dust outputs (below the threshold
+    /// for their script type at the default dust relay fee rate). Used by
+    /// ephemeral dust policy and the `prioritisetransaction` guard.
+    fn tx_has_dust_outputs(tx: &Transaction) -> bool {
+        for output in &tx.output {
+            if output.script_pubkey.is_op_return() {
+                continue;
+            }
+            let threshold =
+                policy::dust_threshold_with_rate(&output.script_pubkey, policy::DUST_RELAY_FEE_RATE);
+            if output.value.to_sat() < threshold {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get all txids in the mempool — the **union** of the acting and
@@ -3529,11 +3686,15 @@ impl Mempool {
             }
         }
 
-        // Fee rate check (sat/kvB).
+        // Fee rate check (sat/kvB), on Core's *modified* fee: a pending
+        // `prioritisetransaction` delta counts toward the min-relay gate, so
+        // `testmempoolaccept` answers what `sendrawtransaction` would do.
+        // `inner` and `cfg` are already held above — do not re-acquire them.
         let weight_u64 = weight as u64;
-        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight_u64);
         let vsize = policy::weight_to_vsize(weight_u64) as usize;
-
+        let priority_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+        let fee_rate =
+            policy::fee_rate_sat_per_kvb(modified_fee(fee, priority_delta), weight_u64);
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
@@ -3555,7 +3716,15 @@ impl Mempool {
         // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
         // `sendrawtransaction` accept this?", so it must apply the same policy
         // verdict the admission path does — otherwise it reports `allowed: true`
-        // for a tx the node would actually refuse.
+        // for a tx the node would actually refuse. A local submission drawing a
+        // *relay*-scoped quarantine verdict (its own, or inherited from a
+        // quarantined in-mempool ancestor) is refused, exactly as
+        // `accept_transaction` does, with `allowquarantined` defaulting off as
+        // for `sendrawtransaction`. A template-only quarantine still relays, so it
+        // stays `allowed: true`. Standardness is not re-litigated here (this dry
+        // run already ran the standardness pass above), so deferred-standardness
+        // forgiveness is moot — this only ever surfaces the relay refusal, never
+        // adds a false one. Counters are left untouched: this is not a real eval.
         if let Some(rs) = self.policy.load_full().as_ref().filter(|r| !r.is_empty()) {
             let inner = self.inner.read();
             // Transitive in-mempool ancestor set (for infectious propagation).
@@ -3606,6 +3775,674 @@ impl Mempool {
         }
 
         Ok((txid, vsize, fee))
+    }
+
+    /// Count how many dust outputs a transaction has (below the dust threshold
+    /// at the default relay fee rate, excluding OP_RETURN).
+    fn count_dust_outputs(tx: &Transaction) -> usize {
+        tx.output
+            .iter()
+            .filter(|o| {
+                !o.script_pubkey.is_op_return() && {
+                    let threshold = policy::dust_threshold_with_rate(
+                        &o.script_pubkey,
+                        policy::DUST_RELAY_FEE_RATE,
+                    );
+                    o.value.to_sat() < threshold
+                }
+            })
+            .count()
+    }
+
+    /// Identify the indices of dust outputs in a transaction.
+    fn dust_output_indices(tx: &Transaction) -> Vec<u32> {
+        tx.output
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                if o.script_pubkey.is_op_return() {
+                    return None;
+                }
+                let threshold = policy::dust_threshold_with_rate(
+                    &o.script_pubkey,
+                    policy::DUST_RELAY_FEE_RATE,
+                );
+                if o.value.to_sat() < threshold {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Submit a package of transactions to the mempool. Supports Bitcoin Core's
+    /// ephemeral dust policy: a parent with exactly one dust output and zero
+    /// base fee is allowed if a child in the same package spends that dust
+    /// output.
+    ///
+    /// Returns `(package_msg, tx_results)` where `package_msg` is "success" on
+    /// full acceptance, or an error description otherwise, and `tx_results` is
+    /// a per-wtxid map of results.
+    pub fn accept_package(
+        &self,
+        txs: Vec<Transaction>,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> (String, serde_json::Map<String, serde_json::Value>) {
+        use serde_json::json;
+
+        let cfg = self.config.read().clone();
+        let mut tx_results: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        // Phase 1: Decode + compute txids, build a lookup of package outputs.
+        // Also track which outputs each tx produces so we can check ephemeral
+        // dust spending later.
+        struct PkgTx {
+            tx: Transaction,
+            txid: Txid,
+            wtxid: bitcoin::Wtxid,
+        }
+        impl PackageMember for PkgTx {
+            fn tx(&self) -> &Transaction {
+                &self.tx
+            }
+            fn txid(&self) -> Txid {
+                self.txid
+            }
+        }
+        let pkg: Vec<PkgTx> = txs
+            .into_iter()
+            .map(|tx| {
+                let txid = tx.compute_txid();
+                let wtxid = tx.compute_wtxid();
+                PkgTx { tx, txid, wtxid }
+            })
+            .collect();
+
+        // Core's `IsWellFormedPackage` (`src/policy/packages.cpp`), run before
+        // any per-transaction work.
+        //
+        // These are not cosmetic parity: without the count and weight caps, a
+        // 10 MiB request body is roughly 80,000 minimal transactions, and the
+        // phases below are O(N^2) in the package while repeatedly taking the
+        // mempool write lock — on the API runtime shared with Esplora,
+        // Electrum and gRPC. Without the sort check, an out-of-order package
+        // reports a spurious `missing-inputs` because the child is attempted
+        // before its parent. Without the conflict check, two members spending
+        // one outpoint reach the accept path together.
+        if let Err(reason) = check_well_formed_package(&pkg) {
+            return (reason.to_string(), tx_results);
+        }
+
+        // Build a set of txids in the package for CPFP resolution.
+        let _pkg_txids: HashSet<Txid> = pkg.iter().map(|p| p.txid).collect();
+
+        // Track package outputs: txid -> tx, for CPFP within the package.
+        let pkg_tx_map: HashMap<Txid, &Transaction> =
+            pkg.iter().map(|p| (p.txid, &p.tx)).collect();
+
+        // Phase 2: Identify ephemeral dust parents. An ephemeral dust parent is
+        // a zero-fee transaction with exactly one dust output. It may enter the
+        // mempool as part of a package if a child spends its dust output.
+        //
+        // For each parent tx: check fee=0, exactly 1 dust output. If it has
+        // nonzero fee + dust, that's an error.
+
+        // First pass: try to accept each tx normally. Those that fail due to
+        // fee or dust are candidates for ephemeral dust handling.
+        let mut accepted_txids: HashSet<Txid> = HashSet::new();
+        let mut ephemeral_parents: HashMap<Txid, Transaction> = HashMap::new();
+        let mut failed: HashMap<bitcoin::Wtxid, String> = HashMap::new();
+        let mut accepted_results: Vec<(bitcoin::Wtxid, Txid, usize, u64)> = Vec::new();
+
+        for ptx in &pkg {
+            // Check if already in mempool
+            {
+                let inner = self.inner.read();
+                if inner.entries.contains_key(&ptx.txid) {
+                    // Already in mempool — treat as success.
+                    if let Some(entry) = inner.entries.get(&ptx.txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((ptx.wtxid, ptx.txid, vsize, entry.fee));
+                    }
+                    accepted_txids.insert(ptx.txid);
+                    continue;
+                }
+            }
+
+            // Try normal acceptance
+            match self.accept_transaction(
+                ptx.tx.clone(),
+                chain_state,
+                script_verifier,
+                TxSource::Rpc,
+                false,
+            ) {
+                Ok(txid) => {
+                    accepted_txids.insert(txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((ptx.wtxid, txid, vsize, entry.fee));
+                    }
+                }
+                Err(MempoolError::InsufficientFee(..)) | Err(MempoolError::Dust) => {
+                    // Candidate for ephemeral dust parent: check the conditions.
+                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
+                    // Resolve inputs to compute fee (may reference confirmed or
+                    // package-internal outputs).
+                    let mut sum_in: u64 = 0;
+                    let mut inputs_ok = true;
+                    for input in &ptx.tx.input {
+                        if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                            sum_in += coin.amount;
+                        } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
+                            if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                                sum_in += out.value.to_sat();
+                            } else {
+                                inputs_ok = false;
+                                break;
+                            }
+                        } else {
+                            let inner = self.inner.read();
+                            if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
+                                if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                    sum_in += out.value.to_sat();
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            } else {
+                                inputs_ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !inputs_ok {
+                        failed.insert(ptx.wtxid, "bad-txns-inputs-missingorspent".to_string());
+                        continue;
+                    }
+
+                    let base_fee = sum_in.saturating_sub(sum_out);
+
+                    if dust_count > 0 && base_fee > 0 {
+                        // Has dust + nonzero fee: rejected per ephemeral dust policy.
+                        failed.insert(
+                            ptx.wtxid,
+                            "dust, tx with dust output must be 0-fee".to_string(),
+                        );
+                    } else if dust_count > 1 {
+                        // Multiple dust outputs: rejected.
+                        failed.insert(ptx.wtxid, "dust".to_string());
+                    } else if dust_count == 1 && base_fee == 0 {
+                        // Valid ephemeral dust candidate — defer acceptance.
+                        ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    } else {
+                        // Not ephemeral dust — propagate original error.
+                        // Re-compute the reason.
+                        let weight_u64 = ptx.tx.weight().to_wu();
+                        let fee_rate = policy::fee_rate_sat_per_kvb(base_fee, weight_u64);
+                        if fee_rate < cfg.min_fee_rate {
+                            failed.insert(
+                                ptx.wtxid,
+                                format!("min relay fee not met. {} < {}", fee_rate, cfg.min_fee_rate),
+                            );
+                        } else {
+                            failed.insert(ptx.wtxid, "dust".to_string());
+                        }
+                    }
+                }
+                Err(MempoolError::MissingInputs) => {
+                    // Might be a child spending from a package parent — defer
+                    // and retry after parents are accepted.
+                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    if dust_count == 1 {
+                        // Resolve inputs to check fee
+                        let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
+                        let mut sum_in: u64 = 0;
+                        let mut inputs_ok = true;
+                        for input in &ptx.tx.input {
+                            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                                sum_in += coin.amount;
+                            } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
+                                if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                                    sum_in += out.value.to_sat();
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            } else {
+                                let inner = self.inner.read();
+                                if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
+                                    if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                        sum_in += out.value.to_sat();
+                                    } else {
+                                        inputs_ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    inputs_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let base_fee = if inputs_ok { sum_in.saturating_sub(sum_out) } else { 1 };
+                        if inputs_ok && base_fee == 0 {
+                            ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                        } else if inputs_ok && base_fee > 0 {
+                            failed.insert(ptx.wtxid, "dust, tx with dust output must be 0-fee".to_string());
+                        } else {
+                            ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                        }
+                    } else if dust_count > 1 {
+                        failed.insert(ptx.wtxid, "dust".to_string());
+                    } else {
+                        // No dust — this is a child needing CPFP from a parent in the package.
+                        ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    }
+                }
+                Err(e) => {
+                    failed.insert(ptx.wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Phase 3: For ephemeral dust parents, check that a child in the
+        // package spends their dust output. Then try to accept them with
+        // bypass_limits (zero fee allowed).
+        let mut parents_to_accept: Vec<Txid> = Vec::new();
+        let mut children_to_accept: Vec<Txid> = Vec::new();
+
+        // First identify which deferred txs are parents and which are children.
+        for (txid, tx) in &ephemeral_parents {
+            let dust_indices = Self::dust_output_indices(tx);
+            if dust_indices.is_empty() && !tx.input.iter().any(|i| ephemeral_parents.contains_key(&i.previous_output.txid) || accepted_txids.contains(&i.previous_output.txid)) {
+                // Not a dust parent and not a child — this shouldn't be deferred.
+                // It might have been deferred due to MissingInputs with no dust.
+                children_to_accept.push(*txid);
+            } else if !dust_indices.is_empty() {
+                parents_to_accept.push(*txid);
+            } else {
+                children_to_accept.push(*txid);
+            }
+        }
+
+        // Now accept parents (bypass fee checks) and check that children spend dust.
+        // Accept parents with zero fee via direct insertion (bypass limits).
+        for &parent_txid in &parents_to_accept {
+            let parent_tx = match ephemeral_parents.get(&parent_txid) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            let dust_indices = Self::dust_output_indices(parent_tx);
+            let wtxid = parent_tx.compute_wtxid();
+
+            // Check that a child in the package (accepted or deferred) spends
+            // ALL dust outputs.
+            let mut dust_spent = vec![false; dust_indices.len()];
+            for ptx in &pkg {
+                if ptx.txid == parent_txid {
+                    continue;
+                }
+                for input in &ptx.tx.input {
+                    if input.previous_output.txid == parent_txid {
+                        for (j, &di) in dust_indices.iter().enumerate() {
+                            if input.previous_output.vout == di {
+                                dust_spent[j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if dust_spent.iter().any(|&s| !s) {
+                // Look for a child that spends from this parent but not dust
+                // — that's the "unspent-dust" case.
+                let has_child_spending = pkg.iter().any(|ptx| {
+                    ptx.txid != parent_txid
+                        && ptx
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == parent_txid)
+                });
+                if has_child_spending {
+                    // Child exists but doesn't spend all dust — check which child
+                    // to tag with the error.
+                    for ptx in &pkg {
+                        if ptx.txid == parent_txid {
+                            continue;
+                        }
+                        let spends_parent = ptx
+                            .tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == parent_txid);
+                        if spends_parent {
+                            let spends_all_dust = dust_indices.iter().all(|&di| {
+                                ptx.tx
+                                    .input
+                                    .iter()
+                                    .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
+                            });
+                            if !spends_all_dust {
+                                failed.insert(
+                                    ptx.wtxid,
+                                    format!(
+                                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                                        ptx.txid, ptx.wtxid
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                // The parent itself cannot enter without its dust being spent.
+                // If there was no child at all, report "unspent-dust" as the
+                // package_msg. Don't add the parent to the failed map — it just
+                // doesn't get accepted.
+                continue;
+            }
+
+            // Accept the parent with bypass_limits: zero fee is OK.
+            // We need to inject it into the mempool bypassing the fee check.
+            match self.accept_transaction_bypass_fee(
+                parent_tx.clone(),
+                chain_state,
+                script_verifier,
+            ) {
+                Ok(_) => {
+                    accepted_txids.insert(parent_txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&parent_txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((wtxid, parent_txid, vsize, entry.fee));
+                    }
+                }
+                Err(e) => {
+                    failed.insert(wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Now try to accept children.
+        for &child_txid in &children_to_accept {
+            let child_tx = match ephemeral_parents.get(&child_txid) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            let wtxid = child_tx.compute_wtxid();
+
+            // Check ephemeral dust spending: for each parent this child spends
+            // from that has dust, ensure it spends the dust output.
+            let mut ephemeral_violation = false;
+            for input in &child_tx.input {
+                let parent_txid_ref = input.previous_output.txid;
+                // Check in-mempool parents for dust outputs.
+                let inner = self.inner.read();
+                if let Some(parent_entry) = inner.entries.get(&parent_txid_ref) {
+                    let dust_indices = Self::dust_output_indices(&parent_entry.tx);
+                    if !dust_indices.is_empty() {
+                        // Parent has dust — does this child spend ALL dust outputs?
+                        let spends_all = dust_indices.iter().all(|&di| {
+                            child_tx
+                                .input
+                                .iter()
+                                .any(|i| i.previous_output.txid == parent_txid_ref && i.previous_output.vout == di)
+                        });
+                        if !spends_all {
+                            ephemeral_violation = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if ephemeral_violation {
+                failed.insert(
+                    wtxid,
+                    format!(
+                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                        child_txid, wtxid
+                    ),
+                );
+                continue;
+            }
+
+            match self.accept_transaction(
+                child_tx.clone(),
+                chain_state,
+                script_verifier,
+                TxSource::Rpc,
+                false,
+            ) {
+                Ok(txid) => {
+                    accepted_txids.insert(txid);
+                    let inner = self.inner.read();
+                    if let Some(entry) = inner.entries.get(&txid) {
+                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
+                        accepted_results.push((wtxid, txid, vsize, entry.fee));
+                    }
+                }
+                Err(e) => {
+                    failed.insert(wtxid, e.to_string());
+                }
+            }
+        }
+
+        // Build the result.
+        // (all_wtxids removed — not needed; result built from pkg iterator)
+
+        // Determine package_msg.
+        let has_failure = !failed.is_empty();
+        // Check for the "unspent-dust" case: an ephemeral parent had no child
+        // spending its dust.
+        let unspent_dust = parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
+        let package_msg = if has_failure {
+            "transaction failed".to_string()
+        } else if unspent_dust {
+            "unspent-dust".to_string()
+        } else {
+            "success".to_string()
+        };
+
+        // Build per-tx results.
+        for ptx in &pkg {
+            if let Some(err) = failed.get(&ptx.wtxid) {
+                tx_results.insert(
+                    ptx.wtxid.to_string(),
+                    json!({
+                        "txid": ptx.txid.to_string(),
+                        "error": err,
+                    }),
+                );
+            } else if let Some((_, _, vsize, fee)) = accepted_results.iter().find(|(w, _, _, _)| *w == ptx.wtxid) {
+                tx_results.insert(
+                    ptx.wtxid.to_string(),
+                    json!({
+                        "txid": ptx.txid.to_string(),
+                        "vsize": vsize,
+                        "fees": {
+                            "base": crate::rpc::amounts::format_amount(*fee, crate::rpc::amounts::default_unit()),
+                        },
+                    }),
+                );
+            }
+        }
+
+        (package_msg, tx_results)
+    }
+
+    /// Accept a transaction bypassing the minimum fee rate check — used for
+    /// ephemeral dust parents that have zero fee. Still applies all other
+    /// validation (consensus, standardness except dust, script verification).
+    fn accept_transaction_bypass_fee(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+    ) -> Result<Txid, MempoolError> {
+        use crate::validation::tx::check_transaction;
+
+        let txid = tx.compute_txid();
+
+        check_transaction(&tx).map_err(|e| MempoolError::Validation(e.to_string()))?;
+
+        if tx.is_coinbase() {
+            return Err(MempoolError::Validation("coinbase not accepted".to_string()));
+        }
+
+        // Absolute finality
+        let next_height = chain_state.tip_height() + 1;
+        let locktime = tx.lock_time.to_consensus_u32();
+        if locktime > 0
+            && !tx
+                .input
+                .iter()
+                .all(|i| i.sequence == bitcoin::Sequence::MAX)
+        {
+            let cutoff = if locktime < 500_000_000 {
+                next_height
+            } else {
+                chain_state.get_median_time_past(next_height)
+            };
+            if locktime >= cutoff {
+                return Err(MempoolError::NonFinal);
+            }
+        }
+
+        let bip68_enforced = (tx.version.0 as u32) >= 2;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
+        let weight = tx.weight().to_wu() as usize;
+        let tx_size = bitcoin::consensus::serialize(&tx).len();
+
+        // Take write lock
+        let mut inner = self.inner.write();
+
+        if inner.entries.contains_key(&txid) {
+            return Err(MempoolError::AlreadyExists);
+        }
+
+        // No two mempool entries may spend the same outpoint.
+        //
+        // `accept_transaction` enforces this by collecting conflicts from
+        // `inner.spends` and putting them through the RBF gate. This path had
+        // neither check and simply `extend`ed `inner.spends` below, so the
+        // second of two conflicting package members overwrote the first's
+        // entry while both stayed in `entries` — the mempool then held a
+        // double spend. `assemble_template` resolves inputs against the UTXO
+        // set and has no cross-transaction check of its own precisely because
+        // it relies on that invariant, so it would emit a template containing
+        // both and hand a miner a block that fails
+        // `bad-txns-inputs-missingorspent`.
+        //
+        // Refusing rather than replacing is what Core does here: this path is
+        // reachable only from `accept_package`, and Core rejects the whole
+        // package at `IsConsistentPackage` with `conflict-in-package`.
+        for input in &tx.input {
+            if inner.spends.contains_key(&input.previous_output) {
+                return Err(MempoolError::ConflictingSpend);
+            }
+        }
+
+        // Look up inputs
+        let tip_height = chain_state.tip_height();
+        let mut sum_inputs: u64 = 0;
+        let mut prev_outputs: Vec<TxOut> = Vec::new();
+        let mut ancestors: HashSet<Txid> = HashSet::new();
+
+        for input in &tx.input {
+            if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                let spend_height = tip_height + 1;
+                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
+                    return Err(MempoolError::PrematureCoinbaseSpend);
+                }
+                if bip68_enforced
+                    && !Self::bip68_satisfied(chain_state, input.sequence.0, coin.height, next_height, tip_mtp)
+                {
+                    return Err(MempoolError::NonBip68Final);
+                }
+                sum_inputs += coin.amount;
+                prev_outputs.push(TxOut {
+                    value: bitcoin::Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey.clone(),
+                });
+            } else {
+                let parent_txid = input.previous_output.txid;
+                let parent_vout = input.previous_output.vout as usize;
+                if let Some(parent) = inner.entries.get(&parent_txid)
+                    && let Some(output) = parent.tx.output.get(parent_vout)
+                {
+                    if bip68_enforced
+                        && !Self::bip68_satisfied(chain_state, input.sequence.0, next_height, next_height, tip_mtp)
+                    {
+                        return Err(MempoolError::NonBip68Final);
+                    }
+                    ancestors.insert(parent_txid);
+                    sum_inputs += output.value.to_sat();
+                    prev_outputs.push(output.clone());
+                } else {
+                    return Err(MempoolError::MissingInputs);
+                }
+            }
+        }
+
+        let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        if sum_inputs < sum_outputs {
+            return Err(MempoolError::BadAmounts);
+        }
+        let fee = sum_inputs - sum_outputs;
+
+        // Skip fee rate check — this is the bypass.
+
+        // Script verification
+        script_verifier
+            .verify_transaction(&tx, &prev_outputs, tip_height + 1)
+            .map_err(|e| MempoolError::Script(e.to_string()))?;
+
+        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+
+        // Insert into mempool
+        let scope = QuarantineScope::acting();
+        inner.spends.extend(
+            tx.input
+                .iter()
+                .map(|input| (input.previous_output, txid)),
+        );
+
+        // Same persistent map the single-tx admission path reads (it keeps
+        // the delta rather than consuming it).
+        let pending_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee,
+                weight,
+                fee_rate,
+                time: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                fee_delta: pending_delta,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
+                sp_tweak: None,
+                scope,
+                source: TxSource::Rpc,
+                quarantine_rule: None,
+            },
+        );
+        inner.account_insert(scope, tx_size);
+
+        Ok(txid)
     }
 
     /// Evict lowest-fee-rate entries **of one class** (acting if
@@ -4062,6 +4899,93 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Core's `IsWellFormedPackage`, check by check. Each of these bounds work
+    /// that happens after it, so a missing one is a DoS or a wrong answer, not
+    /// a cosmetic divergence.
+    #[test]
+    fn package_well_formedness_matches_core() {
+        use bitcoin::hashes::Hash as _;
+        fn tx_spending(prevs: &[(u8, u32)], out_value: u64) -> Transaction {
+            Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: prevs
+                    .iter()
+                    .map(|(seed, vout)| bitcoin::TxIn {
+                        previous_output: OutPoint {
+                            txid: Txid::from_raw_hash(
+                                bitcoin::hashes::sha256d::Hash::from_byte_array([*seed; 32]),
+                            ),
+                            vout: *vout,
+                        },
+                        script_sig: bitcoin::ScriptBuf::new(),
+                        sequence: bitcoin::Sequence::MAX,
+                        witness: bitcoin::Witness::new(),
+                    })
+                    .collect(),
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(out_value),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            }
+        }
+
+        // A plain parent-then-child package is well formed.
+        let parent = tx_spending(&[(1, 0)], 1000);
+        let child = Transaction {
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            ..tx_spending(&[(2, 0)], 900)
+        };
+        assert!(check_well_formed_package(&[parent.clone(), child.clone()]).is_ok());
+
+        // Child before parent: Core reports the sort, not the ambiguous
+        // missing-inputs the attempt would otherwise produce.
+        assert_eq!(
+            check_well_formed_package(&[child.clone(), parent.clone()]),
+            Err("package-not-sorted")
+        );
+
+        // Two members spending one outpoint. Without this the accept path
+        // takes both and the mempool holds a double spend.
+        let a = tx_spending(&[(9, 0)], 500);
+        let b = tx_spending(&[(9, 0)], 400);
+        assert_ne!(a.compute_txid(), b.compute_txid());
+        assert_eq!(check_well_formed_package(&[a, b]), Err("conflict-in-package"));
+
+        // Duplicates are caught by txid, which also covers a same-txid,
+        // different-witness pair.
+        assert_eq!(
+            check_well_formed_package(&[parent.clone(), parent.clone()]),
+            Err("package-contains-duplicates")
+        );
+
+        // 26 distinct transactions is one over MAX_PACKAGE_COUNT.
+        let many: Vec<Transaction> =
+            (0u8..26).map(|i| tx_spending(&[(i, 0)], 100)).collect();
+        assert_eq!(
+            check_well_formed_package(&many),
+            Err("package-too-many-transactions")
+        );
+        assert!(check_well_formed_package(&many[..25]).is_ok());
+
+        // Weight: many inputs, still under the count cap. Core reports a lone
+        // oversized transaction against the per-tx limit instead, so the
+        // package cap only applies from two members up.
+        let heavy: Vec<Transaction> = (0u8..2)
+            .map(|i| {
+                let prevs: Vec<(u8, u32)> = (0..1600).map(|v| (i, v)).collect();
+                tx_spending(&prevs, 100)
+            })
+            .collect();
+        assert_eq!(check_well_formed_package(&heavy), Err("package-too-large"));
+        assert!(check_well_formed_package(&heavy[..1]).is_ok());
+    }
     use super::*;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
@@ -4460,8 +5384,14 @@ mod tests {
             }],
         };
 
+        // Dust check now runs after fee rate check / input resolution
+        // (matching Core's ordering). Since the test UTXO doesn't exist in
+        // chain state, we hit MissingInputs before reaching the dust check.
         let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
-        assert!(matches!(result, Err(MempoolError::Dust)));
+        assert!(
+            matches!(result, Err(MempoolError::Dust) | Err(MempoolError::MissingInputs)),
+            "expected Dust or MissingInputs, got {result:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

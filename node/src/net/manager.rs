@@ -4775,7 +4775,10 @@ impl PeerManager {
             | MempoolError::NonBip68Final
             // Local-submission-only refusal (§6.1); P2P traffic never produces it
             // and it is never peer misbehavior.
-            | MempoolError::Quarantined(_) => 0,
+            | MempoolError::Quarantined(_)
+            // Ephemeral dust policy errors: local package submission only.
+            | MempoolError::EphemeralDustFee
+            | MempoolError::MissingEphemeralSpends(_) => 0,
         }
     }
 
