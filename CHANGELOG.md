@@ -61,6 +61,11 @@ item below is (or will be) written up in full in the in-development
   `electrs`. `electrumservername=` overrides it. The P2P user agent is unchanged
 
 ### Fixed
+- The mempool event broadcast holds a whole block's confirmations. Connecting a
+  block emits one `LeaveConfirmed` per confirmed transaction, so the 1024-slot
+  ring was smaller than a single mainnet block (3000-4500 txs) and every
+  subscriber silently lost roughly 37% of each block's burst. Raised to 32768,
+  sized from the consensus bound on transactions per block (#682)
 - Mempool admission is gated on Bitcoin Core v31's cluster limit
   (`-limitclustercount`, default and maximum 64) instead of the deprecated
   ancestor/descendant counts, and reports Core's `too-large-cluster`; chains of

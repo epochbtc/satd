@@ -13,11 +13,38 @@ use crate::validation::tx::check_transaction;
 use node_index::keys::{scripthash_of, Scripthash};
 use node_sp_index::{compute_tweak, TweakEntry};
 
-/// Capacity of the broadcast channel for `subscribemempool`. Large
-/// enough to absorb short bursts; a subscriber that lags past this
-/// will see `RecvError::Lagged` and skip to the latest events —
-/// correct behavior for a best-effort stream.
-pub const EVENT_BROADCAST_CAPACITY: usize = 1024;
+/// Capacity of the broadcast channel carrying [`MempoolEvent`]s.
+///
+/// This is not a queue depth. `broadcast::send` never blocks and never
+/// fails for want of space — it must not, because the sender is the
+/// mempool accept path and `connect_block`, and no subscriber may stall
+/// consensus. It overwrites the oldest slot instead. So this number is
+/// *how far behind a consumer may fall before it silently loses events*:
+/// past it, `recv` yields `RecvError::Lagged(n)` and those `n` events are
+/// gone for that receiver, with no replay.
+///
+/// It must therefore exceed the largest burst the mempool can produce in
+/// one go, and that burst is bounded by consensus rather than by consumer
+/// behaviour: `remove_for_block` emits one `LeaveConfirmed` per confirmed
+/// transaction, so a block connection fires a burst the size of the
+/// block's transaction count. At 1024 this was *smaller than a single
+/// mainnet block* (3000-4500 txs), and roughly 37% of every block's
+/// confirmation burst was dropped — measured on a synced mainnet node,
+/// with 100% of lag reports landing inside the block-connection window
+/// and none between blocks.
+///
+/// 32768 is sized from the consensus bound, not from today's average: a
+/// block packed with minimal transactions holds several times 4500. The
+/// cost is one allocation at startup — `MempoolEvent` is a flat enum with
+/// no heap allocation, largest variant 68 bytes, so the ring is ~2.5 MiB.
+///
+/// A burst past this bound still drops, and that is by design, not a gap:
+/// `docs/api/streaming.md` §10 makes "never backpressure the publisher" a
+/// non-negotiable safety invariant, so the channel is deliberately lossy
+/// and no finite capacity can promise otherwise. Size this against the
+/// largest burst the node can produce; do not reach for a bound that
+/// tries to make dropping impossible.
+pub const EVENT_BROADCAST_CAPACITY: usize = 32768;
 
 /// Capacity of the in-memory event ring tapped by MCP
 /// `subscribe_mempool_snapshot`. Kept small — MCP is request/response,
@@ -7120,6 +7147,57 @@ mod tests {
         );
         assert_eq!(mp.quarantine_confirmed_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block connection emits one `LeaveConfirmed` per confirmed transaction
+    /// in a tight loop (`remove_for_block`), so the broadcast ring has to hold a
+    /// whole block's worth of events or every subscriber loses part of every
+    /// block. At the old capacity of 1024 the ring was smaller than a single
+    /// mainnet block and dropped roughly 37% of each block's burst.
+    #[test]
+    fn broadcast_ring_absorbs_a_whole_block_of_confirmations() {
+        use bitcoin::hashes::Hash;
+
+        // Larger than any block mainnet has produced, and well past the ~4500
+        // the measurement in EVENT_BROADCAST_CAPACITY's doc comment was taken
+        // against. Consensus bounds this by block weight; consumer behaviour
+        // does not enter into it.
+        const BURST: usize = 12_000;
+
+        let txid_at = |i: usize| {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(raw))
+        };
+
+        let (tx, mut rx) = broadcast::channel::<MempoolEvent>(EVENT_BROADCAST_CAPACITY);
+        let block_hash = bitcoin::BlockHash::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
+        );
+        for i in 0..BURST {
+            tx.send(MempoolEvent::LeaveConfirmed {
+                txid: txid_at(i),
+                block_hash,
+                height: 965_509,
+            })
+            .expect("receiver is alive");
+        }
+
+        // Nothing was read while the burst was in flight — exactly the position
+        // a consumer descheduled across `connect_block` is in.
+        for i in 0..BURST {
+            match rx.try_recv() {
+                Ok(MempoolEvent::LeaveConfirmed { txid, .. }) => {
+                    assert_eq!(txid, txid_at(i), "event {i} arrived out of order");
+                }
+                Ok(other) => panic!("event {i} was not a LeaveConfirmed: {other:?}"),
+                Err(broadcast::error::TryRecvError::Lagged(n)) => panic!(
+                    "dropped {n} events at {i}: ring holds {EVENT_BROADCAST_CAPACITY}, \
+                     burst was {BURST}"
+                ),
+                Err(e) => panic!("event {i} missing: {e:?}"),
+            }
+        }
     }
 
     #[test]
