@@ -402,8 +402,8 @@ async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
         4,
         "a committed anchor resumes at the next unscanned block"
     );
-
 }
+
 /// Cut-through (`tweak_unspent_only`): an entry disappears once its taproot
 /// outputs are spent, and the block says so with `filtered`.
 ///

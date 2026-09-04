@@ -88,6 +88,18 @@ pub enum ConnectError {
     SpIndexEmit(String),
 }
 
+impl ConnectError {
+    /// Whether this rejection is mutation-class and so must never be persisted
+    /// against the block hash. See [`crate::validation::ValidationError::is_mutation_class`].
+    ///
+    /// Only the wrapped structural errors can be mutation-class: everything
+    /// else here is a verdict about the block's *contents*, which the proof of
+    /// work does commit to.
+    pub fn is_mutation_class(&self) -> bool {
+        matches!(self, Self::TxValidation(e) if e.is_mutation_class())
+    }
+}
+
 /// Decode the block height from a BIP 34 coinbase scriptSig.
 ///
 /// BIP 34 requires the coinbase scriptSig to start with a CScript push of the
@@ -452,6 +464,23 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
     // Fast lookup for coins created earlier in this block (intra-block spends).
     let mut intra_block_coins: HashMap<OutPoint, Coin> = HashMap::new();
 
+    // Outpoints already spent by an earlier transaction in this same block.
+    //
+    // Core gets this for free: `ConnectBlock` spends through a
+    // `CCoinsViewCache`, so a second `AccessCoin` of an outpoint an earlier
+    // transaction consumed sees a spent coin and the block fails
+    // `bad-txns-inputs-missingorspent`. Here, external inputs are answered from
+    // the `pre_resolved` snapshot below, which is keyed by `(tx_idx, in_idx)`
+    // and taken *before* any spending — so two different transactions spending
+    // one confirmed outpoint each get their own successful lookup, the block
+    // connects, and one coin pays for two transactions. That is inflation and a
+    // chain split, so the set is not an optimisation: it is the check.
+    //
+    // `check_transaction`'s duplicate-input scan does not cover it (that is
+    // per-transaction), and `check_block`'s `bad-txns-duplicate` is about a
+    // duplicated *transaction*, not a shared input.
+    let mut spent_in_block: HashSet<OutPoint> = HashSet::new();
+
     // Block-wide prev-output script map for BIP 158 filter construction
     // and BIP 352 tweak extraction. Populated alongside `prev_outputs`
     // inside the per-tx loop and consumed by the emit helpers at
@@ -566,6 +595,20 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
         if !is_coinbase {
             for (in_idx, input) in tx.input.iter().enumerate() {
                 let outpoint = input.previous_output;
+
+                // No outpoint may be spent twice in one block, whether by
+                // this transaction or an earlier one. Checked before the
+                // lookup, because the lookup itself cannot tell the difference.
+                if !spent_in_block.insert(outpoint) {
+                    tracing::error!(
+                        %outpoint,
+                        txid = %tx.compute_txid(),
+                        input = in_idx,
+                        height,
+                        "outpoint spent twice within one block"
+                    );
+                    return Err(ConnectError::MissingOrSpentInput { outpoint });
+                }
 
                 // Lookup order: pre-resolved → intra-block → store (avoids DB hit for intra-block spends)
                 let coin = pre_resolved.get(&(tx_idx, in_idx)).cloned()
@@ -1409,6 +1452,112 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         block
+    }
+
+    /// Two *different* transactions in one block spending one confirmed
+    /// outpoint must be rejected.
+    ///
+    /// Core cannot express this bug: `ConnectBlock` spends through a
+    /// `CCoinsViewCache`, so the second `AccessCoin` of an outpoint the first
+    /// transaction already spent returns a spent coin and the block fails with
+    /// `bad-txns-inputs-missingorspent`. satd resolves external inputs from a
+    /// `pre_resolved` snapshot keyed by `(tx_idx, in_idx)`, taken before any
+    /// spending happens — so without an explicit spent set both lookups
+    /// succeed and the block connects, destroying one coin while crediting two
+    /// transactions with it. That is inflation and a chain split.
+    ///
+    /// `check_transaction` does not cover this: its duplicate-input scan is
+    /// per-transaction. `check_block`'s `bad-txns-duplicate` is about a
+    /// duplicated *transaction* (merkle mutation), not a shared input.
+    #[test]
+    fn two_txs_in_one_block_cannot_spend_the_same_confirmed_outpoint() {
+        let (store, outpoint, _coin) = make_test_store_with_coin(0, true);
+        let height = 101; // coinbase at 0 is mature (101 - 0 >= 100)
+
+        let coinbase_script = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .push_opcode(bitcoin::opcodes::OP_FALSE)
+            .into_script();
+        let coinbase = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: coinbase_script,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            // Claims only the subsidy, so an under-claim can never be what
+            // rejects this block.
+            output: vec![TxOut {
+                value: Amount::from_sat(block_subsidy(Network::Regtest, height)),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        // Two distinct transactions — different output values, so different
+        // txids — spending the one outpoint.
+        let spend = |value: u64| Transaction {
+            version: Version(2),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx_a = spend(49_000_000);
+        let tx_b = spend(48_000_000);
+        assert_ne!(tx_a.compute_txid(), tx_b.compute_txid());
+
+        let mut block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, tx_a, tx_b],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let verifier = NoopVerifier;
+        let result = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &verifier,
+            median_time_past: 1_600_000_000,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
+            precomputed_txids: None,
+            address_index: &Default::default(),
+            sp_index: &Default::default(),
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &Default::default(),
+            phase_tracker: None,
+        });
+
+        let verdict = match &result {
+            Ok(_) => "ACCEPTED".to_string(),
+            Err(e) => format!("rejected: {e}"),
+        };
+        assert!(
+            matches!(result, Err(ConnectError::MissingOrSpentInput { .. })),
+            "a block spending one outpoint from two transactions must be \
+             rejected as missing-or-spent, got {verdict}"
+        );
     }
 
     fn default_pos() -> FlatFilePos {

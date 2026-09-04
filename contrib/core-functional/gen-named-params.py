@@ -277,6 +277,10 @@ SATD_ONLY = {
     "getserverstatus": [],
     "getsysteminfo": [],
     "getwarnings": [],
+    "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
+    # Core also has echo/echojson/generate but they're hidden debug RPCs
+    # that gen-named-params.py doesn't discover from Core's help output.
+    "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
     "estimatefees": [["targets", False], ["mode", False]],
     "getmempoolhistory": [["since_secs", False]],
     "getquarantineentry": [["txid", False]],

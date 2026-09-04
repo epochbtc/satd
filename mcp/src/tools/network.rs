@@ -46,12 +46,20 @@ pub fn manage_peer(ctx: &McpContext, action: &str, address: &str) -> String {
             json!({"result": if ok { "disconnected" } else { "peer not found" }}).to_string()
         }
         "ban" => {
-            ctx.peer_manager.set_ban(addr, true);
-            json!({"result": "banned"}).to_string()
+            let target = node::net::ban::BanTarget::Net(ipnet::IpNet::from(addr.ip()));
+            let now = node::time::now_secs();
+            let duration = ctx.peer_manager.default_ban_duration_secs();
+            match ctx.peer_manager.set_ban_subnet(&target, true, now, now + duration) {
+                Ok(()) => json!({"result": "banned"}).to_string(),
+                Err(e) => json!({"error": e}).to_string(),
+            }
         }
         "unban" => {
-            ctx.peer_manager.set_ban(addr, false);
-            json!({"result": "unbanned"}).to_string()
+            let target = node::net::ban::BanTarget::Net(ipnet::IpNet::from(addr.ip()));
+            match ctx.peer_manager.set_ban_subnet(&target, false, 0, 0) {
+                Ok(()) => json!({"result": "unbanned"}).to_string(),
+                Err(e) => json!({"error": e}).to_string(),
+            }
         }
         _ => json!({"error": format!("Unknown action: {}. Use: disconnect, ban, unban", action)})
             .to_string(),

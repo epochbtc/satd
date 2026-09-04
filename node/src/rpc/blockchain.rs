@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
+use crate::storage::Store;
 use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
 
 /// True when the active chain holds exactly `hash` at `height`.
@@ -146,6 +147,44 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
             v if v.is_empty() => Value::String(String::new()),
             v => Value::Array(v.into_iter().map(Value::String).collect()),
         },
+    })
+}
+
+/// `getdeploymentinfo` — report the activation status of buried softfork
+/// deployments.
+///
+/// Core models both BIP 9 (versionbits) and buried (height-gated)
+/// deployments. satd has no BIP 9 deployments — everything is buried — so
+/// the output is a static map of `{ name: { type, active, height } }`.
+///
+/// `active` follows Core's rule: a buried deployment is active for the
+/// *next* block, i.e. `tip_height + 1 >= activation_height`.
+pub fn get_deployment_info(chain_state: &ChainState) -> Value {
+    let tip_height = chain_state.tip_height();
+    let next_height = tip_height + 1;
+    let heights = crate::validation::script::activation_heights(chain_state.network);
+
+    // Helper: one deployment object.
+    let buried = |height: u32| -> Value {
+        json!({
+            "type": "buried",
+            "active": next_height >= height.max(1),
+            "height": height,
+        })
+    };
+
+    let mut map = serde_json::Map::new();
+    map.insert("bip34".to_string(), buried(heights.bip34));
+    map.insert("dersig".to_string(), buried(heights.dersig));
+    map.insert("cltv".to_string(), buried(heights.cltv));
+    map.insert("csv".to_string(), buried(heights.csv));
+    map.insert("segwit".to_string(), buried(heights.segwit));
+    map.insert("taproot".to_string(), buried(heights.taproot));
+
+    json!({
+        "deployments": map,
+        "hash": chain_state.tip_hash().to_string(),
+        "height": tip_height,
     })
 }
 
@@ -309,11 +348,14 @@ pub fn get_block(
             .txdata
             .iter()
             .map(|tx| {
-                crate::rpc::rawtx::decode_transaction_verbose(
+                crate::rpc::rawtx::decode_transaction_verbose_net(
                     tx,
                     Some(&block_hash_str),
                     Some(entry.height),
                     Some(confirmations),
+                    1,
+                    None,
+                    chain_state.network,
                 )
             })
             .collect();
@@ -770,20 +812,127 @@ pub fn get_block_stats(
     }))
 }
 
-/// `getchaintips` — return chain tip info.
+/// `getchaintips` — return info for every chain tip known to the block index.
+///
+/// A "tip" is any block whose hash does not appear as the `prev_blockhash` of
+/// any other indexed block.  The active tip always appears first (highest
+/// chainwork); the rest are sorted by height descending, matching Core's
+/// output.
 pub fn get_chain_tips(chain_state: &ChainState) -> Value {
-    // One read: `tip_snapshot`'s own docs require it of any caller needing both
-    // fields, because two reads can straddle a connect and report a height
-    // alongside the hash of a different block.
-    let (tip_hash, tip_height) = chain_state.tip_snapshot();
+    use crate::storage::blockindex::BlockStatus;
+    use std::collections::{HashMap, HashSet};
 
-    // Currently we only track the active chain tip
-    json!([{
-        "height": tip_height,
-        "hash": tip_hash.to_string(),
-        "branchlen": 0,
-        "status": "active",
-    }])
+    let (active_tip_hash, _active_tip_height) = chain_state.tip_snapshot();
+
+    // Collect every block index entry and the set of hashes that are
+    // referenced as a parent by some other entry.
+    let mut entries: HashMap<bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry> =
+        HashMap::new();
+    let mut has_child: HashSet<bitcoin::BlockHash> = HashSet::new();
+
+    let _ = chain_state.store_ref().for_each_block_index(&mut |hash, entry| {
+        has_child.insert(entry.header.prev_blockhash);
+        entries.insert(hash, entry);
+    });
+
+    // Tips are leaf nodes of the block-index DAG (no other entry has them
+    // as `prev_blockhash`).  The active tip is always included even if it
+    // has header-only children — a header-only descendant does not extend
+    // the connected chain.
+    let mut tips: Vec<(bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry)> = entries
+        .iter()
+        .filter(|(h, _)| !has_child.contains(*h) || **h == active_tip_hash)
+        .map(|(h, e)| (*h, e.clone()))
+        .collect();
+
+    // Sort by height descending — Core's output order.
+    tips.sort_by(|(_h_a, e_a), (_h_b, e_b)| e_b.height.cmp(&e_a.height));
+
+    let result: Vec<Value> = tips
+        .iter()
+        .map(|(hash, entry)| {
+            if *hash == active_tip_hash {
+                return json!({
+                    "height": entry.height,
+                    "hash": hash.to_string(),
+                    "branchlen": 0,
+                    "status": "active",
+                });
+            }
+
+            // Walk back from this tip until we hit a block on the active
+            // chain.  That gives us the fork point and therefore the
+            // branch length.
+            let mut cursor = *hash;
+            let mut branch_len: u32 = 0;
+            let on_active = loop {
+                if chain_state.active_chain_hash_at_height(
+                    entries.get(&cursor).map_or(0, |e| e.height),
+                ) == Some(cursor)
+                {
+                    // `cursor` itself is on the active chain — it is the
+                    // fork point.
+                    break true;
+                }
+                branch_len += 1;
+                let prev = entries
+                    .get(&cursor)
+                    .map(|e| e.header.prev_blockhash);
+                match prev {
+                    Some(p) if entries.contains_key(&p) => cursor = p,
+                    _ => break false,
+                }
+            };
+
+            // Determine status.
+            //
+            // Walk the branch from tip back `branch_len` blocks.  If ANY
+            // block on the branch is `Invalid`, the tip is `invalid`.
+            // Otherwise, if every block has full data (`DataStored` or
+            // `Valid`), it is `valid-fork` (when the fork point is on the
+            // active chain) or `valid-headers`.  If any block is
+            // `HeaderOnly`, the status is `headers-only` (when the fork
+            // point is NOT on the active chain) or `valid-headers`.
+            let mut any_invalid = false;
+            let mut all_have_data = true;
+            {
+                let mut c = *hash;
+                for _ in 0..branch_len {
+                    if let Some(e) = entries.get(&c) {
+                        if e.status == BlockStatus::Invalid {
+                            any_invalid = true;
+                        }
+                        if e.status == BlockStatus::HeaderOnly {
+                            all_have_data = false;
+                        }
+                        c = e.header.prev_blockhash;
+                    } else {
+                        all_have_data = false;
+                        break;
+                    }
+                }
+            }
+
+            let status = if any_invalid {
+                "invalid"
+            } else if all_have_data && on_active {
+                "valid-fork"
+            } else if all_have_data {
+                "valid-headers"
+            } else {
+                "headers-only"
+            };
+
+            json!({
+                "height": entry.height,
+                "hash": hash.to_string(),
+                "branchlen": branch_len,
+                "status": status,
+            })
+        })
+        .collect();
+
+    json!(result)
 }
 
 /// `getchaintxstats` — return tx rate statistics over a window.

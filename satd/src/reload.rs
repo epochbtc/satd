@@ -256,6 +256,7 @@ pub fn mempool_config_from(c: &Config) -> MempoolConfig {
         // crash the daemon — exactly the "never crash on a bad reload" case.
         max_size_bytes: c.maxmempool.saturating_mul(1_000_000),
         min_fee_rate: c.minrelaytxfee,
+        incremental_relay_fee: c.incrementalrelayfee,
         full_rbf: c.mempoolfullrbf,
         dust_relay_fee: c.dustrelayfee,
         data_carrier: c.datacarrier,
