@@ -1247,31 +1247,16 @@ pub async fn start(
             Err(crate::mempool::pool::MempoolError::AlreadyExists) => {
                 // Already in mempool — we'll re-announce below.
             }
-            Err(crate::mempool::pool::MempoolError::Quarantined(_)) if allow_quarantined => {
-                // Quarantined but user overrode — skip pre-flight rejection,
-                // let broadcast_transaction handle the actual submission.
-            }
-            Err(e) => {
-                let code = match &e {
-                    crate::mempool::pool::MempoolError::DecodeFailed => -22,
-                    _ => -25,
-                };
-                let (category, suggestion) = match code {
-                    -22 => (
-                        "rpc.input.parse",
-                        "Transaction hex failed to decode.",
-                    ),
-                    -25 => (
-                        "mempool.rejected",
-                        "Mempool rejected the tx.",
-                    ),
-                    _ => ("rpc.unknown", ""),
-                };
-                let mut err = crate::rpc::error::RpcError::new(code, category, e.to_string());
-                if !suggestion.is_empty() {
-                    err = err.with_suggestion(suggestion);
-                }
-                return Err(err.into_error_object());
+            Err(_) => {
+                // The pre-flight exists only to price the transaction for
+                // `maxfeerate` and to spot an already-confirmed txid. It must
+                // not decide acceptance: `test_accept` does not consult the
+                // policy engine, so the §6.2/§7 deferred-standardness path —
+                // where an `allow` rule forgives a non-standard shape such as
+                // dust — never gets a say here, and a transaction the node
+                // would really accept would be refused. Fall through and let
+                // the actual submission below rule on it; that path reports
+                // Core's own reject reason and error code via `rpc_code`.
             }
         }
 
