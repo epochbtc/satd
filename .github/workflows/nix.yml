@@ -65,7 +65,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main as of 2026-07-15
+        uses: DeterminateSystems/nix-installer-action@b67ad2f0e8376a0bc947db191e4484285b6f5b56 # main as of 2026-07-15
         with:
           # Determinate Systems' installer enables the binary cache
           # and flakes by default. No additional config needed for v1.
@@ -127,7 +127,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main as of 2026-07-15
+        uses: DeterminateSystems/nix-installer-action@b67ad2f0e8376a0bc947db191e4484285b6f5b56 # main as of 2026-07-15
         with:
           extra-conf: |
             experimental-features = nix-command flakes
