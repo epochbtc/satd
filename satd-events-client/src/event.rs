@@ -107,6 +107,10 @@ pub enum EvictReason {
     BlockConflict,
     /// Evicted from the quarantine class on a fee-rate byte-budget overflow.
     Policy,
+    /// Evicted because a chain reorganization made the transaction invalid
+    /// (locktime no longer satisfied, coinbase became immature, or BIP 68
+    /// sequence lock unsatisfied).
+    Reorg,
     /// An eviction reason this client build does not recognize.
     Unknown(i32),
 }
@@ -300,6 +304,7 @@ impl From<pb::EvictReason> for EvictReason {
             pb::EvictReason::Expiry => EvictReason::Expiry,
             pb::EvictReason::BlockConflict => EvictReason::BlockConflict,
             pb::EvictReason::Policy => EvictReason::Policy,
+            pb::EvictReason::Reorg => EvictReason::Reorg,
         }
     }
 }

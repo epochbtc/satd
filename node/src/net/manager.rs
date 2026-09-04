@@ -98,6 +98,10 @@ const REBROADCAST_AUTO_MAX_SECS: u64 = 900;
 /// P2P protocol cap on inventory items per `inv` message (Core's
 /// `MAX_INV_SZ`); peers disconnect senders that exceed it.
 const MAX_INV_PER_MSG: usize = 50_000;
+
+/// Maximum entries in a getheaders/getblocks locator. Core disconnects
+/// peers that exceed this (net_processing.cpp `MAX_LOCATOR_SZ`).
+const MAX_LOCATOR_SZ: usize = 101;
 /// How long a `getblockfrompeer` request stays armed. A block arriving after
 /// this window is treated as an ordinary unsolicited block rather than a
 /// repair, so a peer that answers minutes late cannot divert a block the
@@ -295,8 +299,11 @@ pub struct PeerManager {
     /// peers, so without this a dead onion seed (or a failed gossip-discovered
     /// host) would be hot-dialed every 10s with no backoff.
     onion_reconnect_backoff: RwLock<HashMap<String, ReconnectState>>,
-    /// Banned addresses with ban expiry time.
-    banned_addrs: RwLock<HashMap<SocketAddr, Instant>>,
+    /// Subnet-level ban list with wall-clock expiry times and JSON
+    /// persistence. Replaces the old `HashMap<SocketAddr, Instant>`: bans
+    /// are keyed by normalised subnet string, survive restarts, and respond
+    /// to `setmocktime`.
+    ban_list: RwLock<crate::net::ban::BanList>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
     #[allow(dead_code)]
     fee_estimator: Arc<FeeEstimator>,
@@ -534,7 +541,7 @@ impl PeerManager {
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
-            banned_addrs: RwLock::new(HashMap::new()),
+            ban_list: RwLock::new(crate::net::ban::BanList::default()),
             shutdown,
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
@@ -882,6 +889,11 @@ impl PeerManager {
     /// startup and by SIGHUP config reload.
     pub fn set_ban_duration_secs(&self, secs: u64) {
         self.ban_duration_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Current default ban duration in seconds (the `-bantime` setting).
+    pub fn default_ban_duration_secs(&self) -> u64 {
+        self.ban_duration_secs.load(Ordering::Relaxed)
     }
 
     /// Roll the 24h upload cycle over if it has elapsed.
@@ -1300,6 +1312,16 @@ impl PeerManager {
         }
         let ip = addr.ip();
         let perms = self.whitelist_permissions(ip).union(bind_perms);
+        // A ban has to cover the inbound direction or it covers nothing: a
+        // banned host simply dials us instead of waiting to be dialled, and
+        // `setban` becomes advisory. Core drops the socket here too, before a
+        // `CNode` exists (`src/net.cpp`: `if (!HasFlag(permission_flags,
+        // NoBan) && banned) { ... return; }`), with the same NoBan exemption
+        // so `-whitelist`/`-whitebind` peers stay reachable.
+        if !perms.noban && self.is_addr_banned(&addr) {
+            tracing::debug!(%addr, "banned peer: refusing inbound connection");
+            return;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg_rx = {
             let mut peers = self.peers.write();
@@ -1512,13 +1534,22 @@ impl PeerManager {
         peers.clear();
     }
 
-    /// Get info about all connected peers.
+    /// Get info about all connected peers, sorted by id (ascending).
+    ///
+    /// Bitcoin Core's `getpeerinfo` returns entries sorted by `CNode::GetId()`,
+    /// and the Core functional test suite relies on that: `getpeerinfo()[0]` is
+    /// the first-connected (lowest-id) peer.  A `HashMap` iteration gives no
+    /// ordering guarantee, so we must sort explicitly.
     pub fn get_peer_info(&self) -> Vec<serde_json::Value> {
         let peers = self.peers.read();
-        peers
-            .values()
-            .filter(|h| h.info.state == PeerState::Connected)
-            .map(|h| h.info.to_rpc_json(&h.stats))
+        let mut entries: Vec<_> = peers
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected)
+            .collect();
+        entries.sort_by_key(|(id, _)| **id);
+        entries
+            .into_iter()
+            .map(|(_, h)| h.info.to_rpc_json(&h.stats))
             .collect()
     }
 
@@ -1602,39 +1633,93 @@ impl PeerManager {
 
     /// Get the list of currently banned addresses with expiry times.
     pub fn list_banned(&self) -> Vec<serde_json::Value> {
-        let banned = self.banned_addrs.read();
-        let now = Instant::now();
-        banned
-            .iter()
-            .filter(|(_, expiry)| now < **expiry)
-            .map(|(addr, expiry)| {
-                let remaining = expiry.duration_since(now).as_secs();
+        let now = crate::time::now_secs();
+        let ban_list = self.ban_list.read();
+        ban_list
+            .list(now)
+            .into_iter()
+            .map(|entry| {
                 serde_json::json!({
-                    "address": addr.to_string(),
-                    "ban_created": 0,
-                    "banned_until": remaining,
-                    "ban_duration": self.ban_duration_secs.load(Ordering::Relaxed),
+                    "address": entry.address,
+                    "ban_created": entry.ban_created,
+                    "banned_until": entry.banned_until,
+                    "ban_duration": entry.ban_duration(),
+                    "time_remaining": entry.time_remaining(now),
                     "ban_reason": "node misbehaving",
                 })
             })
             .collect()
     }
 
-    /// Manually ban or unban an address.
-    pub fn set_ban(&self, addr: SocketAddr, ban: bool) {
-        if ban {
-            self.banned_addrs
+    /// Ban or unban a subnet. Called from the `setban` RPC.
+    ///
+    /// On `add`, also disconnects every currently-connected peer whose IP
+    /// falls within the banned subnet, matching Core's behaviour.
+    pub fn set_ban_subnet(
+        &self,
+        target: &crate::net::ban::BanTarget,
+        add: bool,
+        ban_created: u64,
+        banned_until: u64,
+    ) -> Result<(), String> {
+        if add {
+            self.ban_list
                 .write()
-                
-                .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                .add(target, ban_created, banned_until)?;
+            // Disconnect any connected peer whose IP falls within the ban.
+            self.disconnect_banned_peers(target);
         } else {
-            self.banned_addrs.write().remove(&addr);
+            self.ban_list.write().remove(target)?;
+        }
+        Ok(())
+    }
+
+    /// Core's `setban add` duplicate pre-check. Separate from
+    /// [`crate::net::ban::BanList::add`] because the automatic misbehaviour
+    /// path must be able to re-arm and extend bans, while an operator asking
+    /// twice gets `-23`.
+    pub fn is_already_banned(&self, target: &crate::net::ban::BanTarget, is_subnet: bool) -> bool {
+        self.ban_list
+            .read()
+            .already_banned(target, is_subnet, crate::time::now_secs())
+    }
+
+    /// Disconnect every peer whose IP falls within `target`.
+    fn disconnect_banned_peers(&self, target: &crate::net::ban::BanTarget) {
+        let ids_to_disconnect: Vec<u64> = {
+            let peers = self.peers.read();
+            peers
+                .iter()
+                .filter_map(|(id, handle)| {
+                    if target.contains_addr(&handle.info.addr.ip()) {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for id in ids_to_disconnect {
+            self.disconnect_by_id(id);
         }
     }
 
     /// Clear all bans.
     pub fn clear_banned(&self) {
-        self.banned_addrs.write().clear();
+        self.ban_list.write().clear();
+    }
+
+    /// Load the ban list from `banlist.json` in `dir`. Returns whether the
+    /// file was recreated (caller should log the event).
+    pub fn load_banlist(&self, dir: &std::path::Path) -> Result<bool, String> {
+        let path = dir.join("banlist.json");
+        let (mut list, recreated) = crate::net::ban::BanList::load(&path)?;
+        // Prune expired bans from the loaded list using the current node
+        // clock (which may be mocktime).
+        let now = crate::time::now_secs();
+        list.prune_expired(now);
+        *self.ban_list.write() = list;
+        Ok(recreated)
     }
 
     /// Send a ping to all connected peers.
@@ -1773,8 +1858,8 @@ impl PeerManager {
 
     /// Check if an address is currently banned.
     fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
-        let banned = self.banned_addrs.read();
-        matches!(banned.get(addr), Some(expiry) if Instant::now() < *expiry)
+        let now = crate::time::now_secs();
+        self.ban_list.read().is_banned(&addr.ip(), now)
     }
 
     /// Add ban score to a peer. If the score exceeds BAN_THRESHOLD, the peer
@@ -1791,7 +1876,7 @@ impl PeerManager {
             handle.info.ban_score += score;
             if handle.info.ban_score >= BAN_THRESHOLD {
                 tracing::warn!(id, addr = %handle.info.addr, score = handle.info.ban_score, reason, "Banning peer");
-                (true, Some(handle.info.addr))
+                (true, Some(handle.info.addr.ip()))
             } else {
                 tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
                 (false, None)
@@ -1809,11 +1894,16 @@ impl PeerManager {
                 handle.disconnect.notify_one();
             }
             if let Some(addr) = ban_addr {
-                drop(peers); // release peers lock before acquiring banned_addrs lock
-                self.banned_addrs
-                    .write()
-                    
-                    .insert(addr, Instant::now() + Duration::from_secs(self.ban_duration_secs.load(Ordering::Relaxed)));
+                drop(peers); // release peers lock before acquiring ban_list lock
+                let now = crate::time::now_secs();
+                let duration = self.ban_duration_secs.load(Ordering::Relaxed);
+                let target = crate::net::ban::BanTarget::Net(
+                    ipnet::IpNet::from(addr),
+                );
+                // Best-effort: misbehaviour bans are fire-and-forget; if the
+                // entry already exists (e.g. repeated misbehaviour) the add
+                // fails silently.
+                let _ = self.ban_list.write().add(&target, now, now + duration);
             }
         }
     }
@@ -2050,12 +2140,13 @@ impl PeerManager {
                 let need_peers = outbound < target;
                 if need_peers {
                     let addrs = self.connect_addrs.read().clone();
+
                     let now = Instant::now();
 
                     // Clean expired bans
                     {
-                        let mut banned = self.banned_addrs.write();
-                        banned.retain(|_, expiry| now < *expiry);
+                        let now_secs = crate::time::now_secs();
+                        self.ban_list.write().prune_expired(now_secs);
                     }
 
                     for addr in addrs {
@@ -2257,6 +2348,9 @@ impl PeerManager {
             }
             NetworkMessage::GetHeaders(msg) => {
                 self.handle_getheaders(id, msg);
+            }
+            NetworkMessage::GetBlocks(msg) => {
+                self.handle_getblocks(id, msg);
             }
             NetworkMessage::GetData(inv) => {
                 self.handle_getdata(id, inv);
@@ -4585,6 +4679,9 @@ impl PeerManager {
             | MempoolError::Dust
             | MempoolError::NonStandardOpReturn
             | MempoolError::InsufficientReplacementFee(..)
+            | MempoolError::SpendsConflictingTx(..)
+            | MempoolError::TooManyReplacements(..)
+            | MempoolError::DoesNotImproveFeerateDiagram(..)
             | MempoolError::TooLongMempoolChain
             // Non-final for the *next* block is tip-relative, not misbehavior:
             // a peer one block behind (or ahead) legitimately relays these.
@@ -4824,8 +4921,13 @@ impl PeerManager {
         let txid = self
             .submit_and_announce(tx, source, allow_quarantined)
             .map_err(|e| {
-                let code = e.rpc_code();
-                (code, e.to_string())
+                // Core's taxonomy: -25 = RPC_VERIFY_ERROR (in practice only
+                // missing inputs); -26 = RPC_VERIFY_REJECTED (every other
+                // invalid-or-rejected verdict). `rpc_code` maps each variant
+                // to the code Core returns for it, and
+                // `sendrawtransaction_msg` supplies Core's reject-reason
+                // string plus any RBF detail.
+                (e.rpc_code(), e.sendrawtransaction_msg())
             })?;
         Ok(serde_json::Value::String(txid.to_string()))
     }
@@ -5308,6 +5410,11 @@ impl PeerManager {
         id: PeerId,
         msg: bitcoin::p2p::message_blockdata::GetHeadersMessage,
     ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
         let mut start_height = None;
         for hash in &msg.locator_hashes {
             if let Some(entry) = self.chain_state.get_block_index(hash) {
@@ -5333,6 +5440,43 @@ impl PeerManager {
         // versions track silent-drops as soft misbehavior. Empty reply
         // signals "I have nothing newer than your locator."
         self.send_to_peer(id, NetworkMessage::Headers(headers));
+    }
+
+    fn handle_getblocks(
+        &self,
+        id: PeerId,
+        msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
+    ) {
+        if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
+            self.add_ban_score(id, 100, "oversized locator");
+            return;
+        }
+
+        let mut start_height = None;
+        for hash in &msg.locator_hashes {
+            if let Some(entry) = self.chain_state.get_block_index(hash) {
+                start_height = Some(entry.height + 1);
+                break;
+            }
+        }
+
+        let start = start_height.unwrap_or(0);
+        let tip = self.chain_state.tip_height();
+        let end = std::cmp::min(start + 500, tip + 1);
+
+        let mut inv = Vec::new();
+        for h in start..end {
+            if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
+                inv.push(Inventory::Block(hash));
+                if hash == msg.stop_hash {
+                    break;
+                }
+            }
+        }
+
+        if !inv.is_empty() {
+            self.send_to_peer(id, NetworkMessage::Inv(inv));
+        }
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
@@ -6519,7 +6663,7 @@ mod tests {
             MempoolError::AlreadyExists,
             MempoolError::ConflictingSpend,
             MempoolError::NonStandardOpReturn,
-            MempoolError::InsufficientReplacementFee(1, 2),
+            MempoolError::InsufficientReplacementFee(1, 2, String::new(), String::new()),
             MempoolError::TooLongMempoolChain,
             MempoolError::PrematureCoinbaseSpend,
             MempoolError::Validation("nonstandard".into()),

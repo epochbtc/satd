@@ -6218,7 +6218,20 @@ impl ChainState {
                         );
                     }
                 }
+
+                // Core: removeForReorg — evict any pre-existing mempool tx
+                // (or freshly re-added disconnected tx) that is no longer
+                // valid against the new chain tip: non-final locktime,
+                // immature coinbase spend, or unsatisfied BIP 68 lock.
+                mempool.remove_for_reorg(self);
             }
+
+            // After re-adding disconnected-block txs, evict any mempool
+            // entries whose BIP68 sequence locks or absolute locktimes are
+            // no longer satisfied against the new tip. A parent that was
+            // confirmed before the reorg is now unconfirmed, so a child's
+            // relative lock on it may be unmet.
+            mempool.remove_for_reorg(self);
         }
 
         // Reorg chain-event emission is deferred until here — past
@@ -7402,6 +7415,10 @@ impl ChainState {
                     );
                 }
             }
+            // Core: removeForReorg — evict mempool txs that are no longer
+            // valid against the post-reorg chain tip (non-final locktime,
+            // immature coinbase spend, unsatisfied BIP 68 lock).
+            mempool.remove_for_reorg(self);
         }
 
         // Chain events, in the canonical order (Reorg marker → disconnect

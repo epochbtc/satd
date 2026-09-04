@@ -20,12 +20,14 @@ note = "satd accepts positional JSON-RPC parameters only; a named request fails 
 [[test]]
 file = "feature_addrman.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "test writes/reads Core's peers.dat addrman format and checks corruption handling; satd has no addrman or peers.dat"
 
 [[test]]
 file = "feature_anchors.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC addconnection, which the framework uses for outbound test connections"
 
 [[test]]
 file = "feature_asmap.py"
@@ -62,8 +64,7 @@ note = "the framework skipped it; re-triage when the run-set grows"
 
 [[test]]
 file = "feature_bip68_sequence.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "feature_block.py"
@@ -99,7 +100,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "feature_coinstatsindex.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "gettxoutsetinfo missing `disk_size` and `transactions` fields"
 
 [[test]]
 file = "feature_coinstatsindex_compatibility.py"
@@ -154,14 +155,13 @@ reason = "no-wallet"
 
 [[test]]
 file = "feature_framework_miniwallet.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs `generatetodescriptor`; the framework mines to MiniWallet's own descriptor. satd now parses the `raw()` form it passes, so this is a mining-RPC gap rather than a descriptor one"
+status = "run"
 
 [[test]]
 file = "feature_framework_startup_failures.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "clap's error format ('unexpected argument') doesn't match Core's ('Invalid parameter -nonexistentarg'); test regex-matches the exact error string"
 
 [[test]]
 file = "feature_framework_testshell.py"
@@ -178,12 +178,14 @@ status = "run"
 [[test]]
 file = "feature_includeconf.py"
 status = "skip"
-reason = "cache"
+reason = "harness"
+note = "tracing writes all log output to stderr; the test's stop_node(expected_stderr=...) exact-matches a single warning line against the full tracing output. Fix: redirect tracing to debug.log (matching Core)"
 
 [[test]]
 file = "feature_index_prune.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "-blockfilterindex=1 accepted but not activated; getindexinfo never reports synced:true"
 
 [[test]]
 file = "feature_init.py"
@@ -265,8 +267,7 @@ note = "needs block-file pruning, which satd does not implement. Follow-up: prun
 
 [[test]]
 file = "feature_rbf.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "feature_reindex.py"
@@ -277,7 +278,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_reindex_init.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "test looks for Core-specific datadir files (blocks/blk*.dat layout) that satd does not produce"
 
 [[test]]
 file = "feature_reindex_readonly.py"
@@ -288,7 +290,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "feature_remove_pruned_files_on_startup.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "test looks for Core-specific datadir files that satd does not produce"
 
 [[test]]
 file = "feature_segwit.py"
@@ -349,8 +352,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "interface_http.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "interface_ipc.py"
@@ -365,7 +367,8 @@ reason = "no-ipc"
 [[test]]
 file = "interface_rest.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "REST endpoint returns 401 Unauthorized; Core's REST is unauthenticated by design, satd requires auth"
 
 [[test]]
 file = "interface_rpc.py"
@@ -418,8 +421,8 @@ note = "`testmempoolaccept` results have no `wtxid` field"
 [[test]]
 file = "mempool_cluster.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+reason = "feature-missing"
+note = "getmempoolentry missing `optimal` cluster-linearization field (Core v31+)"
 
 [[test]]
 file = "mempool_compatibility.py"
@@ -428,8 +431,7 @@ reason = "prev-release"
 
 [[test]]
 file = "mempool_datacarrier.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "mempool_dust.py"
@@ -464,8 +466,8 @@ note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v3
 [[test]]
 file = "mempool_package_rbf.py"
 status = "skip"
-reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+reason = "feature-missing"
+note = "needs `submitpackage` RPC and package-RBF policy"
 
 [[test]]
 file = "mempool_packages.py"
@@ -481,7 +483,8 @@ reason = "no-wallet"
 [[test]]
 file = "mempool_reorg.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "error-code -26 fixed; fails later: disconnected-block txs not reclaimed into mempool after reorg (invalidateblock path)"
 
 [[test]]
 file = "mempool_resurrect.py"
@@ -508,7 +511,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "mempool_unbroadcast.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs `mockscheduler` RPC and `unbroadcast` field in getmempoolentry"
 
 [[test]]
 file = "mempool_updatefromblock.py"
@@ -519,13 +523,14 @@ note = "uses Core v31 cluster-mempool option; satd targets Core v30 compatibilit
 [[test]]
 file = "mining_basic.py"
 status = "skip"
-reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+reason = "feature-missing"
+note = "getmininginfo fixed; fails on -blockversion=1337 (satd ignores -blockversion CLI arg in getblocktemplate)"
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
 status = "skip"
-reason = "cache"
+reason = "core-log"
+note = "assert_debug_log expects 'ThreadRPCServer method=getblocktemplate'; satd does not log per-method RPC calls"
 
 [[test]]
 file = "mining_mainnet.py"
@@ -542,28 +547,32 @@ note = "`prioritisetransaction` with no arguments answers `-1` with a Rust `Erro
 [[test]]
 file = "mining_template_verification.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "getblocktemplate proposal mode returns the full template instead of null for a valid proposal"
 
 [[test]]
 file = "p2p_1p1c_network.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "needs `getorphantxs` RPC"
 
 [[test]]
 file = "p2p_add_connections.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC addconnection, which the framework uses for outbound test connections"
 
 [[test]]
 file = "p2p_addr_relay.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC addconnection for outbound test connections"
 
 [[test]]
 file = "p2p_addr_selfannouncement.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs `addpeeraddress` RPC"
 
 [[test]]
 file = "p2p_addrfetch.py"
@@ -602,7 +611,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "block hash mismatch after compact-block relay in -blocksonly mode; compact-block handling diverges"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
@@ -612,8 +622,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "p2p_disconnect_ban.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "p2p_dns_seeds.py"
@@ -630,7 +639,8 @@ note = "satd sends no periodic P2P ping, so the test's peers never see one. Same
 [[test]]
 file = "p2p_feefilter.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "fee filter relay assertion fails; satd's feefilter relay timing or threshold differs from Core"
 
 [[test]]
 file = "p2p_filter.py"
@@ -647,7 +657,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_getaddr_caching.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs `addpeeraddress` RPC"
 
 [[test]]
 file = "p2p_getdata.py"
@@ -655,7 +666,8 @@ status = "run"
 [[test]]
 file = "p2p_handshake.py"
 status = "skip"
-reason = "cache"
+reason = "core-log"
+note = "assert_debug_log expects 'ignoring redundant verack message'; satd does not log this"
 
 [[test]]
 file = "p2p_headers_sync_with_minchainwork.py"
@@ -666,7 +678,8 @@ note = "a wait_until predicate on headers sync times out; not yet attributed"
 [[test]]
 file = "p2p_i2p_ports.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "satd hard-errors on -i2psam config key; I2P is out of scope"
 
 [[test]]
 file = "p2p_i2p_sessions.py"
@@ -700,8 +713,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "p2p_invalid_locator.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "p2p_invalid_messages.py"
@@ -718,12 +730,14 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_leak.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "satd does not send a wtxidrelay message during handshake; test asserts got_wtxidrelay"
 
 [[test]]
 file = "p2p_leak_tx.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "getrawmempool(verbose=false, mempool_sequence=true) returns a list instead of {txids, mempool_sequence}; satd has no mempool sequence counter"
 
 [[test]]
 file = "p2p_message_capture.py"
@@ -765,17 +779,19 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "p2p_orphan_handling.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+note = "needs `getorphantxs` RPC"
 
 [[test]]
 file = "p2p_outbound_eviction.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC addconnection for outbound test connections"
 
 [[test]]
 file = "p2p_permissions.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "tx not relayed to a -whitelist peer with relay permission; satd's permission-based relay logic differs"
 
 [[test]]
 file = "p2p_ping.py"
@@ -798,7 +814,8 @@ note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, 
 [[test]]
 file = "p2p_seednode.py"
 status = "skip"
-reason = "cache"
+reason = "core-log"
+note = "assert_debug_log expects 'Empty addrman, adding seednode...'; satd does not log this"
 
 [[test]]
 file = "p2p_segwit.py"
@@ -815,7 +832,8 @@ note = "satd announces a different set of headers than the test expects; not yet
 [[test]]
 file = "p2p_sendtxrcncl.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "erlay/tx reconciliation (BIP 330) not implemented; satd does not send sendtxrcncl during handshake"
 
 [[test]]
 file = "p2p_timeouts.py"
@@ -826,7 +844,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "p2p_tx_download.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "satd does not send GETDATA after receiving a WTX INV; tx download scheduling for wtxid-relay not implemented"
 
 [[test]]
 file = "p2p_tx_privacy.py"
@@ -843,12 +862,14 @@ note = "satd accepts positional JSON-RPC parameters only; a named request fails 
 [[test]]
 file = "p2p_v2_encrypted.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the hidden Core RPC addconnection for outbound v2 test connections"
 
 [[test]]
 file = "p2p_v2_misbehaving.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "v2 transport peer_id counter semantics differ after a detection timeout"
 
 [[test]]
 file = "p2p_v2_transport.py"
@@ -872,7 +893,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 file = "rpc_createmultisig.py"
 status = "skip"
 reason = "rpc-missing"
-note = "MiniWallet drives this through `generatetodescriptor`, which satd does not implement. Follow-up: generatetodescriptor"
+note = "needs `createmultisig` RPC (not a wallet-only method in Core)"
 
 [[test]]
 file = "rpc_decodescript.py"
@@ -887,7 +908,8 @@ status = "run"
 [[test]]
 file = "rpc_deriveaddresses.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs deriveaddresses RPC; also, sat-cli rejects the -n flag Core's CLI uses"
 
 [[test]]
 file = "rpc_dumptxoutset.py"
@@ -898,12 +920,14 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "rpc_estimatefee.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "estimatesmartfee with no args leaks a jsonrpsee ErrorObject Debug dump instead of returning help text. Follow-up: error-message sweep"
 
 [[test]]
 file = "rpc_generate.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "generatetoaddress error message is 'invalid address: validation error' where Core says 'Invalid address'; also needs generateblock with combo() descriptor"
 
 [[test]]
 file = "rpc_getblockfilter.py"
@@ -914,7 +938,8 @@ note = "getblockfilter returns -5 'filter not found for non-active block'; not y
 [[test]]
 file = "rpc_getblockfrompeer.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "blocked by getchaintips not reporting fork tips; test filters getchaintips() for a non-active hash"
 
 [[test]]
 file = "rpc_getblockstats.py"
@@ -924,7 +949,8 @@ reason = "no-wallet"
 [[test]]
 file = "rpc_getchaintips.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "getchaintips only reports the active tip; fork tips (headers-valid, valid-fork) not tracked"
 
 [[test]]
 file = "rpc_getdescriptoractivity.py"
@@ -935,7 +961,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs getdescriptorinfo RPC"
 
 [[test]]
 file = "rpc_gettxspendingprevout.py"
@@ -946,7 +973,8 @@ note = "uses -txospenderindex (Core v31); satd targets Core v30 compatibility, s
 [[test]]
 file = "rpc_help.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the dump_all_command_conversions hidden RPC and Core-format help text (IndexError parsing help output)"
 
 [[test]]
 file = "rpc_invalid_address_message.py"
@@ -963,17 +991,18 @@ note = "satd accepts positional JSON-RPC parameters only; a named request fails 
 [[test]]
 file = "rpc_misc.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs the echo debug RPC; the first call is node.echo()"
 
 [[test]]
 file = "rpc_named_arguments.py"
-status = "skip"
-reason = "cache"
+status = "run"
 
 [[test]]
 file = "rpc_net.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "test starts nodes with -proxy; satd's SOCKS5 proxy support fails to connect through it"
 
 [[test]]
 file = "rpc_orphans.py"
@@ -1001,12 +1030,14 @@ reason = "no-wallet"
 [[test]]
 file = "rpc_rawtransaction.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "getindexinfo does not include a txindex entry; test needs --txindex and waits for sync via getindexinfo"
 
 [[test]]
 file = "rpc_scanblocks.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs scanblocks RPC and -blockfilterindex activation from config"
 
 [[test]]
 file = "rpc_scantxoutset.py"
@@ -1040,7 +1071,8 @@ note = "needs `createmultisig`"
 [[test]]
 file = "rpc_txoutproof.py"
 status = "skip"
-reason = "cache"
+reason = "rpc-missing"
+note = "needs gettxoutproof and verifytxoutproof RPCs"
 
 [[test]]
 file = "rpc_uptime.py"
@@ -1061,7 +1093,8 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 [[test]]
 file = "rpc_whitelist.py"
 status = "skip"
-reason = "cache"
+reason = "feature-missing"
+note = "satd hard-errors on rpcwhitelistdefault config key; by design, satd uses bearer-token auth instead of Core's RPC whitelists"
 
 [[test]]
 file = "tool_bench_sanity_check.py"
@@ -1097,7 +1130,7 @@ reason = "no-tool"
 file = "tool_utxo_to_sqlite.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `generatetodescriptor`; see feature_framework_miniwallet.py"
+note = "dumptxoutset trailing-characters parse error on positional params"
 
 [[test]]
 file = "tool_wallet.py"

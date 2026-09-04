@@ -81,6 +81,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         "getbestblockhash"
         | "getblock"
         | "getblockchaininfo"
+        | "getdeploymentinfo"
         | "getblockcount"
         | "getblockfilter"
         | "getblockhash"
@@ -127,6 +128,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getaddressutxos"
         | "listbanned"
         | "help"
+        | "echo"
+        | "echojson"
+        | "generate"
         | "uptime"
         | "validateaddress"
         | "ping" => Read,
@@ -198,6 +202,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // --- Block-connecting / chainstate-activating (correctness-critical) ---
         "generateblock"
         | "generatetoaddress"
+        | "generatetodescriptor"
         | "submitblock"
         | "submitheader"
         | "preciousblock"
@@ -233,6 +238,7 @@ mod tests {
         for m in [
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "submitblock",
             "submitheader",
             "preciousblock",
@@ -337,6 +343,7 @@ mod tests {
         for m in [
             "generateblock",
             "generatetoaddress",
+            "generatetodescriptor",
             "submitblock",
             "submitheader",
             "preciousblock",

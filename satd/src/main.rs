@@ -187,6 +187,14 @@ async fn main() {
             .expect("test activation overrides installed twice");
     }
 
+    // `-mocktime=N`: install the mock clock at startup (regtest only).
+    if let Some(t) = config.mocktime
+        && t > 0
+        && node::time::clock_is_mockable(config.network)
+    {
+        node::time::set_mock_time(Some(t));
+    }
+
     // Base log filter (see `config::build_env_filter` for the full precedence
     // rules). The filter is wrapped in a `reload::Layer` so SIGHUP can change
     // log verbosity live (`reload::LogReloadHandle`). Only the EnvFilter is
@@ -1845,6 +1853,15 @@ async fn main() {
     // on every restart.
     peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
 
+    // Load the persistent ban list (banlist.json).
+    match peer_manager.load_banlist(&net_datadir) {
+        Ok(true) => tracing::info!("Recreating the banlist database"),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("Failed to load banlist: {e}");
+        }
+    }
+
     // -externalip: addresses advertised to peers.
     if !config.externalip.is_empty() {
         peer_manager.set_external_addrs(config.externalip.clone());
@@ -2400,6 +2417,7 @@ async fn main() {
         },
         config.rpc_threads,
         config.rpc_workqueue,
+        config.rpc_server_timeout,
         chain_state.clone(),
         mempool.clone(),
         peer_manager.clone(),
@@ -3837,6 +3855,9 @@ async fn start_startup_rpc(
             // `-32601 Method not found` -- `-28` is what a Core-compatible
             // client polls on while a node comes up.
             Some(node::rpc::warmup::WarmupLayer::new(warmup_status.clone())),
+            // The startup RPC uses the same header-read timeout as the full
+            // server.  Core's default (30s) applies.
+            Some(std::time::Duration::from_secs(30)),
         )
         .await
         .unwrap_or_else(|e| {

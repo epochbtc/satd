@@ -32,10 +32,14 @@ const (
 	// EvictPolicy - evicted from the quarantine class on a fee-rate byte-budget
 	// overflow.
 	EvictPolicy EvictReason = 4
+	// EvictReorg - evicted because a chain reorganization made the transaction
+	// invalid (locktime no longer satisfied, coinbase became immature, or
+	// BIP 68 sequence lock unsatisfied).
+	EvictReorg EvictReason = 5
 )
 
 // Known reports whether this build recognizes the reason.
-func (r EvictReason) Known() bool { return r >= EvictUnspecified && r <= EvictPolicy }
+func (r EvictReason) Known() bool { return r >= EvictUnspecified && r <= EvictReorg }
 
 func (r EvictReason) String() string {
 	switch r {
@@ -49,6 +53,8 @@ func (r EvictReason) String() string {
 		return "block_conflict"
 	case EvictPolicy:
 		return "policy"
+	case EvictReorg:
+		return "reorg"
 	default:
 		return "unknown(" + strconv.FormatInt(int64(r), 10) + ")"
 	}

@@ -39,6 +39,34 @@ fn now_unix_secs() -> u64 {
     crate::time::now_secs()
 }
 
+/// Format a satoshi amount as a BTC string the way Core's `FormatMoney` does:
+/// 8 decimal digits, trailing zeros stripped but keeping at least 2 decimals.
+/// Compute the modified fee: base fee adjusted by `prioritisetransaction`
+/// delta. A negative delta that exceeds the base fee clamps to 0 — the
+/// modified fee is never negative (matching Bitcoin Core).
+fn modified_fee(base_fee: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        base_fee.saturating_add(delta as u64)
+    } else {
+        base_fee.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn format_btc(sats: u64) -> String {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    let full = format!("{whole}.{frac:08}");
+    // Trim trailing zeros, but keep at least 2 decimal digits.
+    let dot = full.find('.').unwrap();
+    let min_len = dot + 3; // "X.00"
+    let trimmed = full.trim_end_matches('0');
+    if trimmed.len() < min_len {
+        full[..min_len].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MempoolError {
     #[error("txn-already-in-mempool")]
@@ -47,7 +75,7 @@ pub enum MempoolError {
     ConflictingSpend,
     #[error("bad-txns-inputs-missingorspent")]
     MissingInputs,
-    #[error("min relay fee not met. {0} < {1}")]
+    #[error("min relay fee not met")]
     InsufficientFee(u64, u64),
     #[error("mempool full")]
     MempoolFull,
@@ -71,10 +99,24 @@ pub enum MempoolError {
     DecodeFailed,
     #[error("dust")]
     Dust,
-    #[error("scriptpubkey")]
+    #[error("datacarrier")]
     NonStandardOpReturn,
-    #[error("insufficient fee for RBF. {0} < {1}")]
-    InsufficientReplacementFee(u64, u64),
+    /// RBF: replacement tx does not pay enough additional fee.
+    /// Fields: `(new_fee, min_required, replacement_txid, detail)`.
+    #[error("insufficient fee")]
+    InsufficientReplacementFee(u64, u64, String, String),
+    /// RBF: replacement tx spends an output of one of the conflicted txs.
+    /// Field: detail message.
+    #[error("bad-txns-spends-conflicting-tx")]
+    SpendsConflictingTx(String),
+    /// RBF: replacement would evict too many conflicting clusters.
+    /// Field: detail message.
+    #[error("too many potential replacements")]
+    TooManyReplacements(String),
+    /// RBF: replacement does not improve the feerate diagram.
+    /// Field: detail message.
+    #[error("insufficient feerate: does not improve feerate diagram")]
+    DoesNotImproveFeerateDiagram(String),
     #[error("too-long-mempool-chain")]
     TooLongMempoolChain,
     /// A locally-submitted transaction drew a relay-scoped quarantine verdict
@@ -97,52 +139,128 @@ pub enum MempoolError {
 }
 
 impl MempoolError {
-    /// Core-compatible short reject reason for `testmempoolaccept`.
+    /// Core's `sendrawtransaction` error code for this rejection.
     ///
-    /// `testmempoolaccept` returns a `reject-reason` field that is a short
-    /// category string (e.g. "dust", "min relay fee not met") without the
-    /// numeric details that the full `Display` includes. This method returns
-    /// that category string.
-    pub fn reject_reason(&self) -> &str {
+    /// The split is narrower than "consensus vs policy". `HandleATMPError`
+    /// (`src/node/transaction.cpp`) turns *every* invalid
+    /// `AcceptToMemoryPool` outcome except `TX_MISSING_INPUTS` into
+    /// `MEMPOOL_REJECTED`, and `RPCErrorFromTransactionError`
+    /// (`src/rpc/util.cpp`) maps that to `-26` (`RPC_VERIFY_REJECTED`). So
+    /// the `-25` default is reached, in practice, only by missing inputs.
+    ///
+    /// Core's own suite says the same thing: `rpc_rawtransaction.py:354` is
+    /// the single `sendrawtransaction` case asserting `-25`
+    /// (`bad-txns-inputs-missingorspent`), while script, amount, maturity
+    /// and standardness failures all assert `-26` (`feature_nulldummy.py`,
+    /// `feature_segwit.py`, `feature_rbf.py`).
+    pub fn rpc_code(&self) -> i32 {
         match self {
-            MempoolError::AlreadyExists => "txn-already-in-mempool",
-            MempoolError::ConflictingSpend => "txn-mempool-conflict",
-            MempoolError::MissingInputs => "bad-txns-inputs-missingorspent",
-            MempoolError::InsufficientFee(..) => "min relay fee not met",
-            MempoolError::MempoolFull => "mempool full",
-            MempoolError::Validation(s) => s.as_str(),
-            MempoolError::Script(_) => "mandatory-script-verify-flag-failed",
-            MempoolError::BadAmounts => "bad-txns-in-belowout",
-            MempoolError::PrematureCoinbaseSpend => "bad-txns-premature-spend-of-coinbase",
-            MempoolError::NonFinal => "non-final",
-            MempoolError::NonBip68Final => "non-BIP68-final",
-            MempoolError::DecodeFailed => "TX decode failed",
-            MempoolError::Dust => "dust",
-            MempoolError::NonStandardOpReturn => "scriptpubkey",
-            MempoolError::InsufficientReplacementFee(..) => "insufficient fee",
-            MempoolError::TooLongMempoolChain => "too-long-mempool-chain",
-            MempoolError::Quarantined(_) => "txn-policy-quarantined",
-            MempoolError::EphemeralDustFee => "dust, tx with dust output must be 0-fee",
-            MempoolError::MissingEphemeralSpends(_) => "missing-ephemeral-spends",
+            // Core reaches the `-25` default essentially only here:
+            // `TX_MISSING_INPUTS` is the one invalid result `HandleATMPError`
+            // does not fold into `MEMPOOL_REJECTED`.
+            Self::MissingInputs => -25,
+
+            // satd-only, and not a verdict about the transaction: the node
+            // declined to relay it (design §6.1). `satd/tests/policy.rs`
+            // pins this code.
+            Self::Quarantined(_) => -25,
+
+            // Everything else is an "invalid or rejected" verdict, which
+            // Core funnels through `MEMPOOL_REJECTED` -> `-26`.
+            Self::BadAmounts
+            | Self::Script(_)
+            | Self::DecodeFailed
+            | Self::PrematureCoinbaseSpend
+            | Self::Validation(_)
+            | Self::AlreadyExists
+            | Self::ConflictingSpend
+            | Self::InsufficientFee(..)
+            | Self::MempoolFull
+            | Self::NonFinal
+            | Self::NonBip68Final
+            | Self::Dust
+            | Self::NonStandardOpReturn
+            | Self::InsufficientReplacementFee(..)
+            | Self::SpendsConflictingTx(..)
+            | Self::TooManyReplacements(..)
+            | Self::DoesNotImproveFeerateDiagram(..)
+            | Self::EphemeralDustFee
+            | Self::MissingEphemeralSpends(..)
+            | Self::TooLongMempoolChain => -26,
         }
     }
 
-    /// JSON-RPC error code for `sendrawtransaction`.
-    ///
-    /// Maps each error variant to the Bitcoin Core taxonomy:
-    /// - `-22` (`RPC_DESERIALIZATION_ERROR`): decode failures
-    /// - `-25` (`RPC_VERIFY_ERROR`): consensus verification failures
-    /// - `-26` (`RPC_VERIFY_REJECTED`): policy/mempool rejections
-    pub fn rpc_code(&self) -> i32 {
+    /// Short reject reason label for `testmempoolaccept` (Core parity).
+    /// This is the `reject-reason` field; the full `Display` form goes
+    /// into `reject-details`.
+    pub fn reject_reason(&self) -> String {
         match self {
-            MempoolError::DecodeFailed => -22,
-            MempoolError::Script(_)
-            | MempoolError::BadAmounts
-            | MempoolError::PrematureCoinbaseSpend
-            | MempoolError::MissingInputs
-            | MempoolError::Quarantined(_)
-            | MempoolError::Validation(_) => -25,
-            _ => -26,
+            MempoolError::AlreadyExists => "txn-already-in-mempool".to_string(),
+            MempoolError::ConflictingSpend => "txn-mempool-conflict".to_string(),
+            MempoolError::MissingInputs => "bad-txns-inputs-missingorspent".to_string(),
+            MempoolError::InsufficientFee(..) => "min relay fee not met".to_string(),
+            MempoolError::MempoolFull => "mempool full".to_string(),
+            MempoolError::Validation(s) => s.clone(),
+            MempoolError::Script(s) => {
+                format!("mandatory-script-verify-flag-failed ({s})")
+            }
+            MempoolError::BadAmounts => "bad-txns-in-belowout".to_string(),
+            MempoolError::PrematureCoinbaseSpend => {
+                "bad-txns-premature-spend-of-coinbase".to_string()
+            }
+            MempoolError::NonFinal => "non-final".to_string(),
+            MempoolError::NonBip68Final => "non-BIP68-final".to_string(),
+            MempoolError::DecodeFailed => "TX decode failed".to_string(),
+            MempoolError::Dust => "dust".to_string(),
+            MempoolError::NonStandardOpReturn => "scriptpubkey".to_string(),
+            MempoolError::InsufficientReplacementFee(..) => "insufficient fee".to_string(),
+            MempoolError::SpendsConflictingTx(..) => {
+                "bad-txns-spends-conflicting-tx".to_string()
+            }
+            MempoolError::TooManyReplacements(..) => {
+                "too many potential replacements".to_string()
+            }
+            MempoolError::DoesNotImproveFeerateDiagram(..) => {
+                "insufficient feerate: does not improve feerate diagram".to_string()
+            }
+            MempoolError::TooLongMempoolChain => "too-long-mempool-chain".to_string(),
+            // `ephemeral_policy.cpp`: reason "dust", debug "tx with dust
+            // output must be 0-fee" — the detail goes to `reject_details`.
+            MempoolError::EphemeralDustFee => "dust".to_string(),
+            MempoolError::MissingEphemeralSpends(_) => "missing-ephemeral-spends".to_string(),
+            MempoolError::Quarantined(rule) => {
+                format!("txn-policy-quarantined: held by policy rule '{rule}'")
+            }
+        }
+    }
+
+    /// Full detail string for `testmempoolaccept` `reject-details` and
+    /// `sendrawtransaction` error messages (Core parity). Returns `None`
+    /// when the short reason is sufficient (no extra detail).
+    pub fn reject_details(&self) -> Option<String> {
+        match self {
+            MempoolError::InsufficientReplacementFee(_, _, _, detail) => {
+                Some(detail.clone())
+            }
+            MempoolError::SpendsConflictingTx(detail) => Some(detail.clone()),
+            MempoolError::TooManyReplacements(detail) => Some(detail.clone()),
+            MempoolError::DoesNotImproveFeerateDiagram(detail) => Some(detail.clone()),
+            MempoolError::EphemeralDustFee => {
+                Some("tx with dust output must be 0-fee".to_string())
+            }
+            MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
+            _ => None,
+        }
+    }
+
+    /// The full string for `sendrawtransaction` error messages. Produces
+    /// `"reject-reason, details"` when details exist, otherwise just the
+    /// reject-reason.
+    pub fn sendrawtransaction_msg(&self) -> String {
+        if let Some(detail) = self.reject_details() {
+            detail
+        } else {
+            self.reject_reason()
         }
     }
 }
@@ -307,9 +425,17 @@ pub struct MempoolInfo {
     pub bytes: usize,
     pub max_size: usize,
     pub min_fee_rate: u64,
+    pub incremental_relay_fee: u64,
     pub full_rbf: bool,
     /// Count of locally-originated txs not yet confirmed propagated.
     pub unbroadcast: usize,
+    /// Effective OP_RETURN relay cap: 0 when `-datacarrier=0`, otherwise
+    /// the configured `-datacarriersize` (default: Core v31's uncapped
+    /// `MAX_STANDARD_TX_WEIGHT / 4` = 100 000).  Surfaced by
+    /// `getmempoolinfo.maxdatacarriersize`.
+    pub max_data_carrier_size: usize,
+    /// Whether bare multisig outputs are relayed (`-permitbaremultisig`).
+    pub permit_bare_multisig: bool,
 }
 
 /// Outcome of a ruleset re-placement pass ([`Mempool::reapply_policy`], §8).
@@ -481,7 +607,6 @@ struct MempoolInner {
     /// when the tx is later accepted the delta applies. Entries are moved into
     /// the `MempoolEntry::fee_delta` field on admission and removed here.
     /// Cleared when the delta sums to zero (the "reset" path).
-    pending_priority: HashMap<Txid, i64>,
     /// Serialized bytes of **all** entries (acting + quarantine) — the single
     /// physical pool's occupancy. `acting_bytes()` derives the acting class by
     /// subtracting `quarantine_bytes`.
@@ -507,6 +632,11 @@ struct MempoolInner {
     /// Always a subset of `entries`. This is satd's analogue of Core's
     /// `m_unbroadcast_txids`, surfaced as `getmempoolinfo.unbroadcastcount`.
     unbroadcast: HashMap<Txid, HashSet<std::net::IpAddr>>,
+    /// Pre-set fee deltas from `prioritisetransaction` — includes deltas for
+    /// txids not (yet) in the pool, matching Bitcoin Core's `mapDeltas`.
+    /// When a tx enters the pool any pre-existing delta here is applied to its
+    /// `MempoolEntry::fee_delta`; the entry remains so subsequent calls stack.
+    fee_deltas: FxHashMap<Txid, i64>,
 }
 
 impl MempoolInner {
@@ -630,6 +760,9 @@ pub struct MempoolConfig {
     /// load (fatal at startup; last-good kept on SIGHUP). When true, such rules
     /// load with a loud warning instead. Template-only matches always warn-only.
     pub allow_dangerous_filters: bool,
+    /// `incrementalrelayfee` in sat/kvB — minimum additional feerate a
+    /// replacement must pay per relay hop (Core default: 1000 sat/kvB).
+    pub incremental_relay_fee: u64,
     /// How much per-input prevout metadata to retain at admission for the
     /// streaming watch matcher (`streamprevoutmeta`). See [`PrevoutMetaLevel`].
     /// Not a Core flag — a satd streaming knob. Default [`PrevoutMetaLevel::Amount`].
@@ -644,7 +777,7 @@ impl Default for MempoolConfig {
             full_rbf: true,
             dust_relay_fee: policy::DUST_RELAY_FEE_RATE,
             data_carrier: true,
-            data_carrier_size: policy::MAX_OP_RETURN_SIZE,
+            data_carrier_size: policy::DEFAULT_DATA_CARRIER_SIZE,
             max_ancestor_count: policy::MAX_ANCESTOR_COUNT,
             max_descendant_count: policy::MAX_DESCENDANT_COUNT,
             expiry_secs: policy::MEMPOOL_EXPIRY_SECS,
@@ -652,6 +785,7 @@ impl Default for MempoolConfig {
             accept_non_std_txn: false,
             quarantine_max_bytes: policy::DEFAULT_QUARANTINE_MEMPOOL_SIZE,
             allow_dangerous_filters: false,
+            incremental_relay_fee: policy::INCREMENTAL_RELAY_FEE,
             prevout_meta: PrevoutMetaLevel::default(),
         }
     }
@@ -838,10 +972,10 @@ impl Mempool {
             inner: RwLock::new(MempoolInner {
                 entries: FxHashMap::default(),
                 spends: FxHashMap::default(),
-                pending_priority: HashMap::new(),
                 total_bytes: 0,
                 quarantine_bytes: 0,
                 unbroadcast: HashMap::new(),
+                fee_deltas: FxHashMap::default(),
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
@@ -1763,9 +1897,19 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        // Dust check is now separate (check_dust) and runs after the fee rate
-        // check, matching Core's ordering: "min relay fee not met" fires before
-        // "dust" for a zero-fee tx with dust outputs.
+        // Dust output check (configurable via -dustrelayfee, 0 = disable).
+        if cfg.dust_relay_fee > 0 {
+            for output in &tx.output {
+                if output.script_pubkey.is_op_return() {
+                    continue;
+                }
+                let threshold =
+                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
+                if output.value.to_sat() < threshold {
+                    return Err(MempoolError::Dust);
+                }
+            }
+        }
 
         // OP_RETURN limits (configurable via -datacarrier and -datacarriersize).
         if !cfg.data_carrier {
@@ -1796,25 +1940,6 @@ impl Mempool {
             }
         }
 
-        Ok(())
-    }
-
-    /// Dust output check, separated from `check_standardness` so it runs after
-    /// the fee rate check — matching Core's ordering where "min relay fee not
-    /// met" fires before "dust" for a zero-fee tx with dust outputs.
-    fn check_dust(tx: &Transaction, cfg: &MempoolConfig) -> Result<(), MempoolError> {
-        if cfg.dust_relay_fee > 0 {
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    continue;
-                }
-                let threshold =
-                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
-                if output.value.to_sat() < threshold {
-                    return Err(MempoolError::Dust);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1948,7 +2073,9 @@ impl Mempool {
         if !cfg.accept_non_std_txn
             && let Err(e) = Self::check_standardness(&tx, &cfg, weight)
         {
-            if has_allow {
+            if has_allow || matches!(e, MempoolError::Dust) {
+                // Defer dust errors: the fee rate check must fire first so
+                // a 0-fee dusty tx gets "min relay fee not met" (Core parity).
                 deferred_nonstd = Some(e);
             } else {
                 return Err(e);
@@ -2075,41 +2202,135 @@ impl Mempool {
 
         // RBF: if there are conflicts, check replacement rules
         if !conflicts.is_empty() {
-            // Sum fees of all conflicted transactions
-            let mut conflict_fee_total: u64 = 0;
+            // Opt-in RBF: each direct conflict must signal replaceability.
             for conflict_txid in &conflicts {
-                if let Some(conflict_entry) = inner.entries.get(conflict_txid) {
-                    // RBF: in opt-in mode, conflicted tx must signal replaceability
-                    // (any input with sequence < 0xfffffffe). Full RBF skips this check.
-                    if !cfg.full_rbf {
-                        let signals_rbf = conflict_entry
-                            .tx
-                            .input
-                            .iter()
-                            .any(|i| i.sequence.0 < 0xffff_fffe);
-                        if !signals_rbf {
-                            return Err(MempoolError::ConflictingSpend);
-                        }
+                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
+                    && !cfg.full_rbf
+                {
+                    let signals_rbf = conflict_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.sequence.0 < 0xffff_fffe);
+                    if !signals_rbf {
+                        return Err(MempoolError::ConflictingSpend);
                     }
-                    conflict_fee_total += conflict_entry.fee;
                 }
             }
 
-            // Compute new tx fee (we have sum_inputs and sum_outputs from below)
+            // Too-many-replacements limit: reject if the replacement
+            // conflicts with more than 100 distinct clusters.
+            if conflicts.len() > 100 {
+                let detail = format!(
+                    "too many potential replacements, rejecting replacement {}; \
+                     too many conflicting clusters ({} > 100)",
+                    txid,
+                    conflicts.len(),
+                );
+                return Err(MempoolError::TooManyReplacements(detail));
+            }
+
+            // Collect all txids that would be evicted (conflicts + descendants)
+            // and sum their fees.
+            let (all_evicted, conflict_fee_total) =
+                Self::rbf_conflict_set(&inner, &conflicts);
+
+            // Reject if the replacement spends an output of any evicted tx
+            // (direct conflict or descendant).
+            for input in &tx.input {
+                if all_evicted.contains(&input.previous_output.txid) {
+                    let detail = format!(
+                        "bad-txns-spends-conflicting-tx, {} spends conflicting \
+                         transaction {}",
+                        txid, input.previous_output.txid,
+                    );
+                    return Err(MempoolError::SpendsConflictingTx(detail));
+                }
+            }
+
+            // Compute new tx fee (base), then apply any pre-set
+            // `prioritisetransaction` delta for this txid.
             let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             if sum_inputs < sum_outputs {
                 return Err(MempoolError::BadAmounts);
             }
-            let new_fee = sum_inputs - sum_outputs;
+            let new_base_fee = sum_inputs - sum_outputs;
+            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+            let new_fee = modified_fee(new_base_fee, new_delta);
 
-            // New fee must exceed old fees + incremental relay fee (per vbyte).
-            let min_replacement_fee = conflict_fee_total
-                + policy::INCREMENTAL_RELAY_FEE * policy::weight_to_vsize(weight as u64) / 1000;
-            if new_fee < min_replacement_fee {
+            // Check 1: new modified fee must be at least as much as all evicted
+            // modified fees.
+            if new_fee < conflict_fee_total {
+                let detail = format!(
+                    "insufficient fee, rejecting replacement {}, less fees than \
+                     conflicting txs; {} < {}",
+                    txid, format_btc(new_fee), format_btc(conflict_fee_total),
+                );
                 return Err(MempoolError::InsufficientReplacementFee(
                     new_fee,
-                    min_replacement_fee,
+                    conflict_fee_total,
+                    txid.to_string(),
+                    detail,
                 ));
+            }
+
+            // Check 2: additional fee must cover incremental relay fee for
+            // the replacement's size.
+            let additional = new_fee - conflict_fee_total;
+            let min_relay = (cfg.incremental_relay_fee
+                * policy::weight_to_vsize(weight as u64))
+                .div_ceil(1000);
+            if additional < min_relay {
+                let detail = format!(
+                    "insufficient fee, rejecting replacement {}, not enough \
+                     additional fees to relay; {} < {}",
+                    txid, format_btc(additional), format_btc(min_relay),
+                );
+                return Err(MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    conflict_fee_total + min_relay,
+                    txid.to_string(),
+                    detail,
+                ));
+            }
+
+            // Feerate-diagram check: the replacement (plus its non-evicted
+            // in-mempool ancestors) must have a strictly higher chunk feerate
+            // than each direct conflict it replaces. This approximates Core
+            // v31's full cluster-mempool feerate diagram by treating the
+            // replacement's ancestor set as a single chunk.
+            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
+
+            // Compute the ancestor-aware chunk feerate for the replacement.
+            // Include all in-mempool ancestors that are NOT being evicted.
+            let mut anc_fee_total: u64 = new_fee;
+            let mut anc_weight_total: u64 = weight as u64;
+            for anc_txid in &ancestors {
+                if !all_evicted.contains(anc_txid)
+                    && let Some(ae) = inner.entries.get(anc_txid)
+                {
+                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
+                    anc_weight_total += ae.weight as u64;
+                }
+            }
+            let ancestor_feerate =
+                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            // Use the lower of the individual and ancestor feerates as the
+            // effective feerate of the replacement "chunk".
+            let effective_feerate = new_feerate.min(ancestor_feerate);
+
+            for conflict_txid in &conflicts {
+                if let Some(ce) = inner.entries.get(conflict_txid) {
+                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
+                        modified_fee(ce.fee, ce.fee_delta),
+                        ce.weight as u64,
+                    );
+                    if effective_feerate <= conflict_mod_feerate {
+                        return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                            "insufficient feerate: does not improve feerate diagram".to_string(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -2127,18 +2348,13 @@ impl Mempool {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
 
-        // Dust check — after fee rate so "min relay fee not met" fires before
-        // "dust" for a zero-fee tx (Core's ordering).
-        if !cfg.accept_non_std_txn {
-            if has_allow {
-                if let Err(e) = Self::check_dust(&tx, &cfg)
-                    && deferred_nonstd.is_none()
-                {
-                    deferred_nonstd = Some(e);
-                }
-            } else {
-                Self::check_dust(&tx, &cfg)?;
-            }
+        // Apply deferred dust error now that the fee rate check has passed.
+        // A non-zero-fee tx with dust is rejected as "dust"; a zero-fee tx
+        // was already rejected above as "min relay fee not met".
+        if !has_allow
+            && let Some(e) = deferred_nonstd.take()
+        {
+            return Err(e);
         }
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
@@ -2341,20 +2557,22 @@ impl Mempool {
         // txid (§10). (After the isolation guard above, a quarantined submission
         // can't reach here with an acting conflict, so this only filters out
         // quarantined conflicts displaced by an acting replacement.)
+        // Collect all txids to evict (conflicts + descendants).
+        let (all_evicted, _) = Self::rbf_conflict_set(&inner, &conflicts);
         let mut replaced: Vec<Txid> = Vec::new();
-        for conflict_txid in &conflicts {
-            if let Some(conflict_entry) = inner.entries.remove(conflict_txid) {
-                let was_acting = conflict_entry.scope.is_acting();
-                let sz = bitcoin::consensus::serialize(&conflict_entry.tx).len();
-                inner.account_remove(conflict_entry.scope, sz);
-                for ci in &conflict_entry.tx.input {
+        for evict_txid in &all_evicted {
+            if let Some(evict_entry) = inner.entries.remove(evict_txid) {
+                let was_acting = evict_entry.scope.is_acting();
+                let sz = bitcoin::consensus::serialize(&evict_entry.tx).len();
+                inner.account_remove(evict_entry.scope, sz);
+                for ci in &evict_entry.tx.input {
                     inner.spends.remove(&ci.previous_output);
                 }
-                inner.unbroadcast.remove(conflict_txid);
+                inner.unbroadcast.remove(evict_txid);
                 if was_acting {
-                    replaced.push(*conflict_txid);
+                    replaced.push(*evict_txid);
                 }
-                tracing::info!(%conflict_txid, "RBF: evicted conflicting transaction");
+                tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
             }
         }
         self.sync_unbroadcast_len(&inner);
@@ -2419,6 +2637,8 @@ impl Mempool {
 
         let entry_weight_u64 = weight as u64;
         let vsize_u64 = policy::weight_to_vsize(entry_weight_u64);
+        // Apply any pre-set `prioritisetransaction` delta for this txid.
+        let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         inner.entries.insert(
             txid,
             MempoolEntry {
@@ -2427,7 +2647,7 @@ impl Mempool {
                 weight,
                 fee_rate,
                 time: now,
-                fee_delta: 0,
+                fee_delta: preset_delta,
                 sigop_cost,
                 prev_scripthashes,
                 prev_amounts,
@@ -2575,6 +2795,164 @@ impl Mempool {
         }
     }
 
+    /// Remove mempool transactions invalidated by a chain reorganization.
+    ///
+    /// Mirrors Bitcoin Core's `removeForReorg`: after the active chain
+    /// changes, some previously-valid mempool transactions may have become
+    /// invalid because their locktime is no longer satisfied (MTP moved
+    /// backwards), they spend an immature coinbase (tip height decreased),
+    /// or their BIP 68 sequence locks are no longer met. This function
+    /// evicts those transactions and their in-mempool descendants.
+    ///
+    /// Called during reorg reconciliation after `remove_for_block` has
+    /// already evicted confirmations and conflicts from the reconnected
+    /// blocks, and after disconnected-block transactions have been
+    /// re-offered to the mempool.
+    pub fn remove_for_reorg(&self, chain_state: &ChainState) {
+        let tip_height = chain_state.tip_height();
+        let next_height = tip_height + 1;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
+        let mut directly_invalid: Vec<Txid> = Vec::new();
+        let mut all_to_remove: HashSet<Txid> = HashSet::new();
+        let mut evicted: Vec<Txid> = Vec::new();
+
+        {
+            let mut inner = self.inner.write();
+
+            // Pass 1: identify directly invalid transactions.
+            for (txid, entry) in &inner.entries {
+                let tx = &entry.tx;
+
+                // (a) Locktime finality (Core: CheckFinalTxAtTip).
+                let locktime = tx.lock_time.to_consensus_u32();
+                if locktime > 0
+                    && !tx
+                        .input
+                        .iter()
+                        .all(|i| i.sequence == bitcoin::Sequence::MAX)
+                {
+                    let cutoff = if locktime < 500_000_000 {
+                        next_height
+                    } else {
+                        tip_mtp
+                    };
+                    if locktime >= cutoff {
+                        directly_invalid.push(*txid);
+                        continue;
+                    }
+                }
+
+                let bip68_enforced = (tx.version.0 as u32) >= 2;
+                let mut invalid = false;
+
+                for input in &tx.input {
+                    // Inputs referencing mempool parents inherit validity
+                    // from the parent — cascade-removal handles them.
+                    if inner.entries.contains_key(&input.previous_output.txid) {
+                        // BIP 68 against a mempool parent: the unconfirmed
+                        // parent is treated as confirming at next_height
+                        // (matching accept_transaction's convention).
+                        if bip68_enforced
+                            && !Self::bip68_satisfied(
+                                chain_state,
+                                input.sequence.0,
+                                next_height,
+                                next_height,
+                                tip_mtp,
+                            )
+                        {
+                            invalid = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Input from chain state.
+                    if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                        // (b) Coinbase maturity.
+                        if coin.coinbase
+                            && next_height.saturating_sub(coin.height) < COINBASE_MATURITY
+                        {
+                            invalid = true;
+                            break;
+                        }
+                        // (c) BIP 68 sequence locks.
+                        if bip68_enforced
+                            && !Self::bip68_satisfied(
+                                chain_state,
+                                input.sequence.0,
+                                coin.height,
+                                next_height,
+                                tip_mtp,
+                            )
+                        {
+                            invalid = true;
+                            break;
+                        }
+                    } else {
+                        // UTXO not found and not a mempool parent — the
+                        // input no longer exists after the reorg.
+                        invalid = true;
+                        break;
+                    }
+                }
+
+                if invalid {
+                    directly_invalid.push(*txid);
+                }
+            }
+
+            // Pass 2: walk descendants of each directly-invalid tx so
+            // the whole subgraph is removed atomically.
+            for txid in &directly_invalid {
+                all_to_remove.insert(*txid);
+                let mut queue = vec![*txid];
+                let mut buf: Vec<Txid> = Vec::new();
+                while let Some(current) = queue.pop() {
+                    buf.clear();
+                    Self::collect_children(&inner, &current, &mut buf);
+                    for &child in &buf {
+                        if inner.entries.contains_key(&child) && all_to_remove.insert(child) {
+                            queue.push(child);
+                        }
+                    }
+                }
+            }
+
+            // Pass 3: remove.
+            for txid in &all_to_remove {
+                if let Some(entry) = inner.entries.remove(txid) {
+                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.account_remove(entry.scope, tx_size);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    inner.unbroadcast.remove(txid);
+                    if entry.scope.is_acting() {
+                        evicted.push(*txid);
+                    }
+                }
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+
+        // Emit events outside the lock.
+        for txid in &evicted {
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid: *txid,
+                reason: EvictReason::Reorg,
+            });
+        }
+
+        if !all_to_remove.is_empty() {
+            tracing::info!(
+                count = all_to_remove.len(),
+                "Removed invalid transactions after reorg"
+            );
+        }
+    }
+
     /// Get a transaction by txid.
     pub fn get(&self, txid: &Txid) -> Option<MempoolEntry> {
         self.inner.read().entries.get(txid).cloned()
@@ -2582,34 +2960,39 @@ impl Mempool {
 
     /// Adjust the fee delta for a transaction (for mining priority).
     ///
-    /// Works for both in-mempool and not-yet-seen transactions — Core stores
-    /// the delta regardless, applying it when the tx later arrives. Returns
-    /// `Ok(true)` when the tx is in the mempool, `Ok(false)` when stored
-    /// only in the pending map. Returns `Err` if the tx is in the mempool
-    /// and has a dust output (Core rejects priority changes for ephemeral
-    /// dust parents).
+    /// Matches Bitcoin Core's `PrioritiseTransaction`: the delta is stored
+    /// even if the txid is not (yet) in the mempool — it will be applied
+    /// when the tx is later admitted. Successive calls stack (saturating).
+    ///
+    /// `Ok(true)` if the transaction was already in the mempool. Core refuses
+    /// to prioritise a transaction carrying dust outputs, because ephemeral
+    /// dust is only relayable while the transaction stays 0-fee. The refusal
+    /// is decided *before* the delta is stored, so a rejected call leaves no
+    /// delta behind to be applied on a later admission.
     pub fn prioritise_transaction(
         &self,
         txid: &Txid,
         fee_delta: i64,
     ) -> Result<bool, MempoolError> {
         let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.get(txid)
+            && Self::tx_has_dust_outputs(&entry.tx)
+        {
+            return Err(MempoolError::Validation(
+                "Priority is not supported for transactions with dust outputs.".to_string(),
+            ));
+        }
+        // Update the persistent delta map (stacks on previous calls).
+        let stored = inner.fee_deltas.entry(*txid).or_insert(0);
+        *stored = stored.saturating_add(fee_delta);
+        if *stored == 0 {
+            inner.fee_deltas.remove(txid);
+        }
+        // If the tx is already in the pool, update its live entry too.
         if let Some(entry) = inner.entries.get_mut(txid) {
-            // Core blocks priority for in-mempool txs with dust outputs.
-            if Self::tx_has_dust_outputs(&entry.tx) {
-                return Err(MempoolError::Validation(
-                    "Priority is not supported for transactions with dust outputs.".to_string(),
-                ));
-            }
             entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
             Ok(true)
         } else {
-            // Store for later application when the tx is accepted.
-            let current = inner.pending_priority.entry(*txid).or_insert(0);
-            *current = current.saturating_add(fee_delta);
-            if *current == 0 {
-                inner.pending_priority.remove(txid);
-            }
             Ok(false)
         }
     }
@@ -2628,7 +3011,7 @@ impl Mempool {
             }
         }
         // Pending (not yet in mempool) deltas
-        for (txid, delta) in &inner.pending_priority {
+        for (txid, delta) in &inner.fee_deltas {
             result.insert(*txid, (*delta, false));
         }
         result
@@ -2877,6 +3260,34 @@ impl Mempool {
         }
     }
 
+    /// Collect all txids that would be evicted by replacing `conflicts` and
+    /// sum their **modified** fees (base fee + `prioritisetransaction` delta).
+    /// Returns `(all_evicted, total_modified_fee)`. `all_evicted` includes the
+    /// direct conflicts and all their descendants.
+    fn rbf_conflict_set(
+        inner: &MempoolInner,
+        conflicts: &HashSet<Txid>,
+    ) -> (HashSet<Txid>, u64) {
+        let mut all = conflicts.clone();
+        let mut queue: Vec<Txid> = conflicts.iter().copied().collect();
+        let mut buf: Vec<Txid> = Vec::new();
+        while let Some(current) = queue.pop() {
+            buf.clear();
+            Self::collect_children(inner, &current, &mut buf);
+            for &child in &buf {
+                if inner.entries.contains_key(&child) && all.insert(child) {
+                    queue.push(child);
+                }
+            }
+        }
+        let total_fee: u64 = all
+            .iter()
+            .filter_map(|txid| inner.entries.get(txid))
+            .map(|e| modified_fee(e.fee, e.fee_delta))
+            .sum();
+        (all, total_fee)
+    }
+
     /// Get all transitive in-mempool descendants of `txid` (every transaction
     /// reachable by following spends downward), excluding `txid` itself.
     /// Walks the `spends` reverse index via [`Self::collect_children`] —
@@ -2946,6 +3357,7 @@ impl Mempool {
         }
         let vsize = entry.weight / 4;
         let entry_fee = entry.fee;
+        let entry_fee_delta = entry.fee_delta;
         let entry_weight = entry.weight;
         let entry_time = entry.time;
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
@@ -3011,7 +3423,7 @@ impl Mempool {
         Some(serde_json::json!({
             "fees": {
                 "base": entry_fee as f64 / 100_000_000.0,
-                "modified": entry_fee as f64 / 100_000_000.0,
+                "modified": modified_fee(entry_fee, entry_fee_delta) as f64 / 100_000_000.0,
                 "ancestor": ancestor_fees as f64 / 100_000_000.0,
                 "descendant": descendant_fees as f64 / 100_000_000.0,
             },
@@ -3042,6 +3454,7 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
     ) -> Result<(Txid, usize, u64), MempoolError> {
         let txid = tx.compute_txid();
+        let cfg = self.config.read().clone();
 
         crate::validation::tx::check_transaction(tx)
             .map_err(|e| MempoolError::Validation(e.to_string()))?;
@@ -3055,11 +3468,44 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
+        // Standardness checks (dust, etc.) are deferred until after the fee
+        // rate check so that a 0-fee tx is rejected as "min relay fee not met"
+        // rather than "dust" (Core parity).
+
+        // Absolute finality check (Core parity: locktime against next block).
+        let next_height = chain_state.tip_height() + 1;
+        let locktime = tx.lock_time.to_consensus_u32();
+        if locktime > 0
+            && !tx
+                .input
+                .iter()
+                .all(|i| i.sequence == bitcoin::Sequence::MAX)
+        {
+            let cutoff = if locktime < 500_000_000 {
+                next_height
+            } else {
+                chain_state.get_median_time_past(next_height)
+            };
+            if locktime >= cutoff {
+                return Err(MempoolError::NonFinal);
+            }
+        }
+
+        let bip68_enforced = (tx.version.0 as u32) >= 2;
+        let tip_mtp = chain_state.get_median_time_past(next_height);
+
         let inner = self.inner.read();
         if inner.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyExists);
         }
-        drop(inner);
+
+        // Detect conflicting spends (RBF candidates).
+        let mut conflicts: HashSet<Txid> = HashSet::new();
+        for input in &tx.input {
+            if let Some(conflict_txid) = inner.spends.get(&input.previous_output) {
+                conflicts.insert(*conflict_txid);
+            }
+        }
 
         // Look up inputs
         let mut sum_inputs: u64 = 0;
@@ -3069,6 +3515,23 @@ impl Mempool {
 
         for input in &tx.input {
             if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                // Coinbase maturity check.
+                let spend_height = next_height;
+                if coin.coinbase && spend_height - coin.height < COINBASE_MATURITY {
+                    return Err(MempoolError::PrematureCoinbaseSpend);
+                }
+                // BIP 68 relative locktime.
+                if bip68_enforced
+                    && !Self::bip68_satisfied(
+                        chain_state,
+                        input.sequence.0,
+                        coin.height,
+                        next_height,
+                        tip_mtp,
+                    )
+                {
+                    return Err(MempoolError::NonBip68Final);
+                }
                 sum_inputs += coin.amount;
                 prev_outputs.push(TxOut {
                     value: bitcoin::Amount::from_sat(coin.amount),
@@ -3077,9 +3540,20 @@ impl Mempool {
                 prev_is_coinbase.push(coin.coinbase);
             } else {
                 // Check mempool parents
-                let inner = self.inner.read();
                 if let Some(parent) = inner.entries.get(&input.previous_output.txid)
                     && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
+                        // BIP 68 for unconfirmed parent.
+                        if bip68_enforced
+                            && !Self::bip68_satisfied(
+                                chain_state,
+                                input.sequence.0,
+                                next_height,
+                                next_height,
+                                tip_mtp,
+                            )
+                        {
+                            return Err(MempoolError::NonBip68Final);
+                        }
                         sum_inputs += output.value.to_sat();
                         prev_outputs.push(output.clone());
                         prev_is_coinbase.push(false);
@@ -3096,41 +3570,142 @@ impl Mempool {
         }
         let fee = sum_inputs - sum_outputs;
 
+        // RBF conflict checks — mirrors accept_transaction.
+        if !conflicts.is_empty() {
+            // Count conflicting clusters and enforce limit.
+            if conflicts.len() > 100 {
+                let detail = format!(
+                    "too many potential replacements, rejecting replacement {}; \
+                     too many conflicting clusters ({} > 100)",
+                    txid,
+                    conflicts.len(),
+                );
+                return Err(MempoolError::TooManyReplacements(detail));
+            }
+
+            // Opt-in RBF signaling check.
+            for conflict_txid in &conflicts {
+                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
+                    && !cfg.full_rbf
+                {
+                    let signals_rbf = conflict_entry
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| i.sequence.0 < 0xffff_fffe);
+                    if !signals_rbf {
+                        return Err(MempoolError::ConflictingSpend);
+                    }
+                }
+            }
+
+            // Sum modified fees of conflicts + all their descendants.
+            let (all_evicted, conflict_fee_total) =
+                Self::rbf_conflict_set(&inner, &conflicts);
+
+            // Reject if the replacement spends an output of any evicted tx.
+            for input in &tx.input {
+                if all_evicted.contains(&input.previous_output.txid) {
+                    let detail = format!(
+                        "bad-txns-spends-conflicting-tx, {} spends conflicting \
+                         transaction {}",
+                        txid, input.previous_output.txid,
+                    );
+                    return Err(MempoolError::SpendsConflictingTx(detail));
+                }
+            }
+
+            // Apply any pre-set `prioritisetransaction` delta for the
+            // replacement (it is not yet in the pool).
+            let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+            let new_fee = modified_fee(fee, new_delta);
+
+            // Check 1: new modified fee must exceed all evicted modified fees.
+            if new_fee < conflict_fee_total {
+                let detail = format!(
+                    "insufficient fee, rejecting replacement {}, less fees than \
+                     conflicting txs; {} < {}",
+                    txid, format_btc(new_fee), format_btc(conflict_fee_total),
+                );
+                return Err(MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    conflict_fee_total,
+                    txid.to_string(),
+                    detail,
+                ));
+            }
+
+            // Check 2: additional fee must cover incremental relay fee.
+            let additional = new_fee - conflict_fee_total;
+            let min_relay = (cfg.incremental_relay_fee
+                * policy::weight_to_vsize(weight as u64))
+                .div_ceil(1000);
+            if additional < min_relay {
+                let detail = format!(
+                    "insufficient fee, rejecting replacement {}, not enough \
+                     additional fees to relay; {} < {}",
+                    txid, format_btc(additional), format_btc(min_relay),
+                );
+                return Err(MempoolError::InsufficientReplacementFee(
+                    new_fee,
+                    conflict_fee_total + min_relay,
+                    txid.to_string(),
+                    detail,
+                ));
+            }
+
+            // Feerate-diagram check — mirrors accept_transaction.
+            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
+
+            let mut anc_fee_total: u64 = new_fee;
+            let mut anc_weight_total: u64 = weight as u64;
+            for anc_txid in &ancestors {
+                if !all_evicted.contains(anc_txid)
+                    && let Some(ae) = inner.entries.get(anc_txid)
+                {
+                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
+                    anc_weight_total += ae.weight as u64;
+                }
+            }
+            let ancestor_feerate =
+                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            let effective_feerate = new_feerate.min(ancestor_feerate);
+
+            for conflict_txid in &conflicts {
+                if let Some(ce) = inner.entries.get(conflict_txid) {
+                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
+                        modified_fee(ce.fee, ce.fee_delta),
+                        ce.weight as u64,
+                    );
+                    if effective_feerate <= conflict_mod_feerate {
+                        return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                            "insufficient feerate: does not improve feerate diagram".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Fee rate check (sat/kvB), on Core's *modified* fee: a pending
+        // `prioritisetransaction` delta counts toward the min-relay gate, so
+        // `testmempoolaccept` answers what `sendrawtransaction` would do.
+        // `inner` and `cfg` are already held above — do not re-acquire them.
         let weight_u64 = weight as u64;
         let vsize = policy::weight_to_vsize(weight_u64) as usize;
-
-        // Snapshot config for fee rate and standardness checks.
-        let cfg = self.config.read().clone();
-
-        // Apply pending priority delta (Core's GetModifiedFee) to the fee rate
-        // check. testmempoolaccept in Core uses the modified fee for the min
-        // relay fee gate, so prioritisetransaction affects whether a tx passes.
-        let modified_fee = {
-            let inner = self.inner.read();
-            let delta = inner.pending_priority.get(&txid).copied().unwrap_or(0);
-            if delta >= 0 {
-                fee.saturating_add(delta as u64)
-            } else {
-                fee.saturating_sub(delta.unsigned_abs())
-            }
-        };
-        let fee_rate = policy::fee_rate_sat_per_kvb(modified_fee, weight_u64);
-
-        // Fee rate check — matches `accept_transaction`. Without this,
-        // `testmempoolaccept` would report `allowed: true` for a tx that
-        // `sendrawtransaction` would refuse.
+        let priority_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+        let fee_rate =
+            policy::fee_rate_sat_per_kvb(modified_fee(fee, priority_delta), weight_u64);
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
 
-        // Standardness checks (oversize, OP_RETURN, non-standard scripts)
-        // — same gate as `accept_transaction`. The `acceptnonstdtxn` flag
-        // bypasses these.
+        // Standardness checks (dust, OP_RETURN, etc.) — deferred until after
+        // the fee rate check so 0-fee txs get "min relay fee not met" (Core).
         if !cfg.accept_non_std_txn {
             Self::check_standardness(tx, &cfg, weight)?;
-            // Dust check runs after fee rate, matching Core's ordering.
-            Self::check_dust(tx, &cfg)?;
         }
+
+        drop(inner);
 
         // Script verification (tip + 1 = next block height)
         let tip_height = chain_state.tip_height();
@@ -3839,7 +4414,9 @@ impl Mempool {
                 .map(|input| (input.previous_output, txid)),
         );
 
-        let pending_delta = inner.pending_priority.remove(&txid).unwrap_or(0);
+        // Same persistent map the single-tx admission path reads (it keeps
+        // the delta rather than consuming it).
+        let pending_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
 
         inner.entries.insert(
             txid,
@@ -4071,9 +4648,28 @@ impl Mempool {
     pub fn info(&self) -> MempoolInfo {
         // Snapshot policy first (lock released) so the policy lock is never held
         // while `inner` is — uniform leaf-lock discipline (see `remove_expired`).
-        let (max_size, min_fee_rate, full_rbf) = {
+        let (
+            max_size,
+            min_fee_rate,
+            incremental_relay_fee,
+            full_rbf,
+            max_data_carrier_size,
+            permit_bare_multisig,
+        ) = {
             let cfg = self.config.read();
-            (cfg.max_size_bytes, cfg.min_fee_rate, cfg.full_rbf)
+            let dcs = if cfg.data_carrier {
+                cfg.data_carrier_size
+            } else {
+                0
+            };
+            (
+                cfg.max_size_bytes,
+                cfg.min_fee_rate,
+                cfg.incremental_relay_fee,
+                cfg.full_rbf,
+                dcs,
+                cfg.permit_bare_multisig,
+            )
         };
         let inner = self.inner.read();
         // Standard surface (design §6.1/§10): report the **acting class** only,
@@ -4103,9 +4699,18 @@ impl Mempool {
             bytes: inner.acting_bytes(),
             max_size,
             min_fee_rate,
+            incremental_relay_fee,
             full_rbf,
             unbroadcast,
+            max_data_carrier_size,
+            permit_bare_multisig,
         }
+    }
+
+    /// Test-only: override the OP_RETURN size cap.
+    #[cfg(test)]
+    pub(crate) fn set_data_carrier_size(&self, size: usize) {
+        self.config.write().data_carrier_size = size;
     }
 
     /// Test-only: insert a synthetic entry keyed by `txid` so unit tests can
@@ -4117,7 +4722,7 @@ impl Mempool {
             txid,
             MempoolEntry {
                 tx,
-                fee: 0,
+                fee: fee_rate,
                 weight: 4,
                 fee_rate,
                 time: 0,
@@ -4237,7 +4842,7 @@ impl Mempool {
             txid,
             MempoolEntry {
                 tx,
-                fee: 0,
+                fee: fee_rate,
                 weight: 4,
                 fee_rate,
                 time: 0,
@@ -4737,8 +5342,20 @@ mod tests {
         use bitcoin::transaction;
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
-        // Create mempool with default dust relay fee
-        let (cs, _mp, dir) = make_test_env();
+        // Fund a UTXO so the tx reaches the deferred dust check.
+        let input_op = OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
+            ),
+            vout: 0,
+        };
+        let coin = crate::storage::coinview::Coin {
+            amount: 100_000,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE
+            height: 1,
+            coinbase: false,
+        };
+        let (cs, _mp, dir) = make_funded_env(&[(input_op, coin)]);
         let mp = Mempool::with_config(MempoolConfig {
             max_size_bytes: 1_000_000,
             min_fee_rate: 0,
@@ -4751,12 +5368,7 @@ mod tests {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
-                    ),
-                    vout: 0,
-                },
+                previous_output: input_op,
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -4847,7 +5459,17 @@ mod tests {
         use bitcoin::transaction;
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
+        // Create mempool with data_carrier_size = 83 so a 91-byte
+        // OP_RETURN exceeds the limit without exceeding MAX_STANDARD_TX_WEIGHT.
         let (cs, mp, dir) = make_test_env();
+        mp.reload_policy(MempoolConfig {
+            data_carrier_size: 83,
+            ..Default::default()
+        });
+
+        // Set a strict OP_RETURN size limit for this test (the global default
+        // is 100 000, matching Core v31's uncapped behaviour).
+        mp.set_data_carrier_size(83);
 
         // Build an OP_RETURN output > 83 bytes
         let mut op_return_script = vec![0x6a]; // OP_RETURN
@@ -6214,21 +6836,22 @@ mod tests {
 
     #[test]
     fn no_allow_rules_rejects_nonstandard_early() {
-        // With zero `allow` rules the deferral machinery is skipped entirely.
-        // Dust now runs after fee-rate / input resolution (matching Core's
-        // ordering), so an unfunded input surfaces as MissingInputs. With a
-        // funded input dust still rejects.
-        let op = outpoint(0xde);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        // Dust errors are deferred until after the fee rate check so 0-fee txs
+        // get "min relay fee not met" (Core parity). For an unfunded input,
+        // input resolution fails with MissingInputs before the deferred dust
+        // check can fire.
+        let (cs, mp, dir) = make_funded_env(&[]); // no coins funded
         set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
 
-        let tx = spend(op, 1, 0x22); // dust, funded input
+        let tx = spend(outpoint(0xde), 1, 0x22); // dust, unfunded input
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .unwrap_err();
+        // Non-dust standardness failures (e.g. oversized OP_RETURN) still
+        // reject early; Dust is deferred, so the unfunded input surfaces first.
         assert!(
-            matches!(err, MempoolError::Dust),
-            "dust must still reject: got {err:?}"
+            matches!(err, MempoolError::MissingInputs),
+            "deferred dust lets input resolution fail first: got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
