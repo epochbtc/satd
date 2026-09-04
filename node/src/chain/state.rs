@@ -18,6 +18,15 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
+/// A chain tip as reported by `getchaintips`.
+#[derive(Debug, Clone)]
+pub struct ChainTipInfo {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub branch_len: u32,
+    pub status: String,
+}
+
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
 /// moves it on a mockable chain; off regtest that is always the system clock.
@@ -81,6 +90,10 @@ pub fn default_assumevalid(network: Network) -> AssumeValid {
 pub enum ChainError {
     #[error("duplicate")]
     Duplicate,
+    /// The parent hash is not in the block index at all.
+    #[error("prev-blk-not-found")]
+    PrevBlockNotFound,
+    /// The parent exists but is marked invalid (Core: `bad-prevblk`).
     #[error("bad-prevblk")]
     BadPrevBlock,
     /// The parent is a block this chainstate never connected. Distinct from
@@ -1983,6 +1996,108 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
+    /// Compute all chain tips by walking the full block index.
+    ///
+    /// A tip is any block whose hash is not the `prev_blockhash` of any other
+    /// block in the index. Each tip is classified by its relationship to the
+    /// active chain:
+    ///
+    /// - `"active"` — the current best chain tip
+    /// - `"valid-fork"` — fully validated but not on the active chain
+    /// - `"valid-headers"` — headers received, data stored but not connected
+    /// - `"headers-only"` — only the header is known (no block data)
+    /// - `"invalid"` — explicitly marked invalid
+    ///
+    /// `branchlen` is the number of blocks since the fork point from the
+    /// active chain (0 for the active tip itself).
+    pub fn chain_tips(&self) -> Vec<ChainTipInfo> {
+        use std::collections::{HashMap, HashSet};
+
+        let (tip_hash, _tip_height) = self.tip_snapshot();
+
+        // Collect every entry and record which hashes are referenced as a parent.
+        let mut entries: HashMap<BlockHash, BlockIndexEntry> = HashMap::new();
+        let mut has_child: HashSet<BlockHash> = HashSet::new();
+        let _ = self.store.for_each_block_index(&mut |hash, entry| {
+            has_child.insert(entry.header.prev_blockhash);
+            entries.insert(hash, entry);
+        });
+
+        // Build the set of active-chain hashes for fork-point detection.
+        let mut active_hashes: HashSet<BlockHash> = HashSet::new();
+        {
+            let mut cur = tip_hash;
+            loop {
+                active_hashes.insert(cur);
+                if let Some(e) = entries.get(&cur) {
+                    if e.header.prev_blockhash == BlockHash::all_zeros() {
+                        break;
+                    }
+                    cur = e.header.prev_blockhash;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Tips: blocks with no children in the index.
+        let mut tips: Vec<ChainTipInfo> = Vec::new();
+        for (hash, entry) in &entries {
+            if has_child.contains(hash) {
+                continue;
+            }
+
+            // Classify.
+            let (status, branch_len) = if *hash == tip_hash {
+                ("active", 0u32)
+            } else {
+                // Walk back to the fork point (the first ancestor on the active chain).
+                let mut depth = 0u32;
+                let mut cur = *hash;
+                loop {
+                    if active_hashes.contains(&cur) {
+                        break;
+                    }
+                    if let Some(e) = entries.get(&cur) {
+                        if e.header.prev_blockhash == BlockHash::all_zeros() {
+                            depth += 1;
+                            break;
+                        }
+                        cur = e.header.prev_blockhash;
+                        depth += 1;
+                    } else {
+                        depth += 1;
+                        break;
+                    }
+                }
+
+                let status_str = match entry.status {
+                    BlockStatus::Invalid => "invalid",
+                    BlockStatus::HeaderOnly => "headers-only",
+                    BlockStatus::DataStored => "valid-headers",
+                    BlockStatus::Valid | BlockStatus::Pruned => "valid-fork",
+                };
+                (status_str, depth)
+            };
+
+            tips.push(ChainTipInfo {
+                height: entry.height,
+                hash: *hash,
+                branch_len,
+                status: status.to_string(),
+            });
+        }
+
+        // Sort: active first, then by descending height.
+        tips.sort_by(|a, b| {
+            let a_active = a.status == "active";
+            let b_active = b.status == "active";
+            b_active.cmp(&a_active).then(b.height.cmp(&a.height))
+        });
+
+        tips
+    }
+
     /// Direct store handle for tests that need to construct index states the
     /// public API cannot reach — e.g. a stale sibling block that exists in the
     /// block index but is deliberately absent from the height index.
@@ -2042,7 +2157,7 @@ impl ChainState {
         let parent = self
             .store
             .get_block_index(&header.prev_blockhash)
-            .ok_or(ChainError::BadPrevBlock)?;
+            .ok_or(ChainError::PrevBlockNotFound)?;
 
         let new_height = parent.height + 1;
 
@@ -3807,7 +3922,7 @@ impl ChainState {
         let parent = self
             .store
             .get_block_index(&prev_hash)
-            .ok_or(ChainError::BadPrevBlock)?;
+            .ok_or(ChainError::PrevBlockNotFound)?;
 
         // Never store a block descending from an explicitly-invalidated one
         // (Core: "bad-prevblk"). Keeps the invalidated subtree from being
@@ -5579,6 +5694,202 @@ impl ChainState {
         Ok(())
     }
 
+    /// Validate a block as if it were about to be connected, but do not
+    /// persist anything. Used by `getblocktemplate` proposal mode (BIP 22/23).
+    ///
+    /// Returns `Ok(None)` when the block is valid, `Ok(Some(reason))` when
+    /// there is a concrete rejection, and `Err` only for internal errors that
+    /// should surface as an RPC error rather than a reject string.
+    ///
+    /// Differences from `accept_block`:
+    ///  - PoW is NOT checked (proposals are templates, not mined blocks).
+    ///  - The block must build on the current tip; a different prevhash yields
+    ///    `"inconclusive-not-best-prevblk"` rather than triggering a reorg.
+    ///  - No data is written to disk.
+    pub fn test_block_validity(&self, block: &Block) -> Result<Option<String>, ChainError> {
+        let tip_hash = self.tip_hash();
+
+        // The block must build on the current tip.
+        if block.header.prev_blockhash != tip_hash {
+            return Ok(Some("inconclusive-not-best-prevblk".to_string()));
+        }
+
+        let parent = self.store.get_block_index(&tip_hash)
+            .ok_or(ChainError::BadPrevBlock)?;
+        let height = parent.height + 1;
+
+        // Structural + witness block validation (check_block).
+        if let Err(e) = validation::block::check_block(block, self.network, height) {
+            return Ok(Some(e.to_string()));
+        }
+
+        // Difficulty bits must match the expected value.
+        let store_ref = &*self.store;
+        if let Err(e) = validation::pow::check_difficulty(
+            &block.header,
+            &parent,
+            self.network,
+            |h| {
+                let hash = store_ref.get_block_hash_by_height(h)?;
+                store_ref.get_block_index(&hash)
+            },
+            |h| store_ref.get_block_index(h),
+        ) {
+            return Ok(Some(e.to_string()));
+        }
+
+        // Timestamp checks: MTP (time-too-old) and future (time-too-new).
+        if let Err(e) = validation::pow::check_timestamp(
+            &block.header,
+            &parent,
+            |h| store_ref.get_block_index(h),
+        ) {
+            return Ok(Some(e.to_string()));
+        }
+        if let Err(e) = validation::pow::check_future_timestamp(&block.header, unix_now_secs()) {
+            return Ok(Some(e.to_string()));
+        }
+
+        // Block version gate (BIP 34/66/65).
+        if let Err(e) = connect::check_block_version(&block.header, height, self.network) {
+            return Ok(Some(e.to_string()));
+        }
+
+        // Contextual transaction validation: finality, UTXO existence, amounts.
+        // This mirrors the per-tx loop in connect_block but without persisting
+        // anything. Script verification is skipped — Core's TestBlockValidity
+        // runs full script verification, but proposal mode only needs to detect
+        // structural and contextual invalidity.
+        let mtp = connect::get_median_time_past(store_ref, height);
+        let mut total_fees: u64 = 0;
+        // Track coins created within this block for intra-block spend resolution.
+        let mut intra_block_coins: std::collections::HashMap<OutPoint, Coin> =
+            std::collections::HashMap::new();
+        // Track which coins have been spent within this block to detect
+        // double-spends.
+        let mut spent_in_block: std::collections::HashSet<OutPoint> =
+            std::collections::HashSet::new();
+
+        for tx in &block.txdata {
+            let is_coinbase = tx.is_coinbase();
+
+            // Context-free transaction checks.
+            if let Err(e) = crate::validation::tx::check_transaction(tx) {
+                return Ok(Some(e.to_string()));
+            }
+
+            // Finality check (locktime / sequence).
+            let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
+            if !is_final {
+                let locktime = tx.lock_time.to_consensus_u32();
+                if locktime > 0 {
+                    if locktime < 500_000_000 {
+                        if locktime >= height {
+                            return Ok(Some("bad-txns-nonfinal".to_string()));
+                        }
+                    } else {
+                        let time_threshold = if height
+                            >= connect::bip113_activation_height(self.network)
+                        {
+                            mtp
+                        } else {
+                            block.header.time
+                        };
+                        if locktime >= time_threshold {
+                            return Ok(Some("bad-txns-nonfinal".to_string()));
+                        }
+                    }
+                }
+            }
+
+            // BIP 34 coinbase height check.
+            if is_coinbase
+                && height >= connect::bip34_activation_height(self.network)
+            {
+                let script = &tx.input[0].script_sig;
+                let bytes = script.as_bytes();
+                if bytes.is_empty() {
+                    return Ok(Some("bad-cb-height".to_string()));
+                }
+                if let Some(encoded_height) = connect::decode_coinbase_height(bytes) {
+                    if encoded_height != height {
+                        return Ok(Some("bad-cb-height".to_string()));
+                    }
+                } else {
+                    return Ok(Some("bad-cb-height".to_string()));
+                }
+            }
+
+            // UTXO validation for non-coinbase transactions.
+            let mut sum_inputs: u64 = 0;
+            if !is_coinbase {
+                for input in &tx.input {
+                    let outpoint = input.previous_output;
+
+                    if spent_in_block.contains(&outpoint) {
+                        return Ok(Some("bad-txns-inputs-missingorspent".to_string()));
+                    }
+
+                    let coin = intra_block_coins
+                        .get(&outpoint)
+                        .cloned()
+                        .or_else(|| self.store.get_coin(&outpoint));
+
+                    let Some(coin) = coin else {
+                        return Ok(Some("bad-txns-inputs-missingorspent".to_string()));
+                    };
+
+                    // Coinbase maturity.
+                    if coin.coinbase && height - coin.height < 100 {
+                        return Ok(Some(
+                            "bad-txns-premature-spend-of-coinbase".to_string(),
+                        ));
+                    }
+
+                    sum_inputs = sum_inputs.saturating_add(coin.amount);
+                    spent_in_block.insert(outpoint);
+                }
+
+                let sum_outputs: u64 =
+                    tx.output.iter().map(|o| o.value.to_sat()).sum();
+                if sum_inputs < sum_outputs {
+                    return Ok(Some("bad-txns-in-belowout".to_string()));
+                }
+                total_fees = total_fees.saturating_add(sum_inputs - sum_outputs);
+            }
+
+            // Add this transaction's outputs to the intra-block coin map.
+            let txid = tx.compute_txid();
+            for (vout, output) in tx.output.iter().enumerate() {
+                if !connect::is_unspendable(&output.script_pubkey) {
+                    let outpoint = OutPoint::new(txid, vout as u32);
+                    intra_block_coins.insert(
+                        outpoint,
+                        Coin {
+                            amount: output.value.to_sat(),
+                            script_pubkey: output.script_pubkey.clone(),
+                            height,
+                            coinbase: is_coinbase,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Coinbase value must not exceed subsidy + fees.
+        if !block.txdata.is_empty() {
+            let subsidy = connect::block_subsidy(self.network, height);
+            let coinbase_value: u64 =
+                block.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
+            if coinbase_value > subsidy + total_fees {
+                return Ok(Some("bad-cb-amount".to_string()));
+            }
+        }
+
+        // Block passed all checks.
+        Ok(None)
+    }
+
     /// Accept a new block into the chain.
     pub fn accept_block(&self, block: &Block) -> Result<BlockAcceptance, ChainError> {
         // Serialize the whole accept→connect→commit critical section. The
@@ -5630,7 +5941,7 @@ impl ChainState {
         let parent = self
             .store
             .get_block_index(&prev_hash)
-            .ok_or(ChainError::BadPrevBlock)?;
+            .ok_or(ChainError::PrevBlockNotFound)?;
 
         // Refuse to build on a parent that was explicitly invalidated
         // (Core: "bad-prevblk"). `invalidate_block` marks the whole subtree
@@ -12048,7 +12359,7 @@ pub(crate) mod tests {
         // Try to connect block 2 before block 1 — should fail
         let result = cs.connect_stored_block(&hash2);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
+            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
             "Connecting height 2 before 1 should fail, got {:?}",
             result
         );
@@ -12107,8 +12418,8 @@ pub(crate) mod tests {
 
         let result = cs.accept_header(&block.header);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
-            "accept_header with unknown parent should return BadPrevBlock, got {:?}",
+            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
+            "accept_header with unknown parent should return PrevBlockNotFound, got {:?}",
             result
         );
 
@@ -12740,7 +13051,7 @@ pub(crate) mod tests {
         // Try to connect block 3 (skipping block 2) — should fail with BadPrevBlock
         let result = cs.connect_stored_block(&hashes[2]);
         assert!(
-            matches!(result, Err(ChainError::BadPrevBlock)),
+            matches!(result, Err(ChainError::BadPrevBlock | ChainError::PrevBlockNotFound)),
             "Connecting block 3 before block 2 should fail with BadPrevBlock, got {:?}",
             result
         );

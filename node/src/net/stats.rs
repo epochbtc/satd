@@ -112,6 +112,10 @@ pub struct PeerStats {
     ping_time_us: AtomicU64,
     /// Best round trip seen, in microseconds; `u64::MAX` = never measured.
     min_ping_us: AtomicU64,
+    /// Unix seconds when we last received a block from this peer (0 = never).
+    last_block: AtomicU64,
+    /// Unix seconds when we last received a transaction from this peer (0 = never).
+    last_transaction: AtomicU64,
     totals: Arc<NetTotals>,
 }
 
@@ -129,6 +133,8 @@ impl PeerStats {
             ping_sent_us: AtomicU64::new(0),
             ping_time_us: AtomicU64::new(0),
             min_ping_us: AtomicU64::new(u64::MAX),
+            last_block: AtomicU64::new(0),
+            last_transaction: AtomicU64::new(0),
             totals,
         })
     }
@@ -170,6 +176,26 @@ impl PeerStats {
 
     pub fn last_recv(&self) -> u64 {
         self.last_recv.load(Ordering::Relaxed)
+    }
+
+    /// Unix seconds when a block was last received from this peer (0 = never).
+    pub fn last_block(&self) -> u64 {
+        self.last_block.load(Ordering::Relaxed)
+    }
+
+    /// Unix seconds when a transaction was last received from this peer (0 = never).
+    pub fn last_transaction(&self) -> u64 {
+        self.last_transaction.load(Ordering::Relaxed)
+    }
+
+    /// Record that a block was received from this peer now.
+    pub fn record_block(&self) {
+        self.last_block.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// Record that a transaction was received from this peer now.
+    pub fn record_transaction(&self) {
+        self.last_transaction.store(now_secs(), Ordering::Relaxed);
     }
 
     /// Attribute `n` already-counted sent bytes to a message type.

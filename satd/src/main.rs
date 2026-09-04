@@ -2435,6 +2435,9 @@ async fn main() {
         config.silentpaymentindex,
         Some(sp_backfill_handle.clone()),
         Some(sp_backfill_cmd_tx.clone()),
+        config.txindex,
+        config.coinstatsindex,
+        config.txospenderindex,
         listener_status.clone(),
         // BIP 158 filter index: passed unconditionally because `node`'s
         // `block-filter-index` feature is always on in any workspace
@@ -3261,11 +3264,16 @@ async fn main() {
         }
     }
 
-    // Connect to -addnode peers (does NOT disable DNS seeding)
+    // Connect to -addnode peers (does NOT disable DNS seeding).
+    //
+    // Register via `addnode_add`, not `add_peer_addr`: Core keeps config
+    // `-addnode` entries and RPC-added ones in the same `m_added_nodes` list,
+    // and `getaddednodeinfo` reports that list. Adding the address without
+    // recording the entry dials the peer but leaves it invisible to the RPC.
     for addr_str in &config.addnode {
         match node::net::peer::PeerAddr::parse(addr_str) {
             Ok(addr) => {
-                peer_manager.add_peer_addr(addr.clone());
+                peer_manager.addnode_add(addr_str, addr.clone());
                 let pm = peer_manager.clone();
                 tokio::spawn(async move {
                     if let Err(e) = pm.connect_peer_addr(&addr).await {

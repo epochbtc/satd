@@ -274,6 +274,8 @@ SATD_ONLY = {
     "getorphaninfo": [],
     "getpolicyinfo": [],
     "getquarantineinfo": [],
+    # satd-native index view; `getindexinfo` is the Core-compatible surface.
+    "getsatdindexinfo": [],
     "getserverstatus": [],
     "getsysteminfo": [],
     "getwarnings": [],
@@ -290,6 +292,10 @@ SATD_ONLY = {
     ],
     "listquarantine": [["rule", False], ["count", False], ["skip", False]],
     "policytest": [["rawtx", False]],
+    "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
+    "echojson": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
+    "echoipc": [["arg", False]],
+    "generate": [],
     # Subscription pair: jsonrpsee owns the subscription-id argument and Core
     # has no equivalent, so neither declares a nameable parameter.
     "subscribemempool": [],

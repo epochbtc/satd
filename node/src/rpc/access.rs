@@ -95,6 +95,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getdifficulty"
         | "getibdprogress"
         | "getindexinfo"
+        | "getsatdindexinfo"
         | "getmemoryinfo"
         | "getmempoolancestors"
         | "getmempooldescendants"
@@ -130,12 +131,14 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getaddresshistory"
         | "getaddressutxos"
         | "listbanned"
-        | "help"
         | "echo"
+        | "echoipc"
         | "echojson"
-        | "generate"
+        | "help"
         | "uptime"
         | "validateaddress"
+        | "deriveaddresses"
+        | "getdescriptorinfo"
         | "ping" => Read,
 
         // --- Reads: stateless transaction / PSBT tooling (pure compute) ---
@@ -157,7 +160,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "testmempoolaccept" => Read,
 
         // --- Reads: fee estimation ---
-        "estimatefees" | "estimatesmartfee" => Read,
+        "estimatefees" | "estimaterawfee" | "estimatesmartfee" => Read,
 
         // --- Reads: long-poll waits + mempool subscription stream ---
         "waitforblock" | "waitforblockheight" | "waitfornewblock" => Read,
@@ -198,7 +201,12 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // `getblocktemplate` also has a proposal mode that validates blocks;
         // `dumptxoutset` and `getblockfileaudit` are minute-scale on
         // mainnet; `verifychain` re-verifies the chain. ---
-        "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain"
+        // Core registers `generate` as a hidden *mining* command
+        // (`src/rpc/mining.cpp`), beside generatetoaddress/generateblock.
+        // satd only answers -32601, but the classification has to describe
+        // what the method is, not what today's stub happens to do.
+        "generate"
+        | "getblocktemplate" | "dumptxoutset" | "getblockfileaudit" | "verifychain"
         // walks the whole UTXO set; minute-scale on mainnet
         | "scantxoutset" => Control,
 
@@ -341,25 +349,28 @@ mod tests {
         // Every classified method that matches a chain-mutating prefix must
         // NOT be readonly-allowed (must be Control or BlockConnecting).
         let dangerous = |m: &str| DANGEROUS_PREFIXES.iter().any(|p| m.starts_with(p));
-        // The known registered methods matching these shapes — if a new one
-        // is added it should be appended here AND classified as rejecting.
-        for m in [
-            "generateblock",
-            "generatetoaddress",
-            "generatetodescriptor",
-            "submitblock",
-            "submitheader",
-            "preciousblock",
-            "invalidateblock",
-            "reconsiderblock",
-            "loadtxoutset",
-        ] {
-            assert!(dangerous(m), "test prefix list missed {m}");
-            assert!(
-                !readonly_listener_allows(m),
-                "{m} matches a chain-mutating shape but is readonly-allowed — \
-                 it must be classified Control or BlockConnecting"
-            );
-        }
+        // Walk every method the node actually registers, not a hand-kept
+        // list. The old form iterated eight literals, so `generate` — which
+        // is in DANGEROUS_PREFIXES right above — was classified `Read` and
+        // readonly-allowed at the same time, and this test stayed green. A
+        // guard that only checks the cases someone remembered is not a guard.
+        let mut offenders: Vec<&str> = crate::rpc::named_params::ALL_METHODS
+            .iter()
+            .copied()
+            .filter(|m| dangerous(m) && readonly_listener_allows(m))
+            .collect();
+        offenders.sort_unstable();
+        assert!(
+            offenders.is_empty(),
+            "these match a chain-mutating shape but are readonly-allowed — \
+             each must be classified Control or BlockConnecting: {offenders:?}"
+        );
+        // The prefix list must still describe something real.
+        assert!(
+            crate::rpc::named_params::ALL_METHODS
+                .iter()
+                .any(|m| dangerous(m)),
+            "no registered method matches any DANGEROUS_PREFIX — the list has rotted"
+        );
     }
 }

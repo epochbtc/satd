@@ -235,7 +235,7 @@ Same controls as IBD's table; columns differ:
 #### Services row
 
 A single line summarizing satd's wallet-server surfaces, sourced from
-`getserverstatus` and `getindexinfo`:
+`getserverstatus` and `getsatdindexinfo`:
 
 ```
 addr-idx <state>   [sp-idx <state>]   esplora <state>   electrum <state>
@@ -451,7 +451,7 @@ even when RPC is slow.
 |---|---|
 | **1.5 s** | `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, `getconnectioncount`, `getsysteminfo`, `getwarnings`. |
 | **3 s** | `getibdprogress`. During IBD only; the reply is heavy (full bitmap and per-peer breakdown). |
-| **~5 s** | `getindexinfo`, `getserverstatus`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getrawmempool` (verbose), `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`). |
+| **~5 s** | `getsatdindexinfo`, `getserverstatus`, plus the steady-state batch (`estimatefees`, `getmininginfo`, `getchaintxstats`, `uptime`, `getblockstats`, `getrawmempool` (verbose), `gettxoutsetinfo`, `getreorghistory`, `getmempoolhistory`). |
 | **per epoch** | `getblockhash` + `getblockheader` to anchor the current 2,016-block epoch's start time. Refreshed only when the epoch floor advances. |
 
 If a steady-state RPC has not returned within about 3 s, the title bar

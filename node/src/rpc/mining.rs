@@ -292,6 +292,27 @@ pub fn get_network_hash_ps(
     difficulty * 4_294_967_296.0 / time_diff
 }
 
+/// Handle `getblocktemplate` in proposal mode (BIP 22/23).
+///
+/// Decodes the proposed block from `hex_data`, validates it against the
+/// current chain state without persisting anything, and returns `null` for
+/// a valid proposal or a reject-reason string.
+pub fn get_block_template_proposal(
+    chain_state: &ChainState,
+    hex_data: &str,
+) -> Result<Value, (i32, String)> {
+    let block_bytes = hex::decode(hex_data)
+        .map_err(|_| (-22, "Block decode failed".to_string()))?;
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)
+        .map_err(|_| (-22, "Block decode failed".to_string()))?;
+
+    match chain_state.test_block_validity(&block) {
+        Ok(None) => Ok(Value::Null),
+        Ok(Some(reason)) => Ok(Value::String(reason)),
+        Err(e) => Err((-1, e.to_string())),
+    }
+}
+
 /// `submitheader` — accept a block header.
 pub fn submit_header(chain_state: &ChainState, hex_header: &str) -> Result<Value, String> {
     let header_bytes = hex::decode(hex_header).map_err(|_| "Invalid hex".to_string())?;

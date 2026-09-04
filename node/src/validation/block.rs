@@ -37,19 +37,29 @@ pub fn check_block(
         return Err(ValidationError::EmptyBlock);
     }
 
+    // Size limits, split exactly as Core splits them (#548):
+    //
+    // 1. `CheckBlock`'s stripped-size test — tx count and witness-stripped
+    //    serialized size, each scaled by the witness factor — rejects
+    //    `bad-blk-length`. Witness bytes cannot trigger it.
+    // (`Block::base_size` is private in rust-bitcoin 0.32; recover it exactly
+    // from the public pair via weight = base * 3 + total.)
+    let weight = block.weight().to_wu() as usize;
+    let base_size = (weight - block.total_size()) / 3;
+    if block.txdata.len() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+        || base_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    {
+        return Err(ValidationError::OversizedBlock);
+    }
+
     // First transaction must be coinbase
     if !block.txdata[0].is_coinbase() {
         return Err(ValidationError::NoCoinbase);
     }
 
-    // No other transaction may be coinbase
-    for tx in &block.txdata[1..] {
-        if tx.is_coinbase() {
-            return Err(ValidationError::MultipleCoinbase);
-        }
-    }
-
-    // Check merkle root
+    // Check merkle root — Core computes both the root and the mutation flag
+    // together, so the merkle-root mismatch and duplication check fire
+    // BEFORE the multiple-coinbase check.
     let computed = block.compute_merkle_root();
     match computed {
         Some(root) => {
@@ -72,19 +82,13 @@ pub fn check_block(
         return Err(ValidationError::BadTxDuplicate);
     }
 
-    // Size limits, split exactly as Core splits them (#548):
-    //
-    // 1. `CheckBlock`'s stripped-size test — tx count and witness-stripped
-    //    serialized size, each scaled by the witness factor — rejects
-    //    `bad-blk-length`. Witness bytes cannot trigger it.
-    // (`Block::base_size` is private in rust-bitcoin 0.32; recover it exactly
-    // from the public pair via weight = base * 3 + total.)
-    let weight = block.weight().to_wu() as usize;
-    let base_size = (weight - block.total_size()) / 3;
-    if block.txdata.len() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-        || base_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-    {
-        return Err(ValidationError::OversizedBlock);
+    // No other transaction may be coinbase — after the merkle checks so
+    // that Core-order `bad-txns-duplicate` fires before `bad-cb-multiple`
+    // when a coinbase is duplicated.
+    for tx in &block.txdata[1..] {
+        if tx.is_coinbase() {
+            return Err(ValidationError::MultipleCoinbase);
+        }
     }
 
     // Witness commitment (BIP 141), height-gated as Core gates it.

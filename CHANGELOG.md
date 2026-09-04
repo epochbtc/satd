@@ -39,6 +39,13 @@ item below is (or will be) written up in full in the in-development
   tests that prefix and permanently disables request batching on a match
 
 ### Changed
+- **`getindexinfo` is now Bitcoin Core's `getindexinfo`.** It reports only the
+  indexes named by a Core CLI flag (`-txindex`, `-blockfilterindex`,
+  `-coinstatsindex`, `-txospenderindex`), each as `{synced, best_block_height}`,
+  and returns `{}` on a node with none of them set. satd's own richer view —
+  address-index and silent-payment backfill state, cursors, ETAs — moved
+  unchanged to the new `getsatdindexinfo`. Anything reading the old shape
+  (including `sat-tui`) must call `getsatdindexinfo`.
 - The BIP 352 client-side scan examples (Rust and Go) now run under the SDKs'
   `ResilientSubscription` with a file-backed cursor store, so an interrupted scan
   resumes where it stopped instead of rescanning from its start height. The cursor

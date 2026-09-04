@@ -124,11 +124,24 @@ pub fn build_block_to_script(
 }
 
 /// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
+/// Serialises "build a block on the current tip, then submit it".
+///
+/// Core does this implicitly: every mining RPC holds `cs_main` across
+/// template construction and `ProcessNewBlock`. satd's build and submit are
+/// separate calls, so two concurrent `generateblock` callers could read the
+/// same tip, construct byte-identical empty blocks, and have the second
+/// rejected as `duplicate`. `rpc_generate.py` drives exactly that, with six
+/// threads mining fifty blocks each.
+///
+/// Regtest-only paths, so the contention is irrelevant; correctness is not.
+pub static MINING_SUBMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn mine_block_to_script(
     chain_state: &ChainState,
     mempool: &Mempool,
     coinbase_script: ScriptBuf,
 ) -> Result<Block, MineError> {
+    let _guard = MINING_SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let block = build_block_to_script(chain_state, mempool, coinbase_script, None)?;
 
     let acceptance = chain_state
@@ -224,6 +237,102 @@ fn confirm_if_connected(
     if let Some(height) = chain_state.connected_height(acceptance) {
         mempool.remove_for_block(block, height);
     }
+}
+
+/// Build and solve a block with the given coinbase script and explicit
+/// transactions (not from the mempool). The block is solved but NOT
+/// submitted to the chain. Callers choose whether to submit.
+///
+/// `mempool` is needed only for `create_template`'s signature; when
+/// `explicit_txs` is used, the template's mempool txs are discarded.
+pub fn build_solved_block(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+    explicit_txs: Vec<Transaction>,
+) -> Result<Block, MineError> {
+    let template = create_template(chain_state, mempool);
+
+    // generateblock uses ONLY the explicit transaction list (no mempool).
+    // Coinbase value = subsidy + fees of the explicit transactions.
+    let coinbase_value = {
+        let subsidy = crate::chain::connect::block_subsidy(chain_state.network, template.height);
+        if explicit_txs.is_empty() {
+            subsidy
+        } else {
+        // Sum up fees: look up each input's value from the UTXO set,
+        // then subtract the output total. For regtest mining this is the
+        // straightforward path.
+        let mut total_fees = 0u64;
+        for tx in &explicit_txs {
+            let mut input_sum = 0u64;
+            for input in &tx.input {
+                if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                    input_sum += coin.amount;
+                } else if let Some(entry) = mempool.get(&input.previous_output.txid)
+                    && let Some(out) = entry.tx.output.get(input.previous_output.vout as usize)
+                {
+                    input_sum += out.value.to_sat();
+                }
+            }
+            let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            total_fees += input_sum.saturating_sub(output_sum);
+        }
+            subsidy + total_fees
+        }
+    };
+
+    let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
+
+    let has_witness = explicit_txs.iter().any(|tx| {
+        tx.input.iter().any(|i| !i.witness.is_empty())
+    });
+
+    if has_witness {
+        let witness_root = compute_witness_root(&coinbase_tx, &explicit_txs);
+        let witness_nonce = [0u8; 32];
+        let mut commitment_preimage = [0u8; 64];
+        commitment_preimage[..32].copy_from_slice(&witness_root);
+        commitment_preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = bitcoin::hashes::sha256d::Hash::hash(&commitment_preimage);
+
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment.to_byte_array());
+        coinbase_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(commitment_script),
+        });
+        coinbase_tx.input[0].witness = Witness::from_slice(&[witness_nonce]);
+    }
+
+    let mut txdata = vec![coinbase_tx];
+    txdata.extend(explicit_txs);
+
+    let merkle_root = compute_merkle_root(&txdata);
+
+    let mut header = Header {
+        version: Version::from_consensus(template.version),
+        prev_blockhash: template.prev_hash,
+        merkle_root,
+        time: template.cur_time,
+        bits: template.bits,
+        nonce: 0,
+    };
+
+    loop {
+        let target = header.target();
+        match header.validate_pow(target) {
+            Ok(_) => break,
+            Err(_) => {
+                header.nonce += 1;
+                if header.nonce == 0 {
+                    header.time += 1;
+                }
+            }
+        }
+    }
+
+    Ok(Block { header, txdata })
 }
 
 /// Mine multiple blocks, returning their hashes.

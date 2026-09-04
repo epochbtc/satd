@@ -788,6 +788,14 @@ pub struct Config {
     /// service and the `getblockfilter` RPC. Implies an additional
     /// per-block disk write of ~30 KB filter blob + 32-byte header.
     pub blockfilterindex: bool,
+    /// Bitcoin Core's `-coinstatsindex`. satd does not implement the
+    /// UTXO-set hash index; the flag is accepted for drop-in config
+    /// compat and reported as always-synced in `getindexinfo`.
+    pub coinstatsindex: bool,
+    /// Bitcoin Core's `-txospenderindex` (v31+). satd does not implement
+    /// a per-outpoint spender index; the flag is accepted for drop-in
+    /// config compat and reported as always-synced in `getindexinfo`.
+    pub txospenderindex: bool,
     /// Whether to advertise `NODE_COMPACT_FILTERS` and answer
     /// `getcfilters` / `getcfheaders` / `getcfcheckpt` over the BIP
     /// 157 P2P service. Off by default. Enabling requires
@@ -1269,6 +1277,38 @@ impl Config {
         // compatibility). Unrecognized options stay in place so clap still
         // rejects typos.
         let (normalized, cli_warnings) = filter_unsupported_core_cli_args(normalized)?;
+        // Pre-flight: any single-dashed *multi-character* arg that survived
+        // normalize_args (which converts known satd flags to `--long`) and
+        // filter_unsupported_core_cli_args (which drops/errors on
+        // known-Core-but-unsupported flags) is a genuinely unknown Core-style
+        // parameter. Catch it here and report it in Bitcoin Core's format
+        // ("Error: Error parsing command line arguments: Invalid parameter <arg>")
+        // rather than letting clap decompose `-foobar` into short flags (`-f`)
+        // and produce a different error message.
+        //
+        // Single-character flags like `-h` (clap short flags) are exempt: they
+        // are legitimate clap short forms that normalize_args doesn't handle.
+        // `-flag=value` args (containing `=`) are also multi-character and are
+        // caught; the flag name is in the part before `=`.
+        {
+            let mut past_separator = false;
+            for (i, arg) in normalized.iter().enumerate() {
+                if i == 0 { continue; } // binary name
+                if arg == "--" { past_separator = true; continue; }
+                if past_separator { continue; } // after `--`, everything is positional
+                if arg.starts_with("--") || !arg.starts_with('-') { continue; }
+                // The flag part is everything after the dash, up to `=`.
+                let flag = &arg[1..];
+                let flag_name = flag.split('=').next().unwrap_or(flag);
+                // Single-character flags pass through to clap (e.g. `-h`, `-V`).
+                if flag_name.len() <= 1 { continue; }
+                // Multi-character, single-dashed arg that nothing recognised.
+                eprintln!(
+                    "Error: Error parsing command line arguments: Invalid parameter {arg}"
+                );
+                std::process::exit(1);
+            }
+        }
         let cli = match CliArgs::try_parse_from(normalized) {
             Ok(c) => c,
             Err(e) => {
@@ -1291,15 +1331,11 @@ impl Config {
                     std::process::exit(0);
                 }
                 // Bitcoin Core reports a bad command line as
-                // "Error parsing command line arguments: <detail>". Emit that
-                // shape verbatim -- the caller's generic `Error: {e}` wrapper
-                // would give "Error: parsing ...", which is close enough to
-                // read the same and different enough to break anything
-                // matching on Core's wording. Exiting here rather than
-                // returning mirrors the help/version paths just above; this
-                // function runs once at startup and never on the SIGHUP reload
-                // path, which goes through `from_cli` and never exits.
-                eprintln!("Error parsing command line arguments: {e}");
+                // "Error: Error parsing command line arguments: <detail>".
+                // The `Error: ` prefix is required -- test_node.py embeds stderr
+                // verbatim into the FailedToStartError message, and Core's tests
+                // match on the "Error: Error parsing" shape.
+                eprintln!("Error: Error parsing command line arguments: {e}");
                 std::process::exit(1);
             }
         };
@@ -2895,6 +2931,17 @@ impl Config {
             })
             .unwrap_or(false);
 
+        // Core-compat stub indexes: accepted for drop-in config compat,
+        // reported in `getindexinfo` as always-synced when enabled.
+        let coinstatsindex = cli
+            .coinstatsindex
+            .or_else(|| file_get("coinstatsindex").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let txospenderindex = cli
+            .txospenderindex
+            .or_else(|| file_get("txospenderindex").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+
         // BIP 157 P2P advertisement and serving.
         let peerblockfilters = cli
             .peerblockfilters
@@ -3241,6 +3288,8 @@ impl Config {
             electrum_banner,
             electrum_server_name,
             blockfilterindex,
+            coinstatsindex,
+            txospenderindex,
             peerblockfilters,
             prune,
             reindex: cli.reindex.unwrap_or(false),
@@ -4849,6 +4898,27 @@ pub struct CliArgs {
         help = "Build a BIP 158 compact-block-filter index (default: false). Accepts 0/1/basic, or no value at all for \"basic\", matching Bitcoin Core; \"basic\" is the BIP 158 SCRIPT_FILTER (the only filter type defined today). Required by --peerblockfilters=1 and `getblockfilter`."
     )]
     pub blockfilterindex: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Accepted for Bitcoin Core drop-in config compat. satd does not implement a UTXO-set hash index; the flag is accepted silently and the index is reported as always-synced in getindexinfo."
+    )]
+    pub coinstatsindex: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Accepted for Bitcoin Core drop-in config compat. satd does not implement a per-outpoint spender index; the flag is accepted silently and the index is reported as always-synced in getindexinfo."
+    )]
+    pub txospenderindex: Option<bool>,
+
     #[arg(
         long,
         value_name = "BOOL",
@@ -6083,6 +6153,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "addressindex",
         "silentpaymentindex",
         "peerblockfilters",
+        "coinstatsindex",
+        "txospenderindex",
         "mempoolfullrbf",
         "datacarrier",
         "permitbaremultisig",
@@ -6646,6 +6718,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "silentpaymentindex",
     "addrindexsubscriptions",
     "blockfilterindex",
+    "coinstatsindex",
+    "txospenderindex",
     "peerblockfilters",
     // Mempool / relay policy
     "mempoolfullrbf",
@@ -6883,7 +6957,7 @@ const CORE_V30_KEYS: &[&str] = &[
     "spendzeroconfchange",
     "startupnotify", "stopafterblockimport", "stopatheight", "test", "testactivationheight", "testnet",
     "testnet4", "timeout", "torcontrol", "torpassword", "txconfirmtarget", "txindex",
-    "txreconciliation", "uacomment", "unsafesqlitesync", "v2transport", "vbparams", "version",
+    "txospenderindex", "txreconciliation", "uacomment", "unsafesqlitesync", "v2transport", "vbparams", "version",
     "wallet", "walletbroadcast", "walletcrosschain", "walletdir", "walletnotify", "walletrbf",
     "walletrejectlongchains", "whitebind", "whitelist", "whitelistforcerelay", "whitelistrelay", "zmqpubhashblock",
     "zmqpubhashblockhwm", "zmqpubhashtx", "zmqpubhashtxhwm", "zmqpubrawblock", "zmqpubrawblockhwm", "zmqpubrawtx",
@@ -8877,6 +8951,8 @@ testactivationheight=bip34@2
             electrumbanner: None,
             electrumservername: None,
             blockfilterindex: None,
+            coinstatsindex: None,
+            txospenderindex: None,
             peerblockfilters: None,
             prune: None,
             reindex: Some(false),
@@ -9168,6 +9244,8 @@ testactivationheight=bip34@2
             electrumbanner: None,
             electrumservername: None,
             blockfilterindex: None,
+            coinstatsindex: None,
+            txospenderindex: None,
             peerblockfilters: None,
             prune: None,
             reindex: Some(false),
@@ -11820,17 +11898,17 @@ notarealkey=1
         // stop the node — it is skipped with a warning and the rest of the
         // config still loads.
         let cf = ConfigFile::parse(
-            "maxorphantx=100\ncoinstatsindex=1\nprintpriority=1\nserver=1\n",
+            "maxorphantx=100\nnatpmp=1\nprintpriority=1\nserver=1\n",
         )
         .unwrap();
         // The supported key is stored; the skipped ones are not.
         assert!(cf.global.contains_key("server"));
         assert!(!cf.global.contains_key("maxorphantx"));
-        assert!(!cf.global.contains_key("coinstatsindex"));
+        assert!(!cf.global.contains_key("natpmp"));
         // Each skipped key produced a warning naming it.
         assert_eq!(cf.ignored.len(), 3, "got: {:?}", cf.ignored);
         assert!(cf.ignored.iter().any(|m| m.contains("maxorphantx")));
-        assert!(cf.ignored.iter().any(|m| m.contains("coinstatsindex")));
+        assert!(cf.ignored.iter().any(|m| m.contains("natpmp")));
     }
 
     #[test]

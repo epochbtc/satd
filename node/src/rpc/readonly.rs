@@ -31,12 +31,11 @@ use crate::rpc::access::readonly_listener_allows;
 /// exist" from "this method is not available *here*".
 pub const READONLY_REJECT_CODE: i32 = -32001;
 
-/// Mirror of jsonrpsee's default `max_response_body_size` (10 MiB). The
-/// read-only surfaces build their `ServerConfig` without overriding it, so
-/// the batch-response builder below uses the same bound the inner service
-/// enforces. If a read-only surface ever overrides the response size, thread
-/// that value through instead of this constant.
-pub(crate) const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// The response-size bound the batch-response builder below works to. The
+/// read-only listeners share the full listener's `ServerConfig`, so this is
+/// the same [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the inner
+/// service enforces.
+pub(crate) const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_BODY_SIZE;
 
 fn rejected_error(method: &str) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(

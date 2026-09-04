@@ -159,9 +159,7 @@ status = "run"
 
 [[test]]
 file = "feature_framework_startup_failures.py"
-status = "skip"
-reason = "feature-missing"
-note = "clap's error format ('unexpected argument') doesn't match Core's ('Invalid parameter -nonexistentarg'); test regex-matches the exact error string"
+status = "run"
 
 [[test]]
 file = "feature_framework_testshell.py"
@@ -546,9 +544,7 @@ note = "`prioritisetransaction` with no arguments answers `-1` with a Rust `Erro
 
 [[test]]
 file = "mining_template_verification.py"
-status = "skip"
-reason = "feature-missing"
-note = "getblocktemplate proposal mode returns the full template instead of null for a valid proposal"
+status = "run"
 
 [[test]]
 file = "p2p_1p1c_network.py"
@@ -907,9 +903,7 @@ status = "run"
 
 [[test]]
 file = "rpc_deriveaddresses.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs deriveaddresses RPC; also, sat-cli rejects the -n flag Core's CLI uses"
+status = "run"
 
 [[test]]
 file = "rpc_dumptxoutset.py"
@@ -919,15 +913,11 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_estimatefee.py"
-status = "skip"
-reason = "rpc-missing"
-note = "estimatesmartfee with no args leaks a jsonrpsee ErrorObject Debug dump instead of returning help text. Follow-up: error-message sweep"
+status = "run"
 
 [[test]]
 file = "rpc_generate.py"
-status = "skip"
-reason = "feature-missing"
-note = "generatetoaddress error message is 'invalid address: validation error' where Core says 'Invalid address'; also needs generateblock with combo() descriptor"
+status = "run"
 
 [[test]]
 file = "rpc_getblockfilter.py"
@@ -958,9 +948,7 @@ note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the 
 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs getdescriptorinfo RPC"
+status = "run"
 
 [[test]]
 file = "rpc_gettxspendingprevout.py"
@@ -970,9 +958,7 @@ note = "uses -txospenderindex (Core v31); satd targets Core v30 compatibility, s
 
 [[test]]
 file = "rpc_help.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the dump_all_command_conversions hidden RPC and Core-format help text (IndexError parsing help output)"
+status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"

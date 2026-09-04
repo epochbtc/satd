@@ -155,7 +155,7 @@ impl IbdBitmap {
     }
 }
 
-/// Snapshot of the address-index backfill from `getindexinfo`. Only
+/// Snapshot of the address-index backfill from `getsatdindexinfo`. Only
 /// surfaced in the UI when state is one of `running`, `paused`, or
 /// `failed` — `idle`, `completed`, `cancelled`, `rejected` are quiet.
 #[derive(Debug, Clone)]
@@ -171,11 +171,11 @@ pub struct BackfillProgress {
     pub last_error: Option<String>,
 }
 
-/// Snapshot of the silent-payment index from `getindexinfo`.
+/// Snapshot of the silent-payment index from `getsatdindexinfo`.
 ///
 /// Unlike the address index, whose steady-state flags arrive via
 /// `getserverstatus`, everything the services row needs for the
-/// silent-payment index comes from `getindexinfo.silentpayments`.
+/// silent-payment index comes from `getsatdindexinfo.silentpayments`.
 ///
 /// The backfill is a **single** pass over the taproot era, so there is no
 /// `pass` field. Progress must come from the daemon's `progress_ratio`,
@@ -489,7 +489,7 @@ pub struct AppState {
     // when the response shape couldn't be parsed.
     pub backfill: Option<BackfillProgress>,
 
-    /// Silent-payment index status from `getindexinfo`. `None` when the
+    /// Silent-payment index status from `getsatdindexinfo`. `None` when the
     /// daemon has not reported a `silentpayments` object at all.
     pub sp_index: Option<SpIndexProgress>,
 
@@ -1026,7 +1026,7 @@ impl AppState {
         self.uptime_secs = v.as_u64();
     }
 
-    /// Update from `getindexinfo` response.
+    /// Update from `getsatdindexinfo` response.
     pub fn update_index_info(&mut self, v: &serde_json::Value) {
         self.backfill = BackfillProgress::from_json(v);
         self.sp_index = SpIndexProgress::from_json(v);

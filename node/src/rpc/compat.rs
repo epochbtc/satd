@@ -41,16 +41,20 @@
 use http_body_util::{BodyExt, Limited};
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 
-/// jsonrpsee's default `max_request_body_size` (10 MiB). The shim must
-/// not buffer more than the engine would itself accept. The cap is
-/// enforced *while* reading the body (via `http_body_util::Limited`,
-/// plus a `Content-Length` pre-check), never after a full
-/// `collect()` — otherwise this middleware would itself be a memory-DoS
-/// vector, allocating the entire (authenticated or not) request body
-/// before the limit could reject it. An over-limit request is answered
-/// with `413 Payload Too Large`, the same outcome jsonrpsee gives for a
-/// request exceeding its own `max_request_body_size`.
-const MAX_NORMALIZE_BODY: usize = 10 * 1024 * 1024;
+/// Maximum request body size the compat shim will buffer for JSON-RPC
+/// version normalization: the same
+/// [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the engine is
+/// configured with, so the shim never rejects a request the engine would
+/// accept and never buffers one it would not.
+///
+/// The cap is enforced *while* reading the body (via
+/// `http_body_util::Limited`, plus a `Content-Length` pre-check), never
+/// after a full `collect()` — otherwise this middleware would itself be a
+/// memory-DoS vector, allocating the entire (authenticated or not) request
+/// body before the limit could reject it. An over-limit request is
+/// answered with `413 Payload Too Large`, the same outcome jsonrpsee gives
+/// for a request exceeding its own `max_request_body_size`.
+const MAX_NORMALIZE_BODY: usize = crate::rpc::RPC_MAX_BODY_SIZE;
 
 /// Bitcoin Core's libevent `MAX_HEADERS_SIZE` — URIs longer than this
 /// produce `400 Bad Request`.

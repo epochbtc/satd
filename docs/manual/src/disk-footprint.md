@@ -155,7 +155,7 @@ sat-cli backfillindex silentpayment
 ```
 
 The backfill walks from taproot activation to the snapshot height it pinned at
-start, and resumes across a restart. `getindexinfo` reports a `silentpayments`
+start, and resumes across a restart. `getsatdindexinfo` reports a `silentpayments`
 section with the synced flag and the backfill progress, including a
 `backfill.progress_ratio` field. Progress is measured across that walked span,
 not from genesis, so it starts near zero rather than near the fraction of the

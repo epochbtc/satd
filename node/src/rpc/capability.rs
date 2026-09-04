@@ -34,9 +34,10 @@ use crate::rpc::access::{RpcAccess, classify};
 /// apart from "does not exist" / "not available on this listener".
 pub const CAPABILITY_DENIED_CODE: i32 = -32004;
 
-/// Mirror of jsonrpsee's default `max_response_body_size` (10 MiB); used by the
-/// batch-response builder, matching what the inner service enforces.
-const RESPONSE_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// The response-size bound used by the batch-response builder, matching the
+/// [`RPC_MAX_BODY_SIZE`](crate::rpc::RPC_MAX_BODY_SIZE) the inner service
+/// enforces.
+const RESPONSE_BODY_LIMIT: usize = crate::rpc::RPC_MAX_BODY_SIZE;
 
 /// The capability a method requires. Read-classified methods need `rpc:read`;
 /// everything else — mempool-submit, control, block-connecting, AND unclassified
