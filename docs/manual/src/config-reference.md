@@ -187,7 +187,7 @@ startup error.
 | `asmap` | none | restart | core | asmap file for ASN-based addrman bucketing (eclipse resistance). |
 | `port` | network default | restart | core | P2P listen port. |
 | `bind` | `0.0.0.0` | restart | core | Bind P2P to this address; **repeatable**. Accepts `addr`, `addr:port`, and `addr[:port]=onion`. An entry with a port uses it; a bare address takes `port`, and a bare `=onion` entry takes `port` + 1 (as in Core). IPv6 literals may be plain (`::1`) or bracketed. Any explicit `bind` replaces the default listener. Cannot be combined with `listen=0`. |
-| `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). Connect-only *exclusivity* is a startup decision (restart to change). |
+| `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). Any `connect` stops the node dialling addresses it learns from gossip; `connect=0` is Core's spelling for "open no outbound connections at all". Connect-only *exclusivity* is a startup decision (restart to change). |
 | `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding). |
 | `uacomment` | none | restart | core | Append a comment to the advertised user agent (**repeatable**; command-line and config-file values accumulate, command line first). Renders as `/satd:<version>(c1; c2)/`. A comment may contain only alphanumerics and `` .,;-_?@`` — the user agent's own delimiters `/`, `:`, `(` and `)` are refused — and the whole user agent may not exceed 256 bytes. Either violation is a startup error, as in Core. |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |

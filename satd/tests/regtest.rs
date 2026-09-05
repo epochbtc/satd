@@ -13557,3 +13557,330 @@ fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
         "{rollback}"
     );
 }
+
+// ============================================================================
+// `addconnection`: Core's hidden outbound-dial RPC
+//
+// The functional-test framework's `add_outbound_p2p_connection` is built on
+// it, so without it no Core test can exercise satd's *outbound* peer
+// behaviour at all -- the framework can only ever be dialled.
+// ============================================================================
+
+/// A listener that plays the far end of a connection satd opens, so a test can
+/// see the `version` satd sends as the initiator.
+mod addconn_listener {
+    use bitcoin::consensus::{deserialize, serialize};
+    use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::{Address, Magic, ServiceFlags};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant, SystemTime};
+
+    const HEADER_SIZE: usize = 24;
+
+    pub struct Inbound {
+        pub listener: TcpListener,
+        pub addr: SocketAddr,
+    }
+
+    impl Inbound {
+        pub fn bind() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+            let addr = listener.local_addr().unwrap();
+            Self { listener, addr }
+        }
+
+        /// Accept the dial satd makes and read messages until its `version`
+        /// arrives. Returns the stream (mid-handshake) and that version.
+        pub fn accept_version(&self, timeout: Duration) -> (TcpStream, VersionMessage) {
+            self.listener
+                .set_nonblocking(false)
+                .expect("blocking listener");
+            let (mut stream, _) = self.listener.accept().expect("satd never dialled us");
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.set_write_timeout(Some(timeout)).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let deadline = Instant::now() + timeout;
+            loop {
+                assert!(Instant::now() < deadline, "no version from satd");
+                match recv(&mut stream) {
+                    NetworkMessage::Version(v) => return (stream, v),
+                    _ => continue,
+                }
+            }
+        }
+
+        /// Finish the handshake the way a well-behaved peer would.
+        pub fn complete_handshake(&self, stream: &mut TcpStream) {
+            send(stream, NetworkMessage::Version(our_version(self.addr)));
+            send(stream, NetworkMessage::Verack);
+        }
+    }
+
+    fn our_version(receiver: SocketAddr) -> VersionMessage {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: now,
+            receiver: Address::new(&receiver, ServiceFlags::NONE),
+            sender: Address::new(&receiver, ServiceFlags::NONE),
+            nonce: 0x5a7d_0000_0000_0001,
+            user_agent: "/addconn-test:0.1/".to_string(),
+            start_height: 0,
+            relay: true,
+        }
+    }
+
+    pub fn send(stream: &mut TcpStream, msg: NetworkMessage) {
+        let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+        stream.write_all(&serialize(&raw)).expect("send");
+    }
+
+    pub fn recv(stream: &mut TcpStream) -> NetworkMessage {
+        let mut header = [0u8; HEADER_SIZE];
+        stream.read_exact(&mut header).expect("read header");
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        assert!(len < 4 * 1024 * 1024, "implausible payload length {len}");
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("read payload");
+        let mut buf = Vec::with_capacity(HEADER_SIZE + len);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+        deserialize::<RawNetworkMessage>(&buf)
+            .expect("decode message")
+            .payload()
+            .clone()
+    }
+
+    /// Whether the peer closed the connection within `timeout`.
+    ///
+    /// Drains rather than peeking: satd sends `sendaddrv2` straight after its
+    /// `version`, so bytes still in flight are not evidence the connection
+    /// stayed up -- only EOF is.
+    pub fn wait_for_close(stream: &mut TcpStream, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut scratch = [0u8; 256];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            stream.set_read_timeout(Some(remaining)).unwrap();
+            match stream.read(&mut scratch) {
+                Ok(0) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+/// The framework asks for a connection *type*, and the type is not cosmetic:
+/// a block-relay-only connection must not ask the peer for transactions, and
+/// must not be used for address relay. Core clears `fRelay` on the version it
+/// sends and withholds address relay; `getpeerinfo` has to report both.
+#[test]
+fn addconnection_opens_the_connection_type_it_is_asked_for() {
+    use addconn_listener::Inbound;
+
+    let node = TestNode::start(&[]);
+    let peer = Inbound::bind();
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("block-relay-only"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "addconnection must exist: {out}");
+    assert_eq!(out["result"]["address"], serde_json::json!(peer.addr.to_string()));
+    assert_eq!(out["result"]["connection_type"], serde_json::json!("block-relay-only"));
+
+    let (mut stream, version) = peer.accept_version(test_timeout(20));
+    // The whole point of the connection type: Core does not ask a
+    // block-relay-only peer for transactions.
+    assert!(
+        !version.relay,
+        "a block-relay-only connection must clear fRelay, got {version:?}"
+    );
+    peer.complete_handshake(&mut stream);
+
+    let outbound_peer = || -> Option<serde_json::Value> {
+        let info = node.rpc_call("getpeerinfo").ok()?;
+        let peers = info["result"].as_array()?.clone();
+        peers
+            .into_iter()
+            .find(|p| p["inbound"] == serde_json::json!(false))
+    };
+    poll_until(
+        || outbound_peer().is_some(),
+        test_timeout(20),
+        "the dialled peer must show up in getpeerinfo",
+    );
+    let info = outbound_peer().unwrap();
+
+    assert_eq!(
+        info["connection_type"],
+        serde_json::json!("block-relay-only"),
+        "getpeerinfo must report the type the RPC opened: {info}"
+    );
+    assert_eq!(
+        info["addr_relay_enabled"],
+        serde_json::json!(false),
+        "a block-relay-only peer gets no address relay: {info}"
+    );
+}
+
+/// A feeler asks one question -- is anything still listening? -- and the
+/// peer's `version` answers it. Core closes the connection right there,
+/// without a verack, so the peer never becomes a usable connection.
+#[test]
+fn addconnection_drops_a_feeler_as_soon_as_it_has_a_version() {
+    use addconn_listener::Inbound;
+
+    let node = TestNode::start(&[]);
+    let peer = Inbound::bind();
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("feeler"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "{out}");
+
+    let (mut stream, version) = peer.accept_version(test_timeout(20));
+    assert!(!version.relay, "a feeler must clear fRelay too: {version:?}");
+    // Answer with a version and nothing else, exactly as Core's
+    // `P2PFeelerReceiver` does.
+    addconn_listener::send(&mut stream, bitcoin::p2p::message::NetworkMessage::Version(
+        bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            receiver: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
+            sender: bitcoin::p2p::Address::new(&peer.addr, bitcoin::p2p::ServiceFlags::NONE),
+            nonce: 0x5a7d_0000_0000_0002,
+            user_agent: "/addconn-feeler:0.1/".to_string(),
+            start_height: 0,
+            relay: true,
+        },
+    ));
+
+    assert!(
+        addconn_listener::wait_for_close(&mut stream, test_timeout(20)),
+        "satd must close a feeler once it has seen the peer's version"
+    );
+
+    // And it must never have counted as a peer.
+    let info = node.rpc_call("getpeerinfo").unwrap();
+    let outbound: Vec<_> = info["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["inbound"] == serde_json::json!(false))
+        .collect();
+    assert!(outbound.is_empty(), "a feeler must not linger in getpeerinfo: {info}");
+}
+
+/// Core's `CConnman::AddConnection` returns false for `inbound` and `manual`,
+/// and its RPC rejects anything else outright. Accepting a type we do not
+/// implement would report a connection that is not the kind it claims.
+#[test]
+fn addconnection_refuses_a_type_core_cannot_open() {
+    let node = TestNode::start(&[]);
+    for bad in ["manual", "inbound", "outbound", ""] {
+        let out = node
+            .rpc_call_with_params(
+                "addconnection",
+                vec![
+                    serde_json::json!("127.0.0.1:1"),
+                    serde_json::json!(bad),
+                    serde_json::json!(false),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            out["error"]["code"],
+            serde_json::json!(-8),
+            "connection_type {bad:?} must be refused: {out}"
+        );
+    }
+
+    // Hidden means hidden: Core registers `addconnection` but keeps it out of
+    // `help`, and a test-only dial RPC advertised to operators is worse than
+    // no help entry.
+    let help = node.rpc_call("help").unwrap();
+    let text = help["result"].as_str().unwrap_or_default();
+    assert!(
+        !text.contains("addconnection"),
+        "addconnection must stay out of the help listing"
+    );
+}
+
+/// Bitcoin Core spells "open no outbound connections" as `-connect=0`, and
+/// every functional test starts its node that way. satd parsed the `0` as a
+/// peer address and dialled `0.0.0.0:8333` at startup -- which burned peer id
+/// 0, so the first real peer came back as id 1 where Core reports 0. Core's
+/// framework asserts on those ids, so this single line was failing p2p tests
+/// that had nothing to do with it.
+#[test]
+fn connect_zero_means_no_peers_not_the_address_zero() {
+    let node = TestNode::start(&["--connect=0"]);
+    node.rpc_call("getblockchaininfo").unwrap();
+
+    let info = node.rpc_call("getpeerinfo").unwrap();
+    assert_eq!(
+        info["result"].as_array().map(|a| a.len()),
+        Some(0),
+        "a -connect=0 node starts with no peers: {info}"
+    );
+
+    // The observable Core's own test framework depends on: peer ids start at
+    // 0, so a phantom dial must not have consumed one.
+    let peer = addconn_listener::Inbound::bind();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("outbound-full-relay"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "{out}");
+    let (mut stream, _) = peer.accept_version(test_timeout(20));
+    peer.complete_handshake(&mut stream);
+
+    let first_id = || -> Option<serde_json::Value> {
+        let info = node.rpc_call("getpeerinfo").ok()?;
+        info["result"].as_array()?.first().map(|p| p["id"].clone())
+    };
+    poll_until(
+        || first_id().is_some(),
+        test_timeout(20),
+        "the dialled peer must show up in getpeerinfo",
+    );
+    assert_eq!(
+        first_id(),
+        Some(serde_json::json!(0)),
+        "the first peer must be id 0, as it is in Bitcoin Core"
+    );
+}

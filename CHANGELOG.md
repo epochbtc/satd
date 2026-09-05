@@ -23,6 +23,10 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- `addconnection`, Bitcoin Core's hidden regtest-only RPC for opening an
+  outbound connection of a chosen type (`outbound-full-relay`,
+  `block-relay-only`, `addr-fetch`, `feeler`). `getpeerinfo` now reports the
+  real `connection_type`, and each type behaves as Core's does.
 - `validateaddress` reports *why* an address is invalid: Core's `error`
   string plus `error_locations` for a Bech32 checksum failure.
 - `dumptxoutset` accepts Core's `type` argument (every Core-shaped call was
@@ -30,6 +34,11 @@ item below is (or will be) written up in full in the in-development
   network data directory as Core does rather than the working directory.
 
 ### Fixed
+
+- `-connect=0` was parsed as the peer address `0`, so the node dialled
+  `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
+  connections"; satd now does too, and any `-connect` stops the node dialling
+  addresses it learned from gossip.
 
 - `validateaddress` reported an address from another network as valid — it
   never checked the network at all.
