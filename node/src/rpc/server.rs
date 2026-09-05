@@ -12,6 +12,7 @@ use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::CapabilityLayer;
 use crate::rpc::named_params::NamedParamsLayer;
+use crate::rpc::params::Args;
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
 use crate::storage::Store;
@@ -213,106 +214,9 @@ pub struct ReadOnlyListener {
     pub api_handle: tokio::runtime::Handle,
 }
 
-/// Shared state for RPC handlers.
-/// Read Core's `verbose`/`verbosity` argument, which accepts **either** a bool
-/// or a number (`ParseVerbosity`, `src/rpc/util.cpp`): `false` is 0, `true` is 1.
-///
-/// Reading the slot as one concrete Rust type is not merely lossy, it is
-/// silently destructive. `ParamsSequence::next_inner` clears the remaining
-/// buffer on any deserialize error, so a mistyped argument becomes the default
-/// Core-compatible JSON type name for error messages (e.g. "number", "string",
-/// "bool", "array", "object", "null"). Used by the type-checking paths in
-/// `help`, `estimatesmartfee`, `estimaterawfee`, etc.
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-/// *and every argument after it disappears* -- `getrawtransaction` would answer
-/// a numeric `verbosity` as non-verbose and drop the caller's `blockhash`. Going
-/// Reformat a jsonrpsee type-mismatch error into Bitcoin Core's
-/// `RPC_TYPE_ERROR` (-3) shape. Core says:
-///
-///   "JSON value of type <actual> is not of expected type <expected>"
-///
-/// jsonrpsee's serde errors look like:
-///
-///   "invalid type: integer `1234`, expected a string at line 1 column 4"
-///
-/// We parse that format and produce Core's wording; for any error we
-/// cannot parse we fall back to the raw error message.
-fn core_type_error(e: &ErrorObjectOwned, expected: &str) -> ErrorObjectOwned {
-    let msg = e.message();
-    let data_str = e
-        .data()
-        .and_then(|d| serde_json::from_str::<String>(d.get()).ok())
-        .unwrap_or_default();
-
-    // Try parsing serde's "invalid type: <actual>, expected <expected>" pattern
-    // from the data field.
-    let formatted = if let Some(rest) = data_str.strip_prefix("invalid type: ") {
-        // e.g. "integer `1234`, expected a string at line 1 column 4"
-        let actual_type = if rest.starts_with("integer") {
-            "number"
-        } else if rest.starts_with("string") {
-            "string"
-        } else if rest.starts_with("boolean") {
-            "bool"
-        } else if rest.starts_with("map") || rest.starts_with("sequence") {
-            "object"
-        } else {
-            // Unknown type — just use the message as-is
-            return ErrorObjectOwned::owned(
-                -3,
-                format!("JSON value of type unknown is not of expected type {expected}"),
-                None::<()>,
-            );
-        };
-        format!("JSON value of type {actual_type} is not of expected type {expected}")
-    } else {
-        // Doesn't match the serde format; use a reasonable fallback.
-        format!("{msg}: {data_str}")
-    };
-
-    ErrorObjectOwned::owned(-3, formatted, None::<()>)
-}
-
-/// through `Value` cannot fail on type, so the sequence is never poisoned.
-fn optional_verbosity(
-    seq: &mut jsonrpsee::types::params::ParamsSequence<'_>,
-    default: u32,
-) -> Result<u32, ErrorObjectOwned> {
-    let raw: Option<serde_json::Value> = seq
-        .optional_next()
-        .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-    match raw {
-        None | Some(serde_json::Value::Null) => Ok(default),
-        Some(serde_json::Value::Bool(b)) => Ok(u32::from(b)),
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>)),
-        Some(v) => {
-            let type_name = match &v {
-                serde_json::Value::String(_) => "string",
-                serde_json::Value::Array(_) => "array",
-                serde_json::Value::Object(_) => "object",
-                _ => "unknown",
-            };
-            Err(ErrorObjectOwned::owned(
-                -3,
-                format!("JSON value of type {type_name} is not of expected type number"),
-                None::<()>,
-            ))
-        }
-    }
-}
+// Core-compatible JSON type name for error messages, and the non-poisoning
+// positional-argument reader every handler uses. See `crate::rpc::params`.
+use crate::rpc::params::json_type_name;
 
 /// Scan the raw JSON params string for `createrawtransaction` and detect
 /// duplicate keys in the outputs object (the second positional element).
@@ -379,6 +283,7 @@ fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
     serde::Deserializer::deserialize_any(&mut de, visitor).ok().flatten()
 }
 
+/// Shared state for RPC handlers.
 pub struct RpcContext {
     pub chain_state: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
@@ -702,13 +607,12 @@ pub async fn start(
     })?;
 
     module.register_method("getblock", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hash: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
         // Core defaults this to 1 and accepts a bool, where `false` means 0 --
         // a hex string, not an object.
-        let verbosity = optional_verbosity(&mut seq, 1)?;
+        let verbosity = args.verbosity("verbosity", 1)?;
+        args.check()?;
         blockchain::get_block(&ctx.chain_state, &hash, verbosity)
             .map_err(|e| {
                 // "Block not available (...)" errors use RPC_MISC_ERROR (-1),
@@ -720,48 +624,36 @@ pub async fn start(
     })?;
 
     module.register_method("getblockheader", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hash: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let verbose: bool = seq.optional_next().unwrap_or(Some(true)).unwrap_or(true);
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
+        let verbose: bool = args.optional_or("verbose", true)?;
+        args.check()?;
         blockchain::get_block_header(&ctx.chain_state, &hash, verbose)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
 
     module.register_method("getblockfrompeer", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hash: String = seq
-            .next()
-            .map_err(|e| core_type_error(&e, "string"))?;
-        // Parse peer_id as a raw JSON value first so we can distinguish
-        // between "wrong type" (string where number expected → -3) and
-        // "negative number" (valid JSON number that represents no peer →
-        // pass through to the peer-lookup code as None, which yields -1
-        // "Peer does not exist"). Core accepts negative peer_ids at the
-        // deserialization layer and rejects them in the lookup.
-        let peer_id: Option<crate::net::peer::PeerId> = {
-            let raw: Option<serde_json::Value> = seq
-                .optional_next()
-                .map_err(|e| core_type_error(&e, "number"))?;
-            match raw {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::Number(n)) => {
-                    // Negative or too-large numbers are valid JSON but map
-                    // to no existing peer — pass them through as an
-                    // impossibly large id so the lookup fails with "Peer
-                    // does not exist" (matching Core).
-                    Some(n.as_u64().unwrap_or(u64::MAX))
-                }
-                Some(_) => {
-                    return Err(ErrorObjectOwned::owned(
-                        -3,
-                        "JSON value of type string is not of expected type number",
-                        None::<()>,
-                    ));
-                }
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
+        // Read `peer_id` raw: a negative or too-large number is a valid JSON
+        // number that maps to no peer, and Core accepts it at the
+        // deserialization layer and rejects it in the lookup ("Peer does not
+        // exist", -1). A non-number is the type error (-3).
+        let peer_id: Option<crate::net::peer::PeerId> = match args.raw("peer_id")? {
+            None => None,
+            Some(serde_json::Value::Number(n)) => Some(n.as_u64().unwrap_or(u64::MAX)),
+            Some(other) => {
+                return Err(ErrorObjectOwned::owned(
+                    -3,
+                    format!(
+                        "JSON value of type {} is not of expected type number",
+                        json_type_name(&other)
+                    ),
+                    None::<()>,
+                ));
             }
         };
+        args.check()?;
         network::get_block_from_peer(&ctx.chain_state, &ctx.peer_manager, &hash, peer_id)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -787,10 +679,11 @@ pub async fn start(
     })?;
 
     module.register_method("getchaintxstats", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let nblocks: Option<u32> = args.optional("nblocks")?;
         // Core's optional second arg: the block that ends the window.
-        let blockhash_str: Option<String> = seq.optional_next().unwrap_or(None);
+        let blockhash_str: Option<String> = args.optional("blockhash")?;
+        args.check()?;
         let final_blockhash = match blockhash_str {
             Some(s) => Some(s.parse::<bitcoin::BlockHash>().map_err(|e| {
                 ErrorObjectOwned::owned(-8, format!("invalid blockhash: {e}"), None::<()>)
@@ -802,21 +695,19 @@ pub async fn start(
     })?;
 
     module.register_method("getmempoolancestors", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        let verbose: bool = args.optional_or("verbose", false)?;
+        args.check()?;
         blockchain::get_mempool_ancestors(&ctx.mempool, &txid, verbose)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
 
     module.register_method("getmempooldescendants", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        let verbose: bool = args.optional_or("verbose", false)?;
+        args.check()?;
         blockchain::get_mempool_descendants(&ctx.mempool, &txid, verbose)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
     })?;
@@ -824,10 +715,12 @@ pub async fn start(
     module.register_method("getmempoolentry", |params, ctx, _extensions| {
         // Accepts either a single txid string (Core-compat) or an array
         // of txids (bulk). On bulk, returns a map of txid → entry | null.
-        let mut seq = params.sequence();
-        let first: serde_json::Value = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        // Either shape is legitimate here, so the slot is read raw.
+        let first: serde_json::Value = args
+            .raw("txid")?
+            .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument txid", None::<()>))?;
+        args.check()?;
         match first {
             serde_json::Value::Array(arr) => {
                 let mut txids: Vec<String> = Vec::with_capacity(arr.len());
@@ -871,10 +764,11 @@ pub async fn start(
 
     module.register_method("listquarantine", |params, ctx, _extensions| {
         // `listquarantine [rule] [count] [skip]` — all optional.
-        let mut seq = params.sequence();
-        let rule: Option<String> = seq.optional_next().unwrap_or(None);
-        let count: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
-        let skip: usize = seq.optional_next().unwrap_or(None).unwrap_or(0);
+        let mut args = Args::new(&params);
+        let rule: Option<String> = args.optional("rule")?;
+        let count: usize = args.optional_or("count", 0)?;
+        let skip: usize = args.optional_or("skip", 0)?;
+        args.check()?;
         Ok::<_, ErrorObjectOwned>(crate::rpc::policy::list_quarantine(
             &ctx.mempool,
             rule.as_deref(),
@@ -884,20 +778,18 @@ pub async fn start(
     })?;
 
     module.register_method("getquarantineentry", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        args.check()?;
         crate::rpc::policy::get_quarantine_entry(&ctx.mempool, &txid)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("policytest", |params, ctx, _extensions| {
         // `policytest <rawtx-hex>` — dry-run against the loaded ruleset.
-        let mut seq = params.sequence();
-        let rawtx: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let rawtx: String = args.required("rawtx")?;
+        args.check()?;
         crate::rpc::policy::policy_test(&ctx.chain_state, &ctx.mempool, &rawtx)
             .map_err(|e| ErrorObjectOwned::owned(-8, e, None::<()>))
     })?;
@@ -926,9 +818,10 @@ pub async fn start(
     })?;
 
     module.register_method("verifychain", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let check_level: u32 = seq.optional_next().unwrap_or(Some(3)).unwrap_or(3);
-        let nblocks: u32 = seq.optional_next().unwrap_or(Some(6)).unwrap_or(6);
+        let mut args = Args::new(&params);
+        let check_level: u32 = args.optional_or("checklevel", 3)?;
+        let nblocks: u32 = args.optional_or("nblocks", 6)?;
+        args.check()?;
         Ok::<_, ErrorObjectOwned>(blockchain::verify_chain(
             &ctx.chain_state,
             check_level,
@@ -1011,13 +904,10 @@ pub async fn start(
     #[cfg(feature = "block-filter-index")]
     module.register_method("getblockfilter", |params, ctx, _extensions| {
         // `getblockfilter <blockhash> [filtertype]`. Bitcoin-Core-compatible.
-        let mut seq = params.sequence();
-        let block_hash: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
-        let filter_type: Option<String> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let block_hash: String = args.required("blockhash")?;
+        let filter_type: Option<String> = args.optional("filtertype")?;
+        args.check()?;
         indexes::get_block_filter(
             &ctx.chain_state,
             ctx.filter_index.as_ref(),
@@ -1032,16 +922,11 @@ pub async fn start(
     // silent-payment index is always compiled (runtime `silentpaymentindex=1`).
     module.register_method("getsilentpaymentblockdata", |params, ctx, _extensions| {
         // `getsilentpaymentblockdata <blockhash> [verbosity] [dust_limit]`.
-        let mut seq = params.sequence();
-        let block_hash: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
-        let verbosity: Option<u32> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
-        let dust_limit: Option<u64> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-8, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let block_hash: String = args.required("blockhash")?;
+        let verbosity: Option<u32> = args.optional("verbosity")?;
+        let dust_limit: Option<u64> = args.optional("dust_limit")?;
+        args.check()?;
         indexes::get_silent_payment_block_data(&ctx.chain_state, &block_hash, verbosity, dust_limit)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1050,13 +935,12 @@ pub async fn start(
         // Core-compatible getindexinfo: only report indexes that were
         // explicitly requested via CLI flags, matching Bitcoin Core's
         // behavior. Optional index_name parameter filters the response.
-        let mut seq = params.sequence();
+        let mut args = Args::new(&params);
         // Core's `RPCHelpMan` argument loop rejects a wrongly-typed argument
         // with RPC_TYPE_ERROR (-3) rather than ignoring it. Swallowing the
         // error here would answer `getindexinfo(5)` with the full index list.
-        let index_name: Option<String> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let index_name: Option<String> = args.optional("index_name")?;
+        args.check()?;
         #[cfg(feature = "block-filter-index")]
         let bfi_enabled = ctx.blockfilterindex_enabled;
         #[cfg(not(feature = "block-filter-index"))]
@@ -1163,10 +1047,9 @@ pub async fn start(
     // --- Mining RPCs ---
 
     module.register_method("submitblock", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hex_block: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hex_block: String = args.required("hexdata")?;
+        args.check()?;
         Ok::<_, ErrorObjectOwned>(mining::submit_block(
             &ctx.chain_state,
             &ctx.mempool,
@@ -1175,36 +1058,32 @@ pub async fn start(
     })?;
 
     module.register_method("generatetoaddress", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let nblocks: u32 = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let address: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let nblocks: u32 = args.required("nblocks")?;
+        let address: String = args.required("address")?;
+        args.check()?;
         mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("generatetodescriptor", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let nblocks: u32 = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let descriptor: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let nblocks: u32 = args.required("num_blocks")?;
+        let descriptor: String = args.required("descriptor")?;
+        args.check()?;
         mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("generateblock", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let output: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let raw_txs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
-        let submit: bool = seq.optional_next().unwrap_or(None).unwrap_or(true);
+        let mut args = Args::new(&params);
+        let output: String = args.required("output")?;
+        let raw_txs: Option<Vec<serde_json::Value>> = args.optional("transactions")?;
+        let submit: bool = args.optional_or("submit", true)?;
+        // #672: without this, a mistyped `transactions` poisoned the sequence
+        // and `submit` silently reverted to its `true` default -- the caller
+        // asked for a block back without touching the chain and got a new tip.
+        args.check()?;
 
         if ctx.chain_state.network != bitcoin::Network::Regtest {
             return Err(ErrorObjectOwned::owned(
@@ -1303,10 +1182,11 @@ pub async fn start(
         // The optional first positional argument is the template_request
         // object. When it contains `"mode": "proposal"` and `"data"`, run
         // proposal-mode validation instead of returning a new template.
-        let mut seq = params.sequence();
-        let request: Option<serde_json::Value> = seq
-            .optional_next()
-            .unwrap_or(None);
+        let mut args = Args::new(&params);
+        let request: Option<serde_json::Value> =
+            args.optional::<serde_json::Map<String, serde_json::Value>>("template_request")?
+                .map(serde_json::Value::Object);
+        args.check()?;
         if let Some(ref req) = request
             && req.get("mode").and_then(|m| m.as_str()) == Some("proposal")
         {
@@ -1331,9 +1211,10 @@ pub async fn start(
     })?;
 
     module.register_method("getnetworkhashps", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let nblocks: Option<u32> = seq.optional_next().unwrap_or(None);
-        let height: Option<u32> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let nblocks: Option<u32> = args.optional("nblocks")?;
+        let height: Option<u32> = args.optional("height")?;
+        args.check()?;
         Ok::<_, ErrorObjectOwned>(serde_json::json!(mining::get_network_hash_ps(
             &ctx.chain_state,
             nblocks,
@@ -1352,17 +1233,24 @@ pub async fn start(
     // --- Transaction / Mempool RPCs ---
 
     module.register_method("sendrawtransaction", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hex_tx: String = seq.next().map_err(|e| {
-            crate::rpc::error::RpcError::new(-1, "rpc.input.parse", e.to_string())
-                .with_suggestion("Pass the raw transaction as a hex string in the first argument.")
-                .into_error_object()
+        let mut args = Args::new(&params);
+        let hex_tx: String = args.required("hexstring").map_err(|e| {
+            if e.code() == -1 {
+                crate::rpc::error::RpcError::new(-1, "rpc.input.parse", e.message().to_string())
+                    .with_suggestion(
+                        "Pass the raw transaction as a hex string in the first argument.",
+                    )
+                    .into_error_object()
+            } else {
+                e
+            }
         })?;
-        // Core's second arg is `maxfeerate` (numeric or string, BTC/kvB,
-        // default 0.10). We parse it as an f64 so both `0.001` and `"0.001"`
-        // work. We also accept a bool for satd's `allowquarantined` extension —
-        // a numeric value silently sets maxfeerate and leaves quarantine off.
-        let maxfeerate_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        // Core's second arg is `maxfeerate` (AMOUNT: numeric or string,
+        // BTC/kvB, default 0.10), so it has no single expected JSON type and
+        // is read raw. We also accept a bool for satd's `allowquarantined`
+        // extension — a numeric value sets maxfeerate and leaves quarantine
+        // off.
+        let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
         let (maxfeerate_btc_per_kvb, allow_quarantined) = match &maxfeerate_raw {
             None | Some(serde_json::Value::Null) => (0.10_f64, false),
             Some(serde_json::Value::Bool(b)) => (0.10, *b),
@@ -1376,8 +1264,10 @@ pub async fn start(
             }
             _ => (0.10, false),
         };
-        // Core's third arg is `maxburnamount` (numeric or string, BTC, default 0).
-        let maxburnamount_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        // Core's third arg is `maxburnamount` (AMOUNT: numeric or string,
+        // BTC, default 0).
+        let maxburnamount_raw: Option<serde_json::Value> = args.raw("maxburnamount")?;
+        args.check()?;
         let maxburnamount_sat: u64 = match &maxburnamount_raw {
             None | Some(serde_json::Value::Null) => 0,
             Some(serde_json::Value::Number(n)) => {
@@ -1499,18 +1389,19 @@ pub async fn start(
     })?;
 
     module.register_method("getrawmempool", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let verbose: bool = seq.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+        let mut args = Args::new(&params);
+        let verbose: bool = args.optional_or("verbose", false)?;
+        args.check()?;
         Ok::<_, ErrorObjectOwned>(rawtx::get_raw_mempool(&ctx.mempool, verbose))
     })?;
 
     module.register_method("getrawtransaction", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
         // Core declares this NUM with a 0 default and accepts a bool for it.
-        let verbosity = optional_verbosity(&mut seq, 0)?;
+        let verbosity = args.verbosity("verbose", 0)?;
+        let blockhash: Option<String> = args.optional("blockhash")?;
+        args.check()?;
         if verbosity > 2 {
             return Err(ErrorObjectOwned::owned(
                 -8,
@@ -1519,27 +1410,6 @@ pub async fn start(
             ));
         }
         let verbose = verbosity >= 1;
-        // blockhash: must be a string. Core returns -3 for type mismatches.
-        let blockhash_raw: Option<serde_json::Value> = seq.optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let blockhash: Option<String> = match blockhash_raw {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(s)) => Some(s),
-            Some(other) => {
-                let type_name = match &other {
-                    serde_json::Value::Bool(_) => "bool",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::Array(_) => "array",
-                    serde_json::Value::Object(_) => "object",
-                    _ => "unknown",
-                };
-                return Err(ErrorObjectOwned::owned(
-                    -3,
-                    format!("JSON value of type {type_name} is not of expected type string"),
-                    None::<()>,
-                ));
-            }
-        };
         rawtx::get_raw_transaction(
             &ctx.chain_state,
             &ctx.mempool,
@@ -1552,11 +1422,10 @@ pub async fn start(
     })?;
 
     module.register_method("decoderawtransaction", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hex_tx: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let iswitness: Option<bool> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let hex_tx: String = args.required("hexstring")?;
+        let iswitness: Option<bool> = args.optional("iswitness")?;
+        args.check()?;
         rawtx::decode_raw_transaction(&hex_tx, iswitness, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1566,10 +1435,8 @@ pub async fn start(
         // We need this to detect duplicate keys in the outputs object,
         // since serde_json silently deduplicates.
         let raw_params_json = params.as_str().unwrap_or("").to_string();
-        let mut seq = params.sequence();
-        let inputs_raw: serde_json::Value = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, format!("createrawtransaction {e}"), None::<()>))?;
+        let mut args = Args::new(&params);
+        let inputs_raw: serde_json::Value = args.raw("inputs")?.unwrap_or(serde_json::Value::Null);
         let inputs: Vec<serde_json::Value> = match inputs_raw {
             serde_json::Value::Array(arr) => {
                 // Validate each element is an object.
@@ -1608,9 +1475,9 @@ pub async fn start(
                 ));
             }
         };
-        let outputs: serde_json::Value = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, format!("createrawtransaction {e}"), None::<()>))?;
+        let outputs: serde_json::Value = args
+            .raw("outputs")?
+            .ok_or_else(|| ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>))?;
         // Detect duplicate keys in the outputs JSON object. serde_json
         // silently deduplicates, but Core rejects duplicates.  We scan
         // the raw params JSON for the second positional element and check
@@ -1641,14 +1508,12 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        let locktime: Option<serde_json::Value> = seq.optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
-        let replaceable: Option<serde_json::Value> = seq.optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
-        let version: Option<serde_json::Value> = seq.optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let locktime: Option<serde_json::Value> = args.raw("locktime")?;
+        let replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
+        let version: Option<serde_json::Value> = args.raw("version")?;
         // Reject extra arguments.
-        let extra: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let extra: Option<serde_json::Value> = args.raw("<extra>")?;
+        args.check()?;
         if extra.is_some() {
             return Err(ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>));
         }
@@ -1720,15 +1585,12 @@ pub async fn start(
     })?;
 
     module.register_method("signrawtransactionwithkey", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let hex_tx: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let privkeys: Vec<String> = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let prevtxs: Option<Vec<serde_json::Value>> = seq.optional_next().unwrap_or(None);
-        let sighash_type: Option<String> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let hex_tx: String = args.required("hexstring")?;
+        let privkeys: Vec<String> = args.required("privkeys")?;
+        let prevtxs: Option<Vec<serde_json::Value>> = args.optional("prevtxs")?;
+        let sighash_type: Option<String> = args.optional("sighashtype")?;
+        args.check()?;
         rawtx::sign_raw_transaction_with_key(
             &ctx.chain_state,
             &hex_tx,
@@ -1740,12 +1602,11 @@ pub async fn start(
     })?;
 
     module.register_method("testmempoolaccept", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let rawtxs: Vec<String> = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Optional maxfeerate (BTC/kvB, default 0.10).
-        let maxfeerate_raw: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let rawtxs: Vec<String> = args.required("rawtxs")?;
+        // Optional maxfeerate (AMOUNT: numeric or string, BTC/kvB, default 0.10).
+        let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
+        args.check()?;
         let maxfeerate_sat_per_kvb: u64 = match &maxfeerate_raw {
             None | Some(serde_json::Value::Null) => 10_000_000, // 0.10 BTC/kvB
             Some(serde_json::Value::Number(n)) => {
@@ -1889,14 +1750,13 @@ pub async fn start(
     // --- PSBT RPCs ---
 
     module.register_method("createpsbt", |params, _ctx, _extensions| {
-        let mut seq = params.sequence();
-        let inputs: Vec<serde_json::Value> = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let outputs: serde_json::Value = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let locktime: Option<u32> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let inputs: Vec<serde_json::Value> = args.required("inputs")?;
+        let outputs: serde_json::Value = args
+            .raw("outputs")?
+            .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
+        let locktime: Option<u32> = args.optional("locktime")?;
+        args.check()?;
         psbt::create_psbt(&inputs, &outputs, locktime)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1926,11 +1786,10 @@ pub async fn start(
     })?;
 
     module.register_method("finalizepsbt", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let psbt_b64: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let extract: bool = seq.optional_next().unwrap_or(Some(true)).unwrap_or(true);
+        let mut args = Args::new(&params);
+        let psbt_b64: String = args.required("psbt")?;
+        let extract: bool = args.optional_or("extract", true)?;
+        args.check()?;
         let _ = &ctx; // suppress unused
         psbt::finalize_psbt(&psbt_b64, extract)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
@@ -1963,13 +1822,10 @@ pub async fn start(
     // --- UTXO / Chain RPCs ---
 
     module.register_method("gettxout", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let vout: u32 = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let txid: String = args.required("txid")?;
+        let vout: u32 = args.required("n")?;
+        args.check()?;
         blockchain::get_tx_out(&ctx.chain_state, &txid, vout)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1980,11 +1836,10 @@ pub async fn start(
     })?;
 
     module.register_method("gettxoutproof", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txids: Vec<String> = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let blockhash: Option<String> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let txids: Vec<String> = args.required("txids")?;
+        let blockhash: Option<String> = args.optional("blockhash")?;
+        args.check()?;
         rawtx::get_tx_out_proof(
             &ctx.chain_state,
             &txids,
@@ -2006,21 +1861,26 @@ pub async fn start(
     // blocking thread for the same reason: a full pass is minute-scale on
     // mainnet, and an `abort` that queued behind it could never land.
     module.register_async_method("scantxoutset", |params, ctx, _extensions| async move {
-        let mut seq = params.sequence();
-        let action: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let action: String = args.required("action")?;
         match action.as_str() {
-            "status" => Ok(blockchain::scan_tx_out_set_status()),
-            "abort" => Ok(blockchain::scan_tx_out_set_abort()),
+            "status" => {
+                args.check()?;
+                Ok(blockchain::scan_tx_out_set_status())
+            }
+            "abort" => {
+                args.check()?;
+                Ok(blockchain::scan_tx_out_set_abort())
+            }
             "start" => {
-                let scanobjects: serde_json::Value = seq.optional_next().ok().flatten().ok_or_else(|| {
+                let scanobjects: serde_json::Value = args.raw("scanobjects")?.ok_or_else(|| {
                     ErrorObjectOwned::owned(
                         -1,
                         "scanobjects argument is required for the start action",
                         None::<()>,
                     )
                 })?;
+                args.check()?;
                 let chain_state = std::sync::Arc::clone(&ctx.chain_state);
                 let shutdown = ctx.shutdown_tx.subscribe();
                 tokio::task::spawn_blocking(move || {
@@ -2222,12 +2082,12 @@ pub async fn start(
         // `targets`: array of confirmation targets in blocks. Default
         // `[1, 3, 6, 12, 24]`. `mode` (default "blend") selects the data
         // source.
-        let mut seq = params.sequence();
-        let targets: Vec<u32> = seq
-            .optional_next()
-            .unwrap_or(None)
+        let mut fee_args = Args::new(&params);
+        let targets: Vec<u32> = fee_args
+            .optional("targets")?
             .unwrap_or_else(|| vec![1u32, 3, 6, 12, 24]);
-        let mode_str: Option<String> = seq.optional_next().unwrap_or(None);
+        let mode_str: Option<String> = fee_args.optional("mode")?;
+        fee_args.check()?;
         let mode = EstimateMode::parse(mode_str.as_deref()).unwrap_or(EstimateMode::Blend);
 
         let unit = default_unit();
@@ -2298,14 +2158,16 @@ pub async fn start(
     })?;
 
     module.register_async_method("addnode", |params, ctx, _extensions| async move {
-        let mut seq = params.sequence();
-        let addr_str: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, format!("addnode \"node\" \"command\"\n\n{e}"), None::<()>))?;
-        let command: String = seq
-            .optional_next()
-            .unwrap_or(Some("onetry".to_string()))
-            .unwrap_or("onetry".to_string());
+        let mut args = Args::new(&params);
+        let addr_str: String = args.required("node").map_err(|e| {
+            ErrorObjectOwned::owned(
+                e.code(),
+                format!("addnode \"node\" \"command\"\n\n{}", e.message()),
+                None::<()>,
+            )
+        })?;
+        let command: String = args.optional_or("command", "onetry".to_string())?;
+        args.check()?;
 
         // Parse via PeerAddr so `.onion:port` targets are accepted, not just
         // `SocketAddr`s — Bitcoin Core's addnode takes onion addresses, and a
@@ -2369,8 +2231,9 @@ pub async fn start(
     })?;
 
     module.register_method("getaddednodeinfo", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let filter_node: Option<String> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let filter_node: Option<String> = args.optional("node")?;
+        args.check()?;
         let all_info = ctx.peer_manager.get_added_node_info();
         if let Some(ref node) = filter_node {
             let filtered: Vec<_> = all_info.into_iter().filter(|entry| {
@@ -2407,23 +2270,12 @@ pub async fn start(
     })?;
 
     module.register_method("setban", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let subnet_str: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let command: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        // Surface a mistyped optional argument instead of swallowing it: a
-        // `ParamsSequence` that fails to deserialize one element yields `None`
-        // for every element after it, so `setban(ip, "add", "soon", true)`
-        // would silently drop `absolute` and ban for the default duration.
-        let bantime: Option<u64> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
-        let absolute: Option<bool> = seq
-            .optional_next()
-            .map_err(|e| ErrorObjectOwned::owned(-3, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let subnet_str: String = args.required("subnet")?;
+        let command: String = args.required("command")?;
+        let bantime: Option<u64> = args.optional("bantime")?;
+        let absolute: Option<bool> = args.optional("absolute")?;
+        args.check()?;
 
         let target = crate::net::ban::parse_ban_target(&subnet_str)
             .map_err(|e| ErrorObjectOwned::owned(-30, e, None::<()>))?;
@@ -2500,14 +2352,11 @@ pub async fn start(
     })?;
 
     module.register_method("prioritisetransaction", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let txid_str: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let _dummy: Option<f64> = seq.optional_next().unwrap_or(None); // ignored (Core compat)
-        let fee_delta: i64 = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let txid_str: String = args.required("txid")?;
+        let _dummy: Option<f64> = args.optional("dummy")?; // ignored (Core compat)
+        let fee_delta: i64 = args.required("fee_delta")?;
+        args.check()?;
         let txid: bitcoin::Txid = txid_str
             .parse()
             .map_err(|_| ErrorObjectOwned::owned(-8, "Invalid txid", None::<()>))?;
@@ -2536,13 +2385,10 @@ pub async fn start(
         // Core takes the peer either by address or by id, and requires
         // exactly one of the two -- `disconnectnode "" 3` is how its own test
         // framework disconnects, so the address slot is present but empty.
-        let mut seq = params.sequence();
-        let addr_str: Option<String> = seq.optional_next().map_err(|_| {
-            ErrorObjectOwned::owned(-1, "Address must be a string", None::<()>)
-        })?;
-        let node_id: Option<u64> = seq.optional_next().map_err(|_| {
-            ErrorObjectOwned::owned(-1, "Node ID must be a number", None::<()>)
-        })?;
+        let mut args = Args::new(&params);
+        let addr_str: Option<String> = args.optional("address")?;
+        let node_id: Option<u64> = args.optional("nodeid")?;
+        args.check()?;
 
         // Core's branch conditions verbatim (rpc/net.cpp): an address that was
         // supplied at all -- including as the empty string -- takes the
@@ -2863,10 +2709,11 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        let mut seq = params.sequence();
-        let timestamp: i64 = seq.next().map_err(|e| {
-            ErrorObjectOwned::owned(-8, format!("Invalid timestamp: {e}"), None::<()>)
+        let mut args = Args::new(&params);
+        let timestamp: i64 = args.required("timestamp").map_err(|e| {
+            ErrorObjectOwned::owned(-8, format!("Invalid timestamp: {}", e.message()), None::<()>)
         })?;
+        args.check()?;
         // Core's bound is the largest second representable as nanoseconds.
         const MAX_MOCK_TIME: i64 = i64::MAX / 1_000_000_000;
         if !(0..=MAX_MOCK_TIME).contains(&timestamp) {
@@ -3037,11 +2884,9 @@ pub async fn start(
 
     module.register_method("getreorghistory", |params, ctx, _extensions| {
         // `getreorghistory [since_secs]` — default 86400 (24 h).
-        let mut seq = params.sequence();
-        let since_secs: u64 = seq
-            .optional_next()
-            .unwrap_or(Some(86_400))
-            .unwrap_or(86_400);
+        let mut args = Args::new(&params);
+        let since_secs: u64 = args.optional_or("since_secs", 86_400)?;
+        args.check()?;
         let records = match ctx.chain_state.reorg_log() {
             Some(log) => log.history(since_secs),
             None => Vec::new(),
@@ -3061,8 +2906,9 @@ pub async fn start(
         // Returns `available: false` with an empty list when the history
         // log failed to open at startup, so operators can tell a
         // temporarily-empty ring apart from a disabled feature.
-        let mut seq = params.sequence();
-        let since_secs: u64 = seq.optional_next().unwrap_or(Some(3_600)).unwrap_or(3_600);
+        let mut args = Args::new(&params);
+        let since_secs: u64 = args.optional_or("since_secs", 3_600)?;
+        args.check()?;
         let (snapshots, available) = match &ctx.mempool_history {
             Some(h) => (h.history(since_secs), true),
             None => (Vec::new(), false),
@@ -3160,8 +3006,9 @@ pub async fn start(
     })?;
 
     module.register_method("getmemoryinfo", |params, _ctx, _extensions| {
-        let mut seq = params.sequence();
-        let mode: Option<String> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let mode: Option<String> = args.optional("mode")?;
+        args.check()?;
         let mode_str = mode.as_deref().unwrap_or("stats");
         match mode_str {
             "stats" => {
@@ -3240,9 +3087,10 @@ pub async fn start(
             parking_lot::RwLock::new(map)
         });
 
-        let mut seq = params.sequence();
-        let include: Option<Vec<String>> = seq.optional_next().unwrap_or(None);
-        let exclude: Option<Vec<String>> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let include: Option<Vec<String>> = args.optional("include")?;
+        let exclude: Option<Vec<String>> = args.optional("exclude")?;
+        args.check()?;
 
         if let Some(ref inc) = include {
             let mut map = state.write();
@@ -3277,17 +3125,11 @@ pub async fn start(
     })?;
 
     module.register_method("getdescriptorinfo", |params, _ctx, _extensions| {
-        let mut seq = params.sequence();
-        let descriptor: String = seq.next().map_err(|e| {
-            let msg = e.to_string();
-            // Core returns -3 for type errors, -1 for missing params.
-            if msg.contains("not of expected type") || msg.contains("invalid type") {
-                ErrorObjectOwned::owned(
-                    -3,
-                    "JSON value of type number is not of expected type string",
-                    None::<()>,
-                )
-            } else {
+        let mut args = Args::new(&params);
+        // Core returns -3 for a type error and its help text for a missing
+        // argument; `required` already answers -3 for the former.
+        let descriptor: String = args.required("descriptor").map_err(|e| {
+            if e.code() == -1 {
                 ErrorObjectOwned::owned(
                     -1,
                     "getdescriptorinfo \"descriptor\"\n\n\
@@ -3296,18 +3138,22 @@ pub async fn start(
                      1. descriptor    (string, required) The descriptor.\n",
                     None::<()>,
                 )
+            } else {
+                e
             }
         })?;
+        args.check()?;
         crate::rpc::descriptor::get_descriptor_info(&descriptor)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("deriveaddresses", |params, ctx, _extensions| {
-        let mut seq = params.sequence();
-        let descriptor: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        let range: Option<serde_json::Value> = seq.optional_next().unwrap_or(None);
+        let mut args = Args::new(&params);
+        let descriptor: String = args.required("descriptor")?;
+        // Core declares `range` as RANGE (numeric or array), so it has no
+        // single expected JSON type and is validated downstream.
+        let range: Option<serde_json::Value> = args.raw("range")?;
+        args.check()?;
         crate::rpc::descriptor::derive_addresses(
             &descriptor,
             range.as_ref(),
@@ -3321,11 +3167,10 @@ pub async fn start(
     module.register_async_method(
         "waitforblockheight",
         |params, ctx, _extensions| async move {
-            let mut seq = params.sequence();
-            let target_height: u32 = seq
-                .next()
-                .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-            let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+            let mut args = Args::new(&params);
+            let target_height: u32 = args.required("height")?;
+            let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+            args.check()?;
             let timeout = if timeout_ms > 0 {
                 std::time::Duration::from_millis(timeout_ms)
             } else {
@@ -3355,8 +3200,9 @@ pub async fn start(
     )?;
 
     module.register_async_method("waitfornewblock", |params, ctx, _extensions| async move {
-        let mut seq = params.sequence();
-        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
+        let mut args = Args::new(&params);
+        let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+        args.check()?;
         let timeout = if timeout_ms > 0 {
             std::time::Duration::from_millis(timeout_ms)
         } else {
@@ -3386,14 +3232,13 @@ pub async fn start(
     })?;
 
     module.register_async_method("waitforblock", |params, ctx, _extensions| async move {
-        let mut seq = params.sequence();
-        let blockhash: String = seq
-            .next()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let blockhash: String = args.required("blockhash")?;
+        let timeout_ms: u64 = args.optional_or("timeout", 0)?;
+        args.check()?;
         let target_hash: bitcoin::BlockHash = blockhash
             .parse()
             .map_err(|_| ErrorObjectOwned::owned(-1, "Invalid block hash", None::<()>))?;
-        let timeout_ms: u64 = seq.optional_next().unwrap_or(Some(0)).unwrap_or(0);
         let timeout = if timeout_ms > 0 {
             std::time::Duration::from_millis(timeout_ms)
         } else {

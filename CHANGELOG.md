@@ -15,7 +15,14 @@ Bound for **0.5.2**, a patch release on the 0.5.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.2-pre.md`](docs/release-notes/0.5.2-pre.md).
 
-Nothing yet.
+### Fixed
+
+- JSON-RPC: a mistyped argument no longer discards every argument after it.
+  `generateblock` with a bad `transactions` silently ignored `submit=false`
+  and mined a block. Wrong-typed arguments now return Core's `-3`
+  `Wrong type passed:` error naming each one (#672).
+- `sat-cli -named`: an argument with no `=` was silently dropped; it is now
+  sent as a positional argument in Core's reserved `args` slot (#672).
 
 ## Releases
 

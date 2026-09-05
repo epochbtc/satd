@@ -13234,3 +13234,137 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
         "{bad_sum}"
     );
 }
+
+/// #672: a mistyped argument used to be swallowed into the default *and*
+/// erase every argument after it.
+///
+/// `ParamsSequence::next_inner` clears the rest of the buffer on any
+/// deserialize error, so the shape `optional_next().unwrap_or(default)` turned
+/// a caller's type mistake into a silently-applied default and made each later
+/// `optional_next()` answer `Ok(None)`. On `generateblock` that meant a
+/// mistyped `transactions` discarded `submit`: `submit=false` mined *and
+/// connected* a block. The caller asked for a block back without touching the
+/// chain and got a new tip.
+///
+/// Both halves are asserted: the call must fail, naming the argument, and the
+/// tip must not move.
+#[test]
+fn mistyped_argument_errors_instead_of_discarding_later_arguments() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let before = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_u64()
+        .unwrap();
+
+    // `transactions` is an array; pass a string. `submit=false` follows it.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":["{addr}","not-an-array",false]}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+
+    assert_eq!(
+        resp["error"]["code"],
+        serde_json::json!(-3),
+        "a mistyped argument must be Core's RPC_TYPE_ERROR, not a silent default: {resp}"
+    );
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("Wrong type passed"),
+        "Core's wording, so its clients can parse it: {resp}"
+    );
+    assert!(
+        msg.contains("transactions"),
+        "the error must name the offending argument: {resp}"
+    );
+    assert!(
+        resp["result"].is_null(),
+        "no block may be returned for a rejected call: {resp}"
+    );
+
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "the discarded `submit=false` must not have mined and connected a block"
+    );
+
+    // The same call by name, which is how Core's own clients send it.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":"not-an-array","submit":false}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"], serde_json::json!(-3), "{resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "named form must not mine either"
+    );
+
+    // A well-typed call with the same later argument still works: the fix must
+    // not have made `submit=false` unreachable.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":["{addr}",[],false]}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert!(resp["error"].is_null(), "the valid call must succeed: {resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "submit=false must still not advance the chain"
+    );
+}
+
+/// Core reports *every* mismatched argument in one error, keyed by position
+/// and name (`RPCHelpMan::Arg`, `src/rpc/util.cpp`). `rpc_blockchain.py`
+/// asserts the exact rendering for `getnetworkhashps("a", [])`.
+#[test]
+fn wrong_type_error_reports_every_bad_argument_like_core() {
+    let node = TestNode::start(&[]);
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getnetworkhashps","params":["a",[]]}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert_eq!(resp["error"]["code"], serde_json::json!(-3), "{resp}");
+    assert_eq!(
+        resp["error"]["message"].as_str().unwrap(),
+        "Wrong type passed:\n{\n    \
+         \"Position 1 (nblocks)\": \"JSON value of type string is not of expected type number\",\n    \
+         \"Position 2 (height)\": \"JSON value of type array is not of expected type number\"\n}",
+        "{resp}"
+    );
+}
+
+/// The poisoning idiom is a shape, not a single bug, so guard the shape.
+/// `optional_next()` reads a slot straight into a concrete Rust type; combined
+/// with any error-swallowing combinator it reintroduces #672 exactly. Every
+/// handler reads arguments through `crate::rpc::params::Args`, which goes via
+/// `serde_json::Value` and cannot poison the sequence.
+///
+/// Two sites were added *during* the Core-functional wave, two functions away
+/// from the helper written to avoid this, which is why the guard is mechanical
+/// rather than a review note.
+#[test]
+fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
+    let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("node/src/rpc/server.rs");
+    let src = std::fs::read_to_string(&server).unwrap();
+    let offenders: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("optional_next") || l.contains(".sequence()"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "read positional arguments through crate::rpc::params::Args, not \
+         ParamsSequence directly -- a raw optional_next() erases every later \
+         argument on a type mismatch (#672). Offending lines in \
+         node/src/rpc/server.rs:\n{offenders:#?}"
+    );
+}
