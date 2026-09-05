@@ -30,6 +30,7 @@ pub mod indexes;
 pub mod mining;
 pub mod named_params;
 pub mod network;
+pub mod params;
 pub mod policy;
 pub mod psbt;
 pub mod rawtx;
