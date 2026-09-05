@@ -558,6 +558,11 @@ pub struct Config {
     pub v2only: bool,
     pub port: u16,
     pub connect: Vec<String>,
+    /// Bitcoin Core's `m_use_addrman_outgoing`: whether the node may open
+    /// outbound connections to peers it discovered itself. Any `-connect`
+    /// turns it off -- including Core's `-connect=0`, which means "connect to
+    /// nothing", not "connect to the address 0".
+    pub automatic_outbound: bool,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`), resolved to socket addresses. Advertised to peers.
     pub externalip: Vec<SocketAddr>,
@@ -2227,6 +2232,15 @@ impl Config {
         if connect.is_empty() {
             connect = file_get_all("connect");
         }
+        // Core's `-connect` semantics (`init.cpp`, `AppInitMain`): setting it
+        // at all disables automatic outbound connections, and the single
+        // value `0` is the spelling for "and no peers either". satd used to
+        // parse that `0` as an address and dial `0.0.0.0:8333` at every
+        // startup -- the shape every Core functional test starts a node in.
+        let automatic_outbound = connect.is_empty();
+        if connect.len() == 1 && connect[0] == "0" {
+            connect.clear();
+        }
 
         // Computed here rather than inline in the struct below, because the
         // default reads `connect`, which the struct literal has already moved
@@ -3246,6 +3260,7 @@ impl Config {
             asmap,
             port,
             connect,
+            automatic_outbound,
             assumevalid,
             assumevalidage,
             stopatheight,

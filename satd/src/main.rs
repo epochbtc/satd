@@ -3246,6 +3246,10 @@ async fn main() {
         tracing::info!(%bind_addr, "whitebind P2P listening");
     }
 
+    // `-connect` (any form) means: dial these and nothing else. Recorded on
+    // the manager so gossiped addresses are learned but never dialled.
+    peer_manager.set_automatic_outbound(config.automatic_outbound);
+
     // Connect to configured peers (and register for auto-reconnect)
     for addr_str in &config.connect {
         match node::net::peer::PeerAddr::parse(addr_str) {
@@ -3317,7 +3321,7 @@ async fn main() {
     // (hostname resolution) and -dnsseed (query DNS seeds) are enabled.
     // Now that the address book persists, skip DNS when it already has
     // entries — unless -forcednsseed demands a query regardless.
-    let dns_seeding = config.connect.is_empty()
+    let dns_seeding = config.automatic_outbound
         && config.dns
         && config.dnsseed
         && (config.forcednsseed || peer_manager.addrman_is_empty());
@@ -3345,7 +3349,7 @@ async fn main() {
     // empty, and there are no explicit -connect peers. -fixedseeds=0
     // forbids it.
     if config.fixedseeds
-        && config.connect.is_empty()
+        && config.automatic_outbound
         && peer_manager.addrman_is_empty()
         && !dns_seeding
     {

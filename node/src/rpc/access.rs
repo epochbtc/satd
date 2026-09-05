@@ -172,6 +172,9 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // --- Control: node / peer management ---
         "stop"
         | "addnode"
+        // Core's hidden test RPC: makes the node dial out. Regtest-gated in
+        // the handler, and Control here so it is off the read-only listener.
+        | "addconnection"
         | "disconnectnode"
         | "setban"
         | "clearbanned"
@@ -267,6 +270,7 @@ mod tests {
         for m in [
             "stop",
             "addnode",
+            "addconnection",
             "disconnectnode",
             "setban",
             "clearbanned",

@@ -95,6 +95,77 @@ pub enum Direction {
     Outbound,
 }
 
+/// How this connection came about — Bitcoin Core's `ConnectionType`.
+///
+/// Core does not treat these as decoration: the type decides whether we ask
+/// the peer for transactions, whether we relay addresses to it, and how long
+/// we keep it. `getpeerinfo`'s `connection_type` reports it verbatim, and the
+/// functional-test framework's `add_outbound_p2p_connection` selects one
+/// through the hidden `addconnection` RPC.
+///
+/// satd does not open `feeler` or `addr-fetch` connections of its own accord
+/// (it has no automatic connection scheduler that would); they exist here
+/// because `addconnection` can ask for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnType {
+    /// A peer that dialled us.
+    Inbound,
+    /// `addnode` / `-connect` / `-addnode`.
+    Manual,
+    /// The ordinary outbound peer: blocks, transactions and addresses.
+    OutboundFullRelay,
+    /// Blocks only. No transaction relay, no address relay — Core's
+    /// anti-partition connections, deliberately invisible to a tx-graph
+    /// observer.
+    BlockRelay,
+    /// Opened to ask one peer for addresses, then dropped.
+    AddrFetch,
+    /// Opened only to see whether the address is still alive; closed as soon
+    /// as the peer's `version` arrives.
+    Feeler,
+}
+
+impl ConnType {
+    /// Core's spelling, as `getpeerinfo.connection_type` reports it and
+    /// `addconnection` accepts it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnType::Inbound => "inbound",
+            ConnType::Manual => "manual",
+            ConnType::OutboundFullRelay => "outbound-full-relay",
+            ConnType::BlockRelay => "block-relay-only",
+            ConnType::AddrFetch => "addr-fetch",
+            ConnType::Feeler => "feeler",
+        }
+    }
+
+    /// Parse the four types `addconnection` may open. `inbound` and `manual`
+    /// are deliberately absent: Core's `CConnman::AddConnection` returns false
+    /// for them, so they are not openable this way.
+    pub fn from_addconnection_str(s: &str) -> Option<Self> {
+        match s {
+            "outbound-full-relay" => Some(ConnType::OutboundFullRelay),
+            "block-relay-only" => Some(ConnType::BlockRelay),
+            "addr-fetch" => Some(ConnType::AddrFetch),
+            "feeler" => Some(ConnType::Feeler),
+            _ => None,
+        }
+    }
+
+    /// Whether we ask this peer to relay transactions to us — the `fRelay`
+    /// flag in the `version` we send. Core clears it for block-relay-only and
+    /// feeler connections (`CNode::IsBlockOnlyConn() || IsFeelerConn()`).
+    pub fn wants_tx_relay(self) -> bool {
+        !matches!(self, ConnType::BlockRelay | ConnType::Feeler)
+    }
+
+    /// Whether we relay addresses over this connection. Core sets up a peer's
+    /// address-relay state for everything except block-relay-only.
+    pub fn relays_addrs(self) -> bool {
+        !matches!(self, ConnType::BlockRelay)
+    }
+}
+
 /// Peer connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
@@ -168,9 +239,9 @@ pub struct PeerInfo {
     /// socket exists, and for onion peers, whose local end belongs to the
     /// proxy rather than to us.
     pub bind_addr: Option<SocketAddr>,
-    /// Whether this peer was added via `addnode`. Drives `getpeerinfo`'s
-    /// `connection_type` field: Core reports `"manual"` for addnode peers.
-    pub is_addnode: bool,
+    /// How this connection came about. Drives `getpeerinfo`'s
+    /// `connection_type`, the `fRelay` flag we send, and address relay.
+    pub conn_type: ConnType,
     /// Whether this peer relays transactions. Set from the version message's
     /// `relay` flag; defaults to true (matching Core's assumption for peers
     /// that predate BIP 37's optional relay field).
@@ -212,7 +283,10 @@ impl PeerInfo {
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
-            is_addnode: false,
+            conn_type: match direction {
+                Direction::Inbound => ConnType::Inbound,
+                Direction::Outbound => ConnType::OutboundFullRelay,
+            },
             relay_txes: false,
         }
     }
@@ -224,6 +298,14 @@ impl PeerInfo {
         self.user_agent = version.user_agent.clone();
         self.relay_txes = version.relay;
         self.version = Some(version);
+    }
+
+    /// Whether we sync headers and request blocks from this peer. Core
+    /// excludes addr-fetch connections from both (`fPreferredDownload` and
+    /// `CanServeBlocks` are false for them): the connection is opened to
+    /// collect addresses and dropped straight afterwards.
+    pub fn serves_blocks(&self) -> bool {
+        self.conn_type != ConnType::AddrFetch
     }
 
     /// Whether this peer participates in tx relay — the BIP 37 `fRelay`
@@ -311,17 +393,7 @@ impl PeerInfo {
             }
         }
 
-        // Connection type: Core distinguishes manual (addnode), inbound,
-        // outbound-full-relay, etc. The test expects "manual" for addnode,
-        // "inbound" for inbound connections.
-        let connection_type = if self.is_addnode {
-            "manual"
-        } else {
-            match self.direction {
-                Direction::Inbound => "inbound",
-                Direction::Outbound => "outbound-full-relay",
-            }
-        };
+        let connection_type = self.conn_type.as_str();
 
         let mut obj = serde_json::json!({
             "id": self.id,
@@ -348,7 +420,10 @@ impl PeerInfo {
             "permissions": [],
             "addr_processed": 0,
             "addr_rate_limited": 0,
-            "addr_relay_enabled": self.direction == Direction::Outbound,
+            // Core withholds address relay from block-relay-only peers --
+            // that is the whole point of the connection type.
+            "addr_relay_enabled": self.direction == Direction::Outbound
+                && self.conn_type.relays_addrs(),
             "bip152_hb_from": false,
             "bip152_hb_to": false,
             "inv_to_send": 0,
