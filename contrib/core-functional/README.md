@@ -111,6 +111,11 @@ by version order.
 
 Every reason came from running the test, not from reading it.
 
+**`addconnection` landed, and the ten rows behind it were re-measured.** Two
+passed outright (`p2p_add_connections`, `p2p_addrfetch`); the other eight each
+carry the blocker that was actually observed once the RPC existed, and none of
+them is about `addconnection` any more.
+
 **Re-measured 2026-09-05.** Fifty-seven skip rows still named a since-shipped
 blocker (`setmocktime`, named parameters, `syncwithvalidationinterfacequeue`,
 `scantxoutset`); all 66 rows that had a stale or unattributed note were re-run
@@ -125,7 +130,7 @@ priority order.
 | Execs | Blocker |
 |---:|---|
 | 15 | **debug.log phrasing.** `assert_debug_log` greps for a line satd either words differently or does not log: `bad-txns-vout-empty`, `bad-txns-duplicate`, `Added connection peer=0`, `Misbehaving`, `DNS seeding disabled`, `LoadExternalBlockFile: Out of order block`, the assumevalid and addrman lines. Where satd logs the event, a `debuglog_map.toml` rule can carry it; where it does not, the row is `core-log`. |
-| 6 | **`addconnection` hidden RPC.** `add_outbound_p2p_connection` answers Method not found: `p2p_addrfetch`, `p2p_compactblocks`, `p2p_ibd_stalling` (x2), `p2p_mutated_blocks`, plus `feature_anchors`, `p2p_add_connections`, `p2p_addr_relay`, `p2p_outbound_eviction`, `p2p_v2_encrypted` which were credited to it before and have not been re-run. |
+| 3 | **Per-peer in-flight blocks.** `getpeerinfo.inflight` is a hardcoded empty list. `p2p_ibd_stalling` (x2) waits on the total across peers; `p2p_mutated_blocks` asserts the exact list. Core populates it from `mapBlocksInFlight`, so it covers every block request, not only the IBD scheduler's. |
 | 4 | **Startup-abort text.** Four tests assert Core's exact fatal message on stderr for a condition satd does not detect at all: a missing `-blocksdir`, a pre-segwit chainstate, a block-database timestamp from the future. |
 | 3 | **Missing RPC methods.** `createmultisig` (`feature_nulldummy`), `signmessagewithprivkey`, `getdescriptoractivity`. All three are pure secp256k1/script over code satd already has -- no wallet. |
 | 3 | **UTXO-set hashing.** `hash_serialized_3` is not Core's serialization and there is no `muhash`, which blocks `feature_utxo_set_hash`, `rpc_dumptxoutset` and (with Core's own tool on top) `tool_utxo_to_sqlite`. |
@@ -139,6 +144,18 @@ target; the rest need Core-only binaries or internals.
 
 ## Fixed
 
+- **`-connect=0` was dialled as an address.** Core spells "open no outbound
+  connections" that way and every functional-test node is started with it, so
+  satd dialled `0.0.0.0:8333` at each startup and burned peer id 0 -- the
+  first real peer then came back as id 1 where Core reports 0, which is what
+  `p2p_addrfetch` and `p2p_mutated_blocks` were failing on. `-connect` now
+  also stops the node dialling gossiped addresses, as Core's
+  `m_use_addrman_outgoing` does.
+- **`addconnection`.** Core's hidden regtest-only dial RPC, with the four
+  connection types and the behaviour each implies: `block-relay-only` clears
+  `fRelay` and gets no address relay, `feeler` is closed on the peer's
+  `version`, `addr-fetch` gets a `getaddr` and no `getheaders` and is dropped
+  once answered. `getpeerinfo.connection_type` reports the real type.
 - `getdeploymentinfo` reported the buried deployments as `dersig`/`cltv`.
   Core's `DeploymentName` spells them `bip66`/`bip65` on the way out, even
   though `-testactivationheight` takes `dersig`/`cltv` on the way in, and the

@@ -2449,6 +2449,72 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::json!(result))
     })?;
 
+    // `addconnection` is one of Core's hidden RPCs: it is registered but not
+    // listed by `help`, because it exists for the functional-test framework
+    // rather than for operators. `add_outbound_p2p_connection` calls it to
+    // make the node dial a test listener with a chosen connection type, which
+    // is the only way a test can exercise satd's *outbound* peer behaviour.
+    //
+    // Regtest-gated exactly as Core gates it: on any other chain a caller with
+    // RPC access could otherwise force the node to open arbitrary outbound
+    // connections of arbitrary type.
+    module.register_async_method("addconnection", |params, ctx, _extensions| async move {
+        if ctx.chain_state.network != bitcoin::Network::Regtest {
+            // Core throws a bare `std::runtime_error` here, which its
+            // dispatcher reports as RPC_MISC_ERROR (-1).
+            return Err(ErrorObjectOwned::owned(
+                -1,
+                "addconnection is for regression testing (-regtest mode) only.",
+                None::<()>,
+            ));
+        }
+        let mut args = Args::new(&params);
+        let address: String = args.required("address")?;
+        let conn_type_in: String = args.required("connection_type")?;
+        let v2transport: bool = args.required("v2transport")?;
+        args.check()?;
+
+        let conn_type_in = conn_type_in.trim().to_string();
+        let Some(conn_type) = crate::net::peer::ConnType::from_addconnection_str(&conn_type_in)
+        else {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "addconnection \"address\" \"connection_type\" v2transport\n\n\
+                 connection_type must be one of \"outbound-full-relay\", \
+                 \"block-relay-only\", \"addr-fetch\" or \"feeler\"",
+                None::<()>,
+            ));
+        };
+
+        if v2transport && !ctx.peer_manager.v2_transport_enabled() {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Error: Adding v2transport connections requires -v2transport init flag to be set.",
+                None::<()>,
+            ));
+        }
+
+        let sock: std::net::SocketAddr = address
+            .parse()
+            .map_err(|_| ErrorObjectOwned::owned(-8, format!("Invalid address: {address}"), None::<()>))?;
+
+        // -34 = RPC_CLIENT_NODE_CAPACITY_REACHED. Core capacity-checks before
+        // dialling and reports that code; every other dial failure here is a
+        // plain misc error, as Core's OpenNetworkConnection failures are.
+        ctx.peer_manager
+            .connect_outbound_as(sock, Some(conn_type), Some(v2transport))
+            .await
+            .map_err(|e| {
+                let code = if e.starts_with("Error: Already at capacity") { -34 } else { -1 };
+                ErrorObjectOwned::owned(code, e, None::<()>)
+            })?;
+
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({
+            "address": address,
+            "connection_type": conn_type_in,
+        }))
+    })?;
+
     module.register_method("disconnectnode", |params, ctx, _extensions| {
         // Core takes the peer either by address or by id, and requires
         // exactly one of the two -- `disconnectnode "" 3` is how its own test

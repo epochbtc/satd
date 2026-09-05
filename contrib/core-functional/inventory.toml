@@ -26,8 +26,8 @@ note = "test writes/reads Core's peers.dat addrman format and checks corruption 
 [[test]]
 file = "feature_anchors.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC addconnection, which the framework uses for outbound test connections"
+reason = "core-net-policy"
+note = "measured: addconnection works now; the test then reads node0/regtest/anchors.dat, which satd never writes. Core persists its block-relay-only peers there on shutdown and re-dials them at startup. Follow-up: anchors.dat"
 
 [[test]]
 file = "feature_asmap.py"
@@ -556,15 +556,13 @@ note = "needs `getorphantxs` RPC"
 
 [[test]]
 file = "p2p_add_connections.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC addconnection, which the framework uses for outbound test connections"
+status = "run"
 
 [[test]]
 file = "p2p_addr_relay.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC addconnection for outbound test connections"
+reason = "feature-missing"
+note = "measured: addconnection works now; oversized_addr_test sends an addr of 1010 entries and satd neither logs it nor disconnects. Follow-up: enforce MAX_ADDR_TO_SEND on inbound addr"
 
 [[test]]
 file = "p2p_addr_selfannouncement.py"
@@ -574,9 +572,7 @@ note = "needs `addpeeraddress` RPC"
 
 [[test]]
 file = "p2p_addrfetch.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
+status = "run"
 
 [[test]]
 file = "p2p_addrv2_relay.py"
@@ -603,8 +599,8 @@ note = "`getnetworkinfo.localrelay` is always true; Core reports false under `-b
 [[test]]
 file = "p2p_compactblocks.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
+reason = "feature-missing"
+note = "measured: addconnection works now; make_utxos pushes a block with send_and_ping and getbestblockhash stays at genesis -- an unrequested block is not connected. Same root as p2p_unrequested_blocks"
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
@@ -689,7 +685,7 @@ note = "`-i2psam` is unimplemented; satd refuses the option at startup"
 file = "p2p_ibd_stalling.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
+note = "measured: addconnection works now; the test waits on sum(len(peer[inflight])) and getpeerinfo.inflight is a hardcoded empty list. Follow-up: per-peer in-flight block tracking in getpeerinfo"
 
 [[test]]
 file = "p2p_ibd_txrelay.py"
@@ -747,7 +743,7 @@ note = "measured: no msgs_recv.dat written -- satd has no -capturemessages. Foll
 file = "p2p_mutated_blocks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
+note = "measured: addconnection works and the peer-id assertion passes; assert_equal([101], peer[inflight]) then fails on the hardcoded empty getpeerinfo.inflight. Follow-up: per-peer in-flight block tracking"
 
 [[test]]
 file = "p2p_net_deadlock.py"
@@ -782,8 +778,8 @@ note = "needs `getorphantxs` RPC"
 [[test]]
 file = "p2p_outbound_eviction.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC addconnection for outbound test connections"
+reason = "feature-missing"
+note = "measured: addconnection works now; the test waits for the getheaders satd never sends when an outbound peer stalls. Follow-up: outbound peer eviction (stale-tip getheaders + protection rules)"
 
 [[test]]
 file = "p2p_permissions.py"
@@ -860,8 +856,8 @@ note = "measured: assert_debug_log expects 'AcceptBlockHeader: not adding new bl
 [[test]]
 file = "p2p_v2_encrypted.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC addconnection for outbound v2 test connections"
+reason = "feature-missing"
+note = "measured: addconnection works now; the v1 re-dial after a failed outbound v2 handshake ends in early eof, so the advertised-v2/actually-v1 downgrade never completes. Follow-up: v2 downgrade re-dial"
 
 [[test]]
 file = "p2p_v2_misbehaving.py"
