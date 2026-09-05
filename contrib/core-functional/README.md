@@ -109,45 +109,47 @@ by version order.
 
 ## Blockers
 
-Every reason came from running the test, not from reading it. Ranked by tests
-unblocked, which is a map of the framework's demands rather than a priority
-order.
+Every reason came from running the test, not from reading it.
 
-**No `cache` rows remain.** Every test that was blocked by the framework cache
-has been measured to its real blocker. Ranked by tests unblocked:
+**Re-measured 2026-09-05.** Fifty-seven skip rows still named a since-shipped
+blocker (`setmocktime`, named parameters, `syncwithvalidationinterfacequeue`,
+`scantxoutset`); all 66 rows that had a stale or unattributed note were re-run
+as `--candidate` in one batch. **73 executions, 73 failures** -- a stale note
+is never a near-pass, removing the stated blocker only exposes the next one.
+Every one of those rows now carries the blocker that was actually observed, so
+the table below and the inventory agree with the machine.
 
-| Tests | Blocker |
+Ranked by executions blocked. This is a map of the framework's demands, not a
+priority order.
+
+| Execs | Blocker |
 |---:|---|
-| 5 | Missing `addconnection` hidden RPC. The framework uses it for outbound test connections; five P2P tests cannot proceed without it. |
-| 4 | `generatetodescriptor`. The framework mines to MiniWallet's own descriptor. satd already parses the `raw()` form it passes, so this is a mining-RPC gap, not a descriptor one. `generateblock` has the same shape (1 more test). |
-| 4 | Debug-log message mismatches (`assert_debug_log`). Tests grep for Core-specific phrasing that satd either does not log or words differently. |
-| 2 | `-blockfilterindex=1` accepted but not activated. `getindexinfo` never reports `synced:true`, so tests that poll for index sync time out. |
-| 2 | `setban` / ban persistence. satd now accepts bare IPs and disconnects matching peers, but bans are in-memory only; the test restarts the node and checks the ban survives (`banlist.json`). |
-| 2 | `getchaintips` only reports the active tip. Fork tips (headers-valid, valid-fork) are not tracked or returned. |
-| 2 | Handshake protocol: satd does not send `wtxidrelay` or `sendtxrcncl` (BIP 330 erlay) during the version handshake. |
-| 2 | `getpeerinfo` permissions field type mismatch (list vs string). |
-| 1 | `NODE_NETWORK_LIMITED` under `-prune`. satd advertises `NODE_NETWORK\|NODE_WITNESS` where Core signals `NODE_NETWORK_LIMITED\|NODE_WITNESS`. |
-| 1 | Every `-rpcbind` entry. Given two, satd binds only the IPv4 one. |
-| 1 | Core's automatic onion bind. Not adopted — an extra listening socket on every default node is a design decision. |
-| 1 | `MAX_LOCATOR_SZ` enforcement. satd does not disconnect peers that send oversized locators. |
-| 1 | tx download scheduling for `WTX` inv. satd does not send GETDATA after receiving a wtxid-based announcement. |
-| 1 | `OP_RETURN` output size. satd rejects a ~20000-byte `OP_RETURN` as nonstandard; Core v31's `-datacarriersize` defaults to `MAX_STANDARD_TX_WEIGHT/4`. |
-| 1 | `sendrawtransaction` returns the right rejection reason under the wrong code: `-25` where Core returns `-26`. |
-| 1 | Dust policy: satd allows an output Core's dust rule rejects. |
-| 1 | Sigop-equivalent vsize differs by one (satd 344, Core 345). |
-| 1 | `prioritisetransaction` with no arguments leaks a Rust `ErrorObject { .. }` Debug rendering where Core returns its help text. |
-| 1 | Key-based descriptors — `pkh()`, `combo()`, `sh(multi())`, `tr()`, and ranged xpub derivation — which `rpc_scantxoutset.py` needs. |
-
-Missing RPCs not in the table above (1 test each): `echo` (×2 tests),
-`deriveaddresses`, `getdescriptorinfo`, `gettxoutproof`/`verifytxoutproof`,
-`scanblocks`, `dump_all_command_conversions`, `getprioritisedtransactions`,
-`getorphantxs`, `createmultisig`.
+| 15 | **debug.log phrasing.** `assert_debug_log` greps for a line satd either words differently or does not log: `bad-txns-vout-empty`, `bad-txns-duplicate`, `Added connection peer=0`, `Misbehaving`, `DNS seeding disabled`, `LoadExternalBlockFile: Out of order block`, the assumevalid and addrman lines. Where satd logs the event, a `debuglog_map.toml` rule can carry it; where it does not, the row is `core-log`. |
+| 6 | **`addconnection` hidden RPC.** `add_outbound_p2p_connection` answers Method not found: `p2p_addrfetch`, `p2p_compactblocks`, `p2p_ibd_stalling` (x2), `p2p_mutated_blocks`, plus `feature_anchors`, `p2p_add_connections`, `p2p_addr_relay`, `p2p_outbound_eviction`, `p2p_v2_encrypted` which were credited to it before and have not been re-run. |
+| 4 | **Startup-abort text.** Four tests assert Core's exact fatal message on stderr for a condition satd does not detect at all: a missing `-blocksdir`, a pre-segwit chainstate, a block-database timestamp from the future. |
+| 3 | **Missing RPC methods.** `createmultisig` (`feature_nulldummy`), `signmessagewithprivkey`, `getdescriptoractivity`. All three are pure secp256k1/script over code satd already has -- no wallet. |
+| 3 | **UTXO-set hashing.** `hash_serialized_3` is not Core's serialization and there is no `muhash`, which blocks `feature_utxo_set_hash`, `rpc_dumptxoutset` and (with Core's own tool on top) `tool_utxo_to_sqlite`. |
+| 2 | **Unrequested-block connection.** A block pushed over P2P with `send_and_ping` does not connect, so `feature_cltv` and `feature_dersig` stall one block short. Same root as `p2p_unrequested_blocks`. |
+| 2 | **Missing RPC fields.** `getnettotals.uploadtarget` (only the doorway -- the test then drives real `-maxuploadtarget` behaviour), `getmininginfo.bits`. |
+| 32 | **Real policy and behaviour gaps**, each named in its inventory row: TRUC, package relay, high-bandwidth compact blocks, fee estimation, min-relay-fee divergence, reindex logging, assumeutxo rollback, addrman and address relay, the P2P keepalive ping, `-debuglogfile`, `-capturemessages`, datadir permissions, `decodescript` asm rendering, preciousblock and invalidateblock branch selection, key-based descriptors in `scantxoutset`. |
 
 Nine rows are outside the compatibility target: six use Core v31 options
 (cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
 target; the rest need Core-only binaries or internals.
 
 ## Fixed
+
+- `getdeploymentinfo` reported the buried deployments as `dersig`/`cltv`.
+  Core's `DeploymentName` spells them `bip66`/`bip65` on the way out, even
+  though `-testactivationheight` takes `dersig`/`cltv` on the way in, and the
+  test framework keys on the reported name.
+- `validateaddress` never checked the network (a mainnet address validated on
+  regtest) and reported no `error`/`error_locations`. Both fixed, including
+  Core's Bech32 error locator, against Core's own vectors.
+- `dumptxoutset` read its arguments with a helper accepting exactly one, so
+  every `dumptxoutset(path, "latest")` was a parse error; and a relative path
+  was resolved against the process's working directory rather than the network
+  datadir.
 
 - `-minrelaytxfee` / `-dustrelayfee` units: Core denominates in BTC/kvB, satd in
   sat/kvB. Both accepted now. An unparseable value in `bitcoin.conf` was also
