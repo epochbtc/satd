@@ -13368,3 +13368,192 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
          node/src/rpc/server.rs:\n{offenders:#?}"
     );
 }
+
+/// #666: `getdeploymentinfo` reported the buried deployments under the names
+/// `-testactivationheight` takes, not the names Core reports.
+///
+/// Core carries this asymmetry itself: `GetBuriedDeployment` reads `cltv` and
+/// `dersig` on the way in, `DeploymentName` writes `bip65` and `bip66` on the
+/// way out (`src/deploymentinfo.cpp`). Core's test framework keys on the
+/// reported spelling, so satd's output was unreachable.
+#[test]
+fn getdeploymentinfo_uses_core_s_deployment_names_and_honours_blockhash() {
+    let node = TestNode::start(&[]);
+
+    let info = node.rpc_call("getdeploymentinfo").unwrap();
+    let deployments = &info["result"]["deployments"];
+
+    // Exactly Core's `DeploymentName` set, plus taproot.
+    let mut got: Vec<&str> = deployments
+        .as_object()
+        .expect("deployments must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        ["bip34", "bip65", "bip66", "csv", "segwit", "taproot"],
+        "must be Core v31's DeploymentName strings: {info}"
+    );
+    for gone in ["dersig", "cltv"] {
+        assert!(
+            deployments.get(gone).is_none(),
+            "{gone} is the *input* spelling; Core never reports it: {info}"
+        );
+    }
+    for (name, _) in deployments.as_object().unwrap() {
+        let d = &deployments[name];
+        assert_eq!(d["type"], "buried", "{name}: {info}");
+        assert!(d["active"].is_boolean(), "{name}: {info}");
+        assert!(d["height"].is_number(), "{name}: {info}");
+    }
+
+    // `blockhash` was accepted and ignored. Mine, then ask about genesis and
+    // check the answer describes genesis, not the tip.
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(3), serde_json::json!(addr)],
+    )
+    .unwrap();
+    let genesis = node.rpc_call_with_params("getblockhash", vec![serde_json::json!(0)]).unwrap()
+        ["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let at_genesis = node
+        .rpc_call_with_params("getdeploymentinfo", vec![serde_json::json!(genesis)])
+        .unwrap();
+    assert_eq!(at_genesis["result"]["height"], 0, "{at_genesis}");
+    assert_eq!(at_genesis["result"]["hash"], serde_json::json!(genesis), "{at_genesis}");
+
+    // No argument still means the tip.
+    let at_tip = node.rpc_call("getdeploymentinfo").unwrap();
+    assert_eq!(at_tip["result"]["height"], 3, "{at_tip}");
+
+    // A hash the node does not have is Core's -5.
+    let missing = node
+        .rpc_call_with_params(
+            "getdeploymentinfo",
+            vec![serde_json::json!(
+                "00000000000000000000000000000000000000000000000000000000deadbeef"
+            )],
+        )
+        .unwrap();
+    assert_eq!(missing["error"]["code"], serde_json::json!(-5), "{missing}");
+    assert_eq!(missing["error"]["message"], "Block not found", "{missing}");
+}
+
+/// `validateaddress` parsed the address without checking the network and then
+/// asserted the result was checked, so a mainnet address validated on
+/// regtest. It is what a downstream service calls before accepting a
+/// withdrawal destination.
+#[test]
+fn validateaddress_is_network_scoped_and_explains_failures() {
+    let node = TestNode::start(&[]);
+
+    let check = |addr: &str| {
+        node.rpc_call_with_params("validateaddress", vec![serde_json::json!(addr)])
+            .unwrap()["result"]
+            .clone()
+    };
+
+    // Core's own pair from `wallet_disable.py`: a mainnet P2SH address and a
+    // regtest P2PKH one.
+    let mainnet = check("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+    assert_eq!(mainnet["isvalid"], false, "mainnet P2SH on regtest: {mainnet}");
+    assert_eq!(check("mneYUmWYsuk7kySiURxCi3AGxrAqZxLgPZ")["isvalid"], true);
+    // A mainnet bech32 string: the HRP does not match, so Core reports an
+    // encoding error rather than a network one.
+    let bc1 = check("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080");
+    assert_eq!(bc1["isvalid"], false, "{bc1}");
+
+    // A valid regtest address carries no error fields at all.
+    let ok = check("bcrt1qtmp74ayg7p24uslctssvjm06q5phz4yrxucgnv");
+    assert_eq!(ok["isvalid"], true, "{ok}");
+    assert!(ok.get("error").is_none(), "{ok}");
+    assert!(ok.get("error_locations").is_none(), "{ok}");
+
+    // Two mistyped characters, located. Core's vector.
+    let two = check("bcrt1qax9suht3qv95sw33xavx8crpxduefdrsvgsklu");
+    assert_eq!(two["isvalid"], false, "{two}");
+    assert_eq!(two["error"], "Invalid Bech32 checksum", "{two}");
+    assert_eq!(two["error_locations"], serde_json::json!([22, 43]), "{two}");
+
+    // A failure with nothing to attribute still carries an empty array, so a
+    // client can index it unconditionally, as Core's does.
+    let base58 = check("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJJfn");
+    assert_eq!(base58["isvalid"], false, "{base58}");
+    assert_eq!(
+        base58["error"],
+        "Invalid checksum or length of Base58 address (P2PKH or P2SH)",
+        "{base58}"
+    );
+    assert_eq!(base58["error_locations"], serde_json::json!([]), "{base58}");
+}
+
+/// `dumptxoutset` read its arguments with a helper accepting exactly one, so
+/// `dumptxoutset(path, "latest")` -- the shape every Core client sends -- came
+/// back as a JSON parse error rather than a snapshot.
+#[test]
+fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let out = node
+        .rpc_call_with_params(
+            "dumptxoutset",
+            vec![serde_json::json!("txoutset.dat"), serde_json::json!("latest")],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "Core's two-argument form must work: {out}");
+    let path = out["result"]["path"].as_str().expect("path");
+    // Core: a relative path is joined onto the *network* datadir and reported
+    // absolute -- not resolved against the process's working directory.
+    assert!(std::path::Path::new(path).is_absolute(), "{out}");
+    assert!(path.ends_with("regtest/txoutset.dat"), "{out}");
+    assert!(std::path::Path::new(path).is_file(), "the file must be where it says: {out}");
+
+    // An omitted type still means "latest", so callers that predate the
+    // argument keep working.
+    let legacy = node
+        .rpc_call_with_params("dumptxoutset", vec![serde_json::json!("legacy.dat")])
+        .unwrap();
+    assert!(legacy["error"].is_null(), "the one-argument form must still work: {legacy}");
+
+    // An unknown type is Core's message, not a silently-ignored argument.
+    let bad = node
+        .rpc_call_with_params(
+            "dumptxoutset",
+            vec![serde_json::json!("other.dat"), serde_json::json!("sideways")],
+        )
+        .unwrap();
+    assert_eq!(bad["error"]["code"], serde_json::json!(-8), "{bad}");
+    assert!(
+        bad["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid snapshot type \"sideways\" specified."),
+        "{bad}"
+    );
+
+    // satd has no temporary rollback; say so rather than answering with the
+    // tip under a name that promises a historical snapshot.
+    let rollback = node
+        .rpc_call_with_params(
+            "dumptxoutset",
+            vec![serde_json::json!("rb.dat"), serde_json::json!("rollback")],
+        )
+        .unwrap();
+    assert_eq!(rollback["error"]["code"], serde_json::json!(-8), "{rollback}");
+    assert!(
+        rollback["error"]["message"].as_str().unwrap().contains("rollback"),
+        "{rollback}"
+    );
+}

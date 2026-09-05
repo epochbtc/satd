@@ -572,8 +572,13 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(&ctx.chain_state))
     })?;
 
-    module.register_method("getdeploymentinfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(blockchain::get_deployment_info(&ctx.chain_state))
+    module.register_method("getdeploymentinfo", |params, ctx, _extensions| {
+        // Core: `blockhash` is optional and defaults to the chain tip.
+        let mut args = Args::new(&params);
+        let blockhash: Option<String> = args.optional("blockhash")?;
+        args.check()?;
+        blockchain::get_deployment_info(&ctx.chain_state, blockhash.as_deref())
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("getnetworkinfo", |_params, ctx, _extensions| {
@@ -834,10 +839,73 @@ pub async fn start(
     })?;
 
     module.register_method("dumptxoutset", |params, ctx, _extensions| {
-        let path: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        blockchain::dump_txout_set(&ctx.chain_state, &path)
+        // Core takes `(path, type, options)`. satd read the slot with
+        // `params.one()`, which accepts exactly one argument, so every
+        // Core-shaped call -- the framework's `dumptxoutset(path, "latest")`
+        // included -- came back as a JSON parse error.
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        // Core v31 has no default here -- an omitted `type` falls into its
+        // final `else` and is rejected as an invalid snapshot type. satd
+        // defaults it to "latest", its only mode, so callers that predate the
+        // argument keep working; every Core-shaped call is still accepted, and
+        // a *wrong* type is still Core's error. Catalogued in
+        // CORE_DIFFERENCES.md.
+        let snapshot_type: String = args.optional_or("type", "latest".to_string())?;
+        let options = args
+            .optional::<serde_json::Map<String, serde_json::Value>>("options")?
+            .unwrap_or_default();
+        args.check()?;
+
+        // Core's branch order (`src/rpc/blockchain.cpp`), with satd's one
+        // honest divergence: it has no temporary rollback, so `rollback`
+        // is refused by name rather than silently answered with the tip.
+        if options.contains_key("rollback") || snapshot_type == "rollback" {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "satd's dumptxoutset does not implement \"rollback\" snapshots; \
+                 only \"latest\" is supported",
+                None::<()>,
+            ));
+        }
+        if snapshot_type != "latest" {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!(
+                    "Invalid snapshot type \"{snapshot_type}\" specified. \
+                     Please specify \"rollback\" or \"latest\""
+                ),
+                None::<()>,
+            ));
+        }
+        // Core: `AbsPathJoin(args.GetDataDirNet(), path)` -- a relative path
+        // is resolved against the *network* datadir, not the process's
+        // working directory, and the reported `path` is absolute.
+        let resolved = {
+            let p = std::path::Path::new(&path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                let base = ctx
+                    .effective_config
+                    .get("datadir")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| {
+                        ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>)
+                    })?;
+                // Core's chain subdir (`ArgsManager::GetDataDirNet`);
+                // mainnet has none.
+                match ctx.chain_state.network {
+                    bitcoin::Network::Bitcoin => base.join(p),
+                    bitcoin::Network::Testnet => base.join("testnet3").join(p),
+                    bitcoin::Network::Testnet4 => base.join("testnet4").join(p),
+                    bitcoin::Network::Signet => base.join("signet").join(p),
+                    bitcoin::Network::Regtest => base.join("regtest").join(p),
+                }
+            }
+        };
+        blockchain::dump_txout_set(&ctx.chain_state, &resolved.to_string_lossy())
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -3117,11 +3185,25 @@ pub async fn start(
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(obj))
     })?;
 
-    module.register_method("validateaddress", |params, _ctx, _extensions| {
-        let address: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        Ok::<_, ErrorObjectOwned>(util::validate_address(&address))
+    module.register_method("validateaddress", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let address: String = args.required("address").map_err(|e| {
+            if e.code() == -1 {
+                // Core answers a missing required argument with the help text.
+                ErrorObjectOwned::owned(
+                    -1,
+                    "validateaddress \"address\"\n\n\
+                     Return information about the given bitcoin address.\n\n\
+                     Arguments:\n\
+                     1. address    (string, required) The bitcoin address to validate\n",
+                    None::<()>,
+                )
+            } else {
+                e
+            }
+        })?;
+        args.check()?;
+        Ok::<_, ErrorObjectOwned>(util::validate_address(&address, ctx.chain_state.network))
     })?;
 
     module.register_method("getdescriptorinfo", |params, _ctx, _extensions| {

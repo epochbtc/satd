@@ -504,6 +504,16 @@ silently returning an empty or wrong answer.
   key-carrying scripts, `rawtr()` for a taproot output whose key is on the
   curve, `addr()` for anything with an address, `raw()` otherwise.
 
+- **`dumptxoutset`** — satd writes a snapshot of the current UTXO set only.
+  Core's `"rollback"` type, which temporarily rewinds the node to a historical
+  block, is not implemented and is refused by name rather than answered with
+  the tip under a name that promises a historical snapshot. Two smaller
+  divergences: satd defaults an omitted `type` to `"latest"` where Core v31
+  rejects it (so callers predating the argument keep working; every
+  Core-shaped call is still accepted, and a *wrong* type is still Core's
+  error), and `txoutset_hash` is satd's own UTXO-set digest, not Core's
+  `hash_serialized_3` — do not compare the two across implementations.
+
 ---
 
 ## Behavioral defaults that intentionally differ
