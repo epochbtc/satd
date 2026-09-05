@@ -788,15 +788,36 @@ async fn main() {
 
     let json_params: serde_json::Value = if cli.named {
         if let Cmd::Raw(_) = &cli.command {
+            // Core's `RPCConvertNamedValues` (src/rpc/client.cpp): an argument
+            // with no `=` is a *positional* one. They are collected in order
+            // into the reserved `args` key, which the server expands into the
+            // leading argument slots. Dropping them instead -- which is what
+            // this did -- silently sent a different call than the operator
+            // typed (#672).
             let mut obj = serde_json::Map::new();
+            let mut positional: Vec<serde_json::Value> = Vec::new();
             for p in &params {
-                if let Some(s) = p.as_str()
-                    && let Some((k, v)) = s.split_once('=')
-                {
-                    let val: serde_json::Value = serde_json::from_str(v)
-                        .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
-                    obj.insert(k.to_string(), val);
+                let Some(s) = p.as_str() else {
+                    positional.push(p.clone());
+                    continue;
+                };
+                match s.split_once('=') {
+                    Some((k, v)) => {
+                        let val: serde_json::Value = serde_json::from_str(v)
+                            .unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+                        obj.insert(k.to_string(), val);
+                    }
+                    None => {
+                        let val: serde_json::Value = serde_json::from_str(s)
+                            .unwrap_or_else(|_| serde_json::Value::String(s.to_string()));
+                        positional.push(val);
+                    }
                 }
+            }
+            if !positional.is_empty() {
+                // `pushKVEnd` in Core: never overwrite an explicit `args=`.
+                obj.entry("args".to_string())
+                    .or_insert(serde_json::Value::Array(positional));
             }
             serde_json::Value::Object(obj)
         } else {
