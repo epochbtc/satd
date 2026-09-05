@@ -693,21 +693,21 @@ mod address {
 
     #[test]
     fn test_validate_address_valid_bech32() {
-        let result = address::validate_address(REGTEST_ADDR);
+        let result = address::validate_address(REGTEST_ADDR, bitcoin::Network::Regtest);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["isvalid"], true);
     }
 
     #[test]
     fn test_validate_address_invalid() {
-        let result = address::validate_address("not-a-valid-address");
+        let result = address::validate_address("not-a-valid-address", bitcoin::Network::Regtest);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["isvalid"], false);
     }
 
     #[test]
     fn test_validate_address_empty() {
-        let result = address::validate_address("");
+        let result = address::validate_address("", bitcoin::Network::Regtest);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["isvalid"], false);
     }

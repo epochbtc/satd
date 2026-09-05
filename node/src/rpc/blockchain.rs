@@ -1,3 +1,4 @@
+use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::consensus::serialize;
 use serde_json::{json, Value};
@@ -151,17 +152,41 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
 }
 
 /// `getdeploymentinfo` — report the activation status of buried softfork
-/// deployments.
+/// deployments, at the chain tip or at a caller-named block.
 ///
 /// Core models both BIP 9 (versionbits) and buried (height-gated)
 /// deployments. satd has no BIP 9 deployments — everything is buried — so
-/// the output is a static map of `{ name: { type, active, height } }`.
+/// the output is a map of `{ name: { type, active, height } }`.
 ///
-/// `active` follows Core's rule: a buried deployment is active for the
-/// *next* block, i.e. `tip_height + 1 >= activation_height`.
-pub fn get_deployment_info(chain_state: &ChainState) -> Value {
-    let tip_height = chain_state.tip_height();
-    let next_height = tip_height + 1;
+/// The deployment *names* are Core's reporting spellings from
+/// `DeploymentName()` in `src/deploymentinfo.cpp`: `bip34`, `bip65`,
+/// `bip66`, `csv`, `segwit`. Note the asymmetry Core itself carries —
+/// `-testactivationheight` takes `cltv`/`dersig` on the way in
+/// (`GetBuriedDeployment()`) but `getdeploymentinfo` reports `bip65`/`bip66`
+/// on the way out. Core's test framework keys on the reporting spelling.
+///
+/// `active` follows Core's `DeploymentActiveAfter`: a buried deployment is
+/// active for the block *after* the one queried, i.e.
+/// `height + 1 >= activation_height`.
+pub fn get_deployment_info(
+    chain_state: &ChainState,
+    blockhash: Option<&str>,
+) -> Result<Value, (i32, String)> {
+    // One read: a tip hash and a tip height taken separately can straddle a
+    // connect and describe two different blocks.
+    let (hash, height) = match blockhash {
+        None => chain_state.tip_snapshot(),
+        Some(s) => {
+            let parsed: BlockHash = s
+                .parse()
+                .map_err(|_| (-8, format!("blockhash must be of length 64 (not {}, for '{s}')", s.len())))?;
+            let entry = chain_state
+                .get_block_index(&parsed)
+                .ok_or_else(|| (-5, "Block not found".to_string()))?;
+            (parsed, entry.height)
+        }
+    };
+    let next_height = height + 1;
     let heights = crate::validation::script::activation_heights(chain_state.network);
 
     // Helper: one deployment object.
@@ -175,17 +200,17 @@ pub fn get_deployment_info(chain_state: &ChainState) -> Value {
 
     let mut map = serde_json::Map::new();
     map.insert("bip34".to_string(), buried(heights.bip34));
-    map.insert("dersig".to_string(), buried(heights.dersig));
-    map.insert("cltv".to_string(), buried(heights.cltv));
+    map.insert("bip66".to_string(), buried(heights.dersig));
+    map.insert("bip65".to_string(), buried(heights.cltv));
     map.insert("csv".to_string(), buried(heights.csv));
     map.insert("segwit".to_string(), buried(heights.segwit));
     map.insert("taproot".to_string(), buried(heights.taproot));
 
-    json!({
+    Ok(json!({
         "deployments": map,
-        "hash": chain_state.tip_hash().to_string(),
-        "height": tip_height,
-    })
+        "hash": hash.to_string(),
+        "height": height,
+    }))
 }
 
 /// `getchainstates` — Core 27+ RPC describing the active chainstate(s).

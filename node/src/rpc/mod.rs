@@ -19,6 +19,7 @@ pub mod access;
 pub mod address;
 pub mod admission;
 pub mod allowip;
+pub mod address_decode;
 pub mod amounts;
 pub mod auth;
 pub mod blockchain;
