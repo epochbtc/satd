@@ -169,7 +169,18 @@ fn expand_hrp(hrp: &str, values: &[u8]) -> Vec<u8> {
 
 /// Core's `CheckCharacters`: every character must be printable ASCII, and the
 /// string must not mix cases. Returns the offending indices.
+///
+/// One index is allocated per offending character, so this is only bounded
+/// for a string that has already passed the `CHAR_LIMIT` test -- and the
+/// input is an unvalidated RPC argument, where getting that wrong costs one
+/// index per character of a 20 MiB body. Both callers test the length first;
+/// the assertion is here so a third one that forgets says so loudly instead
+/// of quietly allocating.
 fn check_characters(s: &str) -> Vec<usize> {
+    debug_assert!(
+        s.len() <= CHAR_LIMIT,
+        "check_characters is only bounded for a length-checked string"
+    );
     let mut errors = Vec::new();
     let (mut lower, mut upper) = (false, false);
     for (i, c) in s.bytes().enumerate() {
@@ -396,7 +407,16 @@ fn verify_checksum(hrp: &str, values: &[u8]) -> Option<u32> {
 /// Core's `bech32::Decode`: `(encoding_const, hrp, data)` with the checksum
 /// symbols stripped, or `None` for anything that does not decode at all.
 fn bech32_decode(s: &str) -> Option<(u32, String, Vec<u8>)> {
-    if !check_characters(s).is_empty() || s.len() > CHAR_LIMIT {
+    // Length before characters. Both tests are pure, so the order does not
+    // change the answer -- but `||` evaluates its left operand first, and
+    // `check_characters` allocates one index per offending character. Testing
+    // the characters first therefore built an unbounded vector on the way to
+    // rejecting the string for being too long: a mixed-case argument at the
+    // 20 MiB body limit cost ~160 MB before the cheap test that refuses it.
+    if s.len() > CHAR_LIMIT {
+        return None;
+    }
+    if !check_characters(s).is_empty() {
         return None;
     }
     let pos = s.rfind(SEPARATOR)?;
@@ -670,6 +690,31 @@ mod tests {
         );
         // Still points at the first offending character, as Core does.
         assert_eq!(locations.first(), Some(&CHAR_LIMIT));
+    }
+
+    /// The same input driven through the *whole* decoder, and mixed-case so
+    /// that `check_characters` actually collects something.
+    ///
+    /// Bounding `locate_errors` alone was not enough: `bech32_decode` runs
+    /// first, and it tested the characters before the length. `||` evaluates
+    /// its left operand first, so the decoder built one index per offending
+    /// character -- unbounded -- on its way to the bounded answer. An
+    /// all-lowercase probe cannot catch this, because `check_characters` only
+    /// allocates for characters it objects to.
+    #[test]
+    fn an_over_long_mixed_case_address_is_bounded_through_the_whole_decoder() {
+        let s = format!("bcrt1{}", "Q".repeat(200_000));
+        match decode_destination(&s, Network::Regtest) {
+            Decoded::Invalid { error, locations } => {
+                assert_eq!(error, "Bech32 string too long");
+                assert!(
+                    locations.len() <= 256,
+                    "the location list must stay bounded, got {}",
+                    locations.len()
+                );
+            }
+            _ => panic!("an over-long string must not validate"),
+        }
     }
 
     /// A well-formed address has no errors to locate.
