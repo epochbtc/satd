@@ -233,7 +233,17 @@ pub struct TestNode {
 
 impl TestNode {
     pub fn start(extra_args: &[&str]) -> Self {
-        Self::start_inner(extra_args, &[], false)
+        Self::start_inner("--regtest", extra_args, &[], false)
+    }
+
+    /// Start on a chain other than regtest.
+    ///
+    /// The chain selector cannot be passed through `extra_args`: `start`
+    /// puts `--regtest` first and satd resolves the first selector on the
+    /// command line, so a later `--signet` is ignored. Tests for behaviour
+    /// that is *gated* on regtest need a node that genuinely is not one.
+    pub fn start_on_chain(chain_flag: &'static str, extra_args: &[&str]) -> Self {
+        Self::start_inner(chain_flag, extra_args, &[], false)
     }
 
     /// Like `start` but also captures the spawned satd's stderr into a file
@@ -241,7 +251,7 @@ impl TestNode {
     /// caller can dump it on failure. Opt-in because heavy logging adds
     /// enough I/O on loaded CI runners to slow other tests.
     pub fn start_capturing_stderr(extra_args: &[&str]) -> Self {
-        Self::start_inner(extra_args, &[], true)
+        Self::start_inner("--regtest", extra_args, &[], true)
     }
 
     /// Like `start` but also sets environment variables on the spawned
@@ -250,10 +260,15 @@ impl TestNode {
     /// parent process's environment, which would race across parallel
     /// tests.
     pub fn start_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
-        Self::start_inner(extra_args, env, false)
+        Self::start_inner("--regtest", extra_args, env, false)
     }
 
-    fn start_inner(extra_args: &[&str], env: &[(&str, &str)], capture_stderr: bool) -> Self {
+    fn start_inner(
+        chain_flag: &'static str,
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+        capture_stderr: bool,
+    ) -> Self {
         // A satd that never answers RPC has almost always *crashed* on startup
         // (a port race, a datadir lock, a panic) rather than merely being slow:
         // the 120s×MULT deadline is far longer than even a heavily contended CI
@@ -266,7 +281,7 @@ impl TestNode {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_failure = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_start_once(extra_args, env, capture_stderr) {
+            match Self::try_start_once(chain_flag, extra_args, env, capture_stderr) {
                 Ok(node) => return node,
                 Err(reason) => {
                     last_failure = format!("attempt {attempt}/{MAX_ATTEMPTS}: {reason}");
@@ -286,6 +301,7 @@ impl TestNode {
     /// so the caller can retry on a fresh port. Each attempt allocates its own
     /// port/datadir, so a retry never reuses a contended port or a locked dir.
     fn try_start_once(
+        chain_flag: &'static str,
         extra_args: &[&str],
         env: &[(&str, &str)],
         capture_stderr: bool,
@@ -307,7 +323,7 @@ impl TestNode {
         let tracked_p2p_port = caller_port.or(if has_port { None } else { Some(p2p_port) });
 
         let mut cmd = Command::new(satd_bin);
-        cmd.arg("--regtest")
+        cmd.arg(chain_flag)
             .arg(format!("--datadir={}", datadir.display()))
             .arg(format!("--rpcport={}", rpcport));
         if !has_port {
@@ -371,7 +387,18 @@ impl TestNode {
         // runner has needed >60s when many parallel workers contend for
         // the runner. Scaled by SATD_TEST_TIMEOUT_MULT.
         let deadline = Instant::now() + test_timeout(120);
-        let cookie_path = datadir.join("regtest").join(".cookie");
+        // The cookie lives under the chain's own subdirectory, so this has to
+        // track the chain flag: looking for a regtest cookie under a signet
+        // node's datadir simply never finds one, and the node is reported as
+        // having failed to start.
+        let chain_subdir = match chain_flag {
+            "--regtest" => "regtest",
+            "--signet" => "signet",
+            "--testnet4" => "testnet4",
+            "--testnet" => "testnet3",
+            other => panic!("unsupported chain flag for the test harness: {other}"),
+        };
+        let cookie_path = datadir.join(chain_subdir).join(".cookie");
         // Captured from the readiness probe below so we never re-read the
         // cookie file after the loop — that second read used to race the file
         // momentarily vanishing under parallel-startup contention and panic.

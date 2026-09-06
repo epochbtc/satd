@@ -24,13 +24,23 @@ use crate::net::bg_catchup::BgDownloader;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
-use crate::net::peer::{Direction, PeerAddr, PeerId, PeerInfo, PeerState};
+use crate::net::peer::{ConnType, Direction, PeerAddr, PeerId, PeerInfo, PeerState};
 use crate::net::proxy;
 use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
 
 const MAX_OUTBOUND: usize = 8;
 const MAX_OUTBOUND_IBD: usize = 64;
+/// Block-relay-only slots, counted separately from full-relay ones. Bitcoin
+/// Core's `m_max_outbound_block_relay` (2 by default): these connections exist
+/// so a tx-graph observer cannot learn the full topology, which only works if
+/// they are not competing with full-relay peers for the same slots.
+const MAX_OUTBOUND_BLOCK_RELAY: usize = 2;
+/// How long an `addr-fetch` connection is kept if the peer never answers our
+/// `getaddr`. Core's `SendMessages` drops one after `10 *
+/// AVG_ADDRESS_BROADCAST_INTERVAL` (net_processing.cpp), i.e. 300 seconds
+/// since the connection was made.
+const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const BAN_THRESHOLD: u32 = 100;
 /// Keepalive cadence: how often each peer is sent a `ping` when none is
 /// outstanding. Bitcoin Core's `PING_INTERVAL` (net_processing.h).
@@ -242,6 +252,23 @@ enum OutboundDial {
     Onion(String, u16),
 }
 
+/// Holds a per-type outbound slot from the moment the capacity check passes
+/// until the peer is registered (or the dial fails), so two concurrent callers
+/// cannot both be granted the same free slot.
+struct TypedDialGuard<'a> {
+    set: &'a RwLock<Vec<ConnType>>,
+    conn_type: ConnType,
+}
+
+impl Drop for TypedDialGuard<'_> {
+    fn drop(&mut self) {
+        let mut set = self.set.write();
+        if let Some(i) = set.iter().position(|t| *t == self.conn_type) {
+            set.swap_remove(i);
+        }
+    }
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -271,10 +298,23 @@ pub struct PeerManager {
     block_refetch: RwLock<HashMap<bitcoin::BlockHash, (PeerId, Instant)>>,
     /// Configured outbound peer addresses for auto-reconnect.
     connect_addrs: RwLock<Vec<SocketAddr>>,
+    /// Bitcoin Core's `m_use_addrman_outgoing`. False under `-connect`.
+    automatic_outbound: std::sync::atomic::AtomicBool,
     /// Addresses that should be tagged as manual (addnode-initiated) when
     /// they connect. Includes both persistent addnode entries and onetry
     /// connections. Onetry entries are removed after the connect completes.
     manual_addrs: RwLock<HashSet<SocketAddr>>,
+    /// The `.onion` hosts an operator named (`-connect` / `-addnode` /
+    /// `-seednode`), as opposed to those learned from `addrv2` gossip. The
+    /// clearnet equivalent is `manual_addrs`; onion peers need their own set
+    /// because `connect_peer_addrs` holds both kinds and is keyed by host,
+    /// not `SocketAddr`.
+    manual_onion_hosts: RwLock<HashSet<String>>,
+    /// Connection types whose dial has passed the capacity check but has not
+    /// yet reached `spawn_peer`. Held for the duration of the dial and the
+    /// transport handshake so the per-type limits are limits rather than
+    /// suggestions; see `check_outbound_limit_for`.
+    pending_typed_dials: RwLock<Vec<ConnType>>,
     /// User-provided address strings for addnode RPC, paired with the
     /// resolved address. Stored so `getaddednodeinfo` can return the
     /// original string the operator typed, matching Core.
@@ -540,7 +580,10 @@ impl PeerManager {
             in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
+            automatic_outbound: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
+            manual_onion_hosts: RwLock::new(HashSet::new()),
+            pending_typed_dials: RwLock::new(Vec::new()),
             addnode_entries: RwLock::new(Vec::new()),
             external_addrs: RwLock::new(Vec::new()),
             advertised_onion: RwLock::new(None),
@@ -739,7 +782,7 @@ impl PeerManager {
     }
 
     /// Whether the BIP 324 v2 transport is enabled (`-v2transport`).
-    fn v2_transport_enabled(&self) -> bool {
+    pub fn v2_transport_enabled(&self) -> bool {
         self.v2_transport.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -986,10 +1029,44 @@ impl PeerManager {
         // Record in the persistent address book (peers.dat) as a *new*
         // address. This is the chokepoint for gossiped addresses.
         self.addrman.write().add(addr, now_unix_secs());
+        // Under `-connect` the node dials only the peers it was told to.
+        // Core keeps learning addresses in that mode (they go to the addrman
+        // above) but sets `m_use_addrman_outgoing = false`, so it never opens
+        // a connection from them. Pushing them onto the dial list here would
+        // quietly reconnect the node to the network the operator disconnected
+        // it from.
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
         let mut addrs = self.connect_addrs.write();
         if !addrs.contains(&addr) {
             addrs.push(addr);
         }
+    }
+
+    /// Bitcoin Core's `m_use_addrman_outgoing`: whether the node may dial
+    /// peers it learned itself, as opposed to only those it was given.
+    /// `-connect` (with or without addresses) turns this off.
+    pub fn set_automatic_outbound(&self, enabled: bool) {
+        self.automatic_outbound.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the reconnect loop may dial `addr`.
+    ///
+    /// The `add_connect_addr` gate alone is not enough. `peers.dat` is loaded
+    /// straight into `connect_addrs` at startup, long before `-connect` has
+    /// been applied to the manager, so a node restarted with `-connect=0` and
+    /// an existing address book still dialled everything it had learned --
+    /// exactly the reconnect-to-the-network-you-disconnected-from this mode
+    /// exists to prevent. Gating the dial rather than the bookkeeping is also
+    /// order-independent: it holds however an address arrived.
+    ///
+    /// Explicit operator lists are unaffected: `-connect=<addr>`, `-addnode`
+    /// and `-seednode` all register in `manual_addrs`, and Core dials those
+    /// under `-connect` too.
+    fn may_dial(&self, addr: &SocketAddr) -> bool {
+        self.automatic_outbound.load(Ordering::Relaxed)
+            || self.manual_addrs.read().contains(addr)
     }
 
     /// Record a `.onion` peer learned from `addrv2` gossip so the reconnect
@@ -999,6 +1076,12 @@ impl PeerManager {
     /// connection and the existing candidate list. This is what lets a
     /// proxy-only node grow its peer set past the hardcoded onion seeds.
     fn add_onion_connect_addr(&self, host: String, port: u16) {
+        // Under `-connect` the node dials only the peers it was told to; see
+        // `may_dial`. Onion candidates are in-memory only, so refusing them
+        // here is enough to keep them off the dial list.
+        if !self.automatic_outbound.load(Ordering::Relaxed) {
+            return;
+        }
         if self.is_onion_connected(&host) {
             return;
         }
@@ -1059,16 +1142,26 @@ impl PeerManager {
     pub fn add_peer_addr(&self, addr: PeerAddr) -> bool {
         match &addr {
             PeerAddr::Socket(sa) => {
+                // Mark as manual *before* the duplicate check -- so spawn_peer
+                // tags the peer correctly, and so `may_dial` keeps letting it
+                // through. An address can already be a dial candidate by the
+                // time it is configured: `peers.dat` seeds `connect_addrs` at
+                // startup, long before `-connect` reaches the manager, and
+                // gossip adds to it continuously. Marking it only on the
+                // newly-added path left an explicitly configured peer failing
+                // `may_dial`, so under `-connect` one failed dial or
+                // disconnect stranded the node with no peers at all. The onion
+                // arm below already registers before its duplicate check.
+                self.manual_addrs.write().insert(*sa);
                 let mut addrs = self.connect_addrs.write();
                 if addrs.contains(sa) {
                     return false;
                 }
                 addrs.push(*sa);
-                // Also mark as manual so spawn_peer tags it correctly.
-                self.manual_addrs.write().insert(*sa);
                 true
             }
-            PeerAddr::Onion { .. } => {
+            PeerAddr::Onion { host, .. } => {
+                self.manual_onion_hosts.write().insert(host.clone());
                 let mut addrs = self.connect_peer_addrs.write();
                 if addrs.contains(&addr) {
                     return false;
@@ -1178,6 +1271,77 @@ impl PeerManager {
             .count()
     }
 
+    /// An addr-fetch connection exists to collect one batch of addresses and
+    /// go. Core requires more than one entry before treating the answer as
+    /// complete, so a peer that only announces itself does not end the
+    /// connection before it has said anything useful (`net_processing.cpp`,
+    /// "Require multiple addresses to avoid disconnecting on
+    /// self-announcements").
+    ///
+    /// Core applies this in the handler both `addr` and `addrv2` share. satd
+    /// sends `sendaddrv2` on every outbound connection, so every BIP155-capable
+    /// peer -- Bitcoin Core 22 and later, and satd itself -- answers our
+    /// `getaddr` with `addrv2`. Having the rule on the legacy arm alone meant
+    /// the connection never completed against any modern peer and sat holding
+    /// an outbound slot until the 300s expiry.
+    fn note_addr_fetch_answered(&self, id: PeerId, count: usize) {
+        if count > 1 && self.conn_type_of(id) == ConnType::AddrFetch {
+            tracing::debug!(id, count, "addrfetch connection completed, disconnecting");
+            self.disconnect_by_id(id);
+        }
+    }
+
+    /// Bitcoin Core's per-type outbound capacity check
+    /// (`CConnman::AddConnection`): full-relay and block-relay-only each have
+    /// their own budget, and neither addr-fetch nor feeler has one -- they are
+    /// short-lived by construction, and `-seednode` has no limit either.
+    ///
+    /// The error string is the one Core's `addconnection` turns into
+    /// RPC_CLIENT_NODE_CAPACITY_REACHED, so the RPC does not have to re-derive
+    /// which limit was hit.
+    ///
+    /// `pending` is the in-flight dial list, passed in rather than read here
+    /// so the caller can hold it across the check *and* its own reservation:
+    /// two acquisitions would leave the window this check exists to close.
+    fn check_outbound_limit_for(
+        &self,
+        conn_type: ConnType,
+        pending: &[ConnType],
+    ) -> Result<(), String> {
+        let max = match conn_type {
+            ConnType::OutboundFullRelay => {
+                self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND)
+            }
+            ConnType::BlockRelay => MAX_OUTBOUND_BLOCK_RELAY,
+            ConnType::AddrFetch | ConnType::Feeler => return Ok(()),
+            // Core returns false rather than opening one of these.
+            ConnType::Inbound | ConnType::Manual => {
+                return Err(format!(
+                    "cannot open a {} connection this way",
+                    conn_type.as_str()
+                ))
+            }
+        };
+        // Count dials already in flight for this type alongside the peers
+        // that completed. Counting only the map leaves a window between the
+        // check and `spawn_peer` -- the dial and the whole transport
+        // handshake -- in which concurrent callers all see the same free
+        // slot: three concurrent `addconnection` calls at a limit of two
+        // produced three peers. Core is protected by the `semOutbound`
+        // counting semaphore, whose grant is taken before the dial.
+        let existing = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == conn_type)
+            .count()
+            + pending.iter().filter(|t| **t == conn_type).count();
+        if existing >= max {
+            return Err("Error: Already at capacity for specified connection type.".to_string());
+        }
+        Ok(())
+    }
+
     /// Check outbound connection limit.
     fn check_outbound_limit(&self) -> Result<(), String> {
         let max_outbound = if self.is_ibd() {
@@ -1192,12 +1356,41 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to an outbound peer.
+    /// Connect to an outbound peer, letting `spawn_peer` classify it.
     pub async fn connect_outbound(self: &Arc<Self>, addr: SocketAddr) -> Result<(), String> {
+        self.connect_outbound_as(addr, None, None).await
+    }
+
+    /// Connect to an outbound peer of a caller-chosen type.
+    ///
+    /// `conn_type` is `Some` only for `addconnection`; every other dial passes
+    /// `None` and keeps the historical classification (manual if the address
+    /// is an addnode/-connect target, full-relay otherwise) along with the
+    /// historical single outbound cap.
+    pub async fn connect_outbound_as(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        conn_type: Option<ConnType>,
+        use_v2: Option<bool>,
+    ) -> Result<(), String> {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
-        self.check_outbound_limit()?;
+        // Take the capacity check and the per-type reservation together, so
+        // two callers cannot both pass the same free slot.
+        let _typed_slot = match conn_type {
+            Some(t) => {
+                let mut pending = self.pending_typed_dials.write();
+                self.check_outbound_limit_for(t, &pending)?;
+                pending.push(t);
+                drop(pending);
+                Some(TypedDialGuard { set: &self.pending_typed_dials, conn_type: t })
+            }
+            None => {
+                self.check_outbound_limit()?;
+                None
+            }
+        };
 
         // Claim the dial slot before doing any network I/O. Without this,
         // the reconnect loop can spawn multiple concurrent `connect_outbound`
@@ -1244,7 +1437,9 @@ impl PeerManager {
         // Establish the transport before spawning so a failed v2 handshake
         // can re-dial for v1. Peers that already failed v2 this session are
         // connected straight as v1 to avoid a wasted round trip.
-        let conn = self.establish_outbound(stream, OutboundDial::Direct(addr)).await?;
+        let conn = self
+            .establish_outbound(stream, OutboundDial::Direct(addr), use_v2)
+            .await?;
 
         // Re-check after the dial + handshake awaits: `setnetworkactive false`
         // (RPC or SIGHUP) may have run while we were connecting, clearing all
@@ -1261,6 +1456,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             None,
+            conn_type,
         );
         Ok(())
     }
@@ -1319,7 +1515,7 @@ impl PeerManager {
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
         let conn = self
-            .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port))
+            .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port), None)
             .await?;
 
         // Re-check after the dial + handshake awaits (see connect_outbound):
@@ -1335,6 +1531,7 @@ impl PeerManager {
             IncomingTransport::Established(Box::new(conn)),
             Direction::Outbound,
             Some(host),
+            None,
         );
         Ok(())
     }
@@ -2154,7 +2351,9 @@ impl PeerManager {
                     let peer_ids: Vec<PeerId> = {
                         let peers = self.peers.read();
                         peers.iter()
-                            .filter(|(_, h)| h.info.state == PeerState::Connected)
+                            .filter(|(_, h)| {
+                                h.info.state == PeerState::Connected && h.info.serves_blocks()
+                            })
                             .map(|(id, _)| *id)
                             .collect()
                     };
@@ -2170,7 +2369,9 @@ impl PeerManager {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read();
                     peers.iter()
-                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .filter(|(_, h)| {
+                            h.info.state == PeerState::Connected && h.info.serves_blocks()
+                        })
                         .map(|(id, _)| *id)
                         .take(3)
                         .collect()
@@ -2182,7 +2383,9 @@ impl PeerManager {
                 let peer_ids: Vec<PeerId> = {
                     let peers = self.peers.read();
                     peers.iter()
-                        .filter(|(_, h)| h.info.state == PeerState::Connected)
+                        .filter(|(_, h)| {
+                            h.info.state == PeerState::Connected && h.info.serves_blocks()
+                        })
                         .map(|(id, _)| *id)
                         .collect()
                 };
@@ -2223,6 +2426,10 @@ impl PeerManager {
                     }
 
                     for addr in addrs {
+                        // Under `-connect`, only the peers the operator named.
+                        if !self.may_dial(&addr) {
+                            continue;
+                        }
                         // Skip if already connected
                         if self.is_addr_connected(&addr) {
                             continue;
@@ -2288,6 +2495,16 @@ impl PeerManager {
                         if budget == 0 {
                             break;
                         }
+                        // Under `-connect`, only the peers the operator named.
+                        let manual = match &peer_addr {
+                            PeerAddr::Onion { host, .. } => {
+                                self.manual_onion_hosts.read().contains(host)
+                            }
+                            PeerAddr::Socket(sa) => self.manual_addrs.read().contains(sa),
+                        };
+                        if !manual && !self.automatic_outbound.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let already = match &peer_addr {
                             PeerAddr::Onion { host, .. } => {
                                 self.is_onion_connected(host)
@@ -2331,6 +2548,13 @@ impl PeerManager {
                         });
                     }
                 }
+            }
+
+            // Drop addr-fetch connections whose peer never sent a usable
+            // `addr`. Read through the node clock, not the wall clock, so
+            // `setmocktime` moves the deadline the way it does in Core.
+            if ticks.is_multiple_of(2) {
+                self.expire_addr_fetch_peers();
             }
 
             // Yield to tokio runtime
@@ -2466,24 +2690,60 @@ impl PeerManager {
             }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
+                // Address relay is off in *both* directions on a
+                // block-relay-only link (Core's `SetupAddressRelay`), so
+                // nothing this peer announces enters the address book.
+                let relay_addrs = self.conn_type_of(id).relays_addrs();
                 for (_, addr) in &addrs {
-                    if let Ok(sock_addr) = addr.socket_addr()
+                    if relay_addrs
+                        && let Ok(sock_addr) = addr.socket_addr()
                         && !self.is_addr_connected(&sock_addr)
                         && !self.is_addr_banned(&sock_addr)
                     {
                         self.add_connect_addr(sock_addr);
                     }
                 }
+                self.note_addr_fetch_answered(id, addrs.len());
             }
             NetworkMessage::GetAddr => {
                 // Respond with our declared external addresses (-externalip)
                 // followed by addresses of our connected peers.
-                let peers = self.peers.read();
-                let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
-                let addr_entries: Vec<_> = peers
-                    .values()
-                    .filter(|h| h.info.state == PeerState::Connected)
-                    .collect();
+                //
+                // Not on a block-relay-only link: Core's `SetupAddressRelay`
+                // refuses one outright, because answering is what lets an
+                // adversary infer the link from its addr traffic.
+                if !self.conn_type_of(id).relays_addrs() {
+                    tracing::debug!(id, "ignoring getaddr on a block-relay-only connection");
+                    return;
+                }
+                // Copy what we need and drop the guard before sending.
+                // `send_to_peer` takes `peers.read()` itself, and
+                // `parking_lot`'s read lock is not reentrant: a writer
+                // arriving between the two acquisitions makes the second read
+                // queue behind it while it waits on the first, deadlocking
+                // the manager's event-drain task -- and with it the node's
+                // whole P2P loop.
+                struct AddrEntry {
+                    addr: SocketAddr,
+                    services: ServiceFlags,
+                    onion_host: Option<String>,
+                    conn_time: std::time::SystemTime,
+                }
+                let (wants_v2, addr_entries) = {
+                    let peers = self.peers.read();
+                    let wants_v2 = peers.get(&id).is_some_and(|h| h.info.wants_addrv2);
+                    let entries: Vec<AddrEntry> = peers
+                        .values()
+                        .filter(|h| h.info.state == PeerState::Connected)
+                        .map(|h| AddrEntry {
+                            addr: h.info.addr,
+                            services: h.info.services,
+                            onion_host: h.info.onion_host.clone(),
+                            conn_time: h.info.conn_time,
+                        })
+                        .collect();
+                    (wants_v2, entries)
+                };
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2491,9 +2751,8 @@ impl PeerManager {
                 let our_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
                 let externals = self.external_addrs.read().clone();
 
-                let entry_time = |h: &PeerHandle| {
-                    h.info
-                        .conn_time
+                let entry_time = |h: &AddrEntry| {
+                    h.conn_time
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as u32
@@ -2519,9 +2778,7 @@ impl PeerManager {
                         .iter()
                         .filter_map(|a| to_v2(*a, now, our_services))
                         .collect();
-                    // Advertise our own hidden service (read directly — we
-                    // already hold the `peers` read lock, so re-entering it via
-                    // `self_advertise_addrv2` could deadlock).
+                    // Advertise our own hidden service.
                     if let Some(PeerAddr::Onion { host, port }) =
                         self.advertised_onion.read().as_ref()
                         && let Some(pubkey) = crate::net::peer::onion_host_to_torv3_pubkey(host)
@@ -2538,16 +2795,16 @@ impl PeerManager {
                         // A connected onion peer is relayed as a TorV3 entry
                         // (its socket is the 0.0.0.0 placeholder); everything
                         // else goes through the socket path.
-                        if let Some(host) = h.info.onion_host.as_deref() {
+                        if let Some(host) = h.onion_host.as_deref() {
                             if let Some(pubkey) = crate::net::peer::onion_host_to_torv3_pubkey(host) {
                                 addrs.push(bitcoin::p2p::address::AddrV2Message {
                                     time,
-                                    services: h.info.services,
+                                    services: h.services,
                                     addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
-                                    port: h.info.addr.port(),
+                                    port: h.addr.port(),
                                 });
                             }
-                        } else if let Some(msg) = to_v2(h.info.addr, time, h.info.services) {
+                        } else if let Some(msg) = to_v2(h.addr, time, h.services) {
                             addrs.push(msg);
                         }
                     }
@@ -2563,10 +2820,10 @@ impl PeerManager {
                         .map(|a| (now, bitcoin::p2p::Address::new(a, our_services)))
                         .collect();
                     for h in &addr_entries {
-                        if h.info.onion_host.is_some() || h.info.addr.ip().is_unspecified() {
+                        if h.onion_host.is_some() || h.addr.ip().is_unspecified() {
                             continue;
                         }
-                        addrs.push((entry_time(h), bitcoin::p2p::Address::new(&h.info.addr, h.info.services)));
+                        addrs.push((entry_time(h), bitcoin::p2p::Address::new(&h.addr, h.services)));
                     }
                     if !addrs.is_empty() {
                         self.send_to_peer(id, NetworkMessage::Addr(addrs));
@@ -2578,7 +2835,10 @@ impl PeerManager {
                 // Onion peers are only reachable when an onion-routing proxy is
                 // configured; without one there's no point recording them.
                 let onion_routing = self.proxy.is_some() || self.onion_proxy.is_some();
-                for addr_msg in &addrs {
+                // As above: a block-relay-only link relays no addresses in
+                // either direction.
+                let relay_addrs = self.conn_type_of(id).relays_addrs();
+                for addr_msg in addrs.iter().filter(|_| relay_addrs) {
                     match &addr_msg.addr {
                         // BIP 155 TorV3: `socket_addr()` can't represent these,
                         // so derive the .onion host and queue it for dialing.
@@ -2600,6 +2860,7 @@ impl PeerManager {
                         }
                     }
                 }
+                self.note_addr_fetch_answered(id, addrs.len());
             }
             NetworkMessage::SendAddrV2 => {
                 let mut peers = self.peers.write();
@@ -2980,7 +3241,15 @@ impl PeerManager {
         };
         let peer_height = {
             let peers = self.peers.read();
-            peers.get(&peer_id).map(|h| h.info.best_height).unwrap_or(0)
+            let Some(handle) = peers.get(&peer_id) else { return };
+            // An addr-fetch connection exists to answer one `getaddr` and go;
+            // Core excludes it from block download (`CanServeBlocks`), and
+            // the sync loop's `getheaders` broadcasts already do. Registering
+            // it as an IBD source assigns blocks to a peer about to hang up.
+            if !handle.info.serves_blocks() {
+                return;
+            }
+            handle.info.best_height
         };
         // i32::saturating_sub avoids underflow for early-IBD targets.
         if (peer_height as i64) < (target_height as i64).saturating_sub(1000) {
@@ -5791,6 +6060,11 @@ impl PeerManager {
     }
 
     /// Spawn read/write tasks for a new peer connection.
+    ///
+    /// `conn_type` is `Some` only when the caller has already decided what
+    /// kind of connection this is -- today that is the `addconnection` RPC.
+    /// `None` means "work it out from the address", which is how every
+    /// ordinary dial reaches here.
     fn spawn_peer(
         self: &Arc<Self>,
         id: PeerId,
@@ -5798,6 +6072,7 @@ impl PeerManager {
         transport: IncomingTransport,
         direction: Direction,
         onion_host: Option<&str>,
+        conn_type: Option<ConnType>,
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
@@ -5806,8 +6081,15 @@ impl PeerManager {
         // Mark peers from `addnode` / `-connect` so getpeerinfo reports
         // connection_type = "manual" instead of "outbound-full-relay".
         if direction == Direction::Outbound {
-            info.is_addnode = self.connect_addrs.read().contains(&addr)
-                || self.manual_addrs.read().contains(&addr);
+            info.conn_type = conn_type.unwrap_or_else(|| {
+                if self.connect_addrs.read().contains(&addr)
+                    || self.manual_addrs.read().contains(&addr)
+                {
+                    ConnType::Manual
+                } else {
+                    ConnType::OutboundFullRelay
+                }
+            });
         }
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
         // peer this is the socket to the proxy, not a clearnet listener.
@@ -5988,17 +6270,26 @@ impl PeerManager {
     /// bad magic), re-dial a fresh socket and fall back to plaintext v1,
     /// remembering the destination so the next attempt skips v2 directly.
     /// `-v2only` peers are out of scope here (added in PR 5).
+    ///
+    /// `use_v2` overrides the node-wide `-v2transport` setting for this one
+    /// dial: `Some(false)` speaks v1 outright. Only `addconnection` passes it
+    /// -- the functional-test framework decides per connection whether its
+    /// listener speaks v2, and a v2 attempt against a v1 listener would burn
+    /// the single connection that listener accepts before the v1 re-dial
+    /// could reach it.
     async fn establish_outbound(
         self: &Arc<Self>,
         mut stream: TcpStream,
         target: OutboundDial,
+        use_v2: Option<bool>,
     ) -> Result<Connection, String> {
         let magic = self.chain_state.p2p_magic();
         let skip_v2 = match &target {
             OutboundDial::Direct(addr) => self.v2_downgraded.read().contains(addr),
             OutboundDial::Onion(..) => false,
         };
-        if !self.v2_transport_enabled() || skip_v2 {
+        let v2_wanted = use_v2.unwrap_or_else(|| self.v2_transport_enabled());
+        if !v2_wanted || skip_v2 {
             return Ok(Connection::with_magic(stream, magic));
         }
 
@@ -6114,11 +6405,23 @@ impl PeerManager {
             writer.set_counters(stats.clone());
         }
 
-        // Request headers to start sync
-        let getheaders = sync::make_getheaders(&self.chain_state);
-        writer.send(getheaders)
-            .await
-            .map_err(|e| e.to_string())?;
+        // An addr-fetch peer is asked for addresses and nothing else: Core
+        // marks it not-preferred-for-download and never syncs headers with it
+        // (`fPreferredDownload`/`CanServeBlocks` both exclude it), because the
+        // connection is about to be dropped.
+        let conn_type = self.conn_type_of(id);
+        if conn_type == ConnType::AddrFetch {
+            writer
+                .send(NetworkMessage::GetAddr)
+                .await
+                .map_err(|e| format!("send getaddr: {}", e))?;
+        } else {
+            // Request headers to start sync
+            let getheaders = sync::make_getheaders(&self.chain_state);
+            writer.send(getheaders)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         // Negotiate compact block support (BIP 152, version 2 = with witness)
         writer.send(NetworkMessage::SendCmpct(
@@ -6143,6 +6446,7 @@ impl PeerManager {
         // getaddr to outbound peers. Scoped to proxy mode to leave clearnet
         // address handling unchanged in this fix.
         if direction == Direction::Outbound
+            && conn_type != ConnType::AddrFetch
             && (self.proxy.is_some() || self.onion_proxy.is_some())
         {
             writer.send(NetworkMessage::GetAddr)
@@ -6417,7 +6721,12 @@ impl PeerManager {
         conn: &mut Connection,
         direction: Direction,
     ) -> Result<VersionMessage, String> {
-        let our_version = self.build_version_message(conn.peer_addr().map_err(|e| e.to_string())?);
+        // The connection type is already recorded on the PeerHandle by
+        // `spawn_peer` / `accept_inbound`, so the handshake can read it rather
+        // than have it threaded down again.
+        let conn_type = self.conn_type_of(id);
+        let our_version =
+            self.build_version_message(conn.peer_addr().map_err(|e| e.to_string())?, conn_type);
         // Bitcoin Core's `-timeout` (default 5000ms), set from config at
         // startup; bounds each step of the version/verack exchange.
         let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
@@ -6449,6 +6758,23 @@ impl PeerManager {
                         break v;
                     }
                 };
+
+                // A feeler exists to answer one question -- is anything still
+                // listening there? -- and the peer's `version` answers it.
+                // Core closes the connection here without sending a verack
+                // (`net_processing.cpp`: "disconnect feeler connections after
+                // the handshake"), so the peer never enters the connected set
+                // and never reaches `getpeerinfo`.
+                if conn_type == ConnType::Feeler {
+                    // Drop the handle here rather than leaving it for the
+                    // manager's next event drain. `is_addr_connected` counts
+                    // anything not yet `Disconnected`, so a lingering feeler
+                    // makes the very next dial to that address fail with
+                    // "already connected" -- which is exactly what a caller
+                    // does after a feeler tells it the address is alive.
+                    self.peers.write().remove(&id);
+                    return Err("feeler connection: closing after version".to_string());
+                }
 
                 conn.send(NetworkMessage::Verack)
                     .await
@@ -6517,7 +6843,44 @@ impl PeerManager {
         Ok(their_version)
     }
 
-    fn build_version_message(&self, receiver: SocketAddr) -> VersionMessage {
+    /// Disconnect any `addr-fetch` peer that has been connected longer than
+    /// [`ADDR_FETCH_TIMEOUT_SECS`] without completing.
+    fn expire_addr_fetch_peers(self: &Arc<Self>) {
+        let now = crate::time::now_secs();
+        let stale: Vec<PeerId> = self
+            .peers
+            .read()
+            .values()
+            .filter(|h| h.info.conn_type == ConnType::AddrFetch)
+            .filter(|h| {
+                let connected_at = h
+                    .info
+                    .conn_time
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
+            })
+            .map(|h| h.info.id)
+            .collect();
+        for id in stale {
+            tracing::debug!(id, "addrfetch connection timeout, disconnecting");
+            self.disconnect_by_id(id);
+        }
+    }
+
+    /// The connection type of a registered peer, defaulting to full-relay for
+    /// a peer that has already gone away (nothing downstream of this reads it
+    /// for a peer that no longer exists).
+    fn conn_type_of(&self, id: PeerId) -> ConnType {
+        self.peers
+            .read()
+            .get(&id)
+            .map(|h| h.info.conn_type)
+            .unwrap_or(ConnType::OutboundFullRelay)
+    }
+
+    fn build_version_message(&self, receiver: SocketAddr, conn_type: ConnType) -> VersionMessage {
         // Only the cfg-gated COMPACT_FILTERS bit below mutates this.
         #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
@@ -6553,7 +6916,11 @@ impl PeerManager {
             nonce: rand::random(),
             user_agent: crate::user_agent().to_string(),
             start_height: self.chain_state.tip_height() as i32,
-            relay: !self.blocksonly(),
+            // BIP 37 fRelay. Core clears it on block-relay-only and feeler
+            // connections regardless of -blocksonly: asking for transactions
+            // on a connection whose whole purpose is to be invisible to a
+            // tx-graph observer would defeat it.
+            relay: !self.blocksonly() && conn_type.wants_tx_relay(),
         }
     }
 }
@@ -7405,6 +7772,34 @@ mod tests {
         assert_eq!(info.len(), 1);
         assert_eq!(info[0]["addednode"], "localhost:18444");
         assert_eq!(info[0]["connected"], false);
+    }
+
+    /// An explicitly configured peer must stay dialable under `-connect`
+    /// even when its address was already a dial candidate. `peers.dat` is
+    /// loaded into `connect_addrs` at startup, ~1400 lines before `-connect`
+    /// is applied and the configured peers are registered, so for a node
+    /// with an address book this is the *common* case, not the odd one.
+    /// Registering the manual marker only on the newly-added path left
+    /// `may_dial` refusing the one peer the operator named: the startup dial
+    /// still happened, but nothing could retry it.
+    #[test]
+    fn a_configured_peer_already_in_the_dial_pool_stays_dialable() {
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "127.0.0.1:18455".parse().unwrap();
+
+        // As the address book does at startup, before `-connect` is applied.
+        pm.add_connect_addr(addr);
+        pm.set_automatic_outbound(false);
+
+        // Then the configured `-connect=<addr>`, finding it already present.
+        assert!(
+            !pm.add_peer_addr(PeerAddr::Socket(addr)),
+            "the address was already a dial candidate"
+        );
+        assert!(
+            pm.may_dial(&addr),
+            "an explicitly configured peer must stay dialable under -connect"
+        );
     }
 
     /// A real PeerManager over a caller-supplied chain state — spawns the

@@ -98,6 +98,7 @@ const SATD_SLOT_ALIASES: &[&str] = &["allowquarantined"];
 
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
+        "addconnection" => &[("address", false), ("connection_type", false), ("v2transport", false)],
         "addnode" => &[("node", false), ("command", false), ("v2transport", false)],
         "analyzepsbt" => &[("psbt", false)],
         "backfillindex" => &[("index_name", false)],
@@ -225,7 +226,7 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
 /// `match` arm above. Used by the `help("dump_all_command_conversions")` RPC
 /// to build the conversion table that Core's `rpc_help.py` test validates.
 pub(crate) const ALL_METHODS: &[&str] = &[
-    "addnode", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
+    "addconnection", "addnode", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
     "combinepsbt", "combinerawtransaction", "converttopsbt", "createpsbt",
     "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
     "disconnectnode", "dumptxoutset",

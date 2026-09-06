@@ -558,6 +558,11 @@ pub struct Config {
     pub v2only: bool,
     pub port: u16,
     pub connect: Vec<String>,
+    /// Bitcoin Core's `m_use_addrman_outgoing`: whether the node may open
+    /// outbound connections to peers it discovered itself. Any `-connect`
+    /// turns it off -- including Core's `-connect=0`, which means "connect to
+    /// nothing", not "connect to the address 0".
+    pub automatic_outbound: bool,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`), resolved to socket addresses. Advertised to peers.
     pub externalip: Vec<SocketAddr>,
@@ -2227,6 +2232,22 @@ impl Config {
         if connect.is_empty() {
             connect = file_get_all("connect");
         }
+        // Core's `-connect` semantics (`init.cpp`, `AppInitMain`): setting it
+        // at all disables automatic outbound connections, and the single
+        // value `0` is the spelling for "and no peers either". satd used to
+        // parse that `0` as an address and dial `0.0.0.0:8333` at every
+        // startup -- the shape every Core functional test starts a node in.
+        let automatic_outbound = connect.is_empty();
+        // Core's `-connect=0` means "and no peers either": the list is empty
+        // *and* automatic outbound stays off. Keep the count from before the
+        // clear -- the peer-floor default below reads it, and `-connect=0`
+        // must yield a floor of zero rather than the default for a node with
+        // no `-connect` at all.
+        let named_connect_peers = connect.len();
+        if connect.len() == 1 && connect[0] == "0" {
+            connect.clear();
+        }
+        let named_connect_peers = if connect.is_empty() { 0 } else { named_connect_peers };
 
         // Computed here rather than inline in the struct below, because the
         // default reads `connect`, which the struct literal has already moved
@@ -2235,7 +2256,15 @@ impl Config {
             .alert_peer_floor
             .or_else(|| file_get("alertpeerfloor").and_then(|v| v.parse().ok()))
             .unwrap_or_else(|| {
-                node::health::defaults::peer_floor_for(network, connect.len())
+                if automatic_outbound {
+                    node::health::defaults::peer_floor_for(network, 0)
+                } else {
+                    // A node told to dial N specific peers should alert below
+                    // N, and one told to dial none should never alert for
+                    // having none.
+                    node::health::defaults::peer_floor_for(network, named_connect_peers)
+                        .min(named_connect_peers as u64)
+                }
             });
 
         let assumevalid = cli.assumevalid.or_else(|| file_get("assumevalid"));
@@ -3246,6 +3275,7 @@ impl Config {
             asmap,
             port,
             connect,
+            automatic_outbound,
             assumevalid,
             assumevalidage,
             stopatheight,
@@ -3833,6 +3863,10 @@ impl Config {
                 "forcednsseed": self.forcednsseed,
                 "fixedseeds": self.fixedseeds,
                 "connect": self.connect,
+                // `-connect=0` clears the list, so without this an operator
+                // inspecting a deliberately isolated node sees a block
+                // identical to a default node's.
+                "automatic_outbound": self.automatic_outbound,
                 "addnode": self.addnode,
                 "seednode": self.seednode,
                 "blocksonly": self.blocksonly,
@@ -12234,5 +12268,58 @@ notarealkey=1
         ]);
         assert!(cfg.listenonion);
         assert!(!cfg.dnsseed);
+    }
+
+    /// Core's `-connect` semantics (`init.cpp`, `AppInitMain`): setting it at
+    /// all disables automatic outbound connections, and the single value `0`
+    /// additionally means "and no peers either". satd parsed that `0` as an
+    /// address and dialled `0.0.0.0:8333` at every startup.
+    ///
+    /// This is asserted here, not only in the integration test, because the
+    /// integration test's peer-id assertion is environment-dependent: satd
+    /// allocates a peer id only after a dial *succeeds*, so on a host with
+    /// nothing listening on port 8333 the phantom dial is refused, burns no
+    /// id, and the test passes with the defect present.
+    #[test]
+    fn connect_zero_means_no_peers_and_no_automatic_outbound() {
+        let cfg = parse_raw(&["satd", "-regtest", "-connect=0", "-datadir=/tmp/satd-h1-6"]);
+        assert!(cfg.connect.is_empty(), "`0` is not an address to dial: {:?}", cfg.connect);
+        assert!(!cfg.automatic_outbound, "-connect=0 must stop gossip dialling");
+
+        // Any other `-connect` keeps its peers and still disables gossip.
+        let cfg = parse_raw(&[
+            "satd",
+            "-regtest",
+            "-connect=1.2.3.4",
+            "-datadir=/tmp/satd-h1-7",
+        ]);
+        assert_eq!(cfg.connect, vec!["1.2.3.4".to_string()]);
+        assert!(!cfg.automatic_outbound);
+
+        // No `-connect` at all: the node dials what it learns, as before.
+        let cfg = parse_raw(&["satd", "-regtest", "-datadir=/tmp/satd-h1-8"]);
+        assert!(cfg.connect.is_empty());
+        assert!(cfg.automatic_outbound);
+    }
+
+    /// The `alertpeerfloor` default reads the `-connect` count. Clearing the
+    /// list for `-connect=0` before computing it moved a deliberately
+    /// isolated node's floor from 1 to the 3-peer default, so it would alert
+    /// for exactly the condition it was configured to have.
+    #[test]
+    fn connect_zero_does_not_raise_the_peer_floor() {
+        let isolated = parse_raw(&["satd", "-signet", "-connect=0", "-datadir=/tmp/satd-h1-9"]);
+        assert_eq!(isolated.alert_peer_floor, 0, "a node told to have no peers must not alert");
+
+        let pinned = parse_raw(&[
+            "satd",
+            "-signet",
+            "-connect=1.2.3.4",
+            "-datadir=/tmp/satd-h1-10",
+        ]);
+        assert_eq!(pinned.alert_peer_floor, 1, "one named peer, one expected peer");
+
+        let normal = parse_raw(&["satd", "-signet", "-datadir=/tmp/satd-h1-11"]);
+        assert_eq!(normal.alert_peer_floor, 3, "the default is unchanged");
     }
 }
