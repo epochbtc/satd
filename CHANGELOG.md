@@ -65,6 +65,28 @@ item below is (or will be) written up in full in the in-development
   reported by `getmininginfo.networkhashps` and the TUI.
 - `getblockstats`: accepts a numeric height (Core's own help example) and the
   `stats` filter, both of which were rejected outright.
+- P2P: a `block-relay-only` connection now actually withholds transaction and
+  address relay instead of only being labelled as such — satd answered
+  `getaddr`, ingested the peer's addresses, and announced its own transactions
+  over links opened to prevent exactly that. `getpeerinfo.relaytxes` reports
+  `false` for block-relay-only and feeler peers, as Core does.
+- P2P: an `addr-fetch` connection now ends when the peer answers with
+  `addrv2`, not only with the legacy `addr` — every BIP155-capable peer uses
+  the former, so the connection previously held an outbound slot for the full
+  five-minute expiry.
+- `-connect`: gossiped and `peers.dat` addresses are no longer dialled. The
+  previous gate ran where addresses were recorded, which `peers.dat` bypasses
+  by being loaded before the setting is applied.
+- `-connect=0` no longer raises the `peer_floor` alert threshold from 1 to 3,
+  and is reported as `automatic_outbound` by `getconfig`, which could not
+  otherwise tell a deliberately isolated node from a default one.
+- SIGHUP: a `connect` change now applies the gossip-dialling disposition, and
+  adding `connect=0` is no longer reported as "no changes detected".
+- P2P: the per-type outbound connection limits are enforced against dials in
+  flight, so concurrent `addconnection` calls can no longer exceed them.
+- P2P: answering `getaddr` no longer re-enters the peer-table read lock, which
+  `parking_lot` does not allow re-entrantly — a writer arriving between the two
+  acquisitions deadlocked the manager's event loop.
 
 ## Releases
 

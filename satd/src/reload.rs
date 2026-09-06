@@ -676,12 +676,31 @@ fn field_specs() -> Vec<FieldSpec> {
         // identities on one node.
         restart!("uacomment", user_agent),
         restart!("bind", binds),
-        live_delta!("connect", connect, |old, new, h| dial_added_peers(
-            &old.connect,
-            &new.connect,
-            &h.peer_manager,
-            "connect"
-        )),
+        // Not `live_delta!`: `-connect=0` -- Core's spelling for "open no
+        // outbound connections" -- resolves to an *empty* `connect` list, so
+        // diffing the vector alone cannot tell it from no `-connect` at all
+        // and a SIGHUP adding `connect=0` was reported as "no changes
+        // detected". The disposition that actually changed is
+        // `automatic_outbound`, so diff and apply that alongside the list.
+        FieldSpec {
+            key: "connect",
+            diff: |old, new| {
+                let render = |c: &Config| {
+                    format!("{:?} (automatic outbound: {})", c.connect, c.automatic_outbound)
+                };
+                let (o, n) = (render(old), render(new));
+                if o != n { Some((o, n)) } else { None }
+            },
+            apply: Some(Apply::Delta(|old, new, h| {
+                // Applying only the dial list left the manager still dialling
+                // gossiped addresses after an operator pinned the node to
+                // specific peers -- and still refusing to after they removed
+                // the pin.
+                h.peer_manager.set_automatic_outbound(new.automatic_outbound);
+                dial_added_peers(&old.connect, &new.connect, &h.peer_manager, "connect");
+            })),
+            sensitive: false,
+        },
         live_delta!("addnode", addnode, |old, new, h| dial_added_peers(
             &old.addnode,
             &new.addnode,

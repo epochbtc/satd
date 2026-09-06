@@ -14015,6 +14015,170 @@ fn addconnection_refuses_a_type_core_cannot_open() {
     );
 }
 
+/// An addr-fetch connection ends as soon as the peer answers, and the answer
+/// almost always arrives as `addrv2`.
+///
+/// satd sends `sendaddrv2` on every outbound connection, so every
+/// BIP155-capable peer -- Bitcoin Core 22 and later, and satd itself --
+/// replies to our `getaddr` with `addrv2`. Core applies the "answered, hang
+/// up" rule in the handler both messages share; satd had it on the legacy
+/// `addr` arm alone, so against any modern peer the connection never
+/// completed and held an outbound slot for the full 300s expiry.
+#[test]
+fn an_addrfetch_connection_ends_on_an_addrv2_answer() {
+    use addconn_listener::{Inbound, recv, send, wait_for_close};
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message::NetworkMessage;
+
+    let node = TestNode::start(&[]);
+    let peer = Inbound::bind();
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("addr-fetch"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "{out}");
+
+    let (mut stream, _their_version) = peer.accept_version(test_timeout(20));
+    peer.complete_handshake(&mut stream);
+
+    // An addr-fetch peer is asked for addresses, not headers.
+    let deadline = std::time::Instant::now() + test_timeout(20);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "satd never sent getaddr");
+        if matches!(recv(&mut stream), NetworkMessage::GetAddr) {
+            break;
+        }
+    }
+
+    // Answer in the modern encoding. More than one entry, because Core (and
+    // satd) require that before treating the answer as complete.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let entry = |a: [u8; 4], port: u16| AddrV2Message {
+        time: now,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(std::net::Ipv4Addr::from(a)),
+        port,
+    };
+    send(
+        &mut stream,
+        NetworkMessage::AddrV2(vec![entry([203, 0, 113, 7], 8333), entry([198, 51, 100, 9], 8333)]),
+    );
+
+    assert!(
+        wait_for_close(&mut stream, test_timeout(20)),
+        "satd must hang up once an addr-fetch peer has answered, addrv2 included"
+    );
+}
+
+/// Block-relay-only means the link carries no address traffic in either
+/// direction -- Core's `SetupAddressRelay` refuses one outright, "to prevent
+/// providing adversaries with the additional information of addr traffic to
+/// infer the link". satd reported `addr_relay_enabled: false` while answering
+/// `getaddr` over the very same connection.
+#[test]
+fn a_block_relay_only_connection_relays_no_addresses() {
+    use addconn_listener::{Inbound, recv, send};
+    use bitcoin::p2p::message::NetworkMessage;
+
+    let node = TestNode::start(&[]);
+    let peer = Inbound::bind();
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("block-relay-only"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "{out}");
+
+    let (mut stream, _v) = peer.accept_version(test_timeout(20));
+    peer.complete_handshake(&mut stream);
+    send(&mut stream, NetworkMessage::GetAddr);
+
+    // Read whatever satd has to say for a while. It may send anything else it
+    // likes; what it must never send is an address message.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recv(&mut stream)));
+        match msg {
+            Ok(NetworkMessage::Addr(a)) => {
+                panic!("block-relay-only link answered getaddr with {} addresses", a.len())
+            }
+            Ok(NetworkMessage::AddrV2(a)) => {
+                panic!("block-relay-only link answered getaddr with {} addrv2 entries", a.len())
+            }
+            // A read timeout surfaces as a panic from `read_exact`; that is
+            // the expected quiet.
+            Ok(_) | Err(_) => continue,
+        }
+    }
+
+    // And `getpeerinfo` must agree with the wire: Core builds no tx-relay
+    // state for this connection type, so it reports `relaytxes: false`
+    // whatever the peer's own `fRelay` said (this one said true).
+    let info = node.rpc_call("getpeerinfo").unwrap();
+    let p = info["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["connection_type"] == serde_json::json!("block-relay-only"))
+        .expect("the block-relay-only peer must be listed");
+    assert_eq!(p["addr_relay_enabled"], serde_json::json!(false), "{p}");
+    assert_eq!(p["relaytxes"], serde_json::json!(false), "{p}");
+}
+
+/// The regtest gate is the security property of this RPC: `addconnection`
+/// makes the node open a TCP connection to an address the caller chooses, so
+/// off regtest it must not exist at all. Nothing else asserts it, and it is
+/// exactly the kind of gate a later refactor turns into an SSRF primitive on
+/// mainnet without anyone noticing.
+///
+/// Signet is used because it needs no chain data to answer an RPC; the node is
+/// kept off the network entirely.
+#[test]
+fn addconnection_is_refused_off_regtest() {
+    let node =
+        TestNode::start_on_chain("--signet", &["--connect=0", "--dnsseed=0", "--listen=0"]);
+
+    // Sanity: this really is a signet node, not a regtest one that ignored the
+    // flag -- otherwise the assertion below would pass for the wrong reason.
+    let info = node.rpc_call("getblockchaininfo").unwrap();
+    assert_eq!(info["result"]["chain"], serde_json::json!("signet"), "{info}");
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!("127.0.0.1:1"),
+                serde_json::json!("outbound-full-relay"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap();
+    assert_eq!(out["error"]["code"], serde_json::json!(-1), "{out}");
+    assert_eq!(
+        out["error"]["message"],
+        serde_json::json!("addconnection is for regression testing (-regtest mode) only.")
+    );
+}
+
 /// Bitcoin Core spells "open no outbound connections" as `-connect=0`, and
 /// every functional test starts its node that way. satd parsed the `0` as a
 /// peer address and dialled `0.0.0.0:8333` at startup -- which burned peer id

@@ -111,8 +111,8 @@ by version order.
 
 Every reason came from running the test, not from reading it.
 
-**`addconnection` landed, and the ten rows behind it were re-measured.** Two
-passed outright (`p2p_add_connections`, `p2p_addrfetch`); the other eight each
+**`addconnection` landed, and the nine rows behind it were re-measured.** Two
+passed outright (`p2p_add_connections`, `p2p_addrfetch`); the other seven each
 carry the blocker that was actually observed once the RPC existed, and none of
 them is about `addconnection` any more.
 
@@ -150,11 +150,13 @@ target; the rest need Core-only binaries or internals.
 
 - **`-connect=0` was dialled as an address.** Core spells "open no outbound
   connections" that way and every functional-test node is started with it, so
-  satd dialled `0.0.0.0:8333` at each startup and burned peer id 0 -- the
-  first real peer then came back as id 1 where Core reports 0, which is what
-  `p2p_addrfetch` and `p2p_mutated_blocks` were failing on. `-connect` now
-  also stops the node dialling gossiped addresses, as Core's
-  `m_use_addrman_outgoing` does.
+  satd dialled `0.0.0.0:8333` at startup and kept re-dialling it from the
+  reconnect loop. Where something answers on that port -- a Bitcoin Core node
+  on the same host, as on the measuring machine -- the dial succeeds far
+  enough to consume peer id 0, and the first real peer then comes back as id 1
+  where Core reports 0. That is what `p2p_addrfetch` and `p2p_mutated_blocks`
+  were failing on. `-connect` now also stops the node dialling gossiped
+  addresses, as Core's `m_use_addrman_outgoing` does.
 - **`addconnection`.** Core's hidden regtest-only dial RPC, with the four
   connection types and the behaviour each implies: `block-relay-only` clears
   `fRelay` and gets no address relay, `feeler` is closed on the peer's

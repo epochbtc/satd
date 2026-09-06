@@ -316,7 +316,23 @@ impl PeerInfo {
     /// Defaults to `true` when no version has been received yet (such a
     /// peer is not `Connected`, so announce paths skip it anyway).
     pub fn relays_txs(&self) -> bool {
-        self.version.as_ref().map(|v| v.relay).unwrap_or(true)
+        // Both directions matter. The peer's `fRelay` says whether it wants
+        // our transactions; our own connection type says whether this link is
+        // allowed to carry any. A block-relay-only or feeler connection
+        // carries none, and reading only the remote's flag meant satd
+        // announced its own transactions over the very links opened to avoid
+        // exactly that -- Core clears `fRelay` on the way out and never
+        // announces on such a peer.
+        self.conn_type.wants_tx_relay() && self.version.as_ref().map(|v| v.relay).unwrap_or(true)
+    }
+
+    /// Whether addresses may be relayed over this connection, in either
+    /// direction (Core's `SetupAddressRelay`, `net_processing.cpp:5608`:
+    /// "We don't participate in addr relay with outbound block-relay-only
+    /// connections to prevent providing adversaries with the additional
+    /// information of addr traffic to infer the link").
+    pub fn relays_addrs(&self) -> bool {
+        self.conn_type.relays_addrs()
     }
 
     /// How this peer is named to operators -- what `getpeerinfo` reports as
@@ -400,7 +416,11 @@ impl PeerInfo {
             "addr": addr_str,
             "services": format!("{:016x}", self.services.to_u64()),
             "servicesnames": svc_names,
-            "relaytxes": self.relay_txes,
+            // Core: "Whether we relay transactions to this peer". It builds
+            // no TxRelay structure for a block-relay-only or feeler
+            // connection, so `getpeerinfo` reports false for both regardless
+            // of what the peer's own `fRelay` said.
+            "relaytxes": self.relays_txs(),
             "lastsend": stats.last_send(),
             "lastrecv": stats.last_recv(),
             "last_block": stats.last_block(),
