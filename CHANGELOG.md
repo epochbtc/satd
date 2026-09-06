@@ -31,6 +31,9 @@ item below is (or will be) written up in full in the in-development
   an argument error is no longer a Rust `Debug` dump. `submitpackage`,
   `converttopsbt` and `utxoupdatepsbt` rejected their optional arguments
   outright (#687).
+- A wrong-length hash and a right-length non-hex string report different
+  errors, as Core's `ParseHashV` does; `getblockfrompeer` names the argument
+  `blockhash`, as Core does (#692).
 
 ### Added
 

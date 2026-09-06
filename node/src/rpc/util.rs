@@ -88,8 +88,6 @@ pub fn validate_address(address: &str, network: bitcoin::Network) -> Value {
 /// Returning the length message for both tells a caller who typed a non-hex
 /// character to count their characters instead.
 ///
-/// Six other call sites still build the length message unconditionally; they
-/// should adopt this.
 pub fn parse_hash_v<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, (i32, String)> {
     if let Ok(v) = s.parse::<T>() {
         return Ok(v);

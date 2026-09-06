@@ -14319,3 +14319,48 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
         "an empty descriptor list must be accepted: {empty_descriptors}"
     );
 }
+
+/// #692: Core's `ParseHashV` reports a wrong-*length* hash as a length error
+/// and a right-length non-hex string as `must be hexadecimal string`. Six
+/// sites built the length message unconditionally, so a caller who typed a
+/// non-hex character was told to count their characters -- and
+/// `getrawtransaction` reported a fixed length of 0 whatever was passed.
+#[test]
+fn hash_arguments_separate_the_length_error_from_the_hex_error() {
+    let node = TestNode::start(&[]);
+
+    // 64 characters, none of them hex.
+    let non_hex = node
+        .rpc_call_with_params(
+            "getblockfrompeer",
+            vec![serde_json::json!("z".repeat(64)), serde_json::json!(0)],
+        )
+        .unwrap();
+    let msg = non_hex["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("must be hexadecimal string"),
+        "a 64-char non-hex string is a hex error, not a length error: {non_hex}"
+    );
+    // Core names this argument `blockhash`, not `hash`.
+    assert!(msg.starts_with("blockhash "), "must use Core's argument name: {msg}");
+
+    // Too short: still a length error, and it reports the real length.
+    let short = node
+        .rpc_call_with_params(
+            "getblockfrompeer",
+            vec![serde_json::json!("abc"), serde_json::json!(0)],
+        )
+        .unwrap();
+    let msg = short["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("must be of length 64 (not 3,"), "{short}");
+
+    // `getrawtransaction` reported "(not 0, for txid)" for every input.
+    let bad_txid = node
+        .rpc_call_with_params("getrawtransaction", vec![serde_json::json!("abc")])
+        .unwrap();
+    let msg = bad_txid["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("parameter 1 must be of length 64 (not 3,"),
+        "the length must be the caller's, not a constant: {bad_txid}"
+    );
+}

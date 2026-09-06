@@ -76,9 +76,9 @@ pub fn get_raw_transaction(
     verbosity: u32,
     blockhash: Option<&str>,
 ) -> Result<Value, (i32, String)> {
-    let txid: bitcoin::Txid = txid_str
-        .parse()
-        .map_err(|_| (-8, "parameter 1 must be of length 64 (not 0, for txid)".to_string()))?;
+    // Core: `ParseHashV(request.params[0], "parameter 1")`. The message here
+    // was a fixed string claiming a length of 0 whatever the caller passed.
+    let txid: bitcoin::Txid = crate::rpc::util::parse_hash_v(txid_str, "parameter 1")?;
 
     // Genesis-block coinbase is not reachable via getrawtransaction — Core
     // returns this error both when a blockhash is explicitly supplied and
@@ -187,19 +187,7 @@ pub fn get_raw_transaction(
 /// Validate a blockhash string for length and hex-ness, returning Core-compatible
 /// error messages ("parameter 3 must be of length 64 (not N, for 'xxx')").
 fn validate_blockhash_str(s: &str) -> Result<(), (i32, String)> {
-    if s.len() != 64 {
-        return Err((-8, format!(
-            "parameter 3 must be of length 64 (not {}, for '{s}')",
-            s.len()
-        )));
-    }
-    // Hex check: every character must be [0-9a-fA-F].
-    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err((-8, format!(
-            "parameter 3 must be hexadecimal string (not '{s}')"
-        )));
-    }
-    Ok(())
+    crate::rpc::util::parse_hash_v::<bitcoin::BlockHash>(s, "parameter 3").map(|_| ())
 }
 
 /// True when `txid` is the genesis block's coinbase.
@@ -618,15 +606,7 @@ pub fn create_raw_transaction(
         let txid_str = input["txid"]
             .as_str()
             .ok_or((-3, "JSON value of type null is not of expected type string".to_string()))?;
-        if txid_str.len() != 64 {
-            return Err((-8, format!(
-                "txid must be of length 64 (not {}, for '{txid_str}')",
-                txid_str.len()
-            )));
-        }
-        let txid: bitcoin::Txid = txid_str.parse().map_err(|_| {
-            (-8, format!("txid must be hexadecimal string (not '{txid_str}')"))
-        })?;
+        let txid: bitcoin::Txid = crate::rpc::util::parse_hash_v(txid_str, "txid")?;
 
         // Parse vout — Core says "Invalid parameter, missing vout key" for both
         // absent and non-numeric.
@@ -1272,15 +1252,7 @@ pub fn get_tx_out_proof(
     let mut parsed_txids: Vec<bitcoin::Txid> = Vec::with_capacity(txids.len());
     let mut seen = HashSet::new();
     for raw in txids {
-        if raw.len() != 64 {
-            return Err((-8, format!(
-                "txid must be of length 64 (not {}, for '{raw}')",
-                raw.len(),
-            )));
-        }
-        let txid: bitcoin::Txid = raw.parse().map_err(|_| {
-            (-8i32, format!("txid must be hexadecimal string (not '{raw}')"))
-        })?;
+        let txid: bitcoin::Txid = crate::rpc::util::parse_hash_v(raw, "txid")?;
         if !seen.insert(txid) {
             return Err((-8, "Invalid parameter, duplicated txid".into()));
         }
@@ -1289,15 +1261,7 @@ pub fn get_tx_out_proof(
 
     // Resolve the block hash.
     let block_hash: bitcoin::BlockHash = if let Some(bh) = blockhash_str {
-        if bh.len() != 64 {
-            return Err((-8, format!(
-                "blockhash must be of length 64 (not {}, for '{bh}')",
-                bh.len(),
-            )));
-        }
-        bh.parse().map_err(|_| {
-            (-8i32, format!("blockhash must be hexadecimal string (not '{bh}')"))
-        })?
+        crate::rpc::util::parse_hash_v(bh, "blockhash")?
     } else {
         // No explicit blockhash — try to find the block via txindex or UTXO.
         let mut found_hash: Option<bitcoin::BlockHash> = None;
