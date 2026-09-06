@@ -1142,13 +1142,22 @@ impl PeerManager {
     pub fn add_peer_addr(&self, addr: PeerAddr) -> bool {
         match &addr {
             PeerAddr::Socket(sa) => {
+                // Mark as manual *before* the duplicate check -- so spawn_peer
+                // tags the peer correctly, and so `may_dial` keeps letting it
+                // through. An address can already be a dial candidate by the
+                // time it is configured: `peers.dat` seeds `connect_addrs` at
+                // startup, long before `-connect` reaches the manager, and
+                // gossip adds to it continuously. Marking it only on the
+                // newly-added path left an explicitly configured peer failing
+                // `may_dial`, so under `-connect` one failed dial or
+                // disconnect stranded the node with no peers at all. The onion
+                // arm below already registers before its duplicate check.
+                self.manual_addrs.write().insert(*sa);
                 let mut addrs = self.connect_addrs.write();
                 if addrs.contains(sa) {
                     return false;
                 }
                 addrs.push(*sa);
-                // Also mark as manual so spawn_peer tags it correctly.
-                self.manual_addrs.write().insert(*sa);
                 true
             }
             PeerAddr::Onion { host, .. } => {
@@ -7763,6 +7772,34 @@ mod tests {
         assert_eq!(info.len(), 1);
         assert_eq!(info[0]["addednode"], "localhost:18444");
         assert_eq!(info[0]["connected"], false);
+    }
+
+    /// An explicitly configured peer must stay dialable under `-connect`
+    /// even when its address was already a dial candidate. `peers.dat` is
+    /// loaded into `connect_addrs` at startup, ~1400 lines before `-connect`
+    /// is applied and the configured peers are registered, so for a node
+    /// with an address book this is the *common* case, not the odd one.
+    /// Registering the manual marker only on the newly-added path left
+    /// `may_dial` refusing the one peer the operator named: the startup dial
+    /// still happened, but nothing could retry it.
+    #[test]
+    fn a_configured_peer_already_in_the_dial_pool_stays_dialable() {
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "127.0.0.1:18455".parse().unwrap();
+
+        // As the address book does at startup, before `-connect` is applied.
+        pm.add_connect_addr(addr);
+        pm.set_automatic_outbound(false);
+
+        // Then the configured `-connect=<addr>`, finding it already present.
+        assert!(
+            !pm.add_peer_addr(PeerAddr::Socket(addr)),
+            "the address was already a dial candidate"
+        );
+        assert!(
+            pm.may_dial(&addr),
+            "an explicitly configured peer must stay dialable under -connect"
+        );
     }
 
     /// A real PeerManager over a caller-supplied chain state — spawns the
