@@ -23,6 +23,16 @@ item below is (or will be) written up in full in the in-development
   `Wrong type passed:` error naming each one (#672).
 - `sat-cli -named`: an argument with no `=` was silently dropped; it is now
   sent as a positional argument in Core's reserved `args` slot (#672).
+- JSON-RPC: an error raised while reading a *later* argument no longer buries
+  an earlier argument's type mismatch, which in a debug build closed the
+  connection with no response at all (#672).
+- `getnetworkhashps`: `nblocks` and `height` are signed again, so Core's
+  documented `-1` works for both; out-of-range values now return Core's
+  errors. The estimate counts the whole window's work rather than one block's,
+  correcting a figure that was low by a factor of the window size — also
+  reported by `getmininginfo.networkhashps` and the TUI.
+- `getblockstats`: accepts a numeric height (Core's own help example) and the
+  `stats` filter, both of which were rejected outright.
 
 ## Releases
 

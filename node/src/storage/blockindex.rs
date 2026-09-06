@@ -55,6 +55,26 @@ pub fn add_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Convert CompactTarget (nBits) to a 256-bit target as big-endian [u8; 32].
+/// Big-endian 256-bit subtraction, `a - b`. Wraps on underflow, which callers
+/// avoid by construction (chainwork is monotonic along a chain).
+pub fn sub_u256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let diff = u16::from(a[i]).wrapping_sub(u16::from(b[i])).wrapping_sub(borrow);
+        out[i] = diff as u8;
+        borrow = u16::from(diff > 0xff);
+    }
+    out
+}
+
+/// Convert a big-endian 256-bit value to `f64`, as Core's
+/// `arith_uint256::getdouble` does. Precision is the `f64` mantissa's 53
+/// bits; only the ratio of two such values is ever reported.
+pub fn u256_to_f64(v: &[u8; 32]) -> f64 {
+    v.iter().fold(0.0f64, |acc, &b| acc * 256.0 + f64::from(b))
+}
+
 pub fn target_from_compact(bits: CompactTarget) -> [u8; 32] {
     let bits_u32 = bits.to_consensus();
     let exponent = (bits_u32 >> 24) as usize;

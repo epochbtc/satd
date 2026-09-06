@@ -2,7 +2,8 @@ use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
 use crate::rpc::descriptor::parse_descriptor;
-use crate::storage::blockindex::target_to_difficulty;
+use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
+use crate::validation::pow::RETARGET_INTERVAL;
 use serde_json::{json, Value};
 
 /// Handle the `submitblock` RPC call.
@@ -212,7 +213,7 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     } else {
         0.0
     };
-    let hashps = get_network_hash_ps(chain_state, None, None);
+    let hashps = get_network_hash_ps(chain_state, 120, -1).unwrap_or(0.0);
 
     let chain = match chain_state.network {
         bitcoin::Network::Regtest => "regtest",
@@ -247,49 +248,77 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
 
     out
 }
-
-/// `getnetworkhashps` — estimate network hash rate from recent blocks.
+/// `getnetworkhashps` -- estimated network hashes per second.
+///
+/// A faithful port of Core's `GetNetworkHashPS` (`src/rpc/mining.cpp`),
+/// including its argument contract: `nblocks` is the window, or `-1` for
+/// "since the last difficulty change"; `height` is the block to estimate at,
+/// or `-1` for the tip. Both are signed because both use `-1` as a
+/// meaningful value, and Core declares them `RPCArg::Type::NUM`.
+///
+/// The estimate is the *work* accumulated across the window divided by the
+/// time it spanned. satd previously divided the work of a single block by the
+/// whole window's time, understating the network hash rate by a factor of the
+/// window size -- ~120x at the default `nblocks`. `getmininginfo`, the MCP
+/// mining tool and the TUI all read this, so they were all wrong together.
+///
+/// Errors are `(code, message)` pairs carrying Core's exact strings.
 pub fn get_network_hash_ps(
     chain_state: &ChainState,
-    nblocks: Option<u32>,
-    height: Option<u32>,
-) -> f64 {
-    let tip_height = height.unwrap_or_else(|| chain_state.tip_height());
-    let window = nblocks.unwrap_or(120).min(tip_height);
-
-    if window == 0 {
-        return 0.0;
+    nblocks: i64,
+    height: i64,
+) -> Result<f64, (i32, String)> {
+    if nblocks < -1 || nblocks == 0 {
+        return Err((-8, "Invalid nblocks. Must be a positive number or -1.".to_string()));
+    }
+    let tip_height = chain_state.tip_height();
+    if height < -1 || height > i64::from(tip_height) {
+        return Err((-8, "Block does not exist at specified height".to_string()));
     }
 
-    let end_height = tip_height;
-    let start_height = end_height.saturating_sub(window);
-
-    let end_hash = match chain_state.get_block_hash_by_height(end_height) {
-        Some(h) => h,
-        None => return 0.0,
+    // Core indexes the active chain for an explicit height and takes the tip
+    // otherwise; from there it walks parent pointers, which is what the rest
+    // of this function does.
+    let at_height = if height >= 0 { height as u32 } else { tip_height };
+    let Some(hash) = chain_state.get_block_hash_by_height(at_height) else {
+        return Ok(0.0);
     };
-    let start_hash = match chain_state.get_block_hash_by_height(start_height) {
-        Some(h) => h,
-        None => return 0.0,
+    let Some(pb) = chain_state.get_block_index(&hash) else {
+        return Ok(0.0);
     };
-
-    let end_entry = match chain_state.get_block_index(&end_hash) {
-        Some(e) => e,
-        None => return 0.0,
-    };
-    let start_entry = match chain_state.get_block_index(&start_hash) {
-        Some(e) => e,
-        None => return 0.0,
-    };
-
-    let time_diff = end_entry.header.time.saturating_sub(start_entry.header.time) as f64;
-    if time_diff == 0.0 {
-        return 0.0;
+    // Genesis has no window to measure.
+    if pb.height == 0 {
+        return Ok(0.0);
     }
 
-    // Estimate: difficulty * 2^32 / time_diff
-    let difficulty = target_to_difficulty(end_entry.header.bits);
-    difficulty * 4_294_967_296.0 / time_diff
+    let mut lookup = if nblocks == -1 {
+        i64::from(pb.height % RETARGET_INTERVAL + 1)
+    } else {
+        nblocks
+    };
+    // A window longer than the chain is the whole chain.
+    lookup = lookup.min(i64::from(pb.height));
+
+    let mut pb0 = pb.clone();
+    let mut min_time = pb0.header.time;
+    let mut max_time = min_time;
+    for _ in 0..lookup {
+        let prev = pb0.header.prev_blockhash;
+        let Some(entry) = chain_state.get_block_index(&prev) else {
+            return Ok(0.0);
+        };
+        pb0 = entry;
+        min_time = min_time.min(pb0.header.time);
+        max_time = max_time.max(pb0.header.time);
+    }
+
+    // Core guards the divide-by-zero this way rather than on the endpoints.
+    if min_time == max_time {
+        return Ok(0.0);
+    }
+
+    let work = u256_to_f64(&sub_u256(&pb.chainwork, &pb0.chainwork));
+    Ok(work / f64::from(max_time - min_time))
 }
 
 /// Handle `getblocktemplate` in proposal mode (BIP 22/23).

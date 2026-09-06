@@ -5,7 +5,7 @@ use serde_json::json;
 /// Get mining info: difficulty, network hashrate, chain height.
 pub fn get_mining_info(ctx: &McpContext) -> String {
     let info = rpc::get_mining_info(&ctx.chain_state, &ctx.mempool);
-    let hashps = rpc::get_network_hash_ps(&ctx.chain_state, None, None);
+    let hashps = rpc::get_network_hash_ps(&ctx.chain_state, 120, -1).unwrap_or(0.0);
 
     let result = json!({
         "mining_info": info,

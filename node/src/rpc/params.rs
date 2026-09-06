@@ -175,11 +175,11 @@ impl Args {
             // Right JSON type, wrong domain: a negative or fractional value
             // in a `u32` slot, a bad enum string. Core answers -8 for an
             // out-of-range argument value, naming it.
-            Err(e) => Err(ErrorObjectOwned::owned(
+            Err(e) => Err(self.value_error(ErrorObjectOwned::owned(
                 -8,
                 format!("Invalid value for argument {name}: {e}"),
                 None::<()>,
-            )),
+            ))),
         }
     }
 
@@ -200,11 +200,11 @@ impl Args {
     pub(crate) fn required<T: ArgType>(&mut self, name: &str) -> Result<T, ErrorObjectOwned> {
         let v = match self.next_slot() {
             None => {
-                return Err(ErrorObjectOwned::owned(
+                return Err(self.arity_error(ErrorObjectOwned::owned(
                     -1,
                     format!("Missing required argument {name}"),
                     None::<()>,
-                ));
+                )));
             }
             // Explicit null in a required slot is a type error, not an
             // omission.
@@ -222,11 +222,11 @@ impl Args {
             return Err(self.take_mismatch_error().expect("mismatch just recorded"));
         }
         serde_json::from_value::<T>(v).map_err(|e| {
-            ErrorObjectOwned::owned(
+            self.value_error(ErrorObjectOwned::owned(
                 -8,
                 format!("Invalid value for argument {name}: {e}"),
                 None::<()>,
-            )
+            ))
         })
     }
 
@@ -240,15 +240,43 @@ impl Args {
         let Some(v) = self.next_value() else { return Ok(default) };
         match &v {
             Value::Bool(b) => Ok(u32::from(*b)),
-            Value::Number(n) => n
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>)),
+            Value::Number(n) => match n.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                Some(v) => Ok(v),
+                None => Err(self
+                    .value_error(ErrorObjectOwned::owned(-8, "Verbosity out of range", None::<()>))),
+            },
             other => {
                 self.record(name, json_type_name(other), "number");
                 Ok(default)
             }
         }
+    }
+
+    /// Return `e`, unless a type mismatch is already pending -- in which case
+    /// that is the error Core would report.
+    ///
+    /// `RPCHelpMan::Check` (`src/rpc/util.cpp`) validates *every* argument's
+    /// type before the handler body runs, so a `-8` raised while reading a
+    /// later argument can never be the error a caller sees ahead of a `-3`
+    /// for an earlier one. Routing value errors through here also keeps this
+    /// module's invariant intact: an `Args` that returns an error has always
+    /// either reported what it recorded or deliberately superseded it, so
+    /// `Drop`'s check stays meaningful instead of firing on a live path.
+    fn value_error(&mut self, e: ErrorObjectOwned) -> ErrorObjectOwned {
+        self.checked = true;
+        self.take_mismatch_error().unwrap_or(e)
+    }
+
+    /// Return `e`, discarding any pending type mismatch.
+    ///
+    /// Core checks arity first (`IsValidNumArgs` precedes the `MatchesType`
+    /// loop) and throws the help text without ever reaching the type check,
+    /// so a missing required argument outranks a mismatch rather than
+    /// deferring to it.
+    fn arity_error(&mut self, e: ErrorObjectOwned) -> ErrorObjectOwned {
+        self.checked = true;
+        self.mismatches.clear();
+        e
     }
 
     fn take_mismatch_error(&mut self) -> Option<ErrorObjectOwned> {
@@ -467,5 +495,67 @@ mod tests {
         assert_eq!(a.raw("maxfeerate").unwrap(), Some(Value::String("0.001".into())));
         assert_eq!(a.raw("maxburnamount").unwrap(), Some(Value::from(1)));
         a.check().unwrap();
+    }
+
+    /// A recorded mismatch must survive an error raised while reading a
+    /// *later* argument.
+    ///
+    /// Every `Err` return used to leave `check()` uncalled, so the mismatch
+    /// was never reported: in a debug build `Drop`'s assertion fired and the
+    /// caller's connection died with no response at all, and in a release
+    /// build the `-3` was silently discarded and the caller was told only
+    /// about the second argument -- #672's own failure mode, one argument
+    /// along. Core reports the type mismatch, because `RPCHelpMan::Check`
+    /// validates every argument's type before the handler body runs.
+    #[test]
+    fn a_pending_mismatch_outranks_a_later_value_error() {
+        // Position 1 is mistyped; position 2 is the right JSON type but out
+        // of the slot's domain (negative in a `u32`).
+        let p = params(r#"["a",-1]"#);
+        let mut a = Args::new(&p);
+        assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
+        let err = a.optional::<u32>("height").unwrap_err();
+        assert_eq!(err.code(), -3, "the earlier mismatch is the error Core reports");
+        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        // Reported, so dropping the `Args` is not a violation.
+        drop(a);
+    }
+
+    /// The same, for the domain error a *required* slot raises.
+    #[test]
+    fn a_pending_mismatch_outranks_a_required_slots_value_error() {
+        let p = params(r#"[true,-1]"#);
+        let mut a = Args::new(&p);
+        assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
+        let err = a.required::<u32>("height").unwrap_err();
+        assert_eq!(err.code(), -3);
+        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        drop(a);
+    }
+
+    /// Arity outranks type: Core's `IsValidNumArgs` throws before the
+    /// `MatchesType` loop is ever reached, so a missing required argument
+    /// supersedes a mismatch rather than deferring to it.
+    #[test]
+    fn a_missing_required_argument_outranks_a_pending_mismatch() {
+        let p = params(r#"["a"]"#);
+        let mut a = Args::new(&p);
+        assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
+        let err = a.required::<String>("blockhash").unwrap_err();
+        assert_eq!(err.code(), -1);
+        assert!(err.message().contains("Missing required argument blockhash"));
+        drop(a);
+    }
+
+    /// `verbosity`'s range error is a value error like any other.
+    #[test]
+    fn a_pending_mismatch_outranks_a_verbosity_range_error() {
+        let p = params(r#"["a",-5]"#);
+        let mut a = Args::new(&p);
+        assert_eq!(a.optional::<u32>("nblocks").unwrap(), None);
+        let err = a.verbosity("verbosity", 1).unwrap_err();
+        assert_eq!(err.code(), -3);
+        assert!(err.message().contains("Position 1 (nblocks)"), "{}", err.message());
+        drop(a);
     }
 }

@@ -663,11 +663,53 @@ pub async fn start(
     })?;
 
     module.register_method("getblockstats", |params, ctx, _extensions| {
-        let hash_or_height: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        blockchain::get_block_stats(&ctx.chain_state, &hash_or_height)
-            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))
+        // Core declares `hash_or_height` with `skip_type_check` and a
+        // `type_str` of "string or numeric" -- `getblockstats 1000` is its own
+        // help example. Reading it through `Params::one::<String>()` rejected
+        // the numeric form outright, and, being a fixed-length array, rejected
+        // the `stats` filter with it.
+        let mut args = Args::new(&params);
+        let hash_or_height = match args.raw("hash_or_height")? {
+            Some(serde_json::Value::String(s)) => s,
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(other) => {
+                return Err(ErrorObjectOwned::owned(
+                    -1,
+                    format!(
+                        "JSON value of type {} for field hash_or_height is not of expected type string or numeric",
+                        crate::rpc::params::json_type_name(&other)
+                    ),
+                    None::<()>,
+                ));
+            }
+            None => {
+                return Err(ErrorObjectOwned::owned(
+                    -1,
+                    "Missing required argument hash_or_height",
+                    None::<()>,
+                ));
+            }
+        };
+        let stats: Option<Vec<String>> = args.optional("stats")?;
+        args.check()?;
+
+        let all = blockchain::get_block_stats(&ctx.chain_state, &hash_or_height)
+            .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))?;
+        // Core returns only the selected statistics, and names an unknown one
+        // rather than quietly omitting it.
+        let Some(stats) = stats else { return Ok(all) };
+        let mut out = serde_json::Map::new();
+        for stat in stats {
+            let Some(v) = all.get(&stat) else {
+                return Err(ErrorObjectOwned::owned(
+                    -8,
+                    format!("Invalid selected statistic '{stat}'"),
+                    None::<()>,
+                ));
+            };
+            out.insert(stat, v.clone());
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(out))
     })?;
 
     module.register_method("getchaintips", |_params, ctx, _extensions| {
@@ -1211,15 +1253,17 @@ pub async fn start(
     })?;
 
     module.register_method("getnetworkhashps", |params, ctx, _extensions| {
+        // Core declares both arguments `NUM` and gives `height` a default of
+        // -1: `-1` means "the tip" for `height` and "since the last
+        // difficulty change" for `nblocks`, so neither can be read as an
+        // unsigned type without rejecting a documented value.
         let mut args = Args::new(&params);
-        let nblocks: Option<u32> = args.optional("nblocks")?;
-        let height: Option<u32> = args.optional("height")?;
+        let nblocks: i64 = args.optional_or("nblocks", 120)?;
+        let height: i64 = args.optional_or("height", -1)?;
         args.check()?;
-        Ok::<_, ErrorObjectOwned>(serde_json::json!(mining::get_network_hash_ps(
-            &ctx.chain_state,
-            nblocks,
-            height,
-        )))
+        mining::get_network_hash_ps(&ctx.chain_state, nblocks, height)
+            .map(|hps| serde_json::json!(hps))
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("submitheader", |params, ctx, _extensions| {
