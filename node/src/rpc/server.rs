@@ -696,8 +696,12 @@ pub async fn start(
         let all = blockchain::get_block_stats(&ctx.chain_state, &hash_or_height)
             .map_err(|e| ErrorObjectOwned::owned(-5, e, None::<()>))?;
         // Core returns only the selected statistics, and names an unknown one
-        // rather than quietly omitting it.
-        let Some(stats) = stats else { return Ok(all) };
+        // rather than quietly omitting it. An *empty* selection is not "no
+        // statistics" but the default: Core computes `do_all = stats.size()
+        // == 0` (`rpc/blockchain.cpp`) and returns everything. A client
+        // passing its own empty default filter otherwise got `{}` back and
+        // silently lost the whole result.
+        let Some(stats) = stats.filter(|s| !s.is_empty()) else { return Ok(all) };
         let mut out = serde_json::Map::new();
         for stat in stats {
             let Some(v) = all.get(&stat) else {

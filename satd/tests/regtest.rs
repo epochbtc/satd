@@ -13382,6 +13382,21 @@ fn getblockstats_takes_a_height_and_a_stats_filter_like_core() {
     assert_eq!(obj.len(), 2, "only the selected statistics: {filtered}");
     assert!(obj.contains_key("height") && obj.contains_key("total_size"));
 
+    // An *empty* filter is the default, not an empty selection: Core
+    // computes `do_all = stats.size() == 0` and returns everything. A client
+    // passing its own empty default filter must not silently lose the result.
+    let empty_filter = node
+        .rpc_call_with_params(
+            "getblockstats",
+            vec![serde_json::json!(3), serde_json::json!([])],
+        )
+        .unwrap();
+    assert!(empty_filter["error"].is_null(), "{empty_filter}");
+    assert_eq!(
+        empty_filter["result"], by_height["result"],
+        "an empty filter must return every statistic, as it does in Core"
+    );
+
     // An unknown statistic is named, not quietly dropped.
     let bad = node
         .rpc_call_with_params(
