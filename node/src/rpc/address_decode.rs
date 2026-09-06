@@ -196,10 +196,22 @@ fn check_characters(s: &str) -> Vec<usize> {
 /// character indices most likely to be wrong.
 pub fn locate_errors(s: &str) -> (String, Vec<usize>) {
     if s.len() > CHAR_LIMIT {
-        return (
-            "Bech32 string too long".to_string(),
-            (CHAR_LIMIT..s.len()).collect(),
-        );
+        // Core builds one index per character past the limit (`bech32.cpp`:
+        // `resize` then `iota`) with no upper bound, and satd, like Core,
+        // reaches this for any string carrying the network's HRP. At the
+        // 20 MiB body limit that turns one request into ~160 MB of indices
+        // and several hundred MB of serialized array -- per concurrent
+        // caller, on a read-only method.
+        //
+        // The locations are a diagnostic pointing at what to fix, and this
+        // message already says the entire tail is the problem, so cap the
+        // list. The bound is far past any string a person could have meant
+        // as an address -- Core's own functional-test vector for this case
+        // is 108 characters, and a valid address is at most 90 -- so the
+        // reported positions stay identical to Core's in practice.
+        const MAX_TOO_LONG_LOCATIONS: usize = 256;
+        let end = s.len().min(CHAR_LIMIT + MAX_TOO_LONG_LOCATIONS);
+        return ("Bech32 string too long".to_string(), (CHAR_LIMIT..end).collect());
     }
     let bad = check_characters(s);
     if !bad.is_empty() {
@@ -640,6 +652,24 @@ mod tests {
             assert_eq!(&msg, want_msg, "message for {addr}");
             assert_eq!(pos, want_pos.to_vec(), "locations for {addr}");
         }
+    }
+
+    /// An over-long Bech32 argument must not turn a bounded request into an
+    /// unbounded response. Core builds one index per character past the
+    /// limit; at satd's 20 MiB body limit that is ~160 MB of indices and
+    /// several hundred MB of JSON, per concurrent caller.
+    #[test]
+    fn an_over_long_bech32_string_does_not_expand_into_unbounded_locations() {
+        let s = format!("bc1{}", "q".repeat(200_000));
+        let (msg, locations) = locate_errors(&s);
+        assert_eq!(msg, "Bech32 string too long");
+        assert!(
+            locations.len() <= 256,
+            "the location list must stay bounded, got {}",
+            locations.len()
+        );
+        // Still points at the first offending character, as Core does.
+        assert_eq!(locations.first(), Some(&CHAR_LIMIT));
     }
 
     /// A well-formed address has no errors to locate.
