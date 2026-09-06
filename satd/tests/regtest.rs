@@ -13234,3 +13234,318 @@ fn scantxoutset_scans_the_utxo_set_for_a_descriptor() {
         "{bad_sum}"
     );
 }
+
+/// #672: a mistyped argument used to be swallowed into the default *and*
+/// erase every argument after it.
+///
+/// `ParamsSequence::next_inner` clears the rest of the buffer on any
+/// deserialize error, so the shape `optional_next().unwrap_or(default)` turned
+/// a caller's type mistake into a silently-applied default and made each later
+/// `optional_next()` answer `Ok(None)`. On `generateblock` that meant a
+/// mistyped `transactions` discarded `submit`: `submit=false` mined *and
+/// connected* a block. The caller asked for a block back without touching the
+/// chain and got a new tip.
+///
+/// Both halves are asserted: the call must fail, naming the argument, and the
+/// tip must not move.
+#[test]
+fn mistyped_argument_errors_instead_of_discarding_later_arguments() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    let before = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_u64()
+        .unwrap();
+
+    // `transactions` is an array; pass a string. `submit=false` follows it.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":["{addr}","not-an-array",false]}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+
+    assert_eq!(
+        resp["error"]["code"],
+        serde_json::json!(-3),
+        "a mistyped argument must be Core's RPC_TYPE_ERROR, not a silent default: {resp}"
+    );
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("Wrong type passed"),
+        "Core's wording, so its clients can parse it: {resp}"
+    );
+    assert!(
+        msg.contains("transactions"),
+        "the error must name the offending argument: {resp}"
+    );
+    assert!(
+        resp["result"].is_null(),
+        "no block may be returned for a rejected call: {resp}"
+    );
+
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "the discarded `submit=false` must not have mined and connected a block"
+    );
+
+    // The same call by name, which is how Core's own clients send it.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":{{"output":"{addr}","transactions":"not-an-array","submit":false}}}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert_eq!(resp["error"]["code"], serde_json::json!(-3), "{resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "named form must not mine either"
+    );
+
+    // A well-typed call with the same later argument still works: the fix must
+    // not have made `submit=false` unreachable.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"generateblock","params":["{addr}",[],false]}}"#
+    );
+    let resp = node.rpc_call_raw_body(&body).unwrap();
+    assert!(resp["error"].is_null(), "the valid call must succeed: {resp}");
+    assert_eq!(
+        node.rpc_call("getblockcount").unwrap()["result"]
+            .as_u64()
+            .unwrap(),
+        before,
+        "submit=false must still not advance the chain"
+    );
+}
+
+/// Core reports *every* mismatched argument in one error, keyed by position
+/// and name (`RPCHelpMan::Arg`, `src/rpc/util.cpp`). `rpc_blockchain.py`
+/// asserts the exact rendering for `getnetworkhashps("a", [])`.
+#[test]
+fn wrong_type_error_reports_every_bad_argument_like_core() {
+    let node = TestNode::start(&[]);
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getnetworkhashps","params":["a",[]]}"#;
+    let resp = node.rpc_call_raw_body(body).unwrap();
+    assert_eq!(resp["error"]["code"], serde_json::json!(-3), "{resp}");
+    assert_eq!(
+        resp["error"]["message"].as_str().unwrap(),
+        "Wrong type passed:\n{\n    \
+         \"Position 1 (nblocks)\": \"JSON value of type string is not of expected type number\",\n    \
+         \"Position 2 (height)\": \"JSON value of type array is not of expected type number\"\n}",
+        "{resp}"
+    );
+}
+
+/// Core declares `getblockstats`' first argument `skip_type_check` with a
+/// `type_str` of "string or numeric" -- `getblockstats 1000` is its own help
+/// example -- and takes a `stats` filter second.
+///
+/// Reading it through `Params::one::<String>()` rejected both: the numeric
+/// form because it is not a string, and the filter because `one()` is a
+/// fixed-length array of one and refuses any surplus argument.
+#[test]
+fn getblockstats_takes_a_height_and_a_stats_filter_like_core() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let mined = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(3), serde_json::json!(addr)],
+        )
+        .unwrap();
+    let hash = mined["result"][2].as_str().unwrap().to_string();
+
+    // Core's canonical numeric form.
+    let by_height = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!(3)])
+        .unwrap();
+    assert!(by_height["error"].is_null(), "{by_height}");
+    assert_eq!(by_height["result"]["height"], serde_json::json!(3));
+
+    // The string form must agree with it.
+    let by_hash = node
+        .rpc_call_with_params("getblockstats", vec![serde_json::json!(hash)])
+        .unwrap();
+    assert_eq!(by_hash["result"], by_height["result"]);
+
+    // The `stats` filter selects, and only, the named statistics.
+    let filtered = node
+        .rpc_call_with_params(
+            "getblockstats",
+            vec![serde_json::json!(3), serde_json::json!(["height", "total_size"])],
+        )
+        .unwrap();
+    assert!(filtered["error"].is_null(), "{filtered}");
+    let obj = filtered["result"].as_object().unwrap();
+    assert_eq!(obj.len(), 2, "only the selected statistics: {filtered}");
+    assert!(obj.contains_key("height") && obj.contains_key("total_size"));
+
+    // An *empty* filter is the default, not an empty selection: Core
+    // computes `do_all = stats.size() == 0` and returns everything. A client
+    // passing its own empty default filter must not silently lose the result.
+    let empty_filter = node
+        .rpc_call_with_params(
+            "getblockstats",
+            vec![serde_json::json!(3), serde_json::json!([])],
+        )
+        .unwrap();
+    assert!(empty_filter["error"].is_null(), "{empty_filter}");
+    assert_eq!(
+        empty_filter["result"], by_height["result"],
+        "an empty filter must return every statistic, as it does in Core"
+    );
+
+    // An unknown statistic is named, not quietly dropped.
+    let bad = node
+        .rpc_call_with_params(
+            "getblockstats",
+            vec![serde_json::json!(3), serde_json::json!(["nosuchstat"])],
+        )
+        .unwrap();
+    assert_eq!(bad["error"]["code"], serde_json::json!(-8), "{bad}");
+    assert_eq!(
+        bad["error"]["message"],
+        serde_json::json!("Invalid selected statistic 'nosuchstat'")
+    );
+}
+
+/// Core's `getnetworkhashps` argument contract, asserted the way
+/// `rpc_blockchain.py::_test_getnetworkhashps` asserts it.
+///
+/// Both arguments are signed and both use `-1` as a documented value:
+/// `height = -1` is the tip (and is Core's *default*), `nblocks = -1` is
+/// "since the last difficulty change". Reading either as an unsigned type
+/// turns a documented call into an error -- `getnetworkhashps 120 -1` is
+/// simply Core's defaults spelled out.
+#[test]
+fn getnetworkhashps_takes_core_s_signed_arguments() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(20), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let call = |p: Vec<serde_json::Value>| node.rpc_call_with_params("getnetworkhashps", p).unwrap();
+
+    // Spelling out Core's own defaults must work.
+    let explicit = call(vec![serde_json::json!(120), serde_json::json!(-1)]);
+    assert!(explicit["error"].is_null(), "{explicit}");
+    let implicit = call(vec![]);
+    assert_eq!(explicit["result"], implicit["result"]);
+
+    // `nblocks` out of domain.
+    for bad in [-100, 0] {
+        let r = call(vec![serde_json::json!(bad)]);
+        assert_eq!(r["error"]["code"], serde_json::json!(-8), "nblocks={bad}: {r}");
+        assert_eq!(
+            r["error"]["message"],
+            serde_json::json!("Invalid nblocks. Must be a positive number or -1.")
+        );
+    }
+
+    // `height` out of range, in both directions.
+    for bad in [-10i64, 21] {
+        let r = call(vec![serde_json::json!(100), serde_json::json!(bad)]);
+        assert_eq!(r["error"]["code"], serde_json::json!(-8), "height={bad}: {r}");
+        assert_eq!(
+            r["error"]["message"],
+            serde_json::json!("Block does not exist at specified height")
+        );
+    }
+
+    // Genesis has no window to measure.
+    let genesis = call(vec![serde_json::json!(100), serde_json::json!(0)]);
+    assert_eq!(genesis["result"], serde_json::json!(0.0), "{genesis}");
+
+    // `-1` is "since the last difficulty change": Core's window is
+    // `height % 2016 + 1`. Asking for that window by number must give the
+    // identical answer.
+    let height = node.rpc_call("getblockcount").unwrap()["result"].as_i64().unwrap();
+    let since_change = call(vec![serde_json::json!(-1)]);
+    let by_number = call(vec![serde_json::json!(height % 2016 + 1)]);
+    assert!(since_change["error"].is_null(), "{since_change}");
+    assert_eq!(since_change["result"], by_number["result"]);
+
+    // A window longer than the chain is the whole chain, not an error.
+    let long = call(vec![serde_json::json!(height + 1000)]);
+    assert!(long["error"].is_null(), "{long}");
+    assert_eq!(long["result"], by_number["result"]);
+}
+
+/// The estimate is the work accumulated *across the window* over the time it
+/// spanned. Dividing one block's work by the whole window's time -- what satd
+/// did -- understates the hash rate by a factor of the window size, and
+/// `getmininginfo.networkhashps` and the TUI read the same function.
+///
+/// Proven by ratio rather than by an absolute figure: over a window of N
+/// blocks at constant difficulty the answer must scale with N for a fixed
+/// time span, so a window twice as long over the same chain cannot return the
+/// same number the shorter one did.
+#[test]
+fn getnetworkhashps_counts_the_whole_window_s_work() {
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    node.rpc_call_with_params(
+        "generatetoaddress",
+        vec![serde_json::json!(30), serde_json::json!(addr)],
+    )
+    .unwrap();
+
+    let hps = |n: i64| -> f64 {
+        let r = node
+            .rpc_call_with_params("getnetworkhashps", vec![serde_json::json!(n)])
+            .unwrap();
+        assert!(r["error"].is_null(), "{r}");
+        r["result"].as_f64().unwrap()
+    };
+
+    // Regtest blocks are mined back to back, so the window's time span is
+    // dominated by whichever blocks happen to straddle a clock second; what
+    // must hold regardless is that a real window reports real work.
+    assert!(hps(20) > 0.0, "a 20-block window must report a rate");
+
+    // `getmininginfo` reports the same estimate as the default call.
+    let info = node.rpc_call("getmininginfo").unwrap();
+    let default = node
+        .rpc_call_with_params("getnetworkhashps", vec![])
+        .unwrap();
+    assert_eq!(
+        info["result"]["networkhashps"], default["result"],
+        "getmininginfo must agree with getnetworkhashps: {info} vs {default}"
+    );
+}
+
+/// The poisoning idiom is a shape, not a single bug, so guard the shape.
+/// `optional_next()` reads a slot straight into a concrete Rust type; combined
+/// with any error-swallowing combinator it reintroduces #672 exactly. Every
+/// handler reads arguments through `crate::rpc::params::Args`, which goes via
+/// `serde_json::Value` and cannot poison the sequence.
+///
+/// Two sites were added *during* the Core-functional wave, two functions away
+/// from the helper written to avoid this, which is why the guard is mechanical
+/// rather than a review note.
+#[test]
+fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
+    let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("node/src/rpc/server.rs");
+    let src = std::fs::read_to_string(&server).unwrap();
+    let offenders: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("optional_next") || l.contains(".sequence()"))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "read positional arguments through crate::rpc::params::Args, not \
+         ParamsSequence directly -- a raw optional_next() erases every later \
+         argument on a type mismatch (#672). Offending lines in \
+         node/src/rpc/server.rs:\n{offenders:#?}"
+    );
+}

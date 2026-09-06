@@ -12,7 +12,10 @@ const REGTEST_POWLIMIT_BITS: u32 = 0x207fffff;
 /// Testnet minimum difficulty target (same as mainnet).
 const TESTNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
 /// Number of blocks between difficulty retargets.
-const RETARGET_INTERVAL: u32 = 2016;
+/// Bitcoin's difficulty adjustment interval, in blocks (Core's
+/// `Consensus::Params::DifficultyAdjustmentInterval()`). The same on every
+/// network satd supports.
+pub const RETARGET_INTERVAL: u32 = 2016;
 /// Target time span for one retarget period (14 days in seconds).
 const TARGET_TIMESPAN: u32 = 14 * 24 * 60 * 60;
 /// Testnet: allow minimum difficulty if block is >20 minutes after previous.
