@@ -119,8 +119,12 @@ is never a near-pass, removing the stated blocker only exposes the next one.
 Every one of those rows now carries the blocker that was actually observed, so
 the table below and the inventory agree with the machine.
 
-Ranked by executions blocked. This is a map of the framework's demands, not a
-priority order.
+Ranked by executions blocked, except the catch-all row, which is last whatever
+its size. This is a map of the framework's demands, not a priority order.
+
+The rows do not sum to the 73 executions above: five rows credited to
+`addconnection` were not re-run in that batch, and the counts here are per
+blocker rather than per re-measured row.
 
 | Execs | Blocker |
 |---:|---|

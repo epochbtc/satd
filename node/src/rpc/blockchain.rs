@@ -177,9 +177,7 @@ pub fn get_deployment_info(
     let (hash, height) = match blockhash {
         None => chain_state.tip_snapshot(),
         Some(s) => {
-            let parsed: BlockHash = s
-                .parse()
-                .map_err(|_| (-8, format!("blockhash must be of length 64 (not {}, for '{s}')", s.len())))?;
+            let parsed: BlockHash = crate::rpc::util::parse_hash_v(s, "blockhash")?;
             let entry = chain_state
                 .get_block_index(&parsed)
                 .ok_or_else(|| (-5, "Block not found".to_string()))?;

@@ -20,6 +20,10 @@ item below is (or will be) written up in full in the in-development
 - **Breaking:** `getdeploymentinfo` reports the buried deployments under
   Bitcoin Core's names — `dersig` is now `bip66` and `cltv` is now `bip65`
   (#666). It also honours the `blockhash` argument instead of ignoring it.
+- **Breaking:** `validateaddress` describes a destination as Bitcoin Core
+  does. `witness_version` and `witness_program` are omitted for a non-witness
+  address instead of reporting `witness_version: -1`; `isscript` is now true
+  for Taproot and anchor outputs and absent for an unknown witness version.
 
 ### Added
 
@@ -33,6 +37,8 @@ item below is (or will be) written up in full in the in-development
 
 - `validateaddress` reported an address from another network as valid — it
   never checked the network at all.
+- `getdeploymentinfo`: a 64-character `blockhash` that is not hexadecimal
+  reported a length error; it now reports a hex error, as Core does.
 
 - JSON-RPC: a mistyped argument no longer discards every argument after it.
   `generateblock` with a bad `transactions` silently ignored `submit=false`

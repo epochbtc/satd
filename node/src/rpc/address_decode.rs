@@ -438,10 +438,39 @@ fn convert_bits_5_to_8(data: &[u8]) -> Option<Vec<u8>> {
 /// `assume_checked()`, so it reported a mainnet address as valid on regtest.
 pub fn decode_destination(s: &str, network: Network) -> Decoded {
     let hrp = bech32_hrp(network);
-    let is_bech32 = s.len() >= hrp.len() && s[..hrp.len()].eq_ignore_ascii_case(hrp);
+    // Compare bytes, not a `&str` slice: `s[..hrp.len()]` panics when the HRP
+    // length lands inside a multi-byte character, and this string comes
+    // straight from an RPC argument. Core's `str.substr(0, hrp.size())`
+    // (`key_io.cpp`) is byte-based and cannot throw.
+    let is_bech32 = s
+        .as_bytes()
+        .get(..hrp.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(hrp.as_bytes()));
     let (pubkey_prefix, script_prefix) = base58_prefixes(network);
 
     if !is_bech32 {
+        // Core's `DecodeBase58` carries its length cap *inside* the character
+        // loop (`base58.cpp`, `if (length + zeroes > max_ret_len) return
+        // false`), so it abandons an over-long string after a bounded amount
+        // of work. `rust-bitcoin`'s `base58::decode` has no such cap and is
+        // quadratic in the input length, so without one here a single RPC
+        // argument -- the body limit allows ~20 million characters -- pins a
+        // runtime worker for days, and the work is not cancellable when the
+        // caller gives up.
+        //
+        // The largest cap Core uses on this path is 100 decoded bytes, which
+        // needs at most ceil(100 * 8 / log2(58)) = 137 Base58 characters, so
+        // anything longer cannot decode within Core's limit whatever it
+        // contains. Core answers such a string with the encoding error below,
+        // making this short-circuit behaviourally identical to it.
+        const MAX_BASE58_LEN: usize = 140;
+        if s.len() > MAX_BASE58_LEN {
+            return Decoded::Invalid {
+                error: "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string(),
+                locations: Vec::new(),
+            };
+        }
+
         // Core calls `DecodeBase58Check(str, data, 21)`: the *decoded payload*
         // is capped at 21 bytes, and exceeding it is a decode failure, not a
         // long address. `rust-bitcoin` has no such cap, so apply it here --
@@ -728,5 +757,48 @@ mod tests {
                 "{addr} must validate on regtest"
             );
         }
+    }
+
+    /// A `&str` cannot be sliced at an arbitrary byte offset. The HRP-prefix
+    /// test used to do exactly that, so any argument whose first character
+    /// was multi-byte panicked the RPC worker and closed the caller's
+    /// connection with no response. Core's equivalent is a byte compare and
+    /// cannot throw.
+    #[test]
+    fn a_multibyte_first_character_does_not_panic() {
+        for network in [Network::Bitcoin, Network::Regtest, Network::Testnet, Network::Signet] {
+            for s in ["\u{20ac}", "bcr\u{20ac}xxxx", "\u{20ac}\u{20ac}", "b\u{20ac}", "\u{1f600}1qqqq"] {
+                // The value does not matter; not panicking does.
+                let _ = decode_destination(s, network);
+            }
+        }
+    }
+
+    /// `rust-bitcoin`'s Base58 decode is quadratic in the input length and has
+    /// no cap; Core's carries one inside the character loop, so it abandons an
+    /// over-long string after bounded work. Without a cap here a single RPC
+    /// argument pins a runtime worker for days.
+    ///
+    /// Core answers such a string with the encoding error, so the cap is
+    /// behaviourally invisible -- only the time is different.
+    #[test]
+    fn an_over_long_base58_string_is_refused_without_decoding_it() {
+        let huge = "1".repeat(400_000);
+        let started = std::time::Instant::now();
+        let decoded = decode_destination(&huge, Network::Bitcoin);
+        let elapsed = started.elapsed();
+        match decoded {
+            Decoded::Invalid { error, .. } => assert_eq!(
+                error,
+                "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+                "must be Core's message for an undecodable string"
+            ),
+            Decoded::Valid(_) => panic!("400k ones is not an address"),
+        }
+        // Uncapped this takes minutes; capped it is a length comparison.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "decoding was not short-circuited: took {elapsed:?}"
+        );
     }
 }
