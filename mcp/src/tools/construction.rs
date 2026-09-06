@@ -119,7 +119,13 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .get("hex_tx")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            psbt::convert_to_psbt(hex_tx)
+            // Core's `permitsigdata` default: refuse rather than silently
+            // discard a transaction's signatures during the conversion.
+            let permit_sigdata = params
+                .get("permit_sigdata")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            psbt::convert_to_psbt(hex_tx, permit_sigdata)
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "join" => {

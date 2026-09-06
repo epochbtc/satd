@@ -514,6 +514,20 @@ silently returning an empty or wrong answer.
   error), and `txoutset_hash` is satd's own UTXO-set digest, not Core's
   `hash_serialized_3` — do not compare the two across implementations.
 
+- **Optional RPC arguments satd does not yet act on** — accepted as arguments
+  (a Core-shaped call is not a parse error) but refused by name when a value
+  is supplied, rather than accepted and ignored:
+
+  | Method | Argument | Why it is refused |
+  |---|---|---|
+  | `submitpackage` | `maxfeerate`, `maxburnamount` | not applied to a package; `sendrawtransaction` does enforce both |
+  | `utxoupdatepsbt` | `descriptors` | satd fills in UTXOs only; an empty list is a faithful no-op and is accepted |
+  | `converttopsbt` | `iswitness` | satd's decoder auto-detects, which is Core's behaviour when the argument is omitted |
+
+  A fee or burn limit is the caller's own safety check, so silently accepting
+  one that is never enforced is the failure mode worth avoiding: the caller
+  would get no protection and no warning.
+
 ---
 
 ## Behavioral defaults that intentionally differ
