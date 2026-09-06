@@ -15,7 +15,30 @@ Bound for **0.5.2**, a patch release on the 0.5.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.5.2-pre.md`](docs/release-notes/0.5.2-pre.md).
 
+### Changed
+
+- **Breaking:** `getdeploymentinfo` reports the buried deployments under
+  Bitcoin Core's names — `dersig` is now `bip66` and `cltv` is now `bip65`
+  (#666). It also honours the `blockhash` argument instead of ignoring it.
+- **Breaking:** `validateaddress` describes a destination as Bitcoin Core
+  does. `witness_version` and `witness_program` are omitted for a non-witness
+  address instead of reporting `witness_version: -1`; `isscript` is now true
+  for Taproot and anchor outputs and absent for an unknown witness version.
+
+### Added
+
+- `validateaddress` reports *why* an address is invalid: Core's `error`
+  string plus `error_locations` for a Bech32 checksum failure.
+- `dumptxoutset` accepts Core's `type` argument (every Core-shaped call was
+  previously a parse error), and resolves a relative `path` against the
+  network data directory as Core does rather than the working directory.
+
 ### Fixed
+
+- `validateaddress` reported an address from another network as valid — it
+  never checked the network at all.
+- `getdeploymentinfo`: a 64-character `blockhash` that is not hexadecimal
+  reported a length error; it now reports a hex error, as Core does.
 
 - JSON-RPC: a mistyped argument no longer discards every argument after it.
   `generateblock` with a bad `transactions` silently ignored `submit=false`
@@ -48,4 +71,4 @@ item below is (or will be) written up in full in the in-development
 | [0.2.0](docs/release-notes/0.2.0.md) | 2026-05-27 | BIP 324 v2 transport, native TLS, client-side PSBT signing, Core CLI/config-compat gap closed, AssumeUTXO fast-start. **Breaking storage cleanup** — see notes. |
 | [0.1.0](docs/release-notes/0.1.0.md) | 2026-05-08 | First public release: mainnet-validated node, native Esplora/Electrum/cfilters, Core-compatible RPC/CLI, signed reproducible builds. |
 
-[Unreleased]: https://github.com/epochbtc/satd/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/epochbtc/satd/compare/v0.5.1...HEAD

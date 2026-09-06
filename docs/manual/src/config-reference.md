@@ -235,7 +235,7 @@ startup error.
 | `assumevalidage` | 86400 | restart | satd | With `assumevalid=all`, still verify scripts for blocks newer than SECS. |
 | `checkpoints` | on | restart | core | Enforce the built-in block checkpoints. `-checkpoints=0` disables checkpoint validation. |
 | `stopatheight` | none | restart | core | Stop once the active-chain tip reaches HEIGHT. |
-| `testactivationheight` | none | restart | core | Regtest only (warned and ignored elsewhere): `name@height` buried-deployment override (`bip34`\|`dersig`\|`cltv`\|`csv`\|`segwit`), repeatable; command-line and config-file occurrences merge, last wins per name. |
+| `testactivationheight` | none | restart | core | Regtest only (warned and ignored elsewhere): `name@height` buried-deployment override (`bip34`\|`dersig`\|`cltv`\|`csv`\|`segwit`), repeatable. Note Core's own asymmetry, which satd matches: this option takes `dersig`/`cltv`, while `getdeploymentinfo` *reports* the same deployments as `bip66`/`bip65`; command-line and config-file occurrences merge, last wins per name. |
 | `consensus` | rust-shadow | restart | satd | Consensus engine: `cpp`\|`rust`\|`rust-shadow`\|`cpp-shadow`. |
 
 ## Indexing

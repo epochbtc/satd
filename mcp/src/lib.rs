@@ -418,7 +418,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Validate a Bitcoin address and return its type (P2PKH, P2SH, P2WPKH, P2WSH, P2TR), script hex, and witness info.")]
     fn validate_address(&self, Parameters(p): Parameters<ValidateAddressParams>) -> String {
-        tools::address::validate_address(&p.address)
+        tools::address::validate_address(&p.address, self.ctx.network)
     }
 
     // === Operator Ergonomics (PRs #59-#67) ===

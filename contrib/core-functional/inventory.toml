@@ -14,8 +14,8 @@ reason = "no-wallet"
 [[test]]
 file = "feature_abortnode.py"
 status = "skip"
-reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
+reason = "feature-missing"
+note = "measured: unlinks blocks/rev00000.dat to force a write failure and expects the node to abort. satd writes no rev*.dat undo files -- undo data lives in RocksDB -- so the file the test corrupts does not exist. Follow-up: an abort-on-write-failure path the test can reach, or a permanent core-internal reclassification"
 
 [[test]]
 file = "feature_addrman.py"
@@ -32,19 +32,20 @@ note = "needs the hidden Core RPC addconnection, which the framework uses for ou
 [[test]]
 file = "feature_asmap.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `setmocktime`; the framework uses it for deterministic time and to seed the cached chain"
+reason = "core-log"
+note = "measured: assert_debug_log expects 'Using /16 prefix for IP bucketing'; satd has no addrman and no IP bucketing, so there is no event to reword"
 
 [[test]]
 file = "feature_assumeutxo.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `scantxoutset`, which satd does not implement; the framework wallet uses it to rescan the UTXO set"
+reason = "feature-missing"
+note = "measured: dumptxoutset now answers `latest`; the test needs \"rollback\" snapshots and the background-validation states satd does not expose. Follow-up: rollback snapshots"
 
 [[test]]
 file = "feature_assumevalid.py"
 status = "skip"
 reason = "core-log"
+note = "measured: assert_debug_log expects 'Enabling script verification at block #N (<hash>): assumevalid=0 (always verify).'; satd does not log the assumevalid decision"
 
 [[test]]
 file = "feature_bind_extra.py"
@@ -70,13 +71,13 @@ status = "run"
 file = "feature_block.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: assert_raises_rpc_error on a submitblock/sendrawtransaction rejection string that satd words differently. Follow-up: reject-reason parity for the block-level rules this test walks (#671)"
 
 [[test]]
 file = "feature_blocksdir.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: expects the node to exit with Core's exact text, 'Specified blocks directory \"...\" does not exist.'; satd accepts -blocksdir pointing at a missing directory. Follow-up: validate -blocksdir at startup with Core's message"
 
 [[test]]
 file = "feature_blocksxor.py"
@@ -87,14 +88,14 @@ note = "satd rejects MiniWallet's padding output -- `OP_RETURN` followed by ~200
 [[test]]
 file = "feature_chain_tiebreaks.py"
 status = "skip"
-reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
+reason = "feature-missing"
+note = "measured: times out in wait_until on a tie-break between equal-work tips. satd keeps the first tip seen where Core applies its received-order/hash tie-break. Follow-up: Core's tie-break rule for equal-work tips"
 
 [[test]]
 file = "feature_cltv.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: with getdeploymentinfo fixed (#666) the test reaches its next blocker -- a block pushed over P2P with `send_and_ping` is not connected, so `active` stays false where the test expects true. Same blocker as p2p_unrequested_blocks; behind it are exact CLTV reject-reason strings in debug.log and testmempoolaccept `reject-details`"
 
 [[test]]
 file = "feature_coinstatsindex.py"
@@ -110,13 +111,14 @@ reason = "prev-release"
 [[test]]
 file = "feature_config_args.py"
 status = "skip"
-reason = "core-log"
+reason = "feature-missing"
+note = "measured: startup fails on '-nolisten=0' -- satd rejects the negated-with-value form Core accepts ('Invalid parameter -nolisten=0'). Follow-up: Core's -noX=0 handling"
 
 [[test]]
 file = "feature_csv_activation.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: sendrawtransaction rejects the test's transactions with -26 'scriptpubkey'. The test spends bare CSV scripts that satd's standardness rules refuse. Follow-up: standardness parity for the script forms this test uses"
 
 [[test]]
 file = "feature_dbcrash.py"
@@ -126,8 +128,8 @@ reason = "core-internal"
 [[test]]
 file = "feature_dersig.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: with getdeploymentinfo fixed (#666) the test reaches its next blocker -- getblockcount stays at DERSIG_HEIGHT-2 after a block pushed over P2P with `send_and_ping`, i.e. the block is not connected. Same blocker as p2p_unrequested_blocks"
 
 [[test]]
 file = "feature_dirsymlinks.py"
@@ -145,8 +147,8 @@ note = "`generateblock` takes an address only; Core's `output` argument is an ad
 [[test]]
 file = "feature_fee_estimation.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `scantxoutset`, which satd does not implement; the framework wallet uses it to rescan the UTXO set"
+reason = "feature-missing"
+note = "measured: assert_equal(1, 2) on estimatesmartfee's returned confirmation target. satd's estimator does not track per-target buckets the way Core's does. Follow-up: real fee estimation (already on the M18/release-gate list)"
 
 [[test]]
 file = "feature_filelock.py"
@@ -177,7 +179,7 @@ status = "run"
 file = "feature_includeconf.py"
 status = "skip"
 reason = "harness"
-note = "tracing writes all log output to stderr; the test's stop_node(expected_stderr=...) exact-matches a single warning line against the full tracing output. Fix: redirect tracing to debug.log (matching Core)"
+note = "measured: subversion does not end with 'main; relative)/' -- the test's -includeconf chain sets uacomment from an included file. Behind that, tracing writes all log output to stderr and the test's stop_node(expected_stderr=...) exact-matches a single line"
 
 [[test]]
 file = "feature_index_prune.py"
@@ -200,8 +202,8 @@ note = "Core's contrib/linearize scripts exit non-zero against satd; not yet att
 [[test]]
 file = "feature_logging.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: -debuglogfile=foo.log writes no foo.log; satd has no -debuglogfile. Follow-up: -debuglogfile, including the relative-path and unopenable-path error text the test asserts"
 
 [[test]]
 file = "feature_maxtipage.py"
@@ -212,8 +214,8 @@ note = "-maxtipage is not honored, so the node does not leave IBD when the test 
 [[test]]
 file = "feature_maxuploadtarget.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: KeyError 'uploadtarget' on getnettotals. The field is only the first assertion -- the test then drives real -maxuploadtarget behaviour (historical-block refusal, cycle reset, per-peer accounting), which satd does not implement. Follow-up: -maxuploadtarget"
 
 [[test]]
 file = "feature_minchainwork.py"
@@ -231,25 +233,25 @@ note = "an RPC fails with -1 'Header decode failed'; not yet attributed"
 file = "feature_nulldummy.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: createmultisig is Method not found. Follow-up: createmultisig (pure secp256k1/script, no wallet)"
 
 [[test]]
 file = "feature_port.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_debug_log expects 'Bound to 127.0.0.1:<port+1>'. satd already logs 'Bound to <addr>' with Core's wording; what is missing is Core's automatic onion bind at port+1, which four of the six assertions need. Not adopted -- an extra listening socket on every default node is a design decision, not an oversight"
 
 [[test]]
 file = "feature_posix_fs_permissions.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: the datadir is not 0700. The test also checks a wallets/ directory satd never creates. Follow-up: create the datadir and debug.log with Core's 0700/0600 modes"
 
 [[test]]
 file = "feature_presegwit_node_upgrade.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: expects the node to exit with 'Witness data for blocks after height N requires validation. Please restart with -reindex.'; satd has no pre-segwit-chainstate detection. Follow-up: the upgrade check, or a permanent core-internal reclassification"
 
 [[test]]
 file = "feature_proxy.py"
@@ -270,8 +272,8 @@ status = "run"
 [[test]]
 file = "feature_reindex.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-log"
+note = "measured: assert_debug_log expects 'LoadExternalBlockFile: Out of order block' / 'Processing out of order child'; satd's reindex does not log per-block ordering events"
 
 [[test]]
 file = "feature_reindex_init.py"
@@ -282,8 +284,8 @@ note = "test looks for Core-specific datadir files (blocks/blk*.dat layout) that
 [[test]]
 file = "feature_reindex_readonly.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-internal"
+note = "measured: asserts blocks/blk00001.dat exists after mining, then makes it read-only. satd's flat-file layout does not roll to a second file at that size, so the path never appears"
 
 [[test]]
 file = "feature_remove_pruned_files_on_startup.py"
@@ -299,14 +301,14 @@ reason = "no-wallet"
 [[test]]
 file = "feature_settings.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-internal"
+note = "measured: reads and writes Core's regtest/settings.json, which satd does not have"
 
 [[test]]
 file = "feature_shutdown.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: the RPC connection is closed mid-call during shutdown (RemoteDisconnected) where Core answers the in-flight long call first. Follow-up: drain in-flight RPCs before closing listeners on stop"
 
 [[test]]
 file = "feature_signet.py"
@@ -335,13 +337,13 @@ reason = "prev-release"
 file = "feature_utxo_set_hash.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: KeyError 'muhash' -- gettxoutsetinfo ignores hash_type and never returns a muhash. Follow-up: gettxoutsetinfo(hash_type='muhash')"
 
 [[test]]
 file = "feature_versionbits_warning.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: expects getmininginfo().warnings to carry Core's unknown-rules-active warning. satd has no versionbits deployments and no unknown-rule detection. Follow-up: unknown-versionbits warning"
 
 [[test]]
 file = "interface_bitcoin_cli.py"
@@ -372,7 +374,7 @@ note = "REST endpoint returns 401 Unauthorized; Core's REST is unauthenticated b
 file = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: assert_equal(0, 1) on the JSON-RPC batch/notification handling this test walks. Follow-up: batch and notification semantics (#664)"
 
 [[test]]
 file = "interface_usdt_coinselection.py"
@@ -452,8 +454,8 @@ note = "needs `getprioritisedtransactions`"
 [[test]]
 file = "mempool_limit.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_equal(0.00000100, 0.00001) -- satd's mempool-full eviction feerate floor differs from Core's. Follow-up: mempool eviction / min-relay divergence"
 
 [[test]]
 file = "mempool_package_limits.py"
@@ -503,8 +505,8 @@ note = "`sendrawtransaction` returns the right reason (`bad-txns-premature-spend
 [[test]]
 file = "mempool_truc.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_raises_rpc_error saw no exception -- satd has no TRUC (v3) topology policy. Follow-up: TRUC"
 
 [[test]]
 file = "mempool_unbroadcast.py"
@@ -528,19 +530,19 @@ note = "getmininginfo fixed; fails on -blockversion=1337 (satd ignores -blockver
 file = "mining_getblocktemplate_longpoll.py"
 status = "skip"
 reason = "core-log"
-note = "assert_debug_log expects 'ThreadRPCServer method=getblocktemplate'; satd does not log per-method RPC calls"
+note = "measured: assert_debug_log expects 'ThreadRPCServer method=getblocktemplate'; satd does not log per-method RPC calls"
 
 [[test]]
 file = "mining_mainnet.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: KeyError 'bits' on getmininginfo. Follow-up: the `bits` field (Core's compact-target string) on getmininginfo/getblockheader/getblock"
 
 [[test]]
 file = "mining_prioritisetransaction.py"
 status = "skip"
 reason = "rpc-missing"
-note = "`prioritisetransaction` with no arguments answers `-1` with a Rust `ErrorObject { .. }` Debug rendering where Core returns its help text; the test asserts on the message"
+note = "measured: assert_raises_rpc_error on a prioritisetransaction error string satd words differently. Follow-up: prioritisetransaction error parity (#671)"
 
 [[test]]
 file = "mining_template_verification.py"
@@ -574,13 +576,13 @@ note = "needs `addpeeraddress` RPC"
 file = "p2p_addrfetch.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
 
 [[test]]
 file = "p2p_addrv2_relay.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: times out in wait_until waiting for an addrv2 relay satd never sends; satd has no addrman and does not relay addresses. Follow-up: address relay"
 
 [[test]]
 file = "p2p_block_sync.py"
@@ -602,7 +604,7 @@ note = "`getnetworkinfo.localrelay` is always true; Core reports false under `-b
 file = "p2p_compactblocks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
@@ -613,8 +615,8 @@ note = "block hash mismatch after compact-block relay in -blocksonly mode; compa
 [[test]]
 file = "p2p_compactblocks_hb.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: high-bandwidth peer selection never happens -- assert_equal([False]*4, [False,True,False,False]). satd does not promote peers to HB compact-block mode. Follow-up: BIP 152 high-bandwidth mode"
 
 [[test]]
 file = "p2p_disconnect_ban.py"
@@ -623,8 +625,8 @@ status = "run"
 [[test]]
 file = "p2p_dns_seeds.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-log"
+note = "measured: assert_debug_log expects 'DNS seeding disabled'; satd does not log the DNS-seed decision. Follow-up: a debuglog_map.toml rule once satd logs it"
 
 [[test]]
 file = "p2p_eviction.py"
@@ -642,13 +644,13 @@ note = "fee filter relay assertion fails; satd's feefilter relay timing or thres
 file = "p2p_filter.py"
 status = "skip"
 reason = "core-log"
-note = "greps debug.log for `Misbehaving`, which satd has no equivalent of"
+note = "measured: assert_debug_log expects 'Misbehaving'; satd has no misbehaviour scoring to log"
 
 [[test]]
 file = "p2p_fingerprint.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_equal(10, 13) -- satd serves stale blocks the anti-fingerprinting rule says to withhold. Follow-up: Core's stale-block serving cutoff"
 
 [[test]]
 file = "p2p_getaddr_caching.py"
@@ -663,7 +665,7 @@ status = "run"
 file = "p2p_handshake.py"
 status = "skip"
 reason = "core-log"
-note = "assert_debug_log expects 'ignoring redundant verack message'; satd does not log this"
+note = "measured: assert_debug_log expects 'ignoring redundant verack message'; satd does not log this"
 
 [[test]]
 file = "p2p_headers_sync_with_minchainwork.py"
@@ -687,7 +689,7 @@ note = "`-i2psam` is unimplemented; satd refuses the option at startup"
 file = "p2p_ibd_stalling.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
 
 [[test]]
 file = "p2p_ibd_txrelay.py"
@@ -698,14 +700,14 @@ note = "a wait_until predicate times out during IBD tx relay; not yet attributed
 [[test]]
 file = "p2p_initial_headers_sync.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: satd sends getheaders to a second peer during initial headers sync where Core sends to exactly one. Follow-up: Core's single-peer initial-headers-sync rule"
 
 [[test]]
 file = "p2p_invalid_block.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-log"
+note = "measured: assert_debug_log expects the reject reason 'bad-txns-duplicate' in debug.log; satd rejects the block but words the log line differently. Follow-up: a debuglog_map.toml rule for block reject reasons"
 
 [[test]]
 file = "p2p_invalid_locator.py"
@@ -714,14 +716,14 @@ status = "run"
 [[test]]
 file = "p2p_invalid_messages.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: times out in wait_until on a malformed-message disconnect satd does not perform. Follow-up: Core's message-level sanity checks and disconnects"
 
 [[test]]
 file = "p2p_invalid_tx.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-log"
+note = "measured: assert_debug_log expects the reject reason 'bad-txns-vout-empty' in debug.log; satd rejects the transaction but words the log line differently. Follow-up: a debuglog_map.toml rule for tx reject reasons"
 
 [[test]]
 file = "p2p_leak.py"
@@ -738,14 +740,14 @@ note = "getrawmempool(verbose=false, mempool_sequence=true) returns a list inste
 [[test]]
 file = "p2p_message_capture.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: no msgs_recv.dat written -- satd has no -capturemessages. Follow-up: -capturemessages"
 
 [[test]]
 file = "p2p_mutated_blocks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: add_outbound_p2p_connection -> addconnection is Method not found. Follow-up: the hidden addconnection RPC"
 
 [[test]]
 file = "p2p_net_deadlock.py"
@@ -756,8 +758,8 @@ note = "needs the hidden Core RPC sendmsgtopeer to push an unknown message type.
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: times out in wait_until on the disconnect satd does not perform when a peer sends filter messages with -peerbloomfilters=0. Follow-up: BIP 37 filter-message rejection"
 
 [[test]]
 file = "p2p_node_network_limited.py"
@@ -768,8 +770,8 @@ note = "observed: a -prune=550 node advertises NODE_NETWORK|NODE_WITNESS (9) whe
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_equal(0.00000100, 0.00001) on the min-relay feerate the test sets up against; behind it, satd has no 1p1c package relay. Follow-up: package relay"
 
 [[test]]
 file = "p2p_orphan_handling.py"
@@ -792,8 +794,8 @@ note = "tx not relayed to a -whitelist peer with relay permission; satd's permis
 [[test]]
 file = "p2p_ping.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_equal(0.099043, 3) on getpeerinfo().pingtime -- satd sends no periodic ping, so no round-trip is ever measured. Follow-up: the P2P keepalive ping (also blocks ~27 other tests)"
 
 [[test]]
 file = "p2p_private_broadcast.py"
@@ -811,7 +813,7 @@ note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, 
 file = "p2p_seednode.py"
 status = "skip"
 reason = "core-log"
-note = "assert_debug_log expects 'Empty addrman, adding seednode...'; satd does not log this"
+note = "measured: assert_debug_log expects 'Empty addrman, adding seednode (<ip>) to addrfetch'; satd has no addrman, so there is no event to reword"
 
 [[test]]
 file = "p2p_segwit.py"
@@ -834,8 +836,8 @@ note = "erlay/tx reconciliation (BIP 330) not implemented; satd does not send se
 [[test]]
 file = "p2p_timeouts.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "core-log"
+note = "measured: assert_debug_log expects 'Added connection peer=0'; satd words its inbound-accept log differently. Follow-up: a debuglog_map.toml rule once the satd line is stable"
 
 [[test]]
 file = "p2p_tx_download.py"
@@ -852,8 +854,8 @@ note = "after 60s the spy peer has not seen the expected wtxid inv: `AssertionEr
 [[test]]
 file = "p2p_unrequested_blocks.py"
 status = "skip"
-reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
+reason = "core-log"
+note = "measured: assert_debug_log expects 'AcceptBlockHeader: not adding new block header <hash>, missing anti-dos proof-of-work validation'; satd has no anti-DoS header-acceptance gate to log"
 
 [[test]]
 file = "p2p_v2_encrypted.py"
@@ -882,8 +884,8 @@ note = "observed: with two -rpcbind addresses satd binds only 127.0.0.1, not ::1
 [[test]]
 file = "rpc_blockchain.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: expects the node to exit with 'The block database contains a block which appears to be from the future...'; satd has no future-timestamp check on the block database at startup. Follow-up: the startup check, plus getnetworkhashps argument-type parity earlier in the file"
 
 [[test]]
 file = "rpc_createmultisig.py"
@@ -895,7 +897,7 @@ note = "needs `createmultisig` RPC (not a wallet-only method in Core)"
 file = "rpc_decodescript.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: decodescript's `asm` omits opcode names -- satd emits the raw push payload where Core emits 'OP_PUSHBYTES_72 <hex>'. Follow-up: Core's ScriptToAsmStr rendering"
 
 [[test]]
 file = "rpc_deprecated.py"
@@ -908,8 +910,8 @@ status = "run"
 [[test]]
 file = "rpc_dumptxoutset.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: after the `type` argument and datadir-relative path landed, txoutset_hash disagrees with Core -- satd's hash_serialized_3 is not Core's serialization. Follow-up: hash_serialized_3 parity (also blocks feature_utxo_set_hash), then \"rollback\" snapshots"
 
 [[test]]
 file = "rpc_estimatefee.py"
@@ -944,7 +946,7 @@ status = "run"
 file = "rpc_getdescriptoractivity.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: getdescriptoractivity is Method not found. Follow-up: getdescriptoractivity"
 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
@@ -962,21 +964,19 @@ status = "run"
 
 [[test]]
 file = "rpc_invalid_address_message.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "rpc_invalidateblock.py"
 status = "skip"
-reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
+reason = "feature-missing"
+note = "measured: assert_equal(7, 4) on the tip height after invalidateblock across a fork; satd reconnects a different branch than Core does. Follow-up: invalidateblock branch selection"
 
 [[test]]
 file = "rpc_misc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the echo debug RPC; the first call is node.echo()"
+note = "measured: times out in wait_until on getmemoryinfo/logging behaviour after the echo call; satd's `logging` and `getmemoryinfo` report fabricated or incomplete data (#667). Follow-up: #667"
 
 [[test]]
 file = "rpc_named_arguments.py"
@@ -997,14 +997,14 @@ note = "needs `getorphantxs`"
 [[test]]
 file = "rpc_packages.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+reason = "feature-missing"
+note = "measured: assert_raises_rpc_error saw no exception -- submitpackage accepts calls Core rejects, and omits result entries (#665). Follow-up: #665"
 
 [[test]]
 file = "rpc_preciousblock.py"
 status = "skip"
-reason = "rpc-missing"
-note = "satd accepts positional JSON-RPC parameters only; a named request fails on every method (the framework calls generatetoaddress(nblocks=..., address=...) by name). Follow-up: named-parameter support across the RPC surface"
+reason = "feature-missing"
+note = "measured: the tip after preciousblock is the wrong branch -- satd's preciousblock does not re-order equal-work tips. Follow-up: Core's preciousblock semantics"
 
 [[test]]
 file = "rpc_psbt.py"
@@ -1027,7 +1027,7 @@ note = "needs scanblocks RPC and -blockfilterindex activation from config"
 file = "rpc_scantxoutset.py"
 status = "skip"
 reason = "rpc-missing"
-note = "satd's `scantxoutset` implements the key-free descriptors (`raw()`, `addr()`); this test needs the key-based ones -- `pkh()`, `combo()`, `sh(multi())`, `tr()` -- including ranged xpub derivation"
+note = "measured: scantxoutset rejects pkh() with -5. satd implements the key-free descriptors (raw(), addr()); this test needs pkh(), combo(), sh(multi()), tr() and ranged xpub derivation. Follow-up: key-based descriptors (#633)"
 
 [[test]]
 file = "rpc_setban.py"
@@ -1044,7 +1044,7 @@ reason = "no-tool"
 file = "rpc_signmessagewithprivkey.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+note = "measured: signmessagewithprivkey is Method not found. Follow-up: signmessagewithprivkey (pure secp256k1, no wallet)"
 
 [[test]]
 file = "rpc_signrawtransactionwithkey.py"
@@ -1068,9 +1068,7 @@ note = "`connect_nodes()` waits for a `pong` in both directions and satd sends n
 
 [[test]]
 file = "rpc_validateaddress.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "rpc_whitelist.py"
@@ -1111,8 +1109,8 @@ reason = "no-tool"
 [[test]]
 file = "tool_utxo_to_sqlite.py"
 status = "skip"
-reason = "rpc-missing"
-note = "dumptxoutset trailing-characters parse error on positional params"
+reason = "no-tool"
+note = "measured: dumptxoutset now answers, and the test moves on to Core's contrib/utxo-tools/utxo_to_sqlite.py, which exits non-zero on satd's snapshot. Needs snapshot-format parity plus a Core-only tool"
 
 [[test]]
 file = "tool_wallet.py"
@@ -1221,9 +1219,7 @@ reason = "no-wallet"
 
 [[test]]
 file = "wallet_disable.py"
-status = "skip"
-reason = "rpc-missing"
-note = "needs the hidden Core RPC `syncwithvalidationinterfacequeue`, which the framework calls from sync_all(); tracked as the top follow-up in contrib/core-functional/README.md"
+status = "run"
 
 [[test]]
 file = "wallet_encryption.py"
