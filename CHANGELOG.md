@@ -40,7 +40,9 @@ item below is (or will be) written up in full in the in-development
 - `generatetoaddress` and `generatetodescriptor` honour Core's `maxtries`
   argument, which also puts the first bound on satd's nonce grind (#688).
 - `help <command>` answers for every registered RPC, including the ones the
-  listing deliberately omits; fifteen methods Core lists are now listed (#692).
+  listing deliberately omits, and the listing itself now names every method
+  satd registers — thirty were missing, among them the PSBT builders and
+  satd's own index, quarantine and address-index RPCs (#692).
 
 ### Added
 

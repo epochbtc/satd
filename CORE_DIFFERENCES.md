@@ -538,9 +538,9 @@ silently returning an empty or wrong answer.
     `getblockcount takes no arguments (3 given)`. The method name leads the
     message either way, which is the part Core-derived tests assert.
   - `help <command>` answers for every *registered* method, listed or not, as
-    Core does for its `hidden` category. The listing itself carries the
-    methods Core lists plus satd's own that have a category; satd-only RPCs
-    outside that set are answerable but not yet listed.
+    Core does for its `hidden` category. The listing names every method satd
+    registers, satd's own included, each under the category of its closest
+    Core analogue.
 
 ---
 

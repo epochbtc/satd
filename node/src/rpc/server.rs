@@ -2917,12 +2917,13 @@ pub async fn start(
             }
             // Core's `hidden` category suppresses a command from the
             // *listing* only: `help <hidden command>` still returns its full
-            // help (`CRPCTable::help`, `src/rpc/server.cpp`, where the skip
-            // is guarded by `strMethod != strCommand`). satd asked the listing table,
-            // which is the listing, so every registered method missing from
-            // it -- `addconnection` and the PSBT builders alike -- answered
-            // "unknown command" as though it did not exist. Ask what is
-            // *registered* instead; the listing is still what `HELP_METHODS` says.
+            // help (`CRPCTable::help`, `src/rpc/server.cpp`, where the skip is
+            // guarded by `strMethod != strCommand`). satd asked its listing
+            // table, so every registered method missing from that table --
+            // `addconnection` and the PSBT builders alike -- answered "unknown
+            // command" as though it did not exist. Ask the argument table,
+            // which is the one the startup audit holds to the registered set;
+            // what gets *advertised* is still `HELP_METHODS`.
             if cmd.is_empty() || crate::rpc::named_params::arg_names(&cmd).is_some() {
                 return Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")));
             }
