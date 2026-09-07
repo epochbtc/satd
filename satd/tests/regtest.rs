@@ -14462,9 +14462,30 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         .unwrap();
     assert_eq!(unknown["result"].as_str(), Some("help: unknown command: nosuchrpc"));
 
-    // The methods Core lists are now listed here too; satd was omitting
-    // fifteen of them, so `help createrawtransaction` read as unknown.
-    for cmd in ["createrawtransaction", "decodepsbt", "getblockfilter", "waitforblock"] {
+    // Everything registered is listed except the deliberately hidden pair:
+    // a method an operator cannot find in `help` may as well not exist.
+    // `dump_all_command_conversions` is `help`'s own escape hatch for
+    // rpc_help.py, not a method.
+    let registered: Vec<String> = node.rpc_call_with_params("help", vec![json!("dump_all_command_conversions")])
+        .unwrap()["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row.get(0)?.as_str().map(str::to_string))
+        .collect();
+    let hidden = ["addconnection", "generate", "unsubscribemempool"];
+    let mut missing: Vec<&str> = registered
+        .iter()
+        .map(String::as_str)
+        .filter(|m| !hidden.contains(m) && !listing.contains(m))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    assert!(missing.is_empty(), "registered but absent from the help listing: {missing:?}");
+
+    // Named explicitly, because the check above would also pass if the
+    // listing and the registry drifted together.
+    for cmd in ["createrawtransaction", "decodepsbt", "getblockfilter", "waitforblock", "listquarantine"] {
         assert!(listing.contains(&cmd), "{cmd} must appear in the help listing");
     }
 }
