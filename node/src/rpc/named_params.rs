@@ -222,6 +222,74 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     Some(args)
 }
 
+/// Core's `RPC_MISC_ERROR`, the code a wrong-arity call ends up with: Core
+/// throws `HelpResult` (a `std::runtime_error`) out of
+/// `RPCHelpMan::HandleRequest`, and `ExecuteCommand` converts any
+/// `std::exception` into `RPC_MISC_ERROR` (`src/rpc/server.cpp`).
+const RPC_MISC_ERROR: i32 = -1;
+
+/// Methods whose real argument count is not the one this table declares.
+///
+/// `unsubscribemempool` is registered by jsonrpsee, not by satd, and takes the
+/// subscription id it hands out. Its row here is empty because there is no
+/// *nameable* parameter -- Core has no such method and jsonrpsee owns the
+/// argument -- which is exactly the "empty means we did not look" trap the
+/// module docs warn about. Reading arity off that row would reject every
+/// unsubscribe. `unsubscribing_is_not_arity_checked` pins it.
+const ARITY_UNCHECKED: &[&str] = &["unsubscribemempool"];
+
+/// How many *positional* arguments `method` declares.
+///
+/// Named-only entries are fields of an options object, not arguments of their
+/// own: Core's `m_args` holds one `OBJ_NAMED_PARAMS` container where this
+/// table holds one entry per field plus the container, so counting rows would
+/// over-permit by the number of fields. `dumptxoutset` is the only method in
+/// the table with any today.
+fn positional_arity(specs: &[ArgSpec]) -> usize {
+    specs.iter().filter(|(_, named_only)| !named_only).count()
+}
+
+/// Reject a positional call that passes more arguments than the method has.
+///
+/// Core checks this first, in `RPCHelpMan::HandleRequest`: `IsValidNumArgs`
+/// runs before the `MatchesType` loop and throws the method's help text, so a
+/// surplus argument outranks a type error and never reaches the handler.
+/// Without it satd quietly ignored the extras -- `getblockcount 1 2 3`
+/// succeeded, and `estimatesmartfee 1 "ECONOMICAL" 1` answered a feerate where
+/// Core answers `-1`.
+///
+/// **Knowing divergence in the message.** Core's is the full `RPCHelpMan`
+/// help text, which satd has no equivalent of (its `help <command>` is a
+/// stub). Rather than fabricate a usage line, this says plainly what the
+/// bound is. What Core-derived callers actually assert -- code `-1` and the
+/// method name in the message -- holds either way; `CORE_DIFFERENCES.md`
+/// records the rest.
+fn check_arity(method: &str, specs: &[ArgSpec], given: usize) -> Result<(), ErrorObjectOwned> {
+    if ARITY_UNCHECKED.contains(&method) {
+        return Ok(());
+    }
+    let max = positional_arity(specs);
+    if given <= max {
+        return Ok(());
+    }
+    let msg = if max == 0 {
+        format!("{method} takes no arguments ({given} given)")
+    } else {
+        format!("{method} takes at most {max} arguments ({given} given)")
+    };
+    Err(ErrorObjectOwned::owned(RPC_MISC_ERROR, msg, None::<()>))
+}
+
+/// How many positional arguments a request's raw `params` array carries, or
+/// `None` if it is not an array this can read.
+///
+/// Borrowed slices, not a `Value` tree: this runs on every positional request
+/// and the handler parses the array again, so counting must not cost a second
+/// full materialisation.
+fn count_slots(body: &str) -> Option<usize> {
+    serde_json::from_str::<Vec<&serde_json::value::RawValue>>(body).ok().map(|v| v.len())
+}
+
 /// Every method known to the named-parameter table, in the same order as the
 /// `match` arm above. Used by the `help("dump_all_command_conversions")` RPC
 /// to build the conversion table that Core's `rpc_help.py` test validates.
@@ -425,17 +493,31 @@ fn rewrite(
     let Some(raw) = params.as_ref() else {
         return Ok(());
     };
-    // Cheap reject first: only an object needs translating, and the vast
-    // majority of traffic is positional.
-    if !raw.get().trim_start().starts_with('{') {
-        return Ok(());
-    }
     let Some(specs) = arg_names(method) else {
         return Ok(());
     };
-    let obj: Map<String, Value> = serde_json::from_str(raw.get())
+    let body = raw.get().trim_start();
+    // Only an object needs translating, and the vast majority of traffic is
+    // positional -- but a positional call still has to have its argument
+    // count checked, which is why this is no longer an early return.
+    if !body.starts_with('{') {
+        // Not an array this can read is left to the layer that already
+        // reports malformed parameters, rather than told a second story.
+        return match count_slots(body) {
+            Some(n) => check_arity(method, specs, n),
+            None => Ok(()),
+        };
+    }
+    let obj: Map<String, Value> = serde_json::from_str(body)
         .map_err(|e| invalid(format!("Invalid named parameters: {e}")))?;
     let positional = named_to_positional(specs, obj)?;
+    // Named arguments alone cannot exceed the arity -- one slot per declared
+    // argument, and anything else is already reported as unknown -- but the
+    // `args` escape hatch is copied through verbatim, so a long enough `args`
+    // array arrives over the limit. Core checks the *transformed* params
+    // (`transformNamedArguments` runs before `RPCHelpMan::Check`), so this is
+    // the same one check, in the same place.
+    check_arity(method, specs, positional.len())?;
     let rewritten = serde_json::value::to_raw_value(&Value::Array(positional))
         .map_err(|e| invalid(format!("Could not encode parameters: {e}")))?;
     *params = Some(std::borrow::Cow::Owned(rewritten));
@@ -586,6 +668,103 @@ mod tests {
         let specs = arg_names(method).expect("method is registered");
         let obj = params.as_object().expect("object params").clone();
         named_to_positional(specs, obj).map_err(|e| e.message().to_string())
+    }
+
+    /// Drive `rewrite` exactly as the layer does, returning the error message
+    /// on rejection and the (possibly rewritten) params on acceptance.
+    fn dispatch(method: &str, params: Value) -> Result<String, ErrorObjectOwned> {
+        let raw = serde_json::value::to_raw_value(&params).unwrap();
+        let mut slot = Some(std::borrow::Cow::Owned(raw));
+        rewrite(method, &mut slot)?;
+        Ok(slot.unwrap().get().to_string())
+    }
+
+    /// The defect: satd read the arguments it knew about and ignored the
+    /// rest, so a caller who miscounted -- or who was written against a
+    /// different node's argument list -- got a plausible answer instead of an
+    /// error. Core's `IsValidNumArgs` refuses before the handler runs.
+    #[test]
+    fn a_surplus_positional_argument_is_refused() {
+        let err = dispatch("getblockheader", json!(["ff", true, "EXTRA", 99])).unwrap_err();
+        assert_eq!(err.code(), -1, "Core's HelpResult surfaces as RPC_MISC_ERROR");
+        // Core's message is the help text, which begins with the method name;
+        // `rpc_estimatefee.py` and `rpc_blockchain.py` assert exactly that
+        // substring, so it has to lead here too.
+        assert!(err.message().starts_with("getblockheader"), "{}", err.message());
+        assert!(err.message().contains('4'), "{}", err.message());
+    }
+
+    /// A method that declares nothing is the sharpest case: every argument is
+    /// surplus, and `getblockcount 1 2 3` used to succeed.
+    #[test]
+    fn a_method_with_no_arguments_refuses_all_of_them() {
+        let err = dispatch("getblockcount", json!([1, 2, 3])).unwrap_err();
+        assert_eq!(err.code(), -1);
+        assert!(err.message().contains("takes no arguments"), "{}", err.message());
+        // ... and still accepts the empty array every client sends.
+        dispatch("getblockcount", json!([])).unwrap();
+    }
+
+    /// The bound is the declared arity, not one less: the last argument of a
+    /// fully-specified call must still get through.
+    #[test]
+    fn a_call_at_exactly_the_declared_arity_is_untouched() {
+        for (method, params) in [
+            ("getblockheader", json!(["ff", true])),
+            ("getrawtransaction", json!(["ff", 1, "aa"])),
+            ("setban", json!(["1.2.3.4", "add", 0, false])),
+        ] {
+            let out = dispatch(method, params.clone()).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&out).unwrap(),
+                params,
+                "{method} must pass through unchanged"
+            );
+        }
+    }
+
+    /// Named-only entries are fields of an options object, not arguments.
+    /// `dumptxoutset` holds the table's only ones: four rows, three
+    /// positional slots. Counting rows would let a fourth argument through.
+    #[test]
+    fn named_only_fields_do_not_widen_the_positional_arity() {
+        assert_eq!(positional_arity(arg_names("dumptxoutset").unwrap()), 3);
+        dispatch("dumptxoutset", json!(["/tmp/x", "latest", {}])).unwrap();
+        let err = dispatch("dumptxoutset", json!(["/tmp/x", "latest", {}, 1])).unwrap_err();
+        assert_eq!(err.code(), -1);
+    }
+
+    /// `unsubscribemempool` is jsonrpsee's, and takes the subscription id it
+    /// handed out. Its empty row means "no *nameable* parameter", not "no
+    /// parameter" -- reading arity off it would break every unsubscribe.
+    #[test]
+    fn unsubscribing_is_not_arity_checked() {
+        dispatch("unsubscribemempool", json!([42])).unwrap();
+    }
+
+    /// A named call is still translated, and the translated form is what the
+    /// arity is checked against -- because the `args` escape hatch is copied
+    /// through verbatim, so it is the one named shape that can arrive over
+    /// the limit. Core checks the transformed params for the same reason.
+    #[test]
+    fn a_named_call_is_translated_and_then_counted() {
+        let out = dispatch("getblockheader", json!({"blockhash": "ff", "verbose": false})).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), json!(["ff", false]));
+
+        let err = dispatch("getblockheader", json!({"args": ["ff", true, "EXTRA"]})).unwrap_err();
+        assert_eq!(err.code(), -1, "an oversized `args` array is still surplus");
+        assert!(err.message().starts_with("getblockheader"), "{}", err.message());
+    }
+
+    /// Params that are not an array satd can read are left to the layer that
+    /// already reports them, rather than turned into an arity complaint.
+    #[test]
+    fn unreadable_params_are_passed_through() {
+        for params in [json!("not-an-array"), json!(7), json!(null)] {
+            dispatch("getblockcount", params.clone()).unwrap_or_else(|e| {
+                panic!("{params} must pass through, got {}", e.message())
+            });
+        }
     }
 
     /// Two spellings of one slot cannot both be honoured, so rejecting is

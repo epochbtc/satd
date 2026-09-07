@@ -1179,8 +1179,13 @@ pub async fn start(
         let mut args = Args::new(&params);
         let nblocks: u32 = args.required("nblocks")?;
         let address: String = args.required("address")?;
+        // Core's third argument. satd used to read two and drop whatever came
+        // third, so `generatetoaddress 1 <addr> "notanumber"` mined a block
+        // where Core answers -3 -- and the nonce loop it bounds had no bound
+        // at all (#688).
+        let max_tries: u64 = args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
-        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address)
+        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address, max_tries)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1188,8 +1193,16 @@ pub async fn start(
         let mut args = Args::new(&params);
         let nblocks: u32 = args.required("num_blocks")?;
         let descriptor: String = args.required("descriptor")?;
+        let max_tries: u64 =
+            args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
-        mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
+        mining::generate_to_descriptor(
+            &ctx.chain_state,
+            &ctx.mempool,
+            nblocks,
+            &descriptor,
+            max_tries,
+        )
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1631,12 +1644,10 @@ pub async fn start(
         let locktime: Option<serde_json::Value> = args.raw("locktime")?;
         let replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
         let version: Option<serde_json::Value> = args.raw("version")?;
-        // Reject extra arguments.
-        let extra: Option<serde_json::Value> = args.raw("<extra>")?;
+        // A surplus argument is rejected before dispatch now, for every
+        // method, by `named_params::check_arity` (#688) -- this handler no
+        // longer has to be the only one that looks.
         args.check()?;
-        if extra.is_some() {
-            return Err(ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>));
-        }
         // Parse locktime.
         let locktime_val: Option<u32> = match &locktime {
             None | Some(serde_json::Value::Null) => None,
@@ -2087,13 +2098,6 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        if args.len() > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -1,
-                "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nToo many arguments.\n",
-                None::<()>,
-            ));
-        }
         // Type check arg 0: must be number
         let conf_target: u32 = match &args[0] {
             serde_json::Value::Number(n) => n.as_u64()
@@ -2165,13 +2169,6 @@ pub async fn start(
             return Err(ErrorObjectOwned::owned(
                 -1,
                 "estimaterawfee conf_target ( threshold )\n\nEstimates the approximate fee per kilobyte.\n",
-                None::<()>,
-            ));
-        }
-        if args.len() > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -1,
-                "estimaterawfee conf_target ( threshold )\n\nToo many arguments.\n",
                 None::<()>,
             ));
         }
@@ -2750,10 +2747,12 @@ pub async fn start(
             ("getblock", "Blockchain"),
             ("getblockchaininfo", "Blockchain"),
             ("getblockcount", "Blockchain"),
+            ("getblockfilter", "Blockchain"),
             ("getblockfrompeer", "Blockchain"),
             ("getblockhash", "Blockchain"),
             ("getblockheader", "Blockchain"),
             ("getblockstats", "Blockchain"),
+            ("getchainstates", "Blockchain"),
             ("getchaintips", "Blockchain"),
             ("getchaintxstats", "Blockchain"),
             ("getdeploymentinfo", "Blockchain"),
@@ -2770,6 +2769,7 @@ pub async fn start(
             ("gettxoutproof", "Blockchain"),
             ("gettxoutsetinfo", "Blockchain"),
             ("invalidateblock", "Blockchain"),
+            ("loadtxoutset", "Blockchain"),
             ("preciousblock", "Blockchain"),
             ("reconsiderblock", "Blockchain"),
             ("savemempool", "Blockchain"),
@@ -2778,11 +2778,13 @@ pub async fn start(
             ("unsubscribemempool", "Blockchain"),
             ("verifychain", "Blockchain"),
             ("verifytxoutproof", "Blockchain"),
+            ("waitforblock", "Blockchain"),
             ("waitforblockheight", "Blockchain"),
+            ("waitfornewblock", "Blockchain"),
             // == Control ==
             ("echo", "Control"),
-            ("echojson", "Control"),
             ("echoipc", "Control"),
+            ("echojson", "Control"),
             ("getconfig", "Control"),
             ("getmemoryinfo", "Control"),
             ("getrpcinfo", "Control"),
@@ -2822,13 +2824,23 @@ pub async fn start(
             ("setban", "Network"),
             ("setnetworkactive", "Network"),
             // == Rawtransactions ==
+            ("analyzepsbt", "Rawtransactions"),
+            ("combinepsbt", "Rawtransactions"),
+            ("combinerawtransaction", "Rawtransactions"),
+            ("converttopsbt", "Rawtransactions"),
+            ("createpsbt", "Rawtransactions"),
+            ("createrawtransaction", "Rawtransactions"),
+            ("decodepsbt", "Rawtransactions"),
             ("decoderawtransaction", "Rawtransactions"),
             ("decodescript", "Rawtransactions"),
+            ("finalizepsbt", "Rawtransactions"),
             ("getrawtransaction", "Rawtransactions"),
+            ("joinpsbts", "Rawtransactions"),
             ("sendrawtransaction", "Rawtransactions"),
-            ("submitpackage", "Rawtransactions"),
             ("signrawtransactionwithkey", "Rawtransactions"),
+            ("submitpackage", "Rawtransactions"),
             ("testmempoolaccept", "Rawtransactions"),
+            ("utxoupdatepsbt", "Rawtransactions"),
             // == Util ==
             ("deriveaddresses", "Util"),
             ("estimaterawfee", "Util"),
@@ -2868,7 +2880,17 @@ pub async fn start(
                     "logging ( <include> <exclude> )\n\nGets and sets the logging configuration.\nvalid logging categories are: {cats_str}\n"
                 )));
             }
-            if cmd.is_empty() || METHODS.iter().any(|(name, _)| *name == cmd.as_str()) {
+            // Core's `hidden` category suppresses a command from the
+            // *listing* only: `help <hidden command>` still returns its full
+            // help (`CRPCTable::help`, `src/rpc/server.cpp`, where the skip
+            // is guarded by `strMethod != strCommand`). satd asked METHODS,
+            // which is the listing, so every registered method missing from
+            // it -- `addconnection` and the PSBT builders alike -- answered
+            // "unknown command" as though it did not exist. Ask what is
+            // *registered* instead; the listing is still what METHODS says.
+            if cmd.is_empty()
+                || crate::rpc::named_params::ALL_METHODS.contains(&cmd.as_str())
+            {
                 return Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")));
             }
             // Unknown command: Core returns a successful result with this

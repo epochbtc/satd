@@ -69,7 +69,14 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
 /// Create an McpContext with some mined blocks for richer test data.
 fn make_test_ctx_with_blocks(n: u32) -> (McpContext, tempfile::TempDir) {
     let (ctx, dir) = make_test_ctx();
-    node::mining::miner::mine_blocks(&ctx.chain_state, &ctx.mempool, REGTEST_ADDR, n).unwrap();
+    node::mining::miner::mine_blocks(
+        &ctx.chain_state,
+        &ctx.mempool,
+        REGTEST_ADDR,
+        n,
+        node::mining::miner::DEFAULT_MAX_TRIES,
+    )
+    .unwrap();
     (ctx, dir)
 }
 

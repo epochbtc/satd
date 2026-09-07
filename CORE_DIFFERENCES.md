@@ -528,6 +528,20 @@ silently returning an empty or wrong answer.
   one that is never enforced is the failure mode worth avoiding: the caller
   would get no protection and no warning.
 
+- **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
+  `help <command>` returns the command's name rather than a signature and
+  argument descriptions. Two things follow from that, both deliberate:
+
+  - A call that passes **more arguments than the method declares** is refused
+    with Core's code (`-1`) but not Core's message. Core throws the method's
+    whole help text; satd says what the bound is —
+    `getblockcount takes no arguments (3 given)`. The method name leads the
+    message either way, which is the part Core-derived tests assert.
+  - `help <command>` answers for every *registered* method, listed or not, as
+    Core does for its `hidden` category. The listing itself carries the
+    methods Core lists plus satd's own that have a category; satd-only RPCs
+    outside that set are answerable but not yet listed.
+
 ---
 
 ## Behavioral defaults that intentionally differ
