@@ -13525,6 +13525,13 @@ fn getnetworkhashps_counts_the_whole_window_s_work() {
 /// handler reads arguments through `crate::rpc::params::Args`, which goes via
 /// `serde_json::Value` and cannot poison the sequence.
 ///
+/// `.one()` is the same shape with a different edge: it is
+/// `parse::<[T; 1]>()`, a fixed-length array, so it refuses *any* surplus
+/// argument outright and renders the refusal as a Rust `Debug` dump in a
+/// public error message. It is guarded here for the same reason -- three
+/// live Core-parity breaks (`submitpackage`, `converttopsbt`,
+/// `utxoupdatepsbt`) were sites that had simply never been converted.
+///
 /// Two sites were added *during* the Core-functional wave, two functions away
 /// from the helper written to avoid this, which is why the guard is mechanical
 /// rather than a review note.
@@ -13538,14 +13545,20 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
     let offenders: Vec<(usize, &str)> = src
         .lines()
         .enumerate()
-        .filter(|(_, l)| l.contains("optional_next") || l.contains(".sequence()"))
+        // `//` skips the prose that names these idioms while explaining why
+        // they are gone.
+        .filter(|(_, l)| {
+            let code = l.split("//").next().unwrap_or("");
+            code.contains("optional_next") || code.contains(".sequence()") || code.contains(".one()")
+        })
         .map(|(i, l)| (i + 1, l.trim()))
         .collect();
     assert!(
         offenders.is_empty(),
         "read positional arguments through crate::rpc::params::Args, not \
          ParamsSequence directly -- a raw optional_next() erases every later \
-         argument on a type mismatch (#672). Offending lines in \
+         argument on a type mismatch (#672), and .one() refuses every \
+         optional argument a method declares (#687). Offending lines in \
          node/src/rpc/server.rs:\n{offenders:#?}"
     );
 }
@@ -14227,5 +14240,127 @@ fn connect_zero_means_no_peers_not_the_address_zero() {
         first_id(),
         Some(serde_json::json!(0)),
         "the first peer must be id 0, as it is in Bitcoin Core"
+    );
+}
+
+/// #687: 24 handlers still read their argument with `Params::one()`, which is
+/// `parse::<[T; 1]>()` -- a fixed-length array. It refuses **any** surplus
+/// argument, so three methods rejected optional arguments Core declares, and
+/// it rendered the refusal as a Rust `Debug` dump in a public error message.
+///
+/// A raw transaction whose input carries a scriptSig, and the same
+/// transaction with it removed. `converttopsbt` is lossy by construction, and
+/// Core defaults `permitsigdata` to false rather than discard signatures
+/// silently.
+const TX_WITH_SIGDATA: &str = "02000000010000000000000000000000000000000000000000000000000000000000000000000000000151ffffffff010000000000000000015100000000";
+const TX_WITHOUT_SIGDATA: &str = "020000000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff010000000000000000015100000000";
+
+#[test]
+fn methods_accept_the_optional_arguments_core_declares_for_them() {
+    let node = TestNode::start(&[]);
+
+    // A `.one()` failure used to surface as
+    //   -1 "ErrorObject { code: InvalidParams, message: \"Invalid params\", .. }"
+    // which leaks the server's internal types to any caller.
+    let with_maxfeerate = node
+        .rpc_call_with_params(
+            "submitpackage",
+            vec![serde_json::json!([TX_WITHOUT_SIGDATA]), serde_json::json!(0.10)],
+        )
+        .unwrap();
+    let msg = with_maxfeerate["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("ErrorObject"),
+        "an argument error must not be a Rust Debug dump: {with_maxfeerate}"
+    );
+    assert_eq!(with_maxfeerate["error"]["code"], serde_json::json!(-8), "{with_maxfeerate}");
+    assert!(msg.contains("maxfeerate"), "the refusal must name the argument: {msg}");
+
+    // `converttopsbt` takes `permitsigdata` second. Default false: a
+    // transaction carrying signature data is refused, not silently stripped.
+    let refused = node
+        .rpc_call_with_params("converttopsbt", vec![serde_json::json!(TX_WITH_SIGDATA)])
+        .unwrap();
+    assert_eq!(refused["error"]["code"], serde_json::json!(-22), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        serde_json::json!("Inputs must not have scriptSigs and scriptWitnesses")
+    );
+
+    // Explicitly permitted, it converts -- and the second argument is no
+    // longer rejected for merely existing.
+    let permitted = node
+        .rpc_call_with_params(
+            "converttopsbt",
+            vec![serde_json::json!(TX_WITH_SIGDATA), serde_json::json!(true)],
+        )
+        .unwrap();
+    assert!(permitted["error"].is_null(), "{permitted}");
+    let psbt = permitted["result"].as_str().expect("a base64 PSBT").to_string();
+
+    // An unsigned transaction needs no permission.
+    let plain = node
+        .rpc_call_with_params("converttopsbt", vec![serde_json::json!(TX_WITHOUT_SIGDATA)])
+        .unwrap();
+    assert!(plain["error"].is_null(), "{plain}");
+
+    // `utxoupdatepsbt` takes `descriptors` second. An empty list is a
+    // faithful no-op, so it must reach the PSBT logic rather than be
+    // refused as a surplus argument.
+    let empty_descriptors = node
+        .rpc_call_with_params(
+            "utxoupdatepsbt",
+            vec![serde_json::json!(psbt), serde_json::json!([])],
+        )
+        .unwrap();
+    let m = empty_descriptors["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !m.contains("ErrorObject") && !m.contains("descriptors"),
+        "an empty descriptor list must be accepted: {empty_descriptors}"
+    );
+}
+
+/// #692: Core's `ParseHashV` reports a wrong-*length* hash as a length error
+/// and a right-length non-hex string as `must be hexadecimal string`. Six
+/// sites built the length message unconditionally, so a caller who typed a
+/// non-hex character was told to count their characters -- and
+/// `getrawtransaction` reported a fixed length of 0 whatever was passed.
+#[test]
+fn hash_arguments_separate_the_length_error_from_the_hex_error() {
+    let node = TestNode::start(&[]);
+
+    // 64 characters, none of them hex.
+    let non_hex = node
+        .rpc_call_with_params(
+            "getblockfrompeer",
+            vec![serde_json::json!("z".repeat(64)), serde_json::json!(0)],
+        )
+        .unwrap();
+    let msg = non_hex["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("must be hexadecimal string"),
+        "a 64-char non-hex string is a hex error, not a length error: {non_hex}"
+    );
+    // Core names this argument `blockhash`, not `hash`.
+    assert!(msg.starts_with("blockhash "), "must use Core's argument name: {msg}");
+
+    // Too short: still a length error, and it reports the real length.
+    let short = node
+        .rpc_call_with_params(
+            "getblockfrompeer",
+            vec![serde_json::json!("abc"), serde_json::json!(0)],
+        )
+        .unwrap();
+    let msg = short["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("must be of length 64 (not 3,"), "{short}");
+
+    // `getrawtransaction` reported "(not 0, for txid)" for every input.
+    let bad_txid = node
+        .rpc_call_with_params("getrawtransaction", vec![serde_json::json!("abc")])
+        .unwrap();
+    let msg = bad_txid["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("parameter 1 must be of length 64 (not 3,"),
+        "the length must be the caller's, not a constant: {bad_txid}"
     );
 }

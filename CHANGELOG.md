@@ -24,6 +24,16 @@ item below is (or will be) written up in full in the in-development
   does. `witness_version` and `witness_program` are omitted for a non-witness
   address instead of reporting `witness_version: -1`; `isscript` is now true
   for Taproot and anchor outputs and absent for an unknown witness version.
+- **Breaking:** `converttopsbt` refuses a transaction carrying signature data
+  unless `permitsigdata` is true, as Core does, instead of silently
+  discarding it (#687).
+- 24 RPCs accept the optional arguments Bitcoin Core declares for them, and
+  an argument error is no longer a Rust `Debug` dump. `submitpackage`,
+  `converttopsbt` and `utxoupdatepsbt` rejected their optional arguments
+  outright (#687).
+- A wrong-length hash and a right-length non-hex string report different
+  errors, as Core's `ParseHashV` does; `getblockfrompeer` names the argument
+  `blockhash`, as Core does (#692).
 
 ### Added
 

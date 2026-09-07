@@ -7,8 +7,6 @@ use serde_json::{json, Value};
 /// Bitcoin Core's `RPC_MISC_ERROR`, the code Core's own `getblockfrompeer`
 /// uses for every one of its rejections.
 const RPC_MISC_ERROR: i32 = -1;
-/// Bitcoin Core's `RPC_INVALID_PARAMETER`.
-const RPC_INVALID_PARAMETER: i32 = -8;
 
 /// `getblockfrompeer "blockhash" ( peer_id )` — ask one peer for one block.
 ///
@@ -45,16 +43,11 @@ pub fn get_block_from_peer(
     hash_str: &str,
     peer_id: Option<PeerId>,
 ) -> Result<Value, (i32, String)> {
-    let hash: BlockHash = hash_str.parse().map_err(|_| {
-        (
-            RPC_INVALID_PARAMETER,
-            format!(
-                "hash must be of length 64 (not {}, for '{}')",
-                hash_str.len(),
-                hash_str
-            ),
-        )
-    })?;
+    // Core names this argument `blockhash` and splits the length error from
+    // the hex error (`ParseHashV`, `blockchain.cpp`); satd named it `hash`
+    // and reported every failure as a length problem, so a caller who typed
+    // a non-hex character was told to count their characters.
+    let hash: BlockHash = crate::rpc::util::parse_hash_v(hash_str, "blockhash")?;
 
     // We must already hold the header: it is what authenticates whatever the
     // peer sends back (see `repair_block_data`).
@@ -236,8 +229,10 @@ mod tests {
     fn rejects_a_malformed_block_hash() {
         let (cs, pm, _b, dir) = fixture(1);
         let (code, msg) = get_block_from_peer(&cs, &pm, "not-a-hash", None).unwrap_err();
-        assert_eq!(code, RPC_INVALID_PARAMETER);
+        // Core's RPC_INVALID_PARAMETER, from `parse_hash_v`.
+        assert_eq!(code, -8);
         assert!(msg.contains("length 64"), "got {msg}");
+        assert!(msg.starts_with("blockhash "), "Core's argument name: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -594,11 +594,9 @@ pub async fn start(
     })?;
 
     module.register_method("getblockhash", |params, ctx, _extensions| {
-        let height: u32 = params.one().map_err(|e| {
-            crate::rpc::error::RpcError::new(-1, "rpc.input.parse", e.to_string())
-                .with_suggestion("Pass a single integer block height argument.")
-                .into_error_object()
-        })?;
+        let mut args = Args::new(&params);
+        let height: u32 = args.required("height")?;
+        args.check()?;
         let tip = ctx.chain_state.tip_height();
         blockchain::get_block_hash(&ctx.chain_state, height).map_err(|e| {
             crate::rpc::error::RpcError::new(-8, "rpc.input.range", e)
@@ -846,24 +844,24 @@ pub async fn start(
     })?;
 
     module.register_method("preciousblock", |params, _ctx, _extensions| {
-        let hash: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
+        args.check()?;
         blockchain::precious_block(&hash).map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
     })?;
 
     module.register_method("invalidateblock", |params, ctx, _extensions| {
-        let hash: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
+        args.check()?;
         blockchain::invalidate_block(&ctx.chain_state, &hash)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("reconsiderblock", |params, ctx, _extensions| {
-        let hash: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hash: String = args.required("blockhash")?;
+        args.check()?;
         blockchain::reconsider_block(&ctx.chain_state, &hash)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -956,9 +954,9 @@ pub async fn start(
     })?;
 
     module.register_method("loadtxoutset", |params, ctx, _extensions| {
-        let path: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let path: String = args.required("path")?;
+        args.check()?;
         // Network datadir (parent of chainstate/) and prune target from
         // the effective config. For mainnet — the only network with
         // AssumeUTXO anchors — the network datadir is the base datadir.
@@ -990,25 +988,31 @@ pub async fn start(
     // --- Address-history index RPCs (M3) ---
 
     module.register_method("getaddressbalance", |params, ctx, _extensions| {
-        let v: serde_json::Value = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let v = args.raw("address")?.ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "Missing required argument address", None::<()>)
+        })?;
+        args.check()?;
         address::get_address_balance(&ctx.address_index, &v, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("getaddresshistory", |params, ctx, _extensions| {
-        let v: serde_json::Value = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let v = args.raw("address")?.ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "Missing required argument address", None::<()>)
+        })?;
+        args.check()?;
         address::get_address_history(&ctx.address_index, &v, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("getaddressutxos", |params, ctx, _extensions| {
-        let v: serde_json::Value = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let v = args.raw("address")?.ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "Missing required argument address", None::<()>)
+        })?;
+        args.check()?;
         address::get_address_utxos(&ctx.address_index, &v, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1094,9 +1098,9 @@ pub async fn start(
     })?;
 
     module.register_method("backfillindex", |params, ctx, _extensions| {
-        let target: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let target: String = args.required("index_name")?;
+        args.check()?;
         indexes::backfill_index(
             ctx.backfill.as_ref(),
             ctx.backfill_cmd_tx.as_ref(),
@@ -1117,9 +1121,9 @@ pub async fn start(
     })?;
 
     module.register_method("pauseindex", |params, ctx, _extensions| {
-        let target: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let target: String = args.required("index_name")?;
+        args.check()?;
         indexes::pause_index(
             ctx.backfill.as_ref(),
             &target,
@@ -1131,9 +1135,9 @@ pub async fn start(
     })?;
 
     module.register_method("resumeindex", |params, ctx, _extensions| {
-        let target: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let target: String = args.required("index_name")?;
+        args.check()?;
         indexes::resume_index(
             ctx.backfill.as_ref(),
             &target,
@@ -1145,9 +1149,9 @@ pub async fn start(
     })?;
 
     module.register_method("cancelindex", |params, ctx, _extensions| {
-        let target: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let target: String = args.required("index_name")?;
+        args.check()?;
         indexes::cancel_index(
             ctx.backfill.as_ref(),
             &target,
@@ -1339,9 +1343,9 @@ pub async fn start(
     })?;
 
     module.register_method("submitheader", |params, ctx, _extensions| {
-        let hex_header: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hex_header: String = args.required("hexdata")?;
+        args.check()?;
         mining::submit_header(&ctx.chain_state, &hex_header)
             .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
     })?;
@@ -1685,17 +1689,17 @@ pub async fn start(
     })?;
 
     module.register_method("combinerawtransaction", |params, _ctx, _extensions| {
-        let hex_txs: Vec<String> = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hex_txs: Vec<String> = args.required("txs")?;
+        args.check()?;
         rawtx::combine_raw_transaction(&hex_txs)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("decodescript", |params, _ctx, _extensions| {
-        let hex_script: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let hex_script: String = args.required("hexstring")?;
+        args.check()?;
         rawtx::decode_script(&hex_script)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1827,9 +1831,33 @@ pub async fn start(
 
     // --- submitpackage RPC ---
     module.register_method("submitpackage", |params, ctx, _extensions| {
-        let rawtxs: Vec<String> = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let rawtxs: Vec<String> = args.required("package")?;
+        // Core's `maxfeerate` (default 0.10 BTC/kvB) and `maxburnamount`
+        // (default 0) are the caller's own safety limits. satd applies
+        // neither to a package yet, and silently accepting a limit it does
+        // not enforce is the one failure mode worth avoiding here: a client
+        // passing `maxburnamount` to protect itself would get no protection
+        // and no warning. Read the slots so a Core-shaped call is no longer
+        // rejected outright, then refuse a supplied value by name.
+        let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
+        let maxburnamount_raw: Option<serde_json::Value> = args.raw("maxburnamount")?;
+        args.check()?;
+        for (name, given) in
+            [("maxfeerate", &maxfeerate_raw), ("maxburnamount", &maxburnamount_raw)]
+        {
+            if given.is_some() {
+                return Err(ErrorObjectOwned::owned(
+                    -8,
+                    format!(
+                        "{name} is not yet applied to a package by this node; \
+                         omit it or submit the transactions individually with \
+                         sendrawtransaction, which does enforce it"
+                    ),
+                    None::<()>,
+                ));
+            }
+        }
 
         // Decode all transactions.
         let mut txs = Vec::with_capacity(rawtxs.len());
@@ -1878,25 +1906,25 @@ pub async fn start(
     })?;
 
     module.register_method("decodepsbt", |params, _ctx, _extensions| {
-        let psbt_b64: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let psbt_b64: String = args.required("psbt")?;
+        args.check()?;
         psbt::decode_psbt(&psbt_b64)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("analyzepsbt", |params, _ctx, _extensions| {
-        let psbt_b64: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let psbt_b64: String = args.required("psbt")?;
+        args.check()?;
         psbt::analyze_psbt(&psbt_b64)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("combinepsbt", |params, _ctx, _extensions| {
-        let psbt_b64s: Vec<String> = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let psbt_b64s: Vec<String> = args.required("txs")?;
+        args.check()?;
         psbt::combine_psbt(&psbt_b64s)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1912,25 +1940,56 @@ pub async fn start(
     })?;
 
     module.register_method("converttopsbt", |params, _ctx, _extensions| {
-        let hex_tx: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
-        psbt::convert_to_psbt(&hex_tx)
+        let mut args = Args::new(&params);
+        let hex_tx: String = args.required("hexstring")?;
+        // Core defaults `permitsigdata` to *false* and refuses a transaction
+        // carrying signatures rather than discarding them silently
+        // (`rawtransaction.cpp`). satd discarded them unconditionally, so a
+        // caller could lose signature data by asking for a format
+        // conversion.
+        let permit_sigdata: bool = args.optional_or("permitsigdata", false)?;
+        // `iswitness` selects the decode mode. satd's decoder auto-detects,
+        // which is Core's behaviour when the argument is omitted; honouring
+        // an explicit value needs a single-mode decoder, so refuse it rather
+        // than accept a flag that changes nothing.
+        let iswitness: Option<bool> = args.optional("iswitness")?;
+        args.check()?;
+        if iswitness.is_some() {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "iswitness is not supported by this node; omit it and the \
+                 transaction encoding is detected automatically",
+                None::<()>,
+            ));
+        }
+        psbt::convert_to_psbt(&hex_tx, permit_sigdata)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("joinpsbts", |params, _ctx, _extensions| {
-        let psbt_b64s: Vec<String> = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let psbt_b64s: Vec<String> = args.required("txs")?;
+        args.check()?;
         psbt::join_psbts(&psbt_b64s)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("utxoupdatepsbt", |params, ctx, _extensions| {
-        let psbt_b64: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let psbt_b64: String = args.required("psbt")?;
+        // Core's `descriptors` supplies output descriptors used to fill in
+        // key origin data. satd fills the UTXOs only, so an empty list is a
+        // faithful no-op and a populated one is refused rather than ignored.
+        let descriptors: Option<Vec<serde_json::Value>> = args.optional("descriptors")?;
+        args.check()?;
+        if descriptors.is_some_and(|d| !d.is_empty()) {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "descriptors are not supported by this node; utxoupdatepsbt \
+                 fills in UTXOs only",
+                None::<()>,
+            ));
+        }
         psbt::utxo_update_psbt(&ctx.chain_state, &psbt_b64)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -1965,9 +2024,9 @@ pub async fn start(
     })?;
 
     module.register_method("verifytxoutproof", |params, ctx, _extensions| {
-        let proof_hex: String = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let proof_hex: String = args.required("proof")?;
+        args.check()?;
         rawtx::verify_tx_out_proof(&ctx.chain_state, &proof_hex)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
@@ -2459,9 +2518,9 @@ pub async fn start(
     })?;
 
     module.register_method("setnetworkactive", |params, ctx, _extensions| {
-        let active: bool = params
-            .one()
-            .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<()>))?;
+        let mut args = Args::new(&params);
+        let active: bool = args.required("state")?;
+        args.check()?;
         ctx.peer_manager.set_network_active(active);
         // Core returns the resulting state.
         Ok::<_, ErrorObjectOwned>(serde_json::json!(ctx.peer_manager.is_network_active()))

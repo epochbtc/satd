@@ -358,13 +358,25 @@ fn try_finalize_input(input: &mut bitcoin::psbt::Input) {
 }
 
 /// `converttopsbt` — convert a raw transaction to PSBT format.
-pub fn convert_to_psbt(hex_tx: &str) -> Result<Value, (i32, String)> {
+///
+/// `permit_sigdata` is Core's `permitsigdata`, and it defaults to **false**:
+/// a transaction carrying signatures is refused rather than silently
+/// stripped, because the conversion is lossy and the caller may not have
+/// meant to discard them (`rawtransaction.cpp`, `Inputs must not have
+/// scriptSigs and scriptWitnesses`).
+pub fn convert_to_psbt(hex_tx: &str, permit_sigdata: bool) -> Result<Value, (i32, String)> {
     let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
     let mut tx: Transaction =
         bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| (-22, "TX decode failed".to_string()))?;
 
     // Clear scriptSigs and witnesses for the PSBT unsigned tx
     for input in &mut tx.input {
+        if !permit_sigdata && (!input.script_sig.is_empty() || !input.witness.is_empty()) {
+            return Err((
+                -22,
+                "Inputs must not have scriptSigs and scriptWitnesses".to_string(),
+            ));
+        }
         input.script_sig = bitcoin::ScriptBuf::new();
         input.witness = Witness::new();
     }

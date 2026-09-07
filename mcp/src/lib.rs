@@ -169,7 +169,7 @@ struct SendTransactionParams {
 struct PsbtWorkflowParams {
     #[schemars(description = "PSBT action: 'create', 'decode', 'analyze', 'combine', 'finalize', 'update', 'convert', 'join'")]
     action: String,
-    #[schemars(description = "Action-specific parameters (psbt, inputs, outputs, psbts, extract, hex_tx, descriptors)")]
+    #[schemars(description = "Action-specific parameters (psbt, inputs, outputs, psbts, extract, hex_tx, permit_sigdata, descriptors)")]
     params: Option<Value>,
 }
 
