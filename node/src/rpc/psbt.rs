@@ -195,12 +195,38 @@ pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
 fn total_input_value(psbt: &Psbt) -> Option<Amount> {
     let mut total = Amount::ZERO;
     for (i, input) in psbt.inputs.iter().enumerate() {
-        let value = match (&input.witness_utxo, &input.non_witness_utxo) {
-            (Some(txout), _) => txout.value,
-            (None, Some(tx)) => {
-                let vout = psbt.unsigned_tx.input.get(i)?.previous_output.vout as usize;
-                tx.output.get(vout)?.value
+        let prevout = psbt.unsigned_tx.input.get(i)?.previous_output;
+        // Core's `PartiallySignedTransaction::GetInputUTXO` (`src/psbt.cpp`),
+        // which is what `AnalyzePSBT` reads the amounts through:
+        //
+        //     if (input.non_witness_utxo) {
+        //         if (prevout_index >= input.non_witness_utxo->vout.size()) return false;
+        //         if (input.non_witness_utxo->GetHash() != tx->vin[i].prevout.hash) return false;
+        //         utxo = input.non_witness_utxo->vout[prevout_index];
+        //     } else if (!input.witness_utxo.IsNull()) {
+        //         utxo = input.witness_utxo;
+        //     } else { return false; }
+        //
+        // Two things this had backwards. The `non_witness_utxo` wins where one
+        // is present, not the `witness_utxo`; and it is only usable once its
+        // txid has been checked against the input's own `previous_output`.
+        //
+        // Without that check the value is whatever the PSBT's author wrote.
+        // A PSBT handed to a user for inspection could carry a
+        // `non_witness_utxo` that is not the transaction being spent -- or a
+        // `witness_utxo` disagreeing with a correct `non_witness_utxo` -- and
+        // `decodepsbt.fee` / `analyzepsbt.fee` would report a plausible, small
+        // number derived from it. Core omits the field entirely in that case,
+        // which is the signal to go and look. Both RPCs are `Read`, so this is
+        // reachable on the read-only listener.
+        let value = match (&input.non_witness_utxo, &input.witness_utxo) {
+            (Some(tx), _) => {
+                if tx.compute_txid() != prevout.txid {
+                    return None;
+                }
+                tx.output.get(prevout.vout as usize)?.value
             }
+            (None, Some(txout)) => txout.value,
             (None, None) => return None,
         };
         total = total.checked_add(value)?;
@@ -269,16 +295,29 @@ pub fn analyze_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
     Ok(json!({
         "inputs": inputs,
         "estimated_vsize": estimated_vsize,
-        // Core reports the feerate in BTC/kvB alongside the fee, and both
-        // only when every input's UTXO is known. Both were unconditional
-        // `null` while the `witness_utxo` values were already being read a
-        // few lines above.
-        "estimated_feerate": match fee {
-            Some(fee) if estimated_vsize > 0 => {
-                json!((fee.to_sat() as f64 / 100_000_000.0) * 1000.0 / estimated_vsize as f64)
-            }
-            _ => Value::Null,
-        },
+        // `estimated_feerate` stays null, deliberately.
+        //
+        // Core derives it from a *dummy-signed* transaction: `AnalyzePSBT`
+        // (`src/node/psbt.cpp`) signs every input with
+        // `DUMMY_SIGNING_PROVIDER`, measures `GetVirtualTransactionSize` of
+        // the result, and only then computes `CFeeRate(fee, size)`. If the
+        // dummy signing fails for any input it emits neither
+        // `estimated_vsize` nor `estimated_feerate`.
+        //
+        // satd has no dummy signing provider, so the only size available here
+        // is the *unsigned* one -- which is what `estimated_vsize` above has
+        // always reported, and it is smaller than the signed transaction by
+        // the whole witness. Dividing the fee by it produces a feerate that is
+        // systematically too high: a 1-in/2-out P2WPKH spend serialises to 114
+        // bytes unsigned against ~141 vB signed, so the reported rate would
+        // overstate by ~24%, and by more as inputs are added. A signer sizing
+        // a fee off that number underpays.
+        //
+        // A wrong feerate on the one field a signer checks before committing
+        // funds is worse than an absent one, which is exactly the principle
+        // the rest of this change applies. Recorded in CORE_DIFFERENCES.md
+        // along with `estimated_vsize`'s own inaccuracy.
+        "estimated_feerate": Value::Null,
         "fee": match fee {
             Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
             None => Value::Null,
@@ -490,4 +529,92 @@ pub fn utxo_update_psbt(
     }
 
     Ok(Value::String(psbt_to_base64(&psbt)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Core reads a PSBT input's amount through `GetInputUTXO`, which prefers
+    /// the `non_witness_utxo` and only after checking its txid against the
+    /// input's own `previous_output`. Reading the `witness_utxo` first, and
+    /// never checking the txid, meant a PSBT's author chose the fee that
+    /// `decodepsbt`/`analyzepsbt` reported -- on a `Read` surface.
+    #[test]
+    fn psbt_input_values_follow_cores_get_input_utxo() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let funding = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let funding_txid = funding.compute_txid();
+
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let analyze = |psbt: &Psbt| {
+            analyze_psbt(&psbt_to_base64(psbt)).expect("analyzes")
+        };
+
+        // The honest PSBT: a matching non_witness_utxo, fee 0.01 BTC.
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned.clone()).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(funding.clone());
+        let out = analyze(&psbt);
+        assert_eq!(out["fee"], json!(0.01), "{out}");
+
+        // A `witness_utxo` disagreeing with a correct `non_witness_utxo` must
+        // not be the one read: Core takes the non_witness_utxo.
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned.clone()).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(funding.clone());
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(500_000_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let out = analyze(&psbt);
+        assert_eq!(out["fee"], json!(0.01), "the non_witness_utxo wins: {out}");
+
+        // A non_witness_utxo that is not the transaction being spent: Core
+        // returns false from GetInputUTXO and omits the fee entirely.
+        let other = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_consensus(1),
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert_ne!(other.compute_txid(), funding_txid);
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned.clone()).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(other);
+        let out = analyze(&psbt);
+        assert!(out["fee"].is_null(), "a mismatched txid has no usable value: {out}");
+
+        // And `estimated_feerate` is never reported: satd cannot dummy-sign,
+        // so the only size it has is the unsigned one, and a feerate divided
+        // by that overstates by the whole witness.
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(funding);
+        let out = analyze(&psbt);
+        assert!(out["estimated_feerate"].is_null(), "{out}");
+    }
 }

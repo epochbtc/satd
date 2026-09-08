@@ -2563,9 +2563,12 @@ fn test_blocksonly_and_prune_are_reported() {
     let mut node = TestNode::start(&["--prune=550"]);
     let chain = node.rpc_call("getblockchaininfo").unwrap()["result"].clone();
     assert_eq!(chain["pruned"], serde_json::json!(true), "{chain}");
+    // MiB, as Core's `-prune` is: `nPruneArg * 1024 * 1024`, reported verbatim.
+    // satd used to report `mb * 1_000_000`, 4.9% under Core on the byte budget
+    // an operator sizes a disk against.
     assert_eq!(
         chain["prune_target_size"],
-        serde_json::json!(550_000_000u64),
+        serde_json::json!(576_716_800u64),
         "{chain}"
     );
     assert_eq!(chain["automatic_pruning"], serde_json::json!(true), "{chain}");

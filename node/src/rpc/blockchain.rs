@@ -159,8 +159,17 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     // than always appearing. `pruneheight` is deliberately absent: satd keeps
     // no prune floor to read, and deriving one would mean walking the chain
     // on every call. Recorded in CORE_DIFFERENCES.md.
-    if let Some(mb) = prune_target_mb {
-        out["prune_target_size"] = json!(mb.saturating_mul(1_000_000));
+    if let Some(mib) = prune_target_mb {
+        // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes
+        // `uint64_t(nPruneArg) * 1024 * 1024` and `getblockchaininfo` reports
+        // that number verbatim. satd reported `mb * 1_000_000`, so `-prune=550`
+        // came back as 550,000,000 against Core's 576,716,800 — a 4.9%
+        // divergence on a byte budget an operator sizes a disk against.
+        out["prune_target_size"] = json!(mib.saturating_mul(1024 * 1024));
+        // satd has no manual-pruning mode (no `pruneblockchain` RPC), so every
+        // pruning node prunes automatically. Core's `-prune=1` — its spelling
+        // for manual pruning — is refused at startup rather than silently
+        // taken as a 1 MiB budget, so it cannot reach here.
         out["automatic_pruning"] = json!(true);
     }
     out
@@ -1310,7 +1319,12 @@ pub fn save_mempool(
         Ok(_) => Ok(json!({
             "filename": net_datadir.join("mempool.dat").to_string_lossy(),
         })),
-        Err(e) => Err((-1, format!("Unable to dump mempool to disk: {e}"))),
+        // Core's message verbatim (`src/rpc/mempool.cpp`); `mempool_persist.py`
+        // compares it exactly, and the OS error satd appended is in the log.
+        Err(e) => {
+            tracing::warn!(error = %e, "savemempool: could not write mempool.dat");
+            Err((-1, "Unable to dump mempool to disk".to_string()))
+        }
     }
 }
 

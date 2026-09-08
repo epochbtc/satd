@@ -1126,23 +1126,15 @@ pub async fn start(
             if p.is_absolute() {
                 p.to_path_buf()
             } else {
-                let base = ctx
-                    .effective_config
-                    .get("datadir")
-                    .and_then(|v| v.as_str())
-                    .map(std::path::PathBuf::from)
+                // One mapping, not a copy per call site: `savemempool` writes
+                // the file the node reads back at startup, and a subdirectory
+                // the two disagreed about would be a `savemempool` that
+                // reported success into a directory nothing ever reads.
+                net_datadir_from(ctx)
                     .ok_or_else(|| {
                         ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>)
-                    })?;
-                // Core's chain subdir (`ArgsManager::GetDataDirNet`);
-                // mainnet has none.
-                match ctx.chain_state.network {
-                    bitcoin::Network::Bitcoin => base.join(p),
-                    bitcoin::Network::Testnet => base.join("testnet3").join(p),
-                    bitcoin::Network::Testnet4 => base.join("testnet4").join(p),
-                    bitcoin::Network::Signet => base.join("signet").join(p),
-                    bitcoin::Network::Regtest => base.join("regtest").join(p),
-                }
+                    })?
+                    .join(p)
             }
         };
         blockchain::dump_txout_set(&ctx.chain_state, &resolved.to_string_lossy())

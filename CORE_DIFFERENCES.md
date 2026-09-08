@@ -560,6 +560,35 @@ silently returning an empty or wrong answer.
   `getpeerinfo.inflight` (the real per-peer set is the IBD scheduler's, surfaced
   by `getibdprogress.peer_download_stats[].assigned`).
 
+- **`analyzepsbt.estimated_vsize` / `.estimated_feerate`** — Core measures a
+  *dummy-signed* transaction: `AnalyzePSBT` (`src/node/psbt.cpp`) signs every
+  input with `DUMMY_SIGNING_PROVIDER`, takes `GetVirtualTransactionSize` of the
+  result, and computes `CFeeRate(fee, size)` from it — omitting both fields
+  when the dummy signing fails for any input.
+
+  satd has no dummy signing provider. `estimated_vsize` is therefore the
+  *unsigned* size, which understates a signed transaction by the whole witness
+  (a 1-in/2-out P2WPKH spend is 114 bytes unsigned against ~141 vB signed).
+  `estimated_feerate` is `null` rather than that fee divided by that size:
+  the quotient overstates the real rate by ~24% on that example and by more as
+  inputs are added, and a wrong number on the one field a signer checks before
+  committing funds is worse than an absent one.
+
+- **`-prune=1`** — Core's spelling for *manual* pruning
+  (`PRUNE_TARGET_MANUAL`), where the node prunes only on a `pruneblockchain`
+  call. satd has no `pruneblockchain` RPC, so it refuses `-prune=1` at startup
+  rather than reading it as a 1 MiB budget — which would put the node on its
+  288-block floor and delete block data automatically, the opposite of what the
+  operator asked for. Every other `-prune=<n>` is automatic pruning, in MiB as
+  Core's is, so `getblockchaininfo.automatic_pruning` is always true on a
+  pruning satd node.
+
+- **`savemempool`** — Core refuses with `-1 The mempool was not loaded yet`
+  when `CTxMemPool::GetLoadTried()` is false. satd attempts the load
+  unconditionally at startup and has no such flag, so the precondition has
+  nothing to read and the call proceeds. The failure message is Core's
+  verbatim; the OS error goes to the log rather than into the RPC reply.
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index

@@ -4088,9 +4088,11 @@ impl PeerManager {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
 
-        // Compute keep_blocks from prune target.
+        // Compute keep_blocks from the prune target. `-prune` is in **MiB**,
+        // as Core's is (`blockmanager_args.cpp`: `nPruneArg * 1024 * 1024`);
+        // the 2 MiB divisor is an average-block-size assumption, not a unit.
         let keep_blocks: u32 = if prune_target_mb > 0 {
-            ((prune_target_mb * 1_000_000 / (2 * 1_000_000)) as u32).max(288)
+            ((prune_target_mb * 1024 * 1024 / (2 * 1024 * 1024)) as u32).max(288)
         } else {
             0
         };
