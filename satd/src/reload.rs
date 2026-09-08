@@ -105,12 +105,19 @@ fn consumed_from_reloaded_config(_c: &Config, _h: &ReloadHandles) {}
 /// entry from the file does NOT disconnect that peer (matches Core's `-addnode`:
 /// use `disconnectnode` for that). Runs inside the tokio runtime (the reload is
 /// driven from the main select loop), so `tokio::spawn` is valid here.
-fn dial_added_peers(old: &[String], new: &[String], pm: &Arc<PeerManager>, label: &'static str) {
+fn dial_added_peers(
+    old: &[String],
+    new: &[String],
+    pm: &Arc<PeerManager>,
+    network: bitcoin::Network,
+    label: &'static str,
+) {
+    let default_port = node::net::peer::default_p2p_port(network);
     for addr_str in new {
         if old.iter().any(|o| o == addr_str) {
             continue;
         }
-        match node::net::peer::PeerAddr::parse(addr_str) {
+        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_port) {
             Ok(addr) => {
                 pm.add_peer_addr(addr.clone());
                 let pm = pm.clone();
@@ -708,7 +715,7 @@ fn field_specs() -> Vec<FieldSpec> {
                 // specific peers -- and still refusing to after they removed
                 // the pin.
                 h.peer_manager.set_automatic_outbound(new.automatic_outbound);
-                dial_added_peers(&old.connect, &new.connect, &h.peer_manager, "connect");
+                dial_added_peers(&old.connect, &new.connect, &h.peer_manager, new.network, "connect");
             })),
             sensitive: false,
         },
@@ -716,6 +723,7 @@ fn field_specs() -> Vec<FieldSpec> {
             &old.addnode,
             &new.addnode,
             &h.peer_manager,
+            new.network,
             "addnode"
         )),
         live_delta!("seednode", seednode, dial_added_seednodes),

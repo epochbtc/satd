@@ -174,7 +174,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `listen` | on | restart | core | Accept P2P connections. |
+| `listen` | on (see note) | restart | core | Accept P2P connections. The default is *soft*, as in Core: a node given any `connect` (including `connect=0` / `-noconnect`), or `maxconnections=0`, does not accept inbound either, since a node pinned to specific peers has not asked to be reachable. `bind` or `whitebind` raises it back, and an explicit `listen` — flag or config file — beats both. |
 | `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); change it at runtime with the `setnetworkactive` RPC. |
 | `blocksonly` | false | hot | core | Suppress P2P transaction relay; locally-submitted txs still relayed. |
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
@@ -187,8 +187,8 @@ startup error.
 | `asmap` | none | restart | core | asmap file for ASN-based addrman bucketing (eclipse resistance). |
 | `port` | network default | restart | core | P2P listen port. |
 | `bind` | `0.0.0.0` | restart | core | Bind P2P to this address; **repeatable**. Accepts `addr`, `addr:port`, and `addr[:port]=onion`. An entry with a port uses it; a bare address takes `port`, and a bare `=onion` entry takes `port` + 1 (as in Core). IPv6 literals may be plain (`::1`) or bracketed. Any explicit `bind` replaces the default listener. Cannot be combined with `listen=0`. |
-| `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). Any `connect` stops the node dialling addresses it learns from gossip; `connect=0` is Core's spelling for "open no outbound connections at all". Connect-only *exclusivity* is a startup decision (restart to change). |
-| `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding). |
+| `connect` | none | hot | core | Connect only to specific peer(s) (repeatable). An entry with no port takes the network's default P2P port. Any `connect` stops the node dialling addresses it learns from gossip and soft-sets `listen=0` (see `listen`); `connect=0` — and the command-line negation `-noconnect` — is Core's spelling for "open no outbound connections at all". Connect-only *exclusivity* is a startup decision (restart to change). |
+| `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding, and does not affect `listen`). An entry with no port takes the network's default P2P port. |
 | `uacomment` | none | restart | core | Append a comment to the advertised user agent (**repeatable**; command-line and config-file values accumulate, command line first). Renders as `/satd:<version>(c1; c2)/`. A comment may contain only alphanumerics and `` .,;-_?@`` — the user agent's own delimiters `/`, `:`, `(` and `)` are refused — and the whole user agent may not exceed 256 bytes. Either violation is a startup error, as in Core. |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
 | `maxconnections` | 125 | hot | core | Maximum total connections. |

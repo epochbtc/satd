@@ -2045,7 +2045,13 @@ impl Config {
             return Err("--rpcdisableauth=1 requires --rpcmtls=1".to_string());
         }
 
-        let listen = cli
+        // Core's `-listen` is a *soft* default: `InitParameterInteraction`
+        // lowers it to 0 for a `-connect`-pinned node, and a `-bind` /
+        // `-whitebind` raises it back to 1. `SoftSetBoolArg` only writes when
+        // the operator did not, so an explicit setting always wins -- which
+        // means the interaction below needs to know whether there was one.
+        let listen_explicit = cli.listen.is_some() || file_get("listen").is_some();
+        let mut listen = cli
             .listen
             .or_else(|| file_get("listen").and_then(|v| parse_bool(&v)))
             .unwrap_or(true);
@@ -2183,12 +2189,13 @@ impl Config {
         // -bind: every listener the operator asked for. An explicit -bind
         // replaces the default listener entirely, as in Core -- it does not
         // add to it.
+        let bind_raw: Vec<String> = if !cli.bind.is_empty() {
+            cli.bind.clone()
+        } else {
+            file_get_all("bind")
+        };
         let binds: Vec<BindSpec> = {
-            let raw: Vec<String> = if !cli.bind.is_empty() {
-                cli.bind.clone()
-            } else {
-                file_get_all("bind")
-            };
+            let raw = &bind_raw;
             // Core refuses this combination outright ("Cannot set -bind or
             // -whitebind together with -listen=0"). Accepting it would start a
             // node that binds nothing while its config plainly names listeners
@@ -2291,6 +2298,33 @@ impl Config {
             connect.clear();
         }
         let named_connect_peers = if connect.is_empty() { 0 } else { named_connect_peers };
+
+        // Core's `InitParameterInteraction` (`src/init.cpp`): a node told to
+        // dial specific peers -- or told to dial none at all -- does not
+        // accept inbound connections by default either. satd implements the
+        // sibling `-dnsseed=0` half of the same interaction (via
+        // `automatic_outbound`) but defaulted `listen` to true unconditionally,
+        // so a `-connect`-pinned satd still took inbound where Core would not.
+        // That is the opposite of what an operator pinning a node asks for.
+        //
+        // The three soft-set rules Core applies, in Core's order:
+        //   -bind / -whitebind  -> listen = 1
+        //   -connect (set or negated), or maxconnections <= 0 -> listen = 0
+        // and an explicit -listen beats both. satd refuses -bind together with
+        // an explicit -listen=0 (below), so the -bind half only ever has to
+        // hold the default up, never contradict the operator.
+        // Hoisted out of the struct literal: the interaction below reads it,
+        // and Core's own condition is `-connect OR maxconnections <= 0`.
+        let maxconnections: usize = cli
+            .maxconnections
+            .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
+            .or(profile_defaults.maxconnections)
+            .unwrap_or(125);
+        let binds_requested = !bind_raw.is_empty() || !whitebind_raw.is_empty();
+        if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0)
+        {
+            listen = false;
+        }
 
         // Computed here rather than inline in the struct below, because the
         // default reads `connect`, which the struct literal has already moved
@@ -3417,11 +3451,7 @@ impl Config {
             check_block_index: cli
                 .checkblockindex
                 .unwrap_or(network == Network::Regtest),
-            maxconnections: cli
-                .maxconnections
-                .or_else(|| file_get("maxconnections").and_then(|v| v.parse().ok()))
-                .or(profile_defaults.maxconnections)
-                .unwrap_or(125),
+            maxconnections,
             maxinboundperip: cli
                 .maxinboundperip
                 .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
@@ -6340,6 +6370,25 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                 }
             }
 
+            // `-noconnect`: Core's `IsArgNegated("-connect")`, which
+            // `InitParameterInteraction` and `AppInitMain` treat exactly like
+            // a `-connect` — "make no automatic connections", with no address
+            // to dial. That is what `-connect=0` already means here, so the
+            // negation is rewritten to it rather than given a second path.
+            //
+            // `connect` is a `Vec<String>`, so it is not in
+            // `NEGATABLE_BOOL_FLAGS` and cannot be handled by the generic
+            // rewrite above. Only the forms whose meaning is unambiguous are
+            // translated: `-noconnect=0` is Core's double negation, which
+            // resolves to the *address* `1` and dials it, and reproducing that
+            // is worse than letting clap reject the spelling.
+            if arg.starts_with('-') {
+                let stripped = arg.trim_start_matches('-');
+                if stripped == "noconnect" || stripped == "noconnect=1" {
+                    return "--connect=0".to_string();
+                }
+            }
+
             // Special handling for `-noincludeconf` negation, matching
             // Bitcoin Core's `ParseParameters`.  `includeconf` is not in
             // `NEGATABLE_BOOL_FLAGS` (it is a Vec<String>), but Core
@@ -8240,14 +8289,12 @@ bind=127.0.0.1:9002
     }
 
     /// The negated form of an option satd *implements* must never be dropped.
-    /// `-noconnect` is a standard Core idiom for "make no automatic
-    /// connections"; silently discarding it would leave a node the operator
-    /// believes is isolated connecting out normally. satd does not honour the
-    /// negation yet, so the requirement is that it is loud, not that it is
-    /// obeyed.
+    /// Silently discarding it would leave a node the operator believes is
+    /// isolated connecting out normally. `-noconnect` is now obeyed (see
+    /// `noconnect_is_honoured_like_core`); the rest must still be loud.
     #[test]
     fn negated_supported_option_is_not_silently_dropped() {
-        for flag in ["-noconnect", "-noonion", "-noproxy"] {
+        for flag in ["-noonion", "-noproxy"] {
             let args = normalize_args(vec!["satd".to_string(), flag.to_string()]);
             let (kept, warnings) =
                 filter_unsupported_core_cli_args(args).expect("not a fatal key");
@@ -11127,6 +11174,86 @@ rpcport=39999
         let normalized = normalize_args(args.iter().map(|s| s.to_string()).collect());
         let cli = CliArgs::try_parse_from(normalized).map_err(|e| e.to_string())?;
         Config::from_cli(cli)
+    }
+
+    /// Core treats `-noconnect` exactly like a `-connect`: `IsArgNegated`
+    /// gates the same branch in `InitParameterInteraction` and
+    /// `AppInitMain`, with no address to dial. satd used to hard-error on it,
+    /// which was defensible only while it had no way to express "no automatic
+    /// outbound"; `-connect=0` is that expression, so the negation is
+    /// rewritten to it.
+    #[test]
+    fn noconnect_is_honoured_like_core() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+
+        for spelling in ["-noconnect", "--noconnect", "-noconnect=1"] {
+            let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, spelling])
+                .unwrap_or_else(|e| panic!("{spelling} must start a node: {e}"));
+            assert!(
+                !cfg.automatic_outbound,
+                "{spelling} must stop automatic outbound connections"
+            );
+            assert!(cfg.connect.is_empty(), "{spelling} names no peer to dial");
+            // ...and the same `-listen` interaction a `-connect` triggers.
+            assert!(!cfg.listen, "{spelling} must soft-set listen=0 as Core does");
+        }
+
+        // Core's double negation resolves to the address `1` and dials it.
+        // Reproducing that is worse than refusing the spelling, so it stays
+        // loud rather than being silently reinterpreted.
+        assert!(
+            parse_negation(&["satd", "--regtest", "--datadir", dd, "-noconnect=0"]).is_err(),
+            "-noconnect=0 must not be silently reinterpreted"
+        );
+    }
+
+    /// Core's `InitParameterInteraction`: `-connect` (set or negated), or
+    /// `-maxconnections=0`, soft-sets `-listen=0`; `-bind` / `-whitebind`
+    /// soft-sets it back to 1; an explicit `-listen` beats both.
+    #[test]
+    fn connect_soft_sets_listen_off_like_core() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let listen_with = |extra: &[&str]| -> bool {
+            let mut args = vec!["satd", "--regtest", "--datadir", dd];
+            args.extend_from_slice(extra);
+            parse_negation(&args)
+                .unwrap_or_else(|e| panic!("{extra:?} must start a node: {e}"))
+                .listen
+        };
+
+        // No -connect: Core's DEFAULT_LISTEN.
+        assert!(listen_with(&[]), "an unpinned node listens");
+
+        // -connect in any of its spellings lowers it.
+        assert!(!listen_with(&["-connect=1.2.3.4"]), "-connect=<addr>");
+        assert!(!listen_with(&["-connect=0"]), "-connect=0");
+        assert!(!listen_with(&["-maxconnections=0"]), "-maxconnections=0");
+
+        // An explicit -listen wins, from the command line...
+        assert!(listen_with(&["-connect=1.2.3.4", "-listen=1"]), "explicit -listen=1");
+        // ...and -bind holds the default up, as Core's earlier SoftSet does.
+        assert!(listen_with(&["-connect=1.2.3.4", "-bind=127.0.0.1"]), "-bind");
+        assert!(
+            listen_with(&["-connect=1.2.3.4", "-whitebind=noban@127.0.0.1:19999"]),
+            "-whitebind"
+        );
+
+        // -addnode is not -connect: it does not disable anything.
+        assert!(listen_with(&["-addnode=1.2.3.4"]), "-addnode does not pin the node");
+    }
+
+    /// An explicit `listen=1` in `bitcoin.conf` is as explicit as the flag:
+    /// Core's `SoftSetBoolArg` reads one settings namespace, not just argv.
+    #[test]
+    fn connect_listen_interaction_respects_the_config_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("bitcoin.conf"), "listen=1\n").unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "-connect=1.2.3.4"])
+            .expect("starts");
+        assert!(cfg.listen, "a config-file listen=1 must beat the interaction");
     }
 
     #[test]

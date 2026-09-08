@@ -25,12 +25,6 @@ impl PeerAddr {
         }
     }
 
-    /// Try to parse a string as a PeerAddr.
-    /// Handles "host:port" where host can be a .onion address or IP.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        Self::parse_with_default_port(s, 8333)
-    }
-
     /// Parse an address string, using `default_port` when the input has no port.
     /// Matches Core's `LookupHost` which resolves shorthand IPs and appends the
     /// network's default port when none is specified.
