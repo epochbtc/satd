@@ -160,12 +160,46 @@ impl NetPermissions {
                 _ => {}
             }
         }
-        // Core's `TryParsePermissionFlags`: "if (connection_direction ==
-        // ConnectionDirection::None) connection_direction = In".
+        let perms = Self::parse_list(s)?;
+        // Core's `TryParsePermissionFlags` (`src/net_permissions.cpp`):
+        //
+        //     if (connection_direction == ConnectionDirection::None) {
+        //         connection_direction = ConnectionDirection::In;
+        //     } else if (flags == NetPermissionFlags::None) {
+        //         error = "Only direction was set, no permissions: '<str>'";
+        //         return false;
+        //     }
+        //
+        // The second branch matters: `-whitelist=out@10.0.0.0/8` grants
+        // nothing, so accepting it started a node whose operator believed a
+        // grant was in place. Core refuses to start and names the entry.
         if direction == Direction::NONE {
             direction = Direction::IN;
+        } else if perms == Self::NONE {
+            return Err(format!(
+                "only direction was set, no permissions: {s:?}"
+            ));
         }
-        Ok((Self::parse_list(s)?, direction))
+        Ok((perms, direction))
+    }
+
+    /// `-whitebind`'s parse: as [`Self::parse_list_with_direction`], but `out`
+    /// is refused.
+    ///
+    /// Core passes a null `output_connection_direction` for a `-whitebind`
+    /// entry, and `TryParsePermissionFlags` uses exactly that to reject the
+    /// token: a bind address describes where connections *arrive*, so an
+    /// outbound qualifier on one is meaningless. satd swallowed it, so
+    /// `-whitebind=out@127.0.0.1:8333` started a node where Core refuses.
+    pub fn parse_list_for_bind(s: &str) -> Result<Self, String> {
+        if s.split(',').any(|t| t.trim().eq_ignore_ascii_case("out")) {
+            return Err(
+                "whitebind may only be used for incoming connections (\"out\" was passed)"
+                    .to_string(),
+            );
+        }
+        let (perms, _) = Self::parse_list_with_direction(s)?;
+        Ok(perms)
     }
 
     /// Parse a comma-separated permission list (`noban,relay,...` or `all`).
@@ -492,6 +526,45 @@ mod tests {
 
         // `permissions_for_ip` is the inbound spelling, unchanged.
         assert!(permissions_for_ip(&inbound_only, ip).noban);
+    }
+
+    /// Core refuses an entry that sets only a direction, because such an entry
+    /// grants nothing:
+    ///
+    /// ```cpp
+    /// } else if (flags == NetPermissionFlags::None) {
+    ///     error = strprintf(_("Only direction was set, no permissions: '%s'"), str);
+    ///     return false;
+    /// }
+    /// ```
+    ///
+    /// Accepting it started a node whose operator believed a grant was in
+    /// place. And `-whitebind` refuses `out` outright — Core passes a null
+    /// `output_connection_direction` for a bind entry, since a bind address
+    /// describes where connections *arrive*.
+    #[test]
+    fn a_direction_without_permissions_is_refused() {
+        for entry in ["out", "in", "in,out", " out "] {
+            let err = NetPermissions::parse_list_with_direction(entry)
+                .expect_err("{entry:?} grants nothing and must be refused");
+            assert!(err.contains("no permissions"), "{entry:?}: {err}");
+        }
+
+        // A direction *with* a permission is fine, and so is a bare list.
+        assert!(NetPermissions::parse_list_with_direction("noban,out").is_ok());
+        assert!(NetPermissions::parse_list_with_direction("noban").is_ok());
+        // The `@`-form's empty list is Core's "grant nothing" idiom and stays
+        // legal: no direction was set, so the refusal does not apply.
+        assert!(NetPermissions::parse_list_with_direction("").is_ok());
+
+        // `-whitebind` rejects `out` whatever else it carries.
+        let err = NetPermissions::parse_list_for_bind("noban,out")
+            .expect_err("out is meaningless on a bind address");
+        assert!(err.contains("only be used for incoming"), "{err}");
+        assert!(NetPermissions::parse_list_for_bind("noban,in").is_ok());
+        assert!(NetPermissions::parse_list_for_bind("noban").is_ok());
+        // ...and inherits the direction-only refusal.
+        assert!(NetPermissions::parse_list_for_bind("in").is_err());
     }
 
     #[test]

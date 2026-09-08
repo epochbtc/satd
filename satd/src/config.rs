@@ -2130,7 +2130,12 @@ impl Config {
         for raw in &whitebind_raw {
             let (perms, addr_str) = match raw.split_once('@') {
                 Some((p, a)) => (
-                    node::net::permissions::NetPermissions::parse_list(p)
+                    // `-whitebind`'s own parse: Core passes a null
+                    // `output_connection_direction` here, which is what makes
+                    // an `out` token an error rather than a no-op, and a
+                    // direction-only entry an error rather than a silent
+                    // grant of nothing.
+                    node::net::permissions::NetPermissions::parse_list_for_bind(p)
                         .map_err(|e| format!("whitebind: {e}"))?,
                     a.trim(),
                 ),
@@ -2197,6 +2202,10 @@ impl Config {
                 vec![BindSpec {
                     addr: parse_p2p_bind("0.0.0.0", port)?,
                     onion: false,
+                    // The default clearnet listener stands in for an operator
+                    // who named no address at all; failing to bind it is still
+                    // fatal, because the node would then accept nothing.
+                    derived: false,
                 }]
             } else {
                 raw.iter()
@@ -2234,6 +2243,7 @@ impl Config {
                 binds.push(BindSpec {
                     addr: onion_addr,
                     onion: true,
+                    derived: true,
                 });
             }
         }
@@ -7497,6 +7507,13 @@ pub struct BindSpec {
     pub addr: SocketAddr,
     /// `-bind=addr[:port]=onion`: the listener a Tor hidden service points at.
     pub onion: bool,
+    /// True when satd added this listener itself rather than the operator
+    /// naming it — the default onion bind below.
+    ///
+    /// It decides whether a bind failure is fatal. An address the operator
+    /// wrote down must not fail quietly; one satd chose is satd's problem to
+    /// report and step around.
+    pub derived: bool,
 }
 
 impl std::fmt::Display for BindSpec {
@@ -7544,7 +7561,7 @@ pub fn parse_bind_spec(raw: &str, default_port: u16) -> Result<BindSpec, String>
             parse_p2p_bind(addr_part, port)?
         }
     };
-    Ok(BindSpec { addr, onion })
+    Ok(BindSpec { addr, onion, derived: false })
 }
 
 /// Join a `-bind` address and `-port` into a P2P socket address.

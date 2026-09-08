@@ -93,6 +93,11 @@ item below is (or will be) written up in full in the in-development
   and applied every entry in both directions, so `-whitelist=noban@<subnet>`
   made outbound peers in that range un-bannable and exempt from the upload
   budget (#701).
+- **Breaking:** a `-whitelist` entry that sets only a direction and no
+  permission (`-whitelist=out@10.0.0.0/8`) is refused at startup, as Core
+  refuses it — it granted nothing while looking like a grant. `-whitebind`
+  refuses an `out` token outright, also as Core does: a bind address describes
+  where connections arrive (#701).
 - **Security:** a peer arriving over the Tor hidden service is no longer
   matched against `-whitelist`. Tor forwards the service to a local socket, so
   every inbound onion peer looked like a loopback connection and inherited a

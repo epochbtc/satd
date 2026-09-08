@@ -3231,6 +3231,30 @@ async fn main() {
             let onion_listener = spec.onion;
             let listener = match node::net::manager::PeerManager::bind_listener(p2p_addr).await {
                 Ok(l) => l,
+                // A listener satd derived rather than one the operator named
+                // is satd's problem to report and step around, not a reason to
+                // refuse to start. The only derived entry is the default onion
+                // bind: Bitcoin Core adds its equivalent only when there is no
+                // `-bind` at all, so with an explicit `-bind` this is a socket
+                // Core would never have opened, and killing the node over it
+                // would turn a working configuration into a startup failure.
+                //
+                // The degraded outcome is safe: Tor forwards onion
+                // connections to a socket nothing is listening on, so they are
+                // refused. Inbound Tor peers cannot arrive at all, which means
+                // none can arrive indistinguishable from a local one -- the
+                // property the dedicated listener exists to protect.
+                Err(e) if spec.derived => {
+                    tracing::warn!(
+                        bind = %p2p_addr,
+                        error = %e,
+                        "could not bind the default Tor hidden-service listener; \
+                         inbound connections over the hidden service will be refused. \
+                         Name one explicitly with -bind=<addr>:<port>=onion to choose \
+                         a free port."
+                    );
+                    continue;
+                }
                 Err(e) => {
                     eprintln!(
                         "Error: failed to bind P2P listener on {p2p_addr}: {e}\n\
