@@ -7,6 +7,24 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+/// The rewritten spelling of `-noconnect`, kept distinct from the *string*
+/// `"0"`.
+///
+/// Core stores a negation as a boolean `false` settings value
+/// (`InterpretValue`, `src/common/args.cpp`), and `SettingsSpan` skips back to
+/// the last of those. A literal `-connect=0` is stored as the string `"0"`,
+/// for which `isFalse()` is false, so `SettingsSpan` skips nothing and Core
+/// applies a different rule entirely (`src/init.cpp`: "if `connect.size() != 1
+/// || connect[0] != "0"` then these are the outgoing peers"). The two
+/// spellings are different values in Core and have to stay different here;
+/// folding them together made `-connect=<addr> -connect=0` drain the named
+/// peer and silently isolate the node.
+///
+/// A NUL cannot appear in a `-connect` value an operator could write: the
+/// command line is NUL-delimited and the config-file reader stops at the line
+/// end, so no path reaches `connect` carrying one.
+pub(crate) const CONNECT_NEGATED: &str = "\u{0}noconnect";
+
 /// DB cache sizing mode. `Fixed(n)` is the Core-compatible static N-MB budget;
 /// `Auto { max_mb }` lets the adaptive controller grow/shrink the cache based
 /// on system memory pressure, capped at max_mb.
@@ -1968,10 +1986,14 @@ impl Config {
         // (that was satd's original trigger for the hidden service),
         // unless -listenonion=0 overrides. The control-port address
         // defaults to Core's 127.0.0.1:9051 at use time (see main.rs).
-        let listenonion = cli
+        let listenonion_setting = cli
             .listenonion
-            .or_else(|| file_get("listenonion").and_then(|v| parse_bool(&v)))
-            .unwrap_or_else(|| torcontrol.is_some());
+            .or_else(|| file_get("listenonion").and_then(|v| parse_bool(&v)));
+        // Whether the operator named it, so the `-listen=0` interaction below
+        // can soft-set it the way Core's `SoftSetBoolArg` does -- lowering the
+        // default, never overriding a stated value.
+        let listenonion_explicit = listenonion_setting.is_some();
+        let mut listenonion = listenonion_setting.unwrap_or_else(|| torcontrol.is_some());
 
         let rpc_tls_bind = cli.rpctlsbind.or_else(|| file_get("rpctlsbind"));
         let rpc_tls_cert = cli
@@ -2299,20 +2321,50 @@ impl Config {
         // `!GetArgs("-connect").empty() || IsArgNegated("-connect")`.
         let automatic_outbound = connect.is_empty();
 
-        // Which of the named peers survive is `SettingsSpan`
-        // (`src/common/settings.cpp`): `negated()` finds the *last* false
-        // value and `begin()` skips everything up to and including it, so a
-        // negation discards the values before it and leaves the ones after.
+        // Which of the named peers survive a *negation* is `SettingsSpan`
+        // (`src/common/settings.cpp`): `negated()` finds the last false value
+        // and `begin()` skips everything up to and including it, so a negation
+        // discards the values before it and leaves the ones after.
         //
         // Recognising `0` only as a lone value was not enough. `-noconnect`
-        // rewrites to `--connect=0` and `connect` is an appending list, so
-        // `-connect=1.2.3.4 -noconnect` left `["1.2.3.4", "0"]`, the `0`
-        // reached the dialler, and `getaddrinfo("0")` resolved it to
-        // `0.0.0.0` -- reopening the very bug this option's handling was
-        // fixed for, in the one configuration that most clearly means
-        // "connect to nothing".
-        if let Some(last_negation) = connect.iter().rposition(|v| v == "0") {
+        // rewrites to a `connect` entry and `connect` is an appending list, so
+        // `-connect=1.2.3.4 -noconnect` left both, the negation reached the
+        // dialler as an address, and `getaddrinfo` resolved it -- reopening
+        // the very bug this option's handling was fixed for, in the one
+        // configuration that most clearly means "connect to nothing".
+        if let Some(last_negation) = connect.iter().rposition(|v| v == CONNECT_NEGATED) {
             connect.drain(..=last_negation);
+        }
+
+        // The literal string `0` is a different value in Core, and takes a
+        // different rule (`src/init.cpp`):
+        //
+        //     if (connect.size() != 1 || connect[0] != "0") { ...outgoing... }
+        //
+        // Only a *lone* `0` means "and no peers either". Draining on it as
+        // well -- treating it as the negation -- meant `-connect=1.2.3.4
+        // -connect=0` connected to nothing where Core connects to 1.2.3.4:
+        // a silently isolated node, from a config Core starts fine.
+        //
+        // Repeats of it are treated the same way: Core's `size() != 1` test
+        // sends `["0", "0"]` to the resolver, but two spellings of "make no
+        // connections" plainly mean it, and reproducing that resolve is not
+        // parity worth having.
+        if connect.iter().all(|v| v == "0") {
+            connect.clear();
+        } else if let Some(pos) = connect.iter().position(|v| v == "0") {
+            // Core keeps the `0` in the list here and hands it to the
+            // resolver, which answers `0.0.0.0`; the node then dials that
+            // forever. Reproducing a bug is not parity worth having, and
+            // silently dropping the entry would leave the operator believing
+            // a peer was named. Refuse, naming the entry.
+            return Err(format!(
+                "-connect=0 means \"make no connections\" and cannot be combined with a peer \
+                 address; it was given at position {} alongside {} other -connect value(s). \
+                 Use -connect=0 on its own, or -noconnect, to disable outbound connections.",
+                pos + 1,
+                connect.len() - 1
+            ));
         }
 
         // The peer-floor default below reads this: a node told to dial N
@@ -2360,6 +2412,24 @@ impl Config {
         if !listen_explicit && !binds_requested && (!automatic_outbound || maxconnections == 0)
         {
             listen = false;
+        }
+
+        // Core's `-listen=0` in turn soft-sets `-listenonion=0`
+        // (`InitParameterInteraction`, `src/init.cpp`), and it has to: a
+        // hidden service is an inbound surface like any other. satd resolved
+        // `listenonion` independently, so a node that had just been told not
+        // to listen still published a service and accepted peers over it.
+        //
+        // That was reachable without ever writing `-listen=0`: satd defaults
+        // `listenonion` on when `-torcontrol` is set, so
+        // `-connect=<peer> -torcontrol=<addr>` -- a pinned node -- lowered
+        // `listen` by the rule above and kept the onion listener. The
+        // operator asked for a pinned node and got an anonymous inbound
+        // surface.
+        //
+        // Soft, as Core's is: an explicit `-listenonion=1` still wins.
+        if !listen && !listenonion_explicit {
+            listenonion = false;
         }
 
         // Computed here rather than inline in the struct below, because the
@@ -6421,7 +6491,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
             if arg.starts_with('-') {
                 let stripped = arg.trim_start_matches('-');
                 if stripped == "noconnect" || stripped == "noconnect=1" {
-                    return "--connect=0".to_string();
+                    return format!("--connect={CONNECT_NEGATED}");
                 }
             }
 
@@ -11269,7 +11339,6 @@ rpcport=39999
         // The sentinel must never survive into the dial list, in any position.
         for extra in [
             vec!["-connect=1.2.3.4", "-noconnect"],
-            vec!["-connect=1.2.3.4", "-connect=0"],
             vec!["-connect=1.2.3.4", "-connect=5.6.7.8", "-noconnect"],
         ] {
             let (connect, automatic) = connect_of(&extra);
@@ -11293,6 +11362,96 @@ rpcport=39999
         ] {
             assert_eq!(connect_of(&extra).0, expected, "{extra:?}");
         }
+    }
+
+    /// The literal `-connect=0` is not the negation, and conflating them cost
+    /// the node its peers.
+    ///
+    /// Core stores `-noconnect` as a boolean `false` (`InterpretValue`), which
+    /// `SettingsSpan` skips back to, and the literal `"0"` as a string, which
+    /// it does not — the string takes a separate rule in `AppInitMain`:
+    /// `if (connect.size() != 1 || connect[0] != "0") { …these are the
+    /// outgoing peers… }`. So `-connect=1.2.3.4 -connect=0` connects to
+    /// 1.2.3.4 in Core. Draining on the literal too made satd connect to
+    /// nothing: a silently isolated node from a config Core starts fine.
+    ///
+    /// satd will not dial the `0` either — Core hands it to the resolver,
+    /// which answers `0.0.0.0`, and the node dials that forever — so the
+    /// mixed form is refused by name rather than reproduced or silently
+    /// dropped.
+    #[test]
+    fn the_literal_connect_zero_is_not_the_negation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let load = |extra: &[&str]| -> Result<Config, String> {
+            let mut args = vec!["satd", "--regtest", "--datadir", dd];
+            args.extend_from_slice(extra);
+            parse_negation(&args)
+        };
+
+        // Mixed with a real peer: refused, naming the option.
+        for extra in [
+            vec!["-connect=1.2.3.4", "-connect=0"],
+            vec!["-connect=0", "-connect=1.2.3.4"],
+            vec!["-connect=1.2.3.4", "-connect=0", "-connect=5.6.7.8"],
+        ] {
+            let err = load(&extra).expect_err(&format!("{extra:?} must be refused"));
+            assert!(err.contains("-connect=0"), "{extra:?}: {err}");
+        }
+
+        // A negation beside a peer still drains, because it *is* the negation.
+        let cfg = load(&["-connect=1.2.3.4", "-noconnect"]).expect("starts");
+        assert!(cfg.connect.is_empty());
+
+        // And a lone `0` — or only `0`s — still means "no peers", which is
+        // how every Core functional test starts a node.
+        for extra in [vec!["-connect=0"], vec!["-connect=0", "-connect=0"]] {
+            let cfg = load(&extra).unwrap_or_else(|e| panic!("{extra:?} must start: {e}"));
+            assert!(cfg.connect.is_empty(), "{extra:?}");
+            assert!(!cfg.automatic_outbound, "{extra:?}");
+        }
+    }
+
+    /// Core's `-listen=0` soft-sets `-listenonion=0`
+    /// (`InitParameterInteraction`), and it has to: a hidden service is an
+    /// inbound surface like any other.
+    ///
+    /// satd resolved `listenonion` independently of `listen`, and defaults it
+    /// on when `-torcontrol` is set — so `-connect=<peer> -torcontrol=<addr>`
+    /// lowered `listen` by the `-connect` rule and *kept* the onion listener.
+    /// The operator asked for a pinned node and got an anonymous inbound
+    /// surface.
+    #[test]
+    fn listen_zero_soft_sets_listenonion_off() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let load = |extra: &[&str]| -> Config {
+            let mut args = vec!["satd", "--regtest", "--datadir", dd];
+            args.extend_from_slice(extra);
+            parse_negation(&args).unwrap_or_else(|e| panic!("{extra:?} must start: {e}"))
+        };
+
+        // The reachable shape: a pinned node with Tor control configured.
+        let cfg = load(&["-connect=1.2.3.4", "-torcontrol=127.0.0.1:9051"]);
+        assert!(!cfg.listen, "a -connect node does not listen");
+        assert!(
+            !cfg.listenonion,
+            "and must not publish a hidden service either"
+        );
+
+        // An explicit -listen=0 does the same.
+        let cfg = load(&["-listen=0", "-torcontrol=127.0.0.1:9051"]);
+        assert!(!cfg.listenonion);
+
+        // Soft, as Core's `SoftSetBoolArg` is: a stated -listenonion wins.
+        let cfg = load(&["-connect=1.2.3.4", "-torcontrol=127.0.0.1:9051", "-listenonion=1"]);
+        assert!(!cfg.listen);
+        assert!(cfg.listenonion, "an explicit -listenonion=1 is not overridden");
+
+        // And a listening node is untouched.
+        let cfg = load(&["-torcontrol=127.0.0.1:9051"]);
+        assert!(cfg.listen);
+        assert!(cfg.listenonion);
     }
 
     /// `parse_bool` accepts a narrower set than Core's `atoi`-based
