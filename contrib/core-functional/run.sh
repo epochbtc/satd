@@ -23,6 +23,7 @@
 #   SATD_CORE_DIR  fetched Core tree (default: <script dir>/core)
 #   SATD_CF_TMPDIR scratch dir for test datadirs (default: mktemp -d)
 #   SATD_CF_JOBS   parallel jobs     (default: 1 -- see the note by JOBS below)
+#   SATD_CF_TIMEOUT_FACTOR  scale the framework's waits (default: Core's 1)
 
 set -euo pipefail
 
@@ -164,6 +165,19 @@ mkdir -p "$TMPDIR_BASE"
 JOBS="${SATD_CF_JOBS:-1}"
 [[ "$JOBS" -lt 1 ]] && JOBS=1
 
+# Core's own knob for scaling how long the framework waits for something it
+# expects to happen (`--timeout-factor`; the framework multiplies `rpc_timeout`,
+# `sync_blocks`, `sync_mempools` and the P2P waits by it). It changes no
+# assertion -- a node that never does the thing still fails, just later -- so
+# raising it on a contended machine removes a false failure without weakening
+# anything. Core sets it on its own constrained CI for the same reason.
+#
+# The test that needs it is `feature_bip68_sequence.py`: `activateCSV` mines
+# ~575 blocks and then waits 60s for two nodes to agree. That is comfortable on
+# an idle machine and not comfortable on a 4-vCPU runner with three other tests
+# in flight.
+TIMEOUT_FACTOR="${SATD_CF_TIMEOUT_FACTOR:-}"
+
 export SATD_BIN SAT_CLI_BIN
 export BITCOIND="$HERE/shims/bitcoind"
 export BITCOINCLI="$HERE/shims/bitcoin-cli"
@@ -179,6 +193,7 @@ python3 "$FUNCTIONAL_DIR/test_runner.py" \
     --tmpdir="$TMPDIR_BASE" \
     --cachedir="$TMPDIR_BASE/cache" \
     --jobs="$JOBS" \
+    ${TIMEOUT_FACTOR:+--timeout-factor="$TIMEOUT_FACTOR"} \
     --resultsfile="$RESULTS" \
     ${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"} \
     "${RUN_SET[@]}"
