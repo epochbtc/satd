@@ -80,15 +80,18 @@ impl BanEntry {
 /// so an existing satd datadir does not lose its bans at the upgrade, and a
 /// datadir Core has used is readable — which is the case that used to disable
 /// persistence outright.
-fn parse_ban_file(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+///
+/// Returns the rows and whether they came from satd's historical bare-array
+/// format, which the caller rewrites in Core's shape.
+fn parse_ban_file(raw: &str) -> Result<(Vec<serde_json::Value>, bool), String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("not valid JSON: {e}"))?;
     match value {
         serde_json::Value::Object(_) => serde_json::from_value::<BanFile>(value)
-            .map(|f| f.banned_nets)
+            .map(|f| (f.banned_nets, false))
             .map_err(|e| format!("not a banlist object: {e}")),
         // satd's historical format.
-        serde_json::Value::Array(rows) => Ok(rows),
+        serde_json::Value::Array(rows) => Ok((rows, true)),
         other => Err(format!("found non-object value {other}")),
     }
 }
@@ -278,7 +281,7 @@ impl BanList {
             }
         };
 
-        let rows = match parse_ban_file(&raw) {
+        let (rows, legacy_format) = match parse_ban_file(&raw) {
             Ok(rows) => rows,
             Err(e) => {
                 return (
@@ -307,7 +310,15 @@ impl BanList {
         // `BanTarget::normalised()`, which is `"10.0.0.0/8"`. Core cannot
         // reach that state because its map key *is* the `CSubNet`, which
         // masks in its constructor.
-        list.dirty = false;
+        //
+        // A file already in Core's shape has nothing pending. satd's
+        // historical bare array does: leaving it dirty=false meant an upgraded
+        // datadir kept the array on disk until some *other* change happened to
+        // mark the list dirty -- and Bitcoin Core reading that datadir in the
+        // meantime still discarded every ban, which is the interop this whole
+        // change exists for. Marking it dirty rewrites it on the next flush,
+        // which `load_banlist` performs immediately.
+        list.dirty = legacy_format;
 
         (list, false, None)
     }
@@ -621,6 +632,43 @@ mod tests {
                 "{label}: and it still bans"
             );
         }
+    }
+
+    /// Reading satd's historical array is only half the upgrade: the file has
+    /// to be *rewritten* in Core's shape, or a datadir keeps the array until
+    /// some unrelated change happens to mark the list dirty — and Bitcoin Core
+    /// reading that datadir in the meantime still discards every ban, which is
+    /// the interop this change exists for.
+    ///
+    /// A file already in Core's shape has nothing pending and must not be
+    /// rewritten for its own sake.
+    #[test]
+    fn a_legacy_list_is_rewritten_in_cores_shape() {
+        let satd_legacy = r#"[
+            {"address": "10.0.0.0/8", "ban_created": 1, "banned_until": 9999999999}
+        ]"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banlist.json");
+        std::fs::write(&path, satd_legacy).unwrap();
+
+        let (mut list, _, _) = BanList::load(&path);
+        assert!(
+            list.is_dirty(),
+            "a legacy array has a pending rewrite the moment it is read"
+        );
+        let (out_path, json) = list.take_pending_dump().expect("the rewrite is pending");
+        write_banlist(&out_path, &json).expect("write");
+
+        // What Core would now read.
+        let reread = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&reread).unwrap();
+        assert!(v.is_object(), "Core's shape is an object: {reread}");
+        assert!(v.get("banned_nets").is_some_and(|n| n.is_array()), "{reread}");
+
+        // And the ban survived the rewrite.
+        let (list, _, _) = BanList::load(&path);
+        assert!(list.is_banned(&"10.1.2.3".parse().unwrap(), 100));
+        assert!(!list.is_dirty(), "Core's own shape has nothing pending");
     }
 
     /// The consequence that made this more than a format difference: satd

@@ -161,7 +161,8 @@ item below is (or will be) written up in full in the in-development
   silently disabling persistence: pointing satd at a datadir Core had used made
   every subsequent `setban` accepted by the RPC, applied in memory, and gone on
   restart, with no error at any point. satd's own historical array format is
-  still read, so an upgrade keeps its bans (#669).
+  still read and rewritten in Core's shape at startup, so an upgrade keeps its
+  bans and Bitcoin Core can read the datadir straight away (#669).
 - The ban list is written through a temporary file and a rename, and the write
   no longer happens while holding the ban-list lock on the peer event loop
   (#669).
