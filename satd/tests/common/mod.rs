@@ -623,6 +623,28 @@ impl TestNode {
         self.rpc_call_with_raw_params(method, serde_json::json!(params))
     }
 
+    /// Call an RPC and return its `result`, panicking if the node reported an
+    /// error.
+    ///
+    /// `rpc_call*` report the *transport* outcome: `Ok` means a JSON-RPC
+    /// response came back, and a response carrying `{"error": ...}` is an
+    /// `Ok` too. So `let _ = node.rpc_call_with_params(..).unwrap();` asserts
+    /// only that the node was reachable, and a test whose setup silently
+    /// failed then fails somewhere later, describing a symptom rather than
+    /// the cause -- a broadcast that was refused reads as "the outpoint is
+    /// still unspent", which is true and useless.
+    ///
+    /// Any call a test depends on having *worked* belongs here.
+    pub fn rpc_ok(&self, method: &str, params: Vec<serde_json::Value>) -> serde_json::Value {
+        let resp = self
+            .rpc_call_with_params(method, params.clone())
+            .unwrap_or_else(|e| panic!("{method} did not reach the node: {e}"));
+        if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
+            panic!("{method}{params:?} was refused: {err}");
+        }
+        resp.get("result").cloned().unwrap_or(serde_json::Value::Null)
+    }
+
     /// Call with `params` exactly as given -- an array or, for Core's named
     /// form, an object. Core's own test framework switches to the object form
     /// the moment a caller passes a keyword argument, so some methods are only

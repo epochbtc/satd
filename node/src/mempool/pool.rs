@@ -8786,8 +8786,8 @@ mod tests {
     /// dust -- and every assertion would still hold for the wrong reason.
     #[test]
     fn an_output_at_the_dust_threshold_is_not_ephemeral_dust() {
+        // No chain state needed: this is the classifier alone.
         let op = outpoint(0xC5);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
         let at_threshold = p2wpkh_dust_threshold();
 
         let parent = tx_from(&[op], &[(at_threshold, 0x5F), (50_000 - at_threshold, 0x60)]);
@@ -8802,6 +8802,5 @@ mod tests {
             1,
             "an output below the threshold was not counted as dust"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
