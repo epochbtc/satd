@@ -12,6 +12,7 @@ use crate::rpc::auth::{AuthLayer, RpcAuth};
 use crate::rpc::compat::{CoreHttpPreludeLayer, JsonRpcCompatLayer};
 use crate::rpc::capability::CapabilityLayer;
 use crate::rpc::named_params::NamedParamsLayer;
+
 use crate::rpc::params::Args;
 use crate::rpc::readonly::ReadOnlyLayer;
 use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, rawtx, util};
@@ -28,6 +29,152 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// The categories `help` prints, in order. `rpc_help.py::test_categories`
+/// asserts exactly this list and this order.
+const HELP_CATEGORIES: [&str; 6] =
+    ["Blockchain", "Control", "Mining", "Network", "Rawtransactions", "Util"];
+
+/// The `help` listing: every registered method, in exactly one category.
+///
+/// This is the listing, not the set of answerable commands -- `help
+/// <command>` asks the argument table instead, so a hidden method is
+/// answerable without being advertised, as in Core. Everything registered
+/// belongs here: an operator who cannot find a method in `help` has no way to
+/// learn it exists. satd-only methods take the category of their closest Core
+/// analogue, since Core has none to copy.
+const HELP_METHODS: &[(&str, &str)] = &[
+    // == Blockchain ==
+    ("dumptxoutset", "Blockchain"),
+    ("getaddressbalance", "Blockchain"),
+    ("getaddresshistory", "Blockchain"),
+    ("getaddressutxos", "Blockchain"),
+    ("getbestblockhash", "Blockchain"),
+    ("getblock", "Blockchain"),
+    ("getblockchaininfo", "Blockchain"),
+    ("getblockcount", "Blockchain"),
+    ("getblockfileaudit", "Blockchain"),
+    ("getblockfilter", "Blockchain"),
+    ("getblockfrompeer", "Blockchain"),
+    ("getblockhash", "Blockchain"),
+    ("getblockheader", "Blockchain"),
+    ("getblockstats", "Blockchain"),
+    ("getchainstates", "Blockchain"),
+    ("getchaintips", "Blockchain"),
+    ("getchaintxstats", "Blockchain"),
+    ("getdeploymentinfo", "Blockchain"),
+    ("getdifficulty", "Blockchain"),
+    ("getibdprogress", "Blockchain"),
+    ("getmempoolancestors", "Blockchain"),
+    ("getmempooldescendants", "Blockchain"),
+    ("getmempoolentry", "Blockchain"),
+    ("getmempoolhistory", "Blockchain"),
+    ("getmempoolinfo", "Blockchain"),
+    ("getpolicyinfo", "Blockchain"),
+    ("getquarantineentry", "Blockchain"),
+    ("getquarantineinfo", "Blockchain"),
+    ("getrawmempool", "Blockchain"),
+    ("getreorghistory", "Blockchain"),
+    ("getsilentpaymentblockdata", "Blockchain"),
+    ("gettxout", "Blockchain"),
+    ("gettxoutproof", "Blockchain"),
+    ("gettxoutsetinfo", "Blockchain"),
+    ("invalidateblock", "Blockchain"),
+    ("listquarantine", "Blockchain"),
+    ("loadtxoutset", "Blockchain"),
+    ("preciousblock", "Blockchain"),
+    ("reconsiderblock", "Blockchain"),
+    ("savemempool", "Blockchain"),
+    ("scantxoutset", "Blockchain"),
+    ("subscribemempool", "Blockchain"),
+    ("unsubscribemempool", "Blockchain"),
+    ("verifychain", "Blockchain"),
+    ("verifytxoutproof", "Blockchain"),
+    ("waitforblock", "Blockchain"),
+    ("waitforblockheight", "Blockchain"),
+    ("waitfornewblock", "Blockchain"),
+    // == Control ==
+    ("echo", "Control"),
+    ("echoipc", "Control"),
+    ("echojson", "Control"),
+    ("getconfig", "Control"),
+    ("getmemoryinfo", "Control"),
+    ("getrpcinfo", "Control"),
+    ("getserverstatus", "Control"),
+    ("getsysteminfo", "Control"),
+    ("getwarnings", "Control"),
+    ("help", "Control"),
+    ("logging", "Control"),
+    ("setmocktime", "Control"),
+    ("stop", "Control"),
+    ("syncwithvalidationinterfacequeue", "Control"),
+    ("uptime", "Control"),
+    // == Mining ==
+    ("estimatefees", "Mining"),
+    ("generateblock", "Mining"),
+    ("generatetoaddress", "Mining"),
+    ("generatetodescriptor", "Mining"),
+    ("getblocktemplate", "Mining"),
+    ("getmininginfo", "Mining"),
+    ("getnetworkhashps", "Mining"),
+    ("getprioritisedtransactions", "Mining"),
+    ("prioritisetransaction", "Mining"),
+    ("submitblock", "Mining"),
+    ("submitheader", "Mining"),
+    // == Network ==
+    ("addnode", "Network"),
+    ("clearbanned", "Network"),
+    ("disconnectnode", "Network"),
+    ("getaddednodeinfo", "Network"),
+    ("getconnectioncount", "Network"),
+    ("getnettotals", "Network"),
+    ("getnetworkinfo", "Network"),
+    ("getorphaninfo", "Network"),
+    ("getpeerinfo", "Network"),
+    ("listbanned", "Network"),
+    ("ping", "Network"),
+    ("setban", "Network"),
+    ("setnetworkactive", "Network"),
+    // == Rawtransactions ==
+    ("analyzepsbt", "Rawtransactions"),
+    ("combinepsbt", "Rawtransactions"),
+    ("combinerawtransaction", "Rawtransactions"),
+    ("converttopsbt", "Rawtransactions"),
+    ("createpsbt", "Rawtransactions"),
+    ("createrawtransaction", "Rawtransactions"),
+    ("decodepsbt", "Rawtransactions"),
+    ("decoderawtransaction", "Rawtransactions"),
+    ("decodescript", "Rawtransactions"),
+    ("finalizepsbt", "Rawtransactions"),
+    ("getrawtransaction", "Rawtransactions"),
+    ("joinpsbts", "Rawtransactions"),
+    ("policytest", "Rawtransactions"),
+    ("sendrawtransaction", "Rawtransactions"),
+    ("signrawtransactionwithkey", "Rawtransactions"),
+    ("submitpackage", "Rawtransactions"),
+    ("testmempoolaccept", "Rawtransactions"),
+    ("utxoupdatepsbt", "Rawtransactions"),
+    // == Util ==
+    ("backfillindex", "Util"),
+    ("cancelindex", "Util"),
+    ("deriveaddresses", "Util"),
+    ("estimaterawfee", "Util"),
+    ("estimatesmartfee", "Util"),
+    ("getdescriptorinfo", "Util"),
+    ("getindexinfo", "Util"),
+    ("getsatdindexinfo", "Util"),
+    ("pauseindex", "Util"),
+    ("resumeindex", "Util"),
+    ("validateaddress", "Util"),
+    // == hidden ==
+    // Core's own category for a command `help` answers for but never
+    // advertises. The listing walks HELP_CATEGORIES, which does not
+    // include this one, so a row here is excluded by construction rather
+    // than by a filter someone has to remember.
+    ("addconnection", "hidden"),
+    ("generate", "hidden"),
+    ("unsubscribemempool", "hidden"),
+];
 
 /// Max concurrent RPC connections per listener. Mirrors jsonrpsee's own
 /// `ServerConfig` default (100). Used both as the inner `ConnectionGuard`
@@ -1179,8 +1326,13 @@ pub async fn start(
         let mut args = Args::new(&params);
         let nblocks: u32 = args.required("nblocks")?;
         let address: String = args.required("address")?;
+        // Core's third argument. satd used to read two and drop whatever came
+        // third, so `generatetoaddress 1 <addr> "notanumber"` mined a block
+        // where Core answers -3 -- and the nonce loop it bounds had no bound
+        // at all (#688).
+        let max_tries: u64 = args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
-        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address)
+        mining::generate_to_address(&ctx.chain_state, &ctx.mempool, nblocks, &address, max_tries)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1188,8 +1340,16 @@ pub async fn start(
         let mut args = Args::new(&params);
         let nblocks: u32 = args.required("num_blocks")?;
         let descriptor: String = args.required("descriptor")?;
+        let max_tries: u64 =
+            args.optional_or("maxtries", crate::mining::miner::DEFAULT_MAX_TRIES)?;
         args.check()?;
-        mining::generate_to_descriptor(&ctx.chain_state, &ctx.mempool, nblocks, &descriptor)
+        mining::generate_to_descriptor(
+            &ctx.chain_state,
+            &ctx.mempool,
+            nblocks,
+            &descriptor,
+            max_tries,
+        )
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -1631,12 +1791,10 @@ pub async fn start(
         let locktime: Option<serde_json::Value> = args.raw("locktime")?;
         let replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
         let version: Option<serde_json::Value> = args.raw("version")?;
-        // Reject extra arguments.
-        let extra: Option<serde_json::Value> = args.raw("<extra>")?;
+        // A surplus argument is rejected before dispatch now, for every
+        // method, by `named_params::check_arity` (#688) -- this handler no
+        // longer has to be the only one that looks.
         args.check()?;
-        if extra.is_some() {
-            return Err(ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>));
-        }
         // Parse locktime.
         let locktime_val: Option<u32> = match &locktime {
             None | Some(serde_json::Value::Null) => None,
@@ -2087,13 +2245,6 @@ pub async fn start(
                 None::<()>,
             ));
         }
-        if args.len() > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -1,
-                "estimatesmartfee conf_target ( \"estimate_mode\" )\n\nToo many arguments.\n",
-                None::<()>,
-            ));
-        }
         // Type check arg 0: must be number
         let conf_target: u32 = match &args[0] {
             serde_json::Value::Number(n) => n.as_u64()
@@ -2165,13 +2316,6 @@ pub async fn start(
             return Err(ErrorObjectOwned::owned(
                 -1,
                 "estimaterawfee conf_target ( threshold )\n\nEstimates the approximate fee per kilobyte.\n",
-                None::<()>,
-            ));
-        }
-        if args.len() > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -1,
-                "estimaterawfee conf_target ( threshold )\n\nToo many arguments.\n",
                 None::<()>,
             ));
         }
@@ -2740,103 +2884,6 @@ pub async fn start(
             None
         };
 
-        // Categorized method table. Each method belongs to exactly one Core
-        // category. The categories and their sorted order are validated by
-        // rpc_help.py::test_categories().
-        const METHODS: &[(&str, &str)] = &[
-            // == Blockchain ==
-            ("dumptxoutset", "Blockchain"),
-            ("getbestblockhash", "Blockchain"),
-            ("getblock", "Blockchain"),
-            ("getblockchaininfo", "Blockchain"),
-            ("getblockcount", "Blockchain"),
-            ("getblockfrompeer", "Blockchain"),
-            ("getblockhash", "Blockchain"),
-            ("getblockheader", "Blockchain"),
-            ("getblockstats", "Blockchain"),
-            ("getchaintips", "Blockchain"),
-            ("getchaintxstats", "Blockchain"),
-            ("getdeploymentinfo", "Blockchain"),
-            ("getdifficulty", "Blockchain"),
-            ("getibdprogress", "Blockchain"),
-            ("getmempoolancestors", "Blockchain"),
-            ("getmempooldescendants", "Blockchain"),
-            ("getmempoolentry", "Blockchain"),
-            ("getmempoolhistory", "Blockchain"),
-            ("getmempoolinfo", "Blockchain"),
-            ("getrawmempool", "Blockchain"),
-            ("getreorghistory", "Blockchain"),
-            ("gettxout", "Blockchain"),
-            ("gettxoutproof", "Blockchain"),
-            ("gettxoutsetinfo", "Blockchain"),
-            ("invalidateblock", "Blockchain"),
-            ("preciousblock", "Blockchain"),
-            ("reconsiderblock", "Blockchain"),
-            ("savemempool", "Blockchain"),
-            ("scantxoutset", "Blockchain"),
-            ("subscribemempool", "Blockchain"),
-            ("unsubscribemempool", "Blockchain"),
-            ("verifychain", "Blockchain"),
-            ("verifytxoutproof", "Blockchain"),
-            ("waitforblockheight", "Blockchain"),
-            // == Control ==
-            ("echo", "Control"),
-            ("echojson", "Control"),
-            ("echoipc", "Control"),
-            ("getconfig", "Control"),
-            ("getmemoryinfo", "Control"),
-            ("getrpcinfo", "Control"),
-            ("getserverstatus", "Control"),
-            ("getsysteminfo", "Control"),
-            ("getwarnings", "Control"),
-            ("help", "Control"),
-            ("logging", "Control"),
-            ("setmocktime", "Control"),
-            ("stop", "Control"),
-            ("syncwithvalidationinterfacequeue", "Control"),
-            ("uptime", "Control"),
-            // == Mining ==
-            ("estimatefees", "Mining"),
-            ("generateblock", "Mining"),
-            ("generatetoaddress", "Mining"),
-            ("generatetodescriptor", "Mining"),
-            ("getblocktemplate", "Mining"),
-            ("getmininginfo", "Mining"),
-            ("getnetworkhashps", "Mining"),
-            ("getprioritisedtransactions", "Mining"),
-            ("prioritisetransaction", "Mining"),
-            ("submitblock", "Mining"),
-            ("submitheader", "Mining"),
-            // == Network ==
-            ("addnode", "Network"),
-            ("clearbanned", "Network"),
-            ("disconnectnode", "Network"),
-            ("getaddednodeinfo", "Network"),
-            ("getconnectioncount", "Network"),
-            ("getnettotals", "Network"),
-            ("getnetworkinfo", "Network"),
-            ("getorphaninfo", "Network"),
-            ("getpeerinfo", "Network"),
-            ("listbanned", "Network"),
-            ("ping", "Network"),
-            ("setban", "Network"),
-            ("setnetworkactive", "Network"),
-            // == Rawtransactions ==
-            ("decoderawtransaction", "Rawtransactions"),
-            ("decodescript", "Rawtransactions"),
-            ("getrawtransaction", "Rawtransactions"),
-            ("sendrawtransaction", "Rawtransactions"),
-            ("submitpackage", "Rawtransactions"),
-            ("signrawtransactionwithkey", "Rawtransactions"),
-            ("testmempoolaccept", "Rawtransactions"),
-            // == Util ==
-            ("deriveaddresses", "Util"),
-            ("estimaterawfee", "Util"),
-            ("estimatesmartfee", "Util"),
-            ("getdescriptorinfo", "Util"),
-            ("getindexinfo", "Util"),
-            ("validateaddress", "Util"),
-        ];
 
         if let Some(cmd) = command {
             if cmd == "dump_all_command_conversions" {
@@ -2868,7 +2915,16 @@ pub async fn start(
                     "logging ( <include> <exclude> )\n\nGets and sets the logging configuration.\nvalid logging categories are: {cats_str}\n"
                 )));
             }
-            if cmd.is_empty() || METHODS.iter().any(|(name, _)| *name == cmd.as_str()) {
+            // Core's `hidden` category suppresses a command from the
+            // *listing* only: `help <hidden command>` still returns its full
+            // help (`CRPCTable::help`, `src/rpc/server.cpp`, where the skip is
+            // guarded by `strMethod != strCommand`). satd asked its listing
+            // table, so every registered method missing from that table --
+            // `addconnection` and the PSBT builders alike -- answered "unknown
+            // command" as though it did not exist. Ask the argument table,
+            // which is the one the startup audit holds to the registered set;
+            // what gets *advertised* is still `HELP_METHODS`.
+            if cmd.is_empty() || crate::rpc::named_params::arg_names(&cmd).is_some() {
                 return Ok::<_, ErrorObjectOwned>(serde_json::json!(format!("{cmd}\n")));
             }
             // Unknown command: Core returns a successful result with this
@@ -2878,12 +2934,13 @@ pub async fn start(
             )));
         }
 
-        // Build the categorized help listing.
-        let categories = ["Blockchain", "Control", "Mining", "Network", "Rawtransactions", "Util"];
+        // Build the categorized help listing. `hidden` is deliberately not one
+        // of these, which is what keeps a hidden command out of it.
+        let categories = HELP_CATEGORIES;
         let mut output = String::new();
         for cat in &categories {
             output.push_str(&format!("== {} ==\n", cat));
-            for &(name, method_cat) in METHODS {
+            for &(name, method_cat) in HELP_METHODS {
                 if method_cat == *cat {
                     output.push_str(name);
                     output.push('\n');
@@ -3567,6 +3624,29 @@ pub async fn start(
         debug_assert!(
             unnamed.is_empty(),
             "RPC methods missing from rpc::named_params::arg_names: {unnamed:?}"
+        );
+    }
+
+    // The same audit for `ALL_METHODS`, which is the *enumerable* copy of that
+    // table -- hand-maintained, because a `match` cannot be iterated. Nothing
+    // checked it, and it had drifted by nine methods: `help
+    // dump_all_command_conversions` under-reported them to `rpc_help.py`, and
+    // anything else reading the list saw a surface with holes in it. The
+    // audit above could not catch that, since it only asks whether a *row*
+    // exists.
+    let unenumerated: Vec<&str> = methods
+        .method_names()
+        .filter(|m| !crate::rpc::named_params::ALL_METHODS.contains(m))
+        .collect();
+    if !unenumerated.is_empty() {
+        tracing::warn!(
+            methods = ?unenumerated,
+            "registered RPC methods missing from rpc::named_params::ALL_METHODS; \
+             they will be absent from `help dump_all_command_conversions`"
+        );
+        debug_assert!(
+            unenumerated.is_empty(),
+            "RPC methods missing from rpc::named_params::ALL_METHODS: {unenumerated:?}"
         );
     }
     if bind_addrs.is_empty() {
@@ -4286,5 +4366,62 @@ where
             conn.as_mut().graceful_shutdown();
             conn.await
         }
+    }
+}
+
+#[cfg(test)]
+mod help_listing_tests {
+    use super::{HELP_CATEGORIES, HELP_METHODS};
+    use crate::rpc::named_params::ALL_METHODS;
+
+    /// A method an operator cannot find in `help` may as well not exist, so
+    /// leaving one out has to be a decision someone made rather than an
+    /// omission nobody saw. Fifteen methods Core lists and fifteen of satd's
+    /// own were missing from this table before the test existed, and
+    /// `help <name>` answered "unknown command" for every one of them.
+    #[test]
+    fn every_registered_method_has_a_help_category() {
+        let listed: Vec<&str> = HELP_METHODS.iter().map(|(n, _)| *n).collect();
+        let missing: Vec<&&str> = ALL_METHODS.iter().filter(|m| !listed.contains(m)).collect();
+        assert!(missing.is_empty(), "registered but absent from the help table: {missing:?}");
+    }
+
+    /// The other direction: the table must not name a method that is not
+    /// registered, which would send an operator from `help` to a
+    /// method-not-found.
+    #[test]
+    fn the_help_table_names_nothing_unregistered() {
+        let stray: Vec<&str> = HELP_METHODS
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| !ALL_METHODS.contains(n))
+            .collect();
+        assert!(stray.is_empty(), "in the help table but not registered: {stray:?}");
+    }
+
+    /// A category that is neither printed nor `hidden` silently drops its
+    /// methods from the listing -- the same failure as omitting them, with a
+    /// row present to suggest otherwise.
+    #[test]
+    fn every_category_is_printed_or_deliberately_hidden() {
+        for (name, cat) in HELP_METHODS {
+            assert!(
+                HELP_CATEGORIES.contains(cat) || *cat == "hidden",
+                "{name} has category {cat:?}, which `help` never prints"
+            );
+        }
+    }
+
+    /// Core hides these three, and satd's regtest suite asserts
+    /// `addconnection` stays out of the listing. Naming them keeps a later
+    /// re-categorisation from quietly advertising a test-only dial RPC.
+    #[test]
+    fn the_hidden_commands_are_the_expected_three() {
+        let hidden: Vec<&str> = HELP_METHODS
+            .iter()
+            .filter(|(_, c)| *c == "hidden")
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(hidden, ["addconnection", "generate", "unsubscribemempool"]);
     }
 }

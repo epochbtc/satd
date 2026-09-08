@@ -34,6 +34,15 @@ item below is (or will be) written up in full in the in-development
 - A wrong-length hash and a right-length non-hex string report different
   errors, as Core's `ParseHashV` does; `getblockfrompeer` names the argument
   `blockhash`, as Core does (#692).
+- **Breaking:** an RPC call that passes more arguments than the method
+  declares is rejected with `-1`, as Core does, instead of being answered with
+  the surplus ignored (#688).
+- `generatetoaddress` and `generatetodescriptor` honour Core's `maxtries`
+  argument, which also puts the first bound on satd's nonce grind (#688).
+- `help <command>` answers for every registered RPC, including the ones the
+  listing deliberately omits, and the listing itself now names every method
+  satd registers — thirty were missing, among them the PSBT builders and
+  satd's own index, quarantine and address-index RPCs (#692).
 
 ### Added
 

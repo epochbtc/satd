@@ -14364,3 +14364,177 @@ fn hash_arguments_separate_the_length_error_from_the_hex_error() {
         "the length must be the caller's, not a constant: {bad_txid}"
     );
 }
+
+/// Core checks the argument *count* before anything else: `IsValidNumArgs`
+/// runs ahead of the type loop in `RPCHelpMan::HandleRequest` and throws the
+/// method's help text. satd read the arguments it knew about and ignored the
+/// rest, so a caller who miscounted -- or who was written against a node with
+/// a longer argument list -- got a plausible answer instead of an error (#688).
+#[test]
+fn a_surplus_positional_argument_is_refused_before_the_handler_runs() {
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let genesis = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (method, params) in [
+        // Two declared arguments, four given.
+        (
+            "getblockheader",
+            vec![json!(genesis.clone()), json!(true), json!("EXTRA"), json!(99)],
+        ),
+        // None declared: every argument is surplus.
+        ("getblockcount", vec![json!(1), json!(2), json!(3)]),
+        // Core's own suite asserts this one: rpc_estimatefee.py drives
+        // `estimatesmartfee(1, 'ECONOMICAL', 1)` and expects -1.
+        ("estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!(1)]),
+        // ... and rpc_blockchain.py drives this one.
+        ("getchaintxstats", vec![json!(0), json!(""), json!(0)]),
+    ] {
+        let resp = node.rpc_call_with_params(method, params).unwrap();
+        assert!(
+            resp.get("result").is_none() || resp["result"].is_null(),
+            "{method} must not answer a surplus-argument call: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-1),
+            "Core's HelpResult surfaces as RPC_MISC_ERROR: {resp}"
+        );
+        // Core's message is the help text, which opens with the method name.
+        // That prefix is what Core-derived tests assert, so it has to hold.
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.starts_with(method), "{method}: {msg}");
+    }
+
+    // The bound is the declared arity, not one below it: a fully-specified
+    // call still goes through.
+    let ok = node
+        .rpc_call_with_params("getblockheader", vec![json!(genesis), json!(true)])
+        .unwrap();
+    assert!(ok["result"].is_object(), "a full-arity call must still work: {ok}");
+}
+
+/// Core's `hidden` category suppresses a command from the *listing* only --
+/// `help <hidden command>` still returns its help text, because the skip in
+/// `CRPCTable::help` is guarded by `strMethod != strCommand`. satd answered
+/// from its listing table, so every registered method missing from it looked
+/// as though it did not exist (#692).
+#[test]
+fn help_answers_for_a_registered_command_that_the_listing_omits() {
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let raw = node.rpc_call("help").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Command *names*, not a substring search: `generate` is a substring of
+    // `generatetoaddress`, which is listed.
+    let listing: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.starts_with("==") && !l.is_empty())
+        .filter_map(|l| l.split(' ').next())
+        .collect();
+
+    for cmd in ["addconnection", "generate"] {
+        assert!(
+            !listing.contains(&cmd),
+            "{cmd} is hidden and must stay out of the listing"
+        );
+        let help = node
+            .rpc_call_with_params("help", vec![json!(cmd)])
+            .unwrap();
+        let text = help["result"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("unknown command"),
+            "help {cmd} must answer for a registered command: {help}"
+        );
+    }
+
+    // A command that really does not exist still gets Core's exact string,
+    // as a successful result rather than an error (`rpc_help.py` asserts it).
+    let unknown = node
+        .rpc_call_with_params("help", vec![json!("nosuchrpc")])
+        .unwrap();
+    assert_eq!(unknown["result"].as_str(), Some("help: unknown command: nosuchrpc"));
+
+    // Everything registered is listed except the deliberately hidden pair:
+    // a method an operator cannot find in `help` may as well not exist.
+    // `dump_all_command_conversions` is `help`'s own escape hatch for
+    // rpc_help.py, not a method.
+    let registered: Vec<String> = node.rpc_call_with_params("help", vec![json!("dump_all_command_conversions")])
+        .unwrap()["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row.get(0)?.as_str().map(str::to_string))
+        .collect();
+    let hidden = ["addconnection", "generate", "unsubscribemempool"];
+    let mut missing: Vec<&str> = registered
+        .iter()
+        .map(String::as_str)
+        .filter(|m| !hidden.contains(m) && !listing.contains(m))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    assert!(missing.is_empty(), "registered but absent from the help listing: {missing:?}");
+
+    // Named explicitly, because the check above would also pass if the
+    // listing and the registry drifted together.
+    for cmd in ["createrawtransaction", "decodepsbt", "getblockfilter", "waitforblock", "listquarantine"] {
+        assert!(listing.contains(&cmd), "{cmd} must appear in the help listing");
+    }
+}
+
+/// `generatetoaddress` declares a third argument, `maxtries`, that satd read
+/// no value for: a mistyped one was dropped where Core answers -3, and the
+/// nonce loop it is supposed to bound had no bound at all (#688).
+#[test]
+fn generatetoaddress_honours_the_maxtries_budget() {
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    let height = |n: &TestNode| n.rpc_call("getblockcount").unwrap()["result"].as_u64().unwrap();
+    let before = height(&node);
+
+    // Core's `GenerateBlock` returns false the moment the budget is spent,
+    // and `generateBlocks` then breaks and hands back what it mined -- so a
+    // budget of zero mines nothing and is not an error.
+    let none = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![json!(1), json!(addr), json!(0)],
+        )
+        .unwrap();
+    assert_eq!(
+        none["result"].as_array().map(Vec::len),
+        Some(0),
+        "a zero budget must mine nothing: {none}"
+    );
+    assert_eq!(height(&node), before, "and must not move the tip");
+
+    // A mistyped budget is a type error, not a silently dropped argument.
+    let mistyped = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![json!(1), json!(addr), json!("notanumber")],
+        )
+        .unwrap();
+    assert_eq!(mistyped["error"]["code"].as_i64(), Some(-3), "{mistyped}");
+    assert_eq!(height(&node), before, "a rejected call must not mine: {mistyped}");
+
+    // With a real budget it mines, as before.
+    let mined = node
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![json!(1), json!(addr), json!(1_000_000u64)],
+        )
+        .unwrap();
+    assert_eq!(mined["result"].as_array().map(Vec::len), Some(1), "{mined}");
+    assert_eq!(height(&node), before + 1);
+}

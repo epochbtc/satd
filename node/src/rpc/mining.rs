@@ -70,12 +70,13 @@ pub fn generate_to_address(
     mempool: &Mempool,
     nblocks: u32,
     address: &str,
+    max_tries: u64,
 ) -> Result<Value, (i32, String)> {
     if chain_state.network != bitcoin::Network::Regtest {
         return Err((-1, "generatetoaddress is only available in regtest mode".to_string()));
     }
 
-    let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks)
+    let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks, max_tries)
         .map_err(|e| match &e {
             crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
             _ => (-1, e.to_string()),
@@ -90,6 +91,7 @@ pub fn generate_to_descriptor(
     mempool: &Mempool,
     nblocks: u32,
     descriptor: &str,
+    max_tries: u64,
 ) -> Result<Value, (i32, String)> {
     if chain_state.network != bitcoin::Network::Regtest {
         return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
@@ -98,7 +100,8 @@ pub fn generate_to_descriptor(
     let script = parse_descriptor(descriptor, chain_state.network)
         .map_err(|e| (-8, e))?;
 
-    let hashes = crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks)
+    let hashes =
+        crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks, max_tries)
         .map_err(|e| (-1, e.to_string()))?;
 
     Ok(json!(hashes))

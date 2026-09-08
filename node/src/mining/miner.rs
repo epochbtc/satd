@@ -19,14 +19,45 @@ pub enum MineError {
     Failed(String),
     #[error("block rejected: {0}")]
     Rejected(String),
+    #[error("gave up: exhausted the nonce budget without solving a block")]
+    TriesExhausted,
 }
 
-/// Mine a single block on regtest, paying the coinbase to the given address.
-pub fn mine_block(
-    chain_state: &ChainState,
-    mempool: &Mempool,
-    address: &str,
-) -> Result<Block, MineError> {
+/// Core's `DEFAULT_MAX_TRIES` (`src/rpc/mining.h`): how many nonces a mining
+/// RPC grinds before giving up.
+pub const DEFAULT_MAX_TRIES: u64 = 1_000_000;
+
+/// Grind `header`'s nonce until it meets its target, spending from `budget`.
+///
+/// Returns `false` when the budget ran out first, leaving the header unsolved
+/// -- Core's `GenerateBlock` returning false, which stops `generateBlocks` and
+/// hands the caller the blocks it did mine.
+///
+/// The budget is what `generatetoaddress`'s third argument sets, and it is
+/// also the only thing bounding this loop: before it there was none, so a
+/// mining RPC on a chain whose target the node could not meet would spin a
+/// worker forever with no way to interrupt it.
+fn solve(header: &mut Header, budget: &mut u64) -> bool {
+    // Core checks the current nonce before spending anything, so a header
+    // that already solves costs nothing and `budget` counts *increments*
+    // (`GenerateBlock`, `src/rpc/mining.cpp`).
+    while *budget > 0 {
+        if header.validate_pow(header.target()).is_ok() {
+            return true;
+        }
+        *budget -= 1;
+        // `+= 1` here would panic in a debug build on the wrap this very
+        // branch exists to handle.
+        header.nonce = header.nonce.wrapping_add(1);
+        if header.nonce == 0 {
+            header.time += 1;
+        }
+    }
+    false
+}
+
+/// The coinbase output script an address pays to, on this node's network.
+fn address_to_script(chain_state: &ChainState, address: &str) -> Result<ScriptBuf, MineError> {
     let addr: Address<bitcoin::address::NetworkUnchecked> = address
         .parse()
         .map_err(|e| MineError::BadAddress(format!("{}", e)))?;
@@ -35,16 +66,43 @@ pub fn mine_block(
         .require_network(chain_state.network)
         .map_err(|e| MineError::BadAddress(format!("{}", e)))?;
 
-    mine_block_to_script(chain_state, mempool, addr.script_pubkey())
+    Ok(addr.script_pubkey())
 }
 
-/// Build and solve a block paying to the given output script. Does NOT submit.
+/// Mine a single block on regtest, paying the coinbase to the given address.
+pub fn mine_block(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    address: &str,
+) -> Result<Block, MineError> {
+    mine_block_to_script(chain_state, mempool, address_to_script(chain_state, address)?)
+}
+
+/// [`build_block_to_script_within`] on a fresh default budget, for the callers
+/// that have no `maxtries` of their own to spend.
 pub fn build_block_to_script(
     chain_state: &ChainState,
     mempool: &Mempool,
     coinbase_script: ScriptBuf,
     txs: Option<Vec<Transaction>>,
 ) -> Result<Block, MineError> {
+    let mut budget = DEFAULT_MAX_TRIES;
+    build_block_to_script_within(chain_state, mempool, coinbase_script, txs, &mut budget)?
+        .ok_or(MineError::TriesExhausted)
+}
+
+/// Build and solve a block paying to the given output script. Does NOT submit.
+///
+/// Spends from the caller's own nonce budget; see [`DEFAULT_MAX_TRIES`] for
+/// the wrapper every caller that has no budget of its own uses. `Ok(None)`
+/// means the budget ran out with the block unsolved.
+pub fn build_block_to_script_within(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+    txs: Option<Vec<Transaction>>,
+    budget: &mut u64,
+) -> Result<Option<Block>, MineError> {
     let template = create_template(chain_state, mempool);
 
     // When the caller supplies the transaction list, the template's fee
@@ -107,20 +165,11 @@ pub fn build_block_to_script(
         nonce: 0,
     };
 
-    loop {
-        let target = header.target();
-        match header.validate_pow(target) {
-            Ok(_) => break,
-            Err(_) => {
-                header.nonce += 1;
-                if header.nonce == 0 {
-                    header.time += 1;
-                }
-            }
-        }
+    if !solve(&mut header, budget) {
+        return Ok(None);
     }
 
-    Ok(Block { header, txdata })
+    Ok(Some(Block { header, txdata }))
 }
 
 /// Mine a single block on regtest, paying the coinbase to an arbitrary output script.
@@ -141,8 +190,25 @@ pub fn mine_block_to_script(
     mempool: &Mempool,
     coinbase_script: ScriptBuf,
 ) -> Result<Block, MineError> {
+    let mut budget = DEFAULT_MAX_TRIES;
+    mine_block_to_script_within(chain_state, mempool, coinbase_script, &mut budget)?
+        .ok_or(MineError::TriesExhausted)
+}
+
+/// [`mine_block_to_script`] spending from the caller's nonce budget.
+/// `Ok(None)` means the budget ran out before a block was solved.
+fn mine_block_to_script_within(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    coinbase_script: ScriptBuf,
+    budget: &mut u64,
+) -> Result<Option<Block>, MineError> {
     let _guard = MINING_SUBMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let block = build_block_to_script(chain_state, mempool, coinbase_script, None)?;
+    let Some(block) =
+        build_block_to_script_within(chain_state, mempool, coinbase_script, None, budget)?
+    else {
+        return Ok(None);
+    };
 
     let acceptance = chain_state
         .accept_block(&block)
@@ -150,7 +216,7 @@ pub fn mine_block_to_script(
 
     confirm_if_connected(chain_state, mempool, &block, &acceptance);
 
-    Ok(block)
+    Ok(Some(block))
 }
 
 /// Mine a single block WITHOUT submitting it (Core's `generateblock
@@ -202,17 +268,9 @@ pub fn mine_block_only(
         nonce: 0,
     };
 
-    loop {
-        let target = header.target();
-        match header.validate_pow(target) {
-            Ok(_) => break,
-            Err(_) => {
-                header.nonce += 1;
-                if header.nonce == 0 {
-                    header.time += 1;
-                }
-            }
-        }
+    let mut budget = DEFAULT_MAX_TRIES;
+    if !solve(&mut header, &mut budget) {
+        return Err(MineError::TriesExhausted);
     }
 
     Ok(Block { header, txdata })
@@ -319,17 +377,9 @@ pub fn build_solved_block(
         nonce: 0,
     };
 
-    loop {
-        let target = header.target();
-        match header.validate_pow(target) {
-            Ok(_) => break,
-            Err(_) => {
-                header.nonce += 1;
-                if header.nonce == 0 {
-                    header.time += 1;
-                }
-            }
-        }
+    let mut budget = DEFAULT_MAX_TRIES;
+    if !solve(&mut header, &mut budget) {
+        return Err(MineError::TriesExhausted);
     }
 
     Ok(Block { header, txdata })
@@ -341,25 +391,35 @@ pub fn mine_blocks(
     mempool: &Mempool,
     address: &str,
     count: u32,
+    max_tries: u64,
 ) -> Result<Vec<String>, MineError> {
-    let mut hashes = Vec::new();
-    for _ in 0..count {
-        let block = mine_block(chain_state, mempool, address)?;
-        hashes.push(block.block_hash().to_string());
-    }
-    Ok(hashes)
+    let script = address_to_script(chain_state, address)?;
+    mine_blocks_to_script(chain_state, mempool, script, count, max_tries)
 }
 
 /// Mine multiple blocks paying to an arbitrary output script, returning their hashes.
+///
+/// `max_tries` is one budget for the whole call, not per block, and running
+/// out stops it: the caller gets the blocks that were mined and no error.
+/// That is Core's `generateBlocks` (`src/rpc/mining.cpp`), which passes
+/// `nMaxTries` by reference into each `GenerateBlock` and breaks the moment
+/// one returns false -- which is why `generatetoaddress 10 <addr> 1` answers
+/// with an empty array rather than mining ten blocks anyway.
 pub fn mine_blocks_to_script(
     chain_state: &ChainState,
     mempool: &Mempool,
     script: ScriptBuf,
     count: u32,
+    max_tries: u64,
 ) -> Result<Vec<String>, MineError> {
+    let mut budget = max_tries;
     let mut hashes = Vec::new();
     for _ in 0..count {
-        let block = mine_block_to_script(chain_state, mempool, script.clone())?;
+        let Some(block) =
+            mine_block_to_script_within(chain_state, mempool, script.clone(), &mut budget)?
+        else {
+            break;
+        };
         hashes.push(block.block_hash().to_string());
     }
     Ok(hashes)
@@ -501,6 +561,42 @@ mod tests {
     use crate::chain::state::BlockAcceptance;
     use crate::mempool::pool::QuarantineScope;
 
+    /// A header the node can already meet must cost nothing, and one it
+    /// cannot must cost the budget and then stop.
+    ///
+    /// The second half is what `maxtries` buys beyond Core parity: this loop
+    /// had no bound at all, so a mining RPC against a target the node could
+    /// not reach pinned a worker with no way to interrupt it.
+    #[test]
+    fn the_nonce_budget_bounds_the_grind_and_is_spent_only_on_it() {
+        let mut header = Header {
+            version: Version::from_consensus(0x2000_0000),
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_600_000_000,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff), // regtest
+            nonce: 0,
+        };
+        let mut budget = DEFAULT_MAX_TRIES;
+        assert!(solve(&mut header, &mut budget), "regtest work is reachable");
+
+        // Core checks the current nonce before it spends anything
+        // (`GenerateBlock`), so a solved header takes nothing from the budget.
+        let mut untouched = 5;
+        assert!(solve(&mut header, &mut untouched));
+        assert_eq!(untouched, 5, "an already-solved header must cost nothing");
+
+        // Mainnet difficulty-1 work, which regtest cannot reach: the grind
+        // gives up rather than running forever.
+        let mut hard = header;
+        hard.bits = bitcoin::CompactTarget::from_consensus(0x1d00_ffff);
+        hard.nonce = 0;
+        let mut budget = 50;
+        assert!(!solve(&mut hard, &mut budget), "the budget must run out");
+        assert_eq!(budget, 0);
+        assert_eq!(hard.nonce, 50, "one nonce per unit of budget");
+    }
+
     /// A block that was stored but never connected confirms nothing, so the
     /// mempool must not be purged for it. Perturbation: drop the
     /// `connected_height` guard in `confirm_if_connected` and the `Stored`
@@ -608,7 +704,7 @@ mod tests {
         let mp = Mempool::new(1_000_000, 0);
 
         let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-        let hashes = mine_blocks(&cs, &mp, addr, 10).unwrap();
+        let hashes = mine_blocks(&cs, &mp, addr, 10, DEFAULT_MAX_TRIES).unwrap();
         assert_eq!(hashes.len(), 10);
         assert_eq!(cs.tip_height(), 10);
 

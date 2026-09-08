@@ -17,7 +17,13 @@ pub fn get_mining_info(ctx: &McpContext) -> String {
 
 /// Mine blocks to an address (regtest only).
 pub fn generate_blocks(ctx: &McpContext, count: u32, address: &str) -> String {
-    match rpc::generate_to_address(&ctx.chain_state, &ctx.mempool, count, address) {
+    match rpc::generate_to_address(
+        &ctx.chain_state,
+        &ctx.mempool,
+        count,
+        address,
+        node::mining::miner::DEFAULT_MAX_TRIES,
+    ) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
