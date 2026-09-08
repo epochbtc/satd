@@ -36,6 +36,7 @@
 # Packaging & Deployment
 
 - [Packaging satd](packaging.md)
+- [Appliance & Reference Stack](appliance.md)
 
 # Reference
 

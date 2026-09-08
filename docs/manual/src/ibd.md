@@ -78,6 +78,38 @@ does not skip validation.
 > download-verify-load flag and `--fast-start-sha256` are satd extensions. Core
 > requires a manual `loadtxoutset` against a file you fetched yourself.
 
+### Where to get a snapshot
+
+satd hosts none, and does not name one for you. The anchors compiled into
+the binary decide which snapshots are loadable at all — currently mainnet
+heights 840,000, 880,000, 910,000 and 935,000, copied verbatim from Bitcoin
+Core's `m_assumeutxo_data`. Signet, testnet and regtest have no anchors, so
+fast-start is mainnet-only.
+
+Several people publish the `utxo-<height>.dat` files Core's `dumptxoutset`
+produces; Jameson Lopp's mirror and <https://bitcoin-snapshots.jaonoctus.dev/>
+are two that have been around a while. Any of them will do, because the host
+is trusted for **availability only**:
+
+```sh
+satd --fast-start=https://<host>/utxo-880000.dat \
+     --fast-start-sha256=<sha256 of that file>
+```
+
+`--fast-start-sha256` pins what you downloaded, so a truncated or swapped
+file fails before it is parsed. That check is a convenience; the one that
+matters is the anchor comparison above, which satd performs against a hash
+compiled into the binary and which no snapshot host can influence. A
+snapshot from a hostile mirror is rejected at load.
+
+Pick the highest anchor height a published snapshot exists for: the higher
+the base, the less history the background validation has left to walk.
+
+> **`--fast-start-sha256` is the file's SHA-256, not the anchor hash.**
+> `hash_serialized_3` in the anchor table is a hash over the UTXO *set*, not
+> over the file; `sha256sum utxo-880000.dat` does not produce it. Take the
+> file digest from the publisher, or compute it after downloading once.
+
 ## Script-verification skip: `assumevalid`
 
 `-assumevalid` controls how much script verification IBD performs. satd
