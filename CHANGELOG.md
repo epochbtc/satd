@@ -155,6 +155,17 @@ item below is (or will be) written up in full in the in-development
   "insufficient data" error when the estimator has none, and range-checks
   `threshold` (#667).
 
+- `banlist.json` is Bitcoin Core's format — an object keyed by `banned_nets`
+  with a per-entry `version` — instead of a bare JSON array. More importantly,
+  a ban list satd cannot read is now recreated, as Core does, instead of
+  silently disabling persistence: pointing satd at a datadir Core had used made
+  every subsequent `setban` accepted by the RPC, applied in memory, and gone on
+  restart, with no error at any point. satd's own historical array format is
+  still read, so an upgrade keeps its bans (#669).
+- The ban list is written through a temporary file and a rename, and the write
+  no longer happens while holding the ban-list lock on the peer event loop
+  (#669).
+
 - `-connect=0` was parsed as the peer address `0`, so the node dialled
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling

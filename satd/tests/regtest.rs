@@ -2173,6 +2173,65 @@ fn test_listbanned() {
     node.stop();
 }
 
+/// A ban set through `setban` must still be there after a restart, including
+/// on a datadir whose `banlist.json` satd could not read.
+///
+/// The second half is the defect: satd answered an unparseable list by
+/// dropping its persist path, so every later `setban` was accepted by the RPC,
+/// applied in memory, and gone on restart — with no error at any point.
+/// Pointing satd at a datadir Bitcoin Core had used was enough to trigger it,
+/// since satd wrote a bare JSON array where Core writes an object.
+#[test]
+fn test_banlist_survives_restart_even_after_an_unreadable_file() {
+    let mut node = TestNode::start(&[]);
+    let banlist = node.datadir.join("regtest").join("banlist.json");
+
+    let set_and_restart = |node: &mut TestNode, subnet: &str| {
+        let r = node
+            .rpc_call_with_params(
+                "setban",
+                vec![
+                    serde_json::json!(subnet),
+                    serde_json::json!("add"),
+                    serde_json::json!(86_400),
+                ],
+            )
+            .unwrap();
+        assert!(r["error"].is_null(), "setban {subnet}: {r}");
+        node.restart_preserving_datadir(&[]);
+        node.rpc_call("listbanned").unwrap()["result"]
+            .as_array()
+            .expect("listbanned array")
+            .iter()
+            .map(|e| e["address"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // Ordinary case, and the file satd leaves behind is Core's shape.
+    assert_eq!(set_and_restart(&mut node, "10.0.0.0/8"), ["10.0.0.0/8"]);
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&banlist).unwrap()).unwrap();
+    assert!(
+        on_disk["banned_nets"].is_array(),
+        "banlist.json must be Core's object form: {on_disk}"
+    );
+
+    // Now corrupt it the way an interrupted write or a foreign format would,
+    // and confirm persistence keeps working rather than going quietly inert.
+    node.stop();
+    std::fs::write(&banlist, "{ this is not json").unwrap();
+    node.restart_preserving_datadir(&[]);
+    assert!(
+        node.rpc_call("listbanned").unwrap()["result"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "an unreadable list starts empty"
+    );
+    assert_eq!(set_and_restart(&mut node, "192.168.0.0/16"), ["192.168.0.0/16"]);
+    node.stop();
+}
+
 #[test]
 fn test_clearbanned() {
     let mut node = TestNode::start(&[]);

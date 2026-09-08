@@ -1979,10 +1979,12 @@ impl PeerManager {
             self.ban_list
                 .write()
                 .add(target, ban_created, banned_until)?;
+            self.flush_banlist();
             // Disconnect any connected peer whose IP falls within the ban.
             self.disconnect_banned_peers(target);
         } else {
             self.ban_list.write().remove(target)?;
+            self.flush_banlist();
         }
         Ok(())
     }
@@ -2020,19 +2022,49 @@ impl PeerManager {
     /// Clear all bans.
     pub fn clear_banned(&self) {
         self.ban_list.write().clear();
+        self.flush_banlist();
     }
 
     /// Load the ban list from `banlist.json` in `dir`. Returns whether the
-    /// file was recreated (caller should log the event).
-    pub fn load_banlist(&self, dir: &std::path::Path) -> Result<bool, String> {
+    /// database had to be recreated (caller logs Core's "Recreating the
+    /// banlist database") and, if so, why.
+    ///
+    /// This cannot fail. Core's `BanMan` constructor is `LoadBanlist();
+    /// DumpBanlist();` — an unreadable list is recreated, never a reason to
+    /// stop persisting. The old signature returned `Result`, and the caller
+    /// answered an `Err` by leaving the manager holding a default `BanList`
+    /// with no path, so every subsequent `setban` vanished on restart with no
+    /// error at any point.
+    pub fn load_banlist(&self, dir: &std::path::Path) -> (bool, Option<String>) {
         let path = dir.join("banlist.json");
-        let (mut list, recreated) = crate::net::ban::BanList::load(&path)?;
+        let (mut list, recreated, why) = crate::net::ban::BanList::load(&path);
         // Prune expired bans from the loaded list using the current node
         // clock (which may be mocktime).
         let now = crate::time::now_secs();
         list.prune_expired(now);
         *self.ban_list.write() = list;
-        Ok(recreated)
+        // Core dumps immediately after loading, which is what writes the file
+        // for a fresh datadir and rewrites a recreated one.
+        self.flush_banlist();
+        (recreated, why)
+    }
+
+    /// Core's `BanMan::DumpBanlist`: snapshot the list under the lock, release
+    /// it, then write. On a failed write the list is marked dirty again so the
+    /// next flush retries.
+    ///
+    /// The write is deliberately not done under the lock. It runs on the peer
+    /// event loop at every automatic ban, and `fs::write` there stalls every
+    /// other peer for the duration of a disk write.
+    pub fn flush_banlist(&self) {
+        let pending = self.ban_list.write().take_pending_dump();
+        let Some((path, json)) = pending else {
+            return;
+        };
+        if let Err(e) = crate::net::ban::write_banlist(&path, &json) {
+            tracing::warn!("Failed to write banlist {}: {e}", path.display());
+            self.ban_list.write().mark_dirty();
+        }
     }
 
     /// Send a ping to all connected peers.
@@ -2207,6 +2239,7 @@ impl PeerManager {
                 // entry already exists (e.g. repeated misbehaviour) the add
                 // fails silently.
                 let _ = self.ban_list.write().add(&target, now, now + duration);
+                self.flush_banlist();
             }
         }
     }
@@ -2456,6 +2489,7 @@ impl PeerManager {
                     {
                         let now_secs = crate::time::now_secs();
                         self.ban_list.write().prune_expired(now_secs);
+                        self.flush_banlist();
                     }
 
                     for addr in addrs {

@@ -1860,12 +1860,16 @@ async fn main() {
     // on every restart.
     peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
 
-    // Load the persistent ban list (banlist.json).
-    match peer_manager.load_banlist(&net_datadir) {
-        Ok(true) => tracing::info!("Recreating the banlist database"),
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!("Failed to load banlist: {e}");
+    // Load the persistent ban list (banlist.json). A file that cannot be read
+    // or parsed is recreated, as Core's `BanMan::LoadBanlist` does — never a
+    // reason to stop persisting, which is what leaves `setban` silently inert.
+    {
+        let (recreated, why) = peer_manager.load_banlist(&net_datadir);
+        if let Some(why) = why {
+            tracing::warn!("{why}");
+        }
+        if recreated {
+            tracing::info!("Recreating the banlist database");
         }
     }
 
