@@ -1,0 +1,224 @@
+# Appliance CI — the reference stack and the downloadable VM image.
+#
+# Three things are gated here, in increasing cost:
+#
+#   1. The certificate script and the container healthcheck probe. Seconds,
+#      no docker, run on any PR that touches them. Both are small pieces of
+#      shell that everything else depends on being right.
+#   2. The reference stack (contrib/stack): brought up on regtest, with every
+#      TLS listener probed from outside the container against the CA the
+#      stack generated, plus LND syncing to the node over Neutrino and RTL
+#      served through the proxy. This is where a claim like "Sparrow can talk
+#      to this" is actually checked.
+#   3. The appliance image: built with mmdebstrap, booted under QEMU, and
+#      inspected through the guest agent. This is the "the image is not
+#      broken" gate, and it boots the artifact itself rather than a
+#      test-only variant.
+#
+# Everything runs on GitHub-hosted runners. satd is public, and a
+# `pull_request` job on a self-hosted runner would let a fork PR execute
+# arbitrary code on a maintainer machine.
+#
+# On a tag the same build runs for every published format and uploads the
+# artifacts; signing stays a manual post-tag step, as it is for tarballs.
+
+name: Appliance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Which image flavour to build"
+        required: false
+        default: "core"
+        type: choice
+        options: ["core", "desktop", "both"]
+
+concurrency:
+  group: appliance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.93.0'
+
+jobs:
+  # Job-level path gating rather than a workflow-level `paths` filter: a
+  # path-skipped workflow never reports its contexts, which leaves a PR
+  # waiting on a status that will never arrive. A skipped *job* reports
+  # "skipped", which satisfies branch protection.
+  changes:
+    name: detect appliance changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      stack: ${{ steps.filter.outputs.stack }}
+      appliance: ${{ steps.filter.outputs.appliance }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "stack=true"     >> "$GITHUB_OUTPUT"
+            echo "appliance=true" >> "$GITHUB_OUTPUT"
+            echo "scripts=true"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          files="$(git diff --name-only "$base"...HEAD)"
+          echo "changed files:"; echo "$files" | sed 's/^/  /'
+          match() { grep -qE "$1" <<< "$files" && echo true || echo false; }
+          # The stack job also covers the runtime image, since it ships
+          # mkca.sh, satd-init and the config template.
+          echo "stack=$(match '^(contrib/stack/|contrib/docker/|Dockerfile$)')" >> "$GITHUB_OUTPUT"
+          echo "appliance=$(match '^(contrib/appliance/|contrib/stack/|contrib/systemd/)')" >> "$GITHUB_OUTPUT"
+          echo "scripts=$(match '^contrib/(stack/tls/|stack/tests/|docker/)')" >> "$GITHUB_OUTPUT"
+
+  # Cheap and always worth running when touched: no docker, no network.
+  scripts:
+    name: certificate + healthcheck scripts
+    needs: changes
+    if: needs.changes.outputs.scripts == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: mkca.sh
+        run: contrib/stack/tests/mkca-test.sh
+      - name: satd-healthcheck
+        run: contrib/docker/tests/healthcheck-test.sh
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # `-S error` keeps this a correctness gate rather than a style one;
+          # the tree has its own conventions that shellcheck disagrees with.
+          shellcheck -S error \
+            contrib/stack/tls/mkca.sh \
+            contrib/stack/satd/satd-init \
+            contrib/docker/satd-healthcheck \
+            contrib/appliance/build.sh \
+            contrib/appliance/bin/satd-appliance \
+            contrib/appliance/firstboot/satd-appliance-firstboot \
+            contrib/appliance/provision/*.sh
+
+  stack:
+    name: reference stack (regtest, TLS probed)
+    needs: changes
+    if: needs.changes.outputs.stack == 'true'
+    runs-on: ubuntu-24.04
+    # Building the runtime image compiles satd from scratch on a cold cache,
+    # and two stack bring-ups follow it.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build the runtime image
+        # The real Dockerfile, not a shortcut: the image under test has to be
+        # the one that ships mkca.sh, satd-init and the config template.
+        run: docker build -t satd:ci .
+      - name: Core stack
+        run: SATD_IMAGE=satd:ci contrib/stack/tests/smoke.sh
+      - name: With the Lightning and proxy overlays
+        run: |
+          SATD_IMAGE=satd:ci SATD_SMOKE_PORT_BASE=21600 \
+            contrib/stack/tests/smoke.sh --with lightning --with proxy
+      - name: Compose files parse
+        run: |
+          set -euo pipefail
+          for overlay in lightning cln btcpay proxy; do
+            docker compose -f contrib/stack/compose.yml \
+              -f "contrib/stack/compose.$overlay.yml" \
+              --env-file contrib/stack/.env.example \
+              config > /dev/null
+            echo "ok: $overlay"
+          done
+          # cashu extends the Lightning overlay, so it only parses with it.
+          MINT_PRIVATE_KEY=ci POSTGRES_PASSWORD=ci docker compose \
+            -f contrib/stack/compose.yml \
+            -f contrib/stack/compose.lightning.yml \
+            -f contrib/stack/compose.cashu.yml \
+            --env-file contrib/stack/.env.example config > /dev/null
+          echo "ok: cashu"
+
+  image:
+    name: build and boot the appliance image
+    needs: changes
+    if: needs.changes.outputs.appliance == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: ${{ github.event_name == 'pull_request' && fromJSON('["core"]') || fromJSON('["core","desktop"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      - name: Install build dependencies
+        # rocksdb-sys runs bindgen, which needs libclang; the native deps
+        # (rocksdb, zstd, lz4) need cmake and a compiler, and reqwest's TLS
+        # backend needs libssl. Every other Rust job in this repository
+        # installs the same set — without it the build dies in under a
+        # minute, long before anything interesting compiles.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the binaries the image installs
+        run: cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui
+      - name: Build the image
+        run: |
+          contrib/appliance/build-in-docker.sh \
+            --flavor ${{ matrix.flavor }} \
+            --out "$GITHUB_WORKSPACE/appliance-out"
+          ls -lh "$GITHUB_WORKSPACE/appliance-out"
+      - name: Boot it and check every surface
+        run: |
+          set -euo pipefail
+          # /dev/kvm is present on hosted Linux runners, so this boots with
+          # hardware acceleration; the test falls back to TCG where it is not.
+          ls -l /dev/kvm || echo "no /dev/kvm; the boot test will use TCG"
+          image="$(ls "$GITHUB_WORKSPACE"/appliance-out/*.qcow2 | head -1)"
+          contrib/appliance/tests/boot-test.sh --image "$image" --in-docker
+      - name: Upload
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: satd-appliance-${{ matrix.flavor }}
+          # The raw image is large and reconstructible from the qcow2; the
+          # checksums cover everything the build produced.
+          path: |
+            appliance-out/*.qcow2
+            appliance-out/*.ova
+            appliance-out/*.SHA256SUMS
+          retention-days: 14
+          compression-level: 0
