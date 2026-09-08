@@ -94,7 +94,14 @@ fn parse_ban_file(raw: &str) -> Result<Vec<serde_json::Value>, String> {
 }
 
 /// Core's `CBanEntry(const UniValue&)` plus `BanMapFromJson`'s two drop rules.
-/// Returns `None` for a row Core would skip.
+/// Returns `None` for a row that cannot be used.
+///
+/// Deliberately more lenient than Core in one direction: where Core *throws*
+/// on a malformed field -- and `CBanDB::Read` catches that and discards the
+/// whole file -- this drops the row and keeps the rest. Losing one unparseable
+/// ban is strictly better than losing every ban because of it. A row with no
+/// `version` at all is also kept, defaulted to the current version, which is
+/// what lets satd's own historical array load; Core would throw on that too.
 fn ban_entry_from_json(row: &serde_json::Value) -> Option<BanEntry> {
     let address = row.get("address")?.as_str()?.to_string();
     // Core drops an entry whose version it does not know, logging
@@ -108,15 +115,24 @@ fn ban_entry_from_json(row: &serde_json::Value) -> Option<BanEntry> {
     if version != BAN_ENTRY_VERSION {
         return None;
     }
-    // "Dropping entry with unparseable address or subnet". The key is also
-    // the map key, so an unparseable one would be unbannable and unremovable.
-    parse_ban_target(&address).ok()?;
+    // "Dropping entry with unparseable address or subnet". The parse is also
+    // what canonicalises the address: the result becomes the map key, and
+    // `setban ... remove` looks up `BanTarget::normalised()`, so a row stored
+    // under any other spelling is a ban that cannot be lifted.
+    let address = parse_ban_target(&address).ok()?.normalised();
     Some(BanEntry {
         version,
         address,
         ban_created: row.get("ban_created")?.as_u64()?,
         banned_until: row.get("banned_until")?.as_u64()?,
     })
+}
+
+/// Clamp a Unix timestamp to what Bitcoin Core can parse back out of
+/// `banlist.json`. See the call site for why an unclamped value is not merely
+/// cosmetic.
+fn clamp_for_core(secs: u64) -> u64 {
+    secs.min(i64::MAX as u64)
 }
 
 /// Write `json` to `path` through a temporary file and a rename.
@@ -129,7 +145,15 @@ fn ban_entry_from_json(row: &serde_json::Value) -> Option<BanEntry> {
 pub fn write_banlist(path: &Path, json: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Do not leave a stale temporary next to the real file: the next
+        // write would append nothing to it, but an operator inspecting the
+        // datadir after a failure should not find a half-written banlist
+        // sitting beside the good one.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The parsed form of a `setban` subnet argument.
@@ -274,6 +298,15 @@ impl BanList {
             };
             list.entries.insert(entry.address.clone(), entry);
         }
+        // `ban_entry_from_json` re-normalises the address, so the key it
+        // inserts under is the same one `setban` computes. Keying on the
+        // file's spelling instead made a non-canonical row unremovable:
+        // `ipnet` does not mask host bits on construction (that is `trunc()`),
+        // so `"10.0.0.5/8"` in the file matched `is_banned` but no `setban
+        // ... remove` could ever name it -- `remove` looks up
+        // `BanTarget::normalised()`, which is `"10.0.0.0/8"`. Core cannot
+        // reach that state because its map key *is* the `CSubNet`, which
+        // masks in its constructor.
         list.dirty = false;
 
         (list, false, None)
@@ -349,8 +382,16 @@ impl BanList {
             BanEntry {
                 version: BAN_ENTRY_VERSION,
                 address: key,
-                ban_created,
-                banned_until,
+                ban_created: clamp_for_core(ban_created),
+                // Core parses both timestamps with `getInt<int64_t>()`, which
+                // *throws* above `INT64_MAX` -- and `CBanDB::Read` answers a
+                // throw by discarding the entire ban list. satd's `setban`
+                // takes a `u64` bantime and saturates, so an operator could
+                // write a file that silently costs Core every one of its bans.
+                // Core's own RPC cannot produce such a value (`banTime` is
+                // `int64_t`), so clamping loses nothing real: the timestamp is
+                // already ~292 billion years out.
+                banned_until: clamp_for_core(banned_until),
             },
         );
 
@@ -633,10 +674,18 @@ mod tests {
         assert_eq!(kept, ["192.168.0.0/16"], "unknown version and bad address dropped");
     }
 
-    /// A crash mid-write must leave the previous list intact, not a truncated
-    /// one — which is the input that used to disable persistence on restart.
+    /// A failed write must leave the previous list intact, not a truncated
+    /// one — a truncated banlist is exactly the input that used to disable
+    /// persistence on the next start.
+    ///
+    /// The failure is injected at the *temporary* file, which is what makes
+    /// this test load-bearing: replace the body of `write_banlist` with a
+    /// plain `fs::write(path, json)` and the write succeeds, `banlist.json`
+    /// is clobbered, and this fails. A test that instead pointed
+    /// `write_banlist` at some other unwritable path would pass either way,
+    /// because nothing would have touched `banlist.json` in the first place.
     #[test]
-    fn a_write_never_truncates_the_previous_list() {
+    fn a_failed_write_leaves_the_previous_list_intact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("banlist.json");
         let mut list = BanList::new(path.clone());
@@ -645,12 +694,118 @@ mod tests {
         let (dest, json) = list.take_pending_dump().unwrap();
         write_banlist(&dest, &json).unwrap();
         let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("10.0.0.0/8"));
 
-        // A failed rename (the destination is a directory) leaves the original.
-        let blocked = dir.path().join("subdir");
-        std::fs::create_dir(&blocked).unwrap();
-        assert!(write_banlist(&blocked, "{}").is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        // Occupy the temporary path with a directory, so writing it fails
+        // while `banlist.json` itself is perfectly writable.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+
+        list.add(&parse_ban_target("192.168.0.0/16").unwrap(), 1, 9999999999)
+            .unwrap();
+        let (dest, json) = list.take_pending_dump().unwrap();
+        assert!(write_banlist(&dest, &json).is_err(), "the tmp write must fail");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            first,
+            "a failed write must not touch the live banlist"
+        );
+
+        // And the failure is retryable: the caller re-arms the dirty flag, so
+        // the next flush writes the list that was pending.
+        list.mark_dirty();
+        std::fs::remove_dir(&tmp).unwrap();
+        let (dest, json) = list.take_pending_dump().expect("still dirty after a failed write");
+        write_banlist(&dest, &json).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("10.0.0.0/8") && after.contains("192.168.0.0/16"));
+        assert!(!tmp.exists(), "no temporary left behind after a successful write");
+    }
+
+    /// A ban list written with a non-canonical subnet must still be
+    /// removable. `ipnet` keeps host bits on construction, so a file (or a
+    /// hand edit) carrying `10.0.0.5/8` used to load under that exact key
+    /// while `setban ... remove` looked up `10.0.0.0/8` — a ban nothing could
+    /// lift, and a second `setban add` would insert a duplicate beside it.
+    #[test]
+    fn a_non_canonical_address_is_still_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banlist.json");
+        std::fs::write(
+            &path,
+            r#"{"banned_nets": [
+                {"version": 1, "address": "10.0.0.5/8", "ban_created": 1, "banned_until": 9999999999}
+            ]}"#,
+        )
+        .unwrap();
+
+        let (mut list, recreated, _) = BanList::load(&path);
+        assert!(!recreated);
+        assert_eq!(
+            list.list(0).iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
+            ["10.0.0.0/8"],
+            "the address is canonicalised on load"
+        );
+        assert!(list.is_banned(&"10.1.2.3".parse().unwrap(), 100));
+        list.remove(&parse_ban_target("10.0.0.0/8").unwrap())
+            .expect("the ban must be removable by the name setban computes");
+        assert!(!list.is_banned(&"10.1.2.3".parse().unwrap(), 100));
+    }
+
+    /// Core reads both timestamps with `getInt<int64_t>()` and answers a
+    /// parse throw by discarding the *whole* file. satd's `setban` takes a
+    /// `u64` bantime, so an operator could otherwise write a banlist that
+    /// silently costs Core every one of its bans.
+    #[test]
+    fn a_saturating_bantime_stays_readable_by_core() {
+        let mut list = BanList::default();
+        list.add(&parse_ban_target("1.2.3.4").unwrap(), 0, u64::MAX)
+            .unwrap();
+        let entry = list.list(0)[0];
+        assert_eq!(entry.banned_until, i64::MAX as u64);
+        assert!(i64::try_from(entry.banned_until).is_ok());
+    }
+
+    /// Every mutation must leave the list dirty, so a caller that forgets to
+    /// flush is a bug the type can express rather than one only a restart
+    /// reveals.
+    #[test]
+    fn every_mutation_marks_the_list_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut list = BanList::new(dir.path().join("banlist.json"));
+        let target = parse_ban_target("10.0.0.0/8").unwrap();
+
+        let settle = |list: &mut BanList| {
+            let (dest, json) = list.take_pending_dump().expect("pending");
+            write_banlist(&dest, &json).unwrap();
+            assert!(!list.is_dirty());
+        };
+
+        list.add(&target, 1, 9999999999).unwrap();
+        assert!(list.is_dirty(), "add");
+        settle(&mut list);
+
+        list.add(&target, 1, 9999999999).unwrap();
+        assert!(!list.is_dirty(), "a ban that neither inserts nor extends changes nothing");
+
+        list.add(&target, 1, 99999999999).unwrap();
+        assert!(list.is_dirty(), "extending a ban");
+        settle(&mut list);
+
+        list.prune_expired(u64::MAX);
+        assert!(list.is_dirty(), "prune_expired");
+        settle(&mut list);
+
+        list.add(&target, 1, 9999999999).unwrap();
+        settle(&mut list);
+        list.remove(&target).unwrap();
+        assert!(list.is_dirty(), "remove");
+        settle(&mut list);
+
+        list.add(&target, 1, 9999999999).unwrap();
+        settle(&mut list);
+        list.clear();
+        assert!(list.is_dirty(), "clear");
     }
 
     #[test]

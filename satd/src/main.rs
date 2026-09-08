@@ -3786,6 +3786,15 @@ async fn main() {
     // Persist the address book so learned peers survive a restart.
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));
 
+    // Core dumps the ban list in `~BanMan()`. Every mutator flushes inline, so
+    // the only state that can still be pending here is a re-armed dirty flag
+    // from a write that failed earlier (ENOSPC, EIO). Without this the retry
+    // depends on the periodic prune, which only runs while the node is below
+    // its outbound target -- so on a healthy or `-connect`-pinned node it
+    // never runs, and the ban is lost at shutdown having been reported as
+    // accepted.
+    peer_manager.flush_banlist();
+
     server_handle.stop().expect("Failed to stop server");
 
     // The isolated API runtime is torn down by `ApiRuntimeGuard` when `main`

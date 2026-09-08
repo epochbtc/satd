@@ -352,6 +352,23 @@ pub struct PeerManager {
     /// are keyed by normalised subnet string, survive restarts, and respond
     /// to `setmocktime`.
     ban_list: RwLock<crate::net::ban::BanList>,
+    /// Core's `DumpBanlist` `dump_mutex` (`src/banman.cpp`): serialises the
+    /// whole snapshot-then-write, not just the snapshot.
+    ///
+    /// Without it two flushes race, and both outcomes lose data. `setban`
+    /// runs on an RPC thread while the automatic-ban path runs on the manager
+    /// event loop, so this is reachable, not theoretical:
+    ///
+    /// - **Lost update.** A slow flush snapshots `{A}`, is preempted, a fast
+    ///   flush writes `{A, B}` and clears `dirty`, then the slow flush renames
+    ///   `{A}` over it. `B` is gone from the file *and* `dirty` is false, so
+    ///   nothing ever rewrites it — the exact silent-loss failure this whole
+    ///   change exists to close.
+    /// - **Torn file.** Both writes use one `banlist.json.tmp`; the second
+    ///   `File::create` truncates the first's file while it still holds the
+    ///   descriptor, so the bytes interleave and the renamed result is
+    ///   invalid JSON.
+    banlist_dump: parking_lot::Mutex<()>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
     #[allow(dead_code)]
     fee_estimator: Arc<FeeEstimator>,
@@ -595,6 +612,7 @@ impl PeerManager {
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
             ban_list: RwLock::new(crate::net::ban::BanList::default()),
+            banlist_dump: parking_lot::Mutex::new(()),
             shutdown,
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
@@ -2049,14 +2067,21 @@ impl PeerManager {
         (recreated, why)
     }
 
-    /// Core's `BanMan::DumpBanlist`: snapshot the list under the lock, release
-    /// it, then write. On a failed write the list is marked dirty again so the
-    /// next flush retries.
+    /// Core's `BanMan::DumpBanlist`: take the dump mutex, snapshot the list
+    /// under the ban-list lock, release *that* lock, then write. On a failed
+    /// write the list is marked dirty again so the next flush retries.
     ///
-    /// The write is deliberately not done under the lock. It runs on the peer
-    /// event loop at every automatic ban, and `fs::write` there stalls every
-    /// other peer for the duration of a disk write.
+    /// Two locks, each doing one job. `banlist_dump` orders whole dumps
+    /// against each other, so a snapshot can never be written out of order
+    /// with respect to a newer one (see its declaration). `ban_list` is
+    /// released before the write so a concurrent `is_addr_banned` — on the
+    /// inbound-accept path — does not wait on a disk write.
+    ///
+    /// The write is still a blocking syscall on whichever thread calls this,
+    /// which for the automatic-ban path is the manager event loop. That is
+    /// unchanged by this split and is a separate problem.
     pub fn flush_banlist(&self) {
+        let _dumping = self.banlist_dump.lock();
         let pending = self.ban_list.write().take_pending_dump();
         let Some((path, json)) = pending else {
             return;
