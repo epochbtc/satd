@@ -2477,6 +2477,66 @@ fn test_logging_reflects_the_debug_flag_at_startup() {
     node.stop();
 }
 
+/// `-whitelist` is inbound-only unless the entry carries an `out` token, and
+/// even then Core consults it only for manual connections. satd applied every
+/// entry in both directions, so a bare `-whitelist=noban@127.0.0.1` made the
+/// *dialling* node's outbound peer un-bannable and exempt from the upload
+/// budget — a grant nothing asked for.
+#[test]
+fn test_getpeerinfo_whitelist_is_inbound_only_by_default() {
+    let listener_p2p_port = find_available_port();
+    let mut listener = TestNode::start(&[&format!("--port={}", listener_p2p_port)]);
+
+    // The dialler whitelists the address it is about to dial, without `out`.
+    let mut dialler = TestNode::start(&[
+        "--whitelist=noban@127.0.0.1",
+        &format!("--connect=127.0.0.1:{}", listener_p2p_port),
+    ]);
+    poll_until(
+        || get_rpc_u64(&dialler, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the dialler never connected out",
+    );
+    let info = dialler.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    assert_eq!(
+        peers[0]["permissions"].as_array().map(Vec::len),
+        Some(0),
+        "an outbound peer must not inherit an inbound-only whitelist entry: {info}"
+    );
+    dialler.stop();
+    listener.stop();
+
+    // With `out`, a manual connection does take the grant — Core's
+    // `-whitelist=noban,out@127.0.0.1` case.
+    let listener_p2p_port = find_available_port();
+    let mut listener = TestNode::start(&[&format!("--port={}", listener_p2p_port)]);
+    let mut dialler = TestNode::start(&[
+        "--whitelist=noban,out@127.0.0.1",
+        &format!("--connect=127.0.0.1:{}", listener_p2p_port),
+    ]);
+    poll_until(
+        || get_rpc_u64(&dialler, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the dialler never connected out",
+    );
+    let info = dialler.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    let perms: Vec<String> = peers[0]["permissions"]
+        .as_array()
+        .expect("permissions array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        perms,
+        ["noban", "download"],
+        "an `out@` entry grants on a manual outbound connection: {info}"
+    );
+    dialler.stop();
+    listener.stop();
+}
+
 /// Core's idiom for "match this range and grant it nothing" is an `@` entry
 /// with an empty permission list. satd expanded it to the implicit set, so
 /// `getpeerinfo` now shows what was actually granted — nothing.

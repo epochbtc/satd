@@ -180,7 +180,7 @@ startup error.
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
 | `v2only` | false | hot | satd | Refuse peers that do not speak BIP 324 v2 (privacy hardening). |
 | `externalip` | none | hot | core | External address to advertise to peers (repeatable). |
-| `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). |
+| `whitelist` | none | hot | core | Grant net permissions to peers by source subnet (repeatable). `[<perms>@]<subnet>`. **Inbound only unless the permission list carries `out`**, as in Core; an `out` entry applies only to *manual* outbound connections (`connect` / `addnode`), never to automatic ones. `@<subnet>` with an empty list matches the range and grants nothing. A peer arriving over the Tor hidden service is never matched against this — it reaches the node on a loopback socket Tor forwards to, so matching would grant an anonymous remote peer whatever you granted your own machine. |
 | `whitelistrelay` | on | hot | core | Grant `relay` to whitelisted peers with default permissions (relay their txes even under `-blocksonly`). Entries with an explicit `perms@` prefix are unaffected. |
 | `whitelistforcerelay` | off | hot | core | Grant `forcerelay` to whitelisted peers with default permissions. Entries with an explicit `perms@` prefix are unaffected. |
 | `whitebind` | none | restart | core | Bind an extra permissioned P2P listener (repeatable). |
@@ -225,7 +225,7 @@ startup error.
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
 | `torpassword` | none | restart | core | Tor control port password (for a `HashedControlPassword` setup). Leave unset to use SAFECOOKIE cookie auth. |
-| `listenonion` | off (on if `torcontrol` set) | restart | core | Create a Tor v3 hidden service via the control port. |
+| `listenonion` | off (on if `torcontrol` set) | restart | core | Create a Tor v3 hidden service via the control port. Gets its own P2P listener on `127.0.0.1:<port+1>` unless a `bind=<addr>:<port>=onion` entry names one, matching Core's `onion_binds`; peers arriving there are exempt from `whitelist` matching. |
 
 ## Consensus
 

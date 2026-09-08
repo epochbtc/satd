@@ -7,6 +7,30 @@
 use ipnet::IpNet;
 use std::net::IpAddr;
 
+/// Which connection directions a `-whitelist` entry applies to
+/// (Core's `ConnectionDirection`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Direction {
+    pub inbound: bool,
+    pub outbound: bool,
+}
+
+impl Direction {
+    pub const NONE: Self = Self {
+        inbound: false,
+        outbound: false,
+    };
+    /// Core's default for an entry carrying neither token.
+    pub const IN: Self = Self {
+        inbound: true,
+        outbound: false,
+    };
+    pub const OUT: Self = Self {
+        inbound: false,
+        outbound: true,
+    };
+}
+
 /// The subset of Bitcoin Core's net permissions satd acts on. Stored per
 /// peer. `Addr`/`Mempool`/`Download` are tracked for parity/`getpeerinfo`
 /// even where satd does not yet special-case them.
@@ -125,6 +149,25 @@ impl NetPermissions {
         out
     }
 
+    /// Parse a comma-separated permission list, returning the permissions and
+    /// the connection direction its `in` / `out` tokens select.
+    pub fn parse_list_with_direction(s: &str) -> Result<(Self, Direction), String> {
+        let mut direction = Direction::NONE;
+        for tok in s.split(',') {
+            match tok.trim().to_ascii_lowercase().as_str() {
+                "in" => direction.inbound = true,
+                "out" => direction.outbound = true,
+                _ => {}
+            }
+        }
+        // Core's `TryParsePermissionFlags`: "if (connection_direction ==
+        // ConnectionDirection::None) connection_direction = In".
+        if direction == Direction::NONE {
+            direction = Direction::IN;
+        }
+        Ok((Self::parse_list(s)?, direction))
+    }
+
     /// Parse a comma-separated permission list (`noban,relay,...` or `all`).
     ///
     /// An empty list grants **nothing**. This is only reachable as the
@@ -187,6 +230,19 @@ pub struct WhitelistEntry {
     pub net: IpNet,
     pub perms: NetPermissions,
     pub raw: String,
+    /// Which connection directions this entry applies to. Core keeps two
+    /// lists (`vWhitelistedRangeIncoming` / `Outgoing`) and consults the
+    /// outgoing one *only* for manual connections; satd records the direction
+    /// on the entry and applies the same rule in [`permissions_for`].
+    ///
+    /// The default is inbound-only, as in Core, whose
+    /// `TryParsePermissionFlags` resolves an unqualified entry to
+    /// `ConnectionDirection::In`. satd used to swallow the `in` / `out`
+    /// tokens as no-ops and apply every entry in both directions, so
+    /// `-whitelist=noban@127.0.0.1` made an *outbound* peer un-bannable and
+    /// exempt from the upload budget — a grant with no `out` token asking
+    /// for it.
+    pub direction: Direction,
     /// True when the entry was written without an explicit `perms@` prefix
     /// and therefore took the implicit permission set. The global
     /// `-whitelistrelay` / `-whitelistforcerelay` defaults apply only to
@@ -203,9 +259,18 @@ impl WhitelistEntry {
         if raw.is_empty() {
             return Err("empty -whitelist entry".to_string());
         }
-        let (perms, subnet, implicit) = match raw.split_once('@') {
-            Some((p, net)) => (NetPermissions::parse_list(p)?, net.trim(), false),
-            None => (NetPermissions::implicit(), raw.as_str(), true),
+        let (perms, direction, subnet, implicit) = match raw.split_once('@') {
+            Some((p, net)) => {
+                let (perms, direction) = NetPermissions::parse_list_with_direction(p)?;
+                (perms, direction, net.trim(), false)
+            }
+            // No `perms@` prefix: the implicit set, inbound only, as in Core.
+            None => (
+                NetPermissions::implicit(),
+                Direction::IN,
+                raw.as_str(),
+                true,
+            ),
         };
         let net: IpNet = if let Ok(n) = subnet.parse::<IpNet>() {
             n
@@ -225,6 +290,7 @@ impl WhitelistEntry {
             perms,
             raw,
             implicit,
+            direction,
         })
     }
 
@@ -256,8 +322,38 @@ impl WhitelistEntry {
 
 /// Compute the union of permissions granted to `ip` by the whitelist.
 pub fn permissions_for_ip(whitelist: &[WhitelistEntry], ip: IpAddr) -> NetPermissions {
+    permissions_for(whitelist, ip, Direction::IN)
+}
+
+/// The permissions granted to a peer at `ip` reached in `direction`.
+///
+/// Core keeps two lists and picks between them at the call site
+/// (`CConnman::ConnectNode`):
+///
+/// ```text
+/// whitelist_permissions = conn_type == ConnectionType::MANUAL
+///     ? vWhitelistedRangeOutgoing : {};
+/// ```
+///
+/// so an *automatic* outbound connection gets nothing from `-whitelist` at
+/// all, and a manual one gets only the entries carrying an `out` token. satd
+/// applies the same rule by filtering on the entry's recorded direction; the
+/// caller passes [`Direction::NONE`] for an outbound connection that is not
+/// manual.
+pub fn permissions_for(
+    whitelist: &[WhitelistEntry],
+    ip: IpAddr,
+    direction: Direction,
+) -> NetPermissions {
+    if direction == Direction::NONE {
+        return NetPermissions::NONE;
+    }
     whitelist
         .iter()
+        .filter(|e| {
+            (direction.inbound && e.direction.inbound)
+                || (direction.outbound && e.direction.outbound)
+        })
         .filter(|e| e.contains(ip))
         .fold(NetPermissions::NONE, |acc, e| acc.union(e.perms))
 }
@@ -336,6 +432,66 @@ mod tests {
         // A bare subnet never reaches `parse_list`, so it is unaffected.
         let e = WhitelistEntry::parse("127.0.0.1").unwrap();
         assert_eq!(e.perms, NetPermissions::implicit());
+    }
+
+    /// Core's `-whitelist` is inbound-only unless the entry says otherwise,
+    /// and its outgoing list is consulted only for manual connections.
+    /// `p2p_permissions.py` pins the difference:
+    ///
+    /// ```text
+    /// -whitelist=noban,out@127.0.0.1  -> ["noban", "download"]
+    /// -whitelist=noban@127.0.0.1      -> []
+    /// ```
+    ///
+    /// satd swallowed the `in` / `out` tokens as no-ops and applied every
+    /// entry in both directions, so the second line granted `noban` — making
+    /// an outbound peer un-bannable and exempt from the upload budget with no
+    /// `out` token asking for it.
+    #[test]
+    fn whitelist_entries_are_inbound_only_by_default() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let inbound_only = vec![WhitelistEntry::parse("noban@127.0.0.1").unwrap()];
+        assert_eq!(inbound_only[0].direction, Direction::IN);
+        assert!(permissions_for(&inbound_only, ip, Direction::IN).noban);
+        assert_eq!(
+            permissions_for(&inbound_only, ip, Direction::OUT),
+            NetPermissions::NONE,
+            "an entry with no `out` token grants nothing outbound"
+        );
+
+        let outbound = vec![WhitelistEntry::parse("noban,out@127.0.0.1").unwrap()];
+        assert_eq!(outbound[0].direction, Direction::OUT);
+        assert!(permissions_for(&outbound, ip, Direction::OUT).noban);
+        assert!(
+            permissions_for(&outbound, ip, Direction::OUT).download,
+            "noban carries download"
+        );
+        assert_eq!(
+            permissions_for(&outbound, ip, Direction::IN),
+            NetPermissions::NONE,
+            "`out` alone grants nothing inbound"
+        );
+
+        // Both tokens grant in both directions.
+        let both = vec![WhitelistEntry::parse("noban,in,out@127.0.0.1").unwrap()];
+        assert!(permissions_for(&both, ip, Direction::IN).noban);
+        assert!(permissions_for(&both, ip, Direction::OUT).noban);
+
+        // A bare subnet is the implicit set, inbound only.
+        let bare = vec![WhitelistEntry::parse("127.0.0.1").unwrap()];
+        assert_eq!(bare[0].direction, Direction::IN);
+        assert_eq!(permissions_for(&bare, ip, Direction::OUT), NetPermissions::NONE);
+
+        // An automatic outbound connection asks for nothing and gets nothing,
+        // whatever the entries say.
+        assert_eq!(
+            permissions_for(&both, ip, Direction::NONE),
+            NetPermissions::NONE
+        );
+
+        // `permissions_for_ip` is the inbound spelling, unchanged.
+        assert!(permissions_for_ip(&inbound_only, ip).noban);
     }
 
     #[test]
