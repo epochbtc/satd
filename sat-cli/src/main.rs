@@ -57,6 +57,41 @@ struct Cli {
     #[arg(long, help = "Path to cookie file", global = true)]
     rpccookiefile: Option<PathBuf>,
 
+    /// Connect over HTTPS. satd serves TLS-RPC on `-rpctlsbind`, which is
+    /// a different listener (and usually a different port) from the plain
+    /// `-rpcbind` one — pass `-rpcport` to match.
+    #[arg(long, help = "Connect to the RPC server over TLS", global = true)]
+    rpctls: bool,
+
+    /// Trust this CA in addition to the platform trust store. Point it at
+    /// the CA that issued the node's certificate — `contrib/stack/tls/mkca.sh`
+    /// writes one per install — or at a self-signed server certificate,
+    /// which is accepted as its own trust anchor.
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "PEM CA certificate to trust for -rpctls",
+        global = true
+    )]
+    rpccacert: Option<PathBuf>,
+
+    /// Client certificate, for a listener started with `-rpcmtls`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "PEM client certificate for mTLS",
+        global = true
+    )]
+    rpcclientcert: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "PEM private key for -rpcclientcert",
+        global = true
+    )]
+    rpcclientkey: Option<PathBuf>,
+
     #[arg(
         long,
         help = "Data directory (for locating cookie file)",
@@ -280,6 +315,10 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcuser",
         "rpcpassword",
         "rpccookiefile",
+        "rpctls",
+        "rpccacert",
+        "rpcclientcert",
+        "rpcclientkey",
         "datadir",
         "rpcwait",
         "output",
@@ -781,7 +820,13 @@ async fn main() {
         }
     };
 
-    let url = format!("http://{}:{}/", cli.rpcconnect, rpcport);
+    let tls = tls_config::client::ClientTlsOptions {
+        enabled: cli.rpctls,
+        ca_cert: cli.rpccacert.clone(),
+        client_cert: cli.rpcclientcert.clone(),
+        client_key: cli.rpcclientkey.clone(),
+    };
+    let url = tls.endpoint(&cli.rpcconnect, rpcport);
     let output = OutputFormat::parse(cli.output.as_deref());
 
     let (method, params) = resolve_cmd(&cli.command);
@@ -834,7 +879,16 @@ async fn main() {
         "params": json_params,
     });
 
-    let client = reqwest::Client::new();
+    // A bad flag combination or unreadable PEM is fatal here rather than
+    // per-request: every retry would fail identically, and `-rpcwait` would
+    // spin forever on a typo in a path.
+    let client = match tls.build(reqwest::Client::builder()) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     loop {
         let auth_header = format!(

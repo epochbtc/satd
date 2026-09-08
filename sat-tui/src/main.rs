@@ -46,6 +46,23 @@ struct CliArgs {
     #[arg(long, help = "Path to cookie file")]
     rpccookiefile: Option<PathBuf>,
 
+    /// Connect over HTTPS. satd serves TLS-RPC on `-rpctlsbind`, a
+    /// different listener (usually a different port) from plain `-rpcbind`
+    /// — pass `-rpcport` to match.
+    #[arg(long, help = "Connect to the RPC server over TLS")]
+    rpctls: bool,
+
+    /// Trust this CA in addition to the platform trust store. A
+    /// self-signed server certificate works here too, as its own anchor.
+    #[arg(long, value_name = "FILE", help = "PEM CA certificate to trust for -rpctls")]
+    rpccacert: Option<PathBuf>,
+
+    #[arg(long, value_name = "FILE", help = "PEM client certificate for mTLS")]
+    rpcclientcert: Option<PathBuf>,
+
+    #[arg(long, value_name = "FILE", help = "PEM private key for -rpcclientcert")]
+    rpcclientkey: Option<PathBuf>,
+
     #[arg(long, help = "Data directory")]
     datadir: Option<PathBuf>,
 }
@@ -55,6 +72,7 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
     let known_flags = [
         "regtest", "testnet", "signet", "rpcconnect", "rpcport",
         "rpcuser", "rpcpassword", "rpccookiefile", "datadir",
+        "rpctls", "rpccacert", "rpcclientcert", "rpcclientkey",
     ];
     args.into_iter()
         .map(|arg| {
@@ -87,9 +105,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         8332
     });
 
+    let tls = tls_config::client::ClientTlsOptions {
+        enabled: cli.rpctls,
+        ca_cert: cli.rpccacert.clone(),
+        client_cert: cli.rpcclientcert.clone(),
+        client_key: cli.rpcclientkey.clone(),
+    };
+
     // Resolve auth — use cookie path for automatic re-auth on satd restart
     let rpc_client = if let (Some(u), Some(p)) = (&cli.rpcuser, &cli.rpcpassword) {
-        Arc::new(RpcClient::new(&cli.rpcconnect, rpcport, u, p))
+        Arc::new(RpcClient::new(&cli.rpcconnect, rpcport, u, p, &tls)?)
     } else {
         let cookie_path = cli.rpccookiefile.unwrap_or_else(|| {
             let base = cli.datadir.clone().unwrap_or_else(rpc::default_datadir);
@@ -108,7 +133,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base.join(net_subdir).join(".cookie")
             }
         });
-        Arc::new(RpcClient::with_cookie(&cli.rpcconnect, rpcport, cookie_path))
+        Arc::new(RpcClient::with_cookie(
+            &cli.rpcconnect,
+            rpcport,
+            cookie_path,
+            &tls,
+        )?)
     };
     let state = Arc::new(Mutex::new(AppState::new()));
 

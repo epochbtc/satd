@@ -4040,6 +4040,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "tls-config",
  "tokio",
  "zeroize",
 ]
@@ -4056,6 +4057,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tls-config",
  "tokio",
 ]
 
@@ -4915,9 +4917,11 @@ name = "tls-config"
 version = "0.5.2-pre"
 dependencies = [
  "rcgen",
+ "reqwest",
  "rustls-pemfile",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-rustls",
  "x509-parser",
 ]
