@@ -8309,4 +8309,272 @@ mod tests {
             .expect("zero lock value on a mempool parent admits");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- remove_for_reorg (Core's removeForReorg) ----
+    //
+    // Every case below inserts its transaction into the pool *directly* rather
+    // than through `accept_transaction`. That is the situation the function
+    // exists for and the only way to reach it: each of these transactions was
+    // admissible against the chain it was accepted on, and the reorg is what
+    // made it invalid. Admission would refuse them now, so building the
+    // fixture through admission would test nothing.
+    //
+    // The chain state is regtest genesis (tip 0, so a mempool transaction
+    // would confirm at height 1), which is enough to put each guard on the
+    // wrong side of its cutoff without also having to fabricate a reorg.
+
+    /// Insert `tx` into the pool exactly as admission does, maintaining the
+    /// `spends` reverse index that the descendant walk relies on.
+    fn insert_raw(mp: &Mempool, tx: Transaction) -> Txid {
+        let txid = tx.compute_txid();
+        let mut inner = mp.inner.write();
+        for i in &tx.input {
+            inner.spends.insert(i.previous_output, txid);
+        }
+        inner.entries.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee: 1_000,
+                weight: 400,
+                fee_rate: 2_500,
+                time: 0,
+                fee_delta: 0,
+                sigop_cost: 0,
+                prev_scripthashes: Vec::new(),
+                source: TxSource::P2p,
+                scope: QuarantineScope::acting(),
+                quarantine_rule: None,
+                prev_amounts: Vec::new(),
+                prev_scripts: Vec::new(),
+                sp_tweak: None,
+            },
+        );
+        txid
+    }
+
+    fn in_pool(mp: &Mempool, txid: &Txid) -> bool {
+        mp.inner.read().entries.contains_key(txid)
+    }
+
+    /// A transaction nothing has invalidated must survive the sweep. Without
+    /// this every other case here would also pass against a `remove_for_reorg`
+    /// that simply emptied the pool.
+    #[test]
+    fn reorg_leaves_a_still_valid_transaction_alone() {
+        let op = outpoint(0xF0);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let txid = insert_raw(&mp, spend(op, 40_000, 0x30));
+        mp.remove_for_reorg(&cs);
+        assert!(in_pool(&mp, &txid), "a valid transaction was evicted by the reorg sweep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (a) Locktime finality. A height locktime the next block cannot satisfy
+    /// evicts — this is the case a reorg creates by moving the tip backwards
+    /// past a transaction's locktime.
+    #[test]
+    fn reorg_evicts_a_height_locktime_the_new_tip_cannot_satisfy() {
+        let op = outpoint(0xF1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        // locktime 1 against next height 1: the cutoff is strict, so unmet.
+        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x31, 2, 0, 1));
+        // One below the cutoff is still final and must be left alone.
+        let op2 = outpoint(0xF2);
+        let (cs2, mp2, dir2) = make_funded_env(&[(op2, coin(50_000))]);
+        let kept = insert_raw(&mp2, spend_with(op2, 40_000, 0x32, 2, 0, 0));
+
+        mp.remove_for_reorg(&cs);
+        mp2.remove_for_reorg(&cs2);
+
+        assert!(!in_pool(&mp, &evicted), "an unsatisfiable height locktime survived the reorg");
+        assert!(in_pool(&mp2, &kept), "a satisfied locktime was evicted");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (a) again, on the time branch: a locktime at or above the new tip's MTP
+    /// is non-final. The two branches take different cutoffs and a sweep that
+    /// applied the height cutoff to both would pass the test above.
+    #[test]
+    fn reorg_evicts_a_time_locktime_at_the_new_tip_mtp() {
+        let op = outpoint(0xF3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let tip_mtp = cs.get_median_time_past(1);
+        assert!(tip_mtp >= 500_000_000, "regtest genesis time is a time locktime");
+        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x33, 2, 0, tip_mtp));
+        let kept = insert_raw(&mp, spend_with(op, 40_000, 0x34, 2, 0, tip_mtp - 1));
+
+        mp.remove_for_reorg(&cs);
+
+        assert!(!in_pool(&mp, &evicted), "a time locktime at the tip MTP survived the reorg");
+        assert!(in_pool(&mp, &kept), "a time locktime below the tip MTP was evicted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (a) The `SEQUENCE_FINAL` escape hatch. Core's `IsFinalTx` disables
+    /// locktime outright when every input is final, and the reorg sweep has to
+    /// honour that too or it evicts transactions that are still valid.
+    #[test]
+    fn reorg_keeps_a_final_sequence_transaction_whatever_its_locktime() {
+        let op = outpoint(0xF4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let txid = insert_raw(&mp, spend_with(op, 40_000, 0x35, 2, 0xffff_ffff, 1_000_000));
+        mp.remove_for_reorg(&cs);
+        assert!(in_pool(&mp, &txid), "a final-sequence transaction was evicted for its locktime");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) Coinbase maturity — the case #670 is about. A reorg that shortens
+    /// the chain can leave a mempool transaction spending a coinbase that no
+    /// longer has 100 confirmations.
+    #[test]
+    fn reorg_evicts_a_spend_of_a_now_immature_coinbase() {
+        let op = outpoint(0xF5);
+        let cb = Coin {
+            amount: 50_000,
+            script_pubkey: p2wpkh_spk(0x11),
+            height: 0,
+            coinbase: true,
+        };
+        let (cs, mp, dir) = make_funded_env(&[(op, cb)]);
+        // Sequence MAX and locktime 0 isolate maturity from the other guards.
+        let txid = insert_raw(&mp, spend_with(op, 40_000, 0x36, 2, 0xffff_ffff, 0));
+        mp.remove_for_reorg(&cs);
+        assert!(!in_pool(&mp, &txid), "an immature coinbase spend survived the reorg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) The same coin, non-coinbase, must not be touched: maturity applies
+    /// to coinbase outputs alone.
+    #[test]
+    fn reorg_keeps_a_spend_of_a_shallow_non_coinbase_coin() {
+        let op = outpoint(0xF6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 0))]);
+        let txid = insert_raw(&mp, spend_with(op, 40_000, 0x37, 2, 0xffff_ffff, 0));
+        mp.remove_for_reorg(&cs);
+        assert!(in_pool(&mp, &txid), "a shallow non-coinbase spend was evicted as immature");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) BIP 68 relative locks, which a reorg can unmeet by moving the
+    /// spent coin's confirmation height forward relative to the new tip.
+    #[test]
+    fn reorg_evicts_an_unmet_bip68_height_lock() {
+        let op = outpoint(0xF7);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        // Coin at height 1 evaluated at height 1: zero blocks elapsed.
+        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x38, 2, 1, 0));
+        mp.remove_for_reorg(&cs);
+        assert!(!in_pool(&mp, &evicted), "an unmet BIP 68 height lock survived the reorg");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The same lock against a coin one block older is met.
+        let op2 = outpoint(0xF8);
+        let (cs2, mp2, dir2) = make_funded_env(&[(op2, coin_at(50_000, 0))]);
+        let kept = insert_raw(&mp2, spend_with(op2, 40_000, 0x39, 2, 1, 0));
+        mp2.remove_for_reorg(&cs2);
+        assert!(in_pool(&mp2, &kept), "a met BIP 68 height lock was evicted");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (c) BIP 68 does not apply below version 2, so a version-1 transaction
+    /// carrying the identical sequence must survive.
+    #[test]
+    fn reorg_does_not_apply_bip68_to_a_version_1_transaction() {
+        let op = outpoint(0xF9);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let txid = insert_raw(&mp, spend_with(op, 40_000, 0x3A, 1, 1, 0));
+        mp.remove_for_reorg(&cs);
+        assert!(in_pool(&mp, &txid), "BIP 68 was enforced against a version-1 transaction");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) The input is simply gone: the coin was created by a block the
+    /// reorg disconnected and never reappeared. Nothing else in the sweep
+    /// covers this, and it is the most common real cause.
+    #[test]
+    fn reorg_evicts_a_spend_of_a_coin_the_reorg_removed() {
+        // No coins funded at all, so the prevout resolves nowhere.
+        let (cs, mp, dir) = make_funded_env(&[]);
+        let txid = insert_raw(&mp, spend(outpoint(0xFA), 40_000, 0x3B));
+        mp.remove_for_reorg(&cs);
+        assert!(!in_pool(&mp, &txid), "a spend of a vanished coin survived the reorg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pass 2: descendants go with their ancestor. A child is not individually
+    /// invalid — its parent is in the mempool, so it inherits — and would be
+    /// left behind spending a transaction that no longer exists.
+    #[test]
+    fn reorg_evicts_the_whole_descendant_subgraph() {
+        let (cs, mp, dir) = make_funded_env(&[]);
+        // Parent spends a coin that does not exist -> directly invalid.
+        let parent_tx = spend(outpoint(0xFB), 40_000, 0x3C);
+        let parent = insert_raw(&mp, parent_tx);
+        let child = insert_raw(&mp, spend(OutPoint { txid: parent, vout: 0 }, 30_000, 0x3D));
+        let grandchild =
+            insert_raw(&mp, spend(OutPoint { txid: child, vout: 0 }, 20_000, 0x3E));
+
+        mp.remove_for_reorg(&cs);
+
+        assert!(!in_pool(&mp, &parent), "the invalid parent survived");
+        assert!(!in_pool(&mp, &child), "the child of an evicted parent survived");
+        assert!(!in_pool(&mp, &grandchild), "the descendant walk stopped after one level");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pass 3: eviction has to undo the bookkeeping, not just drop the entry.
+    /// A stale `spends` row makes the outpoint look double-spent to the next
+    /// admission, so a valid replacement would be refused as a conflict.
+    #[test]
+    fn reorg_eviction_clears_the_spends_index_and_byte_accounting() {
+        let op = outpoint(0xFC);
+        let (cs, mp, dir) = make_funded_env(&[]);
+        let tx = spend(op, 40_000, 0x3F);
+        let txid = insert_raw(&mp, tx.clone());
+        {
+            let mut inner = mp.inner.write();
+            let size = bitcoin::consensus::serialize(&tx).len();
+            inner.total_bytes = size;
+        }
+
+        mp.remove_for_reorg(&cs);
+
+        let inner = mp.inner.read();
+        assert!(!inner.entries.contains_key(&txid));
+        assert!(
+            !inner.spends.contains_key(&op),
+            "the evicted transaction left its outpoint marked as spent"
+        );
+        assert_eq!(inner.total_bytes, 0, "evicting did not release the transaction's bytes");
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The eviction must be reported. `EvictReason::Reorg` is what tells a
+    /// streaming client its transaction is gone for a reason it can act on,
+    /// as opposed to having been mined.
+    #[test]
+    fn reorg_eviction_emits_a_reorg_evict_event() {
+        let (cs, mp, dir) = make_funded_env(&[]);
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(event_tx);
+        let txid = insert_raw(&mp, spend(outpoint(0xFD), 40_000, 0x40));
+
+        mp.remove_for_reorg(&cs);
+
+        let mut seen = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let MempoolEvent::LeaveEvicted { txid: t, reason } = ev {
+                seen = Some((t, reason));
+            }
+        }
+        assert_eq!(
+            seen,
+            Some((txid, EvictReason::Reorg)),
+            "the reorg sweep evicted silently"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
