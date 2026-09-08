@@ -154,9 +154,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - libssl3: reqwest's openssl backend (matches the build stage)
 #   - ca-certificates: outbound HTTPS for fee oracles, webhooks, etc.
 #   - tini: PID 1 signal forwarding so SIGTERM reaches satd cleanly
+#   - openssl: the CLI, for satd-mkca (below). It issues the per-install CA
+#     and server certificate that satd's TLS surfaces present. Carrying the
+#     tool in the image is what lets the compose stack, the appliance and
+#     the app-store packages all generate identical TLS material without
+#     each shipping their own copy. libssl3 is already here, so this adds
+#     about a megabyte.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        openssl \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
@@ -178,6 +185,14 @@ COPY --from=builder /out/sat-cli /usr/local/bin/sat-cli
 # those packages consume rather than bolted on per package.
 COPY --from=builder /out/sat-tui /usr/local/bin/sat-tui
 COPY contrib/docker/satd-healthcheck /usr/local/bin/satd-healthcheck
+
+# The reference stack's first-run tooling. Baked in rather than bind-mounted
+# so that a deployment which cannot mount repository files — an Umbrel app,
+# a StartOS package — gets exactly the same certificate issuance and config
+# rendering as `docker compose up` from contrib/stack.
+COPY contrib/stack/tls/mkca.sh /usr/local/bin/satd-mkca
+COPY contrib/stack/satd/satd-init /usr/local/bin/satd-init
+COPY contrib/stack/satd/satd.conf.tmpl /etc/satd/satd.conf.tmpl
 
 USER satd
 WORKDIR /var/lib/satd

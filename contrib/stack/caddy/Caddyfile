@@ -1,0 +1,33 @@
+# Caddyfile for the satd stack's reverse proxy. See compose.proxy.yml.
+{
+	# No ACME. This proxy presents the per-install certificate that
+	# tls/mkca.sh issued, which is the same one every satd surface
+	# presents, so a client that imported the CA trusts all of them.
+	# Automatic HTTPS would try to obtain a public certificate for a
+	# name that does not exist publicly and fail on every start.
+	auto_https off
+	admin off
+}
+
+(satd_tls) {
+	tls /satd/tls/fullchain.crt /satd/tls/leaf.key
+}
+
+# Ride The Lightning — compose.lightning.yml.
+:443 {
+	import satd_tls
+	reverse_proxy rtl:3000
+}
+
+# Cashu mint — compose.cashu.yml.
+:8443 {
+	import satd_tls
+	reverse_proxy mint:3338
+}
+
+# satd's metrics, /healthz and /readyz. No native TLS on this listener, which
+# is why it is here; it stays on the compose network otherwise.
+:9443 {
+	import satd_tls
+	reverse_proxy satd:9332
+}

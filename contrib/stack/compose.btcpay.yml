@@ -1,0 +1,99 @@
+# BTCPay Server overlay — Postgres + NBXplorer + BTCPay against satd.
+#
+#   docker compose -f compose.yml -f compose.btcpay.yml up -d
+#
+# BEST-EFFORT and heavy: three more containers, a database, and an initial
+# NBXplorer scan that downloads every block over P2P. Off by default in the
+# appliance image for that reason.
+#
+# NBXplorer is a full-node client, not a light client: it fetches blocks over
+# P2P and queries JSON-RPC, so this overlay exercises satd's RPC surface far
+# harder than the Lightning one does. The repository's NBXplorer and BTCPay
+# canaries gate every PR on the same path — four Core-compatibility bugs were
+# found that way — so what is new here is the packaging, not the claim.
+#
+# Authentication is by cookie: the satd volume is mounted read-only and
+# `rpc-cookie` is the stable per-network symlink satd-init maintains.
+#
+# POSTGRES_PASSWORD has no default. The database is only reachable on the
+# compose network, but a password baked into a file in a public repository
+# is not a password:
+#
+#   echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+
+services:
+  btcpay-db:
+    image: postgres:16-bookworm@sha256:bb3e1a57e5407e0a5280b4211980a5e537f4abd234a87014ac979849a78dd825
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?generate one with `openssl rand -hex 24` and put POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: nbxplorer
+    volumes:
+      - btcpay-db:/var/lib/postgresql/data
+    networks:
+      - satd
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nbxplorer:
+    image: nicolasdorier/nbxplorer:2.5.21@sha256:0eaa2b165873face1ac699297b45f5110d57b557558d68588896dc386c7eb3cb
+    depends_on:
+      satd:
+        condition: service_healthy
+      btcpay-db:
+        condition: service_healthy
+    environment:
+      NBXPLORER_NETWORK: ${NETWORK:-signet}
+      NBXPLORER_BIND: 0.0.0.0:32838
+      NBXPLORER_CHAINS: btc
+      NBXPLORER_BTCRPCURL: http://satd:8332
+      NBXPLORER_BTCRPCCOOKIEFILE: /satd/rpc-cookie
+      NBXPLORER_BTCNODEENDPOINT: satd:${SATD_P2P_PORT:-38333}
+      NBXPLORER_POSTGRES: Host=btcpay-db;Port=5432;Database=nbxplorer;Username=postgres;Password=${POSTGRES_PASSWORD}
+      # No auth on the compose network only; nothing publishes this port.
+      NBXPLORER_NOAUTH: "1"
+      # On a short chain NBXplorer decides it should "warm up" by mining,
+      # via an RPC satd does not implement — which kills its indexer loop
+      # before it connects, on regtest in particular. The repository's
+      # NBXplorer canary disables it for the same reason.
+      NBXPLORER_NOWARMUP: "1"
+    volumes:
+      - nbxplorer-data:/datadir
+      - satd-data:/satd:ro
+    networks:
+      - satd
+    restart: unless-stopped
+    expose:
+      - "32838"
+
+  btcpay:
+    image: btcpayserver/btcpayserver:2.3.9@sha256:7c4b79fd578d919da1bc3bb52fd4695c156fe309ab8c0b6602c36026f1780d27
+    depends_on:
+      - nbxplorer
+    environment:
+      BTCPAY_NETWORK: ${NETWORK:-signet}
+      BTCPAY_BIND: 0.0.0.0:49392
+      BTCPAY_ROOTPATH: /
+      BTCPAY_CHAINS: btc
+      BTCPAY_BTCEXPLORERURL: http://nbxplorer:32838/
+      BTCPAY_POSTGRES: Host=btcpay-db;Port=5432;Database=btcpay;Username=postgres;Password=${POSTGRES_PASSWORD}
+      BTCPAY_EXPLORERPOSTGRES: Host=btcpay-db;Port=5432;Database=nbxplorer;Username=postgres;Password=${POSTGRES_PASSWORD}
+    volumes:
+      - btcpay-data:/datadir
+    networks:
+      - satd
+    restart: unless-stopped
+    # BTCPay speaks plain HTTP and builds absolute URLs from its own root,
+    # so it gets a dedicated proxy port rather than a path. Published
+    # directly here for stacks not running compose.proxy.yml; behind the
+    # proxy, prefer the TLS port.
+    ports:
+      - "${BTCPAY_PORT:-49392}:49392"
+
+volumes:
+  btcpay-db:
+  btcpay-data:
+  nbxplorer-data:

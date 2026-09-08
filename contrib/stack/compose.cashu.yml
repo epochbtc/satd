@@ -1,0 +1,53 @@
+# Cashu overlay — a Nutshell mint whose Lightning backend is the stack's LND.
+#
+#   docker compose -f compose.yml -f compose.lightning.yml \
+#                  -f compose.cashu.yml -f compose.proxy.yml up -d
+#
+# BEST-EFFORT, and emphatically a demo: a mint is a custodian. This one holds
+# whatever you deposit, its keys live in a container volume, and it has no
+# backup story. Signet only, in practice.
+#
+# Requires the Lightning overlay: the mint melts and mints against LND's REST
+# API, which is in turn a Neutrino client of satd. So a working mint here is
+# a three-link claim about satd — filters over P2P, LND on top, mint on top
+# of that.
+#
+# MINT_PRIVATE_KEY is required and has no default. It is the seed for the
+# mint's keysets: shipping one would mean every deployment shared it, and
+# changing it invalidates every token already issued. Generate once:
+#
+#   echo "MINT_PRIVATE_KEY=$(openssl rand -hex 32)" >> .env
+
+services:
+  mint:
+    image: cashubtc/nutshell:0.16.5@sha256:7209a93720a38e78244643329b2a75ee5730363f2a4ef80a82c5bebc188b49dc
+    depends_on:
+      lnd:
+        condition: service_healthy
+    entrypoint: ["poetry", "run", "mint"]
+    environment:
+      MINT_LISTEN_HOST: 0.0.0.0
+      MINT_LISTEN_PORT: "3338"
+      MINT_PRIVATE_KEY: ${MINT_PRIVATE_KEY:?generate one with `openssl rand -hex 32` and put MINT_PRIVATE_KEY in .env}
+      # 0.16 spells the backend selector per-unit. The older
+      # MINT_LIGHTNING_BACKEND name is set too so a pin bump in either
+      # direction keeps working; an unrecognised variable is ignored.
+      MINT_BACKEND_BOLT11_SAT: LndRestWallet
+      MINT_LIGHTNING_BACKEND: LndRestWallet
+      MINT_LND_REST_ENDPOINT: https://lnd:8080
+      MINT_LND_REST_CERT: /lnd/tls.cert
+      MINT_LND_REST_MACAROON: /lnd/data/chain/bitcoin/${NETWORK:-signet}/admin.macaroon
+      MINT_INFO_NAME: satd stack mint (demo)
+      MINT_INFO_DESCRIPTION: Nutshell mint backed by LND, backed by satd.
+    volumes:
+      - lnd-data:/lnd:ro
+      - mint-data:/root/.cashu
+    networks:
+      - satd
+    restart: unless-stopped
+    # Reached through the proxy overlay on 8443. Nutshell speaks plain HTTP.
+    expose:
+      - "3338"
+
+volumes:
+  mint-data:

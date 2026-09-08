@@ -1,0 +1,89 @@
+# contrib/stack/compose.yml — the supported satd service, on its own.
+#
+# This file is the contract. The overlays in this directory extend it, the
+# appliance image runs it, and the Umbrel / StartOS packages are derived from
+# it, so the satd service definition exists once and cannot drift between
+# deliverables.
+#
+#   docker compose up -d                      # satd alone
+#   docker compose -f compose.yml -f compose.lightning.yml up -d
+#
+# Support: satd itself is supported exactly as the release tarballs and the
+# container image are. The overlays bundle third-party software on a
+# best-effort basis — see README.md.
+
+name: satd-stack
+
+x-satd-image: &satd-image ${SATD_IMAGE:-ghcr.io/epochbtc/satd:latest}
+
+services:
+  # One-shot: issues the per-install CA and certificate, renders bitcoin.conf
+  # for ${NETWORK}, and generates the MCP token when SATD_MCP=1. Everything it
+  # writes lands in the data volume; nothing key-like ships in an image.
+  satd-init:
+    image: *satd-image
+    entrypoint: ["/usr/local/bin/satd-init"]
+    user: satd
+    environment:
+      NETWORK: ${NETWORK:-signet}
+      SATD_MCP: ${SATD_MCP:-0}
+      SATD_STACK_SUBNET: ${SATD_STACK_SUBNET:-10.77.0.0/24}
+      SATD_TLS_HOSTNAME: ${SATD_TLS_HOSTNAME:-satd}
+      SATD_P2P_PORT: ${SATD_P2P_PORT:-38333}
+    volumes:
+      - satd-data:/var/lib/satd
+    restart: "no"
+
+  satd:
+    image: *satd-image
+    depends_on:
+      satd-init:
+        condition: service_completed_successfully
+    # The network flag has to be an argument. satd accepts `signet=1` in a
+    # config file and then ignores it, which silently starts a mainnet node,
+    # so the stack never expresses the chain that way.
+    command:
+      - --datadir=/var/lib/satd
+      - --${NETWORK:-signet}
+    environment:
+      # Readiness, not liveness: /readyz stays negative until the chainstate
+      # is loaded and every listener is bound, which is what the overlays'
+      # `depends_on` needs to mean.
+      SATD_HEALTH_URL: http://127.0.0.1:9332/readyz
+    volumes:
+      - satd-data:/var/lib/satd
+    ports:
+      # P2P. Follows the chain, because other nodes expect the convention.
+      - "${SATD_P2P_PORT:-38333}:${SATD_P2P_PORT:-38333}"
+      # TLS surfaces only. The plain RPC / Electrum / Esplora / metrics
+      # listeners bind the compose network for the overlay containers to
+      # reach, and are deliberately not published: nothing unencrypted
+      # leaves the host.
+      - "${SATD_RPC_TLS_PORT:-8336}:8336"
+      - "${SATD_ELECTRUM_TLS_PORT:-50002}:50002"
+      - "${SATD_ESPLORA_TLS_PORT:-3001}:3001"
+    networks:
+      satd:
+        aliases:
+          - satd
+    stop_grace_period: 10m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/satd-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      # Opening a mainnet chainstate is not instant, and a reindex is far
+      # slower still. Failures inside the start period do not count.
+      start_period: 10m
+      retries: 3
+
+volumes:
+  satd-data:
+
+networks:
+  satd:
+    # A fixed subnet so bitcoin.conf's rpcallowip can name it exactly rather
+    # than opening RPC to every RFC1918 address.
+    ipam:
+      config:
+        - subnet: ${SATD_STACK_SUBNET:-10.77.0.0/24}

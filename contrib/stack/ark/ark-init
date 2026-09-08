@@ -1,0 +1,80 @@
+#!/bin/sh
+# ark-init — first-run initialisation for the Ark overlay.
+#
+#   docker compose -f compose.yml -f compose.ark.yml run --rm ark-init
+#
+# arkd will not start without a signer key, and its wallet must be created
+# and unlocked before the service answers anything. Both are per-install
+# secrets, so both are generated here into the data volume rather than
+# shipped or committed.
+#
+# Idempotent: an existing key and wallet are left alone.
+
+set -eu
+
+DATA=/app/data
+KEY_FILE="$DATA/signer.key"
+PW_FILE="$DATA/wallet.password"
+ADMIN="http://arkd:7071"
+
+mkdir -p "$DATA"
+
+# First run generates the key and stops. It has to: arkd will not start
+# without a signer key, so on a first run there is no admin API to talk to
+# yet, and waiting for one would just burn the timeout before telling the
+# operator the one thing they need to do.
+if [ ! -s "$KEY_FILE" ]; then
+    # arkd's own generator, rather than an ad-hoc one: the key has to be
+    # valid for its signer, and that is arkd's definition to make.
+    /app/arkd genkey | grep -oE '[0-9a-f]{64}' | head -1 > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    cat <<EOF
+
+ark-init: generated a signer key.
+
+  Add this to your .env:
+
+    ARKD_SIGNER_KEY=$(cat "$KEY_FILE")
+
+  Then restart the overlay and run this again to create the wallet:
+
+    docker compose -f compose.yml -f compose.ark.yml up -d
+    docker compose -f compose.yml -f compose.ark.yml run --rm ark-init
+
+EOF
+    exit 0
+fi
+
+echo "ark-init: signer key present ($KEY_FILE)"
+
+# Wait for arkd's admin port. It only listens once the wallet service has
+# handed it a signer pubkey, so reaching this is itself the signal that the
+# key above took effect.
+echo "ark-init: waiting for arkd..."
+i=0
+while [ "$i" -lt 60 ]; do
+    if /app/arkd --url "$ADMIN" wallet status >/dev/null 2>&1; then break; fi
+    i=$((i + 1))
+    sleep 5
+done
+if ! /app/arkd --url "$ADMIN" wallet status >/dev/null 2>&1; then
+    echo "ark-init: arkd's admin API never came up." >&2
+    echo "ark-init: if this is the first run, set ARKD_SIGNER_KEY (above) and re-run." >&2
+    exit 1
+fi
+
+if /app/arkd --url "$ADMIN" wallet status 2>/dev/null | grep -q "initialized: true"; then
+    echo "ark-init: wallet already initialised"
+else
+    if [ ! -s "$PW_FILE" ]; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$PW_FILE"
+        chmod 600 "$PW_FILE"
+    fi
+    echo "ark-init: creating the wallet (the mnemonic below is the only copy)"
+    /app/arkd --url "$ADMIN" wallet create --password "$(cat "$PW_FILE")"
+fi
+
+/app/arkd --url "$ADMIN" wallet unlock --password "$(cat "$PW_FILE")" || true
+sleep 5
+echo "ark-init: status:"
+/app/arkd --url "$ADMIN" wallet status 2>&1 | sed 's/^/  /'

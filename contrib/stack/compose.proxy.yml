@@ -1,0 +1,48 @@
+# Reverse-proxy overlay — TLS for the surfaces that have no native TLS.
+#
+#   docker compose -f compose.yml -f compose.proxy.yml up -d
+#
+# satd terminates TLS itself on RPC, Electrum, Esplora, MCP and events-gRPC.
+# Two things it serves have no native TLS — the metrics/health endpoint and
+# the streaming WebSocket — and neither do the third-party web UIs in the
+# other overlays. This overlay puts Caddy in front of them with the same
+# per-install certificate, so everything that leaves the host is encrypted
+# by one certificate the client imported once.
+#
+# One port per app rather than one port with paths. RTL and BTCPay both
+# build absolute URLs from their own root, so serving them under /rtl and
+# /btcpay means rewriting HTML and breaking on the next release. Distinct
+# ports are uglier to type and keep working.
+#
+#   443   Ride The Lightning        (compose.lightning.yml)
+#   8443  Cashu mint                (compose.cashu.yml)
+#   9443  satd metrics / healthz / readyz
+#
+# An overlay that is not enabled leaves its port answering 502, because
+# Caddy resolves upstreams per request rather than at start.
+
+services:
+  caddy:
+    image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+    depends_on:
+      satd-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Read-only, for the certificate and key only. Caddy runs as root in
+      # this image, so it can read the 0600 key; nothing else in the volume
+      # is touched.
+      - satd-data:/satd:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "${PROXY_RTL_PORT:-443}:443"
+      - "${PROXY_MINT_PORT:-8443}:8443"
+      - "${PROXY_METRICS_PORT:-9443}:9443"
+    networks:
+      - satd
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:
