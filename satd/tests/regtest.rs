@@ -2987,6 +2987,30 @@ fn test_create_transaction_output_checks_follow_core_order() {
         let r = call(&mut node, method, r#""hello""#);
         assert_eq!(r["error"]["code"], -3, "{method}: {r}");
 
+        // An explicit `null` is Core's `NormalizeOutputs` refusal, by name.
+        // Core declares `outputs` with `skip_type_check`, so the null reaches
+        // the handler; satd collapsed it to "argument absent" and answered
+        // -1 with a message naming nothing, which made the -8 unreachable
+        // over the wire even though the code for it was there.
+        let r = call(&mut node, method, "null");
+        assert_eq!(r["error"]["code"], -8, "{method}: {r}");
+        assert_eq!(
+            r["error"]["message"],
+            "Invalid parameter, output argument must be non-null",
+            "{method}: {r}"
+        );
+
+        // A repeated key is read with its *first* value, as Core's
+        // `outputs[name_]` is: the unparseable second value is never reached,
+        // so the answer names the duplicate rather than the amount.
+        let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01,"{ADDR}":"wat"}}"#));
+        assert_eq!(r["error"]["code"], -8, "{method}: {r}");
+        assert_eq!(
+            r["error"]["message"],
+            format!("Invalid parameter, duplicated address: {ADDR}"),
+            "{method}: {r}"
+        );
+
         // And the ordinary case still builds.
         let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01}}"#));
         assert!(r["result"].is_string(), "{method}: {r}");

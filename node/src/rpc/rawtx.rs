@@ -704,16 +704,12 @@ pub fn parse_outputs(
         std::collections::HashSet::new();
     let mut seen_data = false;
 
+    // The key/value pairs in source order, duplicates included.
+    let mut pairs: Vec<(&str, &Value)> = Vec::new();
+
     if let Some(obj) = outputs.as_object() {
         for (key, val) in obj {
-            parse_output_entry(
-                key,
-                val,
-                network,
-                &mut tx_outputs,
-                &mut seen_destinations,
-                &mut seen_data,
-            )?;
+            pairs.push((key.as_str(), val));
         }
     } else if outputs.is_null() {
         // Core's `NormalizeOutputs` opens with this exact refusal.
@@ -740,19 +736,50 @@ pub fn parse_outputs(
                     return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
                 }
                 for (key, val) in map {
-                    parse_output_entry(
-                        key,
-                        val,
-                        network,
-                        &mut tx_outputs,
-                        &mut seen_destinations,
-                        &mut seen_data,
-                    )?;
+                    pairs.push((key.as_str(), val));
                 }
             } else {
                 return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
             }
         }
+    }
+
+    // Core walks `outputs.getKeys()` -- which carries every repetition -- but
+    // reads each value as `outputs[name_]`, and `UniValue::operator[]` returns
+    // the *first* member with that key. So a repeated key is visited once per
+    // occurrence, always with the first occurrence's value.
+    //
+    // Reading each occurrence's own value instead changed which error a
+    // caller got: `{"<addr>": 0.01, "<addr>": "wat"}` is Core's
+    // "duplicated address" (it parses 0.01 twice and trips the dedupe), but
+    // reached `parse_btc_amount("wat")` here and came back "Invalid amount",
+    // naming a problem that is not the one to fix. For `data` -- which Core
+    // does not dedupe on value -- it changed the built script outright.
+    // One pass, not a scan-the-prefix-per-entry: `createrawtransaction` is
+    // reachable on the read-only listener with a body limit measured in
+    // megabytes, so anything quadratic in the number of outputs is a lever.
+    {
+        let mut first_value: std::collections::HashMap<&str, &Value> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        for (key, val) in pairs.iter_mut() {
+            match first_value.get(*key) {
+                Some(first) => *val = first,
+                None => {
+                    first_value.insert(*key, *val);
+                }
+            }
+        }
+    }
+
+    for (key, val) in pairs {
+        parse_output_entry(
+            key,
+            val,
+            network,
+            &mut tx_outputs,
+            &mut seen_destinations,
+            &mut seen_data,
+        )?;
     }
 
     Ok(tx_outputs)
@@ -2582,6 +2609,41 @@ mod tests {
             .expect_err("the same destination twice");
         assert_eq!(code, -8);
         assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+    }
+
+    /// Core reads a repeated key's value as `outputs[name_]`, which is the
+    /// *first* member with that key -- so the second occurrence's value is
+    /// never parsed, and the answer is the duplicate-address error rather than
+    /// whatever the second value happens to be.
+    ///
+    /// Reading each occurrence's own value reported "Invalid amount" here,
+    /// pointing the caller at the wrong half of their request. Deleting the
+    /// first-occurrence pass fails this test.
+    #[test]
+    fn a_repeated_key_is_read_with_its_first_value() {
+        let network = bitcoin::Network::Regtest;
+        const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: "wat" }]), network)
+            .expect_err("the same destination twice");
+        assert_eq!(code, -8, "the unparseable second value is never reached");
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+
+        // And the first value is the one a bad *first* entry is judged on.
+        let (code, _) = parse_outputs(&json!([{ ADDR: "wat" }, { ADDR: 0.01 }]), network)
+            .expect_err("the first value is unparseable");
+        assert_eq!(code, -3);
+    }
+
+    /// An explicit `null` is Core's `NormalizeOutputs` refusal, by name. Core
+    /// declares `outputs` with `skip_type_check`, so the null reaches the
+    /// handler rather than the argument type checker.
+    #[test]
+    fn a_null_outputs_argument_is_refused_by_name() {
+        let (code, msg) = parse_outputs(&json!(null), bitcoin::Network::Regtest)
+            .expect_err("null is not an output set");
+        assert_eq!(code, -8);
+        assert_eq!(msg, "Invalid parameter, output argument must be non-null");
     }
 
     /// Core's `ConstructTransaction` picks the default sequence from three

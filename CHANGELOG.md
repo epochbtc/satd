@@ -217,6 +217,16 @@ item below is (or will be) written up in full in the in-development
   `createpsbt '"hello"'` returned a valid PSBT with no outputs. A `data` value
   follows Core's `ParseHexV`: a JSON number is accepted as its own spelling, and
   an empty string is refused rather than building `OP_RETURN OP_0` (#689).
+- `createrawtransaction`/`createpsbt`: an explicit `null` for `outputs` is
+  refused by name — `-8 Invalid parameter, output argument must be non-null`,
+  as Core's `NormalizeOutputs` does — instead of being reported as a missing
+  argument (#689).
+- `createrawtransaction`/`createpsbt`: a repeated output key is read with its
+  *first* value, as Core's `outputs[name_]` is, so a duplicate is reported as a
+  duplicate rather than as whatever the later value happened to be (#689).
+- The JSON-RPC compatibility layer no longer strands the rest of a batch when
+  one element is not an object, and a repeated `jsonrpc` member is judged on
+  its last value — the one the server will act on (#689).
 - `getdeploymentinfo`: a 64-character `blockhash` that is not hexadecimal
   reported a length error; it now reports a hex error, as Core does.
 

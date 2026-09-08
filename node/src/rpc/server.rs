@@ -1802,8 +1802,13 @@ pub async fn start(
                 ));
             }
         };
+        // `raw_or_null`, not `raw`: Core declares `outputs` with
+        // `skip_type_check`, so an explicit `null` reaches the handler and is
+        // answered by `NormalizeOutputs` ("Invalid parameter, output argument
+        // must be non-null"), not by the missing-argument path. Collapsing it
+        // to `None` here made that refusal unreachable over the wire.
         let outputs: serde_json::Value = args
-            .raw("outputs")?
+            .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>))?;
         // Recover the object's source order and its duplicate keys, which
         // serde collapsed, and hand `parse_outputs` the sequence Core's
@@ -2090,8 +2095,10 @@ pub async fn start(
         let raw_params_json = params.as_str().unwrap_or("").to_string();
         let mut args = Args::new(&params);
         let inputs: Vec<serde_json::Value> = args.required("inputs")?;
+        // See `createrawtransaction`: an explicit `null` is the handler's to
+        // refuse, by name, not an omission.
         let outputs: serde_json::Value = args
-            .raw("outputs")?
+            .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
         let locktime: Option<u32> = args.optional("locktime")?;
         args.check()?;

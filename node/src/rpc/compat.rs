@@ -93,18 +93,40 @@ fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
         write_request_object(&mut out, &mut members, fix);
         return Some(out);
     }
-    if let Ok(mut batch) = serde_json::from_slice::<Vec<Members>>(body) {
-        let fixes: Vec<RequestFix> = batch.iter().map(|m| plan_request_fix(m)).collect();
-        if !fixes.iter().any(RequestFix::changed) {
+    // A batch is read element by element, not as `Vec<Members>`: one element
+    // that is not an object (`[{"method":"m"}, 5]`) fails the whole-batch
+    // deserialize, and bailing out then left the *other*, well-formed 1.0
+    // requests in that batch without their `jsonrpc`/`id` fixup -- so a
+    // Core-shaped client's batch stopped working because of a neighbour.
+    // Elements that are not request objects are copied through verbatim; it
+    // is jsonrpsee's job to reject them, not this layer's.
+    if let Ok(elements) = serde_json::from_slice::<Vec<&serde_json::value::RawValue>>(body) {
+        let mut parsed: Vec<Option<(Members, RequestFix)>> = Vec::with_capacity(elements.len());
+        for raw in &elements {
+            match serde_json::from_str::<Members>(raw.get()) {
+                Ok(members) => {
+                    let fix = plan_request_fix(&members);
+                    parsed.push(Some((members, fix)));
+                }
+                Err(_) => parsed.push(None),
+            }
+        }
+        if !parsed
+            .iter()
+            .any(|p| p.as_ref().is_some_and(|(_, fix)| fix.changed()))
+        {
             return None;
         }
-        let mut out = Vec::with_capacity(body.len() + 32 * batch.len().max(1));
+        let mut out = Vec::with_capacity(body.len() + 32 * elements.len().max(1));
         out.push(b'[');
-        for (i, (members, fix)) in batch.iter_mut().zip(fixes).enumerate() {
+        for (i, (raw, slot)) in elements.iter().zip(parsed.iter_mut()).enumerate() {
             if i > 0 {
                 out.push(b',');
             }
-            write_request_object(&mut out, members, fix);
+            match slot {
+                Some((members, fix)) => write_request_object(&mut out, members, *fix),
+                None => out.extend_from_slice(raw.get().as_bytes()),
+            }
         }
         out.push(b']');
         return Some(out);
@@ -179,9 +201,15 @@ fn plan_request_fix(members: &Members<'_>) -> RequestFix {
     if !has("method") {
         return RequestFix::NONE;
     }
+    // The *last* `jsonrpc` member decides, because that is the one jsonrpsee
+    // will see: it parses into a `Map`, where a repeated key keeps the last
+    // value. Reading the first meant `{"jsonrpc":"2.0","jsonrpc":"1.0",...}`
+    // was judged already-2.0 and forwarded unchanged, and jsonrpsee then
+    // rejected the request this layer exists to make it accept. A rewrite
+    // rewrites every occurrence, so the duplicates collapse consistently.
     let already_2_0 = members
         .iter()
-        .find(|(k, _)| k == "jsonrpc")
+        .rfind(|(k, _)| k == "jsonrpc")
         .is_some_and(|(_, v)| v.get().trim() == "\"2.0\"");
     RequestFix {
         set_jsonrpc: !already_2_0,
@@ -891,4 +919,41 @@ mod tests {
         assert!(!request_declared_2_0(b""));
         assert!(!request_declared_2_0(br#"{"jsonrpc":"2.0","id":1}"#));
     }
+
+    /// A repeated `jsonrpc` member is decided by its *last* value, because a
+    /// `Map` keeps the last -- so that is what jsonrpsee will act on. Reading
+    /// the first judged this body already-2.0 and forwarded it verbatim, and
+    /// jsonrpsee then rejected the `"1.0"` it actually saw.
+    #[test]
+    fn the_last_jsonrpc_member_decides_the_rewrite() {
+        let body = br#"{"jsonrpc":"2.0","jsonrpc":"1.0","method":"getblockcount","id":1}"#;
+        let out = super::normalize_jsonrpc_version(body).expect("must rewrite");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(r#""1.0""#), "the 1.0 must not survive: {text}");
+        assert_eq!(text.matches(r#""jsonrpc":"2.0""#).count(), 2, "{text}");
+    }
+
+    /// One unreadable element must not cost the rest of the batch its fixup.
+    /// `Vec<Members>` failed whole-batch on a non-object element, so the
+    /// Core-shaped requests beside it were forwarded without `jsonrpc`/`id`
+    /// and answered as 2.0 notifications -- i.e. not answered at all.
+    #[test]
+    fn a_junk_batch_element_does_not_strand_its_neighbours() {
+        let body = br#"[{"method":"getblockcount","id":1},5]"#;
+        let out = super::normalize_jsonrpc_version(body).expect("must rewrite");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#""jsonrpc":"2.0""#), "{text}");
+        assert!(text.ends_with(",5]"), "the junk element is copied through: {text}");
+    }
+
+    /// The whole point of the raw-member rewrite: `params` reaches jsonrpsee
+    /// byte-for-byte, duplicate keys included.
+    #[test]
+    fn duplicate_params_keys_survive_the_rewrite() {
+        let body = br#"{"method":"createrawtransaction","params":[[],{"a":1,"a":2}]}"#;
+        let out = super::normalize_jsonrpc_version(body).expect("must rewrite");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"{"a":1,"a":2}"#), "{text}");
+    }
+
 }
