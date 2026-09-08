@@ -174,7 +174,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `listen` | on (see note) | restart | core | Accept P2P connections. The default is *soft*, as in Core: a node given any `connect` (including `connect=0` / `-noconnect`), or `maxconnections=0`, does not accept inbound either, since a node pinned to specific peers has not asked to be reachable. `bind` or `whitebind` raises it back, and an explicit `listen` — flag or config file — beats both. |
+| `listen` | on (see note) | restart | core | Accept P2P connections. The default is *soft*, as in Core: a node given any `connect` (including `connect=0` / `-noconnect`), or `maxconnections` ≤ 0, does not accept inbound either, since a node pinned to specific peers has not asked to be reachable. `bind` or `whitebind` raises it back, and an explicit `listen` — flag or config file — beats both. Because the value is derived, changing a *hot* key that feeds it (`connect`, `maxconnections`) over SIGHUP logs a `listen` restart-required notice; the running listener is not started or stopped until a restart. satd does not implement Core's third soft-set, where a `proxy` also lowers `listen` — a Tor-proxied satd is still reachable on clearnet unless you set `listen=0`. |
 | `networkactive` | on | hot | core | Start with P2P networking enabled. `=0` boots with networking paused (no inbound accepts, no outbound dials); change it at runtime with the `setnetworkactive` RPC. |
 | `blocksonly` | false | hot | core | Suppress P2P transaction relay; locally-submitted txs still relayed. |
 | `v2transport` | true | hot | core | Offer/accept BIP 324 v2 encrypted transport (Core default since v26). |
@@ -191,7 +191,7 @@ startup error.
 | `addnode` | none | hot | core | Add a node to connect to (does not disable DNS seeding, and does not affect `listen`). An entry with no port takes the network's default P2P port. |
 | `uacomment` | none | restart | core | Append a comment to the advertised user agent (**repeatable**; command-line and config-file values accumulate, command line first). Renders as `/satd:<version>(c1; c2)/`. A comment may contain only alphanumerics and `` .,;-_?@`` — the user agent's own delimiters `/`, `:`, `(` and `)` are refused — and the whole user agent may not exceed 256 bytes. Either violation is a startup error, as in Core. |
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
-| `maxconnections` | 125 | hot | core | Maximum total connections. |
+| `maxconnections` | 125 | hot | core | Maximum total connections. `0` (or any value ≤ 0) soft-sets `listen=0`, as in Core — see `listen`. That half is a startup decision: changing `maxconnections` over SIGHUP applies the new cap but does not start or stop the listener. |
 | `maxinboundperip` | 3 | hot | satd | Max simultaneous inbound peers from one source IP (Core-style flood guard; no Core flag). |
 | `maxuploadtarget` | 0 (unlimited) | hot | core | Soft cap (bytes/24h) on historical block upload. |
 | `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. |
