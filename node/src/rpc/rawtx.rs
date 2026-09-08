@@ -715,6 +715,24 @@ pub fn parse_outputs(
                 &mut seen_data,
             )?;
         }
+    } else if outputs.is_null() {
+        // Core's `NormalizeOutputs` opens with this exact refusal.
+        return Err((
+            -8,
+            "Invalid parameter, output argument must be non-null".to_string(),
+        ));
+    } else if !outputs.is_array() {
+        // `NormalizeOutputs` calls `get_obj()`/`get_array()`, which throw for
+        // any other type. Falling through instead left `createpsbt '"hello"'`
+        // returning a perfectly valid PSBT with no outputs at all -- a funds
+        // RPC answering a malformed request with a transaction.
+        return Err((
+            -3,
+            format!(
+                "JSON value of type {} is not of expected type array",
+                crate::rpc::params::json_type_name(outputs)
+            ),
+        ));
     } else if let Some(arr) = outputs.as_array() {
         for item in arr {
             if let Some(map) = item.as_object() {
@@ -754,8 +772,28 @@ fn parse_output_entry(
             return Err((-8, "Invalid parameter, duplicate key: data".to_string()));
         }
         *seen_data = true;
-        let hex_data = val.as_str().ok_or((-8, "Data must be hexadecimal string".to_string()))?;
-        let data = hex::decode(hex_data).map_err(|_| (-8, "Data must be hexadecimal string".to_string()))?;
+        // Core's `ParseHexV(outputs[name_].getValStr(), "Data")`: the *literal
+        // text* of the value, so a JSON number is its own spelling, and
+        // `IsHex` requires a non-empty, even-length hex string. satd read
+        // `as_str()` (rejecting `{"data": 1234}`, which Core accepts as
+        // `"1234"`) and used `hex::decode`, which accepts `""` (Core does not,
+        // and an empty `data` built an `OP_RETURN OP_0` output). The message
+        // carries the offending value, as Core's does.
+        let hex_data = match val {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            other => {
+                return Err((
+                    -8,
+                    format!("Data must be hexadecimal string (not '{other}')"),
+                ));
+            }
+        };
+        let bad_hex = || (-8, format!("Data must be hexadecimal string (not '{hex_data}')"));
+        if hex_data.is_empty() || hex_data.len() % 2 != 0 {
+            return Err(bad_hex());
+        }
+        let data = hex::decode(&hex_data).map_err(|_| bad_hex())?;
         let push_data = bitcoin::script::PushBytesBuf::try_from(data)
             .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
         let script = bitcoin::script::Builder::new()
@@ -790,35 +828,168 @@ fn parse_output_entry(
     Ok(())
 }
 
-/// Parse a BTC amount from a JSON value, with Core-compatible error messages.
-fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
-    // Core accepts both number and string representations.
-    let amount_str = match val {
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if f < 0.0 {
-                    return Err((-3, "Amount out of range".to_string()));
+/// Core's `ParseFixedPoint` (`src/util/strencodings.cpp`): exact decimal text
+/// to a fixed-point integer, with no floating point anywhere.
+///
+/// The grammar is deliberately tight, and every one of its refusals matters
+/// for a value denominated in money:
+///
+/// - an optional `-`, then either a *single* `0` or a digit `1`-`9` followed
+///   by digits — so `01.0` is trailing garbage and `.5` is a missing digit;
+/// - an optional `.` that must be followed by at least one digit, so `1.` is
+///   refused;
+/// - an optional `e`/`E` exponent with an optional sign and at least one
+///   digit;
+/// - nothing else, anywhere. No `+`, no whitespace, no `NaN`, no `inf`.
+///
+/// Returns `None` for anything outside that grammar or outside
+/// `10^-decimals ..< 10^(18-decimals)`.
+fn parse_fixed_point(val: &str, decimals: u32) -> Option<i64> {
+    /// Core's `UPPER_BOUND`.
+    const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
+
+    // Core's `ProcessMantissaDigit`: trailing zeros are counted rather than
+    // multiplied in, so `1.10` and `1.1` reach the same mantissa.
+    fn mantissa_digit(ch: u8, mantissa: &mut i64, tzeros: &mut i32) -> bool {
+        if ch == b'0' {
+            *tzeros += 1;
+        } else {
+            for _ in 0..=*tzeros {
+                if *mantissa > UPPER_BOUND / 10 {
+                    return false;
                 }
-                format!("{:.8}", f)
-            } else {
-                return Err((-3, "Invalid amount".to_string()));
+                *mantissa *= 10;
             }
+            *mantissa += i64::from(ch - b'0');
+            *tzeros = 0;
         }
-        Value::String(s) => {
-            let _: f64 = s.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
-            s.clone()
+        true
+    }
+
+    let b = val.as_bytes();
+    let end = b.len();
+    let mut ptr = 0usize;
+    let mut mantissa: i64 = 0;
+    let mut exponent: i64 = 0;
+    let mut tzeros: i32 = 0;
+    let mut point_ofs: i64 = 0;
+    let mut mantissa_sign = false;
+    let mut exponent_sign = false;
+
+    if ptr < end && b[ptr] == b'-' {
+        mantissa_sign = true;
+        ptr += 1;
+    }
+    if ptr < end {
+        if b[ptr] == b'0' {
+            // A single leading zero, and only one.
+            ptr += 1;
+        } else if b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !mantissa_digit(b[ptr], &mut mantissa, &mut tzeros) {
+                    return None;
+                }
+                ptr += 1;
+            }
+        } else {
+            return None; // missing expected digit
         }
-        _ => return Err((-3, "Invalid amount".to_string())),
+    } else {
+        return None; // empty string or a lone '-'
+    }
+    if ptr < end && b[ptr] == b'.' {
+        ptr += 1;
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !mantissa_digit(b[ptr], &mut mantissa, &mut tzeros) {
+                    return None;
+                }
+                ptr += 1;
+                point_ofs += 1;
+            }
+        } else {
+            return None; // missing expected digit
+        }
+    }
+    if ptr < end && (b[ptr] == b'e' || b[ptr] == b'E') {
+        ptr += 1;
+        if ptr < end && b[ptr] == b'+' {
+            ptr += 1;
+        } else if ptr < end && b[ptr] == b'-' {
+            exponent_sign = true;
+            ptr += 1;
+        }
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if exponent > UPPER_BOUND / 10 {
+                    return None;
+                }
+                exponent = exponent * 10 + i64::from(b[ptr] - b'0');
+                ptr += 1;
+            }
+        } else {
+            return None; // missing expected digit
+        }
+    }
+    if ptr != end {
+        return None; // trailing garbage
+    }
+
+    if exponent_sign {
+        exponent = -exponent;
+    }
+    exponent = exponent - point_ofs + i64::from(tzeros);
+    if mantissa_sign {
+        mantissa = -mantissa;
+    }
+
+    exponent += i64::from(decimals);
+    if exponent < 0 {
+        return None; // finer than 10^-decimals
+    }
+    if exponent >= 18 {
+        return None; // 10^(18-decimals) or larger
+    }
+    for _ in 0..exponent {
+        if !(-(UPPER_BOUND / 10)..=UPPER_BOUND / 10).contains(&mantissa) {
+            return None;
+        }
+        mantissa *= 10;
+    }
+    if !(-UPPER_BOUND..=UPPER_BOUND).contains(&mantissa) {
+        return None;
+    }
+    Some(mantissa)
+}
+
+/// Core's `AmountFromValue` (`src/rpc/util.cpp`).
+///
+/// The decimal text is parsed exactly. satd used to round-trip it through
+/// `f64` — `format!("{:.8}")` on a number, `f64::from_str` on a string — which
+/// was wrong in both directions. Wrong *value*: 5.6% of five-decimal amounts
+/// landed a satoshi away from the decimal the caller wrote, because the
+/// nearest `f64` to `0.29` is below it. Wrong *domain*: `f64::from_str`
+/// accepts `NaN`, and `NaN < 0.0` and `NaN > 21_000_000.0` are both false, so
+/// both range guards fell through and `(NaN * 1e8).round() as u64` saturated
+/// to `0` — an output worth nothing, built without an error.
+fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
+    // Core reads the *literal text* of a JSON number (`UniValue::getValStr`),
+    // never a parsed double, so a number and its string spelling are the same
+    // input to `ParseFixedPoint`.
+    let amount_str = match val {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        _ => return Err((-3, "Amount is not a number or string".to_string())),
     };
-    let btc: f64 = amount_str.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
-    if btc < 0.0 {
+    let sat = parse_fixed_point(&amount_str, 8)
+        .ok_or((-3, "Invalid amount".to_string()))?;
+    // Core's `MoneyRange`: `0 <= n <= MAX_MONEY`. Negative amounts fail here,
+    // not in the parser.
+    const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+    if !(0..=MAX_MONEY).contains(&sat) {
         return Err((-3, "Amount out of range".to_string()));
     }
-    if btc > 21_000_000.0 {
-        return Err((-3, "Amount out of range".to_string()));
-    }
-    let sat = (btc * 100_000_000.0).round() as u64;
-    Ok(Amount::from_sat(sat))
+    Ok(Amount::from_sat(sat as u64))
 }
 
 /// `combinerawtransaction` — merge multiple partially-signed raw transactions.
@@ -2266,6 +2437,120 @@ mod tests {
         let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest)
             .expect("array-form outputs");
         assert!(v.as_str().expect("base64").starts_with("cHNidP8"));
+    }
+
+    /// Core parses the *decimal text*, exactly. satd round-tripped it through
+    /// `f64`, which was wrong in both directions: a wrong value for ordinary
+    /// amounts, and a wrong domain for input `f64::from_str` accepts and
+    /// Core's grammar does not.
+    #[test]
+    fn amounts_are_parsed_as_exact_decimals_not_floats() {
+        // The value bug. The nearest f64 to 0.29 is below it, so
+        // `(0.29_f64 * 1e8) as u64` truncated to 28999999 -- one satoshi
+        // short of the decimal the caller wrote. 5.6% of five-decimal
+        // amounts landed a satoshi away.
+        for (text, sat) in [
+            ("0.29", 29_000_000u64),
+            ("0.57", 57_000_000),
+            ("2.675", 267_500_000),
+            ("0.00000001", 1),
+            ("21000000", 2_100_000_000_000_000),
+            ("1.10", 110_000_000),
+            ("1e2", 10_000_000_000),
+        ] {
+            assert_eq!(
+                parse_btc_amount(&json!(text)).expect(text),
+                Amount::from_sat(sat),
+                "string {text}"
+            );
+        }
+        for (num, sat) in [(json!(0.29), 29_000_000u64), (json!(1), 100_000_000)] {
+            assert_eq!(parse_btc_amount(&num).unwrap(), Amount::from_sat(sat), "{num}");
+        }
+
+        // The domain bug. `NaN` is the sharp one: it is neither `< 0.0` nor
+        // `> 21_000_000.0`, so both range guards fell through and the
+        // saturating cast produced a zero-value output with no error at all.
+        for bad in ["NaN", "inf", "-inf", "1.000000009", ".5", "1.", "01.0", "+1.0", "", " 1", "1 "] {
+            assert!(
+                parse_btc_amount(&json!(bad)).is_err(),
+                "{bad:?} must not parse as an amount"
+            );
+        }
+        assert_eq!(parse_btc_amount(&json!("NaN")).unwrap_err().0, -3);
+
+        // Range, which Core checks after the parse.
+        assert_eq!(
+            parse_btc_amount(&json!("-1")).unwrap_err(),
+            (-3, "Amount out of range".to_string())
+        );
+        assert_eq!(
+            parse_btc_amount(&json!("21000000.00000001")).unwrap_err(),
+            (-3, "Amount out of range".to_string())
+        );
+        assert_eq!(parse_btc_amount(&json!(true)).unwrap_err().0, -3);
+    }
+
+    /// `outputs` that is neither an object nor an array is a request error,
+    /// not an empty output set. `createpsbt '"hello"'` used to return a
+    /// perfectly valid PSBT with no outputs.
+    #[test]
+    fn a_scalar_outputs_argument_is_refused() {
+        let network = bitcoin::Network::Regtest;
+        for (bad, ty) in [
+            (json!("hello"), "string"),
+            (json!(5), "number"),
+            (json!(true), "bool"),
+        ] {
+            let (code, msg) =
+                parse_outputs(&bad, network).expect_err("a scalar is not an output set");
+            assert_eq!(code, -3, "{bad}");
+            assert_eq!(
+                msg,
+                format!("JSON value of type {ty} is not of expected type array"),
+                "{bad}"
+            );
+        }
+        // Core's `NormalizeOutputs` opens by refusing null by name.
+        let (code, msg) = parse_outputs(&json!(null), network).expect_err("null");
+        assert_eq!(code, -8);
+        assert_eq!(msg, "Invalid parameter, output argument must be non-null");
+
+        // Both empty forms are legitimate and produce no outputs.
+        assert!(parse_outputs(&json!({}), network).unwrap().is_empty());
+        assert!(parse_outputs(&json!([]), network).unwrap().is_empty());
+    }
+
+    /// Core's `ParseHexV` reads the literal text and requires non-empty,
+    /// even-length hex.
+    #[test]
+    fn data_outputs_follow_cores_hex_rules() {
+        let network = bitcoin::Network::Regtest;
+        // A JSON number is its own spelling to Core, and `1234` is valid hex.
+        let outs = parse_outputs(&json!({"data": 1234}), network).expect("numeric data");
+        assert_eq!(outs.len(), 1);
+        // An empty string is not hex; it used to build `OP_RETURN OP_0`.
+        for bad in [json!({"data": ""}), json!({"data": "abc"}), json!({"data": "zz"})] {
+            let (code, msg) = parse_outputs(&bad, network).expect_err("{bad}");
+            assert_eq!(code, -8, "{bad}");
+            assert!(msg.starts_with("Data must be hexadecimal string (not '"), "{msg}");
+        }
+    }
+
+    /// Dedup is on the decoded destination, not the address string, so two
+    /// spellings of one script collide as they do in Core. Restoring
+    /// string-keyed dedup must fail a named test.
+    #[test]
+    fn two_spellings_of_one_destination_are_a_duplicate() {
+        const UPPER: &str = "BCRT1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQDKU202";
+        const LOWER: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+        let (code, msg) = parse_outputs(
+            &json!([{ UPPER: 0.01 }, { LOWER: 0.02 }]),
+            bitcoin::Network::Regtest,
+        )
+        .expect_err("one destination, written twice");
+        assert_eq!(code, -8);
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {LOWER}"));
     }
 
     /// Core's `ParseOutputs` decodes, parses the amount, *then* throws on an

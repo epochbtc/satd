@@ -2937,6 +2937,63 @@ fn test_create_transaction_rejects_foreign_network_address() {
     node.stop();
 }
 
+/// Core's `ParseOutputs` order is observable over the wire, and the object
+/// form is where satd used to get it wrong: a raw-JSON duplicate-key scan ran
+/// *before* the address decode and the amount parse that Core runs first.
+/// `createpsbt` had no such scan at all, so a duplicated output key silently
+/// took the last value.
+#[test]
+fn test_create_transaction_output_checks_follow_core_order() {
+    let mut node = TestNode::start(&[]);
+    const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+    const MAINNET: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
+    // Raw bodies, because serde collapses duplicate keys before any handler
+    // sees them — which is the whole reason the scan exists.
+    let call = |node: &mut TestNode, method: &str, outputs: &str| -> serde_json::Value {
+        node.rpc_call_raw_body(&format!(
+            r#"{{"jsonrpc":"1.0","id":"t","method":"{method}","params":[[],{outputs}]}}"#
+        ))
+        .unwrap()
+    };
+
+    for method in ["createrawtransaction", "createpsbt"] {
+        // A repeated *invalid* address is an address error: Core's validity
+        // check runs before its duplicate check.
+        let r = call(&mut node, method, &format!(r#"{{"{MAINNET}":0.01,"{MAINNET}":0.02}}"#));
+        assert_eq!(r["error"]["code"], -5, "{method}: {r}");
+        assert_eq!(r["error"]["message"], format!("Invalid Bitcoin address: {MAINNET}"));
+
+        // A repeated *valid* address is the duplicate error — and on
+        // `createpsbt`, which had no detection, it used to succeed.
+        let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01,"{ADDR}":0.02}}"#));
+        assert_eq!(r["error"]["code"], -8, "{method}: {r}");
+        assert_eq!(
+            r["error"]["message"],
+            format!("Invalid parameter, duplicated address: {ADDR}")
+        );
+
+        // A duplicate `data` key, likewise.
+        let r = call(&mut node, method, r#"{"data":"aa","data":"bb"}"#);
+        assert_eq!(r["error"]["code"], -8, "{method}: {r}");
+        assert_eq!(r["error"]["message"], "Invalid parameter, duplicate key: data");
+
+        // A bad amount on a bad address reports the amount: Core runs
+        // `AmountFromValue` before `IsValidDestination`.
+        let r = call(&mut node, method, r#"{"notanaddress":"wat"}"#);
+        assert_eq!(r["error"]["code"], -3, "{method}: {r}");
+
+        // A scalar `outputs` is a request error, not an empty output set.
+        let r = call(&mut node, method, r#""hello""#);
+        assert_eq!(r["error"]["code"], -3, "{method}: {r}");
+
+        // And the ordinary case still builds.
+        let r = call(&mut node, method, &format!(r#"{{"{ADDR}":0.01}}"#));
+        assert!(r["result"].is_string(), "{method}: {r}");
+    }
+    node.stop();
+}
+
 #[test]
 fn test_decodescript() {
     let mut node = TestNode::start(&[]);

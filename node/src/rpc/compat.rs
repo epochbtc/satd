@@ -72,56 +72,159 @@ fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
     if body.is_empty() || body.len() > MAX_NORMALIZE_BODY {
         return None;
     }
-    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let changed = match &mut value {
-        serde_json::Value::Object(_) => fix_request_object(&mut value),
-        serde_json::Value::Array(items) => {
-            // Batch request: fix each element independently. `any` is not
-            // short-circuiting here because we must visit every element.
-            let mut any = false;
-            for item in items.iter_mut() {
-                any |= fix_request_object(item);
-            }
-            any
+    // Each request object is read as a list of *raw* member text, not as a
+    // fully-parsed `Value`. That is the difference between rewriting the
+    // protocol tag and rewriting the request: a `Value` round-trip
+    // renormalises every member, and in particular `serde_json::Map` silently
+    // collapses duplicate keys -- so `{"a":1,"a":2}` inside `params` reached
+    // the handler as `{"a":2}`. Bitcoin Core keeps duplicates
+    // (`UniValue::pushKVEnd`) and rejects them by name in
+    // `createrawtransaction`; satd's check for exactly that sat downstream of
+    // this layer and so could never fire.
+    //
+    // Keeping every member as `&RawValue` re-emits it byte-for-byte, which is
+    // what this module's contract already claimed for `params`.
+    if let Ok(mut members) = serde_json::from_slice::<Members>(body) {
+        let fix = plan_request_fix(&members);
+        if !fix.changed() {
+            return None;
         }
-        _ => false,
-    };
-    if !changed {
-        return None;
+        let mut out = Vec::with_capacity(body.len() + 32);
+        write_request_object(&mut out, &mut members, fix);
+        return Some(out);
     }
-    serde_json::to_vec(&value).ok()
+    if let Ok(mut batch) = serde_json::from_slice::<Vec<Members>>(body) {
+        let fixes: Vec<RequestFix> = batch.iter().map(|m| plan_request_fix(m)).collect();
+        if !fixes.iter().any(RequestFix::changed) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(body.len() + 32 * batch.len().max(1));
+        out.push(b'[');
+        for (i, (members, fix)) in batch.iter_mut().zip(fixes).enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            write_request_object(&mut out, members, fix);
+        }
+        out.push(b']');
+        return Some(out);
+    }
+    None
 }
 
-/// If `value` is a JSON-RPC *request* object (has a `"method"` member),
-/// ensure its `"jsonrpc"` member is exactly `"2.0"` and that an `"id"`
-/// member is present (defaulting to `null`). Without an `id`, jsonrpsee
-/// treats the request as a 2.0 notification and returns no response;
-/// Core always responds, `id` or not.
-fn fix_request_object(value: &mut serde_json::Value) -> bool {
-    let serde_json::Value::Object(map) = value else {
-        return false;
+/// One request object's members, in source order, each still raw text.
+///
+/// A hand-written `Deserialize` rather than a `Map`: `serde_json::Map` only
+/// holds `Value`, and collapsing to `Value` is precisely what this must not
+/// do. Visiting the map directly keeps every member's bytes and every
+/// repetition of a key.
+struct Members<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+
+impl<'a> Members<'a> {
+    fn iter(&self) -> std::slice::Iter<'_, (String, &'a serde_json::value::RawValue)> {
+        self.0.iter()
+    }
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for Members<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Members<'de>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a JSON-RPC request object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let raw: &serde_json::value::RawValue = map.next_value()?;
+                    out.push((key, raw));
+                }
+                Ok(Members(out))
+            }
+        }
+        de.deserialize_map(V)
+    }
+}
+
+/// What [`normalize_jsonrpc_version`] has to change about one request object.
+#[derive(Clone, Copy)]
+struct RequestFix {
+    set_jsonrpc: bool,
+    add_id: bool,
+}
+
+impl RequestFix {
+    const NONE: Self = Self {
+        set_jsonrpc: false,
+        add_id: false,
     };
-    if !map.contains_key("method") {
-        return false;
+
+    fn changed(&self) -> bool {
+        self.set_jsonrpc || self.add_id
     }
-    let mut changed = false;
-    let already_2_0 = map
-        .get("jsonrpc")
-        .and_then(|v| v.as_str())
-        .map(|s| s == "2.0")
-        .unwrap_or(false);
-    if !already_2_0 {
-        map.insert(
-            "jsonrpc".to_string(),
-            serde_json::Value::String("2.0".to_string()),
-        );
-        changed = true;
+}
+
+/// If `members` is a JSON-RPC *request* object (it has a `"method"` member),
+/// decide whether its `"jsonrpc"` member needs forcing to `2.0` and whether an
+/// `"id"` must be added. Without an `id`, jsonrpsee treats the request as a
+/// 2.0 notification and returns no response; Core always responds, `id` or not.
+fn plan_request_fix(members: &Members<'_>) -> RequestFix {
+    let has = |name: &str| members.iter().any(|(k, _)| k == name);
+    if !has("method") {
+        return RequestFix::NONE;
     }
-    if !map.contains_key("id") {
-        map.insert("id".to_string(), serde_json::Value::Null);
-        changed = true;
+    let already_2_0 = members
+        .iter()
+        .find(|(k, _)| k == "jsonrpc")
+        .is_some_and(|(_, v)| v.get().trim() == "\"2.0\"");
+    RequestFix {
+        set_jsonrpc: !already_2_0,
+        add_id: !has("id"),
     }
-    changed
+}
+
+/// Re-emit one request object, applying `fix`. Every member other than
+/// `jsonrpc` is copied out verbatim, so `params` reaches jsonrpsee exactly as
+/// the client wrote it -- duplicate keys, number spellings and all.
+fn write_request_object(out: &mut Vec<u8>, members: &mut Members<'_>, fix: RequestFix) {
+    out.push(b'{');
+    let mut wrote_any = false;
+    let mut wrote_jsonrpc = false;
+    for (key, raw) in members.iter() {
+        if wrote_any {
+            out.push(b',');
+        }
+        wrote_any = true;
+        // `to_vec` on a `String` emits a correctly-escaped JSON string.
+        out.extend_from_slice(&serde_json::to_vec(key).expect("a String is serialisable"));
+        out.push(b':');
+        if key == "jsonrpc" && fix.set_jsonrpc {
+            out.extend_from_slice(b"\"2.0\"");
+            wrote_jsonrpc = true;
+        } else {
+            out.extend_from_slice(raw.get().as_bytes());
+        }
+    }
+    if fix.set_jsonrpc && !wrote_jsonrpc {
+        if wrote_any {
+            out.push(b',');
+        }
+        wrote_any = true;
+        out.extend_from_slice(b"\"jsonrpc\":\"2.0\"");
+    }
+    if fix.add_id {
+        if wrote_any {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"\"id\":null");
+    }
+    out.push(b'}');
 }
 
 /// Rewrite a JSON response's `Content-Type` to Core's exact spelling.
@@ -610,6 +713,54 @@ mod tests {
     fn rewrites_jsonrpc_1_1() {
         let out = norm(r#"{"jsonrpc":"1.1","id":"x","method":"ping"}"#).expect("should rewrite");
         assert_eq!(out["jsonrpc"], "2.0");
+    }
+
+    /// The layer's contract is that it rewrites the protocol tag and nothing
+    /// else. Round-tripping the body through `serde_json::Value` broke that
+    /// silently: `Map` collapses duplicate keys, so a `params` object written
+    /// `{"a":1,"a":2}` reached the handler as `{"a":2}`. Core keeps duplicates
+    /// and `createrawtransaction` rejects them by name — a check that sat
+    /// downstream of this layer and could never fire.
+    #[test]
+    fn params_are_preserved_byte_for_byte() {
+        let body = br#"{"jsonrpc":"1.0","id":"t","method":"createrawtransaction","params":[[],{"a":0.01,"a":0.02}]}"#;
+        let out = normalize_jsonrpc_version(body).expect("should rewrite 1.0 -> 2.0");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#""jsonrpc":"2.0""#), "{text}");
+        assert!(
+            text.contains(r#""params":[[],{"a":0.01,"a":0.02}]"#),
+            "duplicate keys must survive: {text}"
+        );
+
+        // Number spellings survive too — a `Value` round-trip renormalises
+        // them, and amounts are parsed from their literal text.
+        let body = br#"{"method":"createrawtransaction","params":[[],{"a":1.10,"b":1e2}]}"#;
+        let out = normalize_jsonrpc_version(body).expect("should add jsonrpc + id");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"{"a":1.10,"b":1e2}"#), "{text}");
+        assert!(text.contains(r#""id":null"#), "{text}");
+
+        // ...and in a batch.
+        let body = br#"[{"method":"m","params":[{"a":1,"a":2}]},{"jsonrpc":"2.0","id":1,"method":"n","params":[]}]"#;
+        let out = normalize_jsonrpc_version(body).expect("first element needs fixing");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#"{"a":1,"a":2}"#), "{text}");
+    }
+
+    /// A member this layer does not know about must be carried through
+    /// unchanged rather than dropped.
+    #[test]
+    fn unknown_members_survive() {
+        let body = br#"{"jsonrpc":"1.0","id":7,"method":"m","params":[],"extra":{"x":[1,2]}}"#;
+        let out = normalize_jsonrpc_version(body).expect("should rewrite");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(r#""extra":{"x":[1,2]}"#), "{text}");
+        assert!(text.contains(r#""id":7"#), "{text}");
+        // Still exactly one `id` and one `jsonrpc`.
+        assert_eq!(text.matches(r#""id":"#).count(), 1, "{text}");
+        assert_eq!(text.matches(r#""jsonrpc":"#).count(), 1, "{text}");
+        // And the result parses.
+        let _: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
     }
 
     #[test]
