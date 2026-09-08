@@ -9,8 +9,9 @@
 #   sudo systemctl enable --now satd
 #
 # Cookie-auth access for non-root operators: add yourself to the
-# `satd` group. The unit chmods $DATADIR/.cookie to 0640 on every
-# start, so group members can run `sat-cli` / `sat-tui` without sudo:
+# `satd` group. The unit chmods the cookie to 0640 on every start —
+# both $DATADIR/.cookie (mainnet) and $DATADIR/<network>/.cookie — so
+# group members can run `sat-cli` / `sat-tui` without sudo:
 #   sudo usermod -aG satd <your-user>
 # (group changes only take effect in new login sessions)
 #
@@ -72,7 +73,19 @@ ExecStop=/bin/kill -SIGTERM $MAINPID
 # without sudo. `-` prefix: missing cookie (e.g., when --rpcuser is
 # set instead) is non-fatal. Cookie still rotates on every daemon
 # start, so this is no less secure than 0600 for outside-group users.
-ExecStartPost=-/bin/chmod 0640 ${SATD_DATADIR}/.cookie
+#
+# The glob matters. satd writes the cookie under the network's
+# subdirectory on every chain but mainnet — signet/.cookie,
+# testnet4/.cookie, regtest/.cookie — so naming only ${SATD_DATADIR}/.cookie
+# left group members unable to authenticate on any of them, which is
+# precisely the case where an operator is most likely to be poking at the
+# node by hand. /bin/sh is needed because systemd does not expand globs in
+# ExecStartPost= arguments.
+# ${SATD_DATADIR} rather than $SATD_DATADIR: systemd expands the braced form
+# to a single word, and where it does not expand inside quotes the shell
+# resolves it from the same Environment= value. Both readings give the same
+# path, which is what makes this safe to write once.
+ExecStartPost=-/bin/sh -c 'chmod 0640 ${SATD_DATADIR}/.cookie ${SATD_DATADIR}/*/.cookie 2>/dev/null; exit 0'
 
 # Reindex can take hours, but the heartbeat IS the liveness check
 # only when there's a finite budget to extend. EXTEND_TIMEOUT_USEC=

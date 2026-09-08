@@ -1,0 +1,67 @@
+#!/bin/bash
+# configure-network — point the appliance's satd at one network.
+#
+# Called by first boot and by `satd-appliance set-network`. It exists as one
+# script because the two halves have to agree: the rendered bitcoin.conf and
+# the flag systemd passes are both per-network, and a config that says signet
+# under a unit that says nothing starts a mainnet node.
+#
+#   configure-network <mainnet|signet|testnet4|testnet|regtest>
+#
+# Idempotent. Does not start or stop anything; the caller owns that.
+
+set -euo pipefail
+
+NETWORK="${1:-}"
+DATADIR="${SATD_DATADIR:-/var/lib/satd}"
+LIB="${SATD_APPLIANCE_LIB:-/usr/local/lib/satd-appliance}"
+STATE="${SATD_APPLIANCE_STATE:-/var/lib/satd-appliance}"
+
+case "$NETWORK" in
+    mainnet)  CHAIN_FLAG="--chain=main" ;;
+    signet)   CHAIN_FLAG="--chain=signet" ;;
+    testnet)  CHAIN_FLAG="--chain=test" ;;
+    regtest)  CHAIN_FLAG="--chain=regtest" ;;
+    # --chain has no testnet4 selector; the dedicated flag is the only way.
+    testnet4) CHAIN_FLAG="--testnet4=1" ;;
+    *)
+        echo "configure-network: unknown network '$NETWORK'" >&2
+        echo "configure-network: expected mainnet, signet, testnet4, testnet or regtest" >&2
+        exit 2
+        ;;
+esac
+
+mkdir -p "$STATE"
+
+# The node's configuration, rendered by the compose stack's own first-run
+# script so the appliance and the stack cannot drift apart.
+SATD_DATADIR="$DATADIR" \
+SATD_CONF_TEMPLATE="$LIB/satd.conf.tmpl" \
+SATD_MKCA="$LIB/mkca.sh" \
+NETWORK="$NETWORK" \
+SATD_MCP=1 \
+SATD_STACK_SUBNET="${SATD_STACK_SUBNET:-10.77.0.0/24}" \
+SATD_TLS_HOSTNAME="${SATD_TLS_HOSTNAME:-$(hostname)}" \
+SATD_CA_EXPORT_HINT="satd-appliance tls export-ca" \
+    "$LIB/satd-init"
+
+# The chain is NEVER expressed in the config file. satd accepts a
+# `signet=1` line there and then ignores it, which silently starts a
+# mainnet node — so the selector has to reach satd as an argument, and
+# /etc/default/satd is where the shipped unit picks up extra arguments.
+install -d -m 0755 /etc/default
+cat > /etc/default/satd <<DEFAULTS
+# Written by satd-appliance. Edit through \`satd-appliance set-network\`
+# rather than by hand: the chain here and the one in
+# $DATADIR/bitcoin.conf's port settings are rendered together.
+SATD_DATADIR=$DATADIR
+SATD_OPTS=$CHAIN_FLAG
+DEFAULTS
+
+chown -R satd:satd "$DATADIR"
+# satd reads its own key; the console user reads the CA through the satd
+# group, which is why the key is group-readable rather than 0600 here.
+chmod 0640 "$DATADIR/tls/leaf.key" "$DATADIR/tls/ca.key" 2>/dev/null || true
+
+echo "$NETWORK" > "$STATE/network"
+echo "configure-network: $NETWORK ($CHAIN_FLAG)"

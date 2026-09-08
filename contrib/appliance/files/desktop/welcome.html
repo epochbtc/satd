@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>satd appliance</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.5rem; }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.2rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+  pre { background: rgba(127,127,127,.12); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto; }
+  .warn { border-left: 4px solid #c96; background: rgba(200,150,80,.12);
+          padding: .8rem 1rem; border-radius: 0 6px 6px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(127,127,127,.3); }
+  th { font-weight: 600; }
+</style>
+
+<h1>satd appliance</h1>
+<p class="sub">A Bitcoin node, plus the software people actually point at one.</p>
+
+<p>This machine is running <strong>satd</strong>, a Bitcoin Core-compatible node
+written in Rust, with its Electrum, Esplora, JSON-RPC and MCP surfaces on and
+each one served over TLS. It starts on <strong>signet</strong>, where a fully
+indexed node syncs in under an hour and faucets hand out coins, so everything
+here can be exercised end to end without real money.</p>
+
+<h2>First things</h2>
+<pre>satd-appliance status          what the node is doing right now
+sat-tui -rpcport=8332          live dashboard: chain, mempool, peers
+satd-appliance tls export-ca   the certificate to trust on your other machines</pre>
+
+<h2>Connecting from another machine</h2>
+<p>Reach this appliance at <code>satd.local</code>. That name is on the
+certificate and keeps working when the address changes, which an IP address
+does not.</p>
+<p>Export the CA once and every surface below becomes trusted at once:</p>
+<pre>satd-appliance tls export-ca &gt; satd-ca.crt</pre>
+
+<table>
+  <tr><th>Surface</th><th>Address</th></tr>
+  <tr><td>Electrum (Sparrow, Electrum, BlueWallet)</td><td><code>ssl://satd.local:50002</code></td></tr>
+  <tr><td>Esplora REST</td><td><code>https://satd.local:3001/api</code></td></tr>
+  <tr><td>JSON-RPC</td><td><code>https://satd.local:8336</code></td></tr>
+  <tr><td>MCP (for AI agents)</td><td><code>https://satd.local:8339</code> — see <code>~/.satd/mcp.json</code></td></tr>
+</table>
+
+<h2>Wallets on this desktop</h2>
+<p>Sparrow, Electrum and Liana are installed and already pointed at this node's
+Electrum server. They pin the server certificate the first time they connect,
+so you will be asked to accept it once.</p>
+
+<p>There is no Cashu wallet on the desktop: its CLI does not currently build on
+this Debian release. Run the mint with <code>satd-appliance enable cashu</code>
+and point a phone wallet at it.</p>
+
+<h2>Lightning, ecash and more</h2>
+<pre>sudo satd-appliance enable lightning   LND (Neutrino) + Ride The Lightning
+sudo satd-appliance enable cashu       a Cashu mint backed by that LND
+sudo satd-appliance enable btcpay      BTCPay Server
+sudo satd-appliance enable cln         Core Lightning instead of LND</pre>
+<p>Each pulls its containers on first use. <code>satd-appliance disable</code>
+stops one again and keeps its data.</p>
+
+<h2>Going to mainnet</h2>
+<pre>sudo satd-appliance set-network mainnet</pre>
+<p>This refuses on a disk smaller than 1.5 TB, and means it. There is no prune
+option: Electrum and Esplora both need <code>txindex</code>, and pruning
+excludes it, so a mainnet node here stores the whole chain plus every index.</p>
+
+<div class="warn">
+  <p><strong>This image bundles third-party software on a best-effort basis.</strong>
+  The wallets, Lightning, ecash and payment components here are included so you
+  can try satd end to end. They are not a production deployment: their security
+  advisories are not tracked in real time, and a critical fix in one of them may
+  not appear in an appliance image until the next scheduled build.</p>
+  <p>satd itself in this image is the same supported release as the project's
+  tarballs and container image. For production, run satd from a release artifact
+  and operate the other components yourself.</p>
+</div>
+
+<h2>Where things are</h2>
+<pre>/var/lib/satd                the node's data, config and certificates
+/var/lib/satd/tls/ca.crt     this appliance's CA
+/opt/satd/stack              the container overlays
+journalctl -u satd -f        the node's log</pre>

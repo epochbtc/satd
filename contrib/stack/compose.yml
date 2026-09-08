@@ -14,6 +14,11 @@
 
 name: satd-stack
 
+# Overlays address this node as ${SATD_HOST:-satd}. In this file that
+# resolves to the service below. On the appliance, where satd runs natively
+# under systemd and there is no satd container, it is set to the docker
+# network's gateway — see contrib/appliance/files/compose.appliance.yml.
+
 x-satd-image: &satd-image ${SATD_IMAGE:-ghcr.io/epochbtc/satd:latest}
 
 services:

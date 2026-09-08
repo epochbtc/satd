@@ -29,5 +29,5 @@
 # is why it is here; it stays on the compose network otherwise.
 :9443 {
 	import satd_tls
-	reverse_proxy satd:9332
+	reverse_proxy {$SATD_HOST:satd}:9332
 }

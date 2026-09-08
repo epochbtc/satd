@@ -40,18 +40,21 @@ services:
 
   nbxplorer:
     image: nicolasdorier/nbxplorer:2.5.21@sha256:0eaa2b165873face1ac699297b45f5110d57b557558d68588896dc386c7eb3cb
+    # No `depends_on: satd`. The appliance runs satd natively under systemd
+    # and reaches it through `extra_hosts: satd:host-gateway`, so there is no
+    # satd service in that project to depend on. Nothing is lost: this
+    # service retries its connection and is `restart: unless-stopped`, so a
+    # satd that is still starting delays it rather than breaking it.
     depends_on:
-      satd:
-        condition: service_healthy
       btcpay-db:
         condition: service_healthy
     environment:
       NBXPLORER_NETWORK: ${NETWORK:-signet}
       NBXPLORER_BIND: 0.0.0.0:32838
       NBXPLORER_CHAINS: btc
-      NBXPLORER_BTCRPCURL: http://satd:8332
+      NBXPLORER_BTCRPCURL: http://${SATD_HOST:-satd}:8332
       NBXPLORER_BTCRPCCOOKIEFILE: /satd/rpc-cookie
-      NBXPLORER_BTCNODEENDPOINT: satd:${SATD_P2P_PORT:-38333}
+      NBXPLORER_BTCNODEENDPOINT: ${SATD_HOST:-satd}:${SATD_P2P_PORT:-38333}
       NBXPLORER_POSTGRES: Host=btcpay-db;Port=5432;Database=nbxplorer;Username=postgres;Password=${POSTGRES_PASSWORD}
       # No auth on the compose network only; nothing publishes this port.
       NBXPLORER_NOAUTH: "1"

@@ -24,9 +24,20 @@
 services:
   caddy:
     image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
-    depends_on:
-      satd-init:
-        condition: service_completed_successfully
+    # Caddy refuses to start without its certificate, and the certificate is
+    # written by whatever issued it — satd-init in the compose stack, first
+    # boot on the appliance. Waiting for the file rather than depending on a
+    # service keeps this overlay usable in both, where a `depends_on` would
+    # name a service that does not exist in one of them.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while [ ! -s /satd/tls/fullchain.crt ]; do
+          echo "waiting for /satd/tls/fullchain.crt ..."
+          sleep 2
+        done
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       # Read-only, for the certificate and key only. Caddy runs as root in

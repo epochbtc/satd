@@ -29,16 +29,18 @@
 services:
   lnd:
     image: lightninglabs/lnd:v0.18.5-beta@sha256:2b560c9beb559c57ab2f2da1dfed80d286cf11a6dc6e4354cab84aafba79b6f6
-    depends_on:
-      satd:
-        condition: service_healthy
+    # No `depends_on: satd`. The appliance runs satd natively under systemd
+    # and reaches it through `extra_hosts: satd:host-gateway`, so there is no
+    # satd service in that project to depend on. Nothing is lost: this
+    # service retries its connection and is `restart: unless-stopped`, so a
+    # satd that is still starting delays it rather than breaking it.
     command:
       - --bitcoin.active
       - --bitcoin.${NETWORK:-signet}
       - --bitcoin.node=neutrino
       # The only peer LND talks to. `--nobootstrap` keeps it that way, so a
       # green run is evidence about satd rather than about the network.
-      - --neutrino.connect=satd:${SATD_P2P_PORT:-38333}
+      - --neutrino.connect=${SATD_HOST:-satd}:${SATD_P2P_PORT:-38333}
       - --nobootstrap
       - --noseedbackup
       - --rpclisten=0.0.0.0:10009
