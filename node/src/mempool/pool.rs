@@ -2133,6 +2133,45 @@ impl Mempool {
             }
         }
 
+        // Ephemeral dust (Core: `CheckEphemeralSpends`, `src/policy/ephemeral_policy.cpp`).
+        //
+        // A dust output is only allowed to exist because something sweeps it in
+        // the same breath. Core runs this on the single-transaction path too,
+        // gathering dust from in-mempool parents as well as in-package ones,
+        // because otherwise a package can put a dust parent in and a *later*,
+        // separately submitted child can spend around the dust and strand it.
+        //
+        // satd cannot reach that state today -- `accept_package` is the only
+        // way a dust output enters the mempool, and it unwinds a parent whose
+        // sweeper was refused. This is what makes that a property of the code
+        // rather than a coincidence of the current call graph.
+        let mut checked_parents: HashSet<Txid> = HashSet::new();
+        for input in &tx.input {
+            let parent_txid = input.previous_output.txid;
+            if !checked_parents.insert(parent_txid) {
+                continue;
+            }
+            let Some(parent) = inner.entries.get(&parent_txid) else {
+                continue;
+            };
+            let dust_indices = Self::dust_output_indices(&parent.tx);
+            if dust_indices.is_empty() {
+                continue;
+            }
+            let sweeps_all = dust_indices.iter().all(|&di| {
+                tx.input.iter().any(|i| {
+                    i.previous_output.txid == parent_txid && i.previous_output.vout == di
+                })
+            });
+            if !sweeps_all {
+                return Err(MempoolError::MissingEphemeralSpends(format!(
+                    "missing-ephemeral-spends, tx {txid} (wtxid={}) did not spend parent's \
+                     ephemeral dust",
+                    tx.compute_wtxid()
+                )));
+            }
+        }
+
         // Look up UTXOs and validate inputs (with CPFP support)
         let tip_height = chain_state.tip_height();
         let mut sum_inputs: u64 = 0;
@@ -4303,6 +4342,32 @@ impl Mempool {
         // undone here.
         let stranded = self.unwind_stranded_dust_parents(&pkg, &parents_to_accept, &mut accepted_txids);
 
+        // Announce the ephemeral parents that survived.
+        //
+        // `accept_transaction_bypass_fee` inserts without emitting, and it has
+        // to: at that point the parent's fate still depends on a child that has
+        // not been through acceptance. Emitting there and retracting here would
+        // put an Enter/Leave pair on the stream for a transaction that was never
+        // really in the mempool. Emitting once, after the unwind, means a
+        // subscriber sees exactly what stayed -- and every member of an accepted
+        // package gets its `Enter`, which is what a consumer reconstructing
+        // mempool membership from the stream needs.
+        for parent_txid in &parents_to_accept {
+            if !accepted_txids.contains(parent_txid) {
+                continue;
+            }
+            let Some(entry) = self.get(parent_txid) else {
+                continue;
+            };
+            self.emit(MempoolEvent::Enter {
+                txid: *parent_txid,
+                fee: entry.fee,
+                vsize: policy::weight_to_vsize(entry.weight as u64),
+                fee_rate_sat_per_kvb: entry.fee_rate,
+                time: entry.time,
+            });
+        }
+
         // Determine package_msg.
         //
         // Core distinguishes the two. An unspent-dust failure is a property of
@@ -4417,11 +4482,10 @@ impl Mempool {
             self.sync_unbroadcast_len(&inner);
         }
 
-        // Deliberately no `LeaveEvicted`. `accept_transaction_bypass_fee`
-        // inserts the entry without emitting `Enter`, so no subscriber ever saw
-        // these arrive; announcing a departure they never saw begin would make
-        // the stream harder to follow, not easier. (That the ephemeral path
-        // emits no `Enter` at all is a separate gap.)
+        // No `LeaveEvicted`: the `Enter` for these is emitted by the caller
+        // *after* this runs, precisely so an unwound parent is never announced
+        // in the first place. A subscriber sees nothing rather than a pair it
+        // has to reconcile.
         for txid in &removed {
             accepted_txids.remove(txid);
         }
@@ -9116,6 +9180,122 @@ mod tests {
         );
         // Nothing at all is left, so unwinding the parent cannot orphan anyone.
         assert_eq!(mp.inner.read().entries.len(), 0, "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core runs `CheckEphemeralSpends` on the single-transaction path too, so
+    /// a transaction submitted on its own cannot spend around a resident dust
+    /// parent's dust. Without it, the invariant the package path maintains
+    /// holds only by coincidence of the current call graph.
+    #[test]
+    fn a_lone_transaction_cannot_spend_around_a_resident_parents_dust() {
+        let op = outpoint(0xC8);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // Get a dust parent legitimately resident, via a package that sweeps.
+        let parent = tx_from(
+            &[op],
+            &[(dust, 0x70), (25_000, 0x71), (50_000 - dust - 25_000, 0x72)],
+        );
+        let parent_txid = parent.compute_txid();
+        let sweeper = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(20_000, 0x73)],
+        );
+        let (msg, results) = mp.accept_package(vec![parent, sweeper], &cs, &NoopVerifier);
+        assert_eq!(msg, "success", "{results:?}");
+        assert!(in_pool(&mp, &parent_txid), "the fixture needs a resident dust parent");
+
+        // Now, separately: a transaction spending the parent's *other* output
+        // and leaving the dust behind.
+        let around = tx_from(&[OutPoint { txid: parent_txid, vout: 2 }], &[(20_000, 0x74)]);
+        let r = mp.accept_transaction(around, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(r, Err(MempoolError::MissingEphemeralSpends(_))),
+            "a lone transaction spent around the parent's dust: {r:?}"
+        );
+        assert_eq!(
+            r.unwrap_err().reject_reason(),
+            "missing-ephemeral-spends",
+            "wrong reject reason"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every member of an accepted package has to reach the event stream, or a
+    /// consumer reconstructing mempool membership from it silently disagrees
+    /// with `getrawmempool`. The ephemeral parent goes in through a path that
+    /// bypasses the usual admission, so it needs its own announcement.
+    #[test]
+    fn an_accepted_package_emits_enter_for_every_member() {
+        let op = outpoint(0xC9);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(event_tx);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x75), (50_000 - dust, 0x76)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0x77)],
+        );
+        let child_txid = child.compute_txid();
+
+        let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+        assert_eq!(msg, "success", "{results:?}");
+
+        let mut entered: HashSet<Txid> = HashSet::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let MempoolEvent::Enter { txid, .. } = ev {
+                entered.insert(txid);
+            }
+        }
+        assert!(entered.contains(&parent_txid), "the dust parent entered silently");
+        assert!(entered.contains(&child_txid), "the child entered silently");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a parent that does *not* survive must never be
+    /// announced. Emitting on admission and retracting after the unwind would
+    /// put an Enter/Leave pair on the stream for a transaction that was never
+    /// really in the mempool.
+    #[test]
+    fn an_unwound_dust_parent_is_never_announced() {
+        let op = outpoint(0xCA);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let (event_tx, mut rx) = tokio::sync::broadcast::channel::<MempoolEvent>(16);
+        mp.set_event_sender(event_tx);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x78), (50_000 - dust, 0x79)]);
+        let parent_txid = parent.compute_txid();
+        // Sweeps the dust, so the parent is admitted — then refused for its fee.
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(50_000 - 1, 0x7A)],
+        );
+
+        let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+        assert_eq!(msg, "unspent-dust", "{results:?}");
+        assert!(!in_pool(&mp, &parent_txid));
+
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                ev.txid() != &parent_txid,
+                "an unwound parent was announced: {ev:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

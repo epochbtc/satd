@@ -58,6 +58,12 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- The ephemeral dust rule is enforced on the single-transaction path, as Core
+  does: a transaction that spends a resident dust parent without sweeping its
+  dust is refused `missing-ephemeral-spends` instead of accepted (#703).
+- An ephemeral dust parent reached the mempool without a mempool `Enter`
+  event, so a consumer reconstructing membership from the event stream
+  disagreed with `getrawmempool` (#704).
 - `submitpackage` could leave a zero-fee ephemeral-dust parent in the mempool
   after the child that was to sweep its dust was refused, stranding the dust —
   the one outcome the policy exists to prevent. The parent is now removed with

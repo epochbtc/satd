@@ -14410,3 +14410,149 @@ fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
     proves_nothing(&node, flip(proof_hex, 180), "a proof with a corrupted merkle path");
     node.stop();
 }
+
+/// `signrawtransactionwithkey` had no test at all, at any level. The
+/// assertion that matters is not the shape of the reply but that the
+/// signature it produces actually verifies: the transaction is broadcast, so
+/// consensus checks the witness rather than the test doing it.
+#[test]
+fn signrawtransactionwithkey_produces_a_signature_the_node_accepts() {
+    use bitcoin::{Network, PrivateKey};
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x81; 32]);
+    let addr = wallet.address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
+
+    let funding_txid = common::block1_coinbase_txid(&node);
+    let dest = DeterministicWallet::from_secret([0x82; 32]);
+    let subsidy = 50_00000000u64;
+    let send = subsidy - 1_000;
+
+    let unsigned = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": funding_txid, "vout": 0 }]),
+            json!({ dest.address.to_string(): (send as f64) / 100_000_000.0 }),
+        ],
+    );
+    let unsigned = unsigned.as_str().expect("createrawtransaction returns hex").to_string();
+
+    let wif = PrivateKey::new(wallet.sk, Network::Regtest).to_wif();
+    let prevtxs = json!([{
+        "txid": funding_txid,
+        "vout": 0,
+        "scriptPubKey": hex::encode(wallet.address.script_pubkey().as_bytes()),
+        "amount": (subsidy as f64) / 100_000_000.0,
+    }]);
+
+    let signed = node.rpc_ok(
+        "signrawtransactionwithkey",
+        vec![json!(unsigned), json!([wif]), prevtxs.clone()],
+    );
+    assert_eq!(signed["complete"], json!(true), "signing reported incomplete: {signed}");
+    let signed_hex = signed["hex"].as_str().expect("signed hex").to_string();
+    assert_ne!(signed_hex, unsigned, "the returned transaction carries no signature");
+
+    // Consensus is the assertion: a bad signature is rejected here.
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(signed_hex)]);
+    let mempool = node.rpc_ok("getrawmempool", vec![]);
+    assert_eq!(mempool, json!([txid]), "the signed transaction was not accepted");
+
+    // A key that does not match the prevout cannot sign it. Core reports this
+    // as `complete: false` with a per-input error, not as an RPC failure.
+    let wrong = PrivateKey::new(dest.sk, Network::Regtest).to_wif();
+    let unsigned2 = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": funding_txid, "vout": 0 }]),
+            json!({ dest.address.to_string(): (send as f64) / 100_000_000.0 }),
+        ],
+    );
+    let bad = node.rpc_ok(
+        "signrawtransactionwithkey",
+        vec![unsigned2, json!([wrong]), prevtxs],
+    );
+    assert_eq!(bad["complete"], json!(false), "the wrong key signed the input: {bad}");
+    node.stop();
+}
+
+/// `combinerawtransaction` had no test either. Core's use for it is exactly
+/// this: two signers each hold one key, each signs the same transaction
+/// independently, and the halves are merged into one fully-signed
+/// transaction. Broadcasting the result is what proves the merge produced a
+/// valid witness for *both* inputs rather than keeping one signer's.
+#[test]
+fn combinerawtransaction_merges_two_partial_signatures() {
+    use bitcoin::{Network, PrivateKey};
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    // Two wallets, each funding one input, so each signer can only complete
+    // one of the two.
+    let a = DeterministicWallet::from_secret([0x83; 32]);
+    let b = DeterministicWallet::from_secret([0x84; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(a.address.to_string())]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(b.address.to_string())]);
+    node.rpc_ok("generatetoaddress", vec![json!(100), json!(a.address.to_string())]);
+
+    let coinbase_at = |h: u64| -> String {
+        let hash = node.rpc_ok("getblockhash", vec![json!(h)]);
+        let block = node.rpc_ok("getblock", vec![hash, json!(1)]);
+        block["tx"][0].as_str().expect("coinbase txid").to_string()
+    };
+    let txid_a = coinbase_at(1);
+    let txid_b = coinbase_at(2);
+
+    let subsidy = 50_00000000u64;
+    let dest = DeterministicWallet::from_secret([0x85; 32]);
+    let unsigned = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": txid_a, "vout": 0 }, { "txid": txid_b, "vout": 0 }]),
+            json!({ dest.address.to_string(): ((2 * subsidy - 1_000) as f64) / 100_000_000.0 }),
+        ],
+    );
+
+    let prevtxs = json!([
+        {
+            "txid": txid_a, "vout": 0,
+            "scriptPubKey": hex::encode(a.address.script_pubkey().as_bytes()),
+            "amount": (subsidy as f64) / 100_000_000.0,
+        },
+        {
+            "txid": txid_b, "vout": 0,
+            "scriptPubKey": hex::encode(b.address.script_pubkey().as_bytes()),
+            "amount": (subsidy as f64) / 100_000_000.0,
+        },
+    ]);
+
+    let sign_with = |wallet: &DeterministicWallet| -> serde_json::Value {
+        let wif = PrivateKey::new(wallet.sk, Network::Regtest).to_wif();
+        node.rpc_ok(
+            "signrawtransactionwithkey",
+            vec![unsigned.clone(), json!([wif]), prevtxs.clone()],
+        )
+    };
+
+    let half_a = sign_with(&a);
+    let half_b = sign_with(&b);
+    // Each signer completes only its own input, which is what makes the
+    // combine meaningful rather than a copy of either half.
+    assert_eq!(half_a["complete"], json!(false), "signer A completed both inputs: {half_a}");
+    assert_eq!(half_b["complete"], json!(false), "signer B completed both inputs: {half_b}");
+    let hex_a = half_a["hex"].as_str().expect("hex").to_string();
+    let hex_b = half_b["hex"].as_str().expect("hex").to_string();
+    assert_ne!(hex_a, hex_b, "the two signers produced identical transactions");
+
+    let combined = node.rpc_ok("combinerawtransaction", vec![json!([hex_a, hex_b])]);
+    let combined = combined.as_str().expect("combined hex").to_string();
+
+    // Consensus is the assertion: if the merge kept only one signer's witness,
+    // the other input fails script verification here.
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(combined)]);
+    let mempool = node.rpc_ok("getrawmempool", vec![]);
+    assert_eq!(mempool, json!([txid]), "the combined transaction was not accepted");
+    node.stop();
+}
