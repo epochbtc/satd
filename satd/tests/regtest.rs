@@ -14275,7 +14275,17 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
 
     // A reorgs onto B once B outweighs it, leaving A's two blocks stale.
     for hex in &b_hex {
-        node_a.rpc_ok("submitblock", vec![json!(hex)]);
+        // `submitblock` reports a rejection in the result, not as an error, so
+        // `rpc_ok` cannot see one. Check it here: without this, a rejected
+        // block surfaces below as "expected an active tip and one stale
+        // branch", which describes the symptom and not the cause. `null` is
+        // acceptance; `inconclusive` is a valid block that did not connect,
+        // which is what B's first two blocks are while A still has more work.
+        let res = node_a.rpc_ok("submitblock", vec![json!(hex)]);
+        assert!(
+            res.is_null() || res == json!("inconclusive"),
+            "node A rejected a block from B's chain: {res}"
+        );
     }
 
     let tips = node_a.rpc_call("getchaintips").unwrap();
@@ -14347,11 +14357,12 @@ fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
 
     // A transaction that is not in the named block cannot be proven from it.
     let coinbase_of_101 = {
-        let h = node.rpc_call_with_params("getblockhash", vec![json!(101)]).unwrap();
-        let b = node
-            .rpc_call_with_params("getblock", vec![json!(h["result"]), json!(1)])
-            .unwrap();
-        b["result"]["tx"][0].as_str().unwrap().to_string()
+        let h = node.rpc_ok("getblockhash", vec![json!(101)]);
+        let b = node.rpc_ok("getblock", vec![h, json!(1)]);
+        b["tx"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("block 101 has no transactions: {b}"))
+            .to_string()
     };
     let wrong_block = node
         .rpc_call_with_params(

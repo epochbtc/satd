@@ -58,9 +58,14 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `submitpackage` could leave a zero-fee ephemeral-dust parent in the mempool
+  after the child that was to sweep its dust was refused, stranding the dust —
+  the one outcome the policy exists to prevent. The parent is now removed with
+  the child (#673).
 - `submitpackage` reported `bad-txns-inputs-missingorspent` for a child that
   left its parent's ephemeral dust unspent, burying the real reason. It now
-  reports `missing-ephemeral-spends`, as Core does (#673).
+  reports `missing-ephemeral-spends`, and the package result is `unspent-dust`
+  rather than `transaction failed`, as Core does (#673).
 - `-connect=0` was parsed as the peer address `0`, so the node dialled
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling

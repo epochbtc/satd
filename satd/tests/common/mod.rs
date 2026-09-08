@@ -635,6 +635,12 @@ impl TestNode {
     /// still unspent", which is true and useless.
     ///
     /// Any call a test depends on having *worked* belongs here.
+    ///
+    /// One caveat: a handful of methods report failure in the *result* rather
+    /// than as a JSON-RPC error, which this cannot see. `submitblock` is the
+    /// one that matters -- Core returns `null` on acceptance and a reject
+    /// string otherwise, both with `error: null` -- so a test that needs the
+    /// block accepted has to check the returned value itself.
     pub fn rpc_ok(&self, method: &str, params: Vec<serde_json::Value>) -> serde_json::Value {
         let resp = self
             .rpc_call_with_params(method, params.clone())

@@ -104,12 +104,26 @@ node_start_is_teed() {
 
 node_start_is_teed
 
-# A modifier that merely contains a print-and-exit name must not be mistaken
-# for one: Core's -help-debug changes the help text, it does not print it.
+# The match is on the option *key*, not a substring of the argument, so an
+# option that merely begins with one of these names is unaffected. satd does not
+# implement -help-debug -- it skips it with a warning and starts a node -- so
+# that node still needs its debug.log. (Core's own -help-debug does print help
+# and exit, which is why matching on a substring would be doubly wrong here: it
+# would take the exec-through path for an invocation that satd keeps running.)
+#
+# Captured with $(...) like the cases above, so the shell waits on the tee child
+# rather than on a sleep: the shim dup2s away its own copy of the pipe before
+# exec, leaving the tee as the sole writer, so the substitution cannot return
+# until the tee has exited and flushed.
 not_a_print_and_exit() {
     local datadir="$WORK/helpdebug"
     mkdir -p "$datadir"
-    SATD_BIN="$LINGER" "$SHIM" "-datadir=$datadir" -regtest -help-debug=0 >/dev/null 2>&1
+    local out
+    out="$(SATD_BIN="$LINGER" "$SHIM" "-datadir=$datadir" -regtest -help-debug=0 2>/dev/null)"
+    if [[ "$out" != *"MARKER"* ]]; then
+        fail "-help-debug: the node produced no output" "got: $out"
+        return
+    fi
     if [[ ! -s "$datadir/regtest/debug.log" ]]; then
         fail "-help-debug: took the print-and-exit path"
         return

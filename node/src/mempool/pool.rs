@@ -4154,7 +4154,16 @@ impl Mempool {
                             .input
                             .iter()
                             .any(|i| i.previous_output.txid == parent_txid);
-                        if spends_parent {
+                        // A child that is already in the mempool is not the
+                        // reason this parent is stuck. It reaches here when the
+                        // parent is *confirmed* rather than in the package: the
+                        // parent's inputs no longer resolve, so it is deferred as
+                        // an ephemeral candidate, while the child spends its
+                        // now-confirmed outputs and is accepted normally. Core
+                        // gathers dust only from in-package and in-mempool
+                        // parents (`CheckEphemeralSpends`), so a confirmed parent
+                        // contributes none and the child is not refused at all.
+                        if spends_parent && !accepted_txids.contains(&ptx.txid) {
                             let spends_all_dust = dust_indices.iter().all(|&di| {
                                 ptx.tx
                                     .input
@@ -4278,18 +4287,35 @@ impl Mempool {
             }
         }
 
-        // Build the result.
-        // (all_wtxids removed — not needed; result built from pkg iterator)
+        // An ephemeral dust parent is only allowed in because a child is going
+        // to sweep its dust. Above, that was decided *structurally* -- some
+        // member of the package names the dust outpoint as an input -- and the
+        // parent was then admitted before that member had been through
+        // acceptance. If the child did not make it, the parent is left in the
+        // mempool paying zero fee with its dust stranded in the UTXO set, which
+        // is the one state the whole policy exists to prevent.
+        //
+        // Core cannot reach this because it validates the package first and
+        // only then commits: `CheckEphemeralSpends` runs in
+        // `AcceptMultipleTransactions` and returns *before* `FinalizeSubpackage`
+        // (`src/validation.cpp`), so a failure anywhere leaves the mempool
+        // untouched. satd accepts incrementally, so the equivalent has to be
+        // undone here.
+        let stranded = self.unwind_stranded_dust_parents(&pkg, &parents_to_accept, &mut accepted_txids);
 
         // Determine package_msg.
-        let has_failure = !failed.is_empty();
-        // Check for the "unspent-dust" case: an ephemeral parent had no child
-        // spending its dust.
-        let unspent_dust = parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
-        let package_msg = if has_failure {
-            "transaction failed".to_string()
-        } else if unspent_dust {
+        //
+        // Core distinguishes the two. An unspent-dust failure is a property of
+        // the *package* -- `CheckEphemeralSpends` failing sets
+        // `PCKG_TX, "unspent-dust"` -- and it is checked before any per-member
+        // policy failure can be reported, so it wins over `transaction failed`
+        // whenever both are present (`src/validation.cpp`).
+        let unspent_dust = !stranded.is_empty()
+            || parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
+        let package_msg = if unspent_dust {
             "unspent-dust".to_string()
+        } else if !failed.is_empty() {
+            "transaction failed".to_string()
         } else {
             "success".to_string()
         };
@@ -4319,6 +4345,93 @@ impl Mempool {
         }
 
         (package_msg, tx_results)
+    }
+
+    /// Remove any ephemeral dust parent that made it into the mempool without
+    /// the child that was supposed to sweep its dust.
+    ///
+    /// Called at the end of [`Self::accept_package`], where the parents were
+    /// admitted on the strength of a child that merely *existed* in the
+    /// package. Acceptance can still refuse that child afterwards -- for its
+    /// fee, its scripts, a chain limit, anything -- and the parent must not
+    /// outlive it: a zero-fee transaction with an unspendable-in-practice dust
+    /// output would sit in the mempool with nothing paying for it.
+    ///
+    /// The parent alone is enough: no descendant of it can be resident. The
+    /// children loop above refuses any child that does not sweep every dust
+    /// output of an in-mempool parent, so a sibling spending only the parent's
+    /// ordinary outputs is already gone -- and if a child *did* sweep the dust
+    /// and was accepted, the parent is not stranded in the first place.
+    /// `unwinding_a_dust_parent_leaves_no_orphan_behind` pins that.
+    ///
+    /// Returns the parents removed, and clears them from `accepted_txids` so
+    /// the caller does not report them as accepted.
+    fn unwind_stranded_dust_parents(
+        &self,
+        pkg: &[impl PackageMember],
+        parents_to_accept: &[Txid],
+        accepted_txids: &mut HashSet<Txid>,
+    ) -> Vec<Txid> {
+        let mut stranded: Vec<Txid> = Vec::new();
+        for parent_txid in parents_to_accept {
+            if !accepted_txids.contains(parent_txid) {
+                continue;
+            }
+            let Some(parent_tx) = self.get(parent_txid).map(|e| e.tx) else {
+                continue;
+            };
+            let dust_indices = Self::dust_output_indices(&parent_tx);
+            // Every dust output must be spent by a member that was *accepted*,
+            // not merely present in the package.
+            let all_swept = dust_indices.iter().all(|&di| {
+                pkg.iter().any(|member| {
+                    accepted_txids.contains(&member.txid())
+                        && member.tx().input.iter().any(|i| {
+                            i.previous_output.txid == *parent_txid
+                                && i.previous_output.vout == di
+                        })
+                })
+            });
+            if !all_swept {
+                stranded.push(*parent_txid);
+            }
+        }
+        if stranded.is_empty() {
+            return stranded;
+        }
+
+        let mut removed: Vec<Txid> = Vec::new();
+        {
+            let mut inner = self.inner.write();
+            for txid in &stranded {
+                if let Some(entry) = inner.entries.remove(txid) {
+                    let tx_size = bitcoin::consensus::serialize(&entry.tx).len();
+                    inner.account_remove(entry.scope, tx_size);
+                    for input in &entry.tx.input {
+                        inner.spends.remove(&input.previous_output);
+                    }
+                    inner.unbroadcast.remove(txid);
+                    removed.push(*txid);
+                }
+            }
+            self.sync_unbroadcast_len(&inner);
+        }
+
+        // Deliberately no `LeaveEvicted`. `accept_transaction_bypass_fee`
+        // inserts the entry without emitting `Enter`, so no subscriber ever saw
+        // these arrive; announcing a departure they never saw begin would make
+        // the stream harder to follow, not easier. (That the ephemeral path
+        // emits no `Enter` at all is a separate gap.)
+        for txid in &removed {
+            accepted_txids.remove(txid);
+        }
+        if !removed.is_empty() {
+            tracing::debug!(
+                count = removed.len(),
+                "Unwound ephemeral dust parents whose sweeping child was not accepted"
+            );
+        }
+        stranded
     }
 
     /// Accept a transaction bypassing the minimum fee rate check — used for
@@ -8335,8 +8448,16 @@ mod tests {
     // would confirm at height 1), which is enough to put each guard on the
     // wrong side of its cutoff without also having to fabricate a reorg.
 
-    /// Insert `tx` into the pool exactly as admission does, maintaining the
-    /// `spends` reverse index that the descendant walk relies on.
+    /// Insert `tx` into the pool with the `spends` reverse index maintained,
+    /// the way admission maintains it.
+    ///
+    /// Not a stand-in for admission in general: it does not populate the
+    /// prevout metadata, and the caller owns the byte accounting (see
+    /// `reorg_eviction_clears_the_spends_index_and_byte_accounting`, the one
+    /// case that reads it). `remove_for_reorg` touches neither, so the entry
+    /// is faithful for these tests. The fee/weight/fee-rate triple is
+    /// internally consistent with what admission would store, so nothing built
+    /// on this helper later pins a fee rate the pool never produces.
     fn insert_raw(mp: &Mempool, tx: Transaction) -> Txid {
         let txid = tx.compute_txid();
         let mut inner = mp.inner.write();
@@ -8349,7 +8470,7 @@ mod tests {
                 tx,
                 fee: 1_000,
                 weight: 400,
-                fee_rate: 2_500,
+                fee_rate: policy::fee_rate_sat_per_kvb(1_000, 400),
                 time: 0,
                 fee_delta: 0,
                 sigop_cost: 0,
@@ -8382,27 +8503,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (a) Locktime finality. A height locktime the next block cannot satisfy
-    /// evicts — this is the case a reorg creates by moving the tip backwards
-    /// past a transaction's locktime.
+    /// Mine `n` blocks onto the env's chain, so a case can sit at a tip above
+    /// genesis. At tip 0 the only locktime below the cutoff is 0, which the
+    /// `locktime > 0` guard short-circuits before the comparison — so the
+    /// cutoff itself is unobservable there.
+    fn advance_tip(cs: &ChainState, mp: &Mempool, n: usize) {
+        for _ in 0..n {
+            crate::mining::miner::mine_block_to_script(cs, mp, p2wpkh_spk(0x11))
+                .expect("regtest block mines");
+        }
+    }
+
+    /// (a) Locktime finality on the height branch. A locktime the next block
+    /// cannot satisfy evicts — the case a reorg creates by moving the tip
+    /// backwards past a transaction's locktime — and one the next block *can*
+    /// satisfy does not.
+    ///
+    /// Both sides are needed, and both need a tip above genesis: the cutoff is
+    /// `next_height`, so the value that separates it from `tip_height` is
+    /// `locktime == tip_height`, and at tip 0 that is `0`, which never reaches
+    /// the comparison.
     #[test]
     fn reorg_evicts_a_height_locktime_the_new_tip_cannot_satisfy() {
         let op = outpoint(0xF1);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
-        // locktime 1 against next height 1: the cutoff is strict, so unmet.
-        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x31, 2, 0, 1));
-        // One below the cutoff is still final and must be left alone.
         let op2 = outpoint(0xF2);
-        let (cs2, mp2, dir2) = make_funded_env(&[(op2, coin(50_000))]);
-        let kept = insert_raw(&mp2, spend_with(op2, 40_000, 0x32, 2, 0, 0));
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
+        advance_tip(&cs, &mp, 1);
+        let tip = cs.tip_height();
+        assert_eq!(tip, 1, "the fixture needs a tip above genesis");
+
+        // At the cutoff (locktime == next_height): non-final, evicted.
+        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x31, 2, 0, tip + 1));
+        // One below it (locktime == tip_height): final, kept. This is the
+        // assertion that fails if the cutoff is loosened to `tip_height`.
+        let kept = insert_raw(&mp, spend_with(op2, 40_000, 0x32, 2, 0, tip));
 
         mp.remove_for_reorg(&cs);
-        mp2.remove_for_reorg(&cs2);
 
         assert!(!in_pool(&mp, &evicted), "an unsatisfiable height locktime survived the reorg");
-        assert!(in_pool(&mp2, &kept), "a satisfied locktime was evicted");
+        assert!(in_pool(&mp, &kept), "a locktime the next block satisfies was evicted");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// (a) again, on the time branch: a locktime at or above the new tip's MTP
@@ -8410,12 +8550,17 @@ mod tests {
     /// applied the height cutoff to both would pass the test above.
     #[test]
     fn reorg_evicts_a_time_locktime_at_the_new_tip_mtp() {
+        // Two funded outpoints, not one: sharing an outpoint would put a
+        // double spend in the pool, and pass 3's `spends.remove` would then
+        // delete the surviving transaction's index row.
         let op = outpoint(0xF3);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let op2 = outpoint(0xFE);
+        let (cs, mp, dir) =
+            make_funded_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
         let tip_mtp = cs.get_median_time_past(1);
         assert!(tip_mtp >= 500_000_000, "regtest genesis time is a time locktime");
         let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x33, 2, 0, tip_mtp));
-        let kept = insert_raw(&mp, spend_with(op, 40_000, 0x34, 2, 0, tip_mtp - 1));
+        let kept = insert_raw(&mp, spend_with(op2, 40_000, 0x34, 2, 0, tip_mtp - 1));
 
         mp.remove_for_reorg(&cs);
 
@@ -8490,6 +8635,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// (c) BIP 68 against an *unconfirmed* parent, a separate branch from the
+    /// confirmed-coin one above: an in-mempool parent is treated as confirming
+    /// at `next_height`, so any nonzero height lock on it is unmet. The parent
+    /// itself must survive, which is what isolates this from the descendant
+    /// walk.
+    #[test]
+    fn reorg_evicts_an_unmet_bip68_lock_against_a_mempool_parent() {
+        let op = outpoint(0xB0);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let parent = insert_raw(&mp, spend(op, 45_000, 0xA0));
+        let prev = OutPoint { txid: parent, vout: 0 };
+        let evicted = insert_raw(&mp, spend_with(prev, 40_000, 0xA1, 2, 1, 0));
+
+        mp.remove_for_reorg(&cs);
+
+        assert!(in_pool(&mp, &parent), "the valid parent was evicted");
+        assert!(
+            !in_pool(&mp, &evicted),
+            "a height lock against an unconfirmed parent is unsatisfiable, but survived"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Control: a zero lock value on the same shape is met.
+        let op2 = outpoint(0xB1);
+        let (cs2, mp2, dir2) = make_funded_env(&[(op2, coin(50_000))]);
+        let parent2 = insert_raw(&mp2, spend(op2, 45_000, 0xA2));
+        let free = insert_raw(
+            &mp2,
+            spend_with(OutPoint { txid: parent2, vout: 0 }, 40_000, 0xA3, 2, 0, 0),
+        );
+        mp2.remove_for_reorg(&cs2);
+        assert!(in_pool(&mp2, &free), "a zero lock value against a mempool parent was evicted");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// (c) BIP 68's *time* type (bit 22), which anchors on the spent coin's MTP
+    /// rather than its height — a separate branch again, and the one a reorg
+    /// disturbs by moving MTP backwards.
+    #[test]
+    fn reorg_evicts_an_unmet_bip68_time_lock() {
+        // Coin at height 1: its MTP anchor equals the tip's, so zero seconds
+        // have elapsed and one 512-second unit is unmet.
+        let seq_time_1 = (1u32 << 22) | 1;
+        let op = outpoint(0xB2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
+        let evicted = insert_raw(&mp, spend_with(op, 40_000, 0xA4, 2, seq_time_1, 0));
+        mp.remove_for_reorg(&cs);
+        assert!(!in_pool(&mp, &evicted), "an unmet BIP 68 time lock survived the reorg");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A coin at height 0 anchors at an empty MTP window, so the whole
+        // genesis timestamp has "elapsed" and the same lock is met.
+        let op2 = outpoint(0xB3);
+        let (cs2, mp2, dir2) = make_funded_env(&[(op2, coin_at(50_000, 0))]);
+        let kept = insert_raw(&mp2, spend_with(op2, 40_000, 0xA5, 2, seq_time_1, 0));
+        mp2.remove_for_reorg(&cs2);
+        assert!(in_pool(&mp2, &kept), "a met BIP 68 time lock was evicted");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// (c) BIP 68 does not apply below version 2, so a version-1 transaction
     /// carrying the identical sequence must survive.
     #[test]
@@ -8545,10 +8750,15 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[]);
         let tx = spend(op, 40_000, 0x3F);
         let txid = insert_raw(&mp, tx.clone());
+        // Seed with slack, and assert the sweep lands on exactly the slack.
+        // `account_remove` saturates, so `total_bytes == 0` would also hold for
+        // any subtrahend at or above the real size -- a size/weight confusion
+        // would pass. Releasing too much has to fail here, not just too little.
+        const SLACK: usize = 10_000;
+        let size = bitcoin::consensus::serialize(&tx).len();
         {
             let mut inner = mp.inner.write();
-            let size = bitcoin::consensus::serialize(&tx).len();
-            inner.total_bytes = size;
+            inner.total_bytes = size + SLACK;
         }
 
         mp.remove_for_reorg(&cs);
@@ -8559,7 +8769,11 @@ mod tests {
             !inner.spends.contains_key(&op),
             "the evicted transaction left its outpoint marked as spent"
         );
-        assert_eq!(inner.total_bytes, 0, "evicting did not release the transaction's bytes");
+        assert_eq!(
+            inner.total_bytes, SLACK,
+            "eviction released {} bytes, not the transaction's {size}",
+            (size + SLACK).saturating_sub(inner.total_bytes)
+        );
         drop(inner);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8623,6 +8837,24 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Like [`make_funded_env`] but with a real minimum relay fee.
+    ///
+    /// `make_funded_env` sets `min_fee_rate: 0`, which makes the generic
+    /// fallback in `accept_package` report a bare `"dust"` — the same string
+    /// the at-most-one-dust rule reports. With a real floor the fallback says
+    /// `min relay fee not met` instead, so the two are distinguishable and a
+    /// test can pin which one fired.
+    fn make_package_env(coins: &[(OutPoint, Coin)]) -> (ChainState, Mempool, std::path::PathBuf) {
+        let (cs, mp, dir) = make_funded_env(coins);
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 1_000,
+            dust_relay_fee: 3_000,
+            ..Default::default()
+        });
+        (cs, mp, dir)
     }
 
     /// A P2WPKH output below this is dust; at or above it is not. Derived from
@@ -8690,7 +8922,10 @@ mod tests {
         let (msg, results) =
             mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
 
-        assert_eq!(msg, "transaction failed", "{results:?}");
+        // Core reports this as a property of the package, not of one member:
+        // `CheckEphemeralSpends` failing sets `PCKG_TX, "unspent-dust"`, and it
+        // is checked before any per-member policy failure can be reported.
+        assert_eq!(msg, "unspent-dust", "{results:?}");
         assert!(
             err_of(&results, &child).contains("missing-ephemeral-spends"),
             "wrong reason: {}",
@@ -8738,7 +8973,10 @@ mod tests {
     #[test]
     fn a_parent_with_two_dust_outputs_is_refused() {
         let op = outpoint(0xC3);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        // A real min relay fee, so the generic fallback would say
+        // `min relay fee not met` rather than the same bare `"dust"` this rule
+        // reports — without that, deleting the rule leaves the test green.
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
         let parent = tx_from(&[op], &[(dust, 0x59), (dust, 0x5A), (50_000 - 2 * dust, 0x5B)]);
@@ -8776,6 +9014,108 @@ mod tests {
 
         assert_eq!(msg, "unspent-dust", "{results:?}");
         assert!(!in_pool(&mp, &parent_txid), "a lone dust parent entered the mempool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The parent is admitted on the strength of a child that has not been
+    /// through acceptance yet. If that child is then refused, the parent must
+    /// not be left behind: a zero-fee transaction sitting in the mempool with
+    /// its dust stranded in the UTXO set is the one outcome the whole policy
+    /// exists to prevent, and nothing pays to have it there.
+    ///
+    /// Core cannot reach this state — it validates the package and only then
+    /// commits — so this is satd's incremental acceptance having to undo
+    /// itself.
+    #[test]
+    fn a_dust_parent_does_not_outlive_the_child_that_was_to_sweep_it() {
+        let op = outpoint(0xC6);
+        // A real min relay fee is what refuses the child here.
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x61), (50_000 - dust, 0x62)]);
+        let parent_txid = parent.compute_txid();
+        // Sweeps the dust, so the parent is structurally allowed in — but pays
+        // 1 sat, far below the floor, so acceptance refuses it.
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(50_000 - 1, 0x63)],
+        );
+        let child_txid = child.compute_txid();
+
+        let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
+
+        assert!(!in_pool(&mp, &child_txid), "the underpaying child was accepted: {results:?}");
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "a zero-fee dust parent was left in the mempool with its dust unswept: {results:?}"
+        );
+        assert_eq!(msg, "unspent-dust", "{results:?}");
+
+        // The bookkeeping has to be undone with it, or the parent's outpoint
+        // stays marked spent and a replacement reads as a conflict.
+        let inner = mp.inner.read();
+        assert!(
+            !inner.spends.contains_key(&op),
+            "the unwound parent left its input marked as spent"
+        );
+        assert_eq!(inner.total_bytes, 0, "the unwound parent's bytes were not released");
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Why unwinding the parent alone is enough: a sibling that spends the
+    /// parent's ordinary output without sweeping its dust is refused by the
+    /// children loop, so it never becomes an orphan when the parent goes. That
+    /// is also Core's rule -- `CheckEphemeralSpends` gathers dust from
+    /// in-mempool parents too, not just in-package ones.
+    #[test]
+    fn unwinding_a_dust_parent_leaves_no_orphan_behind() {
+        let op = outpoint(0xC7);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // Three outputs, so the sweeper and the sibling spend different ones.
+        // Sharing one would be `conflict-in-package`, and the package would be
+        // refused before any of this ran.
+        let parent = tx_from(
+            &[op],
+            &[(dust, 0x64), (25_000, 0x65), (50_000 - dust - 25_000, 0x66)],
+        );
+        let parent_txid = parent.compute_txid();
+        // Names the dust, so the parent is admitted — then refused for its fee.
+        let sweeper = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(dust + 25_000 - 1, 0x67)],
+        );
+        // Pays properly and conflicts with nobody, but leaves the dust alone.
+        let sibling = tx_from(&[OutPoint { txid: parent_txid, vout: 2 }], &[(20_000, 0x68)]);
+        let sibling_txid = sibling.compute_txid();
+
+        let (msg, results) =
+            mp.accept_package(vec![parent, sweeper, sibling.clone()], &cs, &NoopVerifier);
+
+        // Guards the fixture: any well-formedness refusal would short-circuit
+        // the whole function and make every assertion below vacuously true.
+        assert_eq!(msg, "unspent-dust", "the package never reached the dust policy: {results:?}");
+        assert!(
+            err_of(&results, &sibling).contains("missing-ephemeral-spends"),
+            "the sibling was not refused for leaving the dust: {}",
+            err_of(&results, &sibling)
+        );
+        assert!(!in_pool(&mp, &parent_txid), "the dust parent survived: {results:?}");
+        assert!(
+            !in_pool(&mp, &sibling_txid),
+            "a transaction that left the dust unswept was accepted: {results:?}"
+        );
+        // Nothing at all is left, so unwinding the parent cannot orphan anyone.
+        assert_eq!(mp.inner.read().entries.len(), 0, "{results:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
