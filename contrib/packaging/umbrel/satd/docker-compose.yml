@@ -1,0 +1,68 @@
+# Derived from contrib/stack/compose.yml. The satd service is defined there;
+# what changes here is only what Umbrel owns: the app network, its proxy,
+# and where the data lives.
+#
+# satd-init runs first and does exactly what it does in the reference stack
+# — issues this install's CA and certificate, renders bitcoin.conf, mints
+# the MCP token. It is baked into the image, so this file needs no bind
+# mounts from a repository Umbrel has not cloned.
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: satd_server_1
+      APP_PORT: 3001
+      # Esplora is served over TLS by satd itself; the proxy has to speak
+      # TLS to it rather than plain HTTP.
+      PROXY_AUTH_ADD: "false"
+
+  # The tag is bumped with each satd release the package is published for;
+  # v0.5.2 is the release this package was written against and does not
+  # exist until that release is cut.
+  init:
+    image: ghcr.io/epochbtc/satd:v0.5.2
+    entrypoint: ["/usr/local/bin/satd-init"]
+    user: "2121:2121"
+    restart: on-failure
+    environment:
+      NETWORK: ${APP_SATD_NETWORK:-mainnet}
+      SATD_MCP: "1"
+      SATD_STACK_SUBNET: "10.21.0.0/16"
+      # The name clients reach this node by. Umbrel publishes <hostname>.local
+      # over mDNS, and the certificate has to carry that name or every LAN
+      # client sees a mismatch.
+      SATD_TLS_HOSTNAME: ${DEVICE_HOSTNAME:-umbrel}
+      SATD_P2P_PORT: ${APP_SATD_P2P_PORT:-8333}
+    volumes:
+      - ${APP_DATA_DIR}/data:/var/lib/satd
+
+  server:
+    image: ghcr.io/epochbtc/satd:v0.5.2
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    # The network is an argument, never a config-file line: satd accepts
+    # `signet=1` in a file and then ignores it, which silently starts a
+    # mainnet node.
+    command:
+      - --datadir=/var/lib/satd
+      - --${APP_SATD_NETWORK:-mainnet}
+    environment:
+      SATD_HEALTH_URL: http://127.0.0.1:9332/readyz
+    volumes:
+      - ${APP_DATA_DIR}/data:/var/lib/satd
+    ports:
+      - "${APP_SATD_P2P_PORT:-8333}:${APP_SATD_P2P_PORT:-8333}"
+      - "8336:8336"
+      - "50002:50002"
+      - "3001:3001"
+      - "8339:8339"
+    stop_grace_period: 10m
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/satd-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10m
+      retries: 3
