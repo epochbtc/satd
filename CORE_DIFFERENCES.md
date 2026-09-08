@@ -548,6 +548,29 @@ silently returning an empty or wrong answer.
   omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
   refused with Core's message, as Core itself does off glibc.
 
+- **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
+  `-txindex` is on, not whether the index covers the whole chain. satd writes
+  txindex entries inline during `connect_block`, so with the flag set the index
+  is current for every block the node connects; what it cannot tell you is
+  whether history predating the flag was ever indexed. Core answers that with a
+  background index builder, which satd does not have — `backfillindex` covers
+  the address, silent-payment and filter indexes only. Against the strict
+  predicate, `synced` would stay false forever on a datadir first synced
+  without `-txindex`, and Core's documented "poll `synced`, then query" pattern
+  would hang instead of failing. A txindex backfill is what would let this
+  become a completeness marker.
+
+- **`logging`** — lists the twenty `-debug` categories satd can act on, not
+  Core's full set. satd maps Core's category names onto six tracing subsystems
+  (`net`, `mempool`, `rpc`, `validation`, `storage`, `tor`), so several of
+  Core's names are aliases for one target and the rest — `qt`, `libevent`,
+  `lock`, `rand`, `selectcoins`, `walletdb` — name subsystems satd does not
+  have. Listing those would advertise a category the RPC could neither enable
+  nor report on. Because the names are aliases, enabling `net` also reports
+  `addrman`, `cmpctblock`, `proxy` and `txreconciliation` as enabled: they are
+  the same subsystem. Values are read from the live filter, and `include` /
+  `exclude` change it.
+
 - **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
   actually granted, in Core's order. `bloomfilter` never appears: satd accepts
   the name in a `-whitelist` entry but has no flag for it, so reporting it

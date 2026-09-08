@@ -3,6 +3,7 @@ mod config;
 mod fast_start;
 mod notify;
 mod notifyhooks;
+mod logcontrol;
 mod reload;
 
 #[global_allocator]
@@ -251,6 +252,12 @@ async fn main() {
         registry.with(fmt_layer).init();
     }
     let log_reload_handle = reload::LogReloadHandle::new(filter_reload_handle);
+    // The `logging` RPC's live surface. Owns the category state *and* the
+    // reload handle, so what the RPC reports is what the node logs through.
+    let log_control = Arc::new(logcontrol::LiveLogControl::new(
+        log_reload_handle.clone(),
+        config.clone(),
+    ));
 
     // Drain config-load notes (Esplora ↔ txindex reconciliation,
     // prune auto-disable). These were collected before tracing was
@@ -2439,6 +2446,11 @@ async fn main() {
         config.coinstatsindex,
         config.txospenderindex,
         listener_status.clone(),
+        // Live `logging` control. The filter-reload handle is here, not in
+        // `node`, so the RPC reaches it through a trait -- and this is the one
+        // object holding both the category state the RPC reports and the
+        // filter the node logs through, so they cannot drift.
+        Some(log_control.clone() as Arc<dyn node::rpc::logging::LogControl>),
         // BIP 158 filter index: passed unconditionally because `node`'s
         // `block-filter-index` feature is always on in any workspace
         // build of `satd` (esplora-handlers / electrum-proto pull node
@@ -3544,7 +3556,7 @@ async fn main() {
         mempool: mempool.clone(),
         peer_manager: peer_manager.clone(),
         chain_state: chain_state.clone(),
-        log_filter: log_reload_handle,
+        log_control: log_control.clone(),
         addr_sub_registry: address_index_concrete.subscription_registry(),
         webhook: reorg_webhook_handle,
         rpc_auth: auth.clone(),

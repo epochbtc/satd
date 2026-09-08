@@ -7068,7 +7068,37 @@ fn skip_guidance(key: &str) -> Option<&'static str> {
 /// for (e.g. `qt`, `zmq`, `walletdb`, `leveldb`) — those are accepted
 /// but produce no directive, matching the spirit of Core where a
 /// category for an inactive subsystem simply yields no extra output.
-fn debug_category_target(category: &str) -> Option<&'static str> {
+/// Every Bitcoin Core `-debug` category satd can act on — that is, every one
+/// [`debug_category_target`] maps onto a real subsystem.
+///
+/// This is what the `logging` RPC lists. Core names about thirty; satd names
+/// the ones it can honestly answer for, because a category with no target is
+/// one satd could neither enable nor report on. Kept in sync with the match
+/// below by `debug_categories_all_map`.
+pub const DEBUG_CATEGORIES: &[&str] = &[
+    "addrman",
+    "bench",
+    "blockstorage",
+    "cmpctblock",
+    "coindb",
+    "estimatefee",
+    "http",
+    "i2p",
+    "leveldb",
+    "mempool",
+    "mempoolrej",
+    "net",
+    "proxy",
+    "prune",
+    "reindex",
+    "rpc",
+    "tor",
+    "txpackages",
+    "txreconciliation",
+    "validation",
+];
+
+pub(crate) fn debug_category_target(category: &str) -> Option<&'static str> {
     match category {
         "net" | "addrman" | "cmpctblock" | "txreconciliation" | "proxy" => Some("node::net"),
         "tor" | "i2p" => Some("node::net::tor"),
@@ -8164,6 +8194,41 @@ bind=127.0.0.1:9002
                 CliArgs::try_parse_from(kept).is_err(),
                 "{flag} must reach clap and be rejected"
             );
+        }
+    }
+
+    /// `DEBUG_CATEGORIES` is what the `logging` RPC lists, and
+    /// `debug_category_target` is what actually maps a category onto a
+    /// subsystem. A name in one and not the other is either a category the
+    /// RPC advertises and cannot enable, or one satd honours but never
+    /// mentions — both of which are the "reports something it did not derive"
+    /// defect this list exists to prevent.
+    #[test]
+    fn debug_categories_all_map() {
+        for cat in DEBUG_CATEGORIES {
+            assert!(
+                debug_category_target(cat).is_some(),
+                "{cat} is listed by `logging` but maps to no subsystem"
+            );
+        }
+        assert!(
+            DEBUG_CATEGORIES.windows(2).all(|w| w[0] < w[1]),
+            "the list must be sorted and free of duplicates"
+        );
+        // The reverse direction: every category the mapping honours must be
+        // listed. Core's full category set is the search space.
+        for cat in [
+            "addrman", "bench", "blockstorage", "cmpctblock", "coindb", "estimatefee", "http",
+            "i2p", "leveldb", "libevent", "lock", "mempool", "mempoolrej", "net", "prune",
+            "proxy", "qt", "rand", "reindex", "rpc", "scan", "selectcoins", "tor", "txpackages",
+            "txreconciliation", "validation", "walletdb", "zmq", "kernel", "privatebroadcast",
+        ] {
+            if debug_category_target(cat).is_some() {
+                assert!(
+                    DEBUG_CATEGORIES.contains(&cat),
+                    "{cat} maps to a subsystem but `logging` never lists it"
+                );
+            }
         }
     }
 

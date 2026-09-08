@@ -442,6 +442,10 @@ pub struct RpcContext {
     /// previous process wrote the marker during a successful flush; `false`
     /// on first boot or after a crash / timed-out shutdown.
     pub last_shutdown_clean: bool,
+    /// Live log-category control for the `logging` RPC. `None` in embedded
+    /// uses and tests that do not install a subscriber, where the RPC reports
+    /// an empty category set rather than inventing one.
+    pub log_control: Option<Arc<dyn crate::rpc::logging::LogControl>>,
     /// Pre-rendered effective-config view for the `getconfig` RPC.
     /// Computed once at startup (the server does not hot-reload config).
     /// Secret fields (passwords) are already redacted by the producer.
@@ -656,6 +660,9 @@ pub async fn start(
     coinstatsindex_enabled: bool,
     txospenderindex_enabled: bool,
     listener_status: Arc<ServerListenerStatus>,
+    // Live log-category control for the `logging` RPC. The filter-reload
+    // handle lives in the binary, so the RPC reaches it through a trait.
+    log_control: Option<Arc<dyn crate::rpc::logging::LogControl>>,
     #[cfg(feature = "block-filter-index")] blockfilterindex_enabled: bool,
     #[cfg(feature = "block-filter-index")] filter_index: Option<
         Arc<dyn node_filter_index::FilterIndex>,
@@ -688,6 +695,7 @@ pub async fn start(
         start_time: std::time::Instant::now(),
         last_shutdown_clean,
         effective_config,
+        log_control,
         mempool_history,
         address_index,
         address_index_enabled,
@@ -3376,54 +3384,52 @@ pub async fn start(
         }))
     })?;
 
-    module.register_method("logging", |params, _ctx, _extensions| {
-        // Core-compatible logging categories. All start enabled; callers can
-        // toggle them with include/exclude arrays. State is per-process
-        // (static) because satd logging is process-wide.
-        use std::sync::OnceLock;
-        static LOGGING_STATE: OnceLock<parking_lot::RwLock<std::collections::BTreeMap<String, bool>>> = OnceLock::new();
-        let state = LOGGING_STATE.get_or_init(|| {
-            let cats = [
-                "addrman", "bench", "blockstorage", "cmpctblock", "coindb",
-                "estimatefee", "http", "i2p", "ipc", "leveldb", "libevent",
-                "lock", "mempool", "mempoolrej", "net", "proxy", "prune",
-                "qt", "rand", "reindex", "rpc", "scan", "selectcoins",
-                "tor", "txpackages", "txreconciliation", "util", "validation",
-                "walletdb", "zmq",
-            ];
-            let map: std::collections::BTreeMap<String, bool> = cats
-                .iter()
-                .map(|c| (c.to_string(), true))
-                .collect();
-            parking_lot::RwLock::new(map)
-        });
-
+    module.register_method("logging", |params, ctx, _extensions| {
+        // Core reads and writes the logger's own category mask here, so the
+        // answer is the state that decides whether a line is emitted. satd's
+        // verbosity is a `tracing_subscriber` EnvFilter owned by the binary,
+        // reached through `LogControl`.
+        //
+        // This used to answer from a static map initialised to "everything
+        // on", which nothing else in the process read: toggling a category
+        // flipped a bit nobody consulted, and a node running with no `-debug`
+        // reported 30 categories enabled. The RPC exists to answer exactly the
+        // question it was getting wrong.
         let mut args = Args::new(&params);
         let include: Option<Vec<String>> = args.optional("include")?;
         let exclude: Option<Vec<String>> = args.optional("exclude")?;
         args.check()?;
 
-        if let Some(ref inc) = include {
-            let mut map = state.write();
-            for cat in inc {
-                if let Some(v) = map.get_mut(cat) {
-                    *v = true;
-                }
-            }
-        }
-        if let Some(ref exc) = exclude {
-            let mut map = state.write();
-            for cat in exc {
-                if let Some(v) = map.get_mut(cat) {
-                    *v = false;
-                }
-            }
+        let Some(control) = ctx.log_control.as_ref() else {
+            // No subscriber installed (embedded uses, some tests). Report no
+            // categories rather than a set this process cannot act on.
+            return Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(Default::default()));
+        };
+
+        if include.is_some() || exclude.is_some() {
+            control
+                .update(
+                    include.as_deref().unwrap_or(&[]),
+                    exclude.as_deref().unwrap_or(&[]),
+                )
+                .map_err(|unknown| {
+                    // Core's `EnableOrDisableLogCategories`.
+                    ErrorObjectOwned::owned(
+                        -8,
+                        format!("unknown logging category {unknown}"),
+                        None::<()>,
+                    )
+                })?;
         }
 
-        let map = state.read();
-        let obj: serde_json::Map<String, serde_json::Value> = map
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::json!(*v)))
+        // Core returns the categories in alphabetical order; `rpc_misc.py`
+        // asserts it, and a `BTreeMap` is what gives it here.
+        let obj: serde_json::Map<String, serde_json::Value> = control
+            .categories()
+            .into_iter()
+            .map(|(name, on)| (name.to_string(), serde_json::json!(on)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
             .collect();
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(obj))
     })?;

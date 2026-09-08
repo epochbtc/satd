@@ -2343,6 +2343,99 @@ fn test_getpeerinfo_reports_real_permissions() {
     miner.stop();
 }
 
+/// `logging` must answer from the filter the node actually logs through.
+/// It used to answer from a private static map initialised to "everything
+/// on" — so a node started with no `-debug` reported 30 categories enabled,
+/// and toggling one flipped a bit nothing else read.
+#[test]
+fn test_logging_reports_and_changes_the_real_filter() {
+    let mut node = TestNode::start(&[]);
+    let logging = |node: &mut TestNode, params: Vec<serde_json::Value>| -> serde_json::Value {
+        let r = node.rpc_call_with_params("logging", params).unwrap();
+        assert!(r["error"].is_null(), "logging: {r}");
+        r["result"].clone()
+    };
+
+    // A node with no -debug is logging no categories. The old map said all.
+    let r = logging(&mut node, vec![]);
+    let obj = r.as_object().expect("logging object");
+    assert!(!obj.is_empty(), "satd must name the categories it can act on");
+    assert!(
+        obj.values().all(|v| v == &serde_json::json!(false)),
+        "no -debug means no category is being logged: {r}"
+    );
+    // Only categories satd can actually act on, and in alphabetical order —
+    // `rpc_misc.py` asserts the ordering.
+    let keys: Vec<&String> = obj.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "categories must be alphabetical: {r}");
+    assert!(obj.contains_key("net") && obj.contains_key("mempool"), "{r}");
+    // Categories satd has no subsystem for are not advertised.
+    assert!(!obj.contains_key("qt"), "satd must not claim a category it cannot enable: {r}");
+
+    // Include turns one on, and only it.
+    let r = logging(&mut node, vec![serde_json::json!(["net"])]);
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+    assert_eq!(r["validation"], serde_json::json!(false), "{r}");
+    // ...and it is still on when read back, i.e. the change was applied to
+    // state the next call reads, not to a copy.
+    let r = logging(&mut node, vec![]);
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+
+    // Exclude turns it off again.
+    let r = logging(
+        &mut node,
+        vec![serde_json::json!([]), serde_json::json!(["net"])],
+    );
+    assert_eq!(r["net"], serde_json::json!(false), "{r}");
+
+    // "all" is Core's wildcard.
+    let r = logging(&mut node, vec![serde_json::json!(["all"])]);
+    assert!(
+        r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+        "{r}"
+    );
+    // Core evaluates include then exclude, so a category in both is excluded.
+    let r = logging(
+        &mut node,
+        vec![serde_json::json!(["all"]), serde_json::json!(["rpc"])],
+    );
+    assert_eq!(r["rpc"], serde_json::json!(false), "{r}");
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+
+    // An unknown category is Core's error, and changes nothing.
+    let before = logging(&mut node, vec![]);
+    let r = node
+        .rpc_call_with_params("logging", vec![serde_json::json!(["nosuchcategory"])])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "unknown logging category nosuchcategory");
+    assert_eq!(logging(&mut node, vec![]), before, "a rejected call must apply nothing");
+
+    node.stop();
+}
+
+/// A node started with `-debug=net` must say so, which is the half of the
+/// contract that proves the report is derived from the config rather than
+/// from a default.
+#[test]
+fn test_logging_reflects_the_debug_flag_at_startup() {
+    let mut node = TestNode::start(&["--debug=net"]);
+    let r = node.rpc_call("logging").unwrap();
+    let result = &r["result"];
+    assert_eq!(result["net"], serde_json::json!(true), "{r}");
+    assert_eq!(result["validation"], serde_json::json!(false), "{r}");
+    node.stop();
+
+    let mut node = TestNode::start(&["--debug=all", "--debugexclude=net"]);
+    let r = node.rpc_call("logging").unwrap();
+    let result = &r["result"];
+    assert_eq!(result["net"], serde_json::json!(false), "{r}");
+    assert_eq!(result["validation"], serde_json::json!(true), "{r}");
+    node.stop();
+}
+
 /// Core's idiom for "match this range and grant it nothing" is an `@` entry
 /// with an empty permission list. satd expanded it to the implicit set, so
 /// `getpeerinfo` now shows what was actually granted — nothing.
@@ -2382,12 +2475,17 @@ fn test_getrpcinfo() {
     node.stop();
 }
 
+/// Superseded by `test_logging_reports_and_changes_the_real_filter`, which
+/// asserts the value is derived. This one pinned `net == true` on a node
+/// started with no `-debug` — the fabricated answer, asserted as if it were
+/// the contract.
 #[test]
 fn test_logging() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("logging").unwrap();
     let result = &response["result"];
-    assert_eq!(result["net"], true);
+    assert!(result["net"].is_boolean(), "{response}");
+    assert_eq!(result["net"], false, "no -debug means net is not logged");
     node.stop();
 }
 

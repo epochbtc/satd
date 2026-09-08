@@ -258,15 +258,22 @@ pub fn get_index_info(
     let mut top = serde_json::Map::new();
     top.insert("address".into(), Value::Object(address));
 
-    // txindex sibling — Core's `getindexinfo("txindex")` gate.
-    // `has_txindex()` tells us the runtime flag is set (`-txindex`);
-    // satd writes txindex entries inline during `connect_block`, so as
-    // long as the node is running with txindex enabled the index is
-    // current for every block connected during this session.  Report
-    // `synced: true` whenever the flag is on — the on-disk completeness
-    // marker (`tx_index_complete`) captures the historical-backfill
-    // state, but Core's test framework polls this field as a readiness
-    // gate and satd has no background txindex builder to flip it.
+    // txindex sibling — the same value `getindexinfo` reports, deliberately.
+    //
+    // `synced` is the runtime flag, not `tx_index_complete()`, and that is a
+    // decision rather than an oversight: satd writes txindex entries inline
+    // during `connect_block`, so with the flag on the index is current for
+    // every block this node connects, but the on-disk completeness marker
+    // stays false on a datadir first synced *without* `-txindex`. Core has a
+    // background index builder that eventually flips its equivalent; satd has
+    // none — `backfillindex` covers the address, silent-payment and filter
+    // indexes, not this one. Reporting the strict predicate would therefore
+    // leave `synced` false forever on such a datadir, and Core's documented
+    // pattern (poll `synced`, then query) would hang rather than fail (#649).
+    //
+    // The honest summary is "this node is writing txindex entries", which is
+    // what the flag says. Recorded in CORE_DIFFERENCES.md; a txindex backfill
+    // is what would let this become the completeness marker.
     if chain.store_ref().has_txindex() {
         let mut txi = serde_json::Map::new();
         txi.insert("synced".into(), json!(true));

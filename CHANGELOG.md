@@ -85,6 +85,12 @@ item below is (or will be) written up in full in the in-development
 - `getmemoryinfo` reported the process RSS as the secure-allocator pool's
   `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
   no secure allocator, so the pool is empty and the numbers are zero (#667).
+- `logging` reported from a static map initialised to "everything on" that
+  nothing else in the process read: a node running with no `-debug` claimed 30
+  categories enabled, and toggling one flipped a bit that never reached the log
+  filter. It now reads and writes the node's live `EnvFilter`, lists the
+  categories satd can actually act on, and answers Core's
+  `-8 unknown logging category <cat>` (#667).
 - `estimaterawfee` returned the same feerate for every horizon with `decay: 0`
   — not a value Core's estimator can produce — and zeroed buckets, and
   discarded `threshold` entirely. It now omits a horizon that does not track
