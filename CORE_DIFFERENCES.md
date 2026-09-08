@@ -551,7 +551,13 @@ silently returning an empty or wrong answer.
 - **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
   actually granted, in Core's order. `bloomfilter` never appears: satd accepts
   the name in a `-whitelist` entry but has no flag for it, so reporting it
-  would claim a grant that was never recorded.
+  would claim a grant that was never recorded. Two divergences remain in *what*
+  is granted, both pre-existing and tracked separately: satd applies
+  `-whitelist` to outbound peers, where Core consults its outgoing list only
+  for `out@` entries on manual connections; and an inbound Tor peer inherits a
+  loopback `-whitelist` entry, because satd's hidden service targets the same
+  listener as clearnet while Core binds a separate onion port and skips
+  whitelist matching on it.
 
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and

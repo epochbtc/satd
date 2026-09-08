@@ -75,7 +75,13 @@ item below is (or will be) written up in full in the in-development
 - `getpeerinfo.permissions` was hardcoded `[]` while each peer's permissions
   were populated all along, so a `-whitelist`ed peer reported no grants at all.
   It now reports Core's `ToStrings` of the real flags (#667). `noban` also
-  implies `download`, as Core's `NetPermissionFlags::NoBan` does.
+  carries `download`, as Core's `NetPermissionFlags::NoBan` does — a reporting
+  change, since the upload-budget check already honoured either flag.
+- **Breaking:** two `-whitelist` grants were wider than Core's, and are
+  narrowed to match: a bare `-whitelist=<subnet>` no longer grants `addr`, and
+  `-whitelist=@<subnet>` — Core's "match this range, grant nothing" idiom —
+  grants nothing instead of the implicit set, which had been silently handing
+  out `noban` (#667).
 - `getmemoryinfo` reported the process RSS as the secure-allocator pool's
   `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
   no secure allocator, so the pool is empty and the numbers are zero (#667).

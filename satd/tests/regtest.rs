@@ -2312,23 +2312,62 @@ fn test_getpeerinfo_reports_real_permissions() {
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    // `-whitelist=<subnet>` with no explicit list is Core's implicit set.
+    // Core's implicit set for a bare `-whitelist=<subnet>`, in Core's order.
+    // `p2p_permissions.py` asserts this list literally.
     assert_eq!(
         perms,
-        ["noban", "relay", "mempool", "download", "addr"],
+        ["noban", "relay", "mempool", "download"],
         "whitelisted peer permissions: {info}"
     );
 
     // The other side took no whitelist, so its view is genuinely empty.
+    // Polled, not skipped-if-absent: an `if let Some(..)` here passed while
+    // asserting nothing whenever the outbound peer had not been recorded yet.
+    poll_until(
+        || {
+            get_rpc_u64(&peer, "getconnectioncount").unwrap_or(0) >= 1
+        },
+        test_timeout(30),
+        "the dialling node never recorded its peer",
+    );
     let info = peer.rpc_call("getpeerinfo").unwrap();
     let peers = info["result"].as_array().expect("getpeerinfo array");
-    if let Some(p) = peers.first() {
-        assert_eq!(
-            p["permissions"].as_array().map(Vec::len),
-            Some(0),
-            "an un-whitelisted peer has no permissions: {info}"
-        );
-    }
+    let p = peers.first().expect("the dialling node has a peer");
+    assert_eq!(
+        p["permissions"].as_array().map(Vec::len),
+        Some(0),
+        "an un-whitelisted peer has no permissions: {info}"
+    );
+
+    peer.stop();
+    miner.stop();
+}
+
+/// Core's idiom for "match this range and grant it nothing" is an `@` entry
+/// with an empty permission list. satd expanded it to the implicit set, so
+/// `getpeerinfo` now shows what was actually granted — nothing.
+#[test]
+fn test_getpeerinfo_empty_whitelist_grant_is_empty() {
+    let miner_p2p_port = find_available_port();
+    let mut miner = TestNode::start(&[
+        &format!("--port={}", miner_p2p_port),
+        "--whitelist=@127.0.0.1",
+    ]);
+    let mut peer = TestNode::start(&[&format!("--connect=127.0.0.1:{}", miner_p2p_port)]);
+
+    poll_until(
+        || get_rpc_u64(&miner, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the peer never connected",
+    );
+
+    let info = miner.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    assert_eq!(
+        peers[0]["permissions"].as_array().map(Vec::len),
+        Some(0),
+        "`@<subnet>` must grant nothing, not the implicit set: {info}"
+    );
 
     peer.stop();
     miner.stop();
