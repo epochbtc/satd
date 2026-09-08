@@ -135,14 +135,15 @@ FROM chef AS builder
 # #2).
 COPY --from=planner /src/recipe.json recipe.json
 COPY satd-events-proto/proto satd-events-proto/proto
-RUN cargo chef cook --release --locked --bin satd --bin sat-cli --recipe-path recipe.json
+RUN cargo chef cook --release --locked --bin satd --bin sat-cli --bin sat-tui --recipe-path recipe.json
 
 # Compile first-party crates on top of the cooked dependency artifacts already
 # sitting in target/.
 COPY . .
-RUN cargo build --release --locked --bin satd --bin sat-cli \
+RUN cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui \
     && install -Dm755 target/release/satd /out/satd \
-    && install -Dm755 target/release/sat-cli /out/sat-cli
+    && install -Dm755 target/release/sat-cli /out/sat-cli \
+    && install -Dm755 target/release/sat-tui /out/sat-tui
 
 
 FROM docker.io/library/debian:${DEBIAN_VERSION}-slim AS runtime
@@ -171,6 +172,12 @@ RUN groupadd --system --gid ${SATD_GID} satd \
 
 COPY --from=builder /out/satd /usr/local/bin/satd
 COPY --from=builder /out/sat-cli /usr/local/bin/sat-cli
+# sat-tui ships so `docker exec -it satd sat-tui` works against a running
+# container without a second install. It is also what the Umbrel and
+# StartOS packages expose as their terminal, so it has to be in the image
+# those packages consume rather than bolted on per package.
+COPY --from=builder /out/sat-tui /usr/local/bin/sat-tui
+COPY contrib/docker/satd-healthcheck /usr/local/bin/satd-healthcheck
 
 USER satd
 WORKDIR /var/lib/satd
@@ -180,6 +187,21 @@ VOLUME ["/var/lib/satd"]
 # `-p` mappings; we don't expose them by default to avoid surprising
 # operators who run a single network at a time.
 EXPOSE 8332 8333
+
+# Liveness, not readiness, by default: the probe cannot see the daemon's
+# credentials or its network flags, so it reports healthy as soon as the RPC
+# listener answers at all (a 401 included). Point it at the readiness
+# endpoint for a stricter gate — which is what contrib/stack does, and what
+# `depends_on: condition: service_healthy` needs to mean anything:
+#   -e SATD_HEALTH_URL=http://127.0.0.1:9332/readyz   (with -metricsport=9332)
+# Non-mainnet containers set -e SATD_RPCPORT=<port>; see the script header.
+#
+# start-period is 10 minutes because opening a mainnet chainstate is not
+# instant and failures inside the window do not count against the retries.
+# A node that is reindexing stays "starting" far longer than that; raise it
+# with --health-start-period if you gate anything on the status.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10m --retries=3 \
+    CMD ["/usr/local/bin/satd-healthcheck"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/satd"]
 CMD ["--datadir=/var/lib/satd"]

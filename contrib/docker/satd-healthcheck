@@ -1,0 +1,107 @@
+#!/bin/bash
+# satd-healthcheck — Docker HEALTHCHECK probe for the satd runtime image.
+#
+# "Healthy" means the node is answering on a surface a client would use.
+# Two probe modes, in order:
+#
+#   1. SATD_HEALTH_URL — an http:// URL to GET. Set this to satd's
+#      readiness endpoint when the metrics listener is on, which is what
+#      contrib/stack does:
+#        SATD_HEALTH_URL=http://127.0.0.1:9332/readyz
+#      /readyz is satd's real readiness gate: it reports not-ready until
+#      the chainstate is loaded and every configured listener is bound.
+#      Only a 2xx counts, so a node that is still starting reads as
+#      unhealthy rather than ready.
+#
+#   2. JSON-RPC liveness on SATD_RPCPORT (default 8332). The probe sends a
+#      getblockchaininfo and treats ANY HTTP status line as healthy —
+#      including 401. The point is deliberate: this mode cannot see the
+#      daemon's credentials (the container's CMD may set -rpcuser, or the
+#      cookie may be unreadable), so authenticating is not something it can
+#      do reliably. A 401 still proves the RPC listener is bound and
+#      serving, which is the strongest claim this mode can honestly make.
+#      Use mode 1 when you want readiness rather than liveness.
+#
+# Non-mainnet containers must set SATD_RPCPORT (18332 testnet, 38332
+# signet, 18443 regtest) or SATD_HEALTH_URL, since the probe cannot see
+# the network flags passed to the daemon.
+#
+# No curl/wget dependency: the runtime image is deliberately thin, so the
+# probe speaks HTTP over bash's /dev/tcp.
+#
+# Note on request construction: every request string is assembled with
+# ANSI-C quoting rather than `$(printf ...)`. Command substitution strips
+# trailing newlines, which would eat the blank line that terminates a
+# bodyless GET — the server then waits for the rest of the request until
+# the probe's own read timeout fires and a healthy node reads as down.
+
+set -u
+
+readonly TIMEOUT="${SATD_HEALTH_TIMEOUT:-5}"
+readonly CRLF=$'\r\n'
+
+# Send `payload` to host:port; echo the response's first line. Non-zero if
+# the connection could not be established or nothing came back in time.
+http_probe() {
+    local host="$1" port="$2" payload="$3"
+    # The redirection's own failure message is not useful here (the caller
+    # prints a better one), and `2>/dev/null` on the exec itself does not
+    # suppress it — the diagnostic is emitted by the shell, not the command.
+    { exec 3<>"/dev/tcp/${host}/${port}"; } 2>/dev/null || return 1
+    local status_line=""
+    if printf '%s' "$payload" >&3; then
+        # `read -t` bounds the wait on a listener that accepts but never
+        # answers, which is otherwise indistinguishable from a healthy one.
+        IFS= read -r -t "$TIMEOUT" status_line <&3
+    fi
+    exec 3<&- 2>/dev/null
+    exec 3>&- 2>/dev/null
+    [[ -n "$status_line" ]] || return 1
+    printf '%s\n' "${status_line%$'\r'}"
+}
+
+if [[ -n "${SATD_HEALTH_URL:-}" ]]; then
+    # Parse http://host:port/path — no https here on purpose. This probe
+    # runs inside the container against a loopback listener, and bash has
+    # no TLS. TLS-terminated surfaces are probed from outside the container
+    # (contrib/stack/tests/smoke.sh does exactly that).
+    url="${SATD_HEALTH_URL#http://}"
+    hostport="${url%%/*}"
+    if [[ "$url" == */* ]]; then
+        path="/${url#*/}"
+    else
+        path="/"
+    fi
+    host="${hostport%%:*}"
+    port="${hostport##*:}"
+    [[ "$port" == "$host" ]] && port=80
+
+    request="GET ${path} HTTP/1.1${CRLF}Host: ${hostport}${CRLF}Connection: close${CRLF}User-Agent: satd-healthcheck${CRLF}${CRLF}"
+    if ! status_line=$(http_probe "$host" "$port" "$request"); then
+        echo "satd-healthcheck: no response from $SATD_HEALTH_URL" >&2
+        exit 1
+    fi
+    # Readiness endpoint: only 2xx counts. /readyz answers 503 while the
+    # node is still starting, and calling that healthy defeats the point.
+    if [[ "$status_line" == *" 2"[0-9][0-9]* ]]; then
+        exit 0
+    fi
+    echo "satd-healthcheck: $SATD_HEALTH_URL -> $status_line" >&2
+    exit 1
+fi
+
+host="${SATD_RPCCONNECT:-127.0.0.1}"
+port="${SATD_RPCPORT:-8332}"
+body='{"jsonrpc":"2.0","id":"healthcheck","method":"getblockchaininfo","params":[]}'
+request="POST / HTTP/1.1${CRLF}Host: ${host}:${port}${CRLF}Content-Type: application/json${CRLF}Content-Length: ${#body}${CRLF}Connection: close${CRLF}User-Agent: satd-healthcheck${CRLF}${CRLF}${body}"
+
+if ! status_line=$(http_probe "$host" "$port" "$request"); then
+    echo "satd-healthcheck: RPC listener ${host}:${port} not answering" >&2
+    exit 1
+fi
+# Any HTTP status line means the listener is bound and serving. See header.
+if [[ "$status_line" == HTTP/* ]]; then
+    exit 0
+fi
+echo "satd-healthcheck: ${host}:${port} -> $status_line" >&2
+exit 1
