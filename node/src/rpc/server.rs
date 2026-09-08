@@ -2336,7 +2336,7 @@ pub async fn start(
             }
         };
         // Type check arg 1 (optional): must be number or null
-        let _threshold: Option<f64> = if args.len() > 1 {
+        let threshold: Option<f64> = if args.len() > 1 {
             match &args[1] {
                 serde_json::Value::Number(n) => n.as_f64(),
                 serde_json::Value::Null => None,
@@ -2364,34 +2364,53 @@ pub async fn start(
             ));
         }
 
-        // Use the same fee estimation as estimatesmartfee
+        // Core validates the threshold it is given; satd used to bind it to
+        // `_threshold` and drop it, so an out-of-range value was accepted in
+        // silence.
+        if let Some(t) = threshold
+            && !(0.0..=1.0).contains(&t)
+        {
+            return Err(ErrorObjectOwned::owned(-8, "Invalid threshold", None::<()>));
+        }
+
+        // Core's `HighestTargetTracked` per horizon (`policy/fees.h`): a
+        // horizon that does not track `conf_target` is omitted from the
+        // result entirely, rather than answered with a number it cannot
+        // support. satd keeps the same gate, so `estimaterawfee 500` returns
+        // only `long` here as it does in Core.
+        const HORIZONS: [(&str, u32); 3] = [("short", 12), ("medium", 48), ("long", 1008)];
+
+        // Deliberately not floored to `minrelaytxfee` the way
+        // `estimatesmartfee` is: `estimaterawfee` reports what the *estimator*
+        // has, and a node with fewer than ten fee samples has nothing. Core
+        // says so in the same words rather than quoting the relay floor.
         let unit = default_unit();
-        let floor_sat_per_kvb = ctx.mempool.info().min_fee_rate.max(1_000);
-        let sat_per_kvb = ctx.fee_estimator.estimate_fee(conf_target)
-            .unwrap_or(floor_sat_per_kvb);
-        let mut response = serde_json::json!({
-            "short": {
-                "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
-                "decay": 0,
-                "scale": 1,
-                "pass": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-                "fail": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-            },
-            "medium": {
-                "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
-                "decay": 0,
-                "scale": 1,
-                "pass": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-                "fail": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-            },
-            "long": {
-                "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
-                "decay": 0,
-                "scale": 1,
-                "pass": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-                "fail": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-            },
-        });
+        let estimate = ctx.fee_estimator.estimate_fee(conf_target);
+
+        // satd's estimator is not Core's: it keeps no per-horizon bucket
+        // statistics, so there is no `decay`, no `scale`, and no `pass` /
+        // `fail` bucket to report. Those five fields used to be emitted as
+        // zeros -- and `decay: 0` is not a value Core's estimator can ever
+        // produce, so a client reading it was reading an impossibility. They
+        // are omitted now, which is what Core itself does with a field it has
+        // no data for. See CORE_DIFFERENCES.md.
+        let mut response = serde_json::Map::new();
+        for (name, highest_tracked) in HORIZONS {
+            if conf_target > highest_tracked {
+                continue;
+            }
+            let horizon = match estimate {
+                Some(sat_per_kvb) => serde_json::json!({
+                    "feerate": format_feerate_sat_per_kvb(sat_per_kvb, unit),
+                }),
+                // Core's shape for a horizon with nothing to say.
+                None => serde_json::json!({
+                    "errors": ["Insufficient data or no feerate found which meets threshold"],
+                }),
+            };
+            response.insert(name.to_string(), horizon);
+        }
+        let mut response = serde_json::Value::Object(response);
         annotate_units(&mut response, unit);
         Ok::<_, ErrorObjectOwned>(response)
     })?;
@@ -3310,32 +3329,26 @@ pub async fn start(
         let mode_str = mode.as_deref().unwrap_or("stats");
         match mode_str {
             "stats" => {
-                // Read process memory from /proc/self/status on Linux
-                let rss = std::fs::read_to_string("/proc/self/status")
-                    .ok()
-                    .and_then(|s| {
-                        s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
-                            l.split_whitespace()
-                                .nth(1)
-                                .and_then(|v| v.parse::<u64>().ok())
-                        })
-                    })
-                    .unwrap_or(0)
-                    * 1024; // kB to bytes
-                // The test asserts used > 0, free > 0, chunks_used > 0,
-                // chunks_free > 0, and used + free == total. Use the RSS
-                // as "used" and derive plausible values for the rest.
-                let used = rss.max(1);
-                let free = 1024u64; // At least 1 kB free
-                let total = used + free;
+                // Core's `locked` object is not process memory: it describes
+                // the *secure allocator* arena (`LockedPoolManager`), the
+                // mlock'd pool the wallet keeps private keys in. satd has no
+                // secure allocator and no wallet, so the pool is genuinely
+                // empty and every field is genuinely zero.
+                //
+                // This used to report the process RSS as `used` with `free`,
+                // `total` and both `chunks_*` invented around it — the comment
+                // said outright that the values were chosen to satisfy a
+                // test's assertions. A caller reading `used` got a number that
+                // described something else entirely, on the one RPC whose
+                // whole purpose is to say how much of that pool is in use.
                 Ok::<_, ErrorObjectOwned>(serde_json::json!({
                     "locked": {
-                        "used": used,
-                        "free": free,
-                        "total": total,
+                        "used": 0,
+                        "free": 0,
+                        "total": 0,
                         "locked": 0,
-                        "chunks_used": 1,
-                        "chunks_free": 1,
+                        "chunks_used": 0,
+                        "chunks_free": 0,
                     }
                 }))
             }

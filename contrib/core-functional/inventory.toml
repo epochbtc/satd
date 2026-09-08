@@ -1029,7 +1029,7 @@ note = "measured: scantxoutset rejects pkh() with -5. satd implements the key-fr
 file = "rpc_setban.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getpeerinfo omits permissions. Follow-up: per-peer permission flags in getpeerinfo"
+note = "the getpeerinfo.permissions blocker is closed (#667): the field reports the real flags now. Unmeasured since — the test also wants assert_debug_log('dropped (banned)') and addnode onetry. Re-measure with --candidate before flipping"
 
 [[test]]
 file = "rpc_signer.py"

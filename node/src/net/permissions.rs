@@ -82,6 +82,36 @@ impl NetPermissions {
         self.relay || self.force_relay
     }
 
+    /// Core's `NetPermissions::ToStrings` (`src/net_permissions.cpp`), which
+    /// is what `getpeerinfo.permissions` reports. The order is Core's, not
+    /// alphabetical, and `rpc_setban.py` reads the array by membership.
+    ///
+    /// `bloomfilter` is absent because satd has no flag for it: `parse_list`
+    /// accepts the name and drops it, so reporting it would claim a grant that
+    /// was never recorded.
+    pub fn to_strings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.noban {
+            out.push("noban");
+        }
+        if self.force_relay {
+            out.push("forcerelay");
+        }
+        if self.relay {
+            out.push("relay");
+        }
+        if self.mempool {
+            out.push("mempool");
+        }
+        if self.download {
+            out.push("download");
+        }
+        if self.addr {
+            out.push("addr");
+        }
+        out
+    }
+
     /// Parse a comma-separated permission list (`noban,relay,...` or
     /// `all`). An empty string yields the implicit default set.
     pub fn parse_list(s: &str) -> Result<Self, String> {
@@ -94,7 +124,14 @@ impl NetPermissions {
             match tok.trim().to_ascii_lowercase().as_str() {
                 "" => {}
                 "all" => p = p.union(Self::all()),
-                "noban" => p.noban = true,
+                // Core's `NetPermissionFlags::NoBan` is `(1U << 4) | Download`
+                // -- the grant *is* the pair, not two names that happen to be
+                // given together, so `noban` alone also lifts the
+                // `-maxuploadtarget` block-serving limit.
+                "noban" => {
+                    p.noban = true;
+                    p.download = true;
+                }
                 "relay" => p.relay = true,
                 "forcerelay" => {
                     p.force_relay = true;
@@ -224,6 +261,36 @@ mod tests {
     fn forcerelay_implies_relay() {
         let p = NetPermissions::parse_list("forcerelay").unwrap();
         assert!(p.force_relay && p.relay && p.relays_txes());
+    }
+
+    /// Core's `NetPermissionFlags::NoBan` is `(1U << 4) | Download`: the two
+    /// are one grant, so `noban` also lifts the block-serving limit.
+    #[test]
+    fn noban_implies_download() {
+        let p = NetPermissions::parse_list("noban").unwrap();
+        assert!(p.noban && p.download);
+    }
+
+    /// The array `getpeerinfo.permissions` reports. The order is Core's
+    /// `ToStrings` order, not alphabetical.
+    #[test]
+    fn to_strings_matches_cores_order() {
+        assert_eq!(NetPermissions::NONE.to_strings(), Vec::<&str>::new());
+        assert_eq!(
+            NetPermissions::all().to_strings(),
+            ["noban", "forcerelay", "relay", "mempool", "download", "addr"]
+        );
+        assert_eq!(
+            NetPermissions::implicit().to_strings(),
+            ["noban", "relay", "mempool", "download", "addr"]
+        );
+        // The one `rpc_setban.py` reads.
+        assert!(
+            NetPermissions::parse_list("noban")
+                .unwrap()
+                .to_strings()
+                .contains(&"noban")
+        );
     }
 
     #[test]

@@ -528,6 +528,31 @@ silently returning an empty or wrong answer.
   one that is never enforced is the failure mode worth avoiding: the caller
   would get no protection and no warning.
 
+- **`estimaterawfee`** — Core's fee estimator keeps three horizons of decaying
+  bucket statistics; satd's keeps a rolling sample of recent block feerates.
+  The `feerate` field and the per-horizon gate are faithful: a horizon that
+  does not track the requested `conf_target` is omitted (short tracks 12
+  blocks, medium 48, long 1008), and a node with too few samples answers
+  Core's `errors: ["Insufficient data or no feerate found which meets
+  threshold"]`. The fields that describe Core's buckets — `decay`, `scale`,
+  `pass`, `fail` — have no satd counterpart and are **omitted** rather than
+  reported as zeros. Because satd has one estimator rather than three, the
+  horizons that do answer a given `conf_target` all report the same feerate.
+  `threshold` is range-checked as Core does but does not select a confidence
+  level, there being no bucket distribution to select from.
+
+- **`getmemoryinfo`** — Core's `locked` object describes the secure-allocator
+  arena (`LockedPoolManager`), the mlock'd pool the wallet keeps private keys
+  in. satd has no secure allocator and no wallet, so the pool is empty and
+  every field is `0`. The object is emitted in Core's shape rather than
+  omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
+  refused with Core's message, as Core itself does off glibc.
+
+- **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
+  actually granted, in Core's order. `bloomfilter` never appears: satd accepts
+  the name in a `-whitelist` entry but has no flag for it, so reporting it
+  would claim a grant that was never recorded.
+
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
   argument descriptions. Two things follow from that, both deliberate:

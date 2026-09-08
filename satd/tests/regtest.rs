@@ -2215,7 +2215,123 @@ fn test_getmemoryinfo() {
     let response = node.rpc_call("getmemoryinfo").unwrap();
     let result = &response["result"];
     assert!(result["locked"].is_object());
+    // Core's `locked` describes the secure-allocator arena, not process
+    // memory. satd has no secure allocator, so the pool is empty and the
+    // numbers are zero — not the process RSS with a `free` invented around it
+    // to keep `used + free == total` true.
+    let locked = &result["locked"];
+    for field in ["used", "free", "total", "locked", "chunks_used", "chunks_free"] {
+        assert_eq!(locked[field], serde_json::json!(0), "locked.{field}: {result}");
+    }
+    // Core's two argument errors.
+    let r = node
+        .rpc_call_with_params("getmemoryinfo", vec![serde_json::json!("mallocinfo")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8);
+    let r = node
+        .rpc_call_with_params("getmemoryinfo", vec![serde_json::json!("foobar")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8);
+    assert_eq!(r["error"]["message"], "unknown mode foobar");
     node.stop();
+}
+
+/// `estimaterawfee` reports what the estimator has. A fresh regtest node has
+/// no fee samples, so Core's answer is the "insufficient data" error object,
+/// not a feerate — and never `decay: 0`, which Core's estimator cannot
+/// produce.
+#[test]
+fn test_estimaterawfee_reports_only_what_it_has() {
+    let mut node = TestNode::start(&[]);
+
+    let raw = |node: &mut TestNode, target: i64| -> serde_json::Value {
+        let r = node
+            .rpc_call_with_params("estimaterawfee", vec![serde_json::json!(target)])
+            .unwrap();
+        assert!(r["error"].is_null(), "estimaterawfee {target}: {r}");
+        r["result"].clone()
+    };
+
+    // A horizon that does not track the target is omitted entirely, as in
+    // Core: short tracks 12 blocks, medium 48, long 1008.
+    let r = raw(&mut node, 6);
+    for h in ["short", "medium", "long"] {
+        assert!(r[h].is_object(), "target 6 must reach every horizon: {r}");
+    }
+    let r = raw(&mut node, 100);
+    assert!(r["short"].is_null(), "short does not track 100: {r}");
+    assert!(r["medium"].is_null(), "medium does not track 100: {r}");
+    assert!(r["long"].is_object(), "long tracks 100: {r}");
+
+    // No samples yet, so every horizon says so rather than quoting a number.
+    let long = &raw(&mut node, 6)["long"];
+    assert!(
+        long["errors"].is_array(),
+        "a node with no fee history reports insufficient data: {long}"
+    );
+    // And the fields satd has no data for are absent, not zero.
+    for field in ["decay", "scale", "pass", "fail"] {
+        assert!(long[field].is_null(), "long.{field} must be omitted: {long}");
+    }
+
+    // The threshold is validated rather than discarded.
+    let r = node
+        .rpc_call_with_params(
+            "estimaterawfee",
+            vec![serde_json::json!(6), serde_json::json!(1.5)],
+        )
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "Invalid threshold");
+    node.stop();
+}
+
+/// `getpeerinfo.permissions` was hardcoded `[]` while the peer's permissions
+/// were populated all along. An empty array reads as "nothing granted", which
+/// is the opposite claim for a `-whitelist`ed peer.
+#[test]
+fn test_getpeerinfo_reports_real_permissions() {
+    let miner_p2p_port = find_available_port();
+    let mut miner = TestNode::start(&[
+        &format!("--port={}", miner_p2p_port),
+        "--whitelist=127.0.0.1",
+    ]);
+    let mut peer = TestNode::start(&[&format!("--connect=127.0.0.1:{}", miner_p2p_port)]);
+
+    poll_until(
+        || get_rpc_u64(&miner, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the whitelisted peer never connected",
+    );
+
+    let info = miner.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    let perms: Vec<String> = peers[0]["permissions"]
+        .as_array()
+        .expect("permissions array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    // `-whitelist=<subnet>` with no explicit list is Core's implicit set.
+    assert_eq!(
+        perms,
+        ["noban", "relay", "mempool", "download", "addr"],
+        "whitelisted peer permissions: {info}"
+    );
+
+    // The other side took no whitelist, so its view is genuinely empty.
+    let info = peer.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    if let Some(p) = peers.first() {
+        assert_eq!(
+            p["permissions"].as_array().map(Vec::len),
+            Some(0),
+            "an un-whitelisted peer has no permissions: {info}"
+        );
+    }
+
+    peer.stop();
+    miner.stop();
 }
 
 #[test]

@@ -72,6 +72,20 @@ item below is (or will be) written up in full in the in-development
   left its parent's ephemeral dust unspent, burying the real reason. It now
   reports `missing-ephemeral-spends`, and the package result is `unspent-dust`
   rather than `transaction failed`, as Core does (#673).
+- `getpeerinfo.permissions` was hardcoded `[]` while each peer's permissions
+  were populated all along, so a `-whitelist`ed peer reported no grants at all.
+  It now reports Core's `ToStrings` of the real flags (#667). `noban` also
+  implies `download`, as Core's `NetPermissionFlags::NoBan` does.
+- `getmemoryinfo` reported the process RSS as the secure-allocator pool's
+  `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
+  no secure allocator, so the pool is empty and the numbers are zero (#667).
+- `estimaterawfee` returned the same feerate for every horizon with `decay: 0`
+  — not a value Core's estimator can produce — and zeroed buckets, and
+  discarded `threshold` entirely. It now omits a horizon that does not track
+  the target, omits the bucket fields satd has no data for, answers Core's
+  "insufficient data" error when the estimator has none, and range-checks
+  `threshold` (#667).
+
 - `-connect=0` was parsed as the peer address `0`, so the node dialled
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling

@@ -437,7 +437,12 @@ impl PeerInfo {
             "presynced_headers": -1,
             "synced_headers": -1,
             "synced_blocks": -1,
-            "permissions": [],
+            // Core's `NetPermissions::ToStrings` of the flags actually
+            // granted. This was hardcoded `[]` while `self.permissions` was
+            // populated all along -- and an empty array reads as "no
+            // permissions granted", not "not implemented", which is the
+            // opposite claim for a `-whitelist`ed peer.
+            "permissions": self.permissions.to_strings(),
             "addr_processed": 0,
             "addr_rate_limited": 0,
             // Core withholds address relay from block-relay-only peers --
