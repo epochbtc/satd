@@ -14364,20 +14364,38 @@ fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
         "a transaction absent from the named block was proven from it: {wrong_block}"
     );
 
-    // A corrupted proof must not verify. Flipping a hex digit inside the body
-    // leaves the length and framing intact, so this exercises the verification
-    // rather than the decode.
-    let mut corrupt: Vec<char> = proof_hex.chars().collect();
-    let mid = corrupt.len() / 2;
-    corrupt[mid] = if corrupt[mid] == 'a' { 'b' } else { 'a' };
-    let corrupt: String = corrupt.into_iter().collect();
-    let bad = node
-        .rpc_call_with_params("verifytxoutproof", vec![json!(corrupt)])
-        .unwrap();
-    let verified_txids = bad["result"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    assert!(
-        !bad["error"].is_null() || !verified_txids.contains(&json!(txid)),
-        "a corrupted proof still verified the transaction: {bad}"
-    );
+    // Two ways of corrupting the proof, each isolating one of the two things
+    // verification has to do. Both flip a single hex digit, so the length and
+    // framing stay intact and it is the verification being exercised, not the
+    // decode.
+    //
+    // A merkle block is an 80-byte header, then the transaction count, then
+    // the hash list and flag bytes -- so the first 160 hex characters are the
+    // header, of which characters 72..136 are the merkle root.
+    let flip = |hex: &str, at: usize| -> String {
+        let mut c: Vec<char> = hex.chars().collect();
+        c[at] = if c[at] == 'a' { 'b' } else { 'a' };
+        c.into_iter().collect()
+    };
+    let proves_nothing = |node: &TestNode, hex: String, what: &str| {
+        let resp = node
+            .rpc_call_with_params("verifytxoutproof", vec![json!(hex)])
+            .unwrap();
+        let proved = resp["result"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            !resp["error"].is_null() || !proved.contains(&json!(txid)),
+            "{what} still verified the transaction: {resp}"
+        );
+    };
+
+    // (1) The header is altered outside the merkle root, so the tree still
+    // checks out and the transaction is still "in" it -- but the header is not
+    // one this node has ever seen. A proof is only a proof against a block on
+    // our chain; without that check this is a proof of nothing.
+    proves_nothing(&node, flip(proof_hex, 2), "a proof against an unknown header");
+
+    // (2) The hash list is altered, so the path no longer reconstructs the
+    // root the header commits to.
+    proves_nothing(&node, flip(proof_hex, 180), "a proof with a corrupted merkle path");
     node.stop();
 }
