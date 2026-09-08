@@ -357,7 +357,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Create an unsigned raw transaction from specified inputs and outputs. Amounts in BTC.")]
     fn create_transaction(&self, Parameters(p): Parameters<CreateTransactionParams>) -> String {
-        tools::construction::create_transaction(&p.inputs, &p.outputs, p.locktime)
+        tools::construction::create_transaction(&self.ctx, &p.inputs, &p.outputs, p.locktime)
     }
 
     #[tool(description = "Sign a raw transaction with provided private keys (WIF format). Returns the signed hex and completion status.")]

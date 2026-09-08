@@ -504,7 +504,8 @@ mod construction {
         let outputs = serde_json::json!({
             "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01
         });
-        let result = cst::create_transaction(&inputs, &outputs, None);
+        let (ctx, _dir) = make_test_ctx();
+        let result = cst::create_transaction(&ctx, &inputs, &outputs, None);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Should return hex string of the unsigned tx
         assert!(json.is_string() || json["error"].is_string());
@@ -514,7 +515,8 @@ mod construction {
     fn test_create_transaction_invalid_inputs() {
         let inputs = serde_json::json!("not an array");
         let outputs = serde_json::json!({});
-        let result = cst::create_transaction(&inputs, &outputs, None);
+        let (ctx, _dir) = make_test_ctx();
+        let result = cst::create_transaction(&ctx, &inputs, &outputs, None);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }

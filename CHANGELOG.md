@@ -191,6 +191,13 @@ item below is (or will be) written up in full in the in-development
 
 - `validateaddress` reported an address from another network as valid — it
   never checked the network at all.
+- `createrawtransaction` and `createpsbt` built an output from an address
+  belonging to another network. On mainnet that pays a scriptPubKey the sender
+  does not control, with no prefix left in the transaction to catch it. Both
+  now decode with the network, as Core does, and answer
+  `-5 Invalid Bitcoin address: <addr>` (#689). `createpsbt` picks up the array
+  form of `outputs`, string amounts, and Core's duplicate-address and
+  amount-range checks in the process — it had its own copy of the parser.
 - `getdeploymentinfo`: a 64-character `blockhash` that is not hexadecimal
   reported a length error; it now reports a hex error, as Core does.
 

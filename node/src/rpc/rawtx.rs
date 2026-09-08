@@ -575,6 +575,7 @@ pub fn create_raw_transaction(
     locktime: Option<u32>,
     replaceable: Option<bool>,
     version: Option<u32>,
+    network: bitcoin::Network,
 ) -> Result<Value, (i32, String)> {
     const MAX_BIP125_RBF_SEQUENCE: u32 = 0xffff_fffd;
 
@@ -661,29 +662,7 @@ pub fn create_raw_transaction(
         }
     }
 
-    // Parse outputs — can be an object {addr: amount, ...} or an array [{addr: amount}, ...].
-    let mut tx_outputs = Vec::new();
-    let mut seen_addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_data = false;
-
-    if let Some(obj) = outputs.as_object() {
-        for (key, val) in obj {
-            parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
-        }
-    } else if let Some(arr) = outputs.as_array() {
-        for item in arr {
-            if let Some(map) = item.as_object() {
-                if map.len() != 1 {
-                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
-                }
-                for (key, val) in map {
-                    parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
-                }
-            } else {
-                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
-            }
-        }
-    }
+    let tx_outputs = parse_outputs(outputs, network)?;
 
     let lt = locktime
         .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)
@@ -702,12 +681,72 @@ pub fn create_raw_transaction(
     Ok(Value::String(hex::encode(raw)))
 }
 
+/// Core's `ParseOutputs` + `NormalizeOutputs` (`src/rpc/rawtransaction_util.cpp`),
+/// shared by `createrawtransaction` and `createpsbt` because Core routes both
+/// through the same `ConstructTransaction`.
+///
+/// `network` is not decoration. Core decodes each key with the network-scoped
+/// `DecodeDestination`, so a testnet address handed to a mainnet node is a
+/// `-5 Invalid Bitcoin address` rather than an output. Accepting it builds a
+/// payment to a scriptPubKey whose key the sender does not control, and the
+/// address prefix — the one part of the encoding that would have caught the
+/// mistake — is not carried in the scriptPubKey, so nothing downstream can
+/// notice. `validateaddress`, `scantxoutset` and `deriveaddresses` are all
+/// network-scoped already; these two were the surface that still was not.
+pub fn parse_outputs(
+    outputs: &Value,
+    network: bitcoin::Network,
+) -> Result<Vec<TxOut>, (i32, String)> {
+    let mut tx_outputs = Vec::new();
+    // Core dedupes on the decoded `CTxDestination`, not on the string, and
+    // reports the caller's spelling in the error.
+    let mut seen_destinations: std::collections::HashSet<bitcoin::ScriptBuf> =
+        std::collections::HashSet::new();
+    let mut seen_data = false;
+
+    if let Some(obj) = outputs.as_object() {
+        for (key, val) in obj {
+            parse_output_entry(
+                key,
+                val,
+                network,
+                &mut tx_outputs,
+                &mut seen_destinations,
+                &mut seen_data,
+            )?;
+        }
+    } else if let Some(arr) = outputs.as_array() {
+        for item in arr {
+            if let Some(map) = item.as_object() {
+                if map.len() != 1 {
+                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
+                }
+                for (key, val) in map {
+                    parse_output_entry(
+                        key,
+                        val,
+                        network,
+                        &mut tx_outputs,
+                        &mut seen_destinations,
+                        &mut seen_data,
+                    )?;
+                }
+            } else {
+                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
+            }
+        }
+    }
+
+    Ok(tx_outputs)
+}
+
 /// Parse a single key-value output entry for `createrawtransaction`.
 fn parse_output_entry(
     key: &str,
     val: &Value,
+    network: bitcoin::Network,
     tx_outputs: &mut Vec<TxOut>,
-    seen_addresses: &mut std::collections::HashSet<String>,
+    seen_destinations: &mut std::collections::HashSet<bitcoin::ScriptBuf>,
     seen_data: &mut bool,
 ) -> Result<(), (i32, String)> {
     if key == "data" {
@@ -728,16 +767,24 @@ fn parse_output_entry(
             script_pubkey: script,
         });
     } else {
-        if !seen_addresses.insert(key.to_string()) {
+        // Core's order, which is observable: decode without throwing, parse
+        // the amount, *then* reject an undecodable address, and dedupe last.
+        // A bad amount on a bad address therefore reports the amount, and a
+        // repeated bad address reports the address rather than the repeat.
+        let decoded = crate::rpc::address_decode::decode_destination(key, network);
+        let amount = parse_btc_amount(val)?;
+        let script_pubkey = match decoded {
+            crate::rpc::address_decode::Decoded::Valid(addr) => addr.script_pubkey(),
+            crate::rpc::address_decode::Decoded::Invalid { .. } => {
+                return Err((-5, format!("Invalid Bitcoin address: {key}")));
+            }
+        };
+        if !seen_destinations.insert(script_pubkey.clone()) {
             return Err((-8, format!("Invalid parameter, duplicated address: {key}")));
         }
-        let amount = parse_btc_amount(val)?;
-        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = key
-            .parse()
-            .map_err(|_| (-5, "Invalid Bitcoin address".to_string()))?;
         tx_outputs.push(TxOut {
             value: amount,
-            script_pubkey: address.assume_checked().script_pubkey(),
+            script_pubkey,
         });
     }
     Ok(())
@@ -2155,6 +2202,103 @@ mod tests {
         );
     }
 
+    /// A mainnet address must not build an output on regtest, and vice
+    /// versa. The reverse of the regtest example is what makes this a funds
+    /// bug: a testnet address accepted on mainnet pays a scriptPubKey the
+    /// sender does not control, and the prefix that would have caught it is
+    /// not carried in the script.
+    #[test]
+    fn create_raw_transaction_rejects_a_foreign_network_address() {
+        use bitcoin::Network;
+
+        let inputs = vec![json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        })];
+
+        // (address, the network it belongs to)
+        let cases = [
+            ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Network::Bitcoin),
+            ("bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs", Network::Bitcoin),
+            ("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202", Network::Regtest),
+        ];
+        for (addr, home) in cases {
+            for network in [Network::Bitcoin, Network::Regtest] {
+                let outputs = json!({ addr: 0.01 });
+                let got = create_raw_transaction(&inputs, &outputs, None, None, None, network);
+                if network == home {
+                    assert!(got.is_ok(), "{addr} must build an output on {network}");
+                } else {
+                    let (code, msg) = got.expect_err("{addr} is not a {network} address");
+                    assert_eq!(code, -5, "{addr} on {network}");
+                    assert_eq!(msg, format!("Invalid Bitcoin address: {addr}"), "{addr} on {network}");
+                }
+            }
+        }
+    }
+
+    /// `createpsbt` and `createrawtransaction` reach Core's `ParseOutputs`
+    /// through the same `ConstructTransaction`, so the address rule cannot
+    /// differ between them.
+    #[test]
+    fn create_psbt_applies_the_same_address_rule() {
+        let inputs = vec![json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        })];
+        let outputs = json!({ "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy": 0.01 });
+        let (code, msg) = crate::rpc::psbt::create_psbt(
+            &inputs,
+            &outputs,
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect_err("a mainnet address is not a regtest destination");
+        assert_eq!(code, -5);
+        assert_eq!(msg, "Invalid Bitcoin address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+
+        // ...and the shared parser is what gives `createpsbt` the array form
+        // and string amounts it did not have when it had its own loop.
+        let outputs = json!([
+            { "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": "0.01" },
+            { "data": "deadbeef" },
+        ]);
+        let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest)
+            .expect("array-form outputs");
+        assert!(v.as_str().expect("base64").starts_with("cHNidP8"));
+    }
+
+    /// Core's `ParseOutputs` decodes, parses the amount, *then* throws on an
+    /// undecodable address, and dedupes last. The order is observable through
+    /// which of two simultaneous errors comes back.
+    #[test]
+    fn parse_outputs_reports_errors_in_cores_order() {
+        let network = bitcoin::Network::Regtest;
+        const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        // Bad address *and* bad amount: Core reports the amount, because
+        // `AmountFromValue` runs before `IsValidDestination`.
+        let (code, _) = parse_outputs(&json!({ "notanaddress": "wat" }), network)
+            .expect_err("neither the address nor the amount is usable");
+        assert_eq!(code, -3, "the amount error precedes the address error");
+
+        // A repeated *invalid* address is an address error, not a duplicate
+        // one -- the validity check runs first.
+        let (code, msg) = parse_outputs(
+            &json!([{ "notanaddress": 0.01 }, { "notanaddress": 0.01 }]),
+            network,
+        )
+        .expect_err("still not an address the second time");
+        assert_eq!(code, -5);
+        assert_eq!(msg, "Invalid Bitcoin address: notanaddress");
+
+        // A repeated valid address is the duplicate error.
+        let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: 0.02 }]), network)
+            .expect_err("the same destination twice");
+        assert_eq!(code, -8);
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+    }
+
     /// Core's `ConstructTransaction` picks the default sequence from three
     /// cases, not two. The middle one decides whether a requested locktime is
     /// enforceable at all.
@@ -2167,7 +2311,14 @@ mod tests {
         let outputs = json!({});
 
         let seq_of = |locktime: Option<u32>, replaceable: Option<bool>| -> u64 {
-            let v = create_raw_transaction(&inputs, &outputs, locktime, replaceable, None)
+            let v = create_raw_transaction(
+                &inputs,
+                &outputs,
+                locktime,
+                replaceable,
+                None,
+                bitcoin::Network::Regtest,
+            )
                 .expect("well-formed request");
             let hex = v.as_str().expect("hex string");
             let raw = hex::decode(hex).expect("valid hex");

@@ -1751,7 +1751,7 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("createrawtransaction", |params, _ctx, _extensions| {
+    module.register_method("createrawtransaction", |params, ctx, _extensions| {
         // Grab the raw JSON before the sequence parser touches it.
         // We need this to detect duplicate keys in the outputs object,
         // since serde_json silently deduplicates.
@@ -1883,7 +1883,14 @@ pub async fn start(
                 -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
             )),
         };
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime_val, replaceable_val, version_val)
+        rawtx::create_raw_transaction(
+            &inputs,
+            &outputs,
+            locktime_val,
+            replaceable_val,
+            version_val,
+            ctx.chain_state.network,
+        )
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -2092,7 +2099,7 @@ pub async fn start(
 
     // --- PSBT RPCs ---
 
-    module.register_method("createpsbt", |params, _ctx, _extensions| {
+    module.register_method("createpsbt", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let inputs: Vec<serde_json::Value> = args.required("inputs")?;
         let outputs: serde_json::Value = args
@@ -2100,7 +2107,7 @@ pub async fn start(
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
         let locktime: Option<u32> = args.optional("locktime")?;
         args.check()?;
-        psbt::create_psbt(&inputs, &outputs, locktime)
+        psbt::create_psbt(&inputs, &outputs, locktime, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

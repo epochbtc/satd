@@ -20,10 +20,17 @@ fn psbt_from_base64(b64: &str) -> Result<Psbt, (i32, String)> {
 }
 
 /// `createpsbt` — create a PSBT from inputs and outputs.
+///
+/// Outputs go through `rawtx::parse_outputs`, the port of Core's
+/// `ParseOutputs`. Core reaches it from `createpsbt` and `createrawtransaction`
+/// alike (both call `ConstructTransaction`), so sharing it here is what keeps
+/// the two agreeing — on the network-scoped address decode above all, but also
+/// on duplicate detection, the array form of `outputs`, and string amounts.
 pub fn create_psbt(
     inputs: &[Value],
     outputs: &Value,
     locktime: Option<u32>,
+    network: bitcoin::Network,
 ) -> Result<Value, (i32, String)> {
     // Build the unsigned transaction (same logic as createrawtransaction)
     let mut tx_inputs = Vec::new();
@@ -48,35 +55,7 @@ pub fn create_psbt(
         });
     }
 
-    let mut tx_outputs = Vec::new();
-    if let Some(obj) = outputs.as_object() {
-        for (addr_or_key, val) in obj {
-            if addr_or_key == "data" {
-                let hex_data = val.as_str().ok_or((-8, "data must be hex".to_string()))?;
-                let data = hex::decode(hex_data).map_err(|_| (-8, "Invalid hex".to_string()))?;
-                let push_data = bitcoin::script::PushBytesBuf::try_from(data)
-                    .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
-                let script = bitcoin::script::Builder::new()
-                    .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-                    .push_slice(&push_data)
-                    .into_script();
-                tx_outputs.push(TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: script,
-                });
-            } else {
-                let amount_btc = val.as_f64().ok_or((-8, "Invalid amount".to_string()))?;
-                let amount_sat = (amount_btc * 100_000_000.0) as u64;
-                let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = addr_or_key
-                    .parse()
-                    .map_err(|_| (-8, format!("Invalid address: {}", addr_or_key)))?;
-                tx_outputs.push(TxOut {
-                    value: Amount::from_sat(amount_sat),
-                    script_pubkey: address.assume_checked().script_pubkey(),
-                });
-            }
-        }
-    }
+    let tx_outputs = crate::rpc::rawtx::parse_outputs(outputs, network)?;
 
     let lt = locktime
         .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)

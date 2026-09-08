@@ -2889,6 +2889,54 @@ fn test_createrawtransaction() {
     node.stop();
 }
 
+/// `createrawtransaction` and `createpsbt` build a payment. Core decodes the
+/// destination with the network-scoped `DecodeDestination`, so a mainnet
+/// address on a regtest node is `-5 Invalid Bitcoin address`, not an output.
+/// The direction that costs money is the mirror image: a testnet address
+/// accepted on mainnet pays a scriptPubKey the sender cannot spend, and the
+/// address prefix that would have caught it is not part of the script.
+#[test]
+fn test_create_transaction_rejects_foreign_network_address() {
+    let mut node = TestNode::start(&[]);
+    let inputs = serde_json::json!([{
+        "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+        "vout": 0,
+    }]);
+    // A mainnet P2SH address, and a mainnet bech32 one.
+    for addr in ["3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs"] {
+        let outputs = serde_json::json!({ addr: 0.001 });
+        for method in ["createrawtransaction", "createpsbt"] {
+            let response = node
+                .rpc_call_with_params(method, vec![inputs.clone(), outputs.clone()])
+                .unwrap();
+            assert_eq!(
+                response["error"]["code"], -5,
+                "{method} accepted the mainnet address {addr}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"],
+                format!("Invalid Bitcoin address: {addr}"),
+                "{method} / {addr}"
+            );
+        }
+    }
+
+    // The node's own network still builds an output, on both RPCs.
+    let outputs = serde_json::json!({
+        "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.001,
+    });
+    for method in ["createrawtransaction", "createpsbt"] {
+        let response = node
+            .rpc_call_with_params(method, vec![inputs.clone(), outputs.clone()])
+            .unwrap();
+        assert!(
+            response["result"].is_string(),
+            "{method} refused a regtest address: {response}"
+        );
+    }
+    node.stop();
+}
+
 #[test]
 fn test_decodescript() {
     let mut node = TestNode::start(&[]);

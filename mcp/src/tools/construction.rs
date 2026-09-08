@@ -3,13 +3,18 @@ use node::rpc::{psbt, rawtx};
 use serde_json::{Value, json};
 
 /// Create an unsigned raw transaction from inputs and outputs.
-pub fn create_transaction(inputs: &Value, outputs: &Value, locktime: Option<u32>) -> String {
+pub fn create_transaction(
+    ctx: &McpContext,
+    inputs: &Value,
+    outputs: &Value,
+    locktime: Option<u32>,
+) -> String {
     let input_slice = match inputs.as_array() {
         Some(arr) => arr.as_slice(),
         None => return json!({"error": "inputs must be an array"}).to_string(),
     };
 
-    match rawtx::create_raw_transaction(input_slice, outputs, locktime, None, None) {
+    match rawtx::create_raw_transaction(input_slice, outputs, locktime, None, None, ctx.network) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
@@ -66,7 +71,7 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let input_slice = inputs.map(|v| v.as_slice()).unwrap_or(&[]);
-            psbt::create_psbt(input_slice, outputs, locktime)
+            psbt::create_psbt(input_slice, outputs, locktime, ctx.network)
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "decode" => {
