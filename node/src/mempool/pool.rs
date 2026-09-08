@@ -4209,6 +4209,18 @@ impl Mempool {
             };
             let wtxid = child_tx.compute_wtxid();
 
+            // Already refused above, for a reason that describes the package
+            // rather than the transaction: the child left one of its parent's
+            // ephemeral dust outputs unspent, so the parent was not accepted.
+            // Retrying it here can only fail again -- its parent is not in the
+            // mempool -- and would overwrite `missing-ephemeral-spends` with a
+            // bare `bad-txns-inputs-missingorspent`, which names a consequence
+            // of the real reason and sends the submitter looking in the wrong
+            // place. Core reports the ephemeral reason here.
+            if failed.contains_key(&wtxid) {
+                continue;
+            }
+
             // Check ephemeral dust spending: for each parent this child spends
             // from that has dust, ensure it spends the dust output.
             let mut ephemeral_violation = false;
@@ -8574,6 +8586,221 @@ mod tests {
             seen,
             Some((txid, EvictReason::Reorg)),
             "the reorg sweep evicted silently"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- accept_package / ephemeral dust (Core's ephemeral_policy.cpp) ----
+    //
+    // `accept_package` had no test of its own: `package_well_formedness_matches_core`
+    // covers the pre-flight shape checks, and nothing at all reached the
+    // ephemeral-dust policy those checks guard. The whole point of that policy
+    // is that it relaxes the dust rule *conditionally*, so a test that only
+    // shows the happy path would also pass against a version that relaxed it
+    // unconditionally -- which is why every refusal below is a case of its own.
+
+    /// A transaction spending `prevs` and paying `outs` as `(value, tag)`.
+    fn tx_from(prevs: &[OutPoint], outs: &[(u64, u8)]) -> Transaction {
+        use bitcoin::blockdata::locktime::absolute::LockTime;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
+        Transaction {
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
+            input: prevs
+                .iter()
+                .map(|p| TxIn {
+                    previous_output: *p,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: outs
+                .iter()
+                .map(|&(value, tag)| TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: p2wpkh_spk(tag),
+                })
+                .collect(),
+        }
+    }
+
+    /// A P2WPKH output below this is dust; at or above it is not. Derived from
+    /// the policy the pool actually applies rather than restated, so a change
+    /// to the threshold moves these fixtures with it instead of silently
+    /// turning the dust in them into ordinary outputs.
+    fn p2wpkh_dust_threshold() -> u64 {
+        policy::dust_threshold(&p2wpkh_spk(0x11))
+    }
+
+    fn err_of(results: &serde_json::Map<String, serde_json::Value>, tx: &Transaction) -> String {
+        results
+            .get(&tx.compute_wtxid().to_string())
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<no error reported>")
+            .to_string()
+    }
+
+    /// The policy itself: a zero-fee parent carrying one dust output is
+    /// admitted when a child in the same package spends that dust.
+    #[test]
+    fn a_zero_fee_dust_parent_is_accepted_when_its_child_spends_the_dust() {
+        let op = outpoint(0xC0);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // Zero fee: the outputs sum to the input exactly.
+        let parent = tx_from(&[op], &[(dust, 0x50), (50_000 - dust, 0x51)]);
+        let parent_txid = parent.compute_txid();
+        // The child sweeps the dust along with the parent's other output, and
+        // pays the package's fee.
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0x52)],
+        );
+        let child_txid = child.compute_txid();
+
+        let (msg, results) =
+            mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "success", "package rejected: {results:?}");
+        assert!(in_pool(&mp, &parent_txid), "the ephemeral dust parent was not accepted");
+        assert!(in_pool(&mp, &child_txid), "the child was not accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The condition the policy hangs on. A child that spends the parent but
+    /// leaves the dust behind is exactly what ephemeral dust exists to
+    /// prevent: the dust would be stranded in the UTXO set forever.
+    #[test]
+    fn a_child_that_leaves_the_dust_unspent_fails_the_package() {
+        let op = outpoint(0xC1);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x53), (50_000 - dust, 0x54)]);
+        let parent_txid = parent.compute_txid();
+        // Spends output 1 only, leaving the dust at output 0.
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 1 }], &[(40_000, 0x55)]);
+
+        let (msg, results) =
+            mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "transaction failed", "{results:?}");
+        assert!(
+            err_of(&results, &child).contains("missing-ephemeral-spends"),
+            "wrong reason: {}",
+            err_of(&results, &child)
+        );
+        assert!(!in_pool(&mp, &parent_txid), "the dust parent entered with its dust unspent");
+        assert!(!in_pool(&mp, &child.compute_txid()), "the offending child entered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core requires the dust-carrying transaction to be zero-fee, so that the
+    /// child is the only thing paying for it and therefore has to exist. A
+    /// dust parent that pays its own way could sit in the mempool alone.
+    #[test]
+    fn a_dust_parent_that_pays_a_fee_is_refused() {
+        let op = outpoint(0xC2);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // 900 sat short of the input: a real fee.
+        let parent = tx_from(&[op], &[(dust, 0x56), (50_000 - dust - 900, 0x57)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0x58)],
+        );
+
+        let (msg, results) = mp.accept_package(vec![parent.clone(), child], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "transaction failed", "{results:?}");
+        assert!(
+            err_of(&results, &parent).contains("must be 0-fee"),
+            "wrong reason: {}",
+            err_of(&results, &parent)
+        );
+        assert!(!in_pool(&mp, &parent_txid), "a fee-paying dust parent entered the mempool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core allows at most one ephemeral dust output. Two is an ordinary dust
+    /// violation again, however the package is shaped.
+    #[test]
+    fn a_parent_with_two_dust_outputs_is_refused() {
+        let op = outpoint(0xC3);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x59), (dust, 0x5A), (50_000 - 2 * dust, 0x5B)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint { txid: parent_txid, vout: 2 },
+            ],
+            &[(40_000, 0x5C)],
+        );
+
+        let (msg, results) = mp.accept_package(vec![parent.clone(), child], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "transaction failed", "{results:?}");
+        assert_eq!(err_of(&results, &parent), "dust");
+        assert!(!in_pool(&mp, &parent_txid), "a two-dust parent entered the mempool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dust parent submitted on its own has no child to spend the dust, so
+    /// it must not enter -- and the package reports why rather than claiming
+    /// success over an empty result.
+    #[test]
+    fn a_lone_dust_parent_is_not_accepted() {
+        let op = outpoint(0xC4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0x5D), (50_000 - dust, 0x5E)]);
+        let parent_txid = parent.compute_txid();
+
+        let (msg, results) = mp.accept_package(vec![parent], &cs, &NoopVerifier);
+
+        assert_eq!(msg, "unspent-dust", "{results:?}");
+        assert!(!in_pool(&mp, &parent_txid), "a lone dust parent entered the mempool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An output one satoshi above the threshold is not dust, so the same
+    /// package shape is an ordinary zero-fee parent and gets no relaxation.
+    /// Without this the fixtures above could stop being dust -- if the
+    /// threshold moved, or if `dust_output_indices` classified everything as
+    /// dust -- and every assertion would still hold for the wrong reason.
+    #[test]
+    fn an_output_at_the_dust_threshold_is_not_ephemeral_dust() {
+        let op = outpoint(0xC5);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let at_threshold = p2wpkh_dust_threshold();
+
+        let parent = tx_from(&[op], &[(at_threshold, 0x5F), (50_000 - at_threshold, 0x60)]);
+        assert_eq!(
+            Mempool::count_dust_outputs(&parent),
+            0,
+            "an output at the threshold was counted as dust"
+        );
+        let below = tx_from(&[op], &[(at_threshold - 1, 0x5F), (50_000 - at_threshold, 0x60)]);
+        assert_eq!(
+            Mempool::count_dust_outputs(&below),
+            1,
+            "an output below the threshold was not counted as dust"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
