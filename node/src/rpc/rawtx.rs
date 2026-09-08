@@ -810,17 +810,36 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
 }
 
 /// `decodescript` — decode a hex-encoded script.
-pub fn decode_script(hex_script: &str) -> Result<Value, (i32, String)> {
+pub fn decode_script(
+    hex_script: &str,
+    network: bitcoin::Network,
+) -> Result<Value, (i32, String)> {
     let script_bytes = hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
     let script = bitcoin::ScriptBuf::from_bytes(script_bytes);
 
     let script_type = script_type(&script);
 
-    Ok(json!({
+    // Core emits `p2sh` as the P2SH address that would wrap this script
+    // (`GetScriptForDestination(ScriptHash(script))`), omitting it only for a
+    // script that cannot be wrapped. An empty string was indistinguishable
+    // from "not a valid script", on the field whose whole use is telling you
+    // the address to pay.
+    let mut out = json!({
         "asm": format!("{}", script),
         "type": script_type,
-        "p2sh": "", // would need hash computation
-    }))
+    });
+    // Core refuses to wrap a script that is itself P2SH, and one too large to
+    // be a redeemScript.
+    const MAX_REDEEM_SCRIPT_SIZE: usize = 520;
+    if !script.is_p2sh() && script.len() <= MAX_REDEEM_SCRIPT_SIZE {
+        let p2sh = bitcoin::Address::p2sh(&script, network)
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        if !p2sh.is_empty() {
+            out["p2sh"] = json!(p2sh);
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a sighash type string into EcdsaSighashType.

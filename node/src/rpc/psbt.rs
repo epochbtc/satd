@@ -174,8 +174,49 @@ pub fn decode_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
         "tx_hex": tx_hex,
         "inputs": inputs,
         "outputs": outputs,
-        "fee": Value::Null,
+        // Core emits `fee` once every input's UTXO is present, and omits it
+        // otherwise. This was an unconditional `null`, so a fully-populated
+        // PSBT still reported no fee — the number a signer most wants before
+        // committing.
+        "fee": match psbt_fee(&psbt) {
+            Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+            None => Value::Null,
+        },
     }))
+}
+
+/// Total input value, when every input's UTXO is known.
+///
+/// Core computes the fee only when it has all of them (`PSBTInputAnalysis`:
+/// `if (!input.have_utxo) { ... calc_fee = false; }`), and omits the field
+/// otherwise rather than reporting a partial figure — a fee derived from a
+/// subset of the inputs is not a smaller truth, it is a wrong number on the
+/// one field a signer checks before committing funds.
+fn total_input_value(psbt: &Psbt) -> Option<Amount> {
+    let mut total = Amount::ZERO;
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        let value = match (&input.witness_utxo, &input.non_witness_utxo) {
+            (Some(txout), _) => txout.value,
+            (None, Some(tx)) => {
+                let vout = psbt.unsigned_tx.input.get(i)?.previous_output.vout as usize;
+                tx.output.get(vout)?.value
+            }
+            (None, None) => return None,
+        };
+        total = total.checked_add(value)?;
+    }
+    Some(total)
+}
+
+/// The fee this PSBT pays, when it can be known: inputs minus outputs.
+fn psbt_fee(psbt: &Psbt) -> Option<Amount> {
+    let inputs = total_input_value(psbt)?;
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .try_fold(Amount::ZERO, |acc, o| acc.checked_add(o.value))?;
+    inputs.checked_sub(outputs)
 }
 
 /// `analyzepsbt` — analyze PSBT completeness.
@@ -223,11 +264,25 @@ pub fn analyze_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
         "updater"
     };
 
+    let estimated_vsize = psbt.unsigned_tx.weight().to_wu() / 4;
+    let fee = psbt_fee(&psbt);
     Ok(json!({
         "inputs": inputs,
-        "estimated_vsize": psbt.unsigned_tx.weight().to_wu() / 4,
-        "estimated_feerate": Value::Null,
-        "fee": Value::Null,
+        "estimated_vsize": estimated_vsize,
+        // Core reports the feerate in BTC/kvB alongside the fee, and both
+        // only when every input's UTXO is known. Both were unconditional
+        // `null` while the `witness_utxo` values were already being read a
+        // few lines above.
+        "estimated_feerate": match fee {
+            Some(fee) if estimated_vsize > 0 => {
+                json!((fee.to_sat() as f64 / 100_000_000.0) * 1000.0 / estimated_vsize as f64)
+            }
+            _ => Value::Null,
+        },
+        "fee": match fee {
+            Some(fee) => json!(fee.to_sat() as f64 / 100_000_000.0),
+            None => Value::Null,
+        },
         "next": next,
     }))
 }

@@ -123,6 +123,15 @@ impl Connection {
         }
     }
 
+    /// The BIP 324 session ID, for a v2 connection. `None` on v1, which has
+    /// no such concept — Core reports the field only when there is one.
+    pub fn session_id(&self) -> Option<[u8; 32]> {
+        match self {
+            Connection::V1(_) => None,
+            Connection::V2(c) => Some(c.session_id()),
+        }
+    }
+
     /// Which wire transport this connection uses.
     pub fn transport_protocol(&self) -> crate::net::peer::TransportProtocol {
         match self {

@@ -109,6 +109,23 @@ item below is (or will be) written up in full in the in-development
 - `getmemoryinfo` reported the process RSS as the secure-allocator pool's
   `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
   no secure allocator, so the pool is empty and the numbers are zero (#667).
+- Nine RPC fields reported constants chosen to look plausible rather than
+  values read from the node, in two cases contradicting another RPC on the same
+  node (#702). `getnetworkinfo` now reports the configured `relayfee` /
+  `incrementalfee` (the fixed `0.00001000` was ten times satd's own default,
+  while `getmempoolinfo` had the real value all along), the service flags it
+  actually advertises (the fixed value claimed `NODE_NETWORK_LIMITED`, which
+  satd never sets, and never showed `NODE_COMPACT_FILTERS`, which it does),
+  `localrelay` as the inverse of `-blocksonly`, and the node's real warnings.
+  `getblockchaininfo.pruned` follows `-prune` instead of being false on a
+  pruned node, with Core's `prune_target_size` / `automatic_pruning` alongside.
+  `getmininginfo.warnings` is populated. `decodescript.p2sh` returns the P2SH
+  address. `getpeerinfo.session_id` carries the BIP 324 session ID for a v2
+  peer — the field exists for out-of-band MITM detection and was empty for
+  every peer. `decodepsbt.fee` and `analyzepsbt.fee` / `.estimated_feerate` are
+  computed once every input's UTXO is known, as Core does.
+- **`savemempool` wrote nothing** while returning Core's success value. It now
+  writes `mempool.dat` and returns Core's `{"filename": …}` (#702).
 - `logging` reported from a static map initialised to "everything on" that
   nothing else in the process read: a node running with no `-debug` claimed 30
   categories enabled, and toggling one flipped a bit that never reached the log

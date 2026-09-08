@@ -548,6 +548,18 @@ silently returning an empty or wrong answer.
   omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
   refused with Core's message, as Core itself does off glibc.
 
+- **Fields satd still reports as a placeholder** — each is a value satd has no
+  source for, kept at Core's shape rather than derived, and each is a `0` or an
+  empty list rather than an invented figure:
+  `getblockchaininfo.size_on_disk` (satd tracks no running total of block-file
+  bytes; computing it would mean a directory walk per call),
+  `getblockchaininfo.pruneheight` (absent entirely — satd keeps no prune floor,
+  and deriving one means walking the chain), `getchainstates[].coins_tip_cache_bytes`
+  (absent — satd's coin cache is bounded by entry count, not bytes),
+  `getrpcinfo.active_commands` (needs a dispatcher hook satd does not have), and
+  `getpeerinfo.inflight` (the real per-peer set is the IBD scheduler's, surfaced
+  by `getibdprogress.peer_download_stats[].assigned`).
+
 - **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
   `-txindex` is on, not whether the index covers the whole chain. satd writes
   txindex entries inline during `connect_block`, so with the flag set the index

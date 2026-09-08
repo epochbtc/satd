@@ -117,7 +117,32 @@ pub fn get_block_from_peer(
 
 
 /// Build the `getnetworkinfo` response with live connection data.
-pub fn get_network_info(peer_manager: &PeerManager) -> Value {
+/// Core reports both fee floors in BTC/kvB, at eight decimal places.
+fn sat_per_kvb_to_btc(sat_per_kvb: u64) -> f64 {
+    sat_per_kvb as f64 / 100_000_000.0
+}
+
+pub fn get_network_info(
+    peer_manager: &PeerManager,
+    min_relay_fee_sat_per_kvb: u64,
+    incremental_relay_fee_sat_per_kvb: u64,
+    warnings: Vec<String>,
+) -> Value {
+    let local_services = peer_manager.local_services();
+    // Core's `serviceFlagToStr`, in bit order.
+    let service_names: Vec<&'static str> = [
+        (bitcoin::p2p::ServiceFlags::NETWORK, "NETWORK"),
+        (bitcoin::p2p::ServiceFlags::BLOOM, "BLOOM"),
+        (bitcoin::p2p::ServiceFlags::WITNESS, "WITNESS"),
+        (bitcoin::p2p::ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
+        (bitcoin::p2p::ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
+        (bitcoin::p2p::ServiceFlags::P2P_V2, "P2P_V2"),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| local_services.has(*flag))
+    .map(|(_, name)| name)
+    .collect();
+
     let connections = peer_manager.connection_count();
     let connections_in = peer_manager.inbound_count();
     let connections_out = peer_manager.outbound_count();
@@ -148,9 +173,18 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
         "version": 280000,
         "subversion": crate::user_agent(),
         "protocolversion": 70016,
-        "localservices": "0000000000000409",
-        "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED"],
-        "localrelay": true,
+        // The flags this node actually advertises, from the same call the
+        // version message uses. The old fixed value claimed
+        // `NODE_NETWORK_LIMITED` (never set) and omitted
+        // `NODE_COMPACT_FILTERS` (set once the filter index can serve), so it
+        // was wrong in both directions at once.
+        "localservices": format!("{:016x}", local_services.to_u64()),
+        "localservicesnames": service_names,
+        // Core's `localrelay` is `!IgnoresIncomingTxs()`, i.e. the inverse of
+        // `-blocksonly` -- which satd already honours on the wire and can
+        // reload over SIGHUP. Hardcoding `true` told a `-blocksonly` node's
+        // operator that it was relaying transactions.
+        "localrelay": !peer_manager.blocksonly(),
         "timeoffset": 0,
         "networkactive": peer_manager.is_network_active(),
         "connections": connections,
@@ -179,10 +213,22 @@ pub fn get_network_info(peer_manager: &PeerManager) -> Value {
                 "proxy_randomize_credentials": onion_randomize
             }
         ],
-        "relayfee": 0.00001000,
-        "incrementalfee": 0.00001000,
+        // The node's *configured* floors, not a constant. satd's defaults are
+        // 100 sat/kvB (Core v31 agrees), so the fixed `0.00001000` was ten
+        // times high before an operator set anything -- and `getmempoolinfo`
+        // reported the real values all along, so one node answered two
+        // different numbers for the same knob.
+        "relayfee": sat_per_kvb_to_btc(min_relay_fee_sat_per_kvb),
+        "incrementalfee": sat_per_kvb_to_btc(incremental_relay_fee_sat_per_kvb),
         "localaddresses": local_addresses,
-        "warnings": ""
+        // The node's real warnings, the same set `getblockchaininfo` reports.
+        // This was `""` unconditionally, so a node warning about an unknown
+        // softfork said nothing here — on the RPC an operator polls precisely
+        // to see whether the node is unhappy.
+        "warnings": match warnings {
+            v if v.is_empty() => Value::String(String::new()),
+            v => Value::Array(v.into_iter().map(Value::String).collect()),
+        }
     })
 }
 

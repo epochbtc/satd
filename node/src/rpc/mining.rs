@@ -234,7 +234,15 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
         "networkhashps": hashps,
         "pooledtx": pooledtx,
         "chain": chain,
-        "warnings": "",
+        // The node's real warnings, the same ones `getblockchaininfo`
+        // reports. This was `""` while the plumbing sat one call away —
+        // `get_mining_info` already takes the `ChainState` that owns them, so
+        // a miner watching `getmininginfo` for an unknown-softfork warning saw
+        // nothing however loudly the node was warning elsewhere.
+        "warnings": match chain_state.warnings().as_strings() {
+            v if v.is_empty() => Value::String(String::new()),
+            v => Value::Array(v.into_iter().map(Value::String).collect()),
+        },
     });
 
     // `currentblocktx` / `currentblockweight` describe the last template that

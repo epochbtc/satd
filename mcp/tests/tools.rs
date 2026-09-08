@@ -290,14 +290,16 @@ mod transactions {
     fn test_decode_script_p2pkh() {
         // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
         let hex = "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac";
-        let result = tx::decode_script(hex);
+        let (ctx, _dir) = make_test_ctx();
+        let result = tx::decode_script(&ctx, hex);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["type"].is_string() || json["asm"].is_string() || json["error"].is_string());
     }
 
     #[test]
     fn test_decode_script_invalid() {
-        let result = tx::decode_script("xyz");
+        let (ctx, _dir) = make_test_ctx();
+        let result = tx::decode_script(&ctx, "xyz");
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }

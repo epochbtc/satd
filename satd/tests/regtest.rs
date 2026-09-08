@@ -2477,6 +2477,101 @@ fn test_logging_reflects_the_debug_flag_at_startup() {
     node.stop();
 }
 
+/// Fields that describe the node have to be read from the node. Each of
+/// these was a constant chosen to look plausible, and in two cases the same
+/// node answered a different value on a different RPC.
+#[test]
+fn test_node_facts_are_derived_not_constants() {
+    let mut node = TestNode::start(&[]);
+
+    // `getnetworkinfo.relayfee` was a fixed 0.00001000 BTC/kvB (1000
+    // sat/kvB) while satd's default floor is 100 — and `getmempoolinfo`
+    // reported the real value all along, so one node gave two answers for
+    // one knob.
+    let net = node.rpc_call("getnetworkinfo").unwrap()["result"].clone();
+    let pool = node.rpc_call("getmempoolinfo").unwrap()["result"].clone();
+    let relayfee = net["relayfee"].as_f64().expect("relayfee");
+    let mempool_min = pool["mempoolminfee"]
+        .as_f64()
+        .or_else(|| pool["minrelaytxfee"].as_f64())
+        .expect("a mempool floor");
+    assert!(
+        (relayfee - mempool_min).abs() < 1e-12,
+        "getnetworkinfo and getmempoolinfo must agree: {relayfee} vs {mempool_min}"
+    );
+
+    // `localservices` was a fixed 0000000000000409, claiming
+    // NODE_NETWORK_LIMITED (never set).
+    let names: Vec<&str> = net["localservicesnames"]
+        .as_array()
+        .expect("localservicesnames")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(names.contains(&"NETWORK") && names.contains(&"WITNESS"), "{net}");
+    assert!(
+        !names.contains(&"NETWORK_LIMITED"),
+        "satd does not advertise NODE_NETWORK_LIMITED: {net}"
+    );
+    let services = net["localservices"].as_str().expect("localservices");
+    assert_eq!(services.len(), 16, "Core's 16-hex-digit form: {services}");
+    assert_eq!(
+        u64::from_str_radix(services, 16).unwrap() & (1 << 10),
+        0,
+        "the NETWORK_LIMITED bit must not be set: {services}"
+    );
+
+    // `localrelay` is the inverse of -blocksonly, not a constant.
+    assert_eq!(net["localrelay"], serde_json::json!(true), "{net}");
+
+    // `pruned` was hardcoded false.
+    let chain = node.rpc_call("getblockchaininfo").unwrap()["result"].clone();
+    assert_eq!(chain["pruned"], serde_json::json!(false), "{chain}");
+    assert!(chain["prune_target_size"].is_null(), "absent when not pruning: {chain}");
+
+    // `savemempool` returned Core's success value while writing nothing.
+    let r = node.rpc_call("savemempool").unwrap();
+    assert!(r["error"].is_null(), "savemempool: {r}");
+    let filename = r["result"]["filename"].as_str().expect("Core returns a filename");
+    assert!(
+        std::path::Path::new(filename).exists(),
+        "savemempool must actually write {filename}"
+    );
+
+    // `decodescript.p2sh` was an empty string.
+    let r = node
+        .rpc_call_with_params("decodescript", vec![serde_json::json!("51")])
+        .unwrap();
+    let p2sh = r["result"]["p2sh"].as_str().expect("p2sh address");
+    assert!(p2sh.starts_with('2'), "a regtest P2SH address: {r}");
+
+    node.stop();
+}
+
+/// `-blocksonly` and `-prune` must reach the RPCs that report them.
+#[test]
+fn test_blocksonly_and_prune_are_reported() {
+    let mut node = TestNode::start(&["--blocksonly=1"]);
+    let net = node.rpc_call("getnetworkinfo").unwrap()["result"].clone();
+    assert_eq!(
+        net["localrelay"],
+        serde_json::json!(false),
+        "-blocksonly means the node does not relay transactions: {net}"
+    );
+    node.stop();
+
+    let mut node = TestNode::start(&["--prune=550"]);
+    let chain = node.rpc_call("getblockchaininfo").unwrap()["result"].clone();
+    assert_eq!(chain["pruned"], serde_json::json!(true), "{chain}");
+    assert_eq!(
+        chain["prune_target_size"],
+        serde_json::json!(550_000_000u64),
+        "{chain}"
+    );
+    assert_eq!(chain["automatic_pruning"], serde_json::json!(true), "{chain}");
+    node.stop();
+}
+
 /// `-whitelist` is inbound-only unless the entry carries an `out` token, and
 /// even then Core consults it only for manual connections. satd applied every
 /// entry in both directions, so a bare `-whitelist=noban@127.0.0.1` made the
@@ -2611,7 +2706,18 @@ fn test_getnettotals() {
 fn test_savemempool() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("savemempool").unwrap();
-    assert!(response["result"].is_null());
+    // This used to assert `null` — the stub's return value, pinned as if it
+    // were the contract, while the RPC wrote nothing and told the caller it
+    // had succeeded.
+    assert!(response["error"].is_null(), "{response}");
+    let filename = response["result"]["filename"]
+        .as_str()
+        .expect("Core returns the file it wrote");
+    assert!(filename.ends_with("mempool.dat"), "{response}");
+    assert!(
+        std::path::Path::new(filename).exists(),
+        "savemempool must actually write {filename}"
+    );
     node.stop();
 }
 

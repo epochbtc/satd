@@ -276,7 +276,7 @@ impl SatdMcpServer {
 
     #[tool(description = "Decode a hex-encoded script into human-readable opcodes, type classification, and addresses.")]
     fn decode_script(&self, Parameters(p): Parameters<DecodeScriptParams>) -> String {
-        tools::transactions::decode_script(&p.hex_script)
+        tools::transactions::decode_script(&self.ctx, &p.hex_script)
     }
 
     // === Mempool ===

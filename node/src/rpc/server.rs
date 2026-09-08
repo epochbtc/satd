@@ -431,6 +431,32 @@ fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
 }
 
 /// Shared state for RPC handlers.
+/// The network data directory (Core's `GetDataDirNet`), from the effective
+/// config. `None` when the config carries no datadir — embedded uses only.
+fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
+    let base = ctx
+        .effective_config
+        .get("datadir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)?;
+    Some(match ctx.chain_state.network {
+        bitcoin::Network::Bitcoin => base,
+        bitcoin::Network::Testnet => base.join("testnet3"),
+        bitcoin::Network::Testnet4 => base.join("testnet4"),
+        bitcoin::Network::Signet => base.join("signet"),
+        bitcoin::Network::Regtest => base.join("regtest"),
+    })
+}
+
+/// The configured `-prune` target in MiB, or `None` when the node is not
+/// pruning. Read by `getblockchaininfo`.
+fn prune_target_mb_from(ctx: &RpcContext) -> Option<u64> {
+    ctx.effective_config
+        .get("prune")
+        .and_then(|v| v.as_u64())
+        .filter(|mb| *mb > 0)
+}
+
 pub struct RpcContext {
     pub chain_state: Arc<ChainState>,
     pub mempool: Arc<Mempool>,
@@ -724,7 +750,10 @@ pub async fn start(
     // --- Blockchain RPCs ---
 
     module.register_method("getblockchaininfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(&ctx.chain_state))
+        Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(
+            &ctx.chain_state,
+            prune_target_mb_from(ctx),
+        ))
     })?;
 
     module.register_method("getdeploymentinfo", |params, ctx, _extensions| {
@@ -737,7 +766,15 @@ pub async fn start(
     })?;
 
     module.register_method("getnetworkinfo", |_params, ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(network::get_network_info(&ctx.peer_manager))
+        // The mempool's own view of the floors, which is what
+        // `getmempoolinfo` reports -- so the two RPCs cannot disagree.
+        let mempool_info = ctx.mempool.info();
+        Ok::<_, ErrorObjectOwned>(network::get_network_info(
+            &ctx.peer_manager,
+            mempool_info.min_fee_rate,
+            mempool_info.incremental_relay_fee,
+            ctx.chain_state.warnings().as_strings(),
+        ))
     })?;
 
     module.register_method("getbestblockhash", |_params, ctx, _extensions| {
@@ -1033,8 +1070,12 @@ pub async fn start(
         ))
     })?;
 
-    module.register_method("savemempool", |_params, _ctx, _extensions| {
-        Ok::<_, ErrorObjectOwned>(blockchain::save_mempool())
+    module.register_method("savemempool", |_params, ctx, _extensions| {
+        let net_datadir = net_datadir_from(ctx).ok_or_else(|| {
+            ErrorObjectOwned::owned(-1, "datadir not available in config", None::<()>)
+        })?;
+        blockchain::save_mempool(&ctx.mempool, &net_datadir)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("dumptxoutset", |params, ctx, _extensions| {
@@ -1862,11 +1903,11 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("decodescript", |params, _ctx, _extensions| {
+    module.register_method("decodescript", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let hex_script: String = args.required("hexstring")?;
         args.check()?;
-        rawtx::decode_script(&hex_script)
+        rawtx::decode_script(&hex_script, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 

@@ -19,8 +19,8 @@ pub fn decode_raw_transaction(ctx: &McpContext, hex_tx: &str) -> String {
 }
 
 /// Decode a hex-encoded script into opcodes, type, and addresses.
-pub fn decode_script(hex_script: &str) -> String {
-    match rawtx::decode_script(hex_script) {
+pub fn decode_script(ctx: &McpContext, hex_script: &str) -> String {
+    match rawtx::decode_script(hex_script, ctx.network) {
         Ok(result) => serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
         Err((code, msg)) => json!({"error": msg, "code": code}).to_string(),
     }
