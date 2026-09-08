@@ -77,6 +77,11 @@ item below is (or will be) written up in full in the in-development
   It now reports Core's `ToStrings` of the real flags (#667). `noban` also
   carries `download`, as Core's `NetPermissionFlags::NoBan` does — a reporting
   change, since the upload-budget check already honoured either flag.
+- The `logging` RPC honours Core's wildcard set exactly: `""`, `1` and `all`
+  all mean every category. `none` and `0` are rejected as unknown categories,
+  as Core rejects them — they are `-debug` config spellings, and accepting them
+  meant `logging '["none"]'` silently turned off all logging where Core refuses
+  the call (#667).
 - **Breaking:** two `-whitelist` grants were wider than Core's, and are
   narrowed to match: a bare `-whitelist=<subnet>` no longer grants `addr`, and
   `-whitelist=@<subnet>` — Core's "match this range, grant nothing" idiom —

@@ -569,7 +569,13 @@ silently returning an empty or wrong answer.
   nor report on. Because the names are aliases, enabling `net` also reports
   `addrman`, `cmpctblock`, `proxy` and `txreconciliation` as enabled: they are
   the same subsystem. Values are read from the live filter, and `include` /
-  `exclude` change it.
+  `exclude` change it. Core's wildcard set is honoured exactly as
+  `GetLogCategory` defines it — `""`, `"1"` and `"all"` all mean everything —
+  and `none` / `0` are rejected as unknown categories, as Core rejects them:
+  they are `-debug` config spellings, absent from Core's category table. satd
+  is more lenient than Core in two directions here, both accept-only: a
+  category name is matched case-insensitively and after trimming surrounding
+  whitespace, where Core compares it exactly.
 
 - **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
   actually granted, in Core's order. `bloomfilter` never appears: satd accepts

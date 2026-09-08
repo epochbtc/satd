@@ -13,7 +13,7 @@
 
 use crate::config::{self, Config};
 use crate::reload::LogReloadHandle;
-use node::rpc::logging::{ALL_CATEGORIES, LogControl, NO_CATEGORIES};
+use node::rpc::logging::{ALL_CATEGORIES, LogControl};
 use parking_lot::Mutex;
 
 /// The live `logging` surface.
@@ -42,12 +42,17 @@ impl LiveLogControl {
         self.handle.reload(config);
     }
 
-    /// Whether `name` is a category satd can act on, or one of Core's
-    /// wildcards.
+    /// Whether `name` is a category satd can act on, or Core's `all` wildcard
+    /// (`""`, `"1"`, `"all"` -- see [`ALL_CATEGORIES`]).
+    ///
+    /// `none` and `0` are deliberately *not* known here. They are `-debug`
+    /// config spellings; Core's `logging` RPC answers
+    /// `-8 unknown logging category none` for both, and accepting them meant
+    /// `logging '["none"]'` silently turned off all logging on a node where
+    /// Core would have refused the call.
     fn is_known(name: &str) -> bool {
         let lower = name.trim().to_ascii_lowercase();
         ALL_CATEGORIES.contains(&lower.as_str())
-            || NO_CATEGORIES.contains(&lower.as_str())
             || config::debug_category_target(&lower).is_some()
     }
 }
@@ -103,9 +108,6 @@ impl LogControl for LiveLogControl {
             if ALL_CATEGORIES.contains(&cat.as_str()) {
                 debug = vec!["all".to_string()];
                 debugexclude.clear();
-            } else if NO_CATEGORIES.contains(&cat.as_str()) {
-                debug.clear();
-                debugexclude.clear();
             } else {
                 debugexclude.retain(|e| e != &cat);
                 if !debug.iter().any(|d| d == &cat) {
@@ -115,7 +117,8 @@ impl LogControl for LiveLogControl {
         }
         for name in exclude {
             let cat = norm(name);
-            if ALL_CATEGORIES.contains(&cat.as_str()) || NO_CATEGORIES.contains(&cat.as_str()) {
+            // Core's `DisableCategory(BCLog::ALL)` clears the whole mask.
+            if ALL_CATEGORIES.contains(&cat.as_str()) {
                 debug.clear();
                 debugexclude.clear();
             } else {

@@ -31,7 +31,19 @@ pub trait LogControl: Send + Sync {
     fn update(&self, include: &[String], exclude: &[String]) -> Result<(), String>;
 }
 
-/// Core's two category names with special meanings (`logging`'s help text).
-/// `none`/`0` are accepted by `LogInstance().DisableCategory` as the inverse.
-pub const ALL_CATEGORIES: [&str; 2] = ["all", "1"];
-pub const NO_CATEGORIES: [&str; 2] = ["none", "0"];
+/// The category names Core's `GetLogCategory` (`src/logging.cpp`) resolves to
+/// `BCLog::ALL`:
+///
+/// ```cpp
+/// if (str.empty() || str == "1" || str == "all") { flag = BCLog::ALL; return true; }
+/// ```
+///
+/// Note what is *not* here. `none` and `0` are Core's spellings for the
+/// `-debug` **config option** only, where `SetLoggingCategories`
+/// (`src/init/common.cpp`) special-cases them as a drain over the argument
+/// list. They are absent from `LOG_CATEGORIES_BY_STR`, so `EnableCategory` and
+/// `DisableCategory` both fail on them and the `logging` RPC answers
+/// `-8 unknown logging category none`. Treating them as "disable everything"
+/// here meant `logging '["none"]'` silently turned off all logging on a node
+/// where Core would have refused the call.
+pub const ALL_CATEGORIES: [&str; 3] = ["", "all", "1"];

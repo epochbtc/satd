@@ -2413,6 +2413,47 @@ fn test_logging_reports_and_changes_the_real_filter() {
     assert_eq!(r["error"]["message"], "unknown logging category nosuchcategory");
     assert_eq!(logging(&mut node, vec![]), before, "a rejected call must apply nothing");
 
+    // Core's wildcard set is `GetLogCategory`'s: "", "1" and "all" all mean
+    // everything. The empty string is the one that is easy to miss, and it is
+    // the one a caller reaches by accident.
+    for wildcard in ["", "1", "all"] {
+        let r = logging(&mut node, vec![serde_json::json!([wildcard])]);
+        assert!(
+            r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+            "{wildcard:?} must enable every category: {r}"
+        );
+    }
+
+    // `none` and `0` are *not* in that set. They are `-debug` config
+    // spellings, absent from Core's `LOG_CATEGORIES_BY_STR`, so both
+    // `EnableCategory` and `DisableCategory` fail on them and the RPC answers
+    // "unknown logging category". Accepting them meant `logging '["none"]'`
+    // silently turned off all logging where Core refuses the call.
+    for name in ["none", "0"] {
+        let before = logging(&mut node, vec![]);
+        let r = node
+            .rpc_call_with_params("logging", vec![serde_json::json!([name])])
+            .unwrap();
+        assert_eq!(r["error"]["code"], -8, "{name}: {r}");
+        assert_eq!(r["error"]["message"], format!("unknown logging category {name}"));
+        assert_eq!(
+            logging(&mut node, vec![]),
+            before,
+            "{name} must not have been applied"
+        );
+
+        // And in the exclude slot too, which is where "turn everything off"
+        // would have been reached from.
+        let r = node
+            .rpc_call_with_params(
+                "logging",
+                vec![serde_json::json!([]), serde_json::json!([name])],
+            )
+            .unwrap();
+        assert_eq!(r["error"]["code"], -8, "{name} (exclude): {r}");
+        assert_eq!(logging(&mut node, vec![]), before, "{name} (exclude)");
+    }
+
     node.stop();
 }
 
