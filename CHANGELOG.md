@@ -58,6 +58,9 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `submitpackage` reported `bad-txns-inputs-missingorspent` for a child that
+  left its parent's ephemeral dust unspent, burying the real reason. It now
+  reports `missing-ephemeral-spends`, as Core does (#673).
 - `-connect=0` was parsed as the peer address `0`, so the node dialled
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling

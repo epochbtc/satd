@@ -234,6 +234,15 @@ reads `/proc/<pid>/fd` to find a node's listening sockets and a shim owns none,
 so two bind tests reported binding nothing at all. The shim now execs satd in
 its own process and tees the log from a forked child.
 
+That arrangement carries an invariant worth knowing before adding to it: the
+tee is a separate process, and the framework waits on *satd's* pid before
+reading the node's stdout, so the tee is only safe for a node that outlives
+that first read. An invocation that prints one thing and exits (`-h`, `-help`,
+`-?`, `-version`) can lose the race outright and hand the test an empty
+stdout, so those exec straight through with no tee at all --
+`EXITS_IMMEDIATELY` in the shim. Anything added later that prints and exits
+belongs in that set.
+
 ## Extending
 
 `debuglog_map.toml` rules for `core-log` rows, and the `core-net-policy` and
