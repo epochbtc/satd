@@ -50,6 +50,7 @@ jobs:
         run: |
           contrib/core-functional/tests/test_check_inventory.sh
           contrib/core-functional/tests/test_check_results.sh
+          contrib/core-functional/tests/test_shim_bitcoind.sh
 
       - name: Named-parameter table matches the pinned Core
         run: |

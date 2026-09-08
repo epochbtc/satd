@@ -18,6 +18,10 @@ provided here. That is a deliberately short list:
   4. An empty `wallets/` directory, which Core always has and the cache builder
      removes. satd has no wallet to create it.
 
+The tee in (1) is only safe for a node that outlives the framework's first
+look at its stdout, so an invocation that prints and exits is handed straight
+to satd with no tee at all -- see EXITS_IMMEDIATELY.
+
 What the shim deliberately does NOT do: translate, drop, or invent node
 options. satd accepts Core's spelling directly, and skips
 recognized-but-unsupported Core options with a warning of its own. An option
@@ -34,6 +38,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
+
+# Invocations that print one thing and exit, rather than starting a node.
+#
+# These must not be teed. The framework waits on satd's pid and then reads the
+# stdout file straight away; the tee is a *separate* process, and nothing
+# synchronises it with satd's exit. A node that runs for seconds is drained
+# long before anything reads the file, but a process that writes once and exits
+# can lose the race outright, and the test sees an empty stdout. None of the
+# shim's four jobs apply to these anyway -- nothing greps a help dump for a log
+# line -- so they exec straight through.
+EXITS_IMMEDIATELY = frozenset({"h", "help", "?", "version"})
+
 
 # Chain-name -> datadir subdirectory, matching Core's layout (mainnet is flat).
 CHAIN_DIRS = {
@@ -117,8 +133,20 @@ def apply_rules(line: str, rules) -> str:
     return line.rstrip("\n") + " | " + " | ".join(extra) + "\n"
 
 
+def exits_immediately(argv) -> bool:
+    return any(arg.lstrip("-").partition("=")[0] in EXITS_IMMEDIATELY for arg in argv)
+
+
 def main() -> int:
     argv = sys.argv[1:]
+
+    # Before anything else: a print-and-exit invocation gets no tee, no
+    # datadir scaffolding and no appended options, because none of that is
+    # observable and the tee is actively harmful (see EXITS_IMMEDIATELY).
+    if exits_immediately(argv):
+        os.execv(satd_binary(), [satd_binary()] + argv)
+        raise AssertionError("execv returned")  # unreachable
+
     datadir = parse_datadir(argv)
     chain = parse_chain(argv, datadir)
     chain_dir = datadir / CHAIN_DIRS.get(chain, chain)
@@ -150,6 +178,11 @@ def main() -> int:
     # read end plus the real stdout, point our stdout at the write end, and
     # exec. Signal forwarding disappears with the indirection -- the framework's
     # SIGTERM now lands on satd directly.
+    #
+    # The invariant this arrangement needs: satd must outlive the framework's
+    # first read of the stdout file, because the tee is a separate process and
+    # waiting on satd does not wait for it. Any future invocation that prints
+    # and exits belongs in EXITS_IMMEDIATELY, not here.
     read_fd, write_fd = os.pipe()
     if os.fork() == 0:
         # Child: tee satd's stdout into debug.log and on to the real stdout.
