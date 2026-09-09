@@ -5465,6 +5465,11 @@ fn spawn_two_node_relay_pair() -> (TestNode, TestNode) {
     let relay = TestNode::start(&[
         &format!("--port={}", relay_p2p_port),
         &format!("--connect=127.0.0.1:{}", miner_p2p_port),
+        // `-connect` soft-sets `-listen=0` (Core's `InitParameterInteraction`),
+        // and this relay has to accept the raw P2P client the orphan tests
+        // dial in. Core's own functional framework arranges the same thing by
+        // appending a `-bind` to every node it starts.
+        "--listen=1",
     ]);
 
     // Wait for relay to sync + exit IBD. Scaled by SATD_TEST_TIMEOUT_MULT

@@ -25,12 +25,6 @@ impl PeerAddr {
         }
     }
 
-    /// Try to parse a string as a PeerAddr.
-    /// Handles "host:port" where host can be a .onion address or IP.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        Self::parse_with_default_port(s, 8333)
-    }
-
     /// Parse an address string, using `default_port` when the input has no port.
     /// Matches Core's `LookupHost` which resolves shorthand IPs and appends the
     /// network's default port when none is specified.
@@ -61,15 +55,20 @@ impl PeerAddr {
         if let Some(sa) = s.to_socket_addrs().ok().and_then(|mut it| it.next()) {
             return Ok(PeerAddr::Socket(sa));
         }
-        // If no port was specified, try appending the default port.
+        // A bare IP literal takes the default port. Checked before the
+        // colon test below, because every IPv6 literal contains colons: with
+        // only that test, `-connect=2001:db8::1` fell through to "could not
+        // resolve" while `-connect=1.2.3.4` worked. Core's `Lookup(…,
+        // default_port)` accepts both.
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            return Ok(PeerAddr::Socket(SocketAddr::new(ip, default_port)));
+        }
+        // A hostname with no port. The colon test keeps `host:notaport` from
+        // being retried as `host:notaport:<default>`.
         if !s.contains(':') {
             let with_port = format!("{}:{}", s, default_port);
             if let Some(sa) = with_port.to_socket_addrs().ok().and_then(|mut it| it.next()) {
                 return Ok(PeerAddr::Socket(sa));
-            }
-            // Try as bare IP address with default port.
-            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-                return Ok(PeerAddr::Socket(SocketAddr::new(ip, default_port)));
             }
         }
         Err(format!("invalid address '{}': could not resolve", s))
@@ -630,6 +629,47 @@ mod rpc_json_tests {
         assert_eq!(sent["ping"], 64);
         assert_eq!(sent["pong"], 32);
         assert_eq!(v["bytesrecv_per_msg"].as_object().unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod default_port_tests {
+    use super::*;
+
+    /// `-connect`/`-addnode` entries with no port take the *network's* port.
+    /// This is the whole of change #1 in #690: reverting the call sites to a
+    /// literal 8333 must fail a named test, and before this one nothing did.
+    #[test]
+    fn a_portless_entry_takes_the_networks_default() {
+        for (network, port) in [
+            (bitcoin::Network::Bitcoin, 8333u16),
+            (bitcoin::Network::Testnet, 18333),
+            (bitcoin::Network::Testnet4, 48333),
+            (bitcoin::Network::Signet, 38333),
+            (bitcoin::Network::Regtest, 18444),
+        ] {
+            assert_eq!(default_p2p_port(network), port, "{network}");
+            let addr = PeerAddr::parse_with_default_port("1.2.3.4", port)
+                .unwrap_or_else(|e| panic!("{network}: {e}"));
+            assert_eq!(addr.to_string(), format!("1.2.3.4:{port}"), "{network}");
+            // An explicit port always wins over the network default.
+            let addr = PeerAddr::parse_with_default_port("1.2.3.4:1234", port).unwrap();
+            assert_eq!(addr.to_string(), "1.2.3.4:1234", "{network}");
+        }
+    }
+
+    /// Every IPv6 literal contains colons, so the "has no port" test alone
+    /// rejected them: `-connect=2001:db8::1` was "could not resolve" while
+    /// `-connect=1.2.3.4` worked. The manual promises both.
+    #[test]
+    fn a_bare_ipv6_literal_takes_the_default_port_too() {
+        let addr = PeerAddr::parse_with_default_port("2001:db8::1", 38333).expect("bare IPv6");
+        assert_eq!(addr.to_string(), "[2001:db8::1]:38333");
+        let addr = PeerAddr::parse_with_default_port("::1", 18444).expect("loopback IPv6");
+        assert_eq!(addr.to_string(), "[::1]:18444");
+        // A bracketed literal with an explicit port keeps it.
+        let addr = PeerAddr::parse_with_default_port("[2001:db8::1]:1234", 38333).unwrap();
+        assert_eq!(addr.to_string(), "[2001:db8::1]:1234");
     }
 }
 

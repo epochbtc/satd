@@ -3311,9 +3311,17 @@ async fn main() {
     // the manager so gossiped addresses are learned but never dialled.
     peer_manager.set_automatic_outbound(config.automatic_outbound);
 
-    // Connect to configured peers (and register for auto-reconnect)
+    // Connect to configured peers (and register for auto-reconnect).
+    //
+    // The default port is the *network's*. `PeerAddr::parse` hardcodes 8333,
+    // so `-connect=1.2.3.4` on signet dialled a mainnet port -- the same
+    // hardcoded default by which `-connect=0` used to reach `0.0.0.0:8333`.
+    // Core resolves both `-connect` and `-addnode` through `Lookup(…,
+    // default_port)` with `Params().GetDefaultPort()`, which is what
+    // `-seednode` already does here via `resolve_operator_seeds`.
+    let default_peer_port = node::net::peer::default_p2p_port(config.network);
     for addr_str in &config.connect {
-        match node::net::peer::PeerAddr::parse(addr_str) {
+        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_peer_port) {
             Ok(addr) => {
                 peer_manager.add_peer_addr(addr.clone());
                 let pm = peer_manager.clone();
@@ -3336,7 +3344,7 @@ async fn main() {
     // and `getaddednodeinfo` reports that list. Adding the address without
     // recording the entry dials the peer but leaves it invisible to the RPC.
     for addr_str in &config.addnode {
-        match node::net::peer::PeerAddr::parse(addr_str) {
+        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_peer_port) {
             Ok(addr) => {
                 peer_manager.addnode_add(addr_str, addr.clone());
                 let pm = peer_manager.clone();

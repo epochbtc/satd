@@ -37,6 +37,18 @@ item below is (or will be) written up in full in the in-development
 - **Breaking:** an RPC call that passes more arguments than the method
   declares is rejected with `-1`, as Core does, instead of being answered with
   the surplus ignored (#688).
+- **Breaking:** `-connect` soft-sets `-listen=0`, as Core's
+  `InitParameterInteraction` does; so does `-maxconnections` ≤ 0. A node pinned
+  to specific peers no longer accepts inbound connections unless `-bind`,
+  `-whitebind` or an explicit `-listen` says so (#690).
+- **Breaking:** `-listen=0` soft-sets `-listenonion=0`, as Core's
+  `InitParameterInteraction` does. A node pinned with `-connect` and
+  `-torcontrol` used to lower `listen` and still publish a hidden service,
+  accepting inbound peers over it. An explicit `-listenonion=1` still wins
+  (#690).
+- **Breaking:** a literal `-connect=0` mixed with a peer address is refused
+  rather than silently discarding the peer. `-connect=0` on its own, and
+  `-noconnect`, are unchanged (#690).
 - `generatetoaddress` and `generatetodescriptor` honour Core's `maxtries`
   argument, which also puts the first bound on satd's nonce grind (#688).
 - `help <command>` answers for every registered RPC, including the ones the
@@ -171,6 +183,11 @@ item below is (or will be) written up in full in the in-development
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling
   addresses it learned from gossip.
+- `-connect` and `-addnode` entries without a port took 8333 on every network;
+  they now take the network's default P2P port, as `-seednode` already did
+  (#690).
+- `-noconnect` is honoured rather than refused. Core treats it exactly like a
+  `-connect`, which satd can now express (#690).
 
 - `validateaddress` reported an address from another network as valid — it
   never checked the network at all.
