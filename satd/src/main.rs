@@ -1860,12 +1860,16 @@ async fn main() {
     // on every restart.
     peer_manager.load_addrman(&net_datadir.join("peers.dat"), 256);
 
-    // Load the persistent ban list (banlist.json).
-    match peer_manager.load_banlist(&net_datadir) {
-        Ok(true) => tracing::info!("Recreating the banlist database"),
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!("Failed to load banlist: {e}");
+    // Load the persistent ban list (banlist.json). A file that cannot be read
+    // or parsed is recreated, as Core's `BanMan::LoadBanlist` does — never a
+    // reason to stop persisting, which is what leaves `setban` silently inert.
+    {
+        let (recreated, why) = peer_manager.load_banlist(&net_datadir);
+        if let Some(why) = why {
+            tracing::warn!("{why}");
+        }
+        if recreated {
+            tracing::info!("Recreating the banlist database");
         }
     }
 
@@ -3781,6 +3785,15 @@ async fn main() {
 
     // Persist the address book so learned peers survive a restart.
     peer_manager.dump_addrman(&net_datadir.join("peers.dat"));
+
+    // Core dumps the ban list in `~BanMan()`. Every mutator flushes inline, so
+    // the only state that can still be pending here is a re-armed dirty flag
+    // from a write that failed earlier (ENOSPC, EIO). Without this the retry
+    // depends on the periodic prune, which only runs while the node is below
+    // its outbound target -- so on a healthy or `-connect`-pinned node it
+    // never runs, and the ban is lost at shutdown having been reported as
+    // accepted.
+    peer_manager.flush_banlist();
 
     server_handle.stop().expect("Failed to stop server");
 

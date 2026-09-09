@@ -352,6 +352,23 @@ pub struct PeerManager {
     /// are keyed by normalised subnet string, survive restarts, and respond
     /// to `setmocktime`.
     ban_list: RwLock<crate::net::ban::BanList>,
+    /// Core's `DumpBanlist` `dump_mutex` (`src/banman.cpp`): serialises the
+    /// whole snapshot-then-write, not just the snapshot.
+    ///
+    /// Without it two flushes race, and both outcomes lose data. `setban`
+    /// runs on an RPC thread while the automatic-ban path runs on the manager
+    /// event loop, so this is reachable, not theoretical:
+    ///
+    /// - **Lost update.** A slow flush snapshots `{A}`, is preempted, a fast
+    ///   flush writes `{A, B}` and clears `dirty`, then the slow flush renames
+    ///   `{A}` over it. `B` is gone from the file *and* `dirty` is false, so
+    ///   nothing ever rewrites it — the exact silent-loss failure this whole
+    ///   change exists to close.
+    /// - **Torn file.** Both writes use one `banlist.json.tmp`; the second
+    ///   `File::create` truncates the first's file while it still holds the
+    ///   descriptor, so the bytes interleave and the renamed result is
+    ///   invalid JSON.
+    banlist_dump: parking_lot::Mutex<()>,
     /// Fee estimator fed from confirmed blocks (kept alive via Arc, used in block_processor).
     #[allow(dead_code)]
     fee_estimator: Arc<FeeEstimator>,
@@ -595,6 +612,7 @@ impl PeerManager {
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
             ban_list: RwLock::new(crate::net::ban::BanList::default()),
+            banlist_dump: parking_lot::Mutex::new(()),
             shutdown,
             prune_target_mb,
             max_connections: AtomicUsize::new(max_connections),
@@ -1979,10 +1997,12 @@ impl PeerManager {
             self.ban_list
                 .write()
                 .add(target, ban_created, banned_until)?;
+            self.flush_banlist();
             // Disconnect any connected peer whose IP falls within the ban.
             self.disconnect_banned_peers(target);
         } else {
             self.ban_list.write().remove(target)?;
+            self.flush_banlist();
         }
         Ok(())
     }
@@ -2020,19 +2040,56 @@ impl PeerManager {
     /// Clear all bans.
     pub fn clear_banned(&self) {
         self.ban_list.write().clear();
+        self.flush_banlist();
     }
 
     /// Load the ban list from `banlist.json` in `dir`. Returns whether the
-    /// file was recreated (caller should log the event).
-    pub fn load_banlist(&self, dir: &std::path::Path) -> Result<bool, String> {
+    /// database had to be recreated (caller logs Core's "Recreating the
+    /// banlist database") and, if so, why.
+    ///
+    /// This cannot fail. Core's `BanMan` constructor is `LoadBanlist();
+    /// DumpBanlist();` — an unreadable list is recreated, never a reason to
+    /// stop persisting. The old signature returned `Result`, and the caller
+    /// answered an `Err` by leaving the manager holding a default `BanList`
+    /// with no path, so every subsequent `setban` vanished on restart with no
+    /// error at any point.
+    pub fn load_banlist(&self, dir: &std::path::Path) -> (bool, Option<String>) {
         let path = dir.join("banlist.json");
-        let (mut list, recreated) = crate::net::ban::BanList::load(&path)?;
+        let (mut list, recreated, why) = crate::net::ban::BanList::load(&path);
         // Prune expired bans from the loaded list using the current node
         // clock (which may be mocktime).
         let now = crate::time::now_secs();
         list.prune_expired(now);
         *self.ban_list.write() = list;
-        Ok(recreated)
+        // Core dumps immediately after loading, which is what writes the file
+        // for a fresh datadir and rewrites a recreated one.
+        self.flush_banlist();
+        (recreated, why)
+    }
+
+    /// Core's `BanMan::DumpBanlist`: take the dump mutex, snapshot the list
+    /// under the ban-list lock, release *that* lock, then write. On a failed
+    /// write the list is marked dirty again so the next flush retries.
+    ///
+    /// Two locks, each doing one job. `banlist_dump` orders whole dumps
+    /// against each other, so a snapshot can never be written out of order
+    /// with respect to a newer one (see its declaration). `ban_list` is
+    /// released before the write so a concurrent `is_addr_banned` — on the
+    /// inbound-accept path — does not wait on a disk write.
+    ///
+    /// The write is still a blocking syscall on whichever thread calls this,
+    /// which for the automatic-ban path is the manager event loop. That is
+    /// unchanged by this split and is a separate problem.
+    pub fn flush_banlist(&self) {
+        let _dumping = self.banlist_dump.lock();
+        let pending = self.ban_list.write().take_pending_dump();
+        let Some((path, json)) = pending else {
+            return;
+        };
+        if let Err(e) = crate::net::ban::write_banlist(&path, &json) {
+            tracing::warn!("Failed to write banlist {}: {e}", path.display());
+            self.ban_list.write().mark_dirty();
+        }
     }
 
     /// Send a ping to all connected peers.
@@ -2207,6 +2264,7 @@ impl PeerManager {
                 // entry already exists (e.g. repeated misbehaviour) the add
                 // fails silently.
                 let _ = self.ban_list.write().add(&target, now, now + duration);
+                self.flush_banlist();
             }
         }
     }
@@ -2456,6 +2514,7 @@ impl PeerManager {
                     {
                         let now_secs = crate::time::now_secs();
                         self.ban_list.write().prune_expired(now_secs);
+                        self.flush_banlist();
                     }
 
                     for addr in addrs {
