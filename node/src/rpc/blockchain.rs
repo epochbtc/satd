@@ -93,7 +93,9 @@ fn next_block_hash(
 }
 
 /// Build the `getblockchaininfo` response from real chain state.
-pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
+/// `prune`: `None` when the node is not pruning, else the configured
+/// `-prune` target in MiB.
+pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64>) -> Value {
     let chain = match chain_state.network {
         Network::Regtest => "regtest",
         Network::Testnet => "test",
@@ -128,7 +130,7 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
     let now = crate::time::now_secs();
     let is_ibd = ChainState::tip_time_is_ibd(time as u32);
 
-    json!({
+    let mut out = json!({
         "chain": chain,
         "blocks": tip_height,
         "headers": chain_state.headers_tip_height().max(tip_height),
@@ -140,7 +142,11 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
         "initialblockdownload": is_ibd,
         "chainwork": format!("{:0>64}", chainwork),
         "size_on_disk": 0,
-        "pruned": false,
+        // Whether the node is actually pruning, not a constant `false`. satd
+        // implements `-prune` in full, so the old value told the operator of
+        // a pruned node that it held the whole chain -- and a client reading
+        // it would ask for a block that had been deleted.
+        "pruned": prune_target_mb.is_some(),
         // Core ≥ v27 warnings is an array of strings. Preserves older
         // behavior: if no active warnings, emit the empty-string form
         // Core used historically; otherwise emit the Core-v27 array.
@@ -148,7 +154,25 @@ pub fn get_blockchain_info(chain_state: &ChainState) -> Value {
             v if v.is_empty() => Value::String(String::new()),
             v => Value::Array(v.into_iter().map(Value::String).collect()),
         },
-    })
+    });
+    // Core emits these only on a pruned node, so they follow the flag rather
+    // than always appearing. `pruneheight` is deliberately absent: satd keeps
+    // no prune floor to read, and deriving one would mean walking the chain
+    // on every call. Recorded in CORE_DIFFERENCES.md.
+    if let Some(mib) = prune_target_mb {
+        // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes
+        // `uint64_t(nPruneArg) * 1024 * 1024` and `getblockchaininfo` reports
+        // that number verbatim. satd reported `mb * 1_000_000`, so `-prune=550`
+        // came back as 550,000,000 against Core's 576,716,800 — a 4.9%
+        // divergence on a byte budget an operator sizes a disk against.
+        out["prune_target_size"] = json!(mib.saturating_mul(1024 * 1024));
+        // satd has no manual-pruning mode (no `pruneblockchain` RPC), so every
+        // pruning node prunes automatically. Core's `-prune=1` — its spelling
+        // for manual pruning — is refused at startup rather than silently
+        // taken as a 1 MiB budget, so it cannot reach here.
+        out["automatic_pruning"] = json!(true);
+    }
+    out
 }
 
 /// `getdeploymentinfo` — report the activation status of buried softfork
@@ -241,6 +265,17 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         1.0
     };
 
+    // Core's `coins_db_cache_bytes` is the UTXO database's cache size; satd's
+    // equivalent is the RocksDB block cache, which the store reports. Both
+    // fields used to be a flat `0` while `getsysteminfo` reported real cache
+    // figures off the same `ChainState`.
+    //
+    // `coins_tip_cache_bytes` is deliberately absent rather than zero: satd's
+    // in-memory coin cache is bounded by entry count, not bytes, so there is
+    // no byte figure to report and inventing one would be the defect this
+    // change removes. Recorded in CORE_DIFFERENCES.md.
+    let coins_db_cache_bytes = chain_state.store_ref().block_cache_capacity_bytes();
+
     let mut chainstates = Vec::new();
 
     match chain_state.background() {
@@ -256,8 +291,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "bestblockhash": tip_hash.to_string(),
                 "difficulty": difficulty,
                 "verificationprogress": verificationprogress,
-                "coins_db_cache_bytes": 0,
-                "coins_tip_cache_bytes": 0,
+                "coins_db_cache_bytes": coins_db_cache_bytes,
                 "snapshot_blockhash": bg.snapshot_hash().to_string(),
                 "validated": false,
                 "assumeutxo_rejected": bg.is_rejected(),
@@ -278,8 +312,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "bestblockhash": bg.tip_hash().to_string(),
                 "difficulty": bg_difficulty,
                 "verificationprogress": bg_progress,
-                "coins_db_cache_bytes": 0,
-                "coins_tip_cache_bytes": 0,
+                "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
             }));
         }
@@ -290,8 +323,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "bestblockhash": tip_hash.to_string(),
                 "difficulty": difficulty,
                 "verificationprogress": verificationprogress,
-                "coins_db_cache_bytes": 0,
-                "coins_tip_cache_bytes": 0,
+                "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
             }));
         }
@@ -1270,10 +1302,30 @@ pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) ->
     json!(true)
 }
 
-/// `savemempool` — serialize mempool to disk.
-pub fn save_mempool() -> Value {
-    // Stub: mempool persistence not yet implemented
-    Value::Null
+/// `savemempool` — write `mempool.dat` now.
+///
+/// This used to return Core's exact success value while writing nothing, even
+/// though `mempool::persist::dump_mempool` is real and runs on every clean
+/// shutdown. The caller's whole reason for the call is to make the mempool
+/// durable *before* something risky, and the response said it had.
+///
+/// Core's shape: `{"filename": "<path>"}` on success, `-1` with the OS error
+/// on failure.
+pub fn save_mempool(
+    mempool: &crate::mempool::pool::Mempool,
+    net_datadir: &std::path::Path,
+) -> Result<Value, (i32, String)> {
+    match crate::mempool::persist::dump_mempool(mempool, net_datadir) {
+        Ok(_) => Ok(json!({
+            "filename": net_datadir.join("mempool.dat").to_string_lossy(),
+        })),
+        // Core's message verbatim (`src/rpc/mempool.cpp`); `mempool_persist.py`
+        // compares it exactly, and the OS error satd appended is in the log.
+        Err(e) => {
+            tracing::warn!(error = %e, "savemempool: could not write mempool.dat");
+            Err((-1, "Unable to dump mempool to disk".to_string()))
+        }
+    }
 }
 
 /// `dumptxoutset <path>` — emit a Bitcoin Core-compatible UTXO snapshot
@@ -1599,7 +1651,7 @@ mod tests {
     #[test]
     fn test_getblockchaininfo_genesis() {
         let (cs, dir) = make_cs();
-        let info = get_blockchain_info(&cs);
+        let info = get_blockchain_info(&cs, None);
 
         assert_eq!(info["chain"], "regtest");
         assert_eq!(info["blocks"], 0);

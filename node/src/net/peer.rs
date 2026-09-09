@@ -208,6 +208,13 @@ pub struct PeerInfo {
     /// Wire transport (v1 plaintext or BIP 324 v2). Set once the
     /// connection is established; defaults to v1.
     pub transport: TransportProtocol,
+    /// BIP 324 session ID, for a v2 peer. `None` on v1.
+    ///
+    /// `getpeerinfo.session_id` exists for out-of-band MITM detection: both
+    /// ends compare it, and a mismatch means someone is in between. satd
+    /// reported `""` for every peer — indistinguishable from "no session", so
+    /// the one check the field is for could not be made.
+    pub session_id: Option<[u8; 32]>,
     pub state: PeerState,
     pub version: Option<VersionMessage>,
     pub services: ServiceFlags,
@@ -269,6 +276,7 @@ impl PeerInfo {
             addr,
             direction,
             transport: TransportProtocol::V1,
+            session_id: None,
             state: PeerState::Connecting,
             version: None,
             services: ServiceFlags::NONE,
@@ -472,7 +480,12 @@ impl PeerInfo {
             "bytesrecv_per_msg": per_msg_json(&stats.bytes_recv_per_msg()),
             "minfeefilter": self.fee_filter as f64 / 100_000_000.0,
             "connection_type": connection_type,
-            "session_id": "",
+            // Core pushes this only for a v2 peer (`if (transport ==
+            // V2) ... HexStr(session_id)`), so v1 keeps Core's empty string.
+            "session_id": match self.session_id {
+                Some(id) => hex::encode(id),
+                None => String::new(),
+            },
         });
         // Core reports the local end of the connection here, and its own test
         // framework matches a peer by it — but only when it has one: the field

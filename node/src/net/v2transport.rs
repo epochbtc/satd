@@ -324,6 +324,17 @@ pub struct V2Writer {
 }
 
 impl V2Connection {
+    /// The BIP 324 session ID for this connection.
+    ///
+    /// Reported by `getpeerinfo.session_id`, whose entire purpose is
+    /// out-of-band MITM detection: both ends compare the value, and a
+    /// mismatch means someone is between them. satd reported `""` for every
+    /// peer, v2 included, which is indistinguishable from "no session" — so
+    /// the check the field exists for silently could not be made.
+    pub fn session_id(&self) -> [u8; 32] {
+        *self.cipher.id()
+    }
+
     /// Wrap a socket and an established cipher session. `leftover` is any
     /// bytes read past the handshake's version packet.
     pub fn new(stream: TcpStream, cipher: CipherSession, leftover: Vec<u8>) -> Self {

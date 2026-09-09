@@ -810,17 +810,101 @@ pub fn combine_raw_transaction(hex_txs: &[String]) -> Result<Value, (i32, String
 }
 
 /// `decodescript` — decode a hex-encoded script.
-pub fn decode_script(hex_script: &str) -> Result<Value, (i32, String)> {
+pub fn decode_script(
+    hex_script: &str,
+    network: bitcoin::Network,
+) -> Result<Value, (i32, String)> {
     let script_bytes = hex::decode(hex_script).map_err(|_| (-22, "Script decode failed".to_string()))?;
     let script = bitcoin::ScriptBuf::from_bytes(script_bytes);
 
     let script_type = script_type(&script);
 
-    Ok(json!({
+    // Core emits `p2sh` as the P2SH address that would wrap this script
+    // (`GetScriptForDestination(ScriptHash(script))`), omitting it only for a
+    // script that cannot be wrapped. An empty string was indistinguishable
+    // from "not a valid script", on the field whose whole use is telling you
+    // the address to pay.
+    let mut out = json!({
         "asm": format!("{}", script),
         "type": script_type,
-        "p2sh": "", // would need hash computation
-    }))
+    });
+    if can_wrap_in_p2sh(&script) {
+        // `p2sh_from_hash`, not `Address::p2sh`: the latter refuses a script
+        // over 520 bytes (the redeemScript push limit), and Core applies no
+        // such gate here -- its ceiling is `IsUnspendable()`'s 10,000. Going
+        // through the hash directly keeps a 600-byte script's address, which
+        // Core returns and satd used to swallow into an empty string and then
+        // drop, leaving the caller no address and no error.
+        let hash = bitcoin::hashes::Hash::hash(script.as_bytes());
+        let p2sh = bitcoin::Address::p2sh_from_hash(bitcoin::ScriptHash::from_raw_hash(hash), network);
+        out["p2sh"] = json!(p2sh.to_string());
+    }
+    Ok(out)
+}
+
+/// Bitcoin Core's `can_wrap` from `decodescript`
+/// (`src/rpc/rawtransaction.cpp`): whether a P2SH address wrapping this script
+/// is worth reporting.
+///
+/// satd's previous predicate -- "not already P2SH, and at most 520 bytes" --
+/// was wrong in both directions. It emitted a P2SH address for scripts that
+/// can never be spent (an `OP_RETURN`, a v1 taproot output script, a P2A
+/// anchor, an unknown witness program, a truncated push), and it withheld one
+/// for a 521-to-10,000-byte redeemScript that Core happily reports.
+fn can_wrap_in_p2sh(script: &bitcoin::Script) -> bool {
+    // The five `TxoutType`s Core returns false for outright.
+    if script.is_op_return()          // NULL_DATA
+        || script.is_p2sh()           // SCRIPTHASH
+        || script.is_p2tr()           // WITNESS_V1_TAPROOT
+        // WITNESS_UNKNOWN and ANCHOR: any witness program that is not v0.
+        // (v0 keyhash / scripthash are wrappable; Core lists them above the
+        // early return.)
+        || (script.is_witness_program() && !script.is_p2wpkh() && !script.is_p2wsh())
+    {
+        return false;
+    }
+    // `!script.HasValidOps() || script.IsUnspendable()`.
+    if !has_valid_ops(script) || script.len() > MAX_SCRIPT_SIZE {
+        return false;
+    }
+    // `if (op == OP_CHECKSIGADD || IsOpSuccess(op)) return false;`
+    // `OP_CHECKSIGADD` (0xba) is already above `MAX_OPCODE` and so is caught
+    // by `HasValidOps`; the OP_SUCCESS opcodes at or below it are not.
+    for op in script_opcodes(script) {
+        if is_op_success(op) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Core's `MAX_SCRIPT_SIZE` (`src/script/script.h`), the ceiling
+/// `CScript::IsUnspendable` applies.
+const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// Core's `MAX_OPCODE` (`OP_NOP10`).
+const MAX_OPCODE: u8 = 0xb9;
+
+/// The opcodes of `script`, ignoring pushed data. `None` is never yielded: a
+/// malformed push simply ends the walk, and [`has_valid_ops`] is what reports
+/// that separately.
+fn script_opcodes(script: &bitcoin::Script) -> impl Iterator<Item = u8> + '_ {
+    script
+        .instruction_indices()
+        .filter_map(|r| r.ok())
+        .filter_map(|(i, _)| script.as_bytes().get(i).copied())
+}
+
+/// Core's `IsOpSuccess` (`src/script/script.cpp`).
+fn is_op_success(op: u8) -> bool {
+    op == 80
+        || op == 98
+        || (126..=129).contains(&op)
+        || (131..=134).contains(&op)
+        || (137..=138).contains(&op)
+        || (141..=142).contains(&op)
+        || (149..=153).contains(&op)
+        || (187..=254).contains(&op)
 }
 
 /// Parse a sighash type string into EcdsaSighashType.
@@ -1195,35 +1279,36 @@ pub fn is_burn_output(txout: &TxOut) -> bool {
     !has_valid_ops(script)
 }
 
-/// Mirrors Core's `CScript::HasValidOps()`: iterates the script's opcodes
-/// via `GetOp` and returns `false` if any opcode is undefined.
+/// Core's `CScript::HasValidOps` (`src/script/script.cpp`):
+///
+/// ```cpp
+/// while (it < end()) {
+///     if (!GetOp(it, opcode, item) || opcode > MAX_OPCODE
+///         || item.size() > MAX_SCRIPT_ELEMENT_SIZE) return false;
+/// }
+/// ```
+///
+/// Three conditions, and satd checked only a corner of one: it rejected the
+/// single byte `0xff` and accepted every other undefined opcode, every
+/// truncated push, and every oversized pushed element. `MAX_OPCODE` is
+/// `OP_NOP10` (0xb9), so everything above it -- `OP_CHECKSIGADD` at 0xba
+/// included -- makes a script invalid-ops in Core.
 fn has_valid_ops(script: &bitcoin::Script) -> bool {
-    // Walk through the script's instruction iterator. `rust-bitcoin`'s
-    // `Instructions` yields `Result<Instruction, Error>` where errors
-    // represent un-parseable regions. An `Err` or an opcode that is
-    // unassigned / explicitly invalid counts as "not valid ops".
+    const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
     for instr in script.instructions() {
         match instr {
+            // Core's `GetOp` returned false: a truncated or malformed push.
             Err(_) => return false,
-            Ok(bitcoin::script::Instruction::Op(op)) => {
-                let byte = op.to_u8();
-                // Core's FIRST_UNDEFINED_OP_VALUE is 0xfb (OP_INVALIDOPCODE
-                // is 0xff). However, opcodes 0xbb through 0xfe are also
-                // undefined/reserved ("OP_NOP" range ends at 0xb9,
-                // OP_CHECKSIGADD is 0xba). The simplest mirror of Core's
-                // check: opcodes with numeric value in [0xbb..=0xff] are
-                // treated as undefined.
-                // Actually Core's check is simpler: opcodes >= OP_INVALIDOPCODE
-                // (0xff) are invalid, plus certain NOP ranges. But the
-                // main test case is OP_INVALIDOPCODE (0xff).
-                // Core defines FIRST_UNDEFINED_OP_VALUE = 0xfb (after
-                // OP_CHECKSIGADD = 0xba). So opcodes >= 0xfb are invalid.
-                // Let's just check for 0xff which is the test case.
-                if byte == 0xff {
+            Ok(bitcoin::script::Instruction::PushBytes(b)) => {
+                if b.len() > MAX_SCRIPT_ELEMENT_SIZE {
                     return false;
                 }
             }
-            Ok(bitcoin::script::Instruction::PushBytes(_)) => {}
+            Ok(bitcoin::script::Instruction::Op(op)) => {
+                if op.to_u8() > MAX_OPCODE {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -1390,6 +1475,68 @@ mod tests {
     use super::*;
     use crate::mempool::pool::Mempool;
     use bitcoin::hashes::Hash;
+
+    /// `decodescript.p2sh` is emitted exactly when Core's `can_wrap` says so.
+    ///
+    /// satd's predicate was "not already P2SH, and at most 520 bytes", which
+    /// is wrong in both directions: it minted an address for scripts that can
+    /// never be spent, and withheld one for a redeemScript Core reports.
+    #[test]
+    fn decodescript_p2sh_follows_cores_can_wrap() {
+        let net = bitcoin::Network::Regtest;
+        let p2sh_of = |hex: &str| -> Option<String> {
+            let r = decode_script(hex, net).expect("decodes");
+            r.get("p2sh").and_then(|v| v.as_str()).map(str::to_string)
+        };
+
+        // Wrappable: Core's MULTISIG / NONSTANDARD / PUBKEY / PUBKEYHASH /
+        // WITNESS_V0_* arm.
+        assert!(p2sh_of("51").is_some(), "OP_TRUE is nonstandard and wrappable");
+        // P2WPKH output script: OP_0 <20 bytes>.
+        assert!(p2sh_of("0014000102030405060708090a0b0c0d0e0f10111213").is_some());
+
+        // The five types Core refuses outright.
+        assert_eq!(p2sh_of("6a04deadbeef"), None, "NULL_DATA is unspendable");
+        assert_eq!(
+            p2sh_of("a914000102030405060708090a0b0c0d0e0f1011121387"),
+            None,
+            "SCRIPTHASH"
+        );
+        assert_eq!(
+            p2sh_of(&format!("5120{}", "ab".repeat(32))),
+            None,
+            "WITNESS_V1_TAPROOT"
+        );
+        assert_eq!(p2sh_of("51024e73"), None, "ANCHOR");
+        assert_eq!(
+            p2sh_of("5214000102030405060708090a0b0c0d0e0f10111213"),
+            None,
+            "WITNESS_UNKNOWN"
+        );
+
+        // `!HasValidOps()`: a truncated push, and an undefined opcode.
+        assert_eq!(p2sh_of("4c"), None, "a truncated PUSHDATA1");
+        assert_eq!(p2sh_of("ff"), None, "OP_INVALIDOPCODE");
+        assert_eq!(p2sh_of("ba"), None, "OP_CHECKSIGADD is above MAX_OPCODE");
+
+        // `IsOpSuccess` at or below MAX_OPCODE, which HasValidOps lets past.
+        assert_eq!(p2sh_of("50"), None, "opcode 80 is OP_SUCCESS");
+        assert_eq!(p2sh_of("62"), None, "opcode 98 is OP_SUCCESS");
+
+        // Core has no 520-byte gate here -- its ceiling is `IsUnspendable`'s
+        // 10,000 -- so a 600-byte redeemScript gets an address. satd used to
+        // swallow rust-bitcoin's refusal into an empty string and drop it,
+        // leaving the caller no address and no error.
+        assert!(
+            p2sh_of(&"51".repeat(600)).is_some(),
+            "a 600-byte redeemScript is wrappable"
+        );
+        assert_eq!(
+            p2sh_of(&"51".repeat(10_001)),
+            None,
+            "over IsUnspendable's 10,000 bytes"
+        );
+    }
 
     #[test]
     fn test_getmempoolinfo_empty() {

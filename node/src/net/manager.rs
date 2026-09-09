@@ -721,7 +721,7 @@ impl PeerManager {
     }
 
     /// Whether transaction relay is suppressed (`-blocksonly`).
-    fn blocksonly(&self) -> bool {
+    pub fn blocksonly(&self) -> bool {
         self.blocksonly.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -4088,9 +4088,11 @@ impl PeerManager {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
 
-        // Compute keep_blocks from prune target.
+        // Compute keep_blocks from the prune target. `-prune` is in **MiB**,
+        // as Core's is (`blockmanager_args.cpp`: `nPruneArg * 1024 * 1024`);
+        // the 2 MiB divisor is an average-block-size assumption, not a unit.
         let keep_blocks: u32 = if prune_target_mb > 0 {
-            ((prune_target_mb * 1_000_000 / (2 * 1_000_000)) as u32).max(288)
+            ((prune_target_mb * 1024 * 1024 / (2 * 1024 * 1024)) as u32).max(288)
         } else {
             0
         };
@@ -6151,6 +6153,13 @@ impl PeerManager {
             IncomingTransport::Raw(s) => s.local_addr().ok(),
             IncomingTransport::Established(c) => c.local_addr().ok(),
         };
+        // The BIP 324 session ID is recorded where the transport is (after
+        // the handshake), so the two can never disagree. An inbound peer
+        // arrives here already `Established` and gets it immediately.
+        info.session_id = match &transport {
+            IncomingTransport::Raw(_) => None,
+            IncomingTransport::Established(c) => c.session_id(),
+        };
         let handle = PeerHandle {
             info,
             msg_tx,
@@ -6398,10 +6407,15 @@ impl PeerManager {
             }
         };
 
-        // Record the negotiated transport for getpeerinfo / metrics.
+        // Record the negotiated transport for getpeerinfo / metrics, and the
+        // BIP 324 session ID alongside it. Set together, from the same
+        // connection, so `transport == "v2transport"` and an empty
+        // `session_id` cannot be reported for the same peer.
         let transport_protocol = conn.transport_protocol();
+        let session_id = conn.session_id();
         if let Some(handle) = self.peers.write().get_mut(&id) {
             handle.info.transport = transport_protocol;
+            handle.info.session_id = session_id;
         }
 
         // Perform handshake with timeout
@@ -6934,7 +6948,15 @@ impl PeerManager {
             .unwrap_or(ConnType::OutboundFullRelay)
     }
 
-    fn build_version_message(&self, receiver: SocketAddr, conn_type: ConnType) -> VersionMessage {
+    /// The service flags this node advertises right now.
+    ///
+    /// The single source of truth for both the wire and `getnetworkinfo`.
+    /// `localservices` used to be a hardcoded `0000000000000409`, claiming
+    /// `NODE_NETWORK_LIMITED` — which satd never sets — and never reflecting
+    /// `NODE_COMPACT_FILTERS`, which it does set once the filter index can
+    /// serve. So the RPC described a node that did not exist, in both
+    /// directions at once.
+    pub fn local_services(&self) -> ServiceFlags {
         // Only the cfg-gated COMPACT_FILTERS bit below mutates this.
         #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
@@ -6947,6 +6969,11 @@ impl PeerManager {
         if self.peer_serve_filters_ready() {
             services |= ServiceFlags::COMPACT_FILTERS;
         }
+        services
+    }
+
+    fn build_version_message(&self, receiver: SocketAddr, conn_type: ConnType) -> VersionMessage {
+        let services = self.local_services();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

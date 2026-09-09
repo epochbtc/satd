@@ -109,6 +109,39 @@ item below is (or will be) written up in full in the in-development
 - `getmemoryinfo` reported the process RSS as the secure-allocator pool's
   `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
   no secure allocator, so the pool is empty and the numbers are zero (#667).
+- Nine RPC fields reported constants chosen to look plausible rather than
+  values read from the node, in two cases contradicting another RPC on the same
+  node (#702). `getnetworkinfo` now reports the configured `relayfee` /
+  `incrementalfee` (the fixed `0.00001000` was ten times satd's own default,
+  while `getmempoolinfo` had the real value all along), the service flags it
+  actually advertises (the fixed value claimed `NODE_NETWORK_LIMITED`, which
+  satd never sets, and never showed `NODE_COMPACT_FILTERS`, which it does),
+  `localrelay` as the inverse of `-blocksonly`, and the node's real warnings.
+  `getblockchaininfo.pruned` follows `-prune` instead of being false on a
+  pruned node, with Core's `prune_target_size` / `automatic_pruning` alongside.
+  `getmininginfo.warnings` is populated. `decodescript.p2sh` returns the P2SH
+  address. `getpeerinfo.session_id` carries the BIP 324 session ID for a v2
+  peer — the field exists for out-of-band MITM detection and was empty for
+  every peer. `decodepsbt.fee` and `analyzepsbt.fee` are computed once every
+  input's UTXO is known, as Core does — through Core's `GetInputUTXO` rules,
+  which prefer the `non_witness_utxo` and check its txid against the input's
+  own `previous_output`, so a PSBT's author cannot choose the fee that is
+  reported. `analyzepsbt.estimated_feerate` stays absent: Core derives it from
+  a dummy-signed transaction, which satd cannot produce, and the unsigned size
+  would overstate the rate by the whole witness.
+- **`savemempool` wrote nothing** while returning Core's success value. It now
+  writes `mempool.dat` and returns Core's `{"filename": …}` (#702).
+- **Breaking:** `-prune` is measured in MiB, as Core's is
+  (`nPruneArg * 1024 * 1024`), so `getblockchaininfo.prune_target_size` for
+  `-prune=550` reports 576,716,800 rather than 550,000,000 and the pruner keeps
+  the matching number of blocks. `-prune=1` — Core's spelling for manual
+  pruning, which satd does not implement — is refused at startup instead of
+  being read as a 1 MiB budget that silently deletes block data (#702).
+- `decodescript` emits `p2sh` under Core's `can_wrap` rules rather than a
+  size check: no address for a script that can never be spent (an `OP_RETURN`,
+  a Taproot or anchor output script, an unknown witness program, a truncated
+  push), and an address for a redeemScript between 521 and 10,000 bytes, which
+  Core returns and satd silently dropped (#702).
 - `logging` reported from a static map initialised to "everything on" that
   nothing else in the process read: a node running with no `-debug` claimed 30
   categories enabled, and toggling one flipped a bit that never reached the log

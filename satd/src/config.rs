@@ -3076,6 +3076,22 @@ impl Config {
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
             .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
+        // Core reserves `-prune=1` for *manual* pruning: `blockmanager_args.cpp`
+        // maps it to `PRUNE_TARGET_MANUAL` rather than a 1 MiB budget, and the
+        // node then prunes only when `pruneblockchain` is called.
+        //
+        // satd has no `pruneblockchain` RPC, so it cannot honour that. Taken as
+        // a budget instead, `-prune=1` lands on the 288-block floor and deletes
+        // block data automatically -- the opposite of what the operator asked
+        // for, silently. Refuse it by name.
+        if prune == 1 {
+            return Err(
+                "-prune=1 is Bitcoin Core's spelling for manual pruning, which satd does not \
+                 implement (there is no pruneblockchain RPC). Use -prune=<target in MiB> for \
+                 automatic pruning, or -prune=0 to keep every block."
+                    .to_string(),
+            );
+        }
 
         // AssumeUTXO --fast-start source resolution + validation.
         //   - Remote sources MUST be https:// (TLS, validated certs).
@@ -11085,6 +11101,28 @@ rpcport=39999
 
     /// Run `args` through the full CLI pipeline (normalize_args →
     /// clap → from_cli) the same way `main` does.
+    /// Core reserves `-prune=1` for *manual* pruning: `blockmanager_args.cpp`
+    /// maps it to `PRUNE_TARGET_MANUAL`, not a 1 MiB budget, and the node then
+    /// prunes only when `pruneblockchain` is called.
+    ///
+    /// satd has no `pruneblockchain` RPC. Read as a budget, `-prune=1` landed
+    /// on the 288-block floor and deleted block data automatically -- the
+    /// opposite of what the operator asked for, silently.
+    #[test]
+    fn prune_one_is_refused_rather_than_misread() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let err = parse_negation(&["satd", "--regtest", "--datadir", dd, "--prune=1"])
+            .expect_err("-prune=1 must not start a node");
+        assert!(err.contains("manual pruning"), "{err}");
+
+        // A real budget still starts, and 0 still means "keep everything".
+        for arg in ["--prune=550", "--prune=0"] {
+            parse_negation(&["satd", "--regtest", "--datadir", dd, arg])
+                .unwrap_or_else(|e| panic!("{arg} must start: {e}"));
+        }
+    }
+
     fn parse_negation(args: &[&str]) -> Result<Config, String> {
         let normalized = normalize_args(args.iter().map(|s| s.to_string()).collect());
         let cli = CliArgs::try_parse_from(normalized).map_err(|e| e.to_string())?;
