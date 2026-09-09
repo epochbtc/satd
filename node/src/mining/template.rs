@@ -96,10 +96,15 @@ pub struct BlockTemplate {
 static BLOCK_MIN_TX_FEE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DEFAULT_BLOCK_MIN_TX_FEE);
 
-/// satd's default `-blockmintxfee`, in sat/kvB. Equal to the default
-/// `-minrelaytxfee`, so by default nothing that reached the mempool is
-/// excluded from a template for its feerate alone.
-pub const DEFAULT_BLOCK_MIN_TX_FEE: u64 = 1_000;
+/// Core's `DEFAULT_BLOCK_MIN_TX_FEE`, in sat/kvB.
+///
+/// One satoshi per kvB, three orders of magnitude below the default relay
+/// floor, and deliberately so: the floor exists to keep a template from being
+/// padded with transactions that pay *nothing*, not to second-guess the relay
+/// policy. Defaulting it to the relay floor instead would silently strand
+/// every transaction on any node whose `-minrelaytxfee` is lower — the
+/// mempool would accept them and the template would never mine them.
+pub const DEFAULT_BLOCK_MIN_TX_FEE: u64 = 1;
 
 /// Record the configured `-blockmintxfee`. Called once during startup.
 pub fn set_block_min_tx_fee(rate: u64) {
@@ -1073,6 +1078,45 @@ mod tests {
         let mined: std::collections::HashSet<_> =
             template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
         assert!(mined.contains(&below_txid) && mined.contains(&at_txid));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default floor must not strand what the mempool accepted.
+    ///
+    /// satd first defaulted `-blockmintxfee` to 1000 sat/kvB — the same value
+    /// as the default `-minrelaytxfee` — which is harmless only while the two
+    /// agree. Lower the relay floor (which Core's own functional tests do) and
+    /// every transaction between the two floors enters the mempool and is
+    /// never mined: `generate` stops draining the mempool at all. Core's
+    /// default is 1 sat/kvB, three orders of magnitude below the relay floor,
+    /// for exactly this reason.
+    #[test]
+    fn the_default_floor_mines_what_a_low_relay_floor_admitted() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD7), coin_at(0))]);
+
+        // 1000 sats over 10_000 weight (2500 vbytes) is 400 sat/kvB — under
+        // satd's default relay floor, and a shape a node running
+        // `-minrelaytxfee=0.000001` accepts.
+        let tx = tx_spending(confirmed_prev(0xD7), 50_000, 0x57, 0xffff_ffff, 0);
+        let txid = mp.insert_tx_weighted_for_test(tx, 1_000, 10_000, QuarantineScope::acting());
+
+        let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
+        assert!(
+            template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            "the default template floor stranded a transaction the mempool holds"
+        );
+
+        // A zero-fee transaction with nothing paying for it is still skipped,
+        // which is what the default floor is *for*.
+        let free = tx_spending(confirmed_prev(0xD7), 49_000, 0x58, 0xffff_fffe, 0);
+        let free_txid = mp.insert_tx_weighted_for_test(free, 0, 400, QuarantineScope::acting());
+        let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
+        assert!(
+            !template.transactions.iter().any(|t| t.tx.compute_txid() == free_txid),
+            "a transaction paying nothing was mined"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -97,7 +97,10 @@ item below is (or will be) written up in full in the in-development
   (#670).
 - `-blockmintxfee` is applied. It was parsed and then read nowhere, so the
   template floor did not exist; it is judged on the package feerate, as Core's
-  `addPackageTxs` does, so a zero-fee parent still rides in on its child (#661).
+  `addPackageTxs` does, so a zero-fee parent still rides in on its child. Its
+  default is now Core's 1 sat/kvB rather than 1000 — the old value matched the
+  default `-minrelaytxfee`, which would have stranded every transaction on a
+  node with a lower relay floor (#661).
 - `reorg` is documented as a mempool eviction reason. The node has emitted it
   on every carrier since the reorg sweep landed, but the wire spec and the
   Operator Manual listed only some of the reasons (#670).

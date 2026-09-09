@@ -3668,7 +3668,7 @@ impl Config {
             blockmintxfee: cli
                 .blockmintxfee
                 .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
-                .unwrap_or(1_000),
+                .unwrap_or(node::mining::template::DEFAULT_BLOCK_MIN_TX_FEE),
             pid: cli.pid.or_else(|| file_get("pid")),
             mcp: cli.mcp.unwrap_or_else(|| {
                 file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
@@ -5434,7 +5434,7 @@ pub struct CliArgs {
     #[arg(
         long,
         value_name = "RATE",
-        help = "Minimum tx fee for block template in sat/kvB (default: 1000)"
+        help = "Minimum tx fee for block template in sat/kvB (default: 1)"
     )]
     pub blockmintxfee: Option<u64>,
 
