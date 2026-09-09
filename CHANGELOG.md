@@ -90,8 +90,12 @@ item below is (or will be) written up in full in the in-development
 - `submitpackage` answers with an entry for every submitted wtxid, carrying
   `package-not-validated` when the package aborted, `other-wtxid` for a
   same-txid-different-witness member, and `fees.effective-feerate` /
-  `fees.effective-includes` for an accepted one. An unwound ephemeral-dust
-  parent is no longer reported as accepted (#665).
+  `fees.effective-includes` for an accepted one — per result as Core's are:
+  a member accepted on its own is judged by itself, members accepted together
+  share one feerate, an already-resident member reports neither.
+  `replaced-transactions` includes the evicted descendants, and a member over
+  `maxfeerate` is refused with Core's `max feerate exceeded`. An unwound
+  ephemeral-dust parent is no longer reported as accepted (#665).
 - **Breaking:** `testmempoolaccept` reports `wtxid` on every result, adds
   `fees.effective-feerate` and `fees.effective-includes`, bounds its array to
   1..25, and applies package well-formedness from the same implementation the

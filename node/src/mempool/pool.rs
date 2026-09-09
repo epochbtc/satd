@@ -998,6 +998,51 @@ pub struct PackageResult {
     pub replaced: Vec<Txid>,
 }
 
+/// How a package member came to be in the mempool — Core's
+/// `MempoolAcceptResult::ResultType`, which decides what its `fees` say.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Already resident when the package arrived (`MEMPOOL_ENTRY`).
+    Resident,
+    /// Accepted on its own fee (`VALID` from single-transaction validation).
+    Individual,
+    /// Accepted through the deferred parent/child path, judged together with
+    /// every other member that went through it (`VALID` from subpackage
+    /// validation).
+    Subpackage,
+}
+
+/// One accepted package member, as the result assembly needs it.
+struct AcceptedMember {
+    wtxid: bitcoin::Wtxid,
+    txid: Txid,
+    weight: u64,
+    vsize: usize,
+    fee: u64,
+    modified_fee: u64,
+    admission: Admission,
+}
+
+impl AcceptedMember {
+    fn from_entry(
+        wtxid: bitcoin::Wtxid,
+        txid: Txid,
+        entry: &MempoolEntry,
+        admission: Admission,
+    ) -> Self {
+        let weight = entry.weight as u64;
+        Self {
+            wtxid,
+            txid,
+            weight,
+            vsize: policy::weight_to_vsize(weight) as usize,
+            fee: entry.fee,
+            modified_fee: modified_fee(entry.fee, entry.fee_delta),
+            admission,
+        }
+    }
+}
+
 /// Lets `check_well_formed_package` read the package without knowing the
 /// shape of the caller's per-transaction bookkeeping.
 pub trait PackageMember {
@@ -4260,6 +4305,12 @@ impl Mempool {
         let mut over_maxfeerate: HashSet<Txid> = HashSet::new();
         if let Some(limit) = client_maxfeerate.filter(|r| *r > 0) {
             for ptx in &pkg {
+                // A member already in the mempool is Core's `MEMPOOL_ENTRY`:
+                // it is reported as resident, not re-judged against the
+                // caller's ceiling.
+                if self.inner.read().entries.contains_key(&ptx.txid) {
+                    continue;
+                }
                 // Unknowable fee (an input resolves nowhere) — acceptance will
                 // refuse it for that instead, and with a better reason.
                 let Some(base_fee) = self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
@@ -4277,7 +4328,11 @@ impl Mempool {
                         ptx.wtxid.to_string(),
                         json!({
                             "txid": ptx.txid.to_string(),
-                            "error": "max-fee-exceeded, Fee exceeds maximum configured by user",
+                            // Core's `TxValidationState` string for
+                            // `m_client_maxfeerate` (`validation.cpp`);
+                            // `max-fee-exceeded` is `testmempoolaccept`'s
+                            // reject-reason, a different surface.
+                            "error": "max feerate exceeded",
                         }),
                     );
                 }
@@ -4296,7 +4351,7 @@ impl Mempool {
         let mut accepted_txids: HashSet<Txid> = HashSet::new();
         let mut ephemeral_parents: HashMap<Txid, Transaction> = HashMap::new();
         let mut failed: HashMap<bitcoin::Wtxid, String> = HashMap::new();
-        let mut accepted_results: Vec<(bitcoin::Wtxid, Txid, usize, u64)> = Vec::new();
+        let mut accepted_results: Vec<AcceptedMember> = Vec::new();
         // Members whose txid is resident under a *different* witness: Core's
         // `DIFFERENT_WITNESS` result type, reported as `other-wtxid`.
         let mut same_txid_other_witness: HashMap<Txid, bitcoin::Wtxid> = HashMap::new();
@@ -4305,13 +4360,22 @@ impl Mempool {
         // `accept_transaction` does the replacing internally and reports only
         // the accepted txid, so this is how the set is recovered for Core's
         // `replaced-transactions`.
+        //
+        // Core's `m_replaced_transactions` is `m_all_conflicts`: the direct
+        // conflicts *and* their descendants, which the replacement evicts
+        // too. Sampling only the direct spenders under-reported every
+        // replacement of a transaction with children.
         let conflicts_before: HashSet<Txid> = {
             let inner = self.inner.read();
-            pkg.iter()
+            let direct: HashSet<Txid> = pkg
+                .iter()
                 .flat_map(|p| p.tx.input.iter())
                 .filter_map(|i| inner.spends.get(&i.previous_output).copied())
                 .filter(|t| !pkg.iter().any(|p| p.txid == *t))
-                .collect()
+                .collect();
+            Self::rbf_conflict_set(&inner, &direct, usize::MAX)
+                .expect("an unbounded walk cannot exceed usize::MAX")
+                .0
         };
 
         for ptx in &pkg {
@@ -4326,8 +4390,12 @@ impl Mempool {
                     if resident_wtxid != ptx.wtxid {
                         same_txid_other_witness.insert(ptx.txid, resident_wtxid);
                     } else {
-                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
-                        accepted_results.push((ptx.wtxid, ptx.txid, vsize, entry.fee));
+                        accepted_results.push(AcceptedMember::from_entry(
+                            ptx.wtxid,
+                            ptx.txid,
+                            entry,
+                            Admission::Resident,
+                        ));
                     }
                     accepted_txids.insert(ptx.txid);
                     continue;
@@ -4346,8 +4414,12 @@ impl Mempool {
                     accepted_txids.insert(txid);
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&txid) {
-                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
-                        accepted_results.push((ptx.wtxid, txid, vsize, entry.fee));
+                        accepted_results.push(AcceptedMember::from_entry(
+                            ptx.wtxid,
+                            txid,
+                            entry,
+                            Admission::Individual,
+                        ));
                     }
                 }
                 Err(MempoolError::InsufficientFee(..))
@@ -4599,8 +4671,12 @@ impl Mempool {
                     accepted_txids.insert(parent_txid);
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&parent_txid) {
-                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
-                        accepted_results.push((wtxid, parent_txid, vsize, entry.fee));
+                        accepted_results.push(AcceptedMember::from_entry(
+                            wtxid,
+                            parent_txid,
+                            entry,
+                            Admission::Subpackage,
+                        ));
                     }
                 }
                 Err(e) => {
@@ -4676,8 +4752,12 @@ impl Mempool {
                     accepted_txids.insert(txid);
                     let inner = self.inner.read();
                     if let Some(entry) = inner.entries.get(&txid) {
-                        let vsize = policy::weight_to_vsize(entry.weight as u64) as usize;
-                        accepted_results.push((wtxid, txid, vsize, entry.fee));
+                        accepted_results.push(AcceptedMember::from_entry(
+                            wtxid,
+                            txid,
+                            entry,
+                            Admission::Subpackage,
+                        ));
                     }
                 }
                 Err(e) => {
@@ -4712,7 +4792,7 @@ impl Mempool {
         // assembly reads, and it kept the entry — so `submitpackage` said
         // `unspent-dust` at the package level while telling the submitter its
         // parent had been accepted.
-        accepted_results.retain(|(_, txid, _, _)| !stranded.contains(txid));
+        accepted_results.retain(|m| !stranded.contains(&m.txid));
 
         // Announce the ephemeral parents that survived.
         //
@@ -4764,11 +4844,14 @@ impl Mempool {
         // transaction it submitted.
         //
         // `effective-feerate` and `effective-includes` are Core's answer to
-        // "what did you actually judge this by": for a package member that is
-        // the whole package's fee over the whole package's vsize, and the
-        // wtxids it was computed over. Core omits both for a member that was
-        // already in the mempool, because it cannot know whether package
-        // feerate was used when that one was first submitted.
+        // "what did you actually judge this by", and the answer is per result
+        // type (`validation.cpp`, `AcceptPackage`): a member accepted on its
+        // own is judged by its own modified fee over its own vsize and
+        // `effective-includes` is just its wtxid; the members that went
+        // through the deferred parent/child path were judged together, so
+        // they share one feerate over that set and list every wtxid in it;
+        // a member that was already resident gets neither, because the node
+        // cannot know what it was judged by when it first came in.
         let replaced: Vec<Txid> = {
             let inner = self.inner.read();
             conflicts_before
@@ -4778,14 +4861,16 @@ impl Mempool {
                 .collect()
         };
 
-        let package_fee: u64 = accepted_results.iter().map(|(_, _, _, fee)| *fee).sum();
-        let package_vsize: u64 =
-            accepted_results.iter().map(|(_, _, vsize, _)| *vsize as u64).sum();
-        let effective_feerate = policy::fee_rate_sat_per_kvb(package_fee, package_vsize * 4);
-        let effective_includes: Vec<String> = accepted_results
+        let subpackage: Vec<&AcceptedMember> = accepted_results
             .iter()
-            .map(|(wtxid, _, _, _)| wtxid.to_string())
+            .filter(|m| m.admission == Admission::Subpackage)
             .collect();
+        let subpackage_feerate = policy::fee_rate_sat_per_kvb(
+            subpackage.iter().map(|m| m.modified_fee).sum(),
+            subpackage.iter().map(|m| m.weight).sum(),
+        );
+        let subpackage_includes: Vec<String> =
+            subpackage.iter().map(|m| m.wtxid.to_string()).collect();
 
         for ptx in &pkg {
             if let Some(err) = failed.get(&ptx.wtxid) {
@@ -4796,22 +4881,36 @@ impl Mempool {
                         "error": err,
                     }),
                 );
-            } else if let Some((_, _, vsize, fee)) =
-                accepted_results.iter().find(|(w, _, _, _)| *w == ptx.wtxid)
-            {
+            } else if let Some(m) = accepted_results.iter().find(|m| m.wtxid == ptx.wtxid) {
+                let mut fees = json!({
+                    "base": crate::rpc::amounts::format_amount(
+                        m.fee,
+                        crate::rpc::amounts::default_unit(),
+                    ),
+                });
+                let effective = match m.admission {
+                    Admission::Resident => None,
+                    Admission::Individual => Some((
+                        policy::fee_rate_sat_per_kvb(m.modified_fee, m.weight),
+                        vec![m.wtxid.to_string()],
+                    )),
+                    Admission::Subpackage => {
+                        Some((subpackage_feerate, subpackage_includes.clone()))
+                    }
+                };
+                if let Some((rate, includes)) = effective {
+                    fees["effective-feerate"] = json!(crate::rpc::amounts::format_amount(
+                        rate,
+                        crate::rpc::amounts::default_unit(),
+                    ));
+                    fees["effective-includes"] = json!(includes);
+                }
                 tx_results.insert(
                     ptx.wtxid.to_string(),
                     json!({
                         "txid": ptx.txid.to_string(),
-                        "vsize": vsize,
-                        "fees": {
-                            "base": crate::rpc::amounts::format_amount(*fee, crate::rpc::amounts::default_unit()),
-                            "effective-feerate": crate::rpc::amounts::format_amount(
-                                effective_feerate,
-                                crate::rpc::amounts::default_unit(),
-                            ),
-                            "effective-includes": effective_includes,
-                        },
+                        "vsize": m.vsize,
+                        "fees": fees,
                     }),
                 );
             } else if let Some(other) = same_txid_other_witness.get(&ptx.txid) {
@@ -9978,6 +10077,12 @@ mod tests {
     /// An accepted member carries Core's `effective-feerate` and
     /// `effective-includes` — what the package was actually judged by, and the
     /// wtxids that went into it. satd reported only `base`.
+    ///
+    /// Both members here pay their own way, so each is accepted on its own
+    /// (`AcceptSubPackage({tx})` in Core's `AcceptPackage`) and its
+    /// `effective-includes` is its own wtxid alone. One package-wide feerate
+    /// stamped on every member was the first shape of this, and it is wrong:
+    /// Core's is per result.
     #[test]
     fn an_accepted_member_reports_the_effective_feerate() {
         let op = outpoint(0xF1);
@@ -10008,17 +10113,99 @@ mod tests {
                 !fees["effective-feerate"].is_null(),
                 "no effective-feerate: {fees}"
             );
-            let includes = fees["effective-includes"].as_array().expect("array");
-            let listed: HashSet<String> = includes
+            assert_eq!(
+                fees["effective-includes"],
+                serde_json::json!([w]),
+                "a member accepted on its own is judged by itself alone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The members that go through the deferred parent/child path are judged
+    /// together — Core's subpackage evaluation — so they share one
+    /// `effective-feerate` over the set and `effective-includes` names every
+    /// wtxid in it. The fixture is the ephemeral-dust 1P1C: the parent pays
+    /// nothing and is only in because of the child.
+    #[test]
+    fn deferred_members_share_the_subpackage_feerate() {
+        let op = outpoint(0xF4);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let parent = tx_from(&[op], &[(dust, 0xD0), (50_000 - dust, 0xD1)]);
+        let parent_txid = parent.compute_txid();
+        let child = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(40_000, 0xD2)],
+        );
+        let wtxids: HashSet<String> = [&parent, &child]
+            .iter()
+            .map(|t| t.compute_wtxid().to_string())
+            .collect();
+
+        let r = mp.accept_package_with(
+            vec![parent.clone(), child.clone()],
+            &cs,
+            &NoopVerifier,
+            None,
+        );
+        assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+
+        let mut rates = HashSet::new();
+        for w in &wtxids {
+            let fees = &r.tx_results[w]["fees"];
+            let listed: HashSet<String> = fees["effective-includes"]
+                .as_array()
+                .expect("array")
                 .iter()
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(
-                listed,
-                wtxids.iter().cloned().collect::<HashSet<_>>(),
-                "effective-includes must name every wtxid the feerate covers"
-            );
+            assert_eq!(listed, wtxids, "both were judged together: {fees}");
+            rates.insert(fees["effective-feerate"].to_string());
         }
+        assert_eq!(rates.len(), 1, "one feerate for the set: {rates:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member already in the mempool is Core's `MEMPOOL_ENTRY`: `vsize` and
+    /// `fees.base` are reported, `effective-feerate` and `effective-includes`
+    /// are not, because the node cannot know what it was judged by when it
+    /// first came in (`rpc/mempool.cpp`). And it is not held to the caller's
+    /// `maxfeerate`, which is a ceiling on what the call may *admit*.
+    #[test]
+    fn a_resident_member_reports_base_but_not_an_effective_feerate() {
+        let op = outpoint(0xF5);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(100_000))]);
+
+        // 50_000 sats over ~113 vbytes is ~440_000 sat/kvB — far above the
+        // ceiling the package is submitted under.
+        let parent = tx_from(&[op], &[(50_000, 0xD3)]);
+        let parent_txid = parent.compute_txid();
+        let parent_wtxid = parent.compute_wtxid().to_string();
+        mp.accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent");
+
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(49_000, 0xD4)]);
+        let child_wtxid = child.compute_wtxid().to_string();
+        let r = mp.accept_package_with(vec![parent, child], &cs, &NoopVerifier, Some(100_000));
+        assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
+
+        let resident = &r.tx_results[&parent_wtxid];
+        assert!(resident["error"].is_null(), "a resident member is not refused: {resident}");
+        assert!(!resident["vsize"].is_null(), "{resident}");
+        assert!(!resident["fees"]["base"].is_null(), "{resident}");
+        assert!(
+            resident["fees"]["effective-feerate"].is_null()
+                && resident["fees"]["effective-includes"].is_null(),
+            "a resident member has no effective feerate: {resident}"
+        );
+
+        let fresh = &r.tx_results[&child_wtxid]["fees"];
+        assert_eq!(fresh["effective-includes"], serde_json::json!([child_wtxid]), "{fresh}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10036,9 +10223,11 @@ mod tests {
         let txid = tx.compute_txid();
         let r = mp.accept_package_with(vec![tx.clone()], &cs, &NoopVerifier, Some(1_000));
 
+        // Core's string is its `TxValidationState` one (`validation.cpp`);
+        // `rpc_packages.py` asserts it verbatim.
         assert_eq!(
             r.tx_results[&tx.compute_wtxid().to_string()]["error"],
-            serde_json::json!("max-fee-exceeded, Fee exceeds maximum configured by user")
+            serde_json::json!("max feerate exceeded")
         );
         assert!(!in_pool(&mp, &txid), "a refused transaction reached the mempool");
 
@@ -10065,13 +10254,27 @@ mod tests {
         mp.accept_transaction(original, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("original");
 
+        // A child of the original goes with it: Core's set is
+        // `m_all_conflicts`, conflicts and descendants, and the child is in
+        // fact gone afterwards.
+        let child = tx_from(&[OutPoint { txid: original_txid, vout: 0 }], &[(90_000, 0xCC)]);
+        let child_txid = child.compute_txid();
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("child");
+
         // Same outpoint, far more fee.
         let replacement = tx_from(&[op], &[(50_000, 0xCB)]);
         let r = mp.accept_package_with(vec![replacement], &cs, &NoopVerifier, None);
 
         assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-        assert_eq!(r.replaced, vec![original_txid], "{:?}", r.replaced);
+        assert_eq!(
+            r.replaced.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([original_txid, child_txid]),
+            "{:?}",
+            r.replaced
+        );
         assert!(!in_pool(&mp, &original_txid));
+        assert!(!in_pool(&mp, &child_txid));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
