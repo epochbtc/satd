@@ -175,13 +175,59 @@ pub fn dust_threshold_with_rate(script_pubkey: &bitcoin::ScriptBuf, fee_rate: u6
 /// Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN,
 /// and bare multisig (if configured via `-permitbaremultisig`).
 pub fn is_standard_output_script(script: &bitcoin::Script, permit_bare_multisig: bool) -> bool {
+    // Core decides this with `Solver` (`src/script/solver.cpp`), and
+    // `IsStandard` accepts every type it names except `NONSTANDARD` — with one
+    // extra bound on `MULTISIG`. The list below is that set.
     script.is_p2pkh()
         || script.is_p2sh()
+        || is_p2pk(script)
+        || script.is_op_return()
+        // Witness programs: v0 only at the two sizes Core recognises, and any
+        // other version at any valid program size (`WITNESS_UNKNOWN`, which
+        // also covers pay-to-anchor). A v0 program of some other length is
+        // NONSTANDARD in Core and must be here too, so this cannot be written
+        // as a bare `witness_version().is_some()`.
         || script.is_p2wpkh()
         || script.is_p2wsh()
-        || script.is_p2tr()
-        || script.is_op_return()
-        || (permit_bare_multisig && script.is_multisig())
+        || matches!(
+            script.witness_version(),
+            Some(v) if v != bitcoin::WitnessVersion::V0
+        )
+        || (permit_bare_multisig && is_standard_bare_multisig(script))
+}
+
+/// Core's `MatchPayToPubkey` (`src/script/solver.cpp`): a single 33- or
+/// 65-byte push followed by `OP_CHECKSIG`, with the first byte of the key one
+/// of the four valid prefixes.
+///
+/// rust-bitcoin has no `is_p2pk` predicate, and bare P2PK was simply missing
+/// from satd's standard set — a `sendrawtransaction` of one was refused
+/// `scriptpubkey`, and `mempool_dust.py` failed on its very first vector.
+fn is_p2pk(script: &bitcoin::Script) -> bool {
+    let b = script.as_bytes();
+    match b.len() {
+        // <33-byte push> <key> OP_CHECKSIG
+        35 => b[0] == 33 && b[34] == 0xac && matches!(b[1], 0x02 | 0x03),
+        // <65-byte push> <key> OP_CHECKSIG
+        67 => b[0] == 65 && b[66] == 0xac && matches!(b[1], 0x04 | 0x06 | 0x07),
+        _ => false,
+    }
+}
+
+/// Core's `IsStandard` accepts `MULTISIG` only up to x-of-3: `1 <= n <= 3` and
+/// `1 <= m <= n`. `Script::is_multisig` checks the shape but not the bound.
+fn is_standard_bare_multisig(script: &bitcoin::Script) -> bool {
+    if !script.is_multisig() {
+        return false;
+    }
+    let b = script.as_bytes();
+    let (Some(&first), Some(&last)) = (b.first(), b.get(b.len().wrapping_sub(2))) else {
+        return false;
+    };
+    // OP_1..OP_16 encode as 0x51..0x60.
+    let m = first.wrapping_sub(0x50);
+    let n = last.wrapping_sub(0x50);
+    (1..=3).contains(&n) && (1..=n).contains(&m)
 }
 
 #[cfg(test)]
@@ -334,6 +380,99 @@ mod tests {
         assert_eq!(dust_threshold_with_rate(&p2wpkh_script(), 3_001), 295);
         // And an exact multiple is not rounded past itself.
         assert_eq!(dust_threshold_with_rate(&p2wpkh_script(), 3_000), 294);
+    }
+
+    /// Core's `IsStandard` accepts every type `Solver` names, and satd's set
+    /// was missing two of them: bare P2PK — the very first vector in Core's
+    /// `mempool_dust.py` — and witness programs at versions satd has no
+    /// predicate for, which includes pay-to-anchor.
+    #[test]
+    fn the_standard_output_set_is_the_one_core_solves() {
+        let compressed_p2pk = {
+            let mut v = vec![33u8, 0x02];
+            v.extend_from_slice(&[0x11; 32]);
+            v.push(0xac);
+            ScriptBuf::from_bytes(v)
+        };
+        let uncompressed_p2pk = {
+            let mut v = vec![65u8, 0x04];
+            v.extend_from_slice(&[0x11; 64]);
+            v.push(0xac);
+            ScriptBuf::from_bytes(v)
+        };
+        for (name, script) in [
+            ("P2PKH", p2pkh_script()),
+            ("P2SH", p2sh_script()),
+            ("P2WPKH", p2wpkh_script()),
+            ("P2WSH", p2wsh_script()),
+            ("P2TR", p2tr_script()),
+            ("P2A", p2a_script()),
+            ("future witness version", unknown_witness_script()),
+            ("OP_RETURN", op_return_script()),
+            ("P2PK (compressed)", compressed_p2pk),
+            ("P2PK (uncompressed)", uncompressed_p2pk),
+        ] {
+            assert!(
+                is_standard_output_script(&script, false),
+                "{name} is standard in Core but not in satd"
+            );
+        }
+
+        // …and things Core's Solver calls NONSTANDARD stay out.
+        for (name, script) in [
+            ("bare junk", ScriptBuf::from_bytes(vec![0xff; 10])),
+            // A v0 program of a length Core does not recognise: `Solver`
+            // falls through to NONSTANDARD rather than WITNESS_UNKNOWN.
+            (
+                "v0 witness program of the wrong size",
+                ScriptBuf::from_bytes({
+                    let mut v = vec![0x00, 0x10];
+                    v.extend_from_slice(&[0u8; 16]);
+                    v
+                }),
+            ),
+            (
+                "P2PK with a bad key prefix",
+                ScriptBuf::from_bytes({
+                    let mut v = vec![33u8, 0x05];
+                    v.extend_from_slice(&[0x11; 32]);
+                    v.push(0xac);
+                    v
+                }),
+            ),
+        ] {
+            assert!(
+                !is_standard_output_script(&script, false),
+                "{name} is nonstandard in Core but standard in satd"
+            );
+        }
+    }
+
+    /// Core bounds bare multisig at x-of-3 (`IsStandard`); `is_multisig`
+    /// checks the shape but not the bound.
+    #[test]
+    fn bare_multisig_is_standard_only_up_to_three_keys() {
+        fn multisig(m: u8, n: u8) -> ScriptBuf {
+            let mut v = vec![0x50 + m];
+            for _ in 0..n {
+                v.push(33);
+                v.push(0x02);
+                v.extend_from_slice(&[0x11; 32]);
+            }
+            v.push(0x50 + n);
+            v.push(0xae); // OP_CHECKMULTISIG
+            ScriptBuf::from_bytes(v)
+        }
+        assert!(is_standard_output_script(&multisig(1, 1), true));
+        assert!(is_standard_output_script(&multisig(3, 3), true));
+        assert!(
+            !is_standard_output_script(&multisig(4, 4), true),
+            "4-of-4 exceeds Core's x-of-3 bound"
+        );
+        assert!(
+            !is_standard_output_script(&multisig(1, 1), false),
+            "-permitbaremultisig=0 still excludes it"
+        );
     }
 
     #[test]

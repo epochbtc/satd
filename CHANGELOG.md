@@ -84,6 +84,10 @@ item below is (or will be) written up in full in the in-development
   — base or `prioritisetransaction` delta — is refused
   `dust, tx with dust output must be 0-fee` on the single-transaction path as
   well as in `submitpackage` (#661).
+- **Breaking:** bare P2PK outputs and witness programs at versions satd has no
+  name for — pay-to-anchor among them — are standard, as Core's `Solver` and
+  `IsStandard` have them. A bare P2PK payment was refused outright, and bare
+  multisig is now bounded at x-of-3 as Core bounds it (#661).
 - `-dustrelayfee` reaches every dust decision. `prioritisetransaction`, the
   package path and the stranded-parent unwind read the built-in rate instead of
   the configured one, so `-dustrelayfee=0` did not switch dust policy off

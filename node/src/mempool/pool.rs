@@ -3791,6 +3791,16 @@ impl Mempool {
         let weight_u64 = weight as u64;
         let vsize = policy::weight_to_vsize(weight_u64) as usize;
         let priority_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+
+        // Ephemeral dust, parent side. Core reaches `PreCheckEphemeralTx` from
+        // `PreChecks`, which `testmempoolaccept` goes through as much as
+        // `sendrawtransaction` does — so it has to run here too, and in the
+        // same place: before the relay floor, so a zero-fee dusty transaction
+        // still reports "min relay fee not met".
+        if !cfg.accept_non_std_txn {
+            Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
+        }
+
         let fee_rate =
             policy::fee_rate_sat_per_kvb(modified_fee(fee, priority_delta), weight_u64);
         if fee_rate < cfg.min_fee_rate {
