@@ -14455,6 +14455,205 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
     );
 }
 
+/// Sign a P2WPKH spend of one specific outpoint. The shared helpers all
+/// spend a coinbase; a child of an unconfirmed parent needs an arbitrary one.
+fn sign_p2wpkh_spend_of(
+    wallet: &DeterministicWallet,
+    prev: bitcoin::OutPoint,
+    prev_value_sat: u64,
+    dest: bitcoin::ScriptBuf,
+    fee_sat: u64,
+    sequence: u32,
+) -> (String, bitcoin::Txid) {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let mut spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(sequence),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(prev_value_sat - fee_sat),
+            script_pubkey: dest,
+        }],
+    };
+    let secp = Secp256k1::new();
+    let src_script = wallet.address.script_pubkey();
+    let sighash = SighashCache::new(&spend)
+        .p2wpkh_signature_hash(
+            0,
+            &src_script,
+            Amount::from_sat(prev_value_sat),
+            EcdsaSighashType::All,
+        )
+        .expect("sighash");
+    let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut witness = Witness::new();
+    witness.push(sig_bytes);
+    witness.push(wallet.pk.to_bytes());
+    spend.input[0].witness = witness;
+    let txid = spend.compute_txid();
+    (hex::encode(bitcoin::consensus::serialize(&spend)), txid)
+}
+
+/// #660: a replacement was compared against each conflict's *own* feerate, so
+/// a cheap parent carrying an expensive child could be replaced by something a
+/// miner would rather not have.
+///
+/// Bitcoin Core compares feerate *diagrams* (`ImprovesFeerateDiagram`): the
+/// mempool the replacement leaves behind must be no worse anywhere and better
+/// somewhere. A parent and its child are one chunk, because a miner takes them
+/// together — so beating the parent alone is not beating the chunk.
+///
+/// The replacement here clears Rules 3 and 4 (it pays *more absolute fee* than
+/// parent and child combined, and covers its own relay), and is still refused,
+/// because it spreads that fee over twenty-odd times the size. That is the
+/// whole point: the old rule compared its ~170 sat/vB against the parent's ~9,
+/// and let it through.
+///
+/// The test also pins the other half of #660: `testmempoolaccept` and
+/// `sendrawtransaction` must agree, which they now do by construction (one
+/// `rbf_check`).
+#[test]
+fn a_replacement_must_beat_the_conflicts_whole_chunk_not_just_the_parent() {
+    use bitcoin::{Amount, TxOut};
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x81; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
+
+    // Parent: block 1's coinbase → the same wallet, a low fee, signalling
+    // replaceability.
+    let parent_fee = 1_000u64;
+    let (parent_hex, parent_txid) = common::build_signed_p2wpkh_spend_seq(
+        &node,
+        &wallet,
+        wallet.address.script_pubkey(),
+        parent_fee,
+        0xffff_fffd,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
+    let subsidy = 50u64 * 100_000_000;
+
+    // Child: spends the parent, paying a large fee. This is what lifts the
+    // pair's chunk feerate far above the parent's own.
+    let child_fee = 500_000u64;
+    let (child_hex, _child_txid) = sign_p2wpkh_spend_of(
+        &wallet,
+        bitcoin::OutPoint {
+            txid: parent_txid.parse().expect("parent txid"),
+            vout: 0,
+        },
+        subsidy - parent_fee,
+        wallet.address.script_pubkey(),
+        child_fee,
+        0xffff_fffd,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
+    let chunk_fee = parent_fee + child_fee;
+    let mempool = node.rpc_call("getrawmempool").unwrap();
+    assert_eq!(
+        mempool["result"].as_array().map(Vec::len),
+        Some(2),
+        "parent and child are both in: {mempool}"
+    );
+
+    // The replacement conflicts with the parent (same coinbase input) and
+    // pays *more* than parent and child combined — but across ~90 outputs, so
+    // its feerate is a fraction of the chunk's.
+    let dest = DeterministicWallet::from_secret([0x82; 32]);
+    let outs = 90u64;
+    let per_out = (subsidy - (chunk_fee + 4_000)) / outs;
+    let wide_fee = subsidy - per_out * outs;
+    assert!(
+        wide_fee > chunk_fee,
+        "the premise: it pays more in total ({wide_fee} > {chunk_fee})"
+    );
+    let (weak_hex, _) = common::build_signed_p2wpkh_spend_to_outputs(
+        &node,
+        &wallet,
+        (0..outs)
+            .map(|_| TxOut {
+                value: Amount::from_sat(per_out),
+                script_pubkey: dest.address.script_pubkey(),
+            })
+            .collect(),
+    );
+
+    let accept = node
+        .rpc_call_with_params("testmempoolaccept", vec![json!([weak_hex])])
+        .unwrap();
+    let entry = &accept["result"][0];
+    assert_eq!(
+        entry["allowed"],
+        json!(false),
+        "more total fee at a worse feerate is worse for a miner: {accept}"
+    );
+    assert_eq!(
+        entry["reject-reason"], json!("replacement-failed"),
+        "Core's reason for a diagram failure — not `insufficient fee`, which \
+         is what Rules 3 and 4 would have said: {accept}"
+    );
+
+    // …and `sendrawtransaction` must say the same thing. Disagreeing is the
+    // other half of #660.
+    let send = node
+        .rpc_call_with_params("sendrawtransaction", vec![json!(weak_hex)])
+        .unwrap();
+    assert!(!send["error"].is_null(), "must be refused too: {send}");
+    let msg = send["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("replacement-failed") || msg.contains("feerate diagram"),
+        "same verdict as testmempoolaccept: {send}"
+    );
+
+    // A replacement that does beat the whole chunk is accepted — so the
+    // refusal above is a judgement, not a blanket "no".
+    let (strong_hex, strong_txid) = common::build_signed_p2wpkh_spend_seq(
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        600_000,
+        0xffff_fffd,
+    );
+    let accept = node
+        .rpc_call_with_params("testmempoolaccept", vec![json!([strong_hex])])
+        .unwrap();
+    assert_eq!(
+        accept["result"][0]["allowed"],
+        json!(true),
+        "paying more than parent+child at a higher feerate must be allowed: {accept}"
+    );
+    let send = node
+        .rpc_call_with_params("sendrawtransaction", vec![json!(strong_hex)])
+        .unwrap();
+    assert!(send["error"].is_null(), "and actually accepted: {send}");
+    assert_eq!(send["result"], json!(strong_txid), "{send}");
+
+    // The parent and its child are gone; the replacement is in.
+    let mempool = node.rpc_call("getrawmempool").unwrap();
+    let txids: Vec<&str> = mempool["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert_eq!(txids, [strong_txid.as_str()], "{mempool}");
+}
+
 /// #702: four fields that were constants chosen to look plausible.
 ///
 /// `size_on_disk: 0` told an operator sizing a disk that the chain occupied
