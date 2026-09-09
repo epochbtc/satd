@@ -191,6 +191,42 @@ item below is (or will be) written up in full in the in-development
 
 - `validateaddress` reported an address from another network as valid — it
   never checked the network at all.
+- **Breaking:** `createrawtransaction` and `createpsbt` built an output from an
+  address belonging to another network. On mainnet that pays a scriptPubKey the
+  sender does not control, with no prefix left in the transaction to catch it.
+  Both now decode with the network, as Core does, and answer
+  `-5 Invalid Bitcoin address: <addr>` (#689). `createpsbt` picks up the array
+  form of `outputs` (which it had been ignoring, returning a PSBT with no
+  outputs), string amounts, and Core's duplicate-address and amount-range
+  checks in the process — it had its own copy of the parser.
+- **Breaking:** output amounts are parsed as exact decimals, Core's
+  `ParseFixedPoint`, instead of round-tripping through `f64`. `createpsbt`
+  truncated where it should have rounded, so 5.6% of five-decimal amounts were
+  built one satoshi short of what the caller wrote; and `f64::from_str` accepted
+  `NaN`, which passed both range guards and saturated to a zero-value output
+  with no error. `.5`, `1.`, `01.0`, `+1.0` and `1.000000009` are now refused,
+  as Core refuses them (#689).
+- The JSON-RPC compatibility layer round-tripped every request body through
+  `serde_json::Value` to rewrite the `jsonrpc` member, which silently collapsed
+  duplicate keys in `params` and renormalised number spellings. Core keeps
+  duplicates, and `createrawtransaction`'s duplicate-key check sat downstream of
+  this — so it could never fire. Members are now re-emitted byte-for-byte
+  (#689).
+- `createrawtransaction`/`createpsbt`: `outputs` that is neither an object nor
+  an array is refused rather than treated as an empty output set —
+  `createpsbt '"hello"'` returned a valid PSBT with no outputs. A `data` value
+  follows Core's `ParseHexV`: a JSON number is accepted as its own spelling, and
+  an empty string is refused rather than building `OP_RETURN OP_0` (#689).
+- `createrawtransaction`/`createpsbt`: an explicit `null` for `outputs` is
+  refused by name — `-8 Invalid parameter, output argument must be non-null`,
+  as Core's `NormalizeOutputs` does — instead of being reported as a missing
+  argument (#689).
+- `createrawtransaction`/`createpsbt`: a repeated output key is read with its
+  *first* value, as Core's `outputs[name_]` is, so a duplicate is reported as a
+  duplicate rather than as whatever the later value happened to be (#689).
+- The JSON-RPC compatibility layer no longer strands the rest of a batch when
+  one element is not an object, and a repeated `jsonrpc` member is judged on
+  its last value — the one the server will act on (#689).
 - `getdeploymentinfo`: a 64-character `blockhash` that is not hexadecimal
   reported a length error; it now reports a hex error, as Core does.
 

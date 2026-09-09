@@ -504,17 +504,32 @@ mod construction {
         let outputs = serde_json::json!({
             "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": 0.01
         });
-        let result = cst::create_transaction(&inputs, &outputs, None);
+        let (ctx, _dir) = make_test_ctx();
+        let result = cst::create_transaction(&ctx, &inputs, &outputs, None);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        // Should return hex string of the unsigned tx
-        assert!(json.is_string() || json["error"].is_string());
+        // The context's network must actually reach the decoder. Asserting
+        // `is_string() || error.is_string()` held whichever network was
+        // threaded, so hardcoding one in `create_transaction` passed it.
+        assert!(
+            json.is_string(),
+            "a regtest address must build on a regtest context: {json}"
+        );
+
+        // ...and the mirror image: a mainnet address must not.
+        let mainnet_outputs = serde_json::json!({
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy": 0.01
+        });
+        let result = cst::create_transaction(&ctx, &inputs, &mainnet_outputs, None);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["code"], serde_json::json!(-5), "{json}");
     }
 
     #[test]
     fn test_create_transaction_invalid_inputs() {
         let inputs = serde_json::json!("not an array");
         let outputs = serde_json::json!({});
-        let result = cst::create_transaction(&inputs, &outputs, None);
+        let (ctx, _dir) = make_test_ctx();
+        let result = cst::create_transaction(&ctx, &inputs, &outputs, None);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(json["error"].is_string());
     }

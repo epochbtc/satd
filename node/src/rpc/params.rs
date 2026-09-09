@@ -155,6 +155,20 @@ impl Args {
         Ok(self.next_value())
     }
 
+    /// As [`Args::raw`], but keeping an explicit `null` distinct from an
+    /// absent argument.
+    ///
+    /// A `skip_type_check` argument reaches Core's handler untouched --
+    /// `RPCArg::MatchesType` returns `true` before it can look at the value --
+    /// so a `null` there is answered by the handler, not by the type checker.
+    /// `createrawtransaction`'s is `NormalizeOutputs`'s "Invalid parameter,
+    /// output argument must be non-null". Collapsing the null to `None` here
+    /// meant the handler's missing-argument path answered instead, with a
+    /// different code and a message naming nothing.
+    pub(crate) fn raw_or_null(&mut self, _name: &str) -> Result<Option<Value>, ErrorObjectOwned> {
+        Ok(self.next_slot())
+    }
+
     /// Read an optional argument of Core-declared type `T`.
     ///
     /// A mismatch is recorded and `Ok(None)` returned, so reading continues

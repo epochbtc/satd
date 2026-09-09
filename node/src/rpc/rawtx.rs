@@ -575,6 +575,7 @@ pub fn create_raw_transaction(
     locktime: Option<u32>,
     replaceable: Option<bool>,
     version: Option<u32>,
+    network: bitcoin::Network,
 ) -> Result<Value, (i32, String)> {
     const MAX_BIP125_RBF_SEQUENCE: u32 = 0xffff_fffd;
 
@@ -661,29 +662,7 @@ pub fn create_raw_transaction(
         }
     }
 
-    // Parse outputs — can be an object {addr: amount, ...} or an array [{addr: amount}, ...].
-    let mut tx_outputs = Vec::new();
-    let mut seen_addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_data = false;
-
-    if let Some(obj) = outputs.as_object() {
-        for (key, val) in obj {
-            parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
-        }
-    } else if let Some(arr) = outputs.as_array() {
-        for item in arr {
-            if let Some(map) = item.as_object() {
-                if map.len() != 1 {
-                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
-                }
-                for (key, val) in map {
-                    parse_output_entry(key, val, &mut tx_outputs, &mut seen_addresses, &mut seen_data)?;
-                }
-            } else {
-                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
-            }
-        }
-    }
+    let tx_outputs = parse_outputs(outputs, network)?;
 
     let lt = locktime
         .map(bitcoin::blockdata::locktime::absolute::LockTime::from_consensus)
@@ -702,12 +681,117 @@ pub fn create_raw_transaction(
     Ok(Value::String(hex::encode(raw)))
 }
 
+/// Core's `ParseOutputs` + `NormalizeOutputs` (`src/rpc/rawtransaction_util.cpp`),
+/// shared by `createrawtransaction` and `createpsbt` because Core routes both
+/// through the same `ConstructTransaction`.
+///
+/// `network` is not decoration. Core decodes each key with the network-scoped
+/// `DecodeDestination`, so a testnet address handed to a mainnet node is a
+/// `-5 Invalid Bitcoin address` rather than an output. Accepting it builds a
+/// payment to a scriptPubKey whose key the sender does not control, and the
+/// address prefix — the one part of the encoding that would have caught the
+/// mistake — is not carried in the scriptPubKey, so nothing downstream can
+/// notice. `validateaddress`, `scantxoutset` and `deriveaddresses` are all
+/// network-scoped already; these two were the surface that still was not.
+pub fn parse_outputs(
+    outputs: &Value,
+    network: bitcoin::Network,
+) -> Result<Vec<TxOut>, (i32, String)> {
+    let mut tx_outputs = Vec::new();
+    // Core dedupes on the decoded `CTxDestination`, not on the string, and
+    // reports the caller's spelling in the error.
+    let mut seen_destinations: std::collections::HashSet<bitcoin::ScriptBuf> =
+        std::collections::HashSet::new();
+    let mut seen_data = false;
+
+    // The key/value pairs in source order, duplicates included.
+    let mut pairs: Vec<(&str, &Value)> = Vec::new();
+
+    if let Some(obj) = outputs.as_object() {
+        for (key, val) in obj {
+            pairs.push((key.as_str(), val));
+        }
+    } else if outputs.is_null() {
+        // Core's `NormalizeOutputs` opens with this exact refusal.
+        return Err((
+            -8,
+            "Invalid parameter, output argument must be non-null".to_string(),
+        ));
+    } else if !outputs.is_array() {
+        // `NormalizeOutputs` calls `get_obj()`/`get_array()`, which throw for
+        // any other type. Falling through instead left `createpsbt '"hello"'`
+        // returning a perfectly valid PSBT with no outputs at all -- a funds
+        // RPC answering a malformed request with a transaction.
+        return Err((
+            -3,
+            format!(
+                "JSON value of type {} is not of expected type array",
+                crate::rpc::params::json_type_name(outputs)
+            ),
+        ));
+    } else if let Some(arr) = outputs.as_array() {
+        for item in arr {
+            if let Some(map) = item.as_object() {
+                if map.len() != 1 {
+                    return Err((-8, "Invalid parameter, key-value pair must contain exactly one key".to_string()));
+                }
+                for (key, val) in map {
+                    pairs.push((key.as_str(), val));
+                }
+            } else {
+                return Err((-8, "Invalid parameter, key-value pair not an object as expected".to_string()));
+            }
+        }
+    }
+
+    // Core walks `outputs.getKeys()` -- which carries every repetition -- but
+    // reads each value as `outputs[name_]`, and `UniValue::operator[]` returns
+    // the *first* member with that key. So a repeated key is visited once per
+    // occurrence, always with the first occurrence's value.
+    //
+    // Reading each occurrence's own value instead changed which error a
+    // caller got: `{"<addr>": 0.01, "<addr>": "wat"}` is Core's
+    // "duplicated address" (it parses 0.01 twice and trips the dedupe), but
+    // reached `parse_btc_amount("wat")` here and came back "Invalid amount",
+    // naming a problem that is not the one to fix. For `data` -- which Core
+    // does not dedupe on value -- it changed the built script outright.
+    // One pass, not a scan-the-prefix-per-entry: `createrawtransaction` is
+    // reachable on the read-only listener with a body limit measured in
+    // megabytes, so anything quadratic in the number of outputs is a lever.
+    {
+        let mut first_value: std::collections::HashMap<&str, &Value> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        for (key, val) in pairs.iter_mut() {
+            match first_value.get(*key) {
+                Some(first) => *val = first,
+                None => {
+                    first_value.insert(*key, *val);
+                }
+            }
+        }
+    }
+
+    for (key, val) in pairs {
+        parse_output_entry(
+            key,
+            val,
+            network,
+            &mut tx_outputs,
+            &mut seen_destinations,
+            &mut seen_data,
+        )?;
+    }
+
+    Ok(tx_outputs)
+}
+
 /// Parse a single key-value output entry for `createrawtransaction`.
 fn parse_output_entry(
     key: &str,
     val: &Value,
+    network: bitcoin::Network,
     tx_outputs: &mut Vec<TxOut>,
-    seen_addresses: &mut std::collections::HashSet<String>,
+    seen_destinations: &mut std::collections::HashSet<bitcoin::ScriptBuf>,
     seen_data: &mut bool,
 ) -> Result<(), (i32, String)> {
     if key == "data" {
@@ -715,8 +799,28 @@ fn parse_output_entry(
             return Err((-8, "Invalid parameter, duplicate key: data".to_string()));
         }
         *seen_data = true;
-        let hex_data = val.as_str().ok_or((-8, "Data must be hexadecimal string".to_string()))?;
-        let data = hex::decode(hex_data).map_err(|_| (-8, "Data must be hexadecimal string".to_string()))?;
+        // Core's `ParseHexV(outputs[name_].getValStr(), "Data")`: the *literal
+        // text* of the value, so a JSON number is its own spelling, and
+        // `IsHex` requires a non-empty, even-length hex string. satd read
+        // `as_str()` (rejecting `{"data": 1234}`, which Core accepts as
+        // `"1234"`) and used `hex::decode`, which accepts `""` (Core does not,
+        // and an empty `data` built an `OP_RETURN OP_0` output). The message
+        // carries the offending value, as Core's does.
+        let hex_data = match val {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            other => {
+                return Err((
+                    -8,
+                    format!("Data must be hexadecimal string (not '{other}')"),
+                ));
+            }
+        };
+        let bad_hex = || (-8, format!("Data must be hexadecimal string (not '{hex_data}')"));
+        if hex_data.is_empty() || hex_data.len() % 2 != 0 {
+            return Err(bad_hex());
+        }
+        let data = hex::decode(&hex_data).map_err(|_| bad_hex())?;
         let push_data = bitcoin::script::PushBytesBuf::try_from(data)
             .map_err(|_| (-8, "OP_RETURN data too large".to_string()))?;
         let script = bitcoin::script::Builder::new()
@@ -728,50 +832,191 @@ fn parse_output_entry(
             script_pubkey: script,
         });
     } else {
-        if !seen_addresses.insert(key.to_string()) {
+        // Core's order, which is observable: decode without throwing, parse
+        // the amount, *then* reject an undecodable address, and dedupe last.
+        // A bad amount on a bad address therefore reports the amount, and a
+        // repeated bad address reports the address rather than the repeat.
+        let decoded = crate::rpc::address_decode::decode_destination(key, network);
+        let amount = parse_btc_amount(val)?;
+        let script_pubkey = match decoded {
+            crate::rpc::address_decode::Decoded::Valid(addr) => addr.script_pubkey(),
+            crate::rpc::address_decode::Decoded::Invalid { .. } => {
+                return Err((-5, format!("Invalid Bitcoin address: {key}")));
+            }
+        };
+        if !seen_destinations.insert(script_pubkey.clone()) {
             return Err((-8, format!("Invalid parameter, duplicated address: {key}")));
         }
-        let amount = parse_btc_amount(val)?;
-        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = key
-            .parse()
-            .map_err(|_| (-5, "Invalid Bitcoin address".to_string()))?;
         tx_outputs.push(TxOut {
             value: amount,
-            script_pubkey: address.assume_checked().script_pubkey(),
+            script_pubkey,
         });
     }
     Ok(())
 }
 
-/// Parse a BTC amount from a JSON value, with Core-compatible error messages.
-fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
-    // Core accepts both number and string representations.
-    let amount_str = match val {
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if f < 0.0 {
-                    return Err((-3, "Amount out of range".to_string()));
+/// Core's `ParseFixedPoint` (`src/util/strencodings.cpp`): exact decimal text
+/// to a fixed-point integer, with no floating point anywhere.
+///
+/// The grammar is deliberately tight, and every one of its refusals matters
+/// for a value denominated in money:
+///
+/// - an optional `-`, then either a *single* `0` or a digit `1`-`9` followed
+///   by digits — so `01.0` is trailing garbage and `.5` is a missing digit;
+/// - an optional `.` that must be followed by at least one digit, so `1.` is
+///   refused;
+/// - an optional `e`/`E` exponent with an optional sign and at least one
+///   digit;
+/// - nothing else, anywhere. No `+`, no whitespace, no `NaN`, no `inf`.
+///
+/// Returns `None` for anything outside that grammar or outside
+/// `10^-decimals ..< 10^(18-decimals)`.
+fn parse_fixed_point(val: &str, decimals: u32) -> Option<i64> {
+    /// Core's `UPPER_BOUND`.
+    const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
+
+    // Core's `ProcessMantissaDigit`: trailing zeros are counted rather than
+    // multiplied in, so `1.10` and `1.1` reach the same mantissa.
+    fn mantissa_digit(ch: u8, mantissa: &mut i64, tzeros: &mut i32) -> bool {
+        if ch == b'0' {
+            *tzeros += 1;
+        } else {
+            for _ in 0..=*tzeros {
+                if *mantissa > UPPER_BOUND / 10 {
+                    return false;
                 }
-                format!("{:.8}", f)
-            } else {
-                return Err((-3, "Invalid amount".to_string()));
+                *mantissa *= 10;
             }
+            *mantissa += i64::from(ch - b'0');
+            *tzeros = 0;
         }
-        Value::String(s) => {
-            let _: f64 = s.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
-            s.clone()
+        true
+    }
+
+    let b = val.as_bytes();
+    let end = b.len();
+    let mut ptr = 0usize;
+    let mut mantissa: i64 = 0;
+    let mut exponent: i64 = 0;
+    let mut tzeros: i32 = 0;
+    let mut point_ofs: i64 = 0;
+    let mut mantissa_sign = false;
+    let mut exponent_sign = false;
+
+    if ptr < end && b[ptr] == b'-' {
+        mantissa_sign = true;
+        ptr += 1;
+    }
+    if ptr < end {
+        if b[ptr] == b'0' {
+            // A single leading zero, and only one.
+            ptr += 1;
+        } else if b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !mantissa_digit(b[ptr], &mut mantissa, &mut tzeros) {
+                    return None;
+                }
+                ptr += 1;
+            }
+        } else {
+            return None; // missing expected digit
         }
-        _ => return Err((-3, "Invalid amount".to_string())),
+    } else {
+        return None; // empty string or a lone '-'
+    }
+    if ptr < end && b[ptr] == b'.' {
+        ptr += 1;
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !mantissa_digit(b[ptr], &mut mantissa, &mut tzeros) {
+                    return None;
+                }
+                ptr += 1;
+                point_ofs += 1;
+            }
+        } else {
+            return None; // missing expected digit
+        }
+    }
+    if ptr < end && (b[ptr] == b'e' || b[ptr] == b'E') {
+        ptr += 1;
+        if ptr < end && b[ptr] == b'+' {
+            ptr += 1;
+        } else if ptr < end && b[ptr] == b'-' {
+            exponent_sign = true;
+            ptr += 1;
+        }
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if exponent > UPPER_BOUND / 10 {
+                    return None;
+                }
+                exponent = exponent * 10 + i64::from(b[ptr] - b'0');
+                ptr += 1;
+            }
+        } else {
+            return None; // missing expected digit
+        }
+    }
+    if ptr != end {
+        return None; // trailing garbage
+    }
+
+    if exponent_sign {
+        exponent = -exponent;
+    }
+    exponent = exponent - point_ofs + i64::from(tzeros);
+    if mantissa_sign {
+        mantissa = -mantissa;
+    }
+
+    exponent += i64::from(decimals);
+    if exponent < 0 {
+        return None; // finer than 10^-decimals
+    }
+    if exponent >= 18 {
+        return None; // 10^(18-decimals) or larger
+    }
+    for _ in 0..exponent {
+        if !(-(UPPER_BOUND / 10)..=UPPER_BOUND / 10).contains(&mantissa) {
+            return None;
+        }
+        mantissa *= 10;
+    }
+    if !(-UPPER_BOUND..=UPPER_BOUND).contains(&mantissa) {
+        return None;
+    }
+    Some(mantissa)
+}
+
+/// Core's `AmountFromValue` (`src/rpc/util.cpp`).
+///
+/// The decimal text is parsed exactly. satd used to round-trip it through
+/// `f64` — `format!("{:.8}")` on a number, `f64::from_str` on a string — which
+/// was wrong in both directions. Wrong *value*: 5.6% of five-decimal amounts
+/// landed a satoshi away from the decimal the caller wrote, because the
+/// nearest `f64` to `0.29` is below it. Wrong *domain*: `f64::from_str`
+/// accepts `NaN`, and `NaN < 0.0` and `NaN > 21_000_000.0` are both false, so
+/// both range guards fell through and `(NaN * 1e8).round() as u64` saturated
+/// to `0` — an output worth nothing, built without an error.
+fn parse_btc_amount(val: &Value) -> Result<Amount, (i32, String)> {
+    // Core reads the *literal text* of a JSON number (`UniValue::getValStr`),
+    // never a parsed double, so a number and its string spelling are the same
+    // input to `ParseFixedPoint`.
+    let amount_str = match val {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        _ => return Err((-3, "Amount is not a number or string".to_string())),
     };
-    let btc: f64 = amount_str.parse().map_err(|_| (-3, "Invalid amount".to_string()))?;
-    if btc < 0.0 {
+    let sat = parse_fixed_point(&amount_str, 8)
+        .ok_or((-3, "Invalid amount".to_string()))?;
+    // Core's `MoneyRange`: `0 <= n <= MAX_MONEY`. Negative amounts fail here,
+    // not in the parser.
+    const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+    if !(0..=MAX_MONEY).contains(&sat) {
         return Err((-3, "Amount out of range".to_string()));
     }
-    if btc > 21_000_000.0 {
-        return Err((-3, "Amount out of range".to_string()));
-    }
-    let sat = (btc * 100_000_000.0).round() as u64;
-    Ok(Amount::from_sat(sat))
+    Ok(Amount::from_sat(sat as u64))
 }
 
 /// `combinerawtransaction` — merge multiple partially-signed raw transactions.
@@ -2155,6 +2400,252 @@ mod tests {
         );
     }
 
+    /// A mainnet address must not build an output on regtest, and vice
+    /// versa. The reverse of the regtest example is what makes this a funds
+    /// bug: a testnet address accepted on mainnet pays a scriptPubKey the
+    /// sender does not control, and the prefix that would have caught it is
+    /// not carried in the script.
+    #[test]
+    fn create_raw_transaction_rejects_a_foreign_network_address() {
+        use bitcoin::Network;
+
+        let inputs = vec![json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        })];
+
+        // (address, the network it belongs to)
+        let cases = [
+            ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Network::Bitcoin),
+            ("bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs", Network::Bitcoin),
+            ("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202", Network::Regtest),
+        ];
+        for (addr, home) in cases {
+            for network in [Network::Bitcoin, Network::Regtest] {
+                let outputs = json!({ addr: 0.01 });
+                let got = create_raw_transaction(&inputs, &outputs, None, None, None, network);
+                if network == home {
+                    assert!(got.is_ok(), "{addr} must build an output on {network}");
+                } else {
+                    let (code, msg) = got.expect_err("{addr} is not a {network} address");
+                    assert_eq!(code, -5, "{addr} on {network}");
+                    assert_eq!(msg, format!("Invalid Bitcoin address: {addr}"), "{addr} on {network}");
+                }
+            }
+        }
+    }
+
+    /// `createpsbt` and `createrawtransaction` reach Core's `ParseOutputs`
+    /// through the same `ConstructTransaction`, so the address rule cannot
+    /// differ between them.
+    #[test]
+    fn create_psbt_applies_the_same_address_rule() {
+        let inputs = vec![json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+            "vout": 0
+        })];
+        let outputs = json!({ "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy": 0.01 });
+        let (code, msg) = crate::rpc::psbt::create_psbt(
+            &inputs,
+            &outputs,
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .expect_err("a mainnet address is not a regtest destination");
+        assert_eq!(code, -5);
+        assert_eq!(msg, "Invalid Bitcoin address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+
+        // ...and the shared parser is what gives `createpsbt` the array form
+        // and string amounts it did not have when it had its own loop.
+        let outputs = json!([
+            { "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202": "0.01" },
+            { "data": "deadbeef" },
+        ]);
+        let v = crate::rpc::psbt::create_psbt(&inputs, &outputs, None, bitcoin::Network::Regtest)
+            .expect("array-form outputs");
+        assert!(v.as_str().expect("base64").starts_with("cHNidP8"));
+    }
+
+    /// Core parses the *decimal text*, exactly. satd round-tripped it through
+    /// `f64`, which was wrong in both directions: a wrong value for ordinary
+    /// amounts, and a wrong domain for input `f64::from_str` accepts and
+    /// Core's grammar does not.
+    #[test]
+    fn amounts_are_parsed_as_exact_decimals_not_floats() {
+        // The value bug. The nearest f64 to 0.29 is below it, so
+        // `(0.29_f64 * 1e8) as u64` truncated to 28999999 -- one satoshi
+        // short of the decimal the caller wrote. 5.6% of five-decimal
+        // amounts landed a satoshi away.
+        for (text, sat) in [
+            ("0.29", 29_000_000u64),
+            ("0.57", 57_000_000),
+            ("2.675", 267_500_000),
+            ("0.00000001", 1),
+            ("21000000", 2_100_000_000_000_000),
+            ("1.10", 110_000_000),
+            ("1e2", 10_000_000_000),
+        ] {
+            assert_eq!(
+                parse_btc_amount(&json!(text)).expect(text),
+                Amount::from_sat(sat),
+                "string {text}"
+            );
+        }
+        for (num, sat) in [(json!(0.29), 29_000_000u64), (json!(1), 100_000_000)] {
+            assert_eq!(parse_btc_amount(&num).unwrap(), Amount::from_sat(sat), "{num}");
+        }
+
+        // The domain bug. `NaN` is the sharp one: it is neither `< 0.0` nor
+        // `> 21_000_000.0`, so both range guards fell through and the
+        // saturating cast produced a zero-value output with no error at all.
+        for bad in ["NaN", "inf", "-inf", "1.000000009", ".5", "1.", "01.0", "+1.0", "", " 1", "1 "] {
+            assert!(
+                parse_btc_amount(&json!(bad)).is_err(),
+                "{bad:?} must not parse as an amount"
+            );
+        }
+        assert_eq!(parse_btc_amount(&json!("NaN")).unwrap_err().0, -3);
+
+        // Range, which Core checks after the parse.
+        assert_eq!(
+            parse_btc_amount(&json!("-1")).unwrap_err(),
+            (-3, "Amount out of range".to_string())
+        );
+        assert_eq!(
+            parse_btc_amount(&json!("21000000.00000001")).unwrap_err(),
+            (-3, "Amount out of range".to_string())
+        );
+        assert_eq!(parse_btc_amount(&json!(true)).unwrap_err().0, -3);
+    }
+
+    /// `outputs` that is neither an object nor an array is a request error,
+    /// not an empty output set. `createpsbt '"hello"'` used to return a
+    /// perfectly valid PSBT with no outputs.
+    #[test]
+    fn a_scalar_outputs_argument_is_refused() {
+        let network = bitcoin::Network::Regtest;
+        for (bad, ty) in [
+            (json!("hello"), "string"),
+            (json!(5), "number"),
+            (json!(true), "bool"),
+        ] {
+            let (code, msg) =
+                parse_outputs(&bad, network).expect_err("a scalar is not an output set");
+            assert_eq!(code, -3, "{bad}");
+            assert_eq!(
+                msg,
+                format!("JSON value of type {ty} is not of expected type array"),
+                "{bad}"
+            );
+        }
+        // Core's `NormalizeOutputs` opens by refusing null by name.
+        let (code, msg) = parse_outputs(&json!(null), network).expect_err("null");
+        assert_eq!(code, -8);
+        assert_eq!(msg, "Invalid parameter, output argument must be non-null");
+
+        // Both empty forms are legitimate and produce no outputs.
+        assert!(parse_outputs(&json!({}), network).unwrap().is_empty());
+        assert!(parse_outputs(&json!([]), network).unwrap().is_empty());
+    }
+
+    /// Core's `ParseHexV` reads the literal text and requires non-empty,
+    /// even-length hex.
+    #[test]
+    fn data_outputs_follow_cores_hex_rules() {
+        let network = bitcoin::Network::Regtest;
+        // A JSON number is its own spelling to Core, and `1234` is valid hex.
+        let outs = parse_outputs(&json!({"data": 1234}), network).expect("numeric data");
+        assert_eq!(outs.len(), 1);
+        // An empty string is not hex; it used to build `OP_RETURN OP_0`.
+        for bad in [json!({"data": ""}), json!({"data": "abc"}), json!({"data": "zz"})] {
+            let (code, msg) = parse_outputs(&bad, network).expect_err("{bad}");
+            assert_eq!(code, -8, "{bad}");
+            assert!(msg.starts_with("Data must be hexadecimal string (not '"), "{msg}");
+        }
+    }
+
+    /// Dedup is on the decoded destination, not the address string, so two
+    /// spellings of one script collide as they do in Core. Restoring
+    /// string-keyed dedup must fail a named test.
+    #[test]
+    fn two_spellings_of_one_destination_are_a_duplicate() {
+        const UPPER: &str = "BCRT1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQDKU202";
+        const LOWER: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+        let (code, msg) = parse_outputs(
+            &json!([{ UPPER: 0.01 }, { LOWER: 0.02 }]),
+            bitcoin::Network::Regtest,
+        )
+        .expect_err("one destination, written twice");
+        assert_eq!(code, -8);
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {LOWER}"));
+    }
+
+    /// Core's `ParseOutputs` decodes, parses the amount, *then* throws on an
+    /// undecodable address, and dedupes last. The order is observable through
+    /// which of two simultaneous errors comes back.
+    #[test]
+    fn parse_outputs_reports_errors_in_cores_order() {
+        let network = bitcoin::Network::Regtest;
+        const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        // Bad address *and* bad amount: Core reports the amount, because
+        // `AmountFromValue` runs before `IsValidDestination`.
+        let (code, _) = parse_outputs(&json!({ "notanaddress": "wat" }), network)
+            .expect_err("neither the address nor the amount is usable");
+        assert_eq!(code, -3, "the amount error precedes the address error");
+
+        // A repeated *invalid* address is an address error, not a duplicate
+        // one -- the validity check runs first.
+        let (code, msg) = parse_outputs(
+            &json!([{ "notanaddress": 0.01 }, { "notanaddress": 0.01 }]),
+            network,
+        )
+        .expect_err("still not an address the second time");
+        assert_eq!(code, -5);
+        assert_eq!(msg, "Invalid Bitcoin address: notanaddress");
+
+        // A repeated valid address is the duplicate error.
+        let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: 0.02 }]), network)
+            .expect_err("the same destination twice");
+        assert_eq!(code, -8);
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+    }
+
+    /// Core reads a repeated key's value as `outputs[name_]`, which is the
+    /// *first* member with that key -- so the second occurrence's value is
+    /// never parsed, and the answer is the duplicate-address error rather than
+    /// whatever the second value happens to be.
+    ///
+    /// Reading each occurrence's own value reported "Invalid amount" here,
+    /// pointing the caller at the wrong half of their request. Deleting the
+    /// first-occurrence pass fails this test.
+    #[test]
+    fn a_repeated_key_is_read_with_its_first_value() {
+        let network = bitcoin::Network::Regtest;
+        const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+        let (code, msg) = parse_outputs(&json!([{ ADDR: 0.01 }, { ADDR: "wat" }]), network)
+            .expect_err("the same destination twice");
+        assert_eq!(code, -8, "the unparseable second value is never reached");
+        assert_eq!(msg, format!("Invalid parameter, duplicated address: {ADDR}"));
+
+        // And the first value is the one a bad *first* entry is judged on.
+        let (code, _) = parse_outputs(&json!([{ ADDR: "wat" }, { ADDR: 0.01 }]), network)
+            .expect_err("the first value is unparseable");
+        assert_eq!(code, -3);
+    }
+
+    /// An explicit `null` is Core's `NormalizeOutputs` refusal, by name. Core
+    /// declares `outputs` with `skip_type_check`, so the null reaches the
+    /// handler rather than the argument type checker.
+    #[test]
+    fn a_null_outputs_argument_is_refused_by_name() {
+        let (code, msg) = parse_outputs(&json!(null), bitcoin::Network::Regtest)
+            .expect_err("null is not an output set");
+        assert_eq!(code, -8);
+        assert_eq!(msg, "Invalid parameter, output argument must be non-null");
+    }
+
     /// Core's `ConstructTransaction` picks the default sequence from three
     /// cases, not two. The middle one decides whether a requested locktime is
     /// enforceable at all.
@@ -2167,7 +2658,14 @@ mod tests {
         let outputs = json!({});
 
         let seq_of = |locktime: Option<u32>, replaceable: Option<bool>| -> u64 {
-            let v = create_raw_transaction(&inputs, &outputs, locktime, replaceable, None)
+            let v = create_raw_transaction(
+                &inputs,
+                &outputs,
+                locktime,
+                replaceable,
+                None,
+                bitcoin::Network::Regtest,
+            )
                 .expect("well-formed request");
             let hex = v.as_str().expect("hex string");
             let raw = hex::decode(hex).expect("valid hex");

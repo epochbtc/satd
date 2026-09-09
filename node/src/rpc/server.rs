@@ -365,16 +365,26 @@ pub struct ReadOnlyListener {
 // positional-argument reader every handler uses. See `crate::rpc::params`.
 use crate::rpc::params::json_type_name;
 
-/// Scan the raw JSON params string for `createrawtransaction` and detect
-/// duplicate keys in the outputs object (the second positional element).
+/// Read the `outputs` argument out of the raw JSON params, preserving key
+/// order *and* duplicate keys, as a list of one-key objects.
 ///
-/// serde_json's `Map` silently deduplicates, but Core rejects them.
-/// This function extracts the second element of the params array using
-/// `serde_json::value::RawValue` and then iterates the object keys via a
-/// streaming deserializer to find duplicates.
+/// `serde_json::Map` silently collapses duplicate keys; Core's `UniValue`
+/// keeps them (`pushKVEnd`) and `ParseOutputs` walks `getKeys()` in order. So
+/// the duplicate has to be recovered before serde sees it — but recovering it
+/// as an ordered *sequence* rather than as a "duplicate found" verdict is what
+/// lets `parse_outputs` apply Core's checks, in Core's order, to the object
+/// form and the array form alike.
 ///
-/// Returns `Some(key)` if a duplicate is found, `None` otherwise.
-fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
+/// Reporting the duplicate here instead put the dedup check *first*, ahead of
+/// the address decode and the amount parse that Core runs before it — so a
+/// repeated invalid address came back as `duplicated address` where Core says
+/// `Invalid Bitcoin address`, and a repeated address with a bad amount hid the
+/// amount error. It also left `createpsbt`, which had no such scan, with no
+/// duplicate detection at all.
+///
+/// Returns `None` when the element is absent or is not an object, in which
+/// case the ordinarily-parsed value is used unchanged.
+fn raw_outputs_sequence(raw_params: &str, index: usize) -> Option<Vec<serde_json::Value>> {
     // The params are a JSON array: [inputs, outputs, ...].
     // We need to extract the second element as raw JSON.
     let trimmed = raw_params.trim();
@@ -386,48 +396,44 @@ fn detect_duplicate_output_key(raw_params: &str) -> Option<String> {
     // collapsing duplicate keys: parse each element as a RawValue.
     let elements: Vec<&serde_json::value::RawValue> =
         serde_json::from_str(trimmed).ok()?;
-    let outputs_raw = elements.get(1)?;
+    let outputs_raw = elements.get(index)?;
     let outputs_str = outputs_raw.get();
 
-    // Only check objects (not arrays).
+    // Only objects; an array already carries its own order and duplicates.
     if !outputs_str.trim_start().starts_with('{') {
         return None;
     }
 
-    // Walk the object keys using a streaming approach.
-    // serde_json's `Deserializer` with `MapAccess` would be ideal,
-    // but the simplest approach: use a custom `Visitor` that detects duplicates.
-    let keys: Vec<String> = Vec::new();
-    // Parse as a stream of key-value pairs by using the serde_json
-    // `MapDeserializer`. We can use `serde_json::from_str` with a
-    // custom type that collects all keys.
-    struct DupKeyDetector {
-        keys: Vec<String>,
-    }
+    // Collect every key/value pair in source order. Linear in the input --
+    // the previous version compared each key against a `Vec` of the ones
+    // before it, which is quadratic, and `createrawtransaction` is reachable
+    // on the read-only listener with a body limit measured in megabytes.
+    struct OrderedPairs;
 
-    impl<'de> serde::de::Visitor<'de> for DupKeyDetector {
-        type Value = Option<String>;
+    impl<'de> serde::de::Visitor<'de> for OrderedPairs {
+        type Value = Vec<serde_json::Value>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             write!(f, "a JSON object")
         }
 
-        fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
             while let Some(key) = map.next_key::<String>()? {
-                if self.keys.contains(&key) {
-                    return Ok(Some(key));
-                }
-                self.keys.push(key);
-                // Skip value.
-                let _: serde::de::IgnoredAny = map.next_value()?;
+                let value: serde_json::Value = map.next_value()?;
+                let mut one = serde_json::Map::with_capacity(1);
+                one.insert(key, value);
+                out.push(serde_json::Value::Object(one));
             }
-            Ok(None)
+            Ok(out)
         }
     }
 
     let mut de = serde_json::Deserializer::from_str(outputs_str);
-    let visitor = DupKeyDetector { keys };
-    serde::Deserializer::deserialize_any(&mut de, visitor).ok().flatten()
+    serde::Deserializer::deserialize_any(&mut de, OrderedPairs).ok()
 }
 
 /// Shared state for RPC handlers.
@@ -1751,7 +1757,7 @@ pub async fn start(
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
-    module.register_method("createrawtransaction", |params, _ctx, _extensions| {
+    module.register_method("createrawtransaction", |params, ctx, _extensions| {
         // Grab the raw JSON before the sequence parser touches it.
         // We need this to detect duplicate keys in the outputs object,
         // since serde_json silently deduplicates.
@@ -1796,39 +1802,23 @@ pub async fn start(
                 ));
             }
         };
+        // `raw_or_null`, not `raw`: Core declares `outputs` with
+        // `skip_type_check`, so an explicit `null` reaches the handler and is
+        // answered by `NormalizeOutputs` ("Invalid parameter, output argument
+        // must be non-null"), not by the missing-argument path. Collapsing it
+        // to `None` here made that refusal unreachable over the wire.
         let outputs: serde_json::Value = args
-            .raw("outputs")?
+            .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "createrawtransaction", None::<()>))?;
-        // Detect duplicate keys in the outputs JSON object. serde_json
-        // silently deduplicates, but Core rejects duplicates.  We scan
-        // the raw params JSON for the second positional element and check
-        // for repeated keys.
-        if outputs.is_object()
-            && let Some(dup) = detect_duplicate_output_key(&raw_params_json)
-        {
-            let msg = if dup == "data" {
-                "Invalid parameter, duplicate key: data".to_string()
-            } else {
-                format!("Invalid parameter, duplicated address: {dup}")
-            };
-            return Err(ErrorObjectOwned::owned(-8, msg, None::<()>));
-        }
-
-        // Core accepts either array or object for outputs; reject other types.
-        if !outputs.is_array() && !outputs.is_object() {
-            let type_name = match &outputs {
-                serde_json::Value::String(_) => "string",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Null => "null",
-                _ => "unknown",
-            };
-            return Err(ErrorObjectOwned::owned(
-                -3,
-                format!("JSON value of type {type_name} is not of expected type array"),
-                None::<()>,
-            ));
-        }
+        // Recover the object's source order and its duplicate keys, which
+        // serde collapsed, and hand `parse_outputs` the sequence Core's
+        // `getKeys()` walks. Every check -- duplicate address, duplicate
+        // `data`, the outputs type -- then happens in the one place that
+        // applies them in Core's order, for both this RPC and `createpsbt`.
+        let outputs = match raw_outputs_sequence(&raw_params_json, 1) {
+            Some(pairs) => serde_json::Value::Array(pairs),
+            None => outputs,
+        };
         let locktime: Option<serde_json::Value> = args.raw("locktime")?;
         let replaceable: Option<serde_json::Value> = args.raw("replaceable")?;
         let version: Option<serde_json::Value> = args.raw("version")?;
@@ -1883,7 +1873,14 @@ pub async fn start(
                 -8, format!("Invalid parameter, version out of range({TX_VERSION_MIN}~{TX_VERSION_MAX})"), None::<()>,
             )),
         };
-        rawtx::create_raw_transaction(&inputs, &outputs, locktime_val, replaceable_val, version_val)
+        rawtx::create_raw_transaction(
+            &inputs,
+            &outputs,
+            locktime_val,
+            replaceable_val,
+            version_val,
+            ctx.chain_state.network,
+        )
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -2092,15 +2089,27 @@ pub async fn start(
 
     // --- PSBT RPCs ---
 
-    module.register_method("createpsbt", |params, _ctx, _extensions| {
+    module.register_method("createpsbt", |params, ctx, _extensions| {
+        // Grabbed before the sequence parser touches it, for the same reason
+        // `createrawtransaction` does: serde collapses duplicate output keys.
+        let raw_params_json = params.as_str().unwrap_or("").to_string();
         let mut args = Args::new(&params);
         let inputs: Vec<serde_json::Value> = args.required("inputs")?;
+        // See `createrawtransaction`: an explicit `null` is the handler's to
+        // refuse, by name, not an omission.
         let outputs: serde_json::Value = args
-            .raw("outputs")?
+            .raw_or_null("outputs")?
             .ok_or_else(|| ErrorObjectOwned::owned(-1, "Missing required argument outputs", None::<()>))?;
         let locktime: Option<u32> = args.optional("locktime")?;
         args.check()?;
-        psbt::create_psbt(&inputs, &outputs, locktime)
+        // Same duplicate-preserving read as `createrawtransaction`: Core
+        // reaches one `ParseOutputs` from both, so both must see the same
+        // sequence. `createpsbt` had no duplicate detection at all.
+        let outputs = match raw_outputs_sequence(&raw_params_json, 1) {
+            Some(pairs) => serde_json::Value::Array(pairs),
+            None => outputs,
+        };
+        psbt::create_psbt(&inputs, &outputs, locktime, ctx.chain_state.network)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -4418,6 +4427,38 @@ where
             conn.as_mut().graceful_shutdown();
             conn.await
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_outputs_tests {
+    use super::raw_outputs_sequence;
+
+    /// serde collapses duplicate object keys before any handler sees them, so
+    /// the outputs object has to be re-read from the raw body. The sequence
+    /// this produces is what lets `parse_outputs` apply Core's checks in
+    /// Core's order to the object form.
+    #[test]
+    fn duplicate_keys_survive_in_source_order() {
+        let raw = r#"[[],{"a":0.01,"a":0.02,"data":"aa"}]"#;
+        let pairs = raw_outputs_sequence(raw, 1).expect("an object yields a sequence");
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|p| p.as_object().unwrap().keys().next().unwrap().clone())
+            .collect();
+        assert_eq!(keys, ["a", "a", "data"]);
+        assert_eq!(pairs[0]["a"], serde_json::json!(0.01));
+        assert_eq!(pairs[1]["a"], serde_json::json!(0.02));
+    }
+
+    /// Anything that is not an object keeps its ordinarily-parsed value.
+    #[test]
+    fn non_objects_are_left_alone() {
+        assert!(raw_outputs_sequence(r#"[[],[{"a":1}]]"#, 1).is_none(), "array");
+        assert!(raw_outputs_sequence(r#"[[],"hello"]"#, 1).is_none(), "string");
+        assert!(raw_outputs_sequence(r#"[[]]"#, 1).is_none(), "absent");
+        assert!(raw_outputs_sequence("not json", 1).is_none(), "garbage");
+        assert!(raw_outputs_sequence("", 1).is_none(), "empty");
     }
 }
 
