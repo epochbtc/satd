@@ -90,11 +90,17 @@ services:
       - satd
     restart: unless-stopped
     # BTCPay speaks plain HTTP and builds absolute URLs from its own root,
-    # so it gets a dedicated proxy port rather than a path. Published
-    # directly here for stacks not running compose.proxy.yml; behind the
-    # proxy, prefer the TLS port.
+    # so it gets a dedicated proxy port rather than a path: compose.proxy.yml
+    # serves it over TLS on 49393.
+    #
+    # Bound to loopback, not 0.0.0.0. This endpoint takes a login and a store
+    # configuration, and a published port bypasses the appliance's inbound
+    # nftables chain, so binding every interface put credentials on the LAN in
+    # clear -- including for anyone who added compose.proxy.yml believing that
+    # was the TLS-only setup. Override BTCPAY_BIND_ADDR only for a stack that
+    # terminates TLS somewhere else.
     ports:
-      - "${BTCPAY_PORT:-49392}:49392"
+      - "${BTCPAY_BIND_ADDR:-127.0.0.1}:${BTCPAY_PORT:-49392}:49392"
 
 volumes:
   btcpay-db:

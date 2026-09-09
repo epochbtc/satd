@@ -104,6 +104,10 @@ compose.cashu.yml        Nutshell mint, backed by the LND above.
 compose.btcpay.yml       Postgres + NBXplorer + BTCPay Server.
 compose.ark.yml          An Ark server (arkd), via NBXplorer. Experimental.
 compose.proxy.yml        Caddy, terminating TLS for the web UIs and metrics.
+                         443 RTL, 8443 Cashu mint, 49393 BTCPay, 9443 metrics.
+                         RTL and the mint are not published at all and BTCPay
+                         binds loopback, so these are the only ways to reach a
+                         web UI from another machine.
 satd/satd.conf.tmpl      The node configuration, with @NAME@ substitutions.
 satd/satd-init           Renders it, issues the certificates, mints the MCP token.
 tls/mkca.sh              The one CA/certificate script, shared by all three deliverables.
@@ -121,10 +125,15 @@ Some overlays require a secret with no default, and refuse to start without
 it rather than shipping one everybody shares:
 
 ```sh
+echo "RTL_PASSWORD=$(openssl rand -hex 24)" >> .env            # compose.lightning.yml
 echo "MINT_PRIVATE_KEY=$(openssl rand -hex 32)" >> .env       # compose.cashu.yml
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env      # compose.btcpay.yml
 echo "ARK_POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env  # compose.ark.yml
 ```
+
+`RTL_PASSWORD` is the login for Ride The Lightning, which fronts LND's admin
+macaroon. RTL has no default worth keeping: with nothing set it generates a
+config whose password is the literal string `password`.
 
 ## Why LND runs in Neutrino mode
 

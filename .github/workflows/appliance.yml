@@ -83,11 +83,14 @@ jobs:
           # mkca.sh, satd-init and the config template.
           echo "stack=$(match '^(contrib/stack/|contrib/docker/|Dockerfile$)')" >> "$GITHUB_OUTPUT"
           echo "appliance=$(match '^(contrib/appliance/|contrib/stack/|contrib/systemd/)')" >> "$GITHUB_OUTPUT"
-          echo "scripts=$(match '^contrib/(stack/tls/|stack/tests/|docker/)')" >> "$GITHUB_OUTPUT"
+          # Widened past tls/tests: compose-test.sh asserts invariants over the
+          # compose files, the appliance CLI and the Umbrel package, so it has
+          # to run when any of those change.
+          echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)')" >> "$GITHUB_OUTPUT"
 
   # Cheap and always worth running when touched: no docker, no network.
   scripts:
-    name: certificate + healthcheck scripts
+    name: stack + appliance scripts
     needs: changes
     if: needs.changes.outputs.scripts == 'true'
     runs-on: ubuntu-24.04
@@ -98,6 +101,8 @@ jobs:
         run: contrib/stack/tests/mkca-test.sh
       - name: satd-healthcheck
         run: contrib/docker/tests/healthcheck-test.sh
+      - name: compose + appliance invariants
+        run: contrib/stack/tests/compose-test.sh
       - name: shellcheck
         run: |
           sudo apt-get update -qq
@@ -111,7 +116,8 @@ jobs:
             contrib/appliance/build.sh \
             contrib/appliance/bin/satd-appliance \
             contrib/appliance/firstboot/satd-appliance-firstboot \
-            contrib/appliance/provision/*.sh
+            contrib/appliance/provision/*.sh \
+            contrib/stack/tests/compose-test.sh
 
   stack:
     name: reference stack (regtest, TLS probed)
@@ -141,7 +147,15 @@ jobs:
       - name: Compose files parse
         run: |
           set -euo pipefail
-          for overlay in lightning cln btcpay proxy; do
+          # Every secret an overlay declares as ${VAR:?} has to be in the
+          # environment for the whole loop, not just for the overlay that
+          # prompted it: a missing one is a parse error, so the step fails
+          # on the first overlay that needs one it was not given.
+          export RTL_PASSWORD=ci
+          export MINT_PRIVATE_KEY=ci
+          export POSTGRES_PASSWORD=ci
+          export ARK_POSTGRES_PASSWORD=ci
+          for overlay in lightning cln btcpay ark proxy; do
             docker compose -f contrib/stack/compose.yml \
               -f "contrib/stack/compose.$overlay.yml" \
               --env-file contrib/stack/.env.example \
@@ -149,12 +163,22 @@ jobs:
             echo "ok: $overlay"
           done
           # cashu extends the Lightning overlay, so it only parses with it.
-          MINT_PRIVATE_KEY=ci POSTGRES_PASSWORD=ci docker compose \
+          docker compose \
             -f contrib/stack/compose.yml \
             -f contrib/stack/compose.lightning.yml \
             -f contrib/stack/compose.cashu.yml \
             --env-file contrib/stack/.env.example config > /dev/null
           echo "ok: cashu"
+          # And all of them together, which is what the appliance can end up
+          # running and what no single-overlay parse would catch.
+          docker compose -f contrib/stack/compose.yml \
+            -f contrib/stack/compose.lightning.yml \
+            -f contrib/stack/compose.cashu.yml \
+            -f contrib/stack/compose.btcpay.yml \
+            -f contrib/stack/compose.ark.yml \
+            -f contrib/stack/compose.proxy.yml \
+            --env-file contrib/stack/.env.example config > /dev/null
+          echo "ok: all overlays together"
 
   image:
     name: build and boot the appliance image

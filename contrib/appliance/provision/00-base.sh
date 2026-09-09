@@ -123,7 +123,9 @@ table inet filter {
 		tcp dport { 8336, 50002, 3001, 8339 } accept
 
 		# Reverse proxy: web UIs and metrics, TLS with the same cert.
-		tcp dport { 443, 8443, 9443 } accept
+		# 49393 is BTCPay; its own HTTP port binds loopback in
+		# compose.btcpay.yml and is deliberately not opened here.
+		tcp dport { 443, 8443, 9443, 49393 } accept
 
 		# Lightning P2P (LND / CLN), when an overlay is enabled.
 		tcp dport { 9735, 9736 } accept

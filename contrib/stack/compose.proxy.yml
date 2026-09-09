@@ -14,9 +14,10 @@
 # /btcpay means rewriting HTML and breaking on the next release. Distinct
 # ports are uglier to type and keep working.
 #
-#   443   Ride The Lightning        (compose.lightning.yml)
-#   8443  Cashu mint                (compose.cashu.yml)
-#   9443  satd metrics / healthz / readyz
+#   443    Ride The Lightning       (compose.lightning.yml)
+#   8443   Cashu mint               (compose.cashu.yml)
+#   49393  BTCPay Server            (compose.btcpay.yml)
+#   9443   satd metrics / healthz / readyz
 #
 # An overlay that is not enabled leaves its port answering 502, because
 # Caddy resolves upstreams per request rather than at start.
@@ -49,6 +50,7 @@ services:
     ports:
       - "${PROXY_RTL_PORT:-443}:443"
       - "${PROXY_MINT_PORT:-8443}:8443"
+      - "${PROXY_BTCPAY_PORT:-49393}:49393"
       - "${PROXY_METRICS_PORT:-9443}:9443"
     networks:
       - satd

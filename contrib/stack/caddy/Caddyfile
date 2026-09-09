@@ -25,6 +25,17 @@
 	reverse_proxy mint:3338
 }
 
+# BTCPay Server — compose.btcpay.yml. BTCPay builds absolute URLs and decides
+# whether to mark its cookies Secure from the forwarded headers, so the scheme
+# and host have to be passed through or it redirects a logged-in browser back
+# to http:// on its own port.
+:49393 {
+	import satd_tls
+	reverse_proxy btcpay:49392 {
+		header_up X-Forwarded-Proto https
+	}
+}
+
 # satd's metrics, /healthz and /readyz. No native TLS on this listener, which
 # is why it is here; it stays on the compose network otherwise.
 :9443 {

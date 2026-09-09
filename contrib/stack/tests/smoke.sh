@@ -47,6 +47,10 @@ export PROXY_MINT_PORT=$((PORT_BASE + 4))
 export PROXY_METRICS_PORT=$((PORT_BASE + 5))
 export LND_P2P_PORT=$((PORT_BASE + 6))
 export LND_REST_PORT=$((PORT_BASE + 7))
+export PROXY_BTCPAY_PORT=$((PORT_BASE + 8))
+# Required by compose.lightning.yml, and asserted on below: RTL falls back to
+# the literal password "password" if this does not reach it.
+export RTL_PASSWORD="smoke-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export NETWORK=regtest
 export SATD_IMAGE="${SATD_IMAGE:-ghcr.io/epochbtc/satd:latest}"
 export SATD_TLS_HOSTNAME=satd
@@ -299,6 +303,62 @@ sys.exit(0 if d.get('synced_to_chain') and d.get('block_height')==$HEIGHT else 1
                     fail "Ride The Lightning serves over TLS through the proxy" \
                         "http $rtl_code
 $(compose logs --no-color --tail 30 rtl 2>&1)"
+                fi
+
+                # RTL reads APP_PASSWORD and nothing else. Passing it under
+                # any other name leaves the password RTL writes into the
+                # config it generates -- the literal string "password" -- in
+                # front of LND's admin macaroon, on a port the proxy
+                # publishes. Serving a login page is not evidence that the
+                # login is ours, so both directions are checked.
+                #
+                # RTL mounts csurf on every route, so the POST needs the
+                # token from a prior GET; without it the answer is 403 and
+                # both assertions below would fail for the wrong reason.
+                #
+                # The API lives under RTL's baseHref, /rtl -- express serves
+                # the frontend as a static catch-all, so posting to /api/...
+                # returns 200 and index.html no matter what the credentials
+                # were. Both directions are asserted precisely because a
+                # wrong path answers 200 to anything.
+                rtl_curl() { curl -sS --cacert "$CA" \
+                    --resolve "localhost:$PROXY_RTL_PORT:127.0.0.1" "$@"; }
+                # /rtl/login, not /rtl/: the XSRF-TOKEN cookie is set by the
+                # single-page catch-all, and express.static answers /rtl/ with
+                # index.html before that middleware ever runs.
+                rtl_jar="$WORK/rtl-cookies"
+                rtl_curl -c "$rtl_jar" -o /dev/null \
+                    "https://localhost:$PROXY_RTL_PORT/rtl/login" || true
+                # Netscape jar: name is field 6, value is field 7.
+                rtl_xsrf="$(awk '$6=="XSRF-TOKEN"{print $7}' "$rtl_jar" 2>/dev/null || true)"
+                rtl_login() {
+                    local hash
+                    hash="$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"
+                    rtl_curl -b "$rtl_jar" -c "$rtl_jar" \
+                        -H "X-XSRF-TOKEN: $rtl_xsrf" \
+                        -H 'Content-Type: application/json' \
+                        -o /dev/null -w '%{http_code}' \
+                        -d "{\"authenticateWith\":\"PASSWORD\",\"authenticationValue\":\"$hash\"}" \
+                        "https://localhost:$PROXY_RTL_PORT/rtl/api/authenticate" 2>&1 || true
+                }
+                if [[ -z "$rtl_xsrf" ]]; then
+                    fail "RTL rejects its upstream default password" \
+                        "no XSRF-TOKEN cookie from RTL; the login check could not run"
+                else
+                    default_code="$(rtl_login password)"
+                    if [[ "$default_code" == "401" ]]; then
+                        pass "RTL rejects its upstream default password"
+                    else
+                        fail "RTL rejects its upstream default password" \
+                            "expected http 401, got $default_code -- APP_PASSWORD did not reach RTL"
+                    fi
+                    ours_code="$(rtl_login "$RTL_PASSWORD")"
+                    if [[ "$ours_code" == "200" ]]; then
+                        pass "RTL accepts the password the stack configured"
+                    else
+                        fail "RTL accepts the password the stack configured" \
+                            "expected http 200, got $ours_code"
+                    fi
                 fi
             fi
             ;;

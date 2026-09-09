@@ -44,10 +44,11 @@ services:
         condition: service_completed_successfully
     # The network is an argument, never a config-file line: satd accepts
     # `signet=1` in a file and then ignores it, which silently starts a
-    # mainnet node.
+    # mainnet node. `--chain=` because there is no bare `--mainnet` flag,
+    # and mainnet is this package's default.
     command:
       - --datadir=/var/lib/satd
-      - --${APP_SATD_NETWORK:-mainnet}
+      - --chain=${APP_SATD_NETWORK:-mainnet}
     environment:
       SATD_HEALTH_URL: http://127.0.0.1:9332/readyz
     volumes:

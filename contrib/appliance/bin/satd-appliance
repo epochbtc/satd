@@ -82,15 +82,27 @@ enabled_overlays() {
     find "$ENABLED_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
 }
 
+# Every overlay secret is loaded here, in the one place that runs compose,
+# rather than at each call site. The overlays declare their secrets with
+# compose's `${VAR:?}` form, so a missing one is a hard parse error, not an
+# empty string: any caller that forgot to source overlay.env could not bring
+# the stack up, tear it down, or move it to another network. Sourcing happens
+# in the subshell so the secrets never reach the rest of this script.
 run_compose() {
     local args=()
     mapfile -t args < <(compose_args)
-    ( cd "$STACK" && SATD_HOST="$(stack_gateway)" \
+    (
+        cd "$STACK"
+        if [[ -s "$STATE/overlay.env" ]]; then
+            set -a; . "$STATE/overlay.env"; set +a
+        fi
+        SATD_HOST="$(stack_gateway)" \
         SATD_STACK_SUBNET="$(stack_subnet)" \
         NETWORK="$(current_network)" \
         SATD_P2P_PORT="$(p2p_port_for "$(current_network)")" \
         SATD_TLS_HOSTNAME="$(hostname)" \
-        docker compose "${args[@]}" "$@" )
+        docker compose "${args[@]}" "$@"
+    )
 }
 
 # --- render the node configuration ------------------------------------------
@@ -253,6 +265,8 @@ available: $(cd "$STACK" && ls compose.*.yml | sed 's/compose\.\(.*\)\.yml/\1/' 
     # shipping one that every image would share.
     mkdir -p "$STATE"
     touch "$STATE/overlay.env"; chmod 0600 "$STATE/overlay.env"
+    # Every overlay that declares a `${VAR:?}` secret needs a branch here, or
+    # `enable` fails on compose interpolation before it starts anything.
     case "$overlay" in
         cashu)
             grep -q '^MINT_PRIVATE_KEY=' "$STATE/overlay.env" || \
@@ -262,13 +276,22 @@ available: $(cd "$STACK" && ls compose.*.yml | sed 's/compose\.\(.*\)\.yml/\1/' 
             grep -q '^POSTGRES_PASSWORD=' "$STATE/overlay.env" || \
                 echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
             ;;
+        ark)
+            grep -q '^ARK_POSTGRES_PASSWORD=' "$STATE/overlay.env" || \
+                echo "ARK_POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
+            ;;
+        lightning)
+            # RTL's login. Without it RTL serves its own default, "password",
+            # in front of LND's admin macaroon.
+            grep -q '^RTL_PASSWORD=' "$STATE/overlay.env" || \
+                echo "RTL_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
+            ;;
     esac
 
     systemctl enable --now docker > /dev/null 2>&1 || true
     mkdir -p "$ENABLED_DIR"
     touch "$ENABLED_DIR/$overlay"
     echo "satd-appliance: pulling images for $overlay (this is the first network fetch for it)"
-    set -a; . "$STATE/overlay.env"; set +a
     run_compose pull --quiet 2>/dev/null || run_compose pull
     run_compose up -d
     echo "satd-appliance: $overlay enabled"
@@ -283,15 +306,15 @@ cmd_disable() {
     # bring back what remains: `compose down` only knows about services in
     # the files it is given, so removing the file first would strand the
     # overlay's containers with nothing able to name them.
-    run_compose down --remove-orphans || true
+    # Not `|| true`: a teardown that failed left the overlay's containers
+    # running, and removing the marker then makes them invisible to every
+    # later command -- nothing would name them again to stop them.
+    if ! run_compose down --remove-orphans; then
+        die "could not bring the stack down; $overlay is still enabled and its
+containers are still running. Fix the error above and retry."
+    fi
     rm -f "$ENABLED_DIR/$overlay"
     if [[ -n "$(enabled_overlays)" ]]; then
-        # An `if`, not `[[ -s f ]] && . f`: under `set -e` that AND-list
-        # returns non-zero when the file is absent and aborts the command
-        # half-way through, leaving the remaining overlays down.
-        if [[ -s "$STATE/overlay.env" ]]; then
-            set -a; . "$STATE/overlay.env"; set +a
-        fi
         run_compose up -d
     else
         systemctl disable --now docker > /dev/null 2>&1 || true
@@ -326,6 +349,15 @@ cmd_ssh() {
 
 # Only reachable from the live ISO: a running installed system copying
 # itself over a disk is not something to make easy by accident.
+# Set by cmd_install_to_disk before it mounts anything; read only by the trap.
+INSTALL_MNT=""
+install_cleanup() {
+    [[ -n "$INSTALL_MNT" ]] || return 0
+    umount -R "$INSTALL_MNT/dev" "$INSTALL_MNT/proc" "$INSTALL_MNT/sys" 2>/dev/null || true
+    umount -R "$INSTALL_MNT" 2>/dev/null || true
+    rmdir "$INSTALL_MNT" 2>/dev/null || true
+}
+
 cmd_install_to_disk() {
     need_root install-to-disk "$@"
     local target="${1:-}"
@@ -368,7 +400,18 @@ cmd_install_to_disk() {
     mkfs.vfat -F32 -n ESP "${target}${p}2" > /dev/null
     mkfs.ext4 -q -L satd-root "${target}${p}3"
 
-    local mnt; mnt="$(mktemp -d)"
+    # Global, not local: the EXIT trap below runs while the shell is being
+    # torn down, and a `local` is not something to rely on still being in
+    # scope there.
+    INSTALL_MNT="$(mktemp -d)"
+    local mnt="$INSTALL_MNT"
+    # Everything from here on is unwound on the way out however it goes. A
+    # failure between the first mount and the last (a full disk, a GRUB that
+    # will not install) otherwise leaves the target's filesystems held by this
+    # shell, so the obvious next move -- run the installer again -- fails on a
+    # busy device instead.
+    trap install_cleanup EXIT
+
     mount "${target}${p}3" "$mnt"
     mkdir -p "$mnt/boot/efi"
     mount "${target}${p}2" "$mnt/boot/efi"
@@ -380,6 +423,16 @@ cmd_install_to_disk() {
         --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
         --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lib/live \
         / "$mnt/"
+
+    # rsync excluded these, so none of them exist on the new filesystem. The
+    # bind mounts below would fail on the first one -- after the disk has been
+    # formatted, under `set -e` and before GRUB runs, which leaves the target
+    # erased and unbootable. The installed system needs them regardless: /run
+    # and /tmp are mountpoints systemd fills at boot, and /tmp carries the
+    # sticky bit.
+    mkdir -p "$mnt"/{dev,proc,sys,run,tmp,mnt,media}
+    chmod 0755 "$mnt"/{dev,proc,sys,run,mnt,media}
+    chmod 1777 "$mnt/tmp"
 
     local root_uuid esp_uuid
     root_uuid="$(blkid -s UUID -o value "${target}${p}3")"
@@ -410,6 +463,9 @@ FSTAB
     # live-config's session setup does not belong on an installed system.
     rm -f "$mnt/etc/sudoers.d/live" 2>/dev/null || true
 
+    # Unmount now rather than leaving it to the trap, so a failure to flush
+    # the new filesystem is reported instead of being swallowed by cleanup.
+    trap - EXIT
     umount -R "$mnt/dev" "$mnt/proc" "$mnt/sys" 2>/dev/null || true
     umount -R "$mnt"
     rmdir "$mnt"

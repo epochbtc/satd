@@ -44,12 +44,17 @@ services:
     depends_on:
       satd-init:
         condition: service_completed_successfully
-    # The network flag has to be an argument. satd accepts `signet=1` in a
-    # config file and then ignores it, which silently starts a mainnet node,
-    # so the stack never expresses the chain that way.
+    # The network has to be an argument. satd accepts `signet=1` in a config
+    # file and then ignores it, which silently starts a mainnet node, so the
+    # stack never expresses the chain that way.
+    #
+    # `--chain=<name>` rather than a bare `--<name>`: there are bare flags for
+    # the test networks but none for mainnet, so `NETWORK=mainnet` rendered
+    # `--mainnet` and satd exited on an unknown argument. --chain takes every
+    # name this file accepts, mainnet included.
     command:
       - --datadir=/var/lib/satd
-      - --${NETWORK:-signet}
+      - --chain=${NETWORK:-signet}
     environment:
       # Readiness, not liveness: /readyz stays negative until the chainstate
       # is loaded and every listener is bound, which is what the overlays'

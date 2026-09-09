@@ -85,9 +85,13 @@ services:
       CONFIG_PATH: ""
       RTL_CONFIG_PATH: /RTL/config
       CHANNEL_BACKUP_PATH: /RTL/database/backup
-      # RTL's own login. The appliance replaces this on first boot; set it
-      # in .env for any other deployment.
-      RTL_PASSWORD: ${RTL_PASSWORD:-satd-stack}
+      # RTL's own login. The variable RTL reads is APP_PASSWORD -- it has no
+      # entrypoint that translates anything else, and with APP_PASSWORD unset
+      # it falls back to the `multiPass` in the config it generates, which is
+      # the literal string "password". Required rather than defaulted, so a
+      # stack cannot come up on a well-known credential that fronts LND's
+      # admin macaroon.
+      APP_PASSWORD: ${RTL_PASSWORD:?generate one with `openssl rand -hex 24` and put RTL_PASSWORD in .env}
       PORT: "3000"
       DEFAULT_NODE_INDEX: "1"
     volumes:

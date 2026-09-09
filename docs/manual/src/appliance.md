@@ -55,9 +55,19 @@ Overlays that need a secret have no default and refuse to start without one,
 rather than shipping a value every deployment would share:
 
 ```sh
+echo "RTL_PASSWORD=$(openssl rand -hex 24)" >> .env
 echo "MINT_PRIVATE_KEY=$(openssl rand -hex 32)" >> .env
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
+echo "ARK_POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> .env
 ```
+
+`RTL_PASSWORD` is the login for Ride The Lightning, which fronts LND's admin
+macaroon. Left unset, RTL generates a configuration whose password is the
+literal string `password`, so this one is required rather than defaulted.
+
+`satd-appliance enable <overlay>` generates each of these into
+`/var/lib/satd-appliance/overlay.env` on first use, so the appliance needs
+none of this by hand.
 
 ### Which ports are published
 
@@ -72,7 +82,12 @@ be taught to trust a private CA. What leaves the host is TLS only:
 | 3001 | Esplora over TLS |
 | 8339 | MCP over TLS, when `SATD_MCP=1` |
 | 38333 (signet) | Bitcoin P2P |
-| 443 / 8443 / 9443 | web UIs and metrics, with `compose.proxy.yml` |
+| 443 / 8443 / 49393 / 9443 | RTL, Cashu mint, BTCPay and metrics, with `compose.proxy.yml` |
+
+BTCPay's own HTTP port binds `127.0.0.1` and RTL and the mint are not
+published at all, so the proxy is the only route to a web UI from another
+machine. A docker-published port is also not filtered by the appliance's
+inbound firewall chain, which is the second reason those bindings matter.
 
 The internal RPC port is 8332 on **every** network so that overlays, the
 proxy and the store packages address one fixed port. The cost is that
