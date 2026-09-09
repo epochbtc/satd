@@ -374,7 +374,7 @@ note = "REST endpoint returns 401 Unauthorized; Core's REST is unauthenticated b
 file = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "re-measured after the #664 compat work: notifications, batch entries, id echoing and the HTTP status mapping all pass now. The remaining failure is `test_getrpcinfo` asserting one entry in `active_commands`, which satd still reports as `[]`. Follow-up: #702 `getrpcinfo.active_commands`"
+note = "re-measured 2026-09-09 after #702: `active_commands` now passes — the test reaches `assert_equal(info['logpath'], <chain_path>/debug.log)` and fails there. satd has no `debug.log` by design (it logs to stdout; `-debuglogfile` / `-shrinkdebugfile` / `-printtoconsole` are recognised and refused with that message), so `logpath` is deliberately empty rather than naming a file that does not exist. This row cannot flip without satd growing a log file."
 
 [[test]]
 file = "interface_usdt_coinselection.py"
