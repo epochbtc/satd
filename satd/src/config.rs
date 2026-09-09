@@ -2130,7 +2130,12 @@ impl Config {
         for raw in &whitebind_raw {
             let (perms, addr_str) = match raw.split_once('@') {
                 Some((p, a)) => (
-                    node::net::permissions::NetPermissions::parse_list(p)
+                    // `-whitebind`'s own parse: Core passes a null
+                    // `output_connection_direction` here, which is what makes
+                    // an `out` token an error rather than a no-op, and a
+                    // direction-only entry an error rather than a silent
+                    // grant of nothing.
+                    node::net::permissions::NetPermissions::parse_list_for_bind(p)
                         .map_err(|e| format!("whitebind: {e}"))?,
                     a.trim(),
                 ),
@@ -2197,6 +2202,10 @@ impl Config {
                 vec![BindSpec {
                     addr: parse_p2p_bind("0.0.0.0", port)?,
                     onion: false,
+                    // The default clearnet listener stands in for an operator
+                    // who named no address at all; failing to bind it is still
+                    // fatal, because the node would then accept nothing.
+                    derived: false,
                 }]
             } else {
                 raw.iter()
@@ -2204,6 +2213,40 @@ impl Config {
                     .collect::<Result<Vec<_>, _>>()?
             }
         };
+
+        // Core's `onion_binds` default (`init.cpp`): with `-listenonion` and
+        // no explicit `=onion` entry, the hidden service gets its own
+        // listener on `127.0.0.1:<port+1>`.
+        //
+        // This is not decoration. Tor forwards a hidden-service connection to
+        // whatever socket it is pointed at, so without a listener of its own
+        // the service targets the clearnet port and every inbound onion peer
+        // arrives indistinguishable from a genuine local one — inheriting any
+        // `-whitelist=127.0.0.1` the operator wrote for a local integration.
+        // A dedicated listener is what lets the accept path know which peers
+        // came in over Tor and withhold whitelist matching from them.
+        let mut binds = binds;
+        // Only when the node listens at all: with `-listen=0` there is no
+        // accept loop to spawn it on, and a bind nothing serves would just be
+        // a phantom entry in `getconfig`.
+        if listenonion && listen && !binds.iter().any(|b| b.onion) {
+            let onion_port = port.checked_add(1).ok_or_else(|| {
+                "Cannot derive the Tor hidden-service port: -port=65535 leaves no port+1. \
+                 Set -bind=<addr>:<port>=onion explicitly."
+                    .to_string()
+            })?;
+            let onion_addr = parse_p2p_bind("127.0.0.1", onion_port)?;
+            // An operator who already bound that address gets to keep it —
+            // adding a second listener on it would turn a working config into
+            // a duplicate-binding startup error.
+            if !binds.iter().any(|b| b.addr == onion_addr) {
+                binds.push(BindSpec {
+                    addr: onion_addr,
+                    onion: true,
+                    derived: true,
+                });
+            }
+        }
 
         // Refuse a duplicate binding up front, as Core does. Two listeners on
         // one address cannot both succeed; without this the second bind fails
@@ -7464,6 +7507,13 @@ pub struct BindSpec {
     pub addr: SocketAddr,
     /// `-bind=addr[:port]=onion`: the listener a Tor hidden service points at.
     pub onion: bool,
+    /// True when satd added this listener itself rather than the operator
+    /// naming it — the default onion bind below.
+    ///
+    /// It decides whether a bind failure is fatal. An address the operator
+    /// wrote down must not fail quietly; one satd chose is satd's problem to
+    /// report and step around.
+    pub derived: bool,
 }
 
 impl std::fmt::Display for BindSpec {
@@ -7511,7 +7561,7 @@ pub fn parse_bind_spec(raw: &str, default_port: u16) -> Result<BindSpec, String>
             parse_p2p_bind(addr_part, port)?
         }
     };
-    Ok(BindSpec { addr, onion })
+    Ok(BindSpec { addr, onion, derived: false })
 }
 
 /// Join a `-bind` address and `-port` into a P2P socket address.
@@ -8230,6 +8280,68 @@ bind=127.0.0.1:9002
                 );
             }
         }
+    }
+
+    /// Tor forwards a hidden service to whatever socket it is pointed at. If
+    /// that socket is the clearnet listener, every inbound onion peer arrives
+    /// indistinguishable from a genuine local one and inherits any
+    /// `-whitelist=127.0.0.1` the operator wrote for a local integration —
+    /// `noban` included. Core gives the service its own listener
+    /// (`onion_binds`, defaulting to `127.0.0.1:<port+1>`), which is what
+    /// lets the accept path tell the two apart.
+    #[test]
+    fn listenonion_gets_its_own_bind() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+
+        // No -listenonion: no onion bind, and the clearnet default is intact.
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "--port=19000"])
+            .expect("starts");
+        assert!(!cfg.binds.iter().any(|b| b.onion), "no -listenonion, no onion bind");
+
+        // -listenonion with no explicit entry: Core's port+1 default.
+        let cfg = parse_negation(&[
+            "satd", "--regtest", "--datadir", dd, "--port=19000", "--listenonion=1",
+        ])
+        .expect("starts");
+        let onion: Vec<_> = cfg.binds.iter().filter(|b| b.onion).collect();
+        assert_eq!(onion.len(), 1, "exactly one onion bind: {:?}", cfg.binds);
+        assert_eq!(onion[0].addr.to_string(), "127.0.0.1:19001");
+        // The clearnet listener is still there.
+        assert!(cfg.binds.iter().any(|b| !b.onion), "{:?}", cfg.binds);
+
+        // An explicit `=onion` entry wins; no default is added beside it.
+        let cfg = parse_negation(&[
+            "satd", "--regtest", "--datadir", dd, "--listenonion=1",
+            "--bind=127.0.0.1:19500=onion",
+        ])
+        .expect("starts");
+        let onion: Vec<_> = cfg.binds.iter().filter(|b| b.onion).collect();
+        assert_eq!(onion.len(), 1, "{:?}", cfg.binds);
+        assert_eq!(onion[0].addr.to_string(), "127.0.0.1:19500");
+
+        // An operator who already bound port+1 keeps it: adding a second
+        // listener on the same address would turn a working config into a
+        // duplicate-binding startup error.
+        let cfg = parse_negation(&[
+            "satd", "--regtest", "--datadir", dd, "--port=19000", "--listenonion=1",
+            "--bind=127.0.0.1:19001",
+        ])
+        .expect("an already-bound port+1 must not become a startup error");
+        assert_eq!(
+            cfg.binds.iter().filter(|b| b.addr.to_string() == "127.0.0.1:19001").count(),
+            1,
+            "{:?}",
+            cfg.binds
+        );
+
+        // With -listen=0 there is no accept loop to serve it, so no phantom
+        // bind is invented.
+        let cfg = parse_negation(&[
+            "satd", "--regtest", "--datadir", dd, "--listenonion=1", "--listen=0",
+        ])
+        .expect("starts");
+        assert!(!cfg.binds.iter().any(|b| b.onion), "{:?}", cfg.binds);
     }
 
     #[test]

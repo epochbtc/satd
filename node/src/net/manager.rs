@@ -919,6 +919,16 @@ impl PeerManager {
         crate::net::permissions::permissions_for_ip(&self.whitelist.read(), ip)
     }
 
+    /// `-whitelist` permissions for a peer reached in a given direction.
+    /// See [`crate::net::permissions::permissions_for`] for Core's rule.
+    fn whitelist_permissions_for(
+        &self,
+        ip: IpAddr,
+        direction: crate::net::permissions::Direction,
+    ) -> crate::net::permissions::NetPermissions {
+        crate::net::permissions::permissions_for(&self.whitelist.read(), ip, direction)
+    }
+
     /// Permissions currently held by peer `id` (empty if unknown).
     fn peer_permissions(&self, id: PeerId) -> crate::net::permissions::NetPermissions {
         self.peers
@@ -1568,6 +1578,7 @@ impl PeerManager {
             stream,
             addr,
             crate::net::permissions::NetPermissions::NONE,
+            false,
         );
     }
 
@@ -1580,6 +1591,7 @@ impl PeerManager {
         stream: TcpStream,
         addr: SocketAddr,
         bind_perms: crate::net::permissions::NetPermissions,
+        inbound_onion: bool,
     ) {
         // `-networkactive=0` / `setnetworkactive false`: refuse inbound. The
         // moved `stream` is dropped here, closing the socket.
@@ -1588,7 +1600,24 @@ impl PeerManager {
             return;
         }
         let ip = addr.ip();
-        let perms = self.whitelist_permissions(ip).union(bind_perms);
+        // Core: `AddWhitelistPermissionFlags(permission_flags, inbound_onion ?
+        // std::optional<CNetAddr>{} : addr, vWhitelistedRangeIncoming)`.
+        //
+        // Tor forwards a hidden-service connection to a local port, so every
+        // inbound onion peer arrives with the loopback address of the socket
+        // Tor dialled. Matching that against `-whitelist` hands an anonymous
+        // remote peer whatever the operator granted their own machine — and
+        // `-whitelist=127.0.0.1` is the ordinary way to whitelist a local
+        // Electrum or BTCPay integration. `noban` alone makes such a peer
+        // un-bannable for misbehaviour and exempt from both inbound caps.
+        //
+        // `-whitebind` permissions still apply: those are attached to the
+        // listener the operator named, not inferred from the peer's address.
+        let perms = if inbound_onion {
+            bind_perms
+        } else {
+            self.whitelist_permissions(ip).union(bind_perms)
+        };
         // A ban has to cover the inbound direction or it covers nothing: a
         // banned host simply dials us instead of waiting to be dialled, and
         // `setban` becomes advisory. Core drops the socket here too, before a
@@ -1689,10 +1718,14 @@ impl PeerManager {
     /// Run the inbound accept loop on an already-bound listener, granting every
     /// peer accepted here `bind_perms` (Bitcoin Core's `-whitebind`). Never
     /// returns under normal operation.
+    /// `inbound_onion` marks a listener that Tor forwards a hidden service
+    /// to. Peers arriving there are remote and anonymous however local their
+    /// socket address looks, so `-whitelist` must not match them.
     pub async fn accept_loop(
         self: &Arc<Self>,
         listener: TcpListener,
         bind_perms: crate::net::permissions::NetPermissions,
+        inbound_onion: bool,
     ) {
         let bind_addr = listener.local_addr().ok();
         tracing::info!(?bind_addr, whitebind = bind_perms.any(), "P2P listening");
@@ -1700,7 +1733,7 @@ impl PeerManager {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    self.accept_inbound_with_perms(stream, addr, bind_perms);
+                    self.accept_inbound_with_perms(stream, addr, bind_perms, inbound_onion);
                 }
                 Err(e) => {
                     tracing::warn!("Accept error: {}", e);
@@ -1725,7 +1758,7 @@ impl PeerManager {
         bind_perms: crate::net::permissions::NetPermissions,
     ) -> Result<(), String> {
         let listener = Self::bind_listener(bind_addr).await?;
-        self.accept_loop(listener, bind_perms).await;
+        self.accept_loop(listener, bind_perms, false).await;
         Ok(())
     }
 
@@ -6076,7 +6109,6 @@ impl PeerManager {
     ) {
         let (msg_tx, msg_rx) = mpsc::channel::<NetworkMessage>(256);
         let mut info = PeerInfo::new(id, addr, direction);
-        info.permissions = self.whitelist_permissions(addr.ip());
         info.onion_host = onion_host.map(str::to_string);
         // Mark peers from `addnode` / `-connect` so getpeerinfo reports
         // connection_type = "manual" instead of "outbound-full-relay".
@@ -6091,6 +6123,28 @@ impl PeerManager {
                 }
             });
         }
+        // `-whitelist` permissions, scoped to the direction this peer was
+        // reached in. Core consults its *outgoing* whitelist only for a
+        // manual connection and hands an automatic outbound one nothing at
+        // all; satd applied every entry to both directions, so a bare
+        // `-whitelist=noban@<subnet>` made outbound peers in that range
+        // un-bannable and exempt from the upload budget without any `out`
+        // token asking for it. An inbound peer's permissions are set on the
+        // accept path, which is where `-whitebind` is unioned in.
+        info.permissions = match direction {
+            Direction::Inbound => self
+                .whitelist_permissions_for(addr.ip(), crate::net::permissions::Direction::IN),
+            Direction::Outbound => {
+                if info.conn_type == ConnType::Manual {
+                    self.whitelist_permissions_for(
+                        addr.ip(),
+                        crate::net::permissions::Direction::OUT,
+                    )
+                } else {
+                    crate::net::permissions::NetPermissions::NONE
+                }
+            }
+        };
         // `getpeerinfo`'s `addrbind`: our end of this socket. For an onion
         // peer this is the socket to the proxy, not a clearnet listener.
         info.bind_addr = match &transport {

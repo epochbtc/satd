@@ -87,6 +87,25 @@ item below is (or will be) written up in full in the in-development
   `-whitelist=@<subnet>` — Core's "match this range, grant nothing" idiom —
   grants nothing instead of the implicit set, which had been silently handing
   out `noban` (#667).
+- **Breaking (security):** `-whitelist` is inbound-only unless the entry
+  carries an `out` token, as in Core, and an `out` entry applies only to
+  *manual* outbound connections. satd swallowed the `in`/`out` tokens as no-ops
+  and applied every entry in both directions, so `-whitelist=noban@<subnet>`
+  made outbound peers in that range un-bannable and exempt from the upload
+  budget (#701).
+- **Breaking:** a `-whitelist` entry that sets only a direction and no
+  permission (`-whitelist=out@10.0.0.0/8`) is refused at startup, as Core
+  refuses it — it granted nothing while looking like a grant. `-whitebind`
+  refuses an `out` token outright, also as Core does: a bind address describes
+  where connections arrive (#701).
+- **Security:** a peer arriving over the Tor hidden service is no longer
+  matched against `-whitelist`. Tor forwards the service to a local socket, so
+  every inbound onion peer looked like a loopback connection and inherited a
+  `-whitelist=127.0.0.1` entry — the ordinary way to whitelist a local wallet
+  integration — making anonymous remote peers un-bannable and exempt from the
+  inbound connection caps. `-listenonion` now gets its own listener on
+  `127.0.0.1:<port+1>` (Core's `onion_binds`), and peers accepted there are
+  exempt from whitelist matching (#701).
 - `getmemoryinfo` reported the process RSS as the secure-allocator pool's
   `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
   no secure allocator, so the pool is empty and the numbers are zero (#667).

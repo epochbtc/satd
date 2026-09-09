@@ -579,14 +579,29 @@ silently returning an empty or wrong answer.
 
 - **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
   actually granted, in Core's order. `bloomfilter` never appears: satd accepts
-  the name in a `-whitelist` entry but has no flag for it, so reporting it
-  would claim a grant that was never recorded. Two divergences remain in *what*
-  is granted, both pre-existing and tracked separately: satd applies
-  `-whitelist` to outbound peers, where Core consults its outgoing list only
-  for `out@` entries on manual connections; and an inbound Tor peer inherits a
-  loopback `-whitelist` entry, because satd's hidden service targets the same
-  listener as clearnet while Core binds a separate onion port and skips
-  whitelist matching on it.
+  the name in a `-whitelist` entry (as Core's parser does) but has no flag for
+  it, so reporting it would claim a grant that was never recorded. The one
+  consequence is that `-whitelist=all@<subnet>` lists six names where Core
+  lists seven.
+
+- **The default Tor hidden-service listener** — satd binds
+  `127.0.0.1:<port+1>` for the hidden service whenever `-listenonion` is on and
+  no `-bind=…=onion` entry names one. Bitcoin Core adds that listener only when
+  there is no `-bind` at all (`src/init.cpp`): with an explicit `-bind`, Core
+  points Tor at the first `-bind` and opens no extra socket.
+
+  satd diverges deliberately. Tor forwards a hidden-service connection to
+  whatever socket it is pointed at, so a service targeting the clearnet
+  listener delivers every inbound onion peer indistinguishable from a genuine
+  local one — inheriting any `-whitelist=127.0.0.1` the operator wrote for a
+  local integration. A dedicated listener is what lets the accept path know
+  which peers came in over Tor and withhold whitelist matching from them.
+
+  The cost is one socket Core would not have opened, so a bind failure on that
+  address is a warning rather than a fatal error: the operator did not name it,
+  and the degraded outcome is safe (Tor forwards to a socket nothing serves,
+  and the connections are refused). Name one explicitly with
+  `-bind=<addr>:<port>=onion` to choose the port.
 
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
