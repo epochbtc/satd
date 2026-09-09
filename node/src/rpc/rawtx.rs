@@ -238,32 +238,90 @@ pub fn decode_raw_transaction(
 ) -> Result<Value, (i32, String)> {
     let tx_bytes =
         hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-
-    let tx: bitcoin::Transaction = match iswitness {
-        Some(true) => {
-            // Force witness decoding.
-            bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| (-22, "TX decode failed".to_string()))?
-        }
-        Some(false) => {
-            // Force non-witness (legacy) decoding.
-            bitcoin::consensus::deserialize_partial::<bitcoin::Transaction>(&tx_bytes)
-                .map(|(tx, _)| tx)
-                .map_err(|_| (-22, "TX decode failed".to_string()))
-                // For non-witness decoding, the segwit marker (0x00 0x01) after
-                // version would be treated as zero inputs + one output, which
-                // will fail to parse as a valid transaction. That is the expected
-                // behavior for `iswitness=false` on a segwit tx.
-                ?
-        }
-        None => {
-            // Auto: try witness first, fall back to non-witness.
-            bitcoin::consensus::deserialize(&tx_bytes)
-                .map_err(|_| (-22, "TX decode failed".to_string()))?
-        }
-    };
-
+    let tx = decode_tx(&tx_bytes, iswitness != Some(true), iswitness != Some(false))
+        .ok_or((-22i32, "TX decode failed".to_string()))?;
     Ok(decode_transaction_verbose_net(&tx, None, None, None, 1, None, network))
+}
+
+/// Read a transaction the way Core's `DecodeTx` (`core_io.cpp`) does.
+///
+/// The segwit marker `0x00 0x01` is ambiguous: read as extended serialization
+/// it announces witnesses, read as legacy it is a zero-input one-output
+/// transaction. Core decodes both ways where allowed, discards any reading
+/// that does not consume the whole input, and picks between them with a
+/// script-sanity check — preferring the extended reading when the check
+/// cannot separate them.
+///
+/// satd had no legacy reader at all. `iswitness=false` called rust-bitcoin's
+/// (extended) decoder and merely stopped requiring full consumption, so it
+/// returned the *witness* reading of a segwit transaction — the opposite of
+/// what the argument asks for — and silently accepted trailing bytes.
+pub(crate) fn decode_tx(
+    tx_bytes: &[u8],
+    try_no_witness: bool,
+    try_witness: bool,
+) -> Option<bitcoin::Transaction> {
+    let extended = if try_witness {
+        // rust-bitcoin's `deserialize` already requires full consumption.
+        bitcoin::consensus::deserialize::<bitcoin::Transaction>(tx_bytes).ok()
+    } else {
+        None
+    };
+    if let Some(tx) = &extended
+        && check_tx_scripts_sanity(tx)
+    {
+        return extended;
+    }
+
+    let legacy = if try_no_witness {
+        deserialize_legacy_tx(tx_bytes)
+    } else {
+        None
+    };
+    if let Some(tx) = &legacy
+        && check_tx_scripts_sanity(tx)
+    {
+        return legacy;
+    }
+
+    extended.or(legacy)
+}
+
+/// Read a transaction with the pre-segwit serialization: version, inputs,
+/// outputs, locktime, and nothing else. Refuses trailing bytes.
+fn deserialize_legacy_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
+    use bitcoin::consensus::Decodable;
+    let mut r = bytes;
+    let version = i32::consensus_decode(&mut r).ok()?;
+    let input = Vec::<bitcoin::TxIn>::consensus_decode(&mut r).ok()?;
+    let output = Vec::<TxOut>::consensus_decode(&mut r).ok()?;
+    let lock_time = u32::consensus_decode(&mut r).ok()?;
+    if !r.is_empty() {
+        return None;
+    }
+    Some(bitcoin::Transaction {
+        version: bitcoin::transaction::Version(version),
+        lock_time: bitcoin::absolute::LockTime::from_consensus(lock_time),
+        input,
+        output,
+    })
+}
+
+/// Core's `CheckTxScriptsSanity`: every script must parse and stay within
+/// `MAX_SCRIPT_SIZE`. It is what separates the two readings of an ambiguous
+/// transaction — the wrong one almost always yields nonsense scripts.
+fn check_tx_scripts_sanity(tx: &bitcoin::Transaction) -> bool {
+    const MAX_SCRIPT_SIZE: usize = 10_000;
+    if !tx.is_coinbase() {
+        for input in &tx.input {
+            if !has_valid_ops(&input.script_sig) || input.script_sig.len() > MAX_SCRIPT_SIZE {
+                return false;
+            }
+        }
+    }
+    tx.output
+        .iter()
+        .all(|o| has_valid_ops(&o.script_pubkey) && o.script_pubkey.len() <= MAX_SCRIPT_SIZE)
 }
 
 /// Confirmations for a transaction found in a block.
@@ -652,14 +710,24 @@ pub fn create_raw_transaction(
         });
     }
 
-    // Check: if replaceable is explicitly true, no input's sequence may be
-    // above MAX_BIP125_RBF_SEQUENCE (would contradict the replaceable flag).
-    if replaceable == Some(true) {
-        for inp in &tx_inputs {
-            if inp.sequence.0 > MAX_BIP125_RBF_SEQUENCE {
-                return Err((-8, "Invalid parameter combination: Sequence number(s) contradict replaceable option".to_string()));
-            }
-        }
+    // Core throws only when the transaction signals nothing at all:
+    // `rbf && vin.size() > 0 && !SignalsOptInRBF(tx)`, and `SignalsOptInRBF`
+    // is true if **any** input is at or below `MAX_BIP125_RBF_SEQUENCE`
+    // (`util/rbf.cpp`). satd refused when *any* input was above it, so a
+    // mixed transaction — one RBF-signalling input among several that are not
+    // — was rejected here and accepted by Core. One signalling input makes
+    // the whole transaction replaceable, which is what the flag asks for.
+    if replaceable == Some(true)
+        && !tx_inputs.is_empty()
+        && !tx_inputs
+            .iter()
+            .any(|inp| inp.sequence.0 <= MAX_BIP125_RBF_SEQUENCE)
+    {
+        return Err((
+            -8,
+            "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+                .to_string(),
+        ));
     }
 
     let tx_outputs = parse_outputs(outputs, network)?;
@@ -1565,6 +1633,11 @@ fn has_valid_ops(script: &bitcoin::Script) -> bool {
 /// Without an explicit `blockhash`, the block is located by scanning the UTXO
 /// set for an unspent output of one of the txids; with `-txindex` the txindex
 /// is consulted instead. All txids must reside in the same block.
+/// The most outputs one transaction can have and still fit in a block: the
+/// serialized form of an output is at least 9 bytes (8-byte value plus an
+/// empty script's length prefix), so a 4 MWU block bounds the count.
+const MAX_OUTPUTS_PER_BLOCK: u32 = 4_000_000 / 4 / 9;
+
 pub fn get_tx_out_proof(
     chain_state: &ChainState,
     txids: &[String],
@@ -1608,9 +1681,16 @@ pub fn get_tx_out_proof(
 
         // Fall back to UTXO set: scan outputs of each txid for an unspent
         // coin, then look up its confirming block.
+        //
+        // The bound is the most outputs a transaction can have and still fit
+        // in a block, not an arbitrary 100. A transaction whose only unspent
+        // output is at index 100 or beyond reported "Transaction not yet in
+        // block" for a transaction that is very much in one — and a paying
+        // transaction with a long output list is exactly the shape a batching
+        // service produces.
         if found_hash.is_none() {
             'outer: for txid in &parsed_txids {
-                for vout in 0..100u32 {
+                for vout in 0..MAX_OUTPUTS_PER_BLOCK {
                     let outpoint = OutPoint { txid: *txid, vout };
                     if let Some(coin) = chain_state.get_coin(&outpoint) {
                         // The coin is confirmed at `coin.height`; look up the
@@ -1691,9 +1771,25 @@ pub fn verify_tx_out_proof(
         return Ok(json!([]));
     }
 
-    // Verify the merkle root matches a block header on our chain.
+    // Core (`rpc/txoutproof.cpp`) requires the block to be **on the active
+    // chain**, not merely indexed, and throws `-5 Block not found in chain`
+    // when it is not — a proof against a stale branch proves nothing about
+    // the chain the caller is asking about. satd accepted any indexed block
+    // and returned the txids, so a proof built on a fork read as valid.
     let block_hash = merkle_block.header.block_hash();
-    if chain_state.get_block_index(&block_hash).is_none() {
+    let entry = chain_state
+        .get_block_index(&block_hash)
+        .filter(|e| e.num_tx > 0)
+        .filter(|e| chain_state.active_chain_hash_at_height(e.height) == Some(block_hash))
+        .ok_or((
+            -5i32,
+            "Block not found in chain".to_string(),
+        ))?;
+
+    // Core also requires the proof to cover the whole block:
+    // `pindex->nTx == merkleBlock.txn.GetNumTransactions()`. A proof built
+    // over a different transaction count describes a different tree.
+    if entry.num_tx as usize != merkle_block.txn.num_transactions() as usize {
         return Ok(json!([]));
     }
 
@@ -2722,5 +2818,145 @@ mod tests {
             genesis_coinbase_txid(bitcoin::Network::Testnet4).to_string(),
             "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
         );
+    }
+
+    /// Core's `DecodeTx` reads an ambiguous transaction both ways and picks
+    /// with `CheckTxScriptsSanity`. The segwit marker `0x00 0x01` is the
+    /// ambiguity: extended serialization calls it a witness flag, legacy
+    /// calls it zero inputs and one output.
+    #[test]
+    fn iswitness_selects_the_serialization_it_says_it_does() {
+        use bitcoin::hashes::Hash as _;
+
+        // A real segwit transaction: one input with a witness.
+        let mut tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        tx.input[0].witness.push([0x02; 72]);
+        let bytes = bitcoin::consensus::serialize(&tx);
+
+        // Auto and forced-witness both read the witness.
+        for (no_wit, wit) in [(true, true), (false, true)] {
+            let decoded = decode_tx(&bytes, no_wit, wit).expect("decodes");
+            assert_eq!(decoded.compute_wtxid(), tx.compute_wtxid());
+            assert!(!decoded.input[0].witness.is_empty());
+        }
+
+        // Forced-legacy must NOT return the witness reading. satd used to
+        // call the extended decoder here and merely stop requiring full
+        // consumption, so `iswitness=false` returned the witness transaction
+        // — the opposite of what the argument asks for.
+        let legacy = decode_tx(&bytes, true, false);
+        assert!(
+            legacy.is_none_or(|t| t.compute_wtxid() != tx.compute_wtxid()),
+            "iswitness=false returned the witness reading"
+        );
+    }
+
+    /// A legacy transaction reads the same under every setting: there is no
+    /// marker to be ambiguous about.
+    #[test]
+    fn a_legacy_transaction_reads_the_same_every_way() {
+        use bitcoin::hashes::Hash as _;
+
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                    vout: 1,
+                },
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(2_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let bytes = bitcoin::consensus::serialize(&tx);
+        for (no_wit, wit) in [(true, true), (true, false), (false, true)] {
+            let decoded = decode_tx(&bytes, no_wit, wit).expect("decodes");
+            assert_eq!(decoded.compute_txid(), tx.compute_txid());
+        }
+    }
+
+    /// Core discards any reading that does not consume the whole input
+    /// ("Ignore serializations that do not fully consume the hex string").
+    /// satd's forced-legacy path used `deserialize_partial`, which does not,
+    /// so trailing bytes were accepted in silence.
+    #[test]
+    fn trailing_bytes_are_not_a_transaction() {
+        use bitcoin::hashes::Hash as _;
+
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x33; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(3_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut bytes = bitcoin::consensus::serialize(&tx);
+        assert!(decode_tx(&bytes, true, true).is_some(), "the fixture must decode");
+        bytes.push(0xff);
+        assert!(
+            decode_tx(&bytes, true, true).is_none(),
+            "a transaction with a byte glued on the end is not that transaction"
+        );
+    }
+
+    /// `CheckTxScriptsSanity` is what separates the two readings. A script
+    /// that does not parse fails it.
+    #[test]
+    fn script_sanity_rejects_an_unparseable_script() {
+        use bitcoin::hashes::Hash as _;
+
+        let mut tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x44; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(check_tx_scripts_sanity(&tx));
+        // A push that claims more bytes than follow it.
+        tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x4c, 0xff, 0x00]);
+        assert!(!check_tx_scripts_sanity(&tx));
     }
 }

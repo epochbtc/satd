@@ -2320,21 +2320,9 @@ pub async fn start(
         // caller could lose signature data by asking for a format
         // conversion.
         let permit_sigdata: bool = args.optional_or("permitsigdata", false)?;
-        // `iswitness` selects the decode mode. satd's decoder auto-detects,
-        // which is Core's behaviour when the argument is omitted; honouring
-        // an explicit value needs a single-mode decoder, so refuse it rather
-        // than accept a flag that changes nothing.
         let iswitness: Option<bool> = args.optional("iswitness")?;
         args.check()?;
-        if iswitness.is_some() {
-            return Err(ErrorObjectOwned::owned(
-                -8,
-                "iswitness is not supported by this node; omit it and the \
-                 transaction encoding is detected automatically",
-                None::<()>,
-            ));
-        }
-        psbt::convert_to_psbt(&hex_tx, permit_sigdata)
+        psbt::convert_to_psbt(&hex_tx, permit_sigdata, iswitness)
             .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
@@ -2502,6 +2490,18 @@ pub async fn start(
             return Err(ErrorObjectOwned::owned(
                 -8,
                 "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\", \"mempool\"",
+                None::<()>,
+            ));
+        }
+
+        // Core validates the range (`rpc/fees.cpp`: `1 <= conf_target <=
+        // maxTarget`), and `estimaterawfee` in this same file already did.
+        // `estimatesmartfee` did not, so `conf_target: 0` reached the
+        // estimator and was answered with a feerate rather than refused.
+        if !(1..=1008).contains(&conf_target) {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Invalid conf_target, must be between 1 and 1008",
                 None::<()>,
             ));
         }

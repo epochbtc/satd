@@ -25,6 +25,11 @@ use std::path::{Path, PathBuf};
 /// end, so no path reaches `connect` carrying one.
 pub(crate) const CONNECT_NEGATED: &str = "\u{0}noconnect";
 
+/// Sentinel for `-noincludeconf`. Core represents a negated setting in its
+/// own settings model; satd's normaliser rewrites to clap flags, so the
+/// negation rides as a value no path can name.
+pub(crate) const INCLUDECONF_NEGATED: &str = "\u{0}noincludeconf";
+
 /// DB cache sizing mode. `Fixed(n)` is the Core-compatible static N-MB budget;
 /// `Auto { max_mb }` lets the adaptive controller grow/shrink the cache based
 /// on system memory pressure, capped at max_mb.
@@ -1571,12 +1576,29 @@ impl Config {
                 .unwrap_or(false)
         });
         let mut include_notes: Vec<ConfigNote> = Vec::new();
-        if let Some(cf) = config_file.as_mut() {
+        let skip_includes = cli
+            .includeconf
+            .iter()
+            .any(|v| v == INCLUDECONF_NEGATED);
+        if let Some(cf) = config_file.as_mut()
+            && !skip_includes
+        {
             include_notes = cf.resolve_includes(&base_datadir, section)?;
         }
         if allow_ignored_conf {
             include_notes.clear();
         }
+        // `-noincludeconf` (and `-noincludeconf=1`) disables include
+        // processing rather than naming a file, so it is not the
+        // command-line `-includeconf` the gate below refuses. It was applied
+        // above, where the includes would have been resolved; here it is
+        // filtered out so it does not read as a file the caller named.
+        let cli_includeconf: Vec<&String> = cli
+            .includeconf
+            .iter()
+            .filter(|v| *v != INCLUDECONF_NEGATED)
+            .collect();
+
         // Command-line -includeconf is rejected, the same as Bitcoin Core:
         // includes are a config-file-only feature (a command-line include
         // can't be processed before the config file is read), and Core
@@ -1584,10 +1606,10 @@ impl Config {
         // config the operator asked for. This also upholds this stack's
         // rule: every recognised key is honoured or explicitly rejected,
         // never accepted-and-ignored.
-        if !cli.includeconf.is_empty() {
+        if !cli_includeconf.is_empty() {
             // Format the value exactly as Bitcoin Core does: boolean-like
             // values (`true`/`false`) are bare, file paths are quoted.
-            let val = &cli.includeconf[0];
+            let val = cli_includeconf[0];
             let display_val = if val == "true" || val == "false" || val == "1" || val == "0" || val.is_empty() {
                 format!("-includeconf={val}")
             } else {
@@ -6526,19 +6548,20 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
             if arg.starts_with('-') {
                 let stripped = arg.trim_start_matches('-');
                 if let Some(rest) = stripped.strip_prefix("noincludeconf") {
-                    // `-noincludeconf` (no value) → includeconf disabled,
-                    // but includeconf is a file path, not a boolean.
-                    // `-noincludeconf=0` → double negation → includeconf=true
-                    // `-noincludeconf=1` → negation with 1 → includeconf=false → empty
-                    // For all forms: Core resolves and rejects at the
-                    // "cannot be used from commandline" gate, showing the
-                    // resolved value.  Convert to `--includeconf=<resolved>`.
+                    // Core's `SettingsSpan` skips *negated* values, so the
+                    // "-includeconf cannot be used from commandline" gate
+                    // never sees `-noincludeconf`: it is the supported way to
+                    // tell the node to ignore the config file's `includeconf`
+                    // directives. `-noincludeconf=0` is Core's double
+                    // negation and *does* reach the gate.
+                    //
+                    // satd used to rewrite the negated form to a valueless
+                    // `--includeconf`, which clap refused with its own error
+                    // before the gate — so the option could not be used at
+                    // all.
                     if rest.is_empty() || rest == "=1" {
-                        // negation active → nothing to include, but Core
-                        // still errors on the presence of the flag
-                        return "--includeconf".to_string();
+                        return format!("--includeconf={INCLUDECONF_NEGATED}");
                     } else if rest == "=0" {
-                        // double negation → true
                         return "--includeconf=true".to_string();
                     }
                 }

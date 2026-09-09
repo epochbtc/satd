@@ -130,7 +130,7 @@ pub fn psbt_workflow(ctx: &McpContext, action: &str, params: &Value) -> String {
                 .get("permit_sigdata")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            psbt::convert_to_psbt(hex_tx, permit_sigdata)
+            psbt::convert_to_psbt(hex_tx, permit_sigdata, None)
                 .map_err(|(code, msg)| format!("Error {}: {}", code, msg))
         }
         "join" => {
