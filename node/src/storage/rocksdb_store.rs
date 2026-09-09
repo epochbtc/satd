@@ -126,6 +126,10 @@ const TX_INDEX_COMPLETE_KEY: &[u8] = b"tx_index.complete";
 /// active chain. Absent/false on an upgraded datadir before the backfill
 /// runs; stamped true on fresh datadirs and after the backfill completes.
 const CHAIN_TX_BACKFILL_COMPLETE_KEY: &[u8] = b"chain_tx.backfill_complete";
+/// Lowest height whose block data this node still holds — Core's
+/// `pruneheight`. Absent on a node that has never pruned, which is exactly
+/// how Core decides whether to emit the field at all.
+const PRUNE_HEIGHT_KEY: &[u8] = b"prune.height";
 /// Persisted "address-history index is complete for the active chain"
 /// marker. Mirrors `TX_INDEX_COMPLETE_KEY` — set true after a clean
 /// backfill (or on fresh datadirs that started with addressindex=1
@@ -995,6 +999,26 @@ impl RocksDbStore {
             .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
         self.db
             .put_cf(&cf, CHAIN_TX_BACKFILL_COMPLETE_KEY, [u8::from(value)])
+            .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    fn read_prune_height(&self) -> Option<u32> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        match self.db.get_cf(&cf, PRUNE_HEIGHT_KEY) {
+            Ok(Some(v)) if v.len() == 4 => {
+                Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            }
+            _ => None,
+        }
+    }
+
+    fn write_prune_height(&self, value: u32) -> Result<(), StoreError> {
+        let cf = self
+            .db
+            .cf_handle(CF_METADATA)
+            .ok_or_else(|| StoreError::Database("metadata CF missing".into()))?;
+        self.db
+            .put_cf(&cf, PRUNE_HEIGHT_KEY, value.to_le_bytes())
             .map_err(|e| StoreError::Database(e.to_string()))
     }
 
@@ -2386,6 +2410,14 @@ impl Store for RocksDbStore {
 
     fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
         self.write_chain_tx_backfill_complete(true)
+    }
+
+    fn prune_height(&self) -> Option<u32> {
+        self.read_prune_height()
+    }
+
+    fn set_prune_height(&self, height: u32) -> Result<(), StoreError> {
+        self.write_prune_height(height)
     }
 
     fn address_index_complete(&self) -> bool {

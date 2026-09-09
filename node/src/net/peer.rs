@@ -362,6 +362,16 @@ impl PeerInfo {
     /// the live wire counters (bytes + last-activity timestamps) recorded by
     /// the connection read/write halves.
     pub fn to_rpc_json(&self, stats: &crate::net::stats::PeerStats) -> serde_json::Value {
+        self.to_rpc_json_with_inflight(stats, Vec::new())
+    }
+
+    /// [`to_rpc_json`](Self::to_rpc_json) with the block heights currently
+    /// requested from this peer, which only the peer manager can supply.
+    pub fn to_rpc_json_with_inflight(
+        &self,
+        stats: &crate::net::stats::PeerStats,
+        inflight: Vec<u32>,
+    ) -> serde_json::Value {
         let conntime = self
             .conn_time
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -468,7 +478,7 @@ impl PeerInfo {
             // since block-download scheduling is owned by the IBD layer,
             // not this per-peer record.
             "timeoffset": 0,
-            "inflight": [],
+            "inflight": inflight,
             // Per-message-type wire tallies. Core omits zero entries, so an
             // idle peer yields `{}` rather than a table of zeros.
             "bytessent_per_msg": per_msg_json(&stats.bytes_sent_per_msg()),

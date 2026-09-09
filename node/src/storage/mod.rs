@@ -581,6 +581,17 @@ pub trait Store: Send + Sync {
         0
     }
 
+    /// Byte budget of the in-memory *coin* cache, behind `getchainstates`'
+    /// `coins_tip_cache_bytes`. `None` for a backend with no such cache.
+    ///
+    /// The figure is the configured budget, not measured usage — which is
+    /// also what Core reports, so the two are comparable. satd's cache is
+    /// bounded by entry count; this is the byte budget that count was
+    /// derived from.
+    fn coins_tip_cache_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Number of L0 SST files in the chainstate (coins) column family. Used
     /// by the IBD connector for backpressure: when the count exceeds the
     /// configured pause threshold, the connector pauses to let compaction
@@ -767,6 +778,28 @@ pub trait Store: Send + Sync {
     /// the startup backfill has populated the cumulative-count CF for
     /// the active chain. Default: no-op for backends that don't track it.
     fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Lowest height whose block data is still on disk — Core's
+    /// `pruneheight`. `None` when the node has never pruned, which is what
+    /// makes the RPC field absent rather than zero: Core emits `pruneheight`
+    /// only for a node that has actually deleted something, and a `0` would
+    /// claim "everything from genesis is here" on a node that had pruned.
+    ///
+    /// Persisted rather than derived. Deriving it means finding the lowest
+    /// height whose block is not `Pruned`, and pruning deletes whole *files*
+    /// while `repair_block_data` can append an old-height block to the
+    /// current one — so the pruned set is not reliably a prefix and a binary
+    /// search over it can land on the wrong side. Default: `None` for
+    /// backends that don't track it.
+    fn prune_height(&self) -> Option<u32> {
+        None
+    }
+
+    /// Record the new prune floor. Default: no-op for backends that don't
+    /// track it.
+    fn set_prune_height(&self, _height: u32) -> Result<(), StoreError> {
         Ok(())
     }
 

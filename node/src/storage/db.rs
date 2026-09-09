@@ -25,6 +25,9 @@ pub struct InMemoryStore {
     tx_index: parking_lot::RwLock<std::collections::HashMap<Txid, BlockHash>>,
     chain_tx: parking_lot::RwLock<std::collections::HashMap<BlockHash, u64>>,
     chain_tx_backfill_complete: parking_lot::RwLock<bool>,
+    /// Lowest height whose block data is still held (Core's `pruneheight`).
+    /// `None` until something is actually pruned.
+    prune_height: parking_lot::RwLock<Option<u32>>,
     addr_funding: parking_lot::RwLock<Vec<AddrFundingRow>>,
     addr_spending: parking_lot::RwLock<Vec<AddrSpendingRow>>,
     outpoint_spend: parking_lot::RwLock<std::collections::HashMap<OutPoint, SpendingRef>>,
@@ -68,6 +71,7 @@ impl InMemoryStore {
             // chains populate chain_tx directly, so the backfill is a no-op
             // there regardless.
             chain_tx_backfill_complete: parking_lot::RwLock::new(false),
+            prune_height: parking_lot::RwLock::new(None),
             addr_funding: parking_lot::RwLock::new(Vec::new()),
             addr_spending: parking_lot::RwLock::new(Vec::new()),
             outpoint_spend: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -142,6 +146,15 @@ impl Store for InMemoryStore {
 
     fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
         *self.chain_tx_backfill_complete.write() = true;
+        Ok(())
+    }
+
+    fn prune_height(&self) -> Option<u32> {
+        *self.prune_height.read()
+    }
+
+    fn set_prune_height(&self, height: u32) -> Result<(), StoreError> {
+        *self.prune_height.write() = Some(height);
         Ok(())
     }
 

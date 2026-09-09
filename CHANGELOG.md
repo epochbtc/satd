@@ -96,6 +96,14 @@ item below is (or will be) written up in full in the in-development
   all (#664).
 - A JSON-RPC response too large to normalise is forwarded rather than
   DOM-parsed, which cost several times its size in peak memory (#664).
+- Five RPC fields that were constants stop pretending to be measurements
+  (#702): `getblockchaininfo.size_on_disk` is a maintained total of block-file
+  bytes instead of `0`; `getblockchaininfo.pruneheight` is reported (and
+  persisted across restarts) on a node that has actually pruned;
+  `getchainstates[].coins_tip_cache_bytes` reports the configured coin-cache
+  budget, as Core's does; `getrpcinfo.active_commands` lists the requests
+  actually executing instead of an empty array; and `getpeerinfo.inflight`
+  carries the block heights outstanding to that peer during IBD.
 - **Breaking:** `getdeploymentinfo` reports Bitcoin Core v31.1's full
   deployment set. `taproot` moves from `type: "buried"` to `type: "bip9"`
   (Core models it as a version-bits deployment), `testdummy` is added, and the

@@ -37,6 +37,10 @@ enum DirtyEntry {
 /// All overlay caches (block_index, height_hash, undo, tx_index) are
 /// bounded LRU caches to prevent unbounded memory growth.
 pub struct CoinCache {
+    /// Byte budget the clean-coin LRU's entry cap was derived from, behind
+    /// `getchainstates`' `coins_tip_cache_bytes`. Reported, not measured —
+    /// Core's field is the configured size too.
+    clean_cap_bytes: u64,
     inner: Box<dyn Store>,
     dirty: RwLock<HashMap<OutPoint, DirtyEntry>>,
     clean: Mutex<LruCache<OutPoint, Coin>>,
@@ -215,6 +219,12 @@ impl CoinCache {
         let budget = dbcache_mb as usize * 1_000_000;
 
         let clean_cap = (budget * 80 / 100) / 200; // 80% at ~200 bytes/entry
+        // The byte budget the clean-coin LRU is sized from, kept so
+        // `getchainstates` can report Core's `coins_tip_cache_bytes`. The
+        // cache is *bounded* by entry count, so this is the budget the count
+        // was derived from — which is what Core reports too: its field is the
+        // configured size, not current usage.
+        let clean_cap_bytes = (budget * 80 / 100) as u64;
         let height_hash_cap = 2_000_000; // fixed — must cover full chain
         let block_index_cap = (budget * 2 / 100) / 300; // 2% at ~300 bytes/entry
         let undo_cap = 1_000; // fixed — recent blocks only
@@ -223,6 +233,7 @@ impl CoinCache {
         let flush_threshold = (clean_cap / 4) as u32; // 25% of clean cap
 
         Self {
+            clean_cap_bytes,
             inner,
             dirty: RwLock::new(HashMap::new()),
             clean: Mutex::new(lru(clean_cap.max(1))),
@@ -1322,6 +1333,14 @@ impl Store for CoinCache {
         self.inner.chain_tx_backfill_complete()
     }
 
+    fn prune_height(&self) -> Option<u32> {
+        self.inner.prune_height()
+    }
+
+    fn set_prune_height(&self, height: u32) -> Result<(), StoreError> {
+        self.inner.set_prune_height(height)
+    }
+
     fn mark_chain_tx_backfill_complete(&self) -> Result<(), StoreError> {
         self.inner.mark_chain_tx_backfill_complete()
     }
@@ -1531,6 +1550,10 @@ impl Store for CoinCache {
 
     fn block_cache_capacity_bytes(&self) -> usize {
         self.inner.block_cache_capacity_bytes()
+    }
+
+    fn coins_tip_cache_bytes(&self) -> Option<u64> {
+        Some(self.clean_cap_bytes)
     }
 
     fn chainstate_l0_files(&self) -> u64 {

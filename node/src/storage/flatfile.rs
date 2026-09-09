@@ -147,6 +147,37 @@ pub struct FlatFileManager {
     /// Blocks-dir obfuscation key from `xor.dat` (Core v28+). The zero key
     /// means plaintext and short-circuits every XOR call.
     xor_key: [u8; 8],
+    /// Total bytes of `blk*.dat` on disk, behind `getblockchaininfo`'s
+    /// `size_on_disk`.
+    ///
+    /// Seeded by walking the directory once at open and then maintained in
+    /// place — a `du` on every RPC call would stat every file in a
+    /// several-hundred-gigabyte blocks dir. Core's figure covers `blk*.dat`
+    /// and `rev*.dat`; satd keeps undo data in RocksDB, so there is no
+    /// `rev*` term (recorded in `CORE_DIFFERENCES.md`).
+    total_bytes: u64,
+}
+
+/// Sum the sizes of every `blk*.dat` in `dir`.
+///
+/// Deliberately a full directory read rather than a count-up-from-one loop:
+/// pruning deletes low-numbered files, so a pruned blocks dir has gaps, and
+/// stopping at the first missing number would report a fraction of what is
+/// there. Best-effort — an unreadable entry contributes zero rather than
+/// failing the open of a node that is otherwise fine.
+fn read_dir_blk_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("blk") && name.ends_with(".dat")
+        })
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum()
 }
 
 impl FlatFileManager {
@@ -181,6 +212,13 @@ impl FlatFileManager {
             }
         };
 
+        // Seed `size_on_disk` from what is actually there. The walk cannot
+        // stop at the first gap the way the discovery loop above does:
+        // pruning deletes low-numbered files, so a pruned datadir has holes
+        // with populated files above them, and counting up to the first hole
+        // would under-report by most of the chain.
+        let total_bytes = read_dir_blk_bytes(blocks_dir);
+
         Ok(Self {
             blocks_dir: blocks_dir.to_path_buf(),
             current_file: file_num,
@@ -189,7 +227,14 @@ impl FlatFileManager {
             dirty: false,
             read_cache: std::collections::HashMap::new(),
             xor_key,
+            total_bytes,
         })
+    }
+
+    /// Total bytes of block data on disk — `getblockchaininfo`'s
+    /// `size_on_disk`, which reported a literal `0`.
+    pub fn size_on_disk(&self) -> u64 {
+        self.total_bytes
     }
 
     /// Get the blocks directory path.
@@ -296,6 +341,9 @@ impl FlatFileManager {
             Ok(())
         })();
 
+        if write_result.is_ok() {
+            self.total_bytes += record_size;
+        }
         if let Err(e) = write_result {
             // A failed `write_all` — ENOSPC mid-record is the realistic one —
             // may still have put bytes on disk. `current_pos` was not advanced,
@@ -406,6 +454,13 @@ impl FlatFileManager {
             0
         };
         self.current_pos = len;
+        // The reason this method exists is that the file on disk disagreed
+        // with what we believed about it — a truncation, or rotating into a
+        // file that pruning left behind. `total_bytes` was derived from the
+        // same belief, so re-derive it from the directory rather than carry a
+        // figure we have just established was wrong. Rare enough to afford
+        // the walk: once per 128 MB rollover, or on a recovery path.
+        self.total_bytes = read_dir_blk_bytes(&self.blocks_dir);
         Ok(())
     }
 
@@ -469,7 +524,12 @@ impl FlatFileManager {
         self.read_cache.remove(&file_number);
         let path = self.file_path(file_number);
         if path.exists() {
+            // Read the size before the unlink: afterwards there is nothing
+            // to stat, and guessing MAX_FILE_SIZE would drift on the last
+            // (partial) file.
+            let freed = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             std::fs::remove_file(&path)?;
+            self.total_bytes = self.total_bytes.saturating_sub(freed);
         }
         Ok(())
     }
@@ -667,6 +727,60 @@ mod tests {
     /// Only the repair path can put the pruner in a position to try it (it
     /// appends an old-height block's record to the current file), so the guard
     /// lives here, with the handle, rather than at the call site.
+    /// `size_on_disk` was a literal `0` in `getblockchaininfo`, which told an
+    /// operator sizing a disk that the chain occupied nothing. It is a
+    /// maintained total rather than a directory walk per RPC call, so the
+    /// three things that move it — a write, a rotation, a prune — all have to
+    /// keep it honest.
+    #[test]
+    fn size_on_disk_tracks_writes_deletes_and_a_reopen() {
+        let dir = temp_dir("size-on-disk");
+        let magic = [0xfa, 0xbf, 0xb5, 0xda];
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(mgr.size_on_disk(), 0, "an empty blocks dir holds nothing");
+
+        let block = vec![0xabu8; 1_000];
+        mgr.write_block(&block, magic).unwrap();
+        assert_eq!(
+            mgr.size_on_disk(),
+            1_008,
+            "the record is the block plus its 8-byte header"
+        );
+        mgr.write_block(&block, magic).unwrap();
+        assert_eq!(mgr.size_on_disk(), 2_016);
+
+        // A reopen must agree with what is on disk, not restart from zero.
+        mgr.sync_all().unwrap();
+        drop(mgr);
+        let mut mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(mgr.size_on_disk(), 2_016, "seeded from the directory");
+
+        // Pruning subtracts what it actually removed. Force a second file so
+        // there is one to delete that is not the append file.
+        mgr.current_file = 1;
+        mgr.current_pos = 0;
+        mgr.write_handle = None;
+        mgr.write_block(&block, magic).unwrap();
+        let with_two = mgr.size_on_disk();
+        assert_eq!(with_two, 2_016 + 1_008);
+        mgr.delete_file(0).unwrap();
+        assert_eq!(
+            mgr.size_on_disk(),
+            1_008,
+            "deleting blk00000.dat frees exactly its bytes"
+        );
+
+        // …and a reopen still agrees, over the gap pruning just made.
+        mgr.sync_all().unwrap();
+        drop(mgr);
+        let mgr = FlatFileManager::new(&dir).unwrap();
+        assert_eq!(
+            mgr.size_on_disk(),
+            1_008,
+            "the seed walk must not stop at the hole pruning left"
+        );
+    }
+
     #[test]
     fn delete_file_refuses_the_current_append_file() {
         let dir = std::env::temp_dir()

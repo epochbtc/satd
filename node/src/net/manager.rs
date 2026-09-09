@@ -2047,9 +2047,20 @@ impl PeerManager {
         let peers = self.peers.read();
         let mut entries: Vec<_> = peers.iter().collect();
         entries.sort_by_key(|(id, _)| **id);
+        // `inflight` was a hardcoded `[]`, which reads as "this peer owes us
+        // nothing" — the opposite of the answer when the question is which
+        // peer is stalling the download. Read once for the whole call so a
+        // long peer list does not take the scheduler lock per peer.
+        let ibd = self.ibd.read();
         entries
             .into_iter()
-            .map(|(_, h)| h.info.to_rpc_json(&h.stats))
+            .map(|(id, h)| {
+                let inflight = ibd
+                    .as_ref()
+                    .map(|s| s.peer_inflight_heights(*id))
+                    .unwrap_or_default();
+                h.info.to_rpc_json_with_inflight(&h.stats, inflight)
+            })
             .collect()
     }
 

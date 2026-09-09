@@ -15,6 +15,7 @@
 /// (`ARG_SZ_LARGE` in `rpc_misc.py`), which a 10 MiB cap rejects.
 pub(crate) const RPC_MAX_BODY_SIZE: usize = 20 * 1024 * 1024;
 
+pub mod active_commands;
 pub mod access;
 pub mod address;
 pub mod admission;
