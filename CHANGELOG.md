@@ -64,6 +64,10 @@ item below is (or will be) written up in full in the in-development
   real `connection_type`, and each type behaves as Core's does.
 - `validateaddress` reports *why* an address is invalid: Core's `error`
   string plus `error_locations` for a Bech32 checksum failure.
+- `-vbparams=deployment:start:end[:min_activation_height]`, Core's
+  regtest-only BIP 9 window override. Only `testdummy` is accepted; `taproot`
+  is refused by name, because satd activates it at a fixed height and would
+  report an override it does not honour (#692).
 - `dumptxoutset` accepts Core's `type` argument (every Core-shaped call was
   previously a parse error), and resolves a relative `path` against the
   network data directory as Core does rather than the working directory.
@@ -92,6 +96,21 @@ item below is (or will be) written up in full in the in-development
   all (#664).
 - A JSON-RPC response too large to normalise is forwarded rather than
   DOM-parsed, which cost several times its size in peak memory (#664).
+- **Breaking:** `getdeploymentinfo` reports Bitcoin Core v31.1's full
+  deployment set. `taproot` moves from `type: "buried"` to `type: "bip9"`
+  (Core models it as a version-bits deployment), `testdummy` is added, and the
+  result object carries the `script_flags` array it was missing (#692).
+- `dumptxoutset` reports `nchaintx`, one of the three numbers an AssumeUTXO
+  anchor is made of; without it a dumped snapshot could not be turned into one
+  (#692).
+- **Breaking:** `addconnection` returns as soon as the capacity grant is
+  taken, as Core's does, instead of awaiting the dial and the transport
+  handshake — which deadlocked against a caller that binds a listener, calls
+  the RPC, and only then accepts. It also accepts a hostname, not just a
+  literal `address:port` (#692).
+- `addconnection` requires the new `test:net` capability rather than
+  `rpc:write`, so a delegated write token cannot reshape the node's peer set.
+  The cookie/`rpcauth` operator is unaffected (#692).
 - **Breaking:** an operator-supplied peer name (`-addnode`, `-connect`,
   `addnode`) is no longer resolved with the local resolver under `-proxy` —
   that leaked to the resolver exactly the peers a proxied node exists to hide

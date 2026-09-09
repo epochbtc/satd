@@ -269,6 +269,23 @@ impl Drop for TypedDialGuard<'_> {
     }
 }
 
+/// [`TypedDialGuard`] for a reservation that outlives the call that took it —
+/// `add_connection` reserves the slot synchronously and releases it from the
+/// spawned dial, so the guard cannot borrow the manager.
+struct OwnedTypedDialGuard {
+    pm: Arc<PeerManager>,
+    conn_type: ConnType,
+}
+
+impl Drop for OwnedTypedDialGuard {
+    fn drop(&mut self) {
+        let mut set = self.pm.pending_typed_dials.write();
+        if let Some(i) = set.iter().position(|t| *t == self.conn_type) {
+            set.swap_remove(i);
+        }
+    }
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -1484,19 +1501,88 @@ impl PeerManager {
         conn_type: Option<ConnType>,
         use_v2: Option<bool>,
     ) -> Result<(), String> {
+        self.connect_outbound_inner(addr, conn_type, use_v2, true).await
+    }
+
+    /// Core's `CConnman::AddConnection`, behind `addconnection`.
+    ///
+    /// Returns as soon as the capacity check passes and the outbound slot is
+    /// taken; the dial and the transport handshake run in a spawned task.
+    /// Core answers the RPC the same way — `OpenNetworkConnection` returns
+    /// once the socket is connected, never waiting for the peer's `version`
+    /// — and the difference is not cosmetic: the functional-test framework
+    /// binds a listener, calls `addconnection`, and only *then* accepts and
+    /// speaks. Awaiting the handshake inside the RPC, as this used to,
+    /// deadlocks against that order until the dial times out.
+    ///
+    /// The capacity check stays synchronous so a refusal still reaches the
+    /// caller as `-34`, which is the one part of the outcome Core reports.
+    pub fn add_connection(
+        self: &Arc<Self>,
+        target: PeerAddr,
+        conn_type: ConnType,
+        use_v2: bool,
+    ) -> Result<(), String> {
+        if !self.is_network_active() {
+            return Err("networking disabled (networkactive=false)".to_string());
+        }
+        let addr = match target {
+            PeerAddr::Socket(sa) => sa,
+            // satd types a connection at `spawn_peer`, which is reached from
+            // the socket dial path; the onion dial has its own path and no
+            // way to carry a requested type through it yet. Refuse by name
+            // rather than open an untyped connection the caller would then
+            // see reported as something else.
+            PeerAddr::Onion { host, .. } => {
+                return Err(format!(
+                    "addconnection cannot open a typed connection to an onion address ({host}) yet"
+                ));
+            }
+        };
+        {
+            let mut pending = self.pending_typed_dials.write();
+            self.check_outbound_limit_for(conn_type, &pending)?;
+            pending.push(conn_type);
+        }
+        let pm = self.clone();
+        tokio::spawn(async move {
+            // Releases the reservation on every exit path, including a dial
+            // timeout or a panic below.
+            let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type };
+            if let Err(e) = pm
+                .connect_outbound_inner(addr, Some(conn_type), Some(use_v2), false)
+                .await
+            {
+                tracing::debug!(%addr, ?conn_type, "addconnection dial failed: {e}");
+            }
+        });
+        Ok(())
+    }
+
+    /// `connect_outbound_as`, with the per-type reservation optional:
+    /// `add_connection` has already taken it and holds the grant across the
+    /// spawned dial.
+    async fn connect_outbound_inner(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        conn_type: Option<ConnType>,
+        use_v2: Option<bool>,
+        reserve: bool,
+    ) -> Result<(), String> {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
         // Take the capacity check and the per-type reservation together, so
         // two callers cannot both pass the same free slot.
         let _typed_slot = match conn_type {
-            Some(t) => {
+            Some(t) if reserve => {
                 let mut pending = self.pending_typed_dials.write();
                 self.check_outbound_limit_for(t, &pending)?;
                 pending.push(t);
                 drop(pending);
                 Some(TypedDialGuard { set: &self.pending_typed_dials, conn_type: t })
             }
+            Some(_) => None,
             None => {
                 self.check_outbound_limit()?;
                 None

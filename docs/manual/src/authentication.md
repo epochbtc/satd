@@ -57,6 +57,7 @@ token does not hold.
 | Stream watch | `stream:watch` | Register outpoint/script/descriptor/txid watches, bounded by the token's watch quota. |
 | MCP | `mcp:*` | The MCP server. One capability; there is no per-tool split. |
 | Test clock | `test:clock` | `setmocktime`, which moves the node clock (regtest only). **Not** implied by `rpc:write`: it reaches the future-block check, mempool expiry and block-template timestamps, so it must be granted deliberately. |
+| Test net | `test:net` | `addconnection`, which opens an outbound connection of a chosen type (regtest only). **Not** implied by `rpc:write`: it dials an address the caller chooses and picks the connection's type, which decides whether that peer is asked for transactions and whether it takes part in address relay — reshaping the peer set, not writing to the node. Grant it deliberately. |
 
 The operator and loopback-trust principals hold all capabilities.
 

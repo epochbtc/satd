@@ -31,11 +31,22 @@ pub enum Capability {
     /// timestamps, so a token handed out for ordinary writes should not carry
     /// it. Must be granted explicitly in `auth.toml`.
     TestClock,
+    /// Open an outbound connection of a chosen type via `addconnection`
+    /// (regtest only).
+    ///
+    /// Like [`Capability::TestClock`], deliberately *not* implied by
+    /// [`Capability::RpcWrite`]: `addconnection` dials an address of the
+    /// caller's choosing and picks the connection's type, which decides
+    /// whether that peer is asked for transactions and whether it takes part
+    /// in address relay. A token handed out for ordinary writes should not be
+    /// able to reshape the node's peer set. Must be granted explicitly in
+    /// `auth.toml`.
+    TestNet,
 }
 
 /// Every capability, in bit order. The single source of truth used to derive
 /// [`CapabilitySet::ALL`] and to render a set for logging.
-const ALL_CAPS: [Capability; 7] = [
+const ALL_CAPS: [Capability; 8] = [
     Capability::RpcRead,
     Capability::RpcWrite,
     Capability::EsploraRead,
@@ -43,6 +54,7 @@ const ALL_CAPS: [Capability; 7] = [
     Capability::StreamWatch,
     Capability::McpAll,
     Capability::TestClock,
+    Capability::TestNet,
 ];
 
 impl Capability {
@@ -56,6 +68,7 @@ impl Capability {
             Capability::StreamWatch => "stream:watch",
             Capability::McpAll => "mcp:*",
             Capability::TestClock => "test:clock",
+            Capability::TestNet => "test:net",
         }
     }
 
@@ -102,7 +115,8 @@ impl CapabilitySet {
                 | Capability::StreamSubscribe.bit()
                 | Capability::StreamWatch.bit()
                 | Capability::McpAll.bit()
-                | Capability::TestClock.bit(),
+                | Capability::TestClock.bit()
+                | Capability::TestNet.bit(),
         )
     };
 
