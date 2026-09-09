@@ -1357,23 +1357,47 @@ fn a_notification_in_a_batch_produces_no_entry() {
 /// parse error is 500, an invalid request 400, an unknown method 404. satd
 /// answered 200 to all three, so a client that switches on the status — Core's
 /// own `interface_rpc.py` does — could not tell them apart.
+///
+/// The mapping is for **legacy** requests only. `HTTPReq_JSONRPC` runs a 2.0
+/// request with `catch_errors` on and answers HTTP 200 with the error in the
+/// body; `JSONErrorReply`, where the mapping lives, opens with
+/// `Assume(jreq.m_json_version != JSONRPCVersion::V2)`. Getting that wrong is
+/// not cosmetic: Core's own `authproxy` raises `-342 non-200 HTTP status
+/// code` for a 2.0 reply with a non-200 status *before* it reads the error
+/// object, so the real code never reaches the caller — which is how
+/// `rpc_generate.py` and `wallet_disable.py` broke, both asserting on -32601.
 #[test]
 fn the_http_status_carries_the_jsonrpc_error_class() {
     let mut node = TestNode::start(&[]);
 
-    // Unparseable body → -32700 → 500.
+    // Unparseable body → -32700 → 500. There is no version to read out of a
+    // body that does not parse, so this is the legacy path either way.
     let (status, body) = node.rpc_post_raw_status("{not json");
     assert_eq!(status, 500, "a parse error is 500: {body}");
 
-    // Unknown method → -32601 → 404.
+    // Legacy request, unknown method → -32601 → 404.
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"id":1,"method":"nosuchmethod"}"#);
+    assert_eq!(status, 404, "a 1.0 unknown method is 404: {body}");
+    assert!(body.contains("-32601"), "{body}");
+    let (status, _) =
+        node.rpc_post_raw_status(r#"{"jsonrpc":"1.0","id":1,"method":"nosuchmethod"}"#);
+    assert_eq!(status, 404, "an explicit 1.0 is the same");
+
+    // The same call as JSON-RPC 2.0 keeps 200 and carries the code in the
+    // body, as Core does.
     let (status, body) =
         node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"nosuchmethod"}"#);
-    assert_eq!(status, 404, "an unknown method is 404: {body}");
+    assert_eq!(status, 200, "a 2.0 unknown method stays 200: {body}");
+    assert!(body.contains("-32601"), "the code is still reported: {body}");
 
     // A well-formed call to a real method is still 200, error or not.
     let (status, body) =
         node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[99999999]}"#);
     assert_eq!(status, 200, "an application error keeps 200: {body}");
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"id":1,"method":"getblockhash","params":[99999999]}"#);
+    assert_eq!(status, 200, "…on the legacy path too: {body}");
 
     node.stop();
 }
