@@ -2215,7 +2215,296 @@ fn test_getmemoryinfo() {
     let response = node.rpc_call("getmemoryinfo").unwrap();
     let result = &response["result"];
     assert!(result["locked"].is_object());
+    // Core's `locked` describes the secure-allocator arena, not process
+    // memory. satd has no secure allocator, so the pool is empty and the
+    // numbers are zero — not the process RSS with a `free` invented around it
+    // to keep `used + free == total` true.
+    let locked = &result["locked"];
+    for field in ["used", "free", "total", "locked", "chunks_used", "chunks_free"] {
+        assert_eq!(locked[field], serde_json::json!(0), "locked.{field}: {result}");
+    }
+    // Core's two argument errors.
+    let r = node
+        .rpc_call_with_params("getmemoryinfo", vec![serde_json::json!("mallocinfo")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8);
+    let r = node
+        .rpc_call_with_params("getmemoryinfo", vec![serde_json::json!("foobar")])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8);
+    assert_eq!(r["error"]["message"], "unknown mode foobar");
     node.stop();
+}
+
+/// `estimaterawfee` reports what the estimator has. A fresh regtest node has
+/// no fee samples, so Core's answer is the "insufficient data" error object,
+/// not a feerate — and never `decay: 0`, which Core's estimator cannot
+/// produce.
+#[test]
+fn test_estimaterawfee_reports_only_what_it_has() {
+    let mut node = TestNode::start(&[]);
+
+    let raw = |node: &mut TestNode, target: i64| -> serde_json::Value {
+        let r = node
+            .rpc_call_with_params("estimaterawfee", vec![serde_json::json!(target)])
+            .unwrap();
+        assert!(r["error"].is_null(), "estimaterawfee {target}: {r}");
+        r["result"].clone()
+    };
+
+    // A horizon that does not track the target is omitted entirely, as in
+    // Core: short tracks 12 blocks, medium 48, long 1008.
+    let r = raw(&mut node, 6);
+    for h in ["short", "medium", "long"] {
+        assert!(r[h].is_object(), "target 6 must reach every horizon: {r}");
+    }
+    let r = raw(&mut node, 100);
+    assert!(r["short"].is_null(), "short does not track 100: {r}");
+    assert!(r["medium"].is_null(), "medium does not track 100: {r}");
+    assert!(r["long"].is_object(), "long tracks 100: {r}");
+
+    // No samples yet, so every horizon says so rather than quoting a number.
+    let long = &raw(&mut node, 6)["long"];
+    assert!(
+        long["errors"].is_array(),
+        "a node with no fee history reports insufficient data: {long}"
+    );
+    // And the fields satd has no data for are absent, not zero.
+    for field in ["decay", "scale", "pass", "fail"] {
+        assert!(long[field].is_null(), "long.{field} must be omitted: {long}");
+    }
+
+    // The threshold is validated rather than discarded.
+    let r = node
+        .rpc_call_with_params(
+            "estimaterawfee",
+            vec![serde_json::json!(6), serde_json::json!(1.5)],
+        )
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "Invalid threshold");
+    node.stop();
+}
+
+/// `getpeerinfo.permissions` was hardcoded `[]` while the peer's permissions
+/// were populated all along. An empty array reads as "nothing granted", which
+/// is the opposite claim for a `-whitelist`ed peer.
+#[test]
+fn test_getpeerinfo_reports_real_permissions() {
+    let miner_p2p_port = find_available_port();
+    let mut miner = TestNode::start(&[
+        &format!("--port={}", miner_p2p_port),
+        "--whitelist=127.0.0.1",
+    ]);
+    let mut peer = TestNode::start(&[&format!("--connect=127.0.0.1:{}", miner_p2p_port)]);
+
+    poll_until(
+        || get_rpc_u64(&miner, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the whitelisted peer never connected",
+    );
+
+    let info = miner.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    let perms: Vec<String> = peers[0]["permissions"]
+        .as_array()
+        .expect("permissions array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    // Core's implicit set for a bare `-whitelist=<subnet>`, in Core's order.
+    // `p2p_permissions.py` asserts this list literally.
+    assert_eq!(
+        perms,
+        ["noban", "relay", "mempool", "download"],
+        "whitelisted peer permissions: {info}"
+    );
+
+    // The other side took no whitelist, so its view is genuinely empty.
+    // Polled, not skipped-if-absent: an `if let Some(..)` here passed while
+    // asserting nothing whenever the outbound peer had not been recorded yet.
+    poll_until(
+        || {
+            get_rpc_u64(&peer, "getconnectioncount").unwrap_or(0) >= 1
+        },
+        test_timeout(30),
+        "the dialling node never recorded its peer",
+    );
+    let info = peer.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    let p = peers.first().expect("the dialling node has a peer");
+    assert_eq!(
+        p["permissions"].as_array().map(Vec::len),
+        Some(0),
+        "an un-whitelisted peer has no permissions: {info}"
+    );
+
+    peer.stop();
+    miner.stop();
+}
+
+/// `logging` must answer from the filter the node actually logs through.
+/// It used to answer from a private static map initialised to "everything
+/// on" — so a node started with no `-debug` reported 30 categories enabled,
+/// and toggling one flipped a bit nothing else read.
+#[test]
+fn test_logging_reports_and_changes_the_real_filter() {
+    let mut node = TestNode::start(&[]);
+    let logging = |node: &mut TestNode, params: Vec<serde_json::Value>| -> serde_json::Value {
+        let r = node.rpc_call_with_params("logging", params).unwrap();
+        assert!(r["error"].is_null(), "logging: {r}");
+        r["result"].clone()
+    };
+
+    // A node with no -debug is logging no categories. The old map said all.
+    let r = logging(&mut node, vec![]);
+    let obj = r.as_object().expect("logging object");
+    assert!(!obj.is_empty(), "satd must name the categories it can act on");
+    assert!(
+        obj.values().all(|v| v == &serde_json::json!(false)),
+        "no -debug means no category is being logged: {r}"
+    );
+    // Only categories satd can actually act on, and in alphabetical order —
+    // `rpc_misc.py` asserts the ordering.
+    let keys: Vec<&String> = obj.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "categories must be alphabetical: {r}");
+    assert!(obj.contains_key("net") && obj.contains_key("mempool"), "{r}");
+    // Categories satd has no subsystem for are not advertised.
+    assert!(!obj.contains_key("qt"), "satd must not claim a category it cannot enable: {r}");
+
+    // Include turns one on, and only it.
+    let r = logging(&mut node, vec![serde_json::json!(["net"])]);
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+    assert_eq!(r["validation"], serde_json::json!(false), "{r}");
+    // ...and it is still on when read back, i.e. the change was applied to
+    // state the next call reads, not to a copy.
+    let r = logging(&mut node, vec![]);
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+
+    // Exclude turns it off again.
+    let r = logging(
+        &mut node,
+        vec![serde_json::json!([]), serde_json::json!(["net"])],
+    );
+    assert_eq!(r["net"], serde_json::json!(false), "{r}");
+
+    // "all" is Core's wildcard.
+    let r = logging(&mut node, vec![serde_json::json!(["all"])]);
+    assert!(
+        r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+        "{r}"
+    );
+    // Core evaluates include then exclude, so a category in both is excluded.
+    let r = logging(
+        &mut node,
+        vec![serde_json::json!(["all"]), serde_json::json!(["rpc"])],
+    );
+    assert_eq!(r["rpc"], serde_json::json!(false), "{r}");
+    assert_eq!(r["net"], serde_json::json!(true), "{r}");
+
+    // An unknown category is Core's error, and changes nothing.
+    let before = logging(&mut node, vec![]);
+    let r = node
+        .rpc_call_with_params("logging", vec![serde_json::json!(["nosuchcategory"])])
+        .unwrap();
+    assert_eq!(r["error"]["code"], -8, "{r}");
+    assert_eq!(r["error"]["message"], "unknown logging category nosuchcategory");
+    assert_eq!(logging(&mut node, vec![]), before, "a rejected call must apply nothing");
+
+    // Core's wildcard set is `GetLogCategory`'s: "", "1" and "all" all mean
+    // everything. The empty string is the one that is easy to miss, and it is
+    // the one a caller reaches by accident.
+    for wildcard in ["", "1", "all"] {
+        let r = logging(&mut node, vec![serde_json::json!([wildcard])]);
+        assert!(
+            r.as_object().unwrap().values().all(|v| v == &serde_json::json!(true)),
+            "{wildcard:?} must enable every category: {r}"
+        );
+    }
+
+    // `none` and `0` are *not* in that set. They are `-debug` config
+    // spellings, absent from Core's `LOG_CATEGORIES_BY_STR`, so both
+    // `EnableCategory` and `DisableCategory` fail on them and the RPC answers
+    // "unknown logging category". Accepting them meant `logging '["none"]'`
+    // silently turned off all logging where Core refuses the call.
+    for name in ["none", "0"] {
+        let before = logging(&mut node, vec![]);
+        let r = node
+            .rpc_call_with_params("logging", vec![serde_json::json!([name])])
+            .unwrap();
+        assert_eq!(r["error"]["code"], -8, "{name}: {r}");
+        assert_eq!(r["error"]["message"], format!("unknown logging category {name}"));
+        assert_eq!(
+            logging(&mut node, vec![]),
+            before,
+            "{name} must not have been applied"
+        );
+
+        // And in the exclude slot too, which is where "turn everything off"
+        // would have been reached from.
+        let r = node
+            .rpc_call_with_params(
+                "logging",
+                vec![serde_json::json!([]), serde_json::json!([name])],
+            )
+            .unwrap();
+        assert_eq!(r["error"]["code"], -8, "{name} (exclude): {r}");
+        assert_eq!(logging(&mut node, vec![]), before, "{name} (exclude)");
+    }
+
+    node.stop();
+}
+
+/// A node started with `-debug=net` must say so, which is the half of the
+/// contract that proves the report is derived from the config rather than
+/// from a default.
+#[test]
+fn test_logging_reflects_the_debug_flag_at_startup() {
+    let mut node = TestNode::start(&["--debug=net"]);
+    let r = node.rpc_call("logging").unwrap();
+    let result = &r["result"];
+    assert_eq!(result["net"], serde_json::json!(true), "{r}");
+    assert_eq!(result["validation"], serde_json::json!(false), "{r}");
+    node.stop();
+
+    let mut node = TestNode::start(&["--debug=all", "--debugexclude=net"]);
+    let r = node.rpc_call("logging").unwrap();
+    let result = &r["result"];
+    assert_eq!(result["net"], serde_json::json!(false), "{r}");
+    assert_eq!(result["validation"], serde_json::json!(true), "{r}");
+    node.stop();
+}
+
+/// Core's idiom for "match this range and grant it nothing" is an `@` entry
+/// with an empty permission list. satd expanded it to the implicit set, so
+/// `getpeerinfo` now shows what was actually granted — nothing.
+#[test]
+fn test_getpeerinfo_empty_whitelist_grant_is_empty() {
+    let miner_p2p_port = find_available_port();
+    let mut miner = TestNode::start(&[
+        &format!("--port={}", miner_p2p_port),
+        "--whitelist=@127.0.0.1",
+    ]);
+    let mut peer = TestNode::start(&[&format!("--connect=127.0.0.1:{}", miner_p2p_port)]);
+
+    poll_until(
+        || get_rpc_u64(&miner, "getconnectioncount").unwrap_or(0) >= 1,
+        test_timeout(30),
+        "the peer never connected",
+    );
+
+    let info = miner.rpc_call("getpeerinfo").unwrap();
+    let peers = info["result"].as_array().expect("getpeerinfo array");
+    assert_eq!(
+        peers[0]["permissions"].as_array().map(Vec::len),
+        Some(0),
+        "`@<subnet>` must grant nothing, not the implicit set: {info}"
+    );
+
+    peer.stop();
+    miner.stop();
 }
 
 #[test]
@@ -2227,12 +2516,17 @@ fn test_getrpcinfo() {
     node.stop();
 }
 
+/// Superseded by `test_logging_reports_and_changes_the_real_filter`, which
+/// asserts the value is derived. This one pinned `net == true` on a node
+/// started with no `-debug` — the fabricated answer, asserted as if it were
+/// the contract.
 #[test]
 fn test_logging() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("logging").unwrap();
     let result = &response["result"];
-    assert_eq!(result["net"], true);
+    assert!(result["net"].is_boolean(), "{response}");
+    assert_eq!(result["net"], false, "no -debug means net is not logged");
     node.stop();
 }
 

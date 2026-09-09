@@ -169,7 +169,18 @@ pub struct ReloadHandles {
     /// Chain state — the policy re-placement pass ([`Mempool::reapply_policy`])
     /// re-resolves each entry's prevouts against it on a `policyfile` reload (§8).
     pub chain_state: Arc<ChainState>,
-    pub log_filter: LogReloadHandle,
+    /// The `logging` RPC's live state, which owns the filter-reload handle.
+    ///
+    /// There is deliberately no separate `log_filter` here. While both
+    /// existed, a SIGHUP could rebuild the filter without telling the RPC,
+    /// leaving it reporting the categories it had last set while the node
+    /// logged through something else — the drift the RPC was fixed to
+    /// eliminate. One owner, one path. A reload re-derives verbosity from the
+    /// config file, so it has to go through this rather than straight to
+    /// `log_filter` — otherwise the RPC would keep reporting the categories it
+    /// last set while the node logged through the reloaded filter, which is
+    /// the drift the RPC was fixed to eliminate.
+    pub log_control: Arc<crate::logcontrol::LiveLogControl>,
     /// Address-index subscription registry — its cap is reloadable.
     pub addr_sub_registry: Arc<SubscriptionRegistry>,
     /// Reloadable reorg-webhook target read by the dispatcher. `None` when the
@@ -567,9 +578,9 @@ fn field_specs() -> Vec<FieldSpec> {
         // -checkpoints is consumed once at ChainState construction.
         restart!("checkpoints", enforce_checkpoints),
         live!("maxshutdownsecs", max_shutdown_secs, consumed_from_reloaded_config),
-        live!("debug", debug, |c, h| h.log_filter.reload(c)),
-        live!("debugexclude", debugexclude, |c, h| h.log_filter.reload(c)),
-        live!("loglevel", log_level, |c, h| h.log_filter.reload(c)),
+        live!("debug", debug, |c, h| h.log_control.reset_to(c)),
+        live!("debugexclude", debugexclude, |c, h| h.log_control.reset_to(c)),
+        live!("loglevel", log_level, |c, h| h.log_control.reset_to(c)),
         // ---- RPC server ----
         restart!("rpcport", rpcport),
         restart!("rpcbind", rpcbind),

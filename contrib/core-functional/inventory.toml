@@ -972,7 +972,7 @@ note = "measured: assert_equal(7, 4) on the tip height after invalidateblock acr
 file = "rpc_misc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: times out in wait_until on getmemoryinfo/logging behaviour after the echo call; satd's `logging` and `getmemoryinfo` report fabricated or incomplete data (#667). Follow-up: #667"
+note = "needs echo with named args, echoipc, coinstatsindex and txospenderindex, none of which satd has; the getmemoryinfo assertions (used/free/total/chunks_* > 0) also cannot pass now that satd reports the secure-allocator pool honestly as empty (#667), since it has no such allocator. Not reachable by fixing `logging` alone -- re-measure and re-bucket rather than tracking it as an RPC gap"
 
 [[test]]
 file = "rpc_named_arguments.py"
@@ -1029,7 +1029,7 @@ note = "measured: scantxoutset rejects pkh() with -5. satd implements the key-fr
 file = "rpc_setban.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getpeerinfo omits permissions. Follow-up: per-peer permission flags in getpeerinfo"
+note = "the getpeerinfo.permissions blocker is closed (#667): the field reports the real flags now. Unmeasured since — the test also wants assert_debug_log('dropped (banned)') and addnode onetry. Re-measure with --candidate before flipping"
 
 [[test]]
 file = "rpc_signer.py"

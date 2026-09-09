@@ -528,6 +528,66 @@ silently returning an empty or wrong answer.
   one that is never enforced is the failure mode worth avoiding: the caller
   would get no protection and no warning.
 
+- **`estimaterawfee`** — Core's fee estimator keeps three horizons of decaying
+  bucket statistics; satd's keeps a rolling sample of recent block feerates.
+  The `feerate` field and the per-horizon gate are faithful: a horizon that
+  does not track the requested `conf_target` is omitted (short tracks 12
+  blocks, medium 48, long 1008), and a node with too few samples answers
+  Core's `errors: ["Insufficient data or no feerate found which meets
+  threshold"]`. The fields that describe Core's buckets — `decay`, `scale`,
+  `pass`, `fail` — have no satd counterpart and are **omitted** rather than
+  reported as zeros. Because satd has one estimator rather than three, the
+  horizons that do answer a given `conf_target` all report the same feerate.
+  `threshold` is range-checked as Core does but does not select a confidence
+  level, there being no bucket distribution to select from.
+
+- **`getmemoryinfo`** — Core's `locked` object describes the secure-allocator
+  arena (`LockedPoolManager`), the mlock'd pool the wallet keeps private keys
+  in. satd has no secure allocator and no wallet, so the pool is empty and
+  every field is `0`. The object is emitted in Core's shape rather than
+  omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
+  refused with Core's message, as Core itself does off glibc.
+
+- **`getindexinfo` / `getsatdindexinfo`: `txindex.synced`** — reports whether
+  `-txindex` is on, not whether the index covers the whole chain. satd writes
+  txindex entries inline during `connect_block`, so with the flag set the index
+  is current for every block the node connects; what it cannot tell you is
+  whether history predating the flag was ever indexed. Core answers that with a
+  background index builder, which satd does not have — `backfillindex` covers
+  the address, silent-payment and filter indexes only. Against the strict
+  predicate, `synced` would stay false forever on a datadir first synced
+  without `-txindex`, and Core's documented "poll `synced`, then query" pattern
+  would hang instead of failing. A txindex backfill is what would let this
+  become a completeness marker.
+
+- **`logging`** — lists the twenty `-debug` categories satd can act on, not
+  Core's full set. satd maps Core's category names onto six tracing subsystems
+  (`net`, `mempool`, `rpc`, `validation`, `storage`, `tor`), so several of
+  Core's names are aliases for one target and the rest — `qt`, `libevent`,
+  `lock`, `rand`, `selectcoins`, `walletdb` — name subsystems satd does not
+  have. Listing those would advertise a category the RPC could neither enable
+  nor report on. Because the names are aliases, enabling `net` also reports
+  `addrman`, `cmpctblock`, `proxy` and `txreconciliation` as enabled: they are
+  the same subsystem. Values are read from the live filter, and `include` /
+  `exclude` change it. Core's wildcard set is honoured exactly as
+  `GetLogCategory` defines it — `""`, `"1"` and `"all"` all mean everything —
+  and `none` / `0` are rejected as unknown categories, as Core rejects them:
+  they are `-debug` config spellings, absent from Core's category table. satd
+  is more lenient than Core in two directions here, both accept-only: a
+  category name is matched case-insensitively and after trimming surrounding
+  whitespace, where Core compares it exactly.
+
+- **`getpeerinfo.permissions`** — reports Core's `ToStrings` of the flags
+  actually granted, in Core's order. `bloomfilter` never appears: satd accepts
+  the name in a `-whitelist` entry but has no flag for it, so reporting it
+  would claim a grant that was never recorded. Two divergences remain in *what*
+  is granted, both pre-existing and tracked separately: satd applies
+  `-whitelist` to outbound peers, where Core consults its outgoing list only
+  for `out@` entries on manual connections; and an inbound Tor peer inherits a
+  loopback `-whitelist` entry, because satd's hidden service targets the same
+  listener as clearnet while Core binds a separate onion port and skips
+  whitelist matching on it.
+
 - **RPC help text** — satd has no equivalent of Core's `RPCHelpMan`, so
   `help <command>` returns the command's name rather than a signature and
   argument descriptions. Two things follow from that, both deliberate:

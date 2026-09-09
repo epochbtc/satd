@@ -72,6 +72,37 @@ item below is (or will be) written up in full in the in-development
   left its parent's ephemeral dust unspent, burying the real reason. It now
   reports `missing-ephemeral-spends`, and the package result is `unspent-dust`
   rather than `transaction failed`, as Core does (#673).
+- `getpeerinfo.permissions` was hardcoded `[]` while each peer's permissions
+  were populated all along, so a `-whitelist`ed peer reported no grants at all.
+  It now reports Core's `ToStrings` of the real flags (#667). `noban` also
+  carries `download`, as Core's `NetPermissionFlags::NoBan` does — a reporting
+  change, since the upload-budget check already honoured either flag.
+- The `logging` RPC honours Core's wildcard set exactly: `""`, `1` and `all`
+  all mean every category. `none` and `0` are rejected as unknown categories,
+  as Core rejects them — they are `-debug` config spellings, and accepting them
+  meant `logging '["none"]'` silently turned off all logging where Core refuses
+  the call (#667).
+- **Breaking:** two `-whitelist` grants were wider than Core's, and are
+  narrowed to match: a bare `-whitelist=<subnet>` no longer grants `addr`, and
+  `-whitelist=@<subnet>` — Core's "match this range, grant nothing" idiom —
+  grants nothing instead of the implicit set, which had been silently handing
+  out `noban` (#667).
+- `getmemoryinfo` reported the process RSS as the secure-allocator pool's
+  `used`, with `free`, `total` and both `chunks_*` invented around it. satd has
+  no secure allocator, so the pool is empty and the numbers are zero (#667).
+- `logging` reported from a static map initialised to "everything on" that
+  nothing else in the process read: a node running with no `-debug` claimed 30
+  categories enabled, and toggling one flipped a bit that never reached the log
+  filter. It now reads and writes the node's live `EnvFilter`, lists the
+  categories satd can actually act on, and answers Core's
+  `-8 unknown logging category <cat>` (#667).
+- `estimaterawfee` returned the same feerate for every horizon with `decay: 0`
+  — not a value Core's estimator can produce — and zeroed buckets, and
+  discarded `threshold` entirely. It now omits a horizon that does not track
+  the target, omits the bucket fields satd has no data for, answers Core's
+  "insufficient data" error when the estimator has none, and range-checks
+  `threshold` (#667).
+
 - `-connect=0` was parsed as the peer address `0`, so the node dialled
   `0.0.0.0:8333` at every startup. Core reads it as "open no outbound
   connections"; satd now does too, and any `-connect` stops the node dialling

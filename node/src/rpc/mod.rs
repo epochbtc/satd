@@ -28,6 +28,7 @@ pub mod compat;
 pub mod descriptor;
 pub mod error;
 pub mod indexes;
+pub mod logging;
 pub mod mining;
 pub mod named_params;
 pub mod network;

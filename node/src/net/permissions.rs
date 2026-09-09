@@ -40,6 +40,19 @@ impl NetPermissions {
 
     /// The implicit permission set Bitcoin Core grants a `-whitelist` /
     /// `-whitebind` entry written without an explicit permission list.
+    ///
+    /// Core's expansion (`src/net.cpp`, `CConnman::CreateNodeFromAcceptedSocket`)
+    /// is exactly `ForceRelay?` + `Relay?` + `Mempool` + `NoBan` — and `NoBan`
+    /// carries `Download` in its flag value. **No `Addr`.**
+    /// `p2p_permissions.py` asserts the list literally:
+    ///
+    /// ```text
+    /// ["-whitelist=127.0.0.1"] -> ["relay", "noban", "mempool", "download"]
+    /// ```
+    ///
+    /// satd granted `addr` here as well, which meant a bare `-whitelist`
+    /// entry exempted the peer from address-relay rate limiting. That was
+    /// invisible while `getpeerinfo.permissions` was hardcoded `[]`.
     pub fn implicit() -> Self {
         Self {
             noban: true,
@@ -47,7 +60,7 @@ impl NetPermissions {
             force_relay: false,
             mempool: true,
             download: true,
-            addr: true,
+            addr: false,
         }
     }
 
@@ -82,19 +95,68 @@ impl NetPermissions {
         self.relay || self.force_relay
     }
 
-    /// Parse a comma-separated permission list (`noban,relay,...` or
-    /// `all`). An empty string yields the implicit default set.
+    /// Core's `NetPermissions::ToStrings` (`src/net_permissions.cpp`), which
+    /// is what `getpeerinfo.permissions` reports. The order is Core's, not
+    /// alphabetical, and `rpc_setban.py` reads the array by membership.
+    ///
+    /// `bloomfilter` is absent because satd has no flag for it: `parse_list`
+    /// accepts the name and drops it, so reporting it would claim a grant that
+    /// was never recorded.
+    pub fn to_strings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.noban {
+            out.push("noban");
+        }
+        if self.force_relay {
+            out.push("forcerelay");
+        }
+        if self.relay {
+            out.push("relay");
+        }
+        if self.mempool {
+            out.push("mempool");
+        }
+        if self.download {
+            out.push("download");
+        }
+        if self.addr {
+            out.push("addr");
+        }
+        out
+    }
+
+    /// Parse a comma-separated permission list (`noban,relay,...` or `all`).
+    ///
+    /// An empty list grants **nothing**. This is only reachable as the
+    /// `@`-prefixed form — `-whitelist=@1.2.3.4`, Core's idiom for "match this
+    /// range and grant it nothing" — because a bare subnet never comes through
+    /// here at all; [`WhitelistEntry::parse`] hands it [`Self::implicit`]
+    /// directly. Core takes the `else` branch in `TryParsePermissionFlags`
+    /// for an `@` entry, never setting `Implicit`, so no expansion follows;
+    /// `p2p_permissions.py` asserts `["-whitelist=@127.0.0.1", …] -> []`.
+    ///
+    /// Returning the implicit set here instead silently granted `noban` —
+    /// which exempts a peer from banning *and* from the inbound connection
+    /// caps — to every peer in a range the operator had asked to grant
+    /// nothing.
     pub fn parse_list(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        if s.is_empty() {
-            return Ok(Self::implicit());
-        }
         let mut p = Self::NONE;
+        if s.is_empty() {
+            return Ok(p);
+        }
         for tok in s.split(',') {
             match tok.trim().to_ascii_lowercase().as_str() {
                 "" => {}
                 "all" => p = p.union(Self::all()),
-                "noban" => p.noban = true,
+                // Core's `NetPermissionFlags::NoBan` is `(1U << 4) | Download`
+                // -- the grant *is* the pair, not two names that happen to be
+                // given together, so `noban` alone also lifts the
+                // `-maxuploadtarget` block-serving limit.
+                "noban" => {
+                    p.noban = true;
+                    p.download = true;
+                }
                 "relay" => p.relay = true,
                 "forcerelay" => {
                     p.force_relay = true;
@@ -224,6 +286,56 @@ mod tests {
     fn forcerelay_implies_relay() {
         let p = NetPermissions::parse_list("forcerelay").unwrap();
         assert!(p.force_relay && p.relay && p.relays_txes());
+    }
+
+    /// Core's `NetPermissionFlags::NoBan` is `(1U << 4) | Download`: the two
+    /// are one grant, so `noban` also lifts the block-serving limit.
+    #[test]
+    fn noban_implies_download() {
+        let p = NetPermissions::parse_list("noban").unwrap();
+        assert!(p.noban && p.download);
+    }
+
+    /// The array `getpeerinfo.permissions` reports. The order is Core's
+    /// `ToStrings` order, not alphabetical.
+    #[test]
+    fn to_strings_matches_cores_order() {
+        assert_eq!(NetPermissions::NONE.to_strings(), Vec::<&str>::new());
+        assert_eq!(
+            NetPermissions::all().to_strings(),
+            ["noban", "forcerelay", "relay", "mempool", "download", "addr"]
+        );
+        // Core's `p2p_permissions.py` asserts this list literally, as the
+        // documented default for a bare `-whitelist=<subnet>`.
+        assert_eq!(
+            NetPermissions::implicit().to_strings(),
+            ["noban", "relay", "mempool", "download"]
+        );
+        // The one `rpc_setban.py` reads.
+        assert!(
+            NetPermissions::parse_list("noban")
+                .unwrap()
+                .to_strings()
+                .contains(&"noban")
+        );
+    }
+
+    /// Core's idiom for "match this range and grant it nothing" is an `@`
+    /// entry with an empty permission list. satd expanded it to the implicit
+    /// set, silently granting `noban` — exemption from banning *and* from the
+    /// inbound connection caps — to a range the operator asked to grant
+    /// nothing.
+    #[test]
+    fn an_empty_permission_list_grants_nothing() {
+        assert_eq!(NetPermissions::parse_list("").unwrap(), NetPermissions::NONE);
+        let e = WhitelistEntry::parse("@127.0.0.1").unwrap();
+        assert_eq!(e.perms, NetPermissions::NONE, "@<subnet> grants nothing");
+        assert!(e.perms.to_strings().is_empty());
+        assert!(e.contains("127.0.0.1".parse().unwrap()), "it still matches the range");
+
+        // A bare subnet never reaches `parse_list`, so it is unaffected.
+        let e = WhitelistEntry::parse("127.0.0.1").unwrap();
+        assert_eq!(e.perms, NetPermissions::implicit());
     }
 
     #[test]
