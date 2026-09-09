@@ -742,7 +742,17 @@ where
             // and an unknown method 404. jsonrpsee answers 200 for all three,
             // so a client that switches on the status — Core's own
             // `interface_rpc.py` does — could not tell them apart.
-            if let Some(status) = core_http_status(&resp_bytes) {
+            //
+            // But only for a **legacy** (1.0/1.1) request. Core catches
+            // errors for a 2.0 request and returns them inside an HTTP 200
+            // (`catch_errors{jreq.m_json_version == JSONRPCVersion::V2}`);
+            // `JSONErrorReply`, which does the mapping, opens with
+            // `Assume(jreq.m_json_version != JSONRPCVersion::V2)`. Mapping it
+            // for 2.0 as well is worse than cosmetic: Core's own authproxy
+            // raises `-342 non-200 HTTP status code` for a 2.0 reply with a
+            // non-200 status *before* it looks at the error object, so the
+            // real error code never reaches the caller.
+            if let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0) {
                 head.status = status;
             }
 
@@ -803,7 +813,22 @@ fn drop_notification_replies(body: &[u8], notification_ids: &[String]) -> Vec<u8
 
 /// Core's HTTP status for a JSON-RPC error code (`httprpc.cpp`
 /// `HTTPReq_JSONRPC`). `None` leaves the status alone.
-fn core_http_status(body: &[u8]) -> Option<hyper::StatusCode> {
+///
+/// `client_spoke_2_0` is not decoration. Core maps the status only for a
+/// **legacy** request: `JSONRPCExec` is called with
+/// `catch_errors{jreq.m_json_version == JSONRPCVersion::V2}`, so a 2.0 error
+/// is caught and returned inside an HTTP 200, and `JSONErrorReply` — the only
+/// place the mapping lives — opens with
+/// `Assume(jreq.m_json_version != JSONRPCVersion::V2)`.
+///
+/// Mapping it for 2.0 too is not merely cosmetic. Core's own `authproxy`
+/// raises `-342 non-200 HTTP status code` for a 2.0 reply whose status is not
+/// 200, *before* it reads the error object — so the real code never reaches
+/// the caller and `assert_raises_rpc_error(-32601, ...)` cannot match.
+fn core_http_status(body: &[u8], client_spoke_2_0: bool) -> Option<hyper::StatusCode> {
+    if client_spoke_2_0 {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     // A batch keeps 200 whatever its members say; Core only maps the status
     // for a single request.
@@ -1163,15 +1188,29 @@ mod tests {
             (-32601, hyper::StatusCode::NOT_FOUND),
         ] {
             let body = format!(r#"{{"error":{{"code":{code},"message":"x"}},"id":1}}"#);
-            assert_eq!(core_http_status(body.as_bytes()), Some(want), "code {code}");
+            assert_eq!(
+                core_http_status(body.as_bytes(), false),
+                Some(want),
+                "code {code}"
+            );
+            // The same error answering a *2.0* request keeps 200: Core
+            // catches it and replies 200, and its own authproxy turns any
+            // non-200 on a 2.0 reply into `-342` before it ever reads the
+            // code. `rpc_generate.py` and `wallet_disable.py` both assert on
+            // -32601 through that path.
+            assert_eq!(
+                core_http_status(body.as_bytes(), true),
+                None,
+                "code {code} on a 2.0 request must stay 200"
+            );
         }
         // An application error keeps 200, as Core does.
         let body = br#"{"error":{"code":-8,"message":"x"},"id":1}"#;
-        assert_eq!(core_http_status(body), None);
+        assert_eq!(core_http_status(body, false), None);
         // …and so does a success, and a batch.
-        assert_eq!(core_http_status(br#"{"result":1,"id":1}"#), None);
+        assert_eq!(core_http_status(br#"{"result":1,"id":1}"#, false), None);
         assert_eq!(
-            core_http_status(br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#),
+            core_http_status(br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#, false),
             None
         );
     }
