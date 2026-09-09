@@ -5707,6 +5707,30 @@ impl ChainState {
     ///    `"inconclusive-not-best-prevblk"` rather than triggering a reorg.
     ///  - No data is written to disk.
     pub fn test_block_validity(&self, block: &Block) -> Result<Option<String>, ChainError> {
+        // Core's `TestBlockValidity` holds `cs_main` throughout, for two
+        // reasons that both apply here: the tip must not move between the
+        // prevblk test and the connect, and the store this reads is the one
+        // `accept_block` writes.
+        let _accept_guard = self.accept_lock.lock();
+
+        // Core answers from the block index before validating anything
+        // (`rpc/mining.cpp`, `LookupBlockIndex` ahead of `TestBlockValidity`):
+        // a block it has already judged gets that judgement back rather than a
+        // second, possibly different, one.
+        let hash = block.block_hash();
+        if let Some(entry) = self.store.get_block_index(&hash) {
+            return Ok(Some(
+                match entry.status {
+                    BlockStatus::Valid => "duplicate",
+                    BlockStatus::Invalid => "duplicate-invalid",
+                    // Header-only, stored-but-unvalidated, or pruned: the node
+                    // knows the block but has not decided about its contents.
+                    _ => "duplicate-inconclusive",
+                }
+                .to_string(),
+            ));
+        }
+
         let tip_hash = self.tip_hash();
 
         // The block must build on the current tip.
@@ -5755,139 +5779,52 @@ impl ChainState {
             return Ok(Some(e.to_string()));
         }
 
-        // Contextual transaction validation: finality, UTXO existence, amounts.
-        // This mirrors the per-tx loop in connect_block but without persisting
-        // anything. Script verification is skipped — Core's TestBlockValidity
-        // runs full script verification, but proposal mode only needs to detect
-        // structural and contextual invalidity.
+        // Everything else is `connect_block`, exactly as Core's
+        // `TestBlockValidity` finishes with `ConnectBlock(..., fJustCheck=true)`
+        // against a throwaway coins view.
+        //
+        // `connect_block` is pure: it takes `&dyn Store`, reads, and returns a
+        // `StoreBatch` its *caller* writes. Dropping the batch here is what
+        // makes this a dry run — there is no second implementation of the
+        // rules to keep in step. The hand-written loop this replaces skipped
+        // script verification by its own admission, and with it BIP 68
+        // sequence locks, the block sigop cost, and BIP 30; a miner asking
+        // whether a block would be accepted got "yes" for blocks
+        // `submitblock` then rejected.
+        //
+        // The index configs are defaulted (disabled) rather than the node's:
+        // their only effect is on rows in the batch nobody will write, and
+        // building an address or filter index for a block that is not being
+        // connected is pure cost. `flat_pos` is likewise only stamped into the
+        // discarded batch.
         let mtp = connect::get_median_time_past(store_ref, height);
-        let mut total_fees: u64 = 0;
-        // Track coins created within this block for intra-block spend resolution.
-        let mut intra_block_coins: std::collections::HashMap<OutPoint, Coin> =
-            std::collections::HashMap::new();
-        // Track which coins have been spent within this block to detect
-        // double-spends.
-        let mut spent_in_block: std::collections::HashSet<OutPoint> =
-            std::collections::HashSet::new();
-
-        for tx in &block.txdata {
-            let is_coinbase = tx.is_coinbase();
-
-            // Context-free transaction checks.
-            if let Err(e) = crate::validation::tx::check_transaction(tx) {
-                return Ok(Some(e.to_string()));
-            }
-
-            // Finality check (locktime / sequence).
-            let is_final = tx.input.iter().all(|i| i.sequence == bitcoin::Sequence::MAX);
-            if !is_final {
-                let locktime = tx.lock_time.to_consensus_u32();
-                if locktime > 0 {
-                    if locktime < 500_000_000 {
-                        if locktime >= height {
-                            return Ok(Some("bad-txns-nonfinal".to_string()));
-                        }
-                    } else {
-                        let time_threshold = if height
-                            >= connect::bip113_activation_height(self.network)
-                        {
-                            mtp
-                        } else {
-                            block.header.time
-                        };
-                        if locktime >= time_threshold {
-                            return Ok(Some("bad-txns-nonfinal".to_string()));
-                        }
-                    }
-                }
-            }
-
-            // BIP 34 coinbase height check.
-            if is_coinbase
-                && height >= connect::bip34_activation_height(self.network)
-            {
-                let script = &tx.input[0].script_sig;
-                let bytes = script.as_bytes();
-                if bytes.is_empty() {
-                    return Ok(Some("bad-cb-height".to_string()));
-                }
-                if let Some(encoded_height) = connect::decode_coinbase_height(bytes) {
-                    if encoded_height != height {
-                        return Ok(Some("bad-cb-height".to_string()));
-                    }
-                } else {
-                    return Ok(Some("bad-cb-height".to_string()));
-                }
-            }
-
-            // UTXO validation for non-coinbase transactions.
-            let mut sum_inputs: u64 = 0;
-            if !is_coinbase {
-                for input in &tx.input {
-                    let outpoint = input.previous_output;
-
-                    if spent_in_block.contains(&outpoint) {
-                        return Ok(Some("bad-txns-inputs-missingorspent".to_string()));
-                    }
-
-                    let coin = intra_block_coins
-                        .get(&outpoint)
-                        .cloned()
-                        .or_else(|| self.store.get_coin(&outpoint));
-
-                    let Some(coin) = coin else {
-                        return Ok(Some("bad-txns-inputs-missingorspent".to_string()));
-                    };
-
-                    // Coinbase maturity.
-                    if coin.coinbase && height - coin.height < 100 {
-                        return Ok(Some(
-                            "bad-txns-premature-spend-of-coinbase".to_string(),
-                        ));
-                    }
-
-                    sum_inputs = sum_inputs.saturating_add(coin.amount);
-                    spent_in_block.insert(outpoint);
-                }
-
-                let sum_outputs: u64 =
-                    tx.output.iter().map(|o| o.value.to_sat()).sum();
-                if sum_inputs < sum_outputs {
-                    return Ok(Some("bad-txns-in-belowout".to_string()));
-                }
-                total_fees = total_fees.saturating_add(sum_inputs - sum_outputs);
-            }
-
-            // Add this transaction's outputs to the intra-block coin map.
-            let txid = tx.compute_txid();
-            for (vout, output) in tx.output.iter().enumerate() {
-                if !connect::is_unspendable(&output.script_pubkey) {
-                    let outpoint = OutPoint::new(txid, vout as u32);
-                    intra_block_coins.insert(
-                        outpoint,
-                        Coin {
-                            amount: output.value.to_sat(),
-                            script_pubkey: output.script_pubkey.clone(),
-                            height,
-                            coinbase: is_coinbase,
-                        },
-                    );
-                }
-            }
+        let no_address_index = crate::index::address::AddressIndexConfig::default();
+        let no_sp_index = crate::index::silent_payments::SpIndexConfig::default();
+        #[cfg(feature = "block-filter-index")]
+        let no_filter_index = crate::index::filter::FilterIndexConfig::default();
+        let params = connect::ConnectParams {
+            store: store_ref,
+            block,
+            height,
+            parent_chainwork: &parent.chainwork,
+            flat_pos: crate::storage::flatfile::FlatFilePos { file_number: 0, data_pos: 0 },
+            script_verifier: &*self.script_verifier,
+            median_time_past: mtp,
+            network: self.network,
+            pre_verified_txs: None,
+            num_threads: self.num_threads,
+            precomputed_txids: None,
+            address_index: &no_address_index,
+            sp_index: &no_sp_index,
+            #[cfg(feature = "block-filter-index")]
+            filter_index: &no_filter_index,
+            phase_tracker: None,
+            replay_plan: None,
+        };
+        match connect::connect_block(&params) {
+            Ok(_batch) => Ok(None),
+            Err(e) => Ok(Some(e.to_string())),
         }
-
-        // Coinbase value must not exceed subsidy + fees.
-        if !block.txdata.is_empty() {
-            let subsidy = connect::block_subsidy(self.network, height);
-            let coinbase_value: u64 =
-                block.txdata[0].output.iter().map(|o| o.value.to_sat()).sum();
-            if coinbase_value > subsidy + total_fees {
-                return Ok(Some("bad-cb-amount".to_string()));
-            }
-        }
-
-        // Block passed all checks.
-        Ok(None)
     }
 
     /// Accept a new block into the chain.
@@ -9914,6 +9851,160 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `getblocktemplate` proposal mode is Core's `TestBlockValidity`, which
+    /// finishes with `ConnectBlock(fJustCheck=true)`. satd ran a hand-written
+    /// loop that skipped script verification by its own admission, and with it
+    /// BIP 68 sequence locks, the block sigop cost and BIP 30 — so a miner
+    /// asking whether a block would be accepted got "yes" for blocks
+    /// `submitblock` then rejected.
+    ///
+    /// A BIP 68 violation is the cheapest of those to build without a real
+    /// script verifier, and the hand loop had no sequence-lock check at all.
+    #[test]
+    fn a_proposal_enforces_the_rules_the_hand_written_loop_skipped() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 101);
+        // The coinbase of block 1 is mature at height 102.
+        let coin = OutPoint::new(blocks[0].txdata[0].compute_txid(), 0);
+
+        // 200 blocks of relative lock against 101 confirmations: not final.
+        let bad = build_test_block_sequence_locked(
+            cs.tip_hash(),
+            102,
+            1_300_000_200,
+            coin,
+            200,
+        );
+        assert_eq!(
+            cs.test_block_validity(&bad).unwrap().as_deref(),
+            Some("bad-txns-nonBIP68-final"),
+            "proposal mode did not enforce BIP 68"
+        );
+        // …and a real submission says the same thing, which is the property
+        // that matters: the two answers come from one implementation.
+        assert_eq!(
+            cs.accept_block(&bad).unwrap_err().to_string(),
+            "bad-txns-nonBIP68-final"
+        );
+
+        // The control: a lock the chain does satisfy is accepted, so the
+        // refusal above is the sequence lock and not the fixture.
+        let good = build_test_block_sequence_locked(
+            cs.tip_hash(),
+            102,
+            1_300_000_200,
+            coin,
+            10,
+        );
+        assert_eq!(cs.test_block_validity(&good).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core answers a proposal for a block it already knows from the block
+    /// index, before validating anything (`rpc/mining.cpp`), and the verdict
+    /// depends on what it decided last time. satd reported
+    /// `inconclusive-not-best-prevblk` for every one of them, because a block
+    /// already on the chain does not build on the tip.
+    #[test]
+    fn a_proposal_for_a_block_the_node_already_judged_is_a_duplicate() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+
+        assert_eq!(
+            cs.test_block_validity(&blocks[2]).unwrap().as_deref(),
+            Some("duplicate"),
+            "the tip itself is a duplicate, not an inconclusive prevblk"
+        );
+        assert_eq!(
+            cs.test_block_validity(&blocks[0]).unwrap().as_deref(),
+            Some("duplicate"),
+            "a block deeper in the chain is equally a duplicate"
+        );
+
+        // A block that is genuinely unknown and off the tip keeps the old
+        // answer, so `duplicate` is not being reported for everything.
+        let orphan = build_test_block(blocks[0].block_hash(), 2, 1_300_009_999);
+        assert_eq!(
+            cs.test_block_validity(&orphan).unwrap().as_deref(),
+            Some("inconclusive-not-best-prevblk")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A proposal is a dry run: `connect_block` returns a `StoreBatch` its
+    /// caller writes, and proposal mode drops it. Nothing about the node may
+    /// differ afterwards.
+    #[test]
+    fn a_proposal_commits_nothing() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 2);
+
+        let tip_before = cs.tip_hash();
+        let height_before = cs.tip_height();
+        let coinbase = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
+        let coin_before = cs.get_coin(&coinbase);
+
+        let next = build_test_block(tip_before, 3, 1_300_000_003);
+        assert_eq!(cs.test_block_validity(&next).unwrap(), None, "fixture must be valid");
+
+        assert_eq!(cs.tip_hash(), tip_before, "a proposal moved the tip");
+        assert_eq!(cs.tip_height(), height_before, "a proposal moved the height");
+        assert!(
+            cs.get_block_index(&next.block_hash()).is_none(),
+            "a proposal wrote a block index entry"
+        );
+        assert!(
+            cs.get_coin(&OutPoint::new(next.txdata[0].compute_txid(), 0)).is_none(),
+            "a proposal published the proposed block's coins"
+        );
+        assert_eq!(
+            cs.get_coin(&coinbase).map(|c| c.amount),
+            coin_before.map(|c| c.amount),
+            "a proposal disturbed an existing coin"
+        );
+
+        // The control: accepting the same block really does change all of
+        // that, so the assertions above are not vacuous.
+        cs.accept_block(&next).expect("accept");
+        assert_ne!(cs.tip_hash(), tip_before);
+        assert!(cs.get_block_index(&next.block_hash()).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core holds `cs_main` across `TestBlockValidity` so the tip cannot move
+    /// between the prevblk test and the connect, and so the store this reads
+    /// is not being written underneath it.
+    #[test]
+    fn a_proposal_waits_for_the_accept_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (cs, dir) = make_chain_state();
+        build_and_connect_chain(&cs, 2);
+        let next = build_test_block(cs.tip_hash(), 3, 1_300_000_003);
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let guard = cs.accept_lock.lock();
+            s.spawn(|| {
+                let _ = cs.test_block_validity(&next);
+                done.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "a proposal validated while accept_lock was held"
+            );
+            drop(guard);
+        });
+        assert!(done.load(Ordering::SeqCst), "the proposal completes once the lock is free");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `prune_blocks`' mutation section (file deletes + `Pruned` stamps) must
     /// wait for `accept_lock` — a prune that interleaves with a reorg can
     /// delete a block file the reorg is about to read back. Deleting the
@@ -11414,6 +11505,54 @@ pub(crate) mod tests {
             }
         }
         panic!("Failed to mine time-locked test block within 2,000,000 nonce iterations");
+    }
+
+    /// Like `build_test_block_spending`, but with a BIP 68 *relative*
+    /// sequence lock on the grafted input: the spend is only final once
+    /// `sequence` blocks have passed since the coin's height.
+    ///
+    /// Bit 31 clear opts the input into BIP 68, so the low 16 bits are a
+    /// block-height delta.
+    pub(crate) fn build_test_block_sequence_locked(
+        parent_hash: BlockHash,
+        height: u32,
+        time: u32,
+        spend: bitcoin::OutPoint,
+        sequence: u32,
+    ) -> Block {
+        use bitcoin::Sequence;
+        use bitcoin::hashes::Hash;
+        use bitcoin::pow::CompactTarget;
+
+        let mut block = build_test_block_spending(parent_hash, height, time, spend);
+        let tx = block.txdata.last_mut().expect("grafted spend tx");
+        tx.input[0].sequence = Sequence::from_consensus(sequence);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let target = crate::storage::blockindex::target_from_compact(bits);
+        for nonce in 0u32..2_000_000 {
+            block.header.nonce = nonce;
+            let hash_bytes = *block.block_hash().as_raw_hash().as_byte_array();
+            let mut hash_be = [0u8; 32];
+            for i in 0..32 {
+                hash_be[i] = hash_bytes[31 - i];
+            }
+            let mut ok = true;
+            for i in 0..32 {
+                if hash_be[i] < target[i] {
+                    break;
+                }
+                if hash_be[i] > target[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return block;
+            }
+        }
+        panic!("Failed to mine sequence-locked test block within 2,000,000 nonce iterations");
     }
 
     /// Regression for issue #262: a reorg whose triggering block fails to

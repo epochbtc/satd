@@ -346,10 +346,14 @@ pub fn get_block_template_proposal(
     let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)
         .map_err(|_| (-22, "Block decode failed".to_string()))?;
 
+    // Core's `BIP22ValidationResult`: a valid proposal is JSON null, an
+    // invalid one is its reject reason as a string, and an *error* (as opposed
+    // to a verdict) is `RPC_VERIFY_ERROR` — -25, not -1.
     match chain_state.test_block_validity(&block) {
         Ok(None) => Ok(Value::Null),
+        Ok(Some(reason)) if reason.is_empty() => Ok(Value::String("rejected".to_string())),
         Ok(Some(reason)) => Ok(Value::String(reason)),
-        Err(e) => Err((-1, e.to_string())),
+        Err(e) => Err((-25, e.to_string())),
     }
 }
 

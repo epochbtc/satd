@@ -1214,6 +1214,12 @@ async fn main() {
     // value recorded once here rather than carrying it through every mining
     // entry point.
     node::mining::template::set_block_min_tx_fee(config.blockmintxfee);
+    // Core applies `-blockversion` only under `MineBlocksOnDemand()`, which is
+    // regtest alone: it exists to test forking scenarios, and honouring it on a
+    // live network would signal for deployments the node knows nothing about.
+    node::mining::template::set_block_version_override(
+        if config.network == bitcoin::Network::Regtest { config.blockversion } else { None },
+    );
 
     let mempool = Arc::new(Mempool::with_config(reload::mempool_config_from(&config)));
 

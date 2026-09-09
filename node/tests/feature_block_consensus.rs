@@ -306,6 +306,50 @@ fn case_oversize_block() -> Satd {
     cb(&block_of(vec![coinbase_with_outputs(1, outputs)]))
 }
 
+/// Oversized *and* merkle-broken. Core runs `CheckMerkleRoot` before the size
+/// limits — "all potential-corruption validation must be done before we do any
+/// transaction validation" — so the answer is `bad-txnmrklroot`. satd tested
+/// size first and answered `bad-blk-length`, which is the reason a peer would
+/// get its header marked invalid over transactions it may not have sent.
+/// Core's `CheckBlock` applies a legacy-only sigop ceiling — no prevouts, no
+/// witness, no P2SH — before it looks at a single transaction's inputs. satd
+/// counted sigops only in `connect_block`, where the accurate count needs
+/// resolved prevouts, so a block that is over the ceiling *and* spends nothing
+/// resolvable reported the wrong reason.
+///
+/// `MAX_BLOCK_SIGOPS_COST` is 80_000 and each legacy sigop is scaled by 4, so
+/// 20_001 bare `OP_CHECKSIG`s in an output script is one over.
+fn case_legacy_sigops_over_limit() -> Satd {
+    let output = TxOut {
+        value: Amount::from_sat(0),
+        script_pubkey: bitcoin::ScriptBuf::from(vec![0xac; 20_001]),
+    };
+    cb(&block_of(vec![coinbase_with_outputs(1, vec![output])]))
+}
+
+/// One under the ceiling, so the refusal above is the ceiling and not the
+/// shape of the fixture.
+fn case_legacy_sigops_at_limit() -> Satd {
+    let output = TxOut {
+        value: Amount::from_sat(0),
+        script_pubkey: bitcoin::ScriptBuf::from(vec![0xac; 20_000]),
+    };
+    cb(&block_of(vec![coinbase_with_outputs(1, vec![output])]))
+}
+
+fn case_oversize_and_bad_merkle() -> Satd {
+    let mut outputs = Vec::new();
+    for _ in 0..40 {
+        outputs.push(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::from(vec![0x00; 30_000]),
+        });
+    }
+    let mut block = block_of(vec![coinbase_with_outputs(1, outputs)]);
+    block.header.merkle_root = TxMerkleNode::from_byte_array([0xde; 32]);
+    cb(&block)
+}
+
 /// A spending tx carrying witness data, but the coinbase has no witness
 /// commitment output (BIP141). Core: `unexpected-witness` — with no
 /// commitment there is nothing to match against, so `CheckWitnessMalleation`
@@ -635,6 +679,9 @@ fn cases() -> Vec<Case> {
         Case { name: "multiple_coinbase", core: Reject("bad-cb-multiple"), expect: Match, run: case_multiple_coinbase },
         Case { name: "bad_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_bad_merkle_root },
         Case { name: "oversize_block", core: Reject("bad-blk-length"), expect: Match, run: case_oversize_block },
+        Case { name: "oversize_and_bad_merkle", core: Reject("bad-txnmrklroot"), expect: Match, run: case_oversize_and_bad_merkle },
+        Case { name: "legacy_sigops_over_limit", core: Reject("bad-blk-sigops"), expect: Match, run: case_legacy_sigops_over_limit },
+        Case { name: "legacy_sigops_at_limit", core: Accept, expect: Match, run: case_legacy_sigops_at_limit },
         Case { name: "witness_commitment_missing", core: Reject("unexpected-witness"), expect: Match, run: case_witness_commitment_missing },
         // context-free transaction
         Case { name: "tx_no_inputs", core: Reject("bad-txns-vin-empty"), expect: Match, run: case_tx_no_inputs },

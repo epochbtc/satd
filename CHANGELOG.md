@@ -75,6 +75,23 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** `getblocktemplate` proposal mode validates the proposed block
+  the way `submitblock` does. It ran a separate loop that skipped script
+  verification by its own admission, and with it BIP 68 sequence locks, the
+  block sigop cost and BIP 30, so a miner was told a block would be accepted
+  when it would not (#663).
+- `getblocktemplate` answers `duplicate` / `duplicate-invalid` /
+  `duplicate-inconclusive` for a block the node already knows, as Core does,
+  instead of `inconclusive-not-best-prevblk` (#663).
+- **Breaking:** `getblocktemplate` rejects a `mode` it does not understand with
+  `-8 Invalid mode` rather than silently returning a template, and proposal
+  mode without a string `data` is `-3`, as Core's is (#663).
+- **Breaking:** a block that is both oversized and merkle-broken reports
+  `bad-txnmrklroot`, as Core's `CheckBlock` does — it checks the merkle root
+  before the size limits — and `check_block` applies Core's legacy-sigop
+  ceiling, which fired before any prevout was resolved (#663).
+- `-blockversion` overrides the template's block version on regtest, as Core's
+  `CreateNewBlock` does. It was accepted and ignored (#663).
 - **Breaking:** dust thresholds are Bitcoin Core's. satd charged 68 vbytes to
   spend a witness output where Core charges 67, 107 for P2SH where Core charges
   148, and truncated a fee Core rounds up — so P2WPKH was 297 against Core's

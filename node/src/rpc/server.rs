@@ -1512,21 +1512,37 @@ pub async fn start(
             args.optional::<serde_json::Map<String, serde_json::Value>>("template_request")?
                 .map(serde_json::Value::Object);
         args.check()?;
-        if let Some(ref req) = request
-            && req.get("mode").and_then(|m| m.as_str()) == Some("proposal")
-        {
-            let data = req
-                .get("data")
+        // Core (`rpc/mining.cpp`): `mode` absent or JSON null means "template";
+        // a present-but-non-string `mode`, or any string other than
+        // "template"/"proposal", is `-8 Invalid mode`. Reading a non-string as
+        // "not proposal" silently mined a template for a caller who asked for
+        // something else.
+        let mode = match request.as_ref().and_then(|r| r.get("mode")) {
+            None | Some(serde_json::Value::Null) => "template",
+            Some(serde_json::Value::String(m)) => m.as_str(),
+            Some(_) => {
+                return Err(ErrorObjectOwned::owned(-8, "Invalid mode", None::<()>));
+            }
+        };
+        if mode == "proposal" {
+            // Core throws `RPC_TYPE_ERROR` (-3), not `-8`, when `data` is
+            // missing or not a string.
+            let data = request
+                .as_ref()
+                .and_then(|r| r.get("data"))
                 .and_then(|d| d.as_str())
                 .ok_or_else(|| {
                     ErrorObjectOwned::owned(
-                        -8,
-                        "\"data\" is required for proposal mode",
+                        -3,
+                        "Missing data String key for proposal",
                         None::<()>,
                     )
                 })?;
             return mining::get_block_template_proposal(&ctx.chain_state, data)
                 .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>));
+        }
+        if mode != "template" {
+            return Err(ErrorObjectOwned::owned(-8, "Invalid mode", None::<()>));
         }
         Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
     })?;
