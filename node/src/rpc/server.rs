@@ -2732,7 +2732,9 @@ pub async fn start(
                 // the reconnect loop dials it. Blocking here would stall the RPC
                 // for the whole connect timeout — up to the 20s onion floor — and
                 // wrongly report a transient dial failure as an addnode error.
-                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                let addr = ctx.peer_manager
+                    .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                    .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 // -23 = RPC_CLIENT_NODE_ALREADY_ADDED in Core.
                 if !ctx.peer_manager.addnode_add(&addr_str, addr.clone()) {
@@ -2752,7 +2754,9 @@ pub async fn start(
             "onetry" => {
                 // A single, un-remembered attempt — block on it and surface the
                 // result, matching the prior satd behavior (now onion-capable).
-                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                let addr = ctx.peer_manager
+                    .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                    .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 ctx.peer_manager
                     .connect_peer_addr(&addr)
@@ -2760,7 +2764,9 @@ pub async fn start(
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
             "remove" => {
-                let addr = crate::net::peer::PeerAddr::parse_with_default_port(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                let addr = ctx.peer_manager
+                    .resolve_peer_target(&addr_str, crate::net::peer::default_p2p_port(ctx.chain_state.network))
+                    .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 // -24 = RPC_CLIENT_NODE_NOT_ADDED in Core.
                 if !ctx.peer_manager.addnode_remove(&addr) {

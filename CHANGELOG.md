@@ -92,6 +92,32 @@ item below is (or will be) written up in full in the in-development
   all (#664).
 - A JSON-RPC response too large to normalise is forwarded rather than
   DOM-parsed, which cost several times its size in peak memory (#664).
+- **Breaking:** an operator-supplied peer name (`-addnode`, `-connect`,
+  `addnode`) is no longer resolved with the local resolver under `-proxy` —
+  that leaked to the resolver exactly the peers a proxied node exists to hide
+  — nor at all under `-dns=0`, which was parsed and then ignored outside DNS
+  seeding. Literal IPs and `.onion` targets are unaffected (#668).
+- `getpeerinfo` reports the peer's real `network` (an RFC1918, link-local or
+  loopback peer is `not_publicly_routable`, not `ipv4`/`ipv6`),
+  `addr_relay_enabled` as Core's `SetupAddressRelay` latches it rather than as
+  a function of the direction, and `servicesnames` in bit order (#668).
+- `last_block` / `last_transaction` move only when the node *accepts* the
+  block or transaction, as Core's do. Stamped on receipt, a peer could keep
+  its eviction protection alive with blocks the node already had (#668).
+- `getconnectioncount` counts the peers `getpeerinfo` lists, instead of a
+  narrower set (#668).
+- `getblocks` no longer announces the `hashStop` block the requester said it
+  already had; `getblocks` and `getheaders` start at height 1 rather than
+  re-announcing genesis when nothing in the locator matches, ignore locator
+  entries that sit on a stale fork (Core's `FindForkInGlobalIndex`), and
+  `getheaders` honours `hashStop` instead of always sending up to 2000
+  headers (#668).
+- `addnode <peer> remove` clears the peer's manual status, so it stops being
+  dialled as a manual connection and stops bypassing `-connect` gating (#668).
+- The total number of automatic outbound connections is bounded, as Core's
+  `semOutbound` bounds it. `addconnection` could open unlimited `addr-fetch`
+  and `feeler` connections, the two types Core caps only through that
+  semaphore (#691).
 - **Breaking:** `verifytxoutproof` requires the block to be on the active
   chain and the proof to cover the whole block, as Core does, and answers
   `-5 Block not found in chain` otherwise. A proof built on a stale branch read

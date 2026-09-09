@@ -14823,6 +14823,225 @@ fn addconnection_opens_the_connection_type_it_is_asked_for() {
     );
 }
 
+/// `last_block` and `last_transaction` are eviction inputs: Core protects the
+/// peers that most recently gave it something *useful*. It stamps them in
+/// `ProcessBlock` only when `ProcessNewBlock` reports `new_block`, and in the
+/// `TX` handler only on a VALID mempool accept. satd stamped both the moment
+/// the message arrived, so a peer could keep its own eviction protection
+/// alive indefinitely by re-sending a block the node already had, or a stream
+/// of transactions the node rejects — which is exactly the peer eviction is
+/// meant to shed.
+#[test]
+fn a_peers_last_block_and_last_tx_only_move_on_acceptance() {
+    use addconn_listener::{Inbound, send};
+    use bitcoin::consensus::deserialize;
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x63; 32]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![json!(101), json!(wallet.address.to_string())],
+    );
+    // Built now, sent later: the spend is of block 1's coinbase, so it does
+    // not depend on what the tip is when it goes out.
+    let dest = DeterministicWallet::from_secret([0x64; 32]);
+    let (good_tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
+    );
+    let good_tx: bitcoin::Transaction =
+        deserialize(&hex::decode(&good_tx_hex).unwrap()).unwrap();
+
+    let peer = Inbound::bind();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!(peer.addr.to_string()),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "addconnection: {out}");
+    let (mut stream, _) = peer.accept_version(test_timeout(20));
+    peer.complete_handshake(&mut stream);
+
+    let stamps = || -> (i64, i64) {
+        let info = node.rpc_call("getpeerinfo").unwrap();
+        let p = info["result"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["inbound"] == json!(false)))
+            .cloned()
+            .unwrap_or(json!({}));
+        (
+            p["last_block"].as_i64().unwrap_or(-1),
+            p["last_transaction"].as_i64().unwrap_or(-1),
+        )
+    };
+    poll_until(
+        || stamps() != (-1, -1),
+        test_timeout(20),
+        "the dialled peer must appear in getpeerinfo",
+    );
+    assert_eq!(stamps(), (0, 0), "nothing exchanged yet");
+
+    // satd drops relayed transactions while it believes it is in IBD, and a
+    // node that has heard no headers from anyone counts as in IBD. Announce
+    // the header of a block the node does not have yet, so the peer is a real
+    // relay peer for the rest of this test.
+    let tip_hash = node.rpc_call("getbestblockhash").unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tip_hex = node
+        .rpc_call_with_params("getblock", vec![json!(tip_hash), json!(0)])
+        .unwrap()["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tip_block: bitcoin::Block = deserialize(&hex::decode(&tip_hex).unwrap()).unwrap();
+    let height = node.rpc_call("getblockcount").unwrap()["result"]
+        .as_u64()
+        .unwrap() as u32;
+    // Past the median-time-past of the last 11 blocks: `generatetoaddress`
+    // stamps a fresh chain faster than the wall clock advances, so "now" can
+    // be `time-too-old`.
+    let fresh = build_regtest_block(
+        tip_hash.parse().unwrap(),
+        height + 1,
+        tip_block.header.time + 1,
+        Vec::new(),
+    );
+    send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Headers(vec![fresh.header]),
+    );
+
+    // A block the node already has, and a transaction it will reject.
+    send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Block(tip_block),
+    );
+    send(
+        &mut stream,
+        bitcoin::p2p::message::NetworkMessage::Tx(spend_of_a_nonexistent_output()),
+    );
+    // Give the node room to process both, then confirm neither stamp moved.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(
+        stamps(),
+        (0, 0),
+        "a duplicate block and a rejected transaction are not contributions"
+    );
+
+    // Now the real thing: a block the node does not have, and a transaction
+    // it accepts.
+    send(&mut stream, bitcoin::p2p::message::NetworkMessage::Block(fresh));
+    poll_until(
+        || stamps().0 > 0,
+        test_timeout(20),
+        "an accepted block must stamp last_block",
+    );
+    assert_eq!(stamps().1, 0, "the block must not stamp last_transaction");
+
+    send(&mut stream, bitcoin::p2p::message::NetworkMessage::Tx(good_tx));
+    poll_until(
+        || stamps().1 > 0,
+        test_timeout(20),
+        "an accepted transaction must stamp last_transaction",
+    );
+}
+
+/// Core sizes `semOutbound` at `min(m_max_automatic_outbound,
+/// m_max_automatic_connections)` and takes a grant for every automatic
+/// outbound connection, so the *total* is bounded even for the types Core
+/// leaves individually uncapped — addr-fetch and feeler. satd checked only
+/// the per-type limits, and those two types returned `Ok` unconditionally,
+/// so `addconnection` could open them until the process ran out of sockets.
+#[test]
+fn addconnection_stops_at_the_total_outbound_capacity() {
+    use addconn_listener::Inbound;
+
+    // `-maxconnections` floors the automatic-outbound figure, so three
+    // listeners are enough to fill it.
+    let node = TestNode::start(&["-maxconnections=3"]);
+
+    let open_addrfetch = |peer: &Inbound| {
+        node.rpc_call_with_params(
+            "addconnection",
+            vec![
+                serde_json::json!(peer.addr.to_string()),
+                serde_json::json!("addr-fetch"),
+                serde_json::json!(false),
+            ],
+        )
+        .unwrap()
+    };
+
+    let peers: Vec<Inbound> = (0..3).map(|_| Inbound::bind()).collect();
+    let mut streams = Vec::new();
+    for peer in &peers {
+        let out = open_addrfetch(peer);
+        assert!(out["error"].is_null(), "within capacity: {out}");
+        let (mut stream, _) = peer.accept_version(test_timeout(20));
+        peer.complete_handshake(&mut stream);
+        streams.push(stream);
+    }
+    let count_outbound = || -> usize {
+        node.rpc_call("getpeerinfo")
+            .map(|i| {
+                i["result"]
+                    .as_array()
+                    .map(|ps| {
+                        ps.iter()
+                            .filter(|p| p["inbound"] == serde_json::json!(false))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
+    poll_until(
+        || count_outbound() == 3,
+        test_timeout(20),
+        "all three addr-fetch peers must be connected",
+    );
+
+    let spare = Inbound::bind();
+    let out = open_addrfetch(&spare);
+    assert!(
+        !out["error"].is_null(),
+        "the fourth automatic outbound must be refused: {out}"
+    );
+    assert_eq!(
+        out["error"]["message"],
+        serde_json::json!("Error: Already at capacity for specified connection type."),
+        "Core's message, verbatim: {out}"
+    );
+
+    // A manual connection is exempt — Core gives `-addnode` its own
+    // semaphore (`semAddnode`) rather than an automatic-outbound slot.
+    let manual = Inbound::bind();
+    let out = node
+        .rpc_call_with_params(
+            "addnode",
+            vec![
+                serde_json::json!(manual.addr.to_string()),
+                serde_json::json!("onetry"),
+            ],
+        )
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "a manual connection does not consume an automatic slot: {out}"
+    );
+    drop(streams);
+}
+
 /// A feeler asks one question -- is anything still listening? -- and the
 /// peer's `version` answers it. Core closes the connection right there,
 /// without a verack, so the peer never becomes a usable connection.

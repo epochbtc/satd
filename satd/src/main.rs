@@ -1825,6 +1825,7 @@ async fn main() {
     peer_manager.set_connect_timeout_ms(config.timeout);
     // Per-connection SOCKS credential randomization (Tor stream isolation).
     peer_manager.set_proxy_randomize(config.proxyrandomize);
+    peer_manager.set_dns_enabled(config.dns);
 
     // -blocksonly: suppress P2P transaction relay.
     peer_manager.set_blocksonly(config.blocksonly);
@@ -3332,7 +3333,7 @@ async fn main() {
     // `-seednode` already does here via `resolve_operator_seeds`.
     let default_peer_port = node::net::peer::default_p2p_port(config.network);
     for addr_str in &config.connect {
-        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_peer_port) {
+        match peer_manager.resolve_peer_target(addr_str, default_peer_port).await {
             Ok(addr) => {
                 peer_manager.add_peer_addr(addr.clone());
                 let pm = peer_manager.clone();
@@ -3355,7 +3356,7 @@ async fn main() {
     // and `getaddednodeinfo` reports that list. Adding the address without
     // recording the entry dials the peer but leaves it invisible to the RPC.
     for addr_str in &config.addnode {
-        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_peer_port) {
+        match peer_manager.resolve_peer_target(addr_str, default_peer_port).await {
             Ok(addr) => {
                 peer_manager.addnode_add(addr_str, addr.clone());
                 let pm = peer_manager.clone();

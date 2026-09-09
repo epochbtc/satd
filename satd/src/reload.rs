@@ -113,25 +113,34 @@ fn dial_added_peers(
     label: &'static str,
 ) {
     let default_port = node::net::peer::default_p2p_port(network);
-    for addr_str in new {
-        if old.iter().any(|o| o == addr_str) {
-            continue;
-        }
-        match node::net::peer::PeerAddr::parse_with_default_port(addr_str, default_port) {
-            Ok(addr) => {
-                pm.add_peer_addr(addr.clone());
-                let pm = pm.clone();
-                tokio::spawn(async move {
+    let added: Vec<String> = new
+        .iter()
+        .filter(|a| !old.iter().any(|o| o == *a))
+        .cloned()
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    // Resolution is async now (it must not block a runtime worker on a
+    // resolver, and it consults `-proxy`/`-dns`), so it moves into the
+    // spawned task alongside the dial — the same shape `dial_added_seednodes`
+    // already uses.
+    let pm = pm.clone();
+    tokio::spawn(async move {
+        for addr_str in added {
+            match pm.resolve_peer_target(&addr_str, default_port).await {
+                Ok(addr) => {
+                    pm.add_peer_addr(addr.clone());
                     if let Err(e) = pm.connect_peer_addr(&addr).await {
                         tracing::warn!(addr = %addr, "{label} reload connect failed: {e}");
                     }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(addr = addr_str, "invalid {label} address on reload: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %addr_str, "invalid {label} address on reload: {e}");
+                }
             }
         }
-    }
+    });
 }
 
 /// `-seednode` reload: resolve + dial the entries added since the last config.
