@@ -5,6 +5,11 @@ use bitcoin::{BlockHash, Transaction};
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 
+/// Confirmations a coinbase output needs before it can be spent (Core's
+/// `COINBASE_MATURITY`). Duplicated from `chain::connect`, which keeps it
+/// private to the consensus path.
+const COINBASE_MATURITY: u32 = 100;
+
 /// Maximum block weight (4 million weight units).
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 /// Reserve weight for coinbase transaction. Matches Bitcoin Core v30's
@@ -81,9 +86,43 @@ pub struct BlockTemplate {
 /// If the chain is moving faster than the node can assemble, fall back to a
 /// coinbase-only template -- less profitable for one poll, but a template with
 /// no transactions has no cross-chain inconsistency available to it.
+/// The `-blockmintxfee` floor, in sat/kvB. A package whose feerate is below it
+/// is left out of the template.
+///
+/// Restart-only (`satd/src/reload.rs`), so a process-wide value set once at
+/// startup is a faithful model of the option and keeps it out of eight mining
+/// function signatures. `create_template_with_floor` takes it explicitly for
+/// tests, which must not depend on — or disturb — process state.
+static BLOCK_MIN_TX_FEE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_BLOCK_MIN_TX_FEE);
+
+/// satd's default `-blockmintxfee`, in sat/kvB. Equal to the default
+/// `-minrelaytxfee`, so by default nothing that reached the mempool is
+/// excluded from a template for its feerate alone.
+pub const DEFAULT_BLOCK_MIN_TX_FEE: u64 = 1_000;
+
+/// Record the configured `-blockmintxfee`. Called once during startup.
+pub fn set_block_min_tx_fee(rate: u64) {
+    BLOCK_MIN_TX_FEE.store(rate, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The configured `-blockmintxfee`.
+pub fn block_min_tx_fee() -> u64 {
+    BLOCK_MIN_TX_FEE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemplate {
-    if let Some(template) =
-        chain_state.coherent_read(|| assemble_template(chain_state, mempool, true))
+    create_template_with_floor(chain_state, mempool, block_min_tx_fee())
+}
+
+/// [`create_template`] with an explicit `-blockmintxfee` floor.
+pub fn create_template_with_floor(
+    chain_state: &ChainState,
+    mempool: &Mempool,
+    block_min_tx_fee: u64,
+) -> BlockTemplate {
+    if let Some(template) = chain_state
+        .coherent_read(|| assemble_template(chain_state, mempool, true, block_min_tx_fee))
     {
         return template;
     }
@@ -92,7 +131,7 @@ pub fn create_template(chain_state: &ChainState, mempool: &Mempool) -> BlockTemp
         "chain advanced during every template assembly attempt; \
          emitting a coinbase-only template rather than one assembled across two chains"
     );
-    assemble_template(chain_state, mempool, false)
+    assemble_template(chain_state, mempool, false, block_min_tx_fee)
 }
 
 /// One assembly pass. `include_mempool` false yields a coinbase-only template.
@@ -100,6 +139,7 @@ fn assemble_template(
     chain_state: &ChainState,
     mempool: &Mempool,
     include_mempool: bool,
+    block_min_tx_fee: u64,
 ) -> BlockTemplate {
     let tip_hash = chain_state.tip_hash();
     let tip_entry = chain_state.get_block_index(&tip_hash).unwrap();
@@ -128,8 +168,10 @@ fn assemble_template(
         eff_b.cmp(&eff_a)
     });
 
-    // Effective fee per txid, built before the selection loop consumes
-    // `entries`. Only the zero-fee package check below reads it.
+    // Effective fee and weight per txid, built before the selection loop
+    // consumes `entries`. Only the `-blockmintxfee` check below reads them.
+    let weight_by_txid: std::collections::HashMap<bitcoin::Txid, u64> =
+        entries.iter().map(|(txid, e)| (*txid, e.weight as u64)).collect();
     let effective_fee_by_txid: std::collections::HashMap<bitcoin::Txid, u64> = entries
         .iter()
         .map(|(txid, e)| {
@@ -193,6 +235,20 @@ fn assemble_template(
                 let prev_height = if included.contains(&parent) {
                     height
                 } else if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                    // Coinbase maturity, re-checked here for the same reason
+                    // BIP 68 is: admission judged this spend against the tip it
+                    // saw, and a reorg can leave a transaction in the mempool
+                    // spending a coinbase that is no longer mature at the
+                    // height being built. `remove_for_reorg` makes that rare,
+                    // but a spend accepted between the reorg and the sweep is
+                    // not covered by it, and `connect_block` answers
+                    // `bad-txns-premature-spend-of-coinbase` for the whole
+                    // block. Core checks it in the assembler for the same
+                    // reason.
+                    if coin.coinbase && height - coin.height < COINBASE_MATURITY {
+                        minable = false;
+                        break;
+                    }
                     coin.height
                 } else if in_mempool.contains(&parent) {
                     awaits_parent = true;
@@ -224,20 +280,29 @@ fn assemble_template(
             if total_weight + entry.weight > MAX_BLOCK_WEIGHT {
                 continue; // weight only grows; this can never fit later
             }
-            // A transaction whose own effective fee is zero — a negative
-            // `prioritisetransaction` delta, or a genuinely free tx — is
-            // worth mining only when something spending it pays.
+            // `-blockmintxfee`: Core's `addPackageTxs` compares
+            // `chunk_feerate_vsize` against `blockMinFeeRate`
+            // (`src/node/miner.cpp`) and skips the chunk when it falls short.
             //
-            // Core makes this call on the *chunk* (package) feerate, never
-            // the individual one: `src/node/miner.cpp` compares
-            // `chunk_feerate_vsize` against `blockMinFeeRate`, so a zero-fee
-            // parent rides in on its child's fee (CPFP) and only a package
-            // paying nothing is skipped. Judging it per-transaction dropped
-            // the parent here and then stranded the paying child, which
-            // defers forever behind a parent that is never included — so
-            // CPFP lost *both* transactions rather than mining both.
+            // The comparison is on the *chunk* (package) feerate, never the
+            // individual one, so a zero-fee parent rides in on its child's fee
+            // (CPFP) and only a package paying nothing is skipped. Judging it
+            // per-transaction dropped the parent here and then stranded the
+            // paying child, which defers forever behind a parent that is never
+            // included — so CPFP lost *both* transactions rather than mining
+            // both. At the default floor this subsumes the "a zero-fee
+            // transaction needs a paying descendant" rule it replaces, since a
+            // zero feerate is below any non-zero floor.
             let effective_fee = (entry.fee as i64).saturating_add(entry.fee_delta).max(0) as u64;
-            if effective_fee == 0 && !package_pays(mempool, &effective_fee_by_txid, &txid) {
+            if !meets_block_min_fee(
+                mempool,
+                &effective_fee_by_txid,
+                &weight_by_txid,
+                &txid,
+                effective_fee,
+                entry.weight as u64,
+                block_min_tx_fee,
+            ) {
                 continue;
             }
             total_weight += entry.weight;
@@ -377,16 +442,39 @@ pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
 /// transaction with no paying descendant. Only consulted when the
 /// transaction's own effective fee is zero, so the mempool read costs
 /// nothing on the common path.
-fn package_pays(
+/// Whether a transaction clears the `-blockmintxfee` floor, on its own or as
+/// part of the package a miner would take it in.
+///
+/// Core reads the floor off the chunk the cluster linearisation hands the block
+/// builder. satd has no cluster machinery, so the package here is the
+/// transaction plus its in-mempool descendants — the CPFP shape the floor
+/// exists to accommodate. A transaction that clears the floor by itself is
+/// never dragged below it by a cheap descendant, which is what makes this
+/// equivalent to Core's chunk for the shapes the floor can decide.
+fn meets_block_min_fee(
     mempool: &Mempool,
     effective_fee_by_txid: &std::collections::HashMap<bitcoin::Txid, u64>,
+    weight_by_txid: &std::collections::HashMap<bitcoin::Txid, u64>,
     txid: &bitcoin::Txid,
+    effective_fee: u64,
+    weight: u64,
+    block_min_tx_fee: u64,
 ) -> bool {
-    mempool
-        .get_descendants(txid)
-        .into_iter()
-        .flatten()
-        .any(|d| effective_fee_by_txid.get(&d).is_some_and(|&f| f > 0))
+    if block_min_tx_fee == 0 {
+        return true;
+    }
+    if crate::mempool::policy::fee_rate_sat_per_kvb(effective_fee, weight) >= block_min_tx_fee {
+        return true;
+    }
+    let mut package_fee = effective_fee;
+    let mut package_weight = weight;
+    for d in mempool.get_descendants(txid).into_iter().flatten() {
+        package_fee =
+            package_fee.saturating_add(effective_fee_by_txid.get(&d).copied().unwrap_or(0));
+        package_weight =
+            package_weight.saturating_add(weight_by_txid.get(&d).copied().unwrap_or(0));
+    }
+    crate::mempool::policy::fee_rate_sat_per_kvb(package_fee, package_weight) >= block_min_tx_fee
 }
 
 #[cfg(test)]
@@ -470,8 +558,8 @@ mod tests {
         let tx = tx_spending(confirmed_prev(0xA1), 50_000, 0x31, 0xffff_ffff, 0);
         mp.insert_tx_weighted_for_test(tx, 100, 400, QuarantineScope::acting());
 
-        let full = assemble_template(&cs, &mp, true);
-        let fallback = assemble_template(&cs, &mp, false);
+        let full = assemble_template(&cs, &mp, true, DEFAULT_BLOCK_MIN_TX_FEE);
+        let fallback = assemble_template(&cs, &mp, false, DEFAULT_BLOCK_MIN_TX_FEE);
 
         // Without this the comparison below is vacuous: an empty mempool makes
         // both templates transaction-free and the fallback proves nothing.
@@ -902,6 +990,122 @@ mod tests {
             !mined.contains(&template_only),
             "on-template tx is excluded even at a far higher fee rate"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A coinbase spend that admission judged mature can stop being mature
+    /// under the template's height after a reorg. `connect_block` answers
+    /// `bad-txns-premature-spend-of-coinbase` for the *whole block*, so one
+    /// such transaction costs the miner every fee in the template.
+    #[test]
+    fn a_spend_of_an_immature_coinbase_is_not_selected() {
+        use crate::mempool::pool::QuarantineScope;
+        let immature = crate::storage::coinview::Coin {
+            amount: 100_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 0,
+            coinbase: true,
+        };
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD1), immature)]);
+        // The template is built at height 1, so the coinbase has 1 of the 100
+        // confirmations it needs.
+        let tx = tx_spending(confirmed_prev(0xD1), 50_000, 0x51, 0xffff_ffff, 0);
+        let txid = mp.insert_tx_weighted_for_test(tx, 50_000, 400, QuarantineScope::acting());
+
+        let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
+        assert!(
+            !template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            "a spend of an immature coinbase reached the template"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control for the test above: the same coin at the same height,
+    /// differing only in the coinbase flag, *is* selected. Without it the
+    /// exclusion above would also pass if the fixture never reached selection
+    /// at all.
+    #[test]
+    fn a_spend_of_an_ordinary_output_at_the_same_height_is_selected() {
+        use crate::mempool::pool::QuarantineScope;
+        let ordinary = crate::storage::coinview::Coin {
+            amount: 100_000,
+            script_pubkey: bitcoin::ScriptBuf::new(),
+            height: 0,
+            coinbase: false,
+        };
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD2), ordinary)]);
+        let tx = tx_spending(confirmed_prev(0xD2), 50_000, 0x52, 0xffff_ffff, 0);
+        let txid = mp.insert_tx_weighted_for_test(tx, 50_000, 400, QuarantineScope::acting());
+
+        let template = create_template_with_floor(&cs, &mp, DEFAULT_BLOCK_MIN_TX_FEE);
+        assert!(
+            template.transactions.iter().any(|t| t.tx.compute_txid() == txid),
+            "an ordinary confirmed spend was not selected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-blockmintxfee` is a template floor, not a relay floor: a transaction
+    /// the mempool accepted is left out when it pays less than the floor.
+    #[test]
+    fn blockmintxfee_excludes_a_transaction_below_the_floor() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[
+            (confirmed_prev(0xD3), coin_at(0)),
+            (confirmed_prev(0xD4), coin_at(0)),
+        ]);
+        // 400 weight is 100 vbytes: 500 sats is 5000 sat/kvB, 100 is 1000.
+        let below = tx_spending(confirmed_prev(0xD3), 50_000, 0x53, 0xffff_ffff, 0);
+        let below_txid = mp.insert_tx_weighted_for_test(below, 100, 400, QuarantineScope::acting());
+        let at = tx_spending(confirmed_prev(0xD4), 50_000, 0x54, 0xffff_ffff, 0);
+        let at_txid = mp.insert_tx_weighted_for_test(at, 500, 400, QuarantineScope::acting());
+
+        let template = create_template_with_floor(&cs, &mp, 5_000);
+        let mined: std::collections::HashSet<_> =
+            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        assert!(!mined.contains(&below_txid), "a transaction under the floor was mined");
+        assert!(mined.contains(&at_txid), "a transaction at the floor was not mined");
+
+        // With the floor off, both are mined — the exclusion above is the
+        // floor and not some other selection rule.
+        let template = create_template_with_floor(&cs, &mp, 0);
+        let mined: std::collections::HashSet<_> =
+            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        assert!(mined.contains(&below_txid) && mined.contains(&at_txid));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core applies the floor to the *chunk*, so a parent below it rides in on
+    /// a child that lifts the package above it. Applying it per-transaction
+    /// would drop the parent and strand the paying child — losing both.
+    #[test]
+    fn blockmintxfee_is_judged_on_the_package_not_the_transaction() {
+        use crate::mempool::pool::QuarantineScope;
+        let (cs, mp, dir) = make_funded_template_env(&[(confirmed_prev(0xD5), coin_at(0))]);
+
+        // Parent pays nothing; child pays 10_000 sats over 400 weight.
+        let parent = tx_spending(confirmed_prev(0xD5), 50_000, 0x55, 0xffff_ffff, 0);
+        let parent_txid = parent.compute_txid();
+        mp.insert_tx_weighted_for_test(parent, 0, 400, QuarantineScope::acting());
+        let child = tx_spending(
+            bitcoin::OutPoint { txid: parent_txid, vout: 0 },
+            40_000,
+            0x56,
+            0xffff_ffff,
+            0,
+        );
+        let child_txid =
+            mp.insert_tx_weighted_for_test(child, 10_000, 400, QuarantineScope::acting());
+
+        // The package is 10_000 sats over 200 vbytes = 50_000 sat/kvB; the
+        // parent alone is 0.
+        let template = create_template_with_floor(&cs, &mp, 5_000);
+        let mined: std::collections::HashSet<_> =
+            template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+        assert!(mined.contains(&parent_txid), "the zero-fee parent was dropped");
+        assert!(mined.contains(&child_txid), "the paying child was stranded");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

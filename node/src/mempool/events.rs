@@ -194,8 +194,20 @@ mod tests {
             (EvictReason::FullPool, "full_pool"),
             (EvictReason::Expiry, "expiry"),
             (EvictReason::BlockConflict, "block_conflict"),
+            (EvictReason::Policy, "policy"),
             (EvictReason::Reorg, "reorg"),
         ] {
+            // Exhaustiveness: adding a variant without adding it above — and
+            // to `docs/api/streaming.md` and the Operator Manual, which
+            // publish this list — is a compile error rather than a silently
+            // undocumented wire string.
+            match reason {
+                EvictReason::FullPool
+                | EvictReason::Expiry
+                | EvictReason::BlockConflict
+                | EvictReason::Policy
+                | EvictReason::Reorg => {}
+            }
             let ev = MempoolEvent::LeaveEvicted { txid: tx(3), reason };
             let j = serde_json::to_value(&ev).unwrap();
             assert_eq!(j["kind"], "leave_evicted");

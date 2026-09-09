@@ -75,6 +75,28 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** dust thresholds are Bitcoin Core's. satd charged 68 vbytes to
+  spend a witness output where Core charges 67, 107 for P2SH where Core charges
+  148, and truncated a fee Core rounds up — so P2WPKH was 297 against Core's
+  294, P2TR 333 against 330, and P2SH 417 against 540 (#661).
+- **Breaking:** one dust output is standard, as Core's
+  `MAX_DUST_OUTPUTS_PER_TX` allows, and a dusty transaction that pays any fee
+  — base or `prioritisetransaction` delta — is refused
+  `dust, tx with dust output must be 0-fee` on the single-transaction path as
+  well as in `submitpackage` (#661).
+- `-dustrelayfee` reaches every dust decision. `prioritisetransaction`, the
+  package path and the stranded-parent unwind read the built-in rate instead of
+  the configured one, so `-dustrelayfee=0` did not switch dust policy off
+  (#661).
+- The block template refuses a spend of an immature coinbase. A reorg can
+  leave one in the mempool, and `connect_block` rejects the whole block for it
+  (#670).
+- `-blockmintxfee` is applied. It was parsed and then read nowhere, so the
+  template floor did not exist; it is judged on the package feerate, as Core's
+  `addPackageTxs` does, so a zero-fee parent still rides in on its child (#661).
+- `reorg` is documented as a mempool eviction reason. The node has emitted it
+  on every carrier since the reorg sweep landed, but the wire spec and the
+  Operator Manual listed only some of the reasons (#670).
 - The ephemeral dust rule is enforced on the single-transaction path, as Core
   does: a transaction that spends a resident dust parent without sweeping its
   dust is refused `missing-ephemeral-spends` instead of accepted (#703).

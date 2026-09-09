@@ -85,7 +85,7 @@ tagged by a `kind` field:
 *   `enter`: a transaction was admitted to the mempool.
 *   `leave_confirmed`: it was confirmed in a block.
 *   `leave_evicted`: it was dropped, with an explicit `reason`
-    (`full_pool` | `expiry`).
+    (`full_pool` | `expiry` | `block_conflict` | `policy` | `reorg`).
 *   `leave_replaced`: it was RBF-replaced, carrying the `replacing_txid`.
 
 Bitcoin Core requires polling `getrawmempool` or rebuilding this state from

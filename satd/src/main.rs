@@ -1210,6 +1210,11 @@ async fn main() {
     // Initialize mempool with policy from config
     // Built via the shared `reload::mempool_config_from` so startup and SIGHUP
     // reload use one mapping and cannot drift.
+    // `-blockmintxfee` is restart-only, so the block assembler reads it from a
+    // value recorded once here rather than carrying it through every mining
+    // entry point.
+    node::mining::template::set_block_min_tx_fee(config.blockmintxfee);
+
     let mempool = Arc::new(Mempool::with_config(reload::mempool_config_from(&config)));
 
     // Transaction-filtering policy ruleset (opt-in via `policyfile`). Compiled
