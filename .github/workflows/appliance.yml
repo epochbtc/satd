@@ -1,19 +1,28 @@
 # Appliance CI — the reference stack and the downloadable VM image.
 #
-# Three things are gated here, in increasing cost:
+# Three things are gated here, in increasing cost. Only the first runs on an
+# ordinary pull request:
 #
-#   1. The certificate script and the container healthcheck probe. Seconds,
-#      no docker, run on any PR that touches them. Both are small pieces of
-#      shell that everything else depends on being right.
+#   1. The static checks: the certificate script, the container healthcheck
+#      probe, and the compose/appliance invariants. Seconds, no docker, no
+#      network. Runs on any PR that touches them.
 #   2. The reference stack (contrib/stack): brought up on regtest, with every
 #      TLS listener probed from outside the container against the CA the
 #      stack generated, plus LND syncing to the node over Neutrino and RTL
 #      served through the proxy. This is where a claim like "Sparrow can talk
-#      to this" is actually checked.
+#      to this" is actually checked. ~20 minutes.
 #   3. The appliance image: built with mmdebstrap, booted under QEMU, and
 #      inspected through the guest agent. This is the "the image is not
 #      broken" gate, and it boots the artifact itself rather than a
-#      test-only variant.
+#      test-only variant. ~20 minutes.
+#
+# 2 and 3 each compile satd from scratch, so together they cost around forty
+# minutes of runner time. They run on `v*` tags — the same trigger the release
+# workflow uses — and on workflow_dispatch, not on every pull request.
+#
+# To run them on a PR that actually changes this surface, add the
+# `appliance-ci` label. `labeled` is in the trigger list below, so applying it
+# starts the run; no push is needed.
 #
 # Everything runs on GitHub-hosted runners. satd is public, and a
 # `pull_request` job on a self-hosted runner would let a fork PR execute
@@ -26,7 +35,9 @@ name: Appliance
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    # `labeled` so that adding `appliance-ci` to an open PR starts the heavy
+    # jobs without needing a fresh push.
+    types: [opened, synchronize, reopened, labeled]
   push:
     tags:
       - 'v*'
@@ -122,7 +133,10 @@ jobs:
   stack:
     name: reference stack (regtest, TLS probed)
     needs: changes
-    if: needs.changes.outputs.stack == 'true'
+    # Release trigger, dispatch, or an explicitly labelled PR. Roughly twenty
+    # minutes of runner time, most of it compiling satd, which is not worth
+    # spending on every push to every branch.
+    if: needs.changes.outputs.stack == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'appliance-ci'))
     runs-on: ubuntu-24.04
     # Building the runtime image compiles satd from scratch on a cold cache,
     # and two stack bring-ups follow it.
@@ -183,7 +197,8 @@ jobs:
   image:
     name: build and boot the appliance image
     needs: changes
-    if: needs.changes.outputs.appliance == 'true'
+    # Same gate as `stack`: tags, dispatch, or the `appliance-ci` label.
+    if: needs.changes.outputs.appliance == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'appliance-ci'))
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
