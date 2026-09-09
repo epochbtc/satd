@@ -14784,11 +14784,37 @@ mod addconn_listener {
 
         /// Accept the dial satd makes and read messages until its `version`
         /// arrives. Returns the stream (mid-handshake) and that version.
+        ///
+        /// The accept is bounded, not blocking. `TcpListener::accept` has no
+        /// timeout, so a satd that never dials — because the dial failed, or
+        /// resolved to an address this listener is not on — hung the test
+        /// until CI's own hour-long job timeout killed it, with no indication
+        /// of which test was stuck. Polling turns that into a named failure
+        /// within `timeout`.
         pub fn accept_version(&self, timeout: Duration) -> (TcpStream, VersionMessage) {
+            let accept_deadline = Instant::now() + timeout;
+            self.listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
+            let mut stream = loop {
+                match self.listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < accept_deadline,
+                            "satd never dialled us within {timeout:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
             self.listener
                 .set_nonblocking(false)
                 .expect("blocking listener");
-            let (mut stream, _) = self.listener.accept().expect("satd never dialled us");
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted stream");
             stream.set_read_timeout(Some(timeout)).unwrap();
             stream.set_write_timeout(Some(timeout)).unwrap();
             stream.set_nodelay(true).unwrap();
@@ -15112,6 +15138,14 @@ fn addconnection_returns_without_waiting_for_the_dial() {
 /// Core hands the address string to `OpenNetworkConnection`, which resolves
 /// it — `feature_anchors.py` passes an `.onion`. satd parsed a bare
 /// `SocketAddr` and rejected everything else, including `localhost:<port>`.
+///
+/// The assertion is that the *argument* is accepted, not that a peer appears:
+/// `localhost` resolves to `::1` on some hosts and `127.0.0.1` on others, and
+/// satd — like Core — dials one resolved address, so waiting for a connection
+/// here would depend on which family the runner prefers. (It hung CI for an
+/// hour when it did.) The dial itself is covered by
+/// `addconnection_returns_without_waiting_for_the_dial`, and the resolver's
+/// own behaviour by the `net::dns` unit tests.
 #[test]
 fn addconnection_accepts_a_hostname() {
     use addconn_listener::Inbound;
@@ -15127,22 +15161,32 @@ fn addconnection_accepts_a_hostname() {
             vec![json!(by_name), json!("outbound-full-relay"), json!(false)],
         )
         .unwrap();
-    assert!(out["error"].is_null(), "a hostname must resolve: {out}");
+    assert!(
+        out["error"].is_null(),
+        "a hostname must be resolved, not rejected: {out}"
+    );
+    assert_eq!(out["result"]["address"], json!(by_name), "{out}");
 
-    let (mut stream, _) = peer.accept_version(test_timeout(20));
-    peer.complete_handshake(&mut stream);
-    poll_until(
-        || {
-            node.rpc_call("getpeerinfo")
-                .ok()
-                .and_then(|i| i["result"].as_array().map(|a| !a.is_empty()))
-                .unwrap_or(false)
-        },
-        test_timeout(20),
-        "the peer dialled by name must connect",
+    // A name that cannot resolve is still an error, so the acceptance above
+    // is resolution rather than a parse that stopped checking.
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!("no-such-host.invalid:8333"),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        out["error"]["code"].as_i64(),
+        Some(-8),
+        "an unresolvable name is refused: {out}"
     );
 
-    // An address that needs no lookup at all is unaffected.
+    // An address that needs no lookup at all is unaffected, and this one is
+    // dialled for real.
     let peer2 = Inbound::bind();
     let out = node
         .rpc_call_with_params(
@@ -15155,6 +15199,18 @@ fn addconnection_accepts_a_hostname() {
         )
         .unwrap();
     assert!(out["error"].is_null(), "{out}");
+    let (mut stream, _) = peer2.accept_version(test_timeout(20));
+    peer2.complete_handshake(&mut stream);
+    poll_until(
+        || {
+            node.rpc_call("getpeerinfo")
+                .ok()
+                .and_then(|i| i["result"].as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false)
+        },
+        test_timeout(20),
+        "the peer dialled by literal address must connect",
+    );
     drop(stream);
 }
 
