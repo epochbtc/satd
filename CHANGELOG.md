@@ -75,6 +75,25 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** mempool reject reasons match Bitcoin Core's. A script failure
+  is `mempool-script-verify-flag-failed` on the relay path and
+  `block-script-verify-flag-failed` in `connect_block`, not
+  `mandatory-script-verify-flag-failed` for both; a failed feerate-diagram
+  check is `replacement-failed`; and `min relay fee not met` carries Core's
+  `"<fee> < <required>"` detail in satoshis (#671, #660).
+- RBF Rule 5 counts distinct mempool *clusters*, as Core does, instead of
+  counting the conflicts — a replacement conflicting with a hundred children
+  of one parent affects one cluster and is no longer refused (#660).
+- The relay floor reads the modified fee on both `sendrawtransaction` and
+  `testmempoolaccept`, so the two agree about a prioritised transaction, and
+  mempool eviction sorts on the modified feerate — a `prioritisetransaction`
+  delta could not save a transaction from eviction (#660).
+- `getprioritisedtransactions` reported `in_mempool: false` for every
+  prioritised transaction that was in the mempool (#660).
+- The RBF descendant walk is bounded by the cluster limit, and
+  `-minrelaytxfee` / `-dustrelayfee` / `-incrementalrelayfee` refuse a value
+  outside Core's money range instead of overflowing the incremental-fee
+  multiplication (#660).
 - `getchaintips` no longer walks the whole block index on every call. The leaf
   set is maintained incrementally, the status of a stored-but-unvalidated
   branch is `valid-headers` rather than `valid-fork`, and the order is
