@@ -348,7 +348,7 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `blockmaxweight` | 4000000 | restart | core | Maximum block weight for templates. |
-| `blockmintxfee` | 1000 sat/kvB | restart | core | Minimum tx fee for the block template. |
+| `blockmintxfee` | 1 sat/kvB | restart | core | Minimum fee rate for a transaction (judged with its package) to enter the block template. A bare integer is sat/kvB; a decimal is BTC/kvB, Bitcoin Core's spelling (`0.00001` = 1000 sat/kvB). |
 | `par` | unset | restart | core | Script-verification threads (Core name). When `shadowworkers` is unset, a positive value sets the shadow-verification worker count. It does not size the connect path. |
 
 ## Events
