@@ -742,6 +742,13 @@ jobs:
       # The suite is I/O-light and short; 4 jobs keeps it under a minute
       # without crowding a 4-vCPU hosted runner.
       SATD_CF_JOBS: 4
+      # Four jobs on four vCPUs is real contention, and the framework's waits
+      # are wall-clock. Scaling them changes no assertion -- a node that never
+      # syncs still fails the test -- it just stops a loaded runner reporting a
+      # node that was going to be fine. `feature_bip68_sequence.py` is the one
+      # that needs it: ~575 blocks mined, then a 60s wait for two nodes to
+      # agree.
+      SATD_CF_TIMEOUT_FACTOR: 4
 
     steps:
       - name: Checkout

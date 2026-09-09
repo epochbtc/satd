@@ -50,6 +50,7 @@ jobs:
         run: |
           contrib/core-functional/tests/test_check_inventory.sh
           contrib/core-functional/tests/test_check_results.sh
+          contrib/core-functional/tests/test_shim_bitcoind.sh
 
       - name: Named-parameter table matches the pinned Core
         run: |
@@ -110,6 +111,13 @@ jobs:
       # remove them even when a test fails or the job times out.
       SATD_CF_TMPDIR: ${{ github.workspace }}/.core-functional-tmp
       SATD_CF_JOBS: 4
+      # Four jobs on four vCPUs is real contention, and the framework's waits
+      # are wall-clock. Scaling them changes no assertion -- a node that never
+      # syncs still fails the test -- it just stops a loaded runner reporting a
+      # node that was going to be fine. `feature_bip68_sequence.py` is the one
+      # that needs it: ~575 blocks mined, then a 60s wait for two nodes to
+      # agree.
+      SATD_CF_TIMEOUT_FACTOR: 4
       RUST_TOOLCHAIN: '1.93.0'
     steps:
       - uses: actions/checkout@v7

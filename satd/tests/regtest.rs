@@ -4040,9 +4040,7 @@ fn test_reorg_record_reflects_completed_state() {
     // Submit B chain to node A. Node A should reorg once B has more
     // work than A (after the 3rd B block is submitted — B=3 > A=2).
     for hex in &b_hex {
-        let _ = node_a
-            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
-            .unwrap();
+        node_a.rpc_ok("submitblock", vec![serde_json::json!(hex)]);
     }
 
     // Node A's tip should now be the last B block.
@@ -4215,9 +4213,7 @@ fn test_reorg_record_not_written_when_final_block_fails() {
     // perform_reorg succeeds, B1+B2 reconnect, then connect_block for
     // B3 must fail on the bad coinbase.
     for hex in &b_hex {
-        let _ = node_a
-            .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
-            .unwrap();
+        node_a.rpc_ok("submitblock", vec![serde_json::json!(hex)]);
     }
 
     // With the final connect failing, atomic rollback (M4 round 2)
@@ -5160,12 +5156,7 @@ fn test_address_index_rpc_getaddressbalance() {
 
     // Mine 101 blocks so the first coinbase is matured + spendable
     // visibility doesn't matter — we just want a confirmed balance.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(101), serde_json::json!(addr)]);
 
     let resp = node
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
@@ -5190,12 +5181,7 @@ fn test_address_index_rpc_getaddresshistory() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(5), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
 
     let resp = node
         .rpc_call_with_params("getaddresshistory", vec![serde_json::json!(addr)])
@@ -5227,12 +5213,7 @@ fn test_address_index_rpc_getaddressutxos() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
 
     let resp = node
         .rpc_call_with_params("getaddressutxos", vec![serde_json::json!(addr)])
@@ -5280,12 +5261,7 @@ fn test_address_index_scripthash_param_form() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     // Resolve scripthash by computing sha256 of the bech32-decoded spk.
     // Easier: use the bare-address form, observe history, then probe
@@ -5340,12 +5316,7 @@ fn test_address_index_mempool_quiet_when_empty() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(5), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
 
     let resp = node
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
@@ -5587,12 +5558,7 @@ fn poll_sp_backfill_state(
 fn test_sp_index_from_genesis_reports_synced() {
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(10), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(10), serde_json::json!(addr)]);
 
     let r = node.rpc_call("getsatdindexinfo").expect("rpc");
     let spi = &r["result"]["silentpayments"];
@@ -5638,12 +5604,7 @@ fn test_getsilentpaymentblockdata_rpc() {
 
     // Enabled: mine some blocks and serve the tip's row.
     let mut node = TestNode::start(&["--silentpaymentindex=1"]);
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(5), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
     let best = node.rpc_call("getbestblockhash").expect("rpc");
     let hash = best["result"].as_str().expect("blockhash").to_string();
 
@@ -5699,12 +5660,7 @@ fn test_sp_index_enable_on_existing_datadir_backfills() {
     // Phase 1: sync with the SP index OFF (the default). Connecting blocks
     // with the index disabled clears the completeness marker.
     let mut node = TestNode::start(&[]);
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(20), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
 
     // Phase 2: restart with the index ON, same datadir. The marker stays
     // false (open-time stamp only touches a never-set marker), so the
@@ -5812,12 +5768,7 @@ fn test_sp_index_backfill_pause_resume() {
     // the resume comfortably exceeds `MIN_STINT`, which is what the ETA
     // assertion below needs; the old 30-block walk finished in under a second
     // and so could never produce one.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(300), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(300), serde_json::json!(addr)]);
 
     let started = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("silentpayment")])
@@ -6491,12 +6442,7 @@ fn test_address_index_backfillindex_starts_and_completes() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a small chain so there's something to walk over.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(20), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
 
     let r = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
@@ -6530,16 +6476,9 @@ fn test_address_index_backfillindex_starts_and_completes() {
 fn test_address_index_backfill_idempotent_after_completion() {
     let mut node = TestNode::start(&[]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(15), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
     poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
 
     let r = node
@@ -6585,16 +6524,9 @@ fn test_address_index_backfill_pause_resume() {
     // process only — parent's env stays clean across parallel tests.
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(30), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
 
     // Pause within 100 ms — runner is almost certainly between batches.
     std::thread::sleep(Duration::from_millis(100));
@@ -6633,16 +6565,9 @@ fn test_address_index_backfill_pause_resume() {
 fn test_address_index_backfill_cancel_then_restart_succeeds() {
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "30")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(30), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
 
     std::thread::sleep(Duration::from_millis(100));
     let cancel_resp = node
@@ -6699,12 +6624,7 @@ fn test_address_index_backfill_resumable_after_kill() {
     // Phase 1: mine 40 blocks, graceful-stop to flush tip durably.
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(40), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
     node.stop();
 
     // Phase 2: restart with the debug delay, kick off backfill,
@@ -6719,9 +6639,7 @@ fn test_address_index_backfill_resumable_after_kill() {
         "chain tip should survive graceful stop+restart: {}",
         info
     );
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
     std::thread::sleep(Duration::from_millis(300));
     let _ = node.process.kill();
     let _ = node.process.wait();
@@ -6749,15 +6667,8 @@ fn test_address_index_backfill_persists_completed_across_restart() {
 
     let mut node = TestNode::start_with_datadir(&datadir, rpcport, &[&port_arg]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(15), serde_json::json!(addr)],
-        )
-        .expect("rpc");
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
+    node.rpc_ok("backfillindex", vec![serde_json::json!("address")]);
     poll_backfill_state(&node, &["completed"], Duration::from_secs(30));
     node.stop();
 
@@ -6803,12 +6714,7 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
 
     // ── Control: run with --addressindex=1 from the start ──
     let mut control = TestNode::start(&[]);
-    let _ = control
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(blocks), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    control.rpc_ok("generatetoaddress", vec![serde_json::json!(blocks), serde_json::json!(addr)]);
     let control_balance = control
         .rpc_call_with_params("getaddressbalance", vec![serde_json::json!(addr)])
         .expect("rpc");
@@ -6830,12 +6736,7 @@ fn test_address_index_backfill_data_parity_after_disabled_mining() {
 
     let mut subject =
         TestNode::start_with_datadir(&datadir, rpcport, &["--addressindex=0", &port_arg]);
-    let _ = subject
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(blocks), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    subject.rpc_ok("generatetoaddress", vec![serde_json::json!(blocks), serde_json::json!(addr)]);
     // Sanity: with the index disabled, lookups return an explicit
     // error (not zero/empty silently) so operators can tell the
     // difference between "no activity" and "index off".
@@ -6974,12 +6875,7 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
         TestNode::start_with_datadir(&datadir, rpcport, &["--addressindex=0", &port_arg]);
 
     // Mine 101 blocks so the first coinbase is matured (subsidy spendable).
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(101), serde_json::json!(src_str)]);
 
     // Pull block 1's coinbase txid. satd's `getblock` verbosity 1
     // returns the tx-id list; verbosity 2 (full tx detail) is not
@@ -7056,12 +6952,7 @@ fn test_address_index_backfill_spending_row_with_real_spend() {
     );
 
     // Mine one more block to confirm the spend.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(src_str)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
 
     let spend_txid = spend.compute_txid().to_string();
 
@@ -7197,12 +7088,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     // 4 batches × 1 s = ~4 s of runtime; pauseindex from the test
     // reliably lands during the first batch's sleep.
     let mut node_a = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "1000")]);
-    let _ = node_a
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr_a)],
-        )
-        .expect("rpc");
+    node_a.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr_a)]);
     let a_tip_height = node_a.rpc_call("getblockcount").expect("rpc")["result"]
         .as_u64()
         .unwrap_or(0) as u32;
@@ -7240,9 +7126,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
         .expect("rpc");
     assert_eq!(r["result"]["started"].as_bool(), Some(true));
-    let _ = node_a
-        .rpc_call_with_params("pauseindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node_a.rpc_ok("pauseindex", vec![serde_json::json!("address")]);
     // Wait for the runner to observe paused so cursor reflects Paused.
     // 15s timeout covers RPC-roundtrip variance + the 1 s/batch debug
     // delay on the slowest self-hosted CI runners.
@@ -7274,9 +7158,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
     );
 
     // Resume — next runner wake → verify_anchor_active fails → Failed.
-    let _ = node_a
-        .rpc_call_with_params("resumeindex", vec![serde_json::json!("address")])
-        .expect("rpc");
+    node_a.rpc_ok("resumeindex", vec![serde_json::json!("address")]);
 
     // Poll for Failed deterministically (no `completed` fallback now).
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -7365,12 +7247,7 @@ fn test_address_index_backfill_reorg_invalidates_to_failed() {
 fn test_address_index_backfill_duplicate_rpc_race_rejected() {
     let mut node = TestNode::start_with_env(&[], &[("SATD_BACKFILL_DEBUG_DELAY_MS", "50")]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(20), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(20), serde_json::json!(addr)]);
 
     let r1 = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("address")])
@@ -7426,12 +7303,7 @@ fn test_esplora_tip_hash_and_height_match_chain_state() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
 
     let h_resp = esplora_get(esplora_port, "/blocks/tip/height");
     assert_eq!(h_resp.status(), 200);
@@ -7463,12 +7335,7 @@ fn test_esplora_deep_page_resolves_the_right_blocks_past_the_walk_limit() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(210), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(210), serde_json::json!(addr)]);
 
     let r = esplora_get(esplora_port, "/blocks/5");
     assert_eq!(r.status(), 200);
@@ -7514,12 +7381,7 @@ fn test_esplora_blocks_recent_returns_descending_summaries() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(5), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(5), serde_json::json!(addr)]);
 
     let r = esplora_get(esplora_port, "/blocks");
     assert_eq!(r.status(), 200);
@@ -7705,12 +7567,7 @@ fn test_esplora_block_detail_populated() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -7739,12 +7596,7 @@ fn test_esplora_block_header_hex() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -7763,12 +7615,7 @@ fn test_esplora_block_raw_bytes() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -7793,12 +7640,7 @@ fn test_esplora_block_status_in_best_chain() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     let h1 = esplora_get(esplora_port, "/block-height/1")
         .text()
@@ -7831,12 +7673,7 @@ fn test_esplora_block_txids_and_paging() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -7870,12 +7707,7 @@ fn test_esplora_block_txs_pagination_past_end_returns_empty() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -7908,12 +7740,7 @@ fn test_esplora_block_mediantime_includes_target_block() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -7944,12 +7771,7 @@ fn test_esplora_blocks_recent_reports_real_size_weight() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     let r = esplora_get(esplora_port, "/blocks");
     let arr: Vec<serde_json::Value> = r.json().unwrap();
     // Inspect the most recent (non-genesis) entries — genesis is
@@ -8036,12 +7858,7 @@ fn test_esplora_tx_detail_confirmed_coinbase() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
 
     let txids: Vec<String> = {
         let tip = esplora_get(esplora_port, "/blocks/tip/hash")
@@ -8099,12 +7916,7 @@ fn test_esplora_tx_status_confirmed() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -8130,12 +7942,7 @@ fn test_esplora_tx_hex_roundtrip() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -8280,12 +8087,7 @@ fn test_esplora_refuses_legacy_txindex_incomplete_datadir() {
         &["--esplora=0", &format!("--port={}", p2p_port1)],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node1
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     node1.stop();
 
     // Phase 2: restart with default settings — esplora auto-enables
@@ -8340,12 +8142,7 @@ fn test_esplora_refuses_partial_txindex_history() {
         &["--esplora=0", &format!("--port={}", p2p_port1)],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node1
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     node1.stop();
 
     // Phase 2: enable --txindex=1 (still --esplora=0). This writes
@@ -8358,12 +8155,7 @@ fn test_esplora_refuses_partial_txindex_history() {
         rpcport2,
         &["--esplora=0", "--txindex", &format!("--port={}", p2p_port2)],
     );
-    let _ = node2
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     node2.stop();
 
     // Phase 3: default startup (esplora on). Marker is still false
@@ -8413,12 +8205,7 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
         &["--esplora=0", "--txindex", &format!("--port={}", p2p_port1)],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node1
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node1.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
     node1.stop();
 
     // Phase 2: connect ONE more block with --txindex=0. This MUST
@@ -8430,12 +8217,7 @@ fn test_esplora_refuses_after_txindex_disabled_gap() {
         rpcport2,
         &["--esplora=0", &format!("--port={}", p2p_port2)],
     );
-    let _ = node2
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node2.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     node2.stop();
 
     // Phase 3: default startup must hard-fail now.
@@ -8566,12 +8348,7 @@ fn test_esplora_block_txs_returns_full_tx_shape() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind, "--txindex"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -8640,12 +8417,7 @@ fn test_esplora_address_info_funded_chain_stats() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(3), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(3), serde_json::json!(addr)]);
 
     let r = esplora_get(esplora_port, &format!("/address/{}", addr));
     assert_eq!(r.status(), 200);
@@ -8669,12 +8441,7 @@ fn test_esplora_scripthash_endpoint_matches_address() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     let sh = esplora_scripthash_of(addr);
     let by_addr: serde_json::Value = esplora_get(esplora_port, &format!("/address/{}", addr))
@@ -8699,12 +8466,7 @@ fn test_esplora_address_utxo_lists_coinbases() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     let r = esplora_get(esplora_port, &format!("/address/{}/utxo", addr));
     assert_eq!(r.status(), 200);
@@ -8730,12 +8492,7 @@ fn test_esplora_address_txs_chain_pagination() {
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // 30 distinct coinbases → 25 on page 1, 5 on page 2, empty on page 3.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(30), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(30), serde_json::json!(addr)]);
 
     let page1: Vec<serde_json::Value> =
         esplora_get(esplora_port, &format!("/address/{}/txs/chain", addr))
@@ -8778,12 +8535,7 @@ fn test_esplora_address_txs_chain_unknown_cursor_returns_empty() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     // 32-byte zero txid is never a real tx; cursor lookup fails.
     let zero = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -8824,12 +8576,10 @@ fn test_esplora_address_chain_stats_after_spend() {
     let mut node = TestNode::start(&["--esplora=1", &bind]);
 
     // Mine 101 blocks to src so coinbase 1 is matured.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+    );
 
     // Pull block 1's coinbase txid.
     let block1_hash = node
@@ -8891,16 +8641,12 @@ fn test_esplora_address_chain_stats_after_spend() {
     witness.push(pk.to_bytes());
     spend.input[0].witness = witness;
     let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
-    let _ = node
-        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
-        .unwrap();
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
     // Mine to confirm.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(1), serde_json::json!(src_str.clone())],
+    );
 
     // src now has 100 confirmed coinbases (101 mined; matured ones
     // count as "funded" rows regardless of maturity since the index
@@ -8950,12 +8696,10 @@ fn test_esplora_address_txs_mempool_visibility() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+    );
     let block1_hash = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
         .unwrap()["result"]
@@ -9017,9 +8761,7 @@ fn test_esplora_address_txs_mempool_visibility() {
     let spend_txid = spend.compute_txid().to_string();
 
     // Submit but DO NOT mine — tx sits in mempool.
-    let _ = node
-        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
-        .unwrap();
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
 
     // dest's `/txs/mempool` must include the unconfirmed tx; `/txs/chain` must not.
     let mempool_resp: Vec<serde_json::Value> =
@@ -9121,12 +8863,10 @@ fn test_esplora_address_utxo_excludes_mempool_spent() {
     let esplora_port = find_available_port();
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+    );
 
     // Pull block 1's coinbase (the matured one we'll spend).
     let block1_hash = node
@@ -9201,9 +8941,7 @@ fn test_esplora_address_utxo_excludes_mempool_spent() {
     spend.input[0].witness = witness;
 
     let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
-    let _ = node
-        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
-        .unwrap();
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
 
     // Post-broadcast: src's `/utxo` MUST NOT list the spent outpoint
     // even though the spending tx is still in the mempool.
@@ -9257,12 +8995,10 @@ fn esplora_pr6_make_spend(node: &mut TestNode) -> (String, String, String, &'sta
     let src_str = src_addr.to_string();
     let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+    );
 
     let block1_hash = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
@@ -9323,12 +9059,7 @@ fn esplora_pr6_make_spend(node: &mut TestNode) -> (String, String, String, &'sta
 
     let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
     let spend_txid = spend.compute_txid().to_string();
-    let _ = node
-        .rpc_call_with_params(
-            "sendrawtransaction",
-            vec![serde_json::json!(raw_hex.clone())],
-        )
-        .unwrap();
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex.clone())]);
     (raw_hex, spend_txid, src_str, dest_addr, cb_value)
 }
 
@@ -9340,12 +9071,7 @@ fn test_esplora_outspend_unspent_returns_spent_false() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -9373,12 +9099,7 @@ fn test_esplora_outspend_confirmed_spend_reports_spender() {
     let (_raw_hex, spend_txid, src_str, _dest, cb_value) = esplora_pr6_make_spend(&mut node);
 
     // Mine 1 to confirm the spend.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(src_str)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
 
     // Find the cb txid for block 1 (the one being spent).
     let block1_hash = node
@@ -9441,12 +9162,7 @@ fn test_esplora_outspends_array_matches_output_count() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     // Pull tip's coinbase.
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
@@ -9474,12 +9190,7 @@ fn test_esplora_merkle_proof_single_tx_block_is_empty() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -9515,12 +9226,7 @@ fn test_esplora_merkle_proof_two_tx_block_proves_inclusion() {
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
     // Mine to confirm spend → block 102 has 2 txs (coinbase + spend).
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(src_str)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
 
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
@@ -9594,12 +9300,7 @@ fn test_esplora_merkleblock_proof_decodes_with_target_txid() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let (_raw, spend_txid, src_str, _dest, _) = esplora_pr6_make_spend(&mut node);
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(src_str)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(src_str)]);
 
     let r = esplora_get(
         esplora_port,
@@ -9651,12 +9352,7 @@ fn test_esplora_outspend_out_of_range_vout_returns_404() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
     let tip = esplora_get(esplora_port, "/blocks/tip/hash")
         .text()
         .unwrap()
@@ -9692,12 +9388,7 @@ fn test_esplora_root_returns_chain_tip_and_mempool_count() {
     let bind = format!("--esplorabind=127.0.0.1:{}", esplora_port);
     let mut node = TestNode::start(&["--esplora=1", &bind]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(2), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(2), serde_json::json!(addr)]);
 
     let r = esplora_get(esplora_port, "/");
     assert_eq!(r.status(), 200);
@@ -9764,12 +9455,10 @@ fn test_esplora_mempool_with_tx_reports_summary_txids_and_recent() {
     let src_str = src_addr.to_string();
     let dest_addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
-        )
-        .unwrap();
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![serde_json::json!(101), serde_json::json!(src_str.clone())],
+    );
     let block1_hash = node
         .rpc_call_with_params("getblockhash", vec![serde_json::json!(1)])
         .unwrap()["result"]
@@ -9828,9 +9517,7 @@ fn test_esplora_mempool_with_tx_reports_summary_txids_and_recent() {
 
     let raw_hex = hex::encode(bitcoin::consensus::serialize(&spend));
     let spend_txid = spend.compute_txid().to_string();
-    let _ = node
-        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
-        .unwrap();
+    node.rpc_ok("sendrawtransaction", vec![serde_json::json!(raw_hex)]);
 
     // /mempool: count=1, total_fee=1000.
     let body: serde_json::Value = esplora_get(esplora_port, "/mempool").json().unwrap();
@@ -9988,12 +9675,7 @@ fn test_esplora_blocks_sse_emits_on_new_block() {
 
     // Mine in a separate thread so we don't deadlock on the SSE read.
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "block");
@@ -10016,12 +9698,7 @@ fn test_esplora_address_sse_emits_status_on_touch() {
     let mut client = SseClient::connect(esplora_port, &format!("/address/{}/sse", addr));
 
     // Mine to the address so the status_hash updates.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "status");
@@ -10046,12 +9723,7 @@ fn test_esplora_scripthash_sse_emits_status_on_touch() {
     let sh = esplora_scripthash_of(addr);
     let mut client = SseClient::connect(esplora_port, &format!("/scripthash/{}/sse", sh));
 
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(1), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(1), serde_json::json!(addr)]);
 
     let (event_type, data) = client.next_event();
     assert_eq!(event_type, "status");
@@ -10318,12 +9990,7 @@ fn test_electrum_headers_subscribe_returns_tip_after_mining() {
     let mut node = TestNode::start(&["--electrum=1", &bind]);
 
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(7), serde_json::json!(addr)],
-        )
-        .unwrap();
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(7), serde_json::json!(addr)]);
 
     let v = electrum_round_trip(
         electrum_port,
@@ -10559,12 +10226,7 @@ fn test_filter_backfill_starts_and_completes() {
     let mut node = TestNode::start(&["--blockfilterindex=basic"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a small chain.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(15), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(15), serde_json::json!(addr)]);
 
     let r = node
         .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
@@ -10597,16 +10259,9 @@ fn test_filter_backfill_starts_and_completes() {
 fn test_filter_backfill_idempotent_after_completion() {
     let mut node = TestNode::start(&["--blockfilterindex=basic"]);
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(10), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(10), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["completed"], Duration::from_secs(30));
 
     let r = node
@@ -10638,16 +10293,9 @@ fn test_filter_backfill_pause_resume() {
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
     // Mine a chain long enough that 100ms/block dwarfs the test's
     // pause-observe window.
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(40), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
 
     let p = node
@@ -10690,16 +10338,9 @@ fn test_filter_backfill_cancel_drops_progress() {
         &[("SATD_FILTER_BACKFILL_DEBUG_DELAY_MS", "100")],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(40), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
 
     let r = node
@@ -10757,16 +10398,9 @@ fn test_filter_backfill_resume_after_restart() {
         &[("SATD_FILTER_BACKFILL_DEBUG_DELAY_MS", "100")],
     );
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    let _ = node
-        .rpc_call_with_params(
-            "generatetoaddress",
-            vec![serde_json::json!(40), serde_json::json!(addr)],
-        )
-        .expect("rpc");
+    node.rpc_ok("generatetoaddress", vec![serde_json::json!(40), serde_json::json!(addr)]);
 
-    let _ = node
-        .rpc_call_with_params("backfillindex", vec![serde_json::json!("blockfilter")])
-        .expect("rpc");
+    node.rpc_ok("backfillindex", vec![serde_json::json!("blockfilter")]);
     poll_filter_backfill_state(&node, &["running"], Duration::from_secs(15));
     // Capture some progress, then `kill -9`-style stop without
     // letting the backfill finish.
@@ -14537,4 +14171,388 @@ fn generatetoaddress_honours_the_maxtries_budget() {
         .unwrap();
     assert_eq!(mined["result"].as_array().map(Vec::len), Some(1), "{mined}");
     assert_eq!(height(&node), before + 1);
+}
+
+/// `generatetodescriptor` must mine the mempool, the same as
+/// `generatetoaddress`. It went through a separate code path that built its
+/// block from the template but never carried the mempool's transactions, so it
+/// could mine indefinitely without ever confirming anything -- and nothing
+/// tested it, because nothing tested `generatetodescriptor` at all.
+#[test]
+fn generatetodescriptor_confirms_mempool_transactions() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x71; 32]);
+    let addr = wallet.address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
+
+    let dest = DeterministicWallet::from_secret([0x72; 32]);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
+    let mempool = node.rpc_call("getrawmempool").unwrap();
+    assert_eq!(
+        mempool["result"].as_array().map(Vec::len),
+        Some(1),
+        "the spend did not reach the mempool: {mempool}"
+    );
+
+    // `addr(...)` is the descriptor form Core's own tests use here.
+    let mined = node.rpc_ok(
+        "generatetodescriptor",
+        vec![json!(1), json!(format!("addr({addr})"))],
+    );
+    let hash = mined.as_array().and_then(|a| a.first()).and_then(|v| v.as_str());
+    let hash = hash.unwrap_or_else(|| panic!("no block hash returned: {mined}"));
+
+    let block = node.rpc_call_with_params("getblock", vec![json!(hash), json!(1)]).unwrap();
+    let txs: Vec<&str> = block["result"]["tx"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tx list: {block}"))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        txs.contains(&txid.as_str()),
+        "generatetodescriptor mined an empty block; the mempool transaction is still unconfirmed: {txs:?}"
+    );
+    assert!(
+        node.rpc_call("getrawmempool").unwrap()["result"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "the mempool was not drained by the block"
+    );
+    node.stop();
+}
+
+/// `getchaintips` with an actual fork present. The two existing tests both run
+/// against a single-tip node, so they assert the shape of the active entry and
+/// nothing about the branch logic that #649 added: a stale branch has to be
+/// reported, with its own height, its fork length, and a status that is not
+/// `active`.
+#[test]
+fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
+    use serde_json::json;
+
+    let wallet_a = DeterministicWallet::from_secret([0x73; 32]);
+    let wallet_b = DeterministicWallet::from_secret([0x74; 32]);
+
+    // Two independent chains from the same genesis: A of 2 blocks, B of 3.
+    let mut node_a = TestNode::start(&[]);
+    let a_hashes: Vec<String> = node_a
+        .rpc_ok("generatetoaddress", vec![json!(2), json!(wallet_a.address.to_string())])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    let mut node_b = TestNode::start(&[]);
+    let b_hashes: Vec<String> = node_b
+        .rpc_ok("generatetoaddress", vec![json!(3), json!(wallet_b.address.to_string())])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let b_hex: Vec<String> = b_hashes
+        .iter()
+        .map(|h| {
+            node_b
+                .rpc_call_with_params("getblock", vec![json!(h), json!(0)])
+                .unwrap()["result"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    node_b.stop();
+
+    // A reorgs onto B once B outweighs it, leaving A's two blocks stale.
+    for hex in &b_hex {
+        // `submitblock` reports a rejection in the result, not as an error, so
+        // `rpc_ok` cannot see one. Check it here: without this, a rejected
+        // block surfaces below as "expected an active tip and one stale
+        // branch", which describes the symptom and not the cause. `null` is
+        // acceptance; `inconclusive` is a valid block that did not connect,
+        // which is what B's first two blocks are while A still has more work.
+        let res = node_a.rpc_ok("submitblock", vec![json!(hex)]);
+        assert!(
+            res.is_null() || res == json!("inconclusive"),
+            "node A rejected a block from B's chain: {res}"
+        );
+    }
+
+    let tips = node_a.rpc_call("getchaintips").unwrap();
+    let tips = tips["result"].as_array().unwrap_or_else(|| panic!("{tips}"));
+    assert_eq!(tips.len(), 2, "expected an active tip and one stale branch: {tips:?}");
+
+    let active = tips
+        .iter()
+        .find(|t| t["status"] == json!("active"))
+        .unwrap_or_else(|| panic!("no active tip: {tips:?}"));
+    assert_eq!(active["hash"], json!(b_hashes[2]));
+    assert_eq!(active["height"], json!(3));
+    assert_eq!(active["branchlen"], json!(0), "the active tip forks from itself");
+
+    let stale = tips
+        .iter()
+        .find(|t| t["status"] != json!("active"))
+        .unwrap_or_else(|| panic!("no stale branch: {tips:?}"));
+    assert_eq!(stale["hash"], json!(a_hashes[1]), "wrong branch tip");
+    assert_eq!(stale["height"], json!(2));
+    // A's two blocks both descend from genesis, which is the fork point.
+    assert_eq!(stale["branchlen"], json!(2), "branchlen must count back to the fork point");
+    assert_ne!(stale["status"], json!("active"));
+    node_a.stop();
+}
+
+/// `gettxoutproof` / `verifytxoutproof` had no test at all. The round trip is
+/// the easy half; the assertions that matter are the refusals, because a proof
+/// that verifies against anything is not a proof.
+#[test]
+fn gettxoutproof_round_trips_and_refuses_what_it_cannot_prove() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x75; 32]);
+    let addr = wallet.address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
+
+    let dest = DeterministicWallet::from_secret([0x76; 32]);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &wallet,
+        dest.address.script_pubkey(),
+        1_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
+    let block_hash = node
+        .rpc_ok("generatetoaddress", vec![json!(1), json!(addr)])
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Round trip: the proof verifies and names the transaction it proves.
+    let proof = node.rpc_ok("gettxoutproof", vec![json!([txid])]);
+    let proof_hex = proof.as_str().unwrap_or_else(|| panic!("{proof}"));
+    let verified = node.rpc_ok("verifytxoutproof", vec![json!(proof_hex)]);
+    assert_eq!(
+        verified,
+        json!([txid]),
+        "the proof did not verify back to its own transaction"
+    );
+
+    // Naming the containing block explicitly must work too, and is the form
+    // that makes the proof unambiguous.
+    let with_block = node.rpc_ok("gettxoutproof", vec![json!([txid]), json!(block_hash)]);
+    assert_eq!(with_block, proof, "the same proof must come back for the block that holds it");
+
+    // A transaction that is not in the named block cannot be proven from it.
+    let coinbase_of_101 = {
+        let h = node.rpc_ok("getblockhash", vec![json!(101)]);
+        let b = node.rpc_ok("getblock", vec![h, json!(1)]);
+        b["tx"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("block 101 has no transactions: {b}"))
+            .to_string()
+    };
+    let wrong_block = node
+        .rpc_call_with_params(
+            "gettxoutproof",
+            vec![json!([coinbase_of_101]), json!(block_hash)],
+        )
+        .unwrap();
+    assert!(
+        !wrong_block["error"].is_null(),
+        "a transaction absent from the named block was proven from it: {wrong_block}"
+    );
+
+    // Two ways of corrupting the proof, each isolating one of the two things
+    // verification has to do. Both flip a single hex digit, so the length and
+    // framing stay intact and it is the verification being exercised, not the
+    // decode.
+    //
+    // A merkle block is an 80-byte header, then the transaction count, then
+    // the hash list and flag bytes -- so the first 160 hex characters are the
+    // header, of which characters 72..136 are the merkle root.
+    let flip = |hex: &str, at: usize| -> String {
+        let mut c: Vec<char> = hex.chars().collect();
+        c[at] = if c[at] == 'a' { 'b' } else { 'a' };
+        c.into_iter().collect()
+    };
+    let proves_nothing = |node: &TestNode, hex: String, what: &str| {
+        let resp = node
+            .rpc_call_with_params("verifytxoutproof", vec![json!(hex)])
+            .unwrap();
+        let proved = resp["result"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            !resp["error"].is_null() || !proved.contains(&json!(txid)),
+            "{what} still verified the transaction: {resp}"
+        );
+    };
+
+    // (1) The header is altered outside the merkle root, so the tree still
+    // checks out and the transaction is still "in" it -- but the header is not
+    // one this node has ever seen. A proof is only a proof against a block on
+    // our chain; without that check this is a proof of nothing.
+    proves_nothing(&node, flip(proof_hex, 2), "a proof against an unknown header");
+
+    // (2) The hash list is altered, so the path no longer reconstructs the
+    // root the header commits to.
+    proves_nothing(&node, flip(proof_hex, 180), "a proof with a corrupted merkle path");
+    node.stop();
+}
+
+/// `signrawtransactionwithkey` had no test at all, at any level. The
+/// assertion that matters is not the shape of the reply but that the
+/// signature it produces actually verifies: the transaction is broadcast, so
+/// consensus checks the witness rather than the test doing it.
+#[test]
+fn signrawtransactionwithkey_produces_a_signature_the_node_accepts() {
+    use bitcoin::{Network, PrivateKey};
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let wallet = DeterministicWallet::from_secret([0x81; 32]);
+    let addr = wallet.address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
+
+    let funding_txid = common::block1_coinbase_txid(&node);
+    let dest = DeterministicWallet::from_secret([0x82; 32]);
+    let subsidy = 50_00000000u64;
+    let send = subsidy - 1_000;
+
+    let unsigned = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": funding_txid, "vout": 0 }]),
+            json!({ dest.address.to_string(): (send as f64) / 100_000_000.0 }),
+        ],
+    );
+    let unsigned = unsigned.as_str().expect("createrawtransaction returns hex").to_string();
+
+    let wif = PrivateKey::new(wallet.sk, Network::Regtest).to_wif();
+    let prevtxs = json!([{
+        "txid": funding_txid,
+        "vout": 0,
+        "scriptPubKey": hex::encode(wallet.address.script_pubkey().as_bytes()),
+        "amount": (subsidy as f64) / 100_000_000.0,
+    }]);
+
+    let signed = node.rpc_ok(
+        "signrawtransactionwithkey",
+        vec![json!(unsigned), json!([wif]), prevtxs.clone()],
+    );
+    assert_eq!(signed["complete"], json!(true), "signing reported incomplete: {signed}");
+    let signed_hex = signed["hex"].as_str().expect("signed hex").to_string();
+    assert_ne!(signed_hex, unsigned, "the returned transaction carries no signature");
+
+    // Consensus is the assertion: a bad signature is rejected here.
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(signed_hex)]);
+    let mempool = node.rpc_ok("getrawmempool", vec![]);
+    assert_eq!(mempool, json!([txid]), "the signed transaction was not accepted");
+
+    // A key that does not match the prevout cannot sign it. Core reports this
+    // as `complete: false` with a per-input error, not as an RPC failure.
+    let wrong = PrivateKey::new(dest.sk, Network::Regtest).to_wif();
+    let unsigned2 = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": funding_txid, "vout": 0 }]),
+            json!({ dest.address.to_string(): (send as f64) / 100_000_000.0 }),
+        ],
+    );
+    let bad = node.rpc_ok(
+        "signrawtransactionwithkey",
+        vec![unsigned2, json!([wrong]), prevtxs],
+    );
+    assert_eq!(bad["complete"], json!(false), "the wrong key signed the input: {bad}");
+    node.stop();
+}
+
+/// `combinerawtransaction` had no test either. Core's use for it is exactly
+/// this: two signers each hold one key, each signs the same transaction
+/// independently, and the halves are merged into one fully-signed
+/// transaction. Broadcasting the result is what proves the merge produced a
+/// valid witness for *both* inputs rather than keeping one signer's.
+#[test]
+fn combinerawtransaction_merges_two_partial_signatures() {
+    use bitcoin::{Network, PrivateKey};
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    // Two wallets, each funding one input, so each signer can only complete
+    // one of the two.
+    let a = DeterministicWallet::from_secret([0x83; 32]);
+    let b = DeterministicWallet::from_secret([0x84; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(a.address.to_string())]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(b.address.to_string())]);
+    node.rpc_ok("generatetoaddress", vec![json!(100), json!(a.address.to_string())]);
+
+    let coinbase_at = |h: u64| -> String {
+        let hash = node.rpc_ok("getblockhash", vec![json!(h)]);
+        let block = node.rpc_ok("getblock", vec![hash, json!(1)]);
+        block["tx"][0].as_str().expect("coinbase txid").to_string()
+    };
+    let txid_a = coinbase_at(1);
+    let txid_b = coinbase_at(2);
+
+    let subsidy = 50_00000000u64;
+    let dest = DeterministicWallet::from_secret([0x85; 32]);
+    let unsigned = node.rpc_ok(
+        "createrawtransaction",
+        vec![
+            json!([{ "txid": txid_a, "vout": 0 }, { "txid": txid_b, "vout": 0 }]),
+            json!({ dest.address.to_string(): ((2 * subsidy - 1_000) as f64) / 100_000_000.0 }),
+        ],
+    );
+
+    let prevtxs = json!([
+        {
+            "txid": txid_a, "vout": 0,
+            "scriptPubKey": hex::encode(a.address.script_pubkey().as_bytes()),
+            "amount": (subsidy as f64) / 100_000_000.0,
+        },
+        {
+            "txid": txid_b, "vout": 0,
+            "scriptPubKey": hex::encode(b.address.script_pubkey().as_bytes()),
+            "amount": (subsidy as f64) / 100_000_000.0,
+        },
+    ]);
+
+    let sign_with = |wallet: &DeterministicWallet| -> serde_json::Value {
+        let wif = PrivateKey::new(wallet.sk, Network::Regtest).to_wif();
+        node.rpc_ok(
+            "signrawtransactionwithkey",
+            vec![unsigned.clone(), json!([wif]), prevtxs.clone()],
+        )
+    };
+
+    let half_a = sign_with(&a);
+    let half_b = sign_with(&b);
+    // Each signer completes only its own input, which is what makes the
+    // combine meaningful rather than a copy of either half.
+    assert_eq!(half_a["complete"], json!(false), "signer A completed both inputs: {half_a}");
+    assert_eq!(half_b["complete"], json!(false), "signer B completed both inputs: {half_b}");
+    let hex_a = half_a["hex"].as_str().expect("hex").to_string();
+    let hex_b = half_b["hex"].as_str().expect("hex").to_string();
+    assert_ne!(hex_a, hex_b, "the two signers produced identical transactions");
+
+    let combined = node.rpc_ok("combinerawtransaction", vec![json!([hex_a, hex_b])]);
+    let combined = combined.as_str().expect("combined hex").to_string();
+
+    // Consensus is the assertion: if the merge kept only one signer's witness,
+    // the other input fails script verification here.
+    let txid = node.rpc_ok("sendrawtransaction", vec![json!(combined)]);
+    let mempool = node.rpc_ok("getrawmempool", vec![]);
+    assert_eq!(mempool, json!([txid]), "the combined transaction was not accepted");
+    node.stop();
 }
