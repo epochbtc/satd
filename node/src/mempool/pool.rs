@@ -1930,18 +1930,19 @@ impl Mempool {
             return Err(MempoolError::Validation("tx-size".to_string()));
         }
 
-        // Dust output check (configurable via -dustrelayfee, 0 = disable).
-        if cfg.dust_relay_fee > 0 {
-            for output in &tx.output {
-                if output.script_pubkey.is_op_return() {
-                    continue;
-                }
-                let threshold =
-                    policy::dust_threshold_with_rate(&output.script_pubkey, cfg.dust_relay_fee);
-                if output.value.to_sat() < threshold {
-                    return Err(MempoolError::Dust);
-                }
-            }
+        // Dust output check. Core's `IsStandardTx` (`src/policy/policy.cpp`)
+        // permits up to `MAX_DUST_OUTPUTS_PER_TX` dust outputs — one — so that
+        // a zero-fee ephemeral-dust parent stays standard; the zero-fee
+        // requirement on that one output is `PreCheckEphemeralTx`'s job, and
+        // the requirement that a child sweep it is `CheckEphemeralSpends`'s.
+        // Rejecting every dust output here would make satd refuse
+        // transactions Core relays whenever the relay floor is low enough for
+        // them to reach this point.
+        //
+        // `-dustrelayfee=0` needs no special case: every threshold is then 0
+        // and no output is dust, which is exactly how Core switches it off.
+        if Self::count_dust_outputs(tx, cfg.dust_relay_fee) > policy::MAX_DUST_OUTPUTS_PER_TX {
+            return Err(MempoolError::Dust);
         }
 
         // OP_RETURN limits (configurable via -datacarrier and -datacarriersize).
@@ -2106,9 +2107,7 @@ impl Mempool {
         if !cfg.accept_non_std_txn
             && let Err(e) = Self::check_standardness(&tx, &cfg, weight)
         {
-            if has_allow || matches!(e, MempoolError::Dust) {
-                // Defer dust errors: the fee rate check must fire first so
-                // a 0-fee dusty tx gets "min relay fee not met" (Core parity).
+            if has_allow {
                 deferred_nonstd = Some(e);
             } else {
                 return Err(e);
@@ -2154,7 +2153,7 @@ impl Mempool {
             let Some(parent) = inner.entries.get(&parent_txid) else {
                 continue;
             };
-            let dust_indices = Self::dust_output_indices(&parent.tx);
+            let dust_indices = Self::dust_output_indices(&parent.tx, cfg.dust_relay_fee);
             if dust_indices.is_empty() {
                 continue;
             }
@@ -2414,15 +2413,22 @@ impl Mempool {
 
         let fee = sum_inputs - sum_outputs;
 
+        // Ephemeral dust, parent side (Core: `PreCheckEphemeralTx`, called
+        // from `PreChecks` immediately before `CheckFeeRate`). A dusty
+        // transaction that pays anything is refused here, so a zero-fee dusty
+        // one falls through to the relay floor below and reports "min relay
+        // fee not met" exactly as Core does.
+        let fee_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
+        Self::pre_check_ephemeral(&tx, fee, fee_delta, cfg.dust_relay_fee)?;
+
         // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
         }
 
-        // Apply deferred dust error now that the fee rate check has passed.
-        // A non-zero-fee tx with dust is rejected as "dust"; a zero-fee tx
-        // was already rejected above as "min relay fee not met".
+        // Apply any deferred standardness error now that the fee rate check
+        // has passed.
         if !has_allow
             && let Some(e) = deferred_nonstd.take()
         {
@@ -3046,9 +3052,12 @@ impl Mempool {
         txid: &Txid,
         fee_delta: i64,
     ) -> Result<bool, MempoolError> {
+        // Snapshot the rate before taking `inner`: `config` is a leaf lock and
+        // must never be acquired while `inner` is held.
+        let dust_relay_fee = self.config.read().dust_relay_fee;
         let mut inner = self.inner.write();
         if let Some(entry) = inner.entries.get(txid)
-            && Self::tx_has_dust_outputs(&entry.tx)
+            && Self::tx_has_dust_outputs(&entry.tx, dust_relay_fee)
         {
             return Err(MempoolError::Validation(
                 "Priority is not supported for transactions with dust outputs.".to_string(),
@@ -3090,15 +3099,19 @@ impl Mempool {
     }
 
     /// Check whether a transaction has any dust outputs (below the threshold
-    /// for their script type at the default dust relay fee rate). Used by
-    /// ephemeral dust policy and the `prioritisetransaction` guard.
-    fn tx_has_dust_outputs(tx: &Transaction) -> bool {
+    /// for their script type at `dust_relay_fee`). Used by ephemeral dust
+    /// policy and the `prioritisetransaction` guard.
+    ///
+    /// The rate is a parameter rather than `policy::DUST_RELAY_FEE_RATE` so
+    /// that `-dustrelayfee` reaches every dust decision. A rate of 0 makes
+    /// every threshold 0, which is Core's way of switching dust off.
+    fn tx_has_dust_outputs(tx: &Transaction, dust_relay_fee: u64) -> bool {
         for output in &tx.output {
             if output.script_pubkey.is_op_return() {
                 continue;
             }
             let threshold =
-                policy::dust_threshold_with_rate(&output.script_pubkey, policy::DUST_RELAY_FEE_RATE);
+                policy::dust_threshold_with_rate(&output.script_pubkey, dust_relay_fee);
             if output.value.to_sat() < threshold {
                 return true;
             }
@@ -3850,24 +3863,23 @@ impl Mempool {
     }
 
     /// Count how many dust outputs a transaction has (below the dust threshold
-    /// at the default relay fee rate, excluding OP_RETURN).
-    fn count_dust_outputs(tx: &Transaction) -> usize {
+    /// at `dust_relay_fee`, excluding OP_RETURN).
+    fn count_dust_outputs(tx: &Transaction, dust_relay_fee: u64) -> usize {
         tx.output
             .iter()
             .filter(|o| {
                 !o.script_pubkey.is_op_return() && {
-                    let threshold = policy::dust_threshold_with_rate(
-                        &o.script_pubkey,
-                        policy::DUST_RELAY_FEE_RATE,
-                    );
+                    let threshold =
+                        policy::dust_threshold_with_rate(&o.script_pubkey, dust_relay_fee);
                     o.value.to_sat() < threshold
                 }
             })
             .count()
     }
 
-    /// Identify the indices of dust outputs in a transaction.
-    fn dust_output_indices(tx: &Transaction) -> Vec<u32> {
+    /// Identify the indices of dust outputs in a transaction, at
+    /// `dust_relay_fee`.
+    fn dust_output_indices(tx: &Transaction, dust_relay_fee: u64) -> Vec<u32> {
         tx.output
             .iter()
             .enumerate()
@@ -3875,10 +3887,8 @@ impl Mempool {
                 if o.script_pubkey.is_op_return() {
                     return None;
                 }
-                let threshold = policy::dust_threshold_with_rate(
-                    &o.script_pubkey,
-                    policy::DUST_RELAY_FEE_RATE,
-                );
+                let threshold =
+                    policy::dust_threshold_with_rate(&o.script_pubkey, dust_relay_fee);
                 if o.value.to_sat() < threshold {
                     Some(i as u32)
                 } else {
@@ -3886,6 +3896,31 @@ impl Mempool {
                 }
             })
             .collect()
+    }
+
+    /// Core's `PreCheckEphemeralTx` (`src/policy/ephemeral_policy.cpp`).
+    ///
+    /// A transaction carrying dust must pay nothing at all — no base fee and
+    /// no `prioritisetransaction` delta — because the point of ephemeral dust
+    /// is that a miner has no incentive to mine the parent without the child
+    /// that sweeps its dust. Core tests `base_fee != 0 || mod_fee != 0`, so a
+    /// delta alone disqualifies a transaction whose base fee is zero.
+    ///
+    /// Runs on both the single-transaction and the package path; Core calls it
+    /// from `PreChecks`, which both `AcceptSingleTransaction` and
+    /// `AcceptMultipleTransactions` go through.
+    fn pre_check_ephemeral(
+        tx: &Transaction,
+        base_fee: u64,
+        modified_fee: i64,
+        dust_relay_fee: u64,
+    ) -> Result<(), MempoolError> {
+        if (base_fee != 0 || modified_fee != 0)
+            && Self::count_dust_outputs(tx, dust_relay_fee) > 0
+        {
+            return Err(MempoolError::EphemeralDustFee);
+        }
+        Ok(())
     }
 
     /// Submit a package of transactions to the mempool. Supports Bitcoin Core's
@@ -3999,9 +4034,11 @@ impl Mempool {
                         accepted_results.push((ptx.wtxid, txid, vsize, entry.fee));
                     }
                 }
-                Err(MempoolError::InsufficientFee(..)) | Err(MempoolError::Dust) => {
+                Err(MempoolError::InsufficientFee(..))
+                | Err(MempoolError::Dust)
+                | Err(MempoolError::EphemeralDustFee) => {
                     // Candidate for ephemeral dust parent: check the conditions.
-                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
                     // Resolve inputs to compute fee (may reference confirmed or
                     // package-internal outputs).
@@ -4040,15 +4077,22 @@ impl Mempool {
 
                     let base_fee = sum_in.saturating_sub(sum_out);
 
-                    if dust_count > 0 && base_fee > 0 {
-                        // Has dust + nonzero fee: rejected per ephemeral dust policy.
-                        failed.insert(
-                            ptx.wtxid,
-                            "dust, tx with dust output must be 0-fee".to_string(),
-                        );
-                    } else if dust_count > 1 {
-                        // Multiple dust outputs: rejected.
-                        failed.insert(ptx.wtxid, "dust".to_string());
+                    // Core's ordering: `IsStandardTx` refuses more than one
+                    // dust output before anything else, then
+                    // `PreCheckEphemeralTx` refuses a dusty transaction that
+                    // pays a fee, then the relay floor applies. The strings
+                    // come from the error variants so the two admission paths
+                    // cannot drift apart.
+                    let fee_delta = self.inner.read().fee_deltas.get(&ptx.txid).copied().unwrap_or(0);
+                    if dust_count > policy::MAX_DUST_OUTPUTS_PER_TX {
+                        failed.insert(ptx.wtxid, MempoolError::Dust.to_string());
+                    } else if let Err(e) = Self::pre_check_ephemeral(
+                        &ptx.tx,
+                        base_fee,
+                        fee_delta,
+                        cfg.dust_relay_fee,
+                    ) {
+                        failed.insert(ptx.wtxid, e.to_string());
                     } else if dust_count == 1 && base_fee == 0 {
                         // Valid ephemeral dust candidate — defer acceptance.
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
@@ -4070,7 +4114,7 @@ impl Mempool {
                 Err(MempoolError::MissingInputs) => {
                     // Might be a child spending from a package parent — defer
                     // and retry after parents are accepted.
-                    let dust_count = Self::count_dust_outputs(&ptx.tx);
+                    let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     if dust_count == 1 {
                         // Resolve inputs to check fee
                         let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -4130,7 +4174,7 @@ impl Mempool {
 
         // First identify which deferred txs are parents and which are children.
         for (txid, tx) in &ephemeral_parents {
-            let dust_indices = Self::dust_output_indices(tx);
+            let dust_indices = Self::dust_output_indices(tx, cfg.dust_relay_fee);
             if dust_indices.is_empty() && !tx.input.iter().any(|i| ephemeral_parents.contains_key(&i.previous_output.txid) || accepted_txids.contains(&i.previous_output.txid)) {
                 // Not a dust parent and not a child — this shouldn't be deferred.
                 // It might have been deferred due to MissingInputs with no dust.
@@ -4149,7 +4193,7 @@ impl Mempool {
                 Some(tx) => tx,
                 None => continue,
             };
-            let dust_indices = Self::dust_output_indices(parent_tx);
+            let dust_indices = Self::dust_output_indices(parent_tx, cfg.dust_relay_fee);
             let wtxid = parent_tx.compute_wtxid();
 
             // Check that a child in the package (accepted or deferred) spends
@@ -4277,7 +4321,7 @@ impl Mempool {
                 // Check in-mempool parents for dust outputs.
                 let inner = self.inner.read();
                 if let Some(parent_entry) = inner.entries.get(&parent_txid_ref) {
-                    let dust_indices = Self::dust_output_indices(&parent_entry.tx);
+                    let dust_indices = Self::dust_output_indices(&parent_entry.tx, cfg.dust_relay_fee);
                     if !dust_indices.is_empty() {
                         // Parent has dust — does this child spend ALL dust outputs?
                         let spends_all = dust_indices.iter().all(|&di| {
@@ -4340,7 +4384,12 @@ impl Mempool {
         // (`src/validation.cpp`), so a failure anywhere leaves the mempool
         // untouched. satd accepts incrementally, so the equivalent has to be
         // undone here.
-        let stranded = self.unwind_stranded_dust_parents(&pkg, &parents_to_accept, &mut accepted_txids);
+        let stranded = self.unwind_stranded_dust_parents(
+            &pkg,
+            &parents_to_accept,
+            &mut accepted_txids,
+            cfg.dust_relay_fee,
+        );
 
         // Announce the ephemeral parents that survived.
         //
@@ -4436,6 +4485,7 @@ impl Mempool {
         pkg: &[impl PackageMember],
         parents_to_accept: &[Txid],
         accepted_txids: &mut HashSet<Txid>,
+        dust_relay_fee: u64,
     ) -> Vec<Txid> {
         let mut stranded: Vec<Txid> = Vec::new();
         for parent_txid in parents_to_accept {
@@ -4445,7 +4495,7 @@ impl Mempool {
             let Some(parent_tx) = self.get(parent_txid).map(|e| e.tx) else {
                 continue;
             };
-            let dust_indices = Self::dust_output_indices(&parent_tx);
+            let dust_indices = Self::dust_output_indices(&parent_tx, dust_relay_fee);
             // Every dust output must be spent by a member that was *accepted*,
             // not merely present in the package.
             let all_swept = dust_indices.iter().all(|&di| {
@@ -5606,13 +5656,23 @@ mod tests {
             }],
         };
 
-        // Dust check now runs after fee rate check / input resolution
-        // (matching Core's ordering). Since the test UTXO doesn't exist in
-        // chain state, we hit MissingInputs before reaching the dust check.
-        let result = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
+        // The transaction pays 99_999 sats in fee and carries a dust output,
+        // so Core's `PreCheckEphemeralTx` refuses it: the point of ephemeral
+        // dust is that the parent must be worthless to mine on its own.
+        // Core's reject reason is `dust` either way, so pin the detail too —
+        // it is the only thing that distinguishes this from the
+        // more-than-one-dust standardness rule.
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
         assert!(
-            matches!(result, Err(MempoolError::Dust) | Err(MempoolError::MissingInputs)),
-            "expected Dust or MissingInputs, got {result:?}"
+            matches!(err, MempoolError::EphemeralDustFee),
+            "expected EphemeralDustFee, got {err:?}"
+        );
+        assert_eq!(err.reject_reason(), "dust");
+        assert_eq!(
+            err.reject_details().as_deref(),
+            Some("tx with dust output must be 0-fee")
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6804,6 +6864,18 @@ mod tests {
         }
     }
 
+    /// A zero-fee spend of `prev` (worth `input_value`) carrying **two** dust
+    /// outputs.
+    ///
+    /// One dust output is standard — Core's `MAX_DUST_OUTPUTS_PER_TX` is 1, so
+    /// that an ephemeral-dust parent stays relayable — so a fixture that needs
+    /// a genuine standardness failure has to carry two. Zero fee keeps
+    /// `PreCheckEphemeralTx` out of the way, leaving the standardness rule as
+    /// the only thing that can reject it.
+    fn two_dust_spend(prev: OutPoint, input_value: u64) -> Transaction {
+        tx_from(&[prev], &[(1, 0x22), (1, 0x23), (input_value - 2, 0x24)])
+    }
+
     fn set_ruleset(mp: &Mempool, src: &str) {
         let rs = satd_policy::parse_ruleset(src).expect("test ruleset must compile");
         mp.set_policy(std::sync::Arc::new(rs));
@@ -7035,13 +7107,13 @@ mod tests {
 
     #[test]
     fn deferred_standardness_allow_match_admits_to_acting() {
-        // A dust output is nonstandard, but an `allow` matching the submission
-        // forgives it (§6.2) → admitted to the acting class.
+        // Two dust outputs are nonstandard, but an `allow` matching the
+        // submission forgives it (§6.2) → admitted to the acting class.
         let op = outpoint(0xa3);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
         set_ruleset(&mp, "version 1\nallow mine when tx.source == rpc");
 
-        let tx = spend(op, 1, 0x22); // 1-sat output ⇒ dust
+        let tx = two_dust_spend(op, 100_000);
         let txid = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("allow forgives the dust nonstandardness");
@@ -7061,7 +7133,7 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
         set_ruleset(&mp, "version 1\nallow mine when tx.source == mcp");
 
-        let tx = spend(op, 1, 0x22); // dust
+        let tx = two_dust_spend(op, 100_000);
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .unwrap_err();
@@ -7082,7 +7154,8 @@ mod tests {
             "version 1\nallow mine when tx.source == mcp\nquarantine catch when tx.version == 2",
         );
 
-        let tx = spend(op, 1, 0x22); // dust, version 2 (would match the quarantine rule)
+        // Version 2, so it would match the quarantine rule.
+        let tx = two_dust_spend(op, 100_000);
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .unwrap_err();
@@ -7097,22 +7170,19 @@ mod tests {
 
     #[test]
     fn no_allow_rules_rejects_nonstandard_early() {
-        // Dust errors are deferred until after the fee rate check so 0-fee txs
-        // get "min relay fee not met" (Core parity). For an unfunded input,
-        // input resolution fails with MissingInputs before the deferred dust
-        // check can fire.
+        // A single dust output is standard (Core's MAX_DUST_OUTPUTS_PER_TX),
+        // so nothing is deferred here at all and input resolution is the first
+        // thing that can fail.
         let (cs, mp, dir) = make_funded_env(&[]); // no coins funded
         set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
 
-        let tx = spend(outpoint(0xde), 1, 0x22); // dust, unfunded input
+        let tx = spend(outpoint(0xde), 1, 0x22); // one dust output, unfunded input
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .unwrap_err();
-        // Non-dust standardness failures (e.g. oversized OP_RETURN) still
-        // reject early; Dust is deferred, so the unfunded input surfaces first.
         assert!(
             matches!(err, MempoolError::MissingInputs),
-            "deferred dust lets input resolution fail first: got {err:?}"
+            "an unfunded input surfaces before any fee-dependent rule: got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8943,7 +9013,7 @@ mod tests {
     #[test]
     fn a_zero_fee_dust_parent_is_accepted_when_its_child_spends_the_dust() {
         let op = outpoint(0xC0);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
         // Zero fee: the outputs sum to the input exactly.
@@ -8975,7 +9045,7 @@ mod tests {
     #[test]
     fn a_child_that_leaves_the_dust_unspent_fails_the_package() {
         let op = outpoint(0xC1);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
         let parent = tx_from(&[op], &[(dust, 0x53), (50_000 - dust, 0x54)]);
@@ -9006,7 +9076,7 @@ mod tests {
     #[test]
     fn a_dust_parent_that_pays_a_fee_is_refused() {
         let op = outpoint(0xC2);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
         // 900 sat short of the input: a real fee.
@@ -9068,7 +9138,7 @@ mod tests {
     #[test]
     fn a_lone_dust_parent_is_not_accepted() {
         let op = outpoint(0xC4);
-        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
         let parent = tx_from(&[op], &[(dust, 0x5D), (50_000 - dust, 0x5E)]);
@@ -9226,6 +9296,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Core runs `PreCheckEphemeralTx` from `PreChecks`, which both
+    /// `AcceptSingleTransaction` and `AcceptMultipleTransactions` go through,
+    /// so `sendrawtransaction` refuses a fee-paying dusty transaction exactly
+    /// as `submitpackage` does. satd used to enforce this only inside
+    /// `accept_package`, leaving the single-transaction path to reject *all*
+    /// dust for an unrelated reason.
+    #[test]
+    fn a_fee_paying_dust_transaction_is_refused_on_the_single_tx_path() {
+        let op = outpoint(0xD0);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // One dust output, and a 5_000-sat fee.
+        let tx = tx_from(&[op], &[(dust, 0x80), (45_000 - dust, 0x81)]);
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
+        assert_eq!(err.reject_reason(), "dust");
+        assert_eq!(
+            err.reject_details().as_deref(),
+            Some("tx with dust output must be 0-fee"),
+            "the ephemeral-fee rule and the multi-dust rule share the reject \
+             reason `dust`; only the detail tells them apart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other branch that reports `dust`: more outputs than
+    /// `MAX_DUST_OUTPUTS_PER_TX`. It carries no detail, which is the only
+    /// observable difference from the rule above — the trap that let a deleted
+    /// guard pass its own test in #700.
+    #[test]
+    fn two_dust_outputs_are_nonstandard_on_the_single_tx_path() {
+        let op = outpoint(0xD1);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // Zero fee, so the ephemeral rule above cannot be what fires.
+        let tx = tx_from(
+            &[op],
+            &[(dust, 0x82), (dust, 0x83), (50_000 - 2 * dust, 0x84)],
+        );
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::Dust), "got {err:?}");
+        assert_eq!(err.reject_reason(), "dust");
+        assert_eq!(err.reject_details(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero-fee transaction with one dust output is *standard*: Core's
+    /// `MAX_DUST_OUTPUTS_PER_TX` is 1 and `PreCheckEphemeralTx` is satisfied by
+    /// the zero fee, so the relay floor is what refuses it. Core's
+    /// `mempool_ephemeral_dust.py` asserts exactly this string.
+    #[test]
+    fn a_zero_fee_dust_transaction_reports_the_relay_floor_not_dust() {
+        let op = outpoint(0xD2);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        let tx = tx_from(&[op], &[(dust, 0x85), (50_000 - dust, 0x86)]);
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::InsufficientFee(..)), "got {err:?}");
+        assert_eq!(err.reject_reason(), "min relay fee not met");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core tests `base_fee != 0 || mod_fee != 0`, so a `prioritisetransaction`
+    /// delta on a not-yet-resident txid disqualifies it before it ever arrives.
+    /// Reading only the base fee would let the delta through.
+    #[test]
+    fn a_prioritise_delta_alone_disqualifies_a_dust_transaction() {
+        let op = outpoint(0xD3);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // Zero fee: without the delta this is the relay-floor case above.
+        let tx = tx_from(&[op], &[(dust, 0x87), (50_000 - dust, 0x88)]);
+        let txid = tx.compute_txid();
+        mp.prioritise_transaction(&txid, 1_000_000)
+            .expect("a delta on an absent txid is allowed");
+
+        let err = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .unwrap_err();
+        assert!(matches!(err, MempoolError::EphemeralDustFee), "got {err:?}");
+        assert_eq!(
+            err.reject_details().as_deref(),
+            Some("tx with dust output must be 0-fee")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-dustrelayfee=0` is how an operator switches dust policy off. Every
+    /// threshold becomes 0, so nothing is dust, and each of the paths that
+    /// classifies dust has to read the configured rate rather than the
+    /// `DUST_RELAY_FEE_RATE` constant.
+    #[test]
+    fn dustrelayfee_zero_reaches_every_dust_decision() {
+        let op = outpoint(0xD4);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 1_000,
+            dust_relay_fee: 0,
+            ..Default::default()
+        });
+        // 200 sats is well under the 294-sat P2WPKH threshold at the default
+        // rate, so every one of these would be dust if the rate were ignored.
+        assert!(200 < policy::dust_threshold(&p2wpkh_spk(0x11)));
+
+        // The single-transaction path: admitted, and the ephemeral-fee rule
+        // does not fire even though the transaction pays 4_800 sats.
+        let tx = tx_from(&[op], &[(200, 0x89), (45_000, 0x8A)]);
+        let txid = tx.compute_txid();
+        mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("with dust policy off, a 200-sat output is an ordinary output");
+        assert!(in_pool(&mp, &txid));
+
+        // …and `prioritisetransaction`, whose guard also has to see the rate.
+        mp.prioritise_transaction(&txid, 1_000)
+            .expect("no output is dust, so nothing blocks a delta");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every member of an accepted package has to reach the event stream, or a
     /// consumer reconstructing mempool membership from it silently disagrees
     /// with `getrawmempool`. The ephemeral parent goes in through a path that
@@ -9312,13 +9511,13 @@ mod tests {
 
         let parent = tx_from(&[op], &[(at_threshold, 0x5F), (50_000 - at_threshold, 0x60)]);
         assert_eq!(
-            Mempool::count_dust_outputs(&parent),
+            Mempool::count_dust_outputs(&parent, policy::DUST_RELAY_FEE_RATE),
             0,
             "an output at the threshold was counted as dust"
         );
         let below = tx_from(&[op], &[(at_threshold - 1, 0x5F), (50_000 - at_threshold, 0x60)]);
         assert_eq!(
-            Mempool::count_dust_outputs(&below),
+            Mempool::count_dust_outputs(&below, policy::DUST_RELAY_FEE_RATE),
             1,
             "an output below the threshold was not counted as dust"
         );
