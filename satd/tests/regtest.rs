@@ -1283,6 +1283,101 @@ fn test_getblocktemplate_fields() {
     node.stop();
 }
 
+/// A JSON-RPC 2.0 request with no `id` is a notification: the method runs and
+/// nothing comes back. satd injected `"id": null` into every request that
+/// lacked one, so jsonrpsee never saw a notification and the node always
+/// answered.
+#[test]
+fn a_jsonrpc_2_0_notification_gets_no_response() {
+    let mut node = TestNode::start(&[]);
+
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","method":"getblockcount","params":[]}"#);
+    assert_eq!(status, 204, "a notification is answered 204: {body:?}");
+    assert!(body.is_empty(), "a notification carries no body: {body:?}");
+
+    // The method really ran — the same request with an id answers normally.
+    let (status, body) = node
+        .rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}"#);
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["id"], serde_json::json!(1), "{body}");
+
+    // A 1.0 request without an id is *not* a notification: only 2.0 has them.
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"jsonrpc":"1.0","method":"getblockcount","params":[]}"#);
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(
+        v.get("id").is_none(),
+        "Core omits `id` when the request carried none: {body}"
+    );
+
+    // …and an explicit null id is an id, echoed as one.
+    let (_, body) = node.rpc_post_raw_status(
+        r#"{"jsonrpc":"1.0","id":null,"method":"getblockcount","params":[]}"#,
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(
+        v.get("id"),
+        Some(&serde_json::Value::Null),
+        "an explicit null id is echoed: {body}"
+    );
+
+    node.stop();
+}
+
+/// In a batch a notification produces no entry, and its neighbours still do.
+#[test]
+fn a_notification_in_a_batch_produces_no_entry() {
+    let mut node = TestNode::start(&[]);
+
+    let (status, body) = node.rpc_post_raw_status(
+        r#"[{"jsonrpc":"2.0","method":"getblockcount"},
+            {"jsonrpc":"2.0","id":7,"method":"getbestblockhash"}]"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let items = v.as_array().unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(items.len(), 1, "only the request with an id answers: {body}");
+    assert_eq!(items[0]["id"], serde_json::json!(7), "{body}");
+
+    // A batch of nothing but notifications is 204 whole.
+    let (status, body) = node.rpc_post_raw_status(
+        r#"[{"jsonrpc":"2.0","method":"getblockcount"},
+            {"jsonrpc":"2.0","method":"getbestblockhash"}]"#,
+    );
+    assert_eq!(status, 204, "{body:?}");
+    assert!(body.is_empty(), "{body:?}");
+
+    node.stop();
+}
+
+/// Core's HTTP status carries the JSON-RPC error class (`httprpc.cpp`): a
+/// parse error is 500, an invalid request 400, an unknown method 404. satd
+/// answered 200 to all three, so a client that switches on the status — Core's
+/// own `interface_rpc.py` does — could not tell them apart.
+#[test]
+fn the_http_status_carries_the_jsonrpc_error_class() {
+    let mut node = TestNode::start(&[]);
+
+    // Unparseable body → -32700 → 500.
+    let (status, body) = node.rpc_post_raw_status("{not json");
+    assert_eq!(status, 500, "a parse error is 500: {body}");
+
+    // Unknown method → -32601 → 404.
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"nosuchmethod"}"#);
+    assert_eq!(status, 404, "an unknown method is 404: {body}");
+
+    // A well-formed call to a real method is still 200, error or not.
+    let (status, body) =
+        node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[99999999]}"#);
+    assert_eq!(status, 200, "an application error keeps 200: {body}");
+
+    node.stop();
+}
+
 /// Core validates `estimatesmartfee`'s `conf_target` range, and
 /// `estimaterawfee` in the same file already did. `estimatesmartfee` did not,
 /// so `conf_target: 0` reached the estimator and was answered with a feerate.

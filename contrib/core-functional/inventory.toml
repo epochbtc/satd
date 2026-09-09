@@ -374,7 +374,7 @@ note = "REST endpoint returns 401 Unauthorized; Core's REST is unauthenticated b
 file = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: assert_equal(0, 1) on the JSON-RPC batch/notification handling this test walks. Follow-up: batch and notification semantics (#664)"
+note = "re-measured after the #664 compat work: notifications, batch entries, id echoing and the HTTP status mapping all pass now. The remaining failure is `test_getrpcinfo` asserting one entry in `active_commands`, which satd still reports as `[]`. Follow-up: #702 `getrpcinfo.active_commands`"
 
 [[test]]
 file = "interface_usdt_coinselection.py"

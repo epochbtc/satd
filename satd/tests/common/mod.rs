@@ -795,6 +795,33 @@ impl TestNode {
         Ok(json)
     }
 
+    /// POST an exact body string and return the HTTP status alongside the
+    /// raw response text.
+    ///
+    /// [`Self::rpc_call_raw_body`] parses the body as JSON, so it cannot see
+    /// a `204 No Content` (there is no body) or the status code at all —
+    /// both of which Core's JSON-RPC surface uses to carry meaning.
+    pub fn rpc_post_raw_status(&self, body: &str) -> (u16, String) {
+        let url = format!("http://127.0.0.1:{}/", self.rpcport);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let (user, pass) = self
+            .cookie
+            .split_once(':')
+            .unwrap_or(("__cookie__", "none"));
+        let response = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .expect("the server must answer");
+        let status = response.status().as_u16();
+        (status, response.text().unwrap_or_default())
+    }
+
     /// POST an exact body string and report the transport outcome:
     /// `Some(status)` if the server returned an HTTP response, or `None`
     /// if the connection was dropped mid-send. Both are valid ways for
