@@ -18,15 +18,6 @@ use crate::storage::{Store, StoreError};
 use crate::validation;
 use crate::validation::script::{NoopVerifier, ScriptVerifier};
 
-/// A chain tip as reported by `getchaintips`.
-#[derive(Debug, Clone)]
-pub struct ChainTipInfo {
-    pub height: u32,
-    pub hash: BlockHash,
-    pub branch_len: u32,
-    pub status: String,
-}
-
 /// The node's current time in seconds since the Unix epoch, for the
 /// future-block-time consensus check. Reads [`crate::time`] so `setmocktime`
 /// moves it on a mockable chain; off regtest that is always the system clock.
@@ -298,6 +289,19 @@ pub struct ChainState {
     /// "best-known-at-height" index), this names the actual most-work chain, so
     /// a competing chain that is heavier-but-shorter is still pursued.
     best_header: RwLock<(BlockHash, [u8; 32])>,
+    /// Every leaf of the block-index tree: the hashes no other indexed entry
+    /// names as its `prev_blockhash`.
+    ///
+    /// `getchaintips` needs this set, and derived it by scanning the whole
+    /// block index on every call — O(index) per RPC, which on a mainnet node
+    /// is a million-row walk to answer a question with a handful of rows in
+    /// it. The set is maintained the same way `best_header` is: seeded by the
+    /// one-time load scan, then updated wherever an index entry is created.
+    ///
+    /// Structural, so a reorg does not disturb it — a reorg changes which
+    /// branch is active, not which blocks have children. Only a *new* entry
+    /// can add a leaf or take one away.
+    tips: RwLock<std::collections::HashSet<BlockHash>>,
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
@@ -659,6 +663,12 @@ impl ChainState {
                 // chainwork in accept_header/accept_headers/accept_block. Seeded
                 // with the active tip so a scan miss still yields a sane value.
                 let mut best_header = (tip_hash, entry.chainwork);
+                // Seeded in the same pass: every hash, minus every hash some
+                // other entry names as its parent, is the leaf set.
+                let mut all: std::collections::HashSet<BlockHash> =
+                    std::collections::HashSet::new();
+                let mut parents: std::collections::HashSet<BlockHash> =
+                    std::collections::HashSet::new();
                 // Propagate a scan failure rather than swallowing it: a
                 // block_index that cannot be iterated is corruption that
                 // must fail startup loudly, not silently degrade the
@@ -667,7 +677,11 @@ impl ChainState {
                     if compare_u256(&e.chainwork, &best_header.1) > 0 {
                         best_header = (h, e.chainwork);
                     }
+                    all.insert(h);
+                    parents.insert(e.header.prev_blockhash);
                 })?;
+                let tips: std::collections::HashSet<BlockHash> =
+                    all.difference(&parents).copied().collect();
                 // Rows dropped mid-scan (bad key / bad value) don't return
                 // Err but DO mean the best-header seed may have missed a
                 // heavier branch — surface them instead of masking.
@@ -702,6 +716,7 @@ impl ChainState {
                     enforce_checkpoints: true,
                     headers_tip_height: AtomicU32::new(htip),
                     best_header: RwLock::new(best_header),
+                    tips: RwLock::new(tips),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     connector_scan_last: Mutex::new(None),
                     num_threads,
@@ -812,6 +827,7 @@ impl ChainState {
             enforce_checkpoints: true,
             headers_tip_height: AtomicU32::new(0),
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
+            tips: RwLock::new(std::collections::HashSet::from([genesis_hash])),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             connector_scan_last: Mutex::new(None),
             num_threads,
@@ -1243,7 +1259,7 @@ impl ChainState {
             ..Default::default()
         };
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(tip_batch)?;
+        self.write_chain_batch(tip_batch)?;
         {
             self.set_tip(anchor.blockhash, anchor.height);
         }
@@ -1276,7 +1292,7 @@ impl ChainState {
             ..Default::default()
         };
         let _chain_mutation = self.begin_chain_mutation();
-        if let Err(e) = self.store.write_batch(reset) {
+        if let Err(e) = self.write_chain_batch(reset) {
             tracing::error!(error = %e, "snapshot rollback: tip reset failed");
         }
         {
@@ -1996,107 +2012,6 @@ impl ChainState {
         self.store.get_block_hash_by_height(height)
     }
 
-    /// Compute all chain tips by walking the full block index.
-    ///
-    /// A tip is any block whose hash is not the `prev_blockhash` of any other
-    /// block in the index. Each tip is classified by its relationship to the
-    /// active chain:
-    ///
-    /// - `"active"` — the current best chain tip
-    /// - `"valid-fork"` — fully validated but not on the active chain
-    /// - `"valid-headers"` — headers received, data stored but not connected
-    /// - `"headers-only"` — only the header is known (no block data)
-    /// - `"invalid"` — explicitly marked invalid
-    ///
-    /// `branchlen` is the number of blocks since the fork point from the
-    /// active chain (0 for the active tip itself).
-    pub fn chain_tips(&self) -> Vec<ChainTipInfo> {
-        use std::collections::{HashMap, HashSet};
-
-        let (tip_hash, _tip_height) = self.tip_snapshot();
-
-        // Collect every entry and record which hashes are referenced as a parent.
-        let mut entries: HashMap<BlockHash, BlockIndexEntry> = HashMap::new();
-        let mut has_child: HashSet<BlockHash> = HashSet::new();
-        let _ = self.store.for_each_block_index(&mut |hash, entry| {
-            has_child.insert(entry.header.prev_blockhash);
-            entries.insert(hash, entry);
-        });
-
-        // Build the set of active-chain hashes for fork-point detection.
-        let mut active_hashes: HashSet<BlockHash> = HashSet::new();
-        {
-            let mut cur = tip_hash;
-            loop {
-                active_hashes.insert(cur);
-                if let Some(e) = entries.get(&cur) {
-                    if e.header.prev_blockhash == BlockHash::all_zeros() {
-                        break;
-                    }
-                    cur = e.header.prev_blockhash;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Tips: blocks with no children in the index.
-        let mut tips: Vec<ChainTipInfo> = Vec::new();
-        for (hash, entry) in &entries {
-            if has_child.contains(hash) {
-                continue;
-            }
-
-            // Classify.
-            let (status, branch_len) = if *hash == tip_hash {
-                ("active", 0u32)
-            } else {
-                // Walk back to the fork point (the first ancestor on the active chain).
-                let mut depth = 0u32;
-                let mut cur = *hash;
-                loop {
-                    if active_hashes.contains(&cur) {
-                        break;
-                    }
-                    if let Some(e) = entries.get(&cur) {
-                        if e.header.prev_blockhash == BlockHash::all_zeros() {
-                            depth += 1;
-                            break;
-                        }
-                        cur = e.header.prev_blockhash;
-                        depth += 1;
-                    } else {
-                        depth += 1;
-                        break;
-                    }
-                }
-
-                let status_str = match entry.status {
-                    BlockStatus::Invalid => "invalid",
-                    BlockStatus::HeaderOnly => "headers-only",
-                    BlockStatus::DataStored => "valid-headers",
-                    BlockStatus::Valid | BlockStatus::Pruned => "valid-fork",
-                };
-                (status_str, depth)
-            };
-
-            tips.push(ChainTipInfo {
-                height: entry.height,
-                hash: *hash,
-                branch_len,
-                status: status.to_string(),
-            });
-        }
-
-        // Sort: active first, then by descending height.
-        tips.sort_by(|a, b| {
-            let a_active = a.status == "active";
-            let b_active = b.status == "active";
-            b_active.cmp(&a_active).then(b.height.cmp(&a.height))
-        });
-
-        tips
-    }
 
     /// Direct store handle for tests that need to construct index states the
     /// public API cannot reach — e.g. a stale sibling block that exists in the
@@ -2214,7 +2129,7 @@ impl ChainState {
             if new_height > self.tip_height() {
                 batch.height_hash_puts.push((new_height, hash));
             }
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
 
         // Track highest header for locator construction
@@ -2370,7 +2285,7 @@ impl ChainState {
                 let _accept_guard = self.accept_lock.lock();
                 let tip_height = self.tip_height();
                 batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
-                if let Err(e) = self.store.write_batch(batch) {
+                if let Err(e) = self.write_chain_batch(batch) {
                     return (0, Some(e.into()));
                 }
             }
@@ -2396,6 +2311,60 @@ impl ChainState {
         if compare_u256(&chainwork, &best.1) > 0 {
             *best = (hash, chainwork);
         }
+    }
+
+    /// Record a newly indexed block in the leaf set: it is a tip until
+    /// something builds on it, and its parent has stopped being one.
+    ///
+    /// Called wherever a `block_index` entry is created for a hash the index
+    /// did not already hold. Calling it for a hash already present is
+    /// harmless — both operations are idempotent — which matters because the
+    /// header and block paths both reach the same hash.
+    fn note_indexed_block(&self, hash: BlockHash, prev: BlockHash) {
+        let mut tips = self.tips.write();
+        tips.insert(hash);
+        tips.remove(&prev);
+    }
+
+    /// Commit a `StoreBatch` and keep the leaf set in step with it.
+    ///
+    /// Every write that creates a `block_index` entry goes through here, so
+    /// "the leaf set tracks the index" is a property of the code rather than a
+    /// list of call sites someone has to remember to extend. The entry itself
+    /// is produced by `connect_block`, `accept_header` and `store_block` on
+    /// half a dozen paths; they all end in one of these commits.
+    ///
+    /// Only a hash the index did not already hold becomes a leaf: several
+    /// paths re-put an existing entry to change its status (pruning, invalid
+    /// marking, hole repair), and a block that already has children is not a
+    /// leaf however many times its row is rewritten.
+    fn write_chain_batch(&self, batch: crate::storage::StoreBatch) -> Result<(), StoreError> {
+        let fresh: Vec<(BlockHash, BlockHash)> = batch
+            .block_index_puts
+            .iter()
+            .filter(|(h, _)| self.store.get_block_index(h).is_none())
+            .map(|(h, e)| (*h, e.header.prev_blockhash))
+            .collect();
+        self.store.write_batch(batch)?;
+        for (hash, prev) in fresh {
+            self.note_indexed_block(hash, prev);
+        }
+        Ok(())
+    }
+
+    /// Every leaf of the block-index tree, plus the active tip.
+    ///
+    /// The active tip is unioned in because a header-only descendant of it
+    /// takes it out of the leaf set while not extending the connected chain:
+    /// Core reports the active tip unconditionally for the same reason
+    /// (`setTips.insert(active_chain.Tip())`).
+    pub fn chain_tip_hashes(&self) -> Vec<BlockHash> {
+        let active = self.tip_hash();
+        let mut out: Vec<BlockHash> = self.tips.read().iter().copied().collect();
+        if !out.contains(&active) {
+            out.push(active);
+        }
+        out
     }
 
     /// The most-work header chain tip seen so far (analogous to Core's
@@ -3150,7 +3119,7 @@ impl ChainState {
                 })?;
                 let mut batch = crate::storage::StoreBatch::default();
                 batch.chain_tx_puts.push((tip_hash, entry.num_tx as u64));
-                self.store.write_batch(batch)?;
+                self.write_chain_batch(batch)?;
                 self.store.flush()?;
             }
             self.store.mark_chain_tx_backfill_complete()?;
@@ -3235,11 +3204,11 @@ impl ChainState {
             batch.chain_tx_puts.push((hash, cum));
             written += 1;
             if batch.chain_tx_puts.len() >= CHUNK {
-                self.store.write_batch(std::mem::take(&mut batch))?;
+                self.write_chain_batch(std::mem::take(&mut batch))?;
             }
         }
         if !batch.chain_tx_puts.is_empty() {
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
         self.store.flush()?;
         self.store.mark_chain_tx_backfill_complete()?;
@@ -3494,7 +3463,7 @@ impl ChainState {
         outcome.elapsed_secs = span_start.elapsed().as_secs();
 
         if outcome.repaired > 0 {
-            self.store.write_batch(repair_batch)?;
+            self.write_chain_batch(repair_batch)?;
             // Durable flush so a crash before the next periodic flush
             // doesn't lose the repair work and leave us re-scanning at
             // next startup.
@@ -3700,7 +3669,7 @@ impl ChainState {
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(batch)?;
+        self.write_chain_batch(batch)?;
 
         // Update in-memory tip
         phases.enter(ConnectPhase::TipWrite);
@@ -4001,7 +3970,7 @@ impl ChainState {
             if new_height > self.tip_height() {
                 batch.height_hash_puts.push((new_height, block_hash));
             }
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
 
         Ok((block_hash, new_height))
@@ -4199,7 +4168,7 @@ impl ChainState {
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.block_index_puts.push((hash, repaired));
-        self.store.write_batch(batch)?;
+        self.write_chain_batch(batch)?;
 
         tracing::info!(
             %hash,
@@ -4363,7 +4332,7 @@ impl ChainState {
         // Atomic commit
         phases.enter(ConnectPhase::WriteBatch);
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(batch)?;
+        self.write_chain_batch(batch)?;
 
         // Update in-memory tip
         phases.enter(ConnectPhase::TipWrite);
@@ -4930,7 +4899,7 @@ impl ChainState {
             phase_tracker: None,
         })?;
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(batch)?;
+        self.write_chain_batch(batch)?;
         self.set_tip(pre.hash, pre.height);
         Ok(())
     }
@@ -5025,7 +4994,7 @@ impl ChainState {
             phase_tracker: None,
         })?;
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(batch)?;
+        self.write_chain_batch(batch)?;
         self.set_tip(hash, height);
         Ok(())
     }
@@ -5428,7 +5397,7 @@ impl ChainState {
                 phase_tracker: None,
             })?;
             let _chain_mutation = self.begin_chain_mutation();
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
 
             {
                 self.set_tip(hash, height);
@@ -5684,7 +5653,7 @@ impl ChainState {
             indexed += 1;
         }
         if !batch.block_index_puts.is_empty() {
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
         tracing::info!(
             indexed,
@@ -5989,7 +5958,7 @@ impl ChainState {
             };
             let mut batch = crate::storage::StoreBatch::default();
             batch.block_index_puts.push((block_hash, entry.clone()));
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
 
             // Check if this side chain now has more work than the current tip
             let tip_entry = self.store.get_block_index(&current_tip)
@@ -6233,7 +6202,7 @@ impl ChainState {
                         phase_tracker: None,
                     })?;
                     let _chain_mutation = self.begin_chain_mutation();
-                    self.store.write_batch(batch)?;
+                    self.write_chain_batch(batch)?;
                     {
                         self.set_tip(*side_hash, side_entry.height);
                     }
@@ -6412,7 +6381,7 @@ impl ChainState {
         };
 
         let _chain_mutation = self.begin_chain_mutation();
-        if let Err(e) = self.store.write_batch(batch) {
+        if let Err(e) = self.write_chain_batch(batch) {
             if let Some(pending) = pending_reorg.as_ref() {
                 tracing::warn!(
                     error = %e,
@@ -6846,7 +6815,7 @@ impl ChainState {
 
         // Atomic commit of all disconnections
         let _chain_mutation = self.begin_chain_mutation();
-        self.store.write_batch(combined_batch)?;
+        self.write_chain_batch(combined_batch)?;
 
         // Update in-memory tip to fork point
         {
@@ -7342,7 +7311,7 @@ impl ChainState {
         // `write_batch` updates the block-index LRU in lock-step (an Invalid
         // write is never HeaderOnly, so the dominance filter never drops it).
         if !batch.block_index_puts.is_empty() {
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
         Ok(())
     }
@@ -7374,7 +7343,7 @@ impl ChainState {
             }
         }
         if !batch.block_index_puts.is_empty() {
-            self.store.write_batch(batch)?;
+            self.write_chain_batch(batch)?;
         }
         Ok(())
     }
@@ -7644,7 +7613,7 @@ impl ChainState {
                     phase_tracker: None,
                 })?;
                 let _chain_mutation = self.begin_chain_mutation();
-                self.store.write_batch(batch)?;
+                self.write_chain_batch(batch)?;
                 {
                     self.set_tip(*h, e.height);
                 }
@@ -7871,7 +7840,7 @@ impl ChainState {
         drop(flat_files);
 
         if !batch.block_index_puts.is_empty()
-            && let Err(e) = self.store.write_batch(batch)
+            && let Err(e) = self.write_chain_batch(batch)
         {
             tracing::error!("Failed to update block index after pruning: {}", e);
         }
@@ -9852,6 +9821,78 @@ pub(crate) mod tests {
             "the connect completes once the lock is free"
         );
         assert_eq!(cs.tip_hash(), b4.block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leaf set `getchaintips` reads is maintained incrementally, so it has
+    /// to agree with what a full scan of the block index would produce — after
+    /// every path that creates an index entry, not just the one a test happens
+    /// to exercise.
+    ///
+    /// Deriving it by scanning was O(index) per `getchaintips` call, which on a
+    /// mainnet node is a million rows to answer a question with a handful of
+    /// rows in it.
+    #[test]
+    fn the_incremental_leaf_set_agrees_with_a_full_scan() {
+        use crate::storage::Store as _;
+
+        fn scan_leaves(cs: &ChainState) -> std::collections::HashSet<BlockHash> {
+            let mut all = std::collections::HashSet::new();
+            let mut parents = std::collections::HashSet::new();
+            cs.store_ref()
+                .for_each_block_index(&mut |h, e| {
+                    all.insert(h);
+                    parents.insert(e.header.prev_blockhash);
+                })
+                .expect("scan");
+            all.difference(&parents).copied().collect()
+        }
+        fn check(cs: &ChainState, what: &str) {
+            let mut incremental: Vec<BlockHash> = cs.tips.read().iter().copied().collect();
+            let mut scanned: Vec<BlockHash> = scan_leaves(cs).into_iter().collect();
+            incremental.sort();
+            scanned.sort();
+            assert_eq!(incremental, scanned, "leaf set diverged after {what}");
+        }
+
+        let (cs, dir) = make_chain_state();
+        check(&cs, "construction");
+
+        // `accept_block`, extending the tip.
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis, 1, 1_700_000_001);
+        cs.accept_block(&a1).expect("a1");
+        check(&cs, "accept_block extending the tip");
+
+        // `accept_header`, on a competing branch.
+        let b1 = build_test_block(genesis, 1, 1_700_000_099);
+        cs.accept_header(&b1.header).expect("b1 header");
+        check(&cs, "accept_header on a fork");
+
+        // `accept_headers`, extending that branch.
+        let b2 = build_test_block(b1.block_hash(), 2, 1_700_000_100);
+        let (n, err) = cs.accept_headers(&[b2.header]);
+        assert_eq!((n, err.is_none()), (1, true));
+        check(&cs, "accept_headers");
+
+        // `store_block`, filling in data for a header-only block.
+        cs.store_block(&b1).expect("store b1");
+        check(&cs, "store_block");
+
+        // `accept_block` on the side chain, which stores before deciding
+        // whether to reorg.
+        let a2 = build_test_block(a1.block_hash(), 2, 1_700_000_002);
+        cs.accept_block(&a2).expect("a2");
+        check(&cs, "accept_block on the side chain");
+
+        // And the RPC's view: every leaf, plus the active tip.
+        let reported: std::collections::HashSet<BlockHash> =
+            cs.chain_tip_hashes().into_iter().collect();
+        assert!(reported.contains(&cs.tip_hash()), "the active tip is always reported");
+        for h in scan_leaves(&cs) {
+            assert!(reported.contains(&h), "a leaf is missing from getchaintips: {h}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -75,6 +75,10 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- `getchaintips` no longer walks the whole block index on every call. The leaf
+  set is maintained incrementally, the status of a stored-but-unvalidated
+  branch is `valid-headers` rather than `valid-fork`, and the order is
+  deterministic across calls (#662).
 - **Breaking:** `getblocktemplate` proposal mode validates the proposed block
   the way `submitblock` does. It ran a separate loop that skipped script
   verification by its own admission, and with it BIP 68 sequence locks, the

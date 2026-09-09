@@ -15209,7 +15209,88 @@ fn getchaintips_reports_a_stale_branch_alongside_the_active_one() {
     assert_eq!(stale["height"], json!(2));
     // A's two blocks both descend from genesis, which is the fork point.
     assert_eq!(stale["branchlen"], json!(2), "branchlen must count back to the fork point");
-    assert_ne!(stale["status"], json!("active"));
+    // Core keys the status on how far validation got, not on whether the
+    // branch reaches the active chain. A's blocks were connected and then
+    // reorged away, so they are validated: `valid-fork`. A branch that was
+    // only ever *stored* would be `valid-headers`, which is what satd used to
+    // report as `valid-fork` for both.
+    assert_eq!(stale["status"], json!("valid-fork"), "{tips:?}");
+
+    // The answer is derived from an incrementally maintained leaf set now, so
+    // two calls on an unchanged chain must agree exactly — including order.
+    let again = node_a.rpc_call("getchaintips").unwrap();
+    assert_eq!(
+        again["result"], json!(tips),
+        "getchaintips is not deterministic across calls"
+    );
+
+    // …and it survives a restart, which rebuilds the leaf set from the block
+    // index rather than from the sequence of calls that built the chain.
+    let datadir = node_a.datadir.clone();
+    let rpcport = node_a.rpcport;
+    node_a.stop();
+    let mut node_a = TestNode::start_with_datadir(&datadir, rpcport, &[]);
+    let after_restart = node_a.rpc_call("getchaintips").unwrap();
+    assert_eq!(
+        after_restart["result"], json!(tips),
+        "the leaf set seeded at startup disagrees with the one maintained live"
+    );
+    node_a.stop();
+}
+
+/// A header-only branch is `headers-only`, and a branch whose blocks were
+/// stored but never connected is `valid-headers` — Core distinguishes the two
+/// by whether the data is there, and both from `valid-fork`, which means the
+/// scripts were run. satd reported `valid-fork` for any branch with data whose
+/// fork point was on the active chain.
+#[test]
+fn getchaintips_distinguishes_a_stored_branch_from_a_validated_one() {
+    use serde_json::json;
+
+    let wallet_a = DeterministicWallet::from_secret([0x7a; 32]);
+    let wallet_b = DeterministicWallet::from_secret([0x7b; 32]);
+
+    // Node B builds a two-block branch from genesis and hands node A only its
+    // *headers*, so A knows the branch exists and has none of its data.
+    let mut node_b = TestNode::start(&[]);
+    let b_hashes: Vec<String> = node_b
+        .rpc_ok("generatetoaddress", vec![json!(2), json!(wallet_b.address.to_string())])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    let b_headers: Vec<String> = b_hashes
+        .iter()
+        .map(|h| {
+            node_b
+                .rpc_ok("getblockheader", vec![json!(h), json!(false)])
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    node_b.stop();
+
+    // Node A has a heavier chain, so B's branch stays a branch.
+    let mut node_a = TestNode::start(&[]);
+    node_a.rpc_ok("generatetoaddress", vec![json!(4), json!(wallet_a.address.to_string())]);
+    for hdr in &b_headers {
+        node_a.rpc_ok("submitheader", vec![json!(hdr)]);
+    }
+
+    let tips = node_a.rpc_call("getchaintips").unwrap();
+    let tips = tips["result"].as_array().unwrap_or_else(|| panic!("{tips}")).clone();
+    let branch = tips
+        .iter()
+        .find(|t| t["hash"] == json!(b_hashes[1]))
+        .unwrap_or_else(|| panic!("the header-only branch is missing: {tips:?}"));
+    assert_eq!(
+        branch["status"], json!("headers-only"),
+        "a branch with no block data is headers-only: {tips:?}"
+    );
+    assert_eq!(branch["branchlen"], json!(2));
+
     node_a.stop();
 }
 
