@@ -367,6 +367,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
+          # The runner image ships third-party apt sources (Google Chrome,
+          # Microsoft) that none of the packages below come from. A hash-sum
+          # mismatch on one of them fails the whole `apt-get update` under
+          # `set -euo pipefail`, and it does: that is what took every canary
+          # job down on 2026-09-09. Drop them first — this needs Ubuntu's own
+          # archives and nothing else.
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang \

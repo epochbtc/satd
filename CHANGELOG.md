@@ -70,6 +70,11 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- CI: every `apt-get update` drops the runner image's third-party apt sources
+  first. A hash-sum mismatch on Google's Chrome repository — which none of the
+  installed packages come from — was failing the whole step, and with it every
+  canary job.
+
 - The ephemeral dust rule is enforced on the single-transaction path, as Core
   does: a transaction that spends a resident dust parent without sweeping its
   dust is refused `missing-ephemeral-spends` instead of accepted (#703).
