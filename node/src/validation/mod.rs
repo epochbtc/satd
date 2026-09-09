@@ -48,10 +48,18 @@ pub enum ValidationError {
     BadTxNoOutputs,
     #[error("bad-txns-oversize")]
     BadTxOversize,
-    // Core distinguishes a single output exceeding MAX_MONEY
-    // (`bad-txns-vout-toolarge`) from the running/total sum exceeding it
-    // (`bad-txns-txouttotal-toolarge`). The negative-value case
-    // (`bad-txns-vout-negative`) cannot occur with an unsigned amount type.
+    // Core reads an output value as `int64_t` and distinguishes three cases:
+    // negative (`bad-txns-vout-negative`), a single output over MAX_MONEY
+    // (`bad-txns-vout-toolarge`), and the running total over it
+    // (`bad-txns-txouttotal-toolarge`).
+    //
+    // The negative case is *not* unreachable in Rust, whatever the amount
+    // type says: the wire format is eight bytes, and rust-bitcoin reads them
+    // as `u64`. A value with the high bit set is negative to Core and simply
+    // enormous to satd, so the two reported different reasons for the same
+    // bytes.
+    #[error("bad-txns-vout-negative")]
+    BadTxOutputNegative,
     #[error("bad-txns-vout-toolarge")]
     BadTxOutputTooLarge,
     #[error("bad-txns-txouttotal-toolarge")]

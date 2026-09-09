@@ -393,6 +393,21 @@ fn case_tx_no_outputs() -> Satd {
     })
 }
 
+/// An output value with the high bit set. Core reads the eight bytes as
+/// `int64_t`, so this is *negative* to it and `bad-txns-vout-negative`;
+/// rust-bitcoin reads them as `u64`, and satd called the same bytes
+/// `bad-txns-vout-toolarge`.
+fn case_tx_output_negative() -> Satd {
+    tx(&spending_tx(
+        OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+        // -1 as int64_t.
+        u64::MAX,
+        1,
+        0xffff_ffff,
+        0,
+    ))
+}
+
 fn case_tx_output_over_max() -> Satd {
     tx(&spending_tx(
         OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
@@ -687,6 +702,7 @@ fn cases() -> Vec<Case> {
         Case { name: "tx_no_inputs", core: Reject("bad-txns-vin-empty"), expect: Match, run: case_tx_no_inputs },
         Case { name: "tx_no_outputs", core: Reject("bad-txns-vout-empty"), expect: Match, run: case_tx_no_outputs },
         Case { name: "tx_output_over_max", core: Reject("bad-txns-vout-toolarge"), expect: Match, run: case_tx_output_over_max },
+        Case { name: "tx_output_negative", core: Reject("bad-txns-vout-negative"), expect: Match, run: case_tx_output_negative },
         Case { name: "tx_duplicate_inputs", core: Reject("bad-txns-inputs-duplicate"), expect: Match, run: case_tx_duplicate_inputs },
         Case { name: "coinbase_scriptsig_too_short", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_short },
         Case { name: "coinbase_scriptsig_too_long", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_long },

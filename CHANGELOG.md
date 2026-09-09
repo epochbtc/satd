@@ -75,6 +75,29 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** `testmempoolaccept` reports `txn-already-known` only while one
+  of the transaction's outputs is still an unspent coin, as Core does; it also
+  consulted the txindex, which finds a confirmed transaction forever, so a
+  fully-spent one was reported as already known instead of `missing-inputs`.
+  A missing input is `missing-inputs`, Core's own name for it, rather than the
+  mempool's internal reject reason (#665).
+- **Breaking:** an output value with the high bit set is `bad-txns-vout-negative`,
+  as Core reads it (`int64_t`), not `bad-txns-vout-toolarge` (#665).
+- **Breaking:** `submitpackage` applies `maxfeerate` and `maxburnamount`
+  instead of refusing them by name, bounds its array to Core's 1..25, checks
+  Core's child-with-parents topology, and always emits
+  `replaced-transactions` (#665).
+- `submitpackage` answers with an entry for every submitted wtxid, carrying
+  `package-not-validated` when the package aborted, `other-wtxid` for a
+  same-txid-different-witness member, and `fees.effective-feerate` /
+  `fees.effective-includes` for an accepted one. An unwound ephemeral-dust
+  parent is no longer reported as accepted (#665).
+- **Breaking:** `testmempoolaccept` reports `wtxid` on every result, adds
+  `fees.effective-feerate` and `fees.effective-includes`, bounds its array to
+  1..25, and applies package well-formedness from the same implementation the
+  mempool uses. `maxfeerate` is parsed as Core's `ParseFeeRate`: a negative
+  value is `-3 Amount out of range` and one at or above 1 BTC/kvB is `-8`,
+  where both used to be silently replaced by the default (#665).
 - **Breaking:** mempool reject reasons match Bitcoin Core's. A script failure
   is `mempool-script-verify-flag-failed` on the relay path and
   `block-script-verify-flag-failed` in `connect_block`, not

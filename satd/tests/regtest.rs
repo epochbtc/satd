@@ -1283,6 +1283,119 @@ fn test_getblocktemplate_fields() {
     node.stop();
 }
 
+/// `submitpackage` and `testmempoolaccept` both bound their array to Core's
+/// 1..25, and `submitpackage` checks Core's child-with-parents topology.
+/// Neither guard existed: an empty array was answered with an empty result,
+/// and a package of unrelated transactions was judged member by member, which
+/// is not what package acceptance means.
+#[test]
+fn the_package_rpcs_bound_their_array_and_check_topology() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+
+    for method in ["submitpackage", "testmempoolaccept"] {
+        let empty = node.rpc_call_with_params(method, vec![json!([])]).unwrap();
+        assert_eq!(empty["error"]["code"].as_i64(), Some(-8), "{method}: {empty}");
+        assert_eq!(
+            empty["error"]["message"].as_str(),
+            Some("Array must contain between 1 and 25 transactions."),
+            "{method}"
+        );
+
+        let too_many: Vec<serde_json::Value> =
+            (0..26).map(|_| json!(TX_WITHOUT_SIGDATA)).collect();
+        let over = node
+            .rpc_call_with_params(method, vec![json!(too_many)])
+            .unwrap();
+        assert_eq!(over["error"]["code"].as_i64(), Some(-8), "{method}: {over}");
+    }
+
+    // Two unrelated transactions are not a child with its parents.
+    let unrelated = node
+        .rpc_call_with_params(
+            "submitpackage",
+            vec![json!([TX_WITHOUT_SIGDATA, TX_WITH_SIGDATA])],
+        )
+        .unwrap();
+    assert_eq!(unrelated["error"]["code"].as_i64(), Some(-25), "{unrelated}");
+    assert!(
+        unrelated["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("package topology disallowed"),
+        "{unrelated}"
+    );
+
+    node.stop();
+}
+
+/// Core's `ParseFeeRate` bounds `maxfeerate`: negative is `-3 Amount out of
+/// range` and one whole BTC per kvB or more is `-8`. satd's parser replaced
+/// anything it could not read with the default, so exactly the values a caller
+/// passes the argument to be protected from became 0.10 silently.
+#[test]
+fn maxfeerate_is_bounded_rather_than_silently_defaulted() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+
+    for method in ["submitpackage", "testmempoolaccept"] {
+        let negative = node
+            .rpc_call_with_params(method, vec![json!([TX_WITHOUT_SIGDATA]), json!(-0.01)])
+            .unwrap();
+        assert_eq!(negative["error"]["code"].as_i64(), Some(-3), "{method}: {negative}");
+        assert_eq!(
+            negative["error"]["message"].as_str(),
+            Some("Amount out of range"),
+            "{method}"
+        );
+
+        let too_high = node
+            .rpc_call_with_params(method, vec![json!([TX_WITHOUT_SIGDATA]), json!(1)])
+            .unwrap();
+        assert_eq!(too_high["error"]["code"].as_i64(), Some(-8), "{method}: {too_high}");
+        assert_eq!(
+            too_high["error"]["message"].as_str(),
+            Some("Fee rates larger than or equal to 1BTC/kvB are not accepted"),
+            "{method}"
+        );
+
+        // …and 0.99 is accepted, so the ceiling is at 1 and not lower.
+        let ok = node
+            .rpc_call_with_params(method, vec![json!([TX_WITHOUT_SIGDATA]), json!(0.99)])
+            .unwrap();
+        let msg = ok["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("Fee rates larger") && !msg.contains("Amount out of range"),
+            "{method}: 0.99 BTC/kvB must be under the ceiling: {ok}"
+        );
+    }
+
+    node.stop();
+}
+
+/// `submitpackage` emits `replaced-transactions` unconditionally, as Core
+/// does. satd omitted the field entirely, because `accept_package` never
+/// returned a replaced set.
+#[test]
+fn submitpackage_always_reports_replaced_transactions() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let response = node
+        .rpc_call_with_params("submitpackage", vec![json!([TX_WITHOUT_SIGDATA])])
+        .unwrap();
+    // The package itself is refused — what matters is the response shape.
+    let result = &response["result"];
+    assert!(
+        result["replaced-transactions"].is_array(),
+        "replaced-transactions must always be present: {response}"
+    );
+    assert!(result["tx-results"].is_object(), "{response}");
+    node.stop();
+}
+
 /// A transaction spending an outpoint that exists nowhere. Structurally valid,
 /// contextually dead: the block carrying it fails at input resolution.
 fn spend_of_a_nonexistent_output() -> bitcoin::Transaction {
@@ -14796,7 +14909,9 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
 
     // A `.one()` failure used to surface as
     //   -1 "ErrorObject { code: InvalidParams, message: \"Invalid params\", .. }"
-    // which leaks the server's internal types to any caller.
+    // which leaks the server's internal types to any caller. `maxfeerate` is
+    // enforced now rather than refused by name, so a Core-shaped call gets
+    // past argument handling entirely and is answered by package validation.
     let with_maxfeerate = node
         .rpc_call_with_params(
             "submitpackage",
@@ -14808,8 +14923,10 @@ fn methods_accept_the_optional_arguments_core_declares_for_them() {
         !msg.contains("ErrorObject"),
         "an argument error must not be a Rust Debug dump: {with_maxfeerate}"
     );
-    assert_eq!(with_maxfeerate["error"]["code"], serde_json::json!(-8), "{with_maxfeerate}");
-    assert!(msg.contains("maxfeerate"), "the refusal must name the argument: {msg}");
+    assert!(
+        !msg.contains("maxfeerate"),
+        "maxfeerate is applied now, not refused by name: {with_maxfeerate}"
+    );
 
     // `converttopsbt` takes `permitsigdata` second. Default false: a
     // transaction carrying signature data is refused, not silently stripped.

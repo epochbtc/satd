@@ -410,13 +410,13 @@ reason = "no-core-zmq"
 file = "mempool_accept.py"
 status = "skip"
 reason = "rpc-missing"
-note = "`getmempoolinfo` has no `permitbaremultisig` field"
+note = "re-measured after the #665 shape work, which carried it from line 113 to line 287: four divergences fixed on the way (missing `wtxid`, the lenient `maxfeerate` parser, `txn-already-known` decided from the txindex, and `bad-txns-vout-negative`). The remaining blocker is unrelated: with `-txindex` the test's `getrawtransaction` of a coinbase answers `-5 Use -txindex` after `getindexinfo` reports the index synced. Follow-up: txindex completeness over a cached datadir"
 
 [[test]]
 file = "mempool_accept_wtxid.py"
 status = "skip"
-reason = "rpc-missing"
-note = "`testmempoolaccept` results have no `wtxid` field"
+reason = "feature-missing"
+note = "re-measured after `wtxid` was added to every `testmempoolaccept` result: the blocker is now BIP 339 wtxid relay, which satd does not implement at all — it announces txids under MSG_WITNESS_TX, so `wait_for_broadcast([wtxid])` never matches. Follow-up: BIP 339 wtxid relay"
 
 [[test]]
 file = "mempool_cluster.py"
@@ -990,7 +990,7 @@ note = "needs `getorphantxs`"
 file = "rpc_packages.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_raises_rpc_error saw no exception -- submitpackage accepts calls Core rejects, and omits result entries (#665). Follow-up: #665"
+note = "re-measured after #665: the package shape, limits, topology and arity all pass now, and the test runs to `test_submitpackage_with_ancestors`, where it waits for the node to announce four *wtxids*. satd has no BIP 339 wtxid relay. Follow-up: BIP 339 wtxid relay"
 
 [[test]]
 file = "rpc_preciousblock.py"
