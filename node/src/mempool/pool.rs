@@ -2418,8 +2418,21 @@ impl Mempool {
         // transaction that pays anything is refused here, so a zero-fee dusty
         // one falls through to the relay floor below and reports "min relay
         // fee not met" exactly as Core does.
+        //
+        // Core gates it on `require_standard` alongside `IsStandardTx`, so
+        // `-acceptnonstdtxn` lifts it, and it joins the exemptable standardness
+        // set an `allow` rule can forgive (§6.2). An earlier deferred failure
+        // wins: Core reports `IsStandardTx`'s verdict first because it runs
+        // first.
         let fee_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
-        Self::pre_check_ephemeral(&tx, fee, fee_delta, cfg.dust_relay_fee)?;
+        if !cfg.accept_non_std_txn
+            && let Err(e) = Self::pre_check_ephemeral(&tx, fee, fee_delta, cfg.dust_relay_fee)
+        {
+            if !has_allow {
+                return Err(e);
+            }
+            deferred_nonstd.get_or_insert(e);
+        }
 
         // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
