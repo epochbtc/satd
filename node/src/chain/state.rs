@@ -5721,11 +5721,16 @@ impl ChainState {
         if let Some(entry) = self.store.get_block_index(&hash) {
             return Ok(Some(
                 match entry.status {
-                    BlockStatus::Valid => "duplicate",
+                    // Core tests `IsValid(BLOCK_VALID_SCRIPTS)`, a validity
+                    // level pruning does not lower: a pruned block was
+                    // connected and judged, only its data is gone.
+                    BlockStatus::Valid | BlockStatus::Pruned => "duplicate",
                     BlockStatus::Invalid => "duplicate-invalid",
-                    // Header-only, stored-but-unvalidated, or pruned: the node
-                    // knows the block but has not decided about its contents.
-                    _ => "duplicate-inconclusive",
+                    // Header-only or stored-but-unvalidated: the node knows
+                    // the block but has not decided about its contents.
+                    BlockStatus::HeaderOnly | BlockStatus::DataStored => {
+                        "duplicate-inconclusive"
+                    }
                 }
                 .to_string(),
             ));
@@ -9920,6 +9925,22 @@ pub(crate) mod tests {
             cs.test_block_validity(&blocks[0]).unwrap().as_deref(),
             Some("duplicate"),
             "a block deeper in the chain is equally a duplicate"
+        );
+
+        // Pruning drops a block's data, not the judgement the node reached
+        // about it: Core's `IsValid(BLOCK_VALID_SCRIPTS)` still holds, so it
+        // is still `duplicate` — not `duplicate-inconclusive`, which would
+        // tell a miner the node never decided.
+        let pruned_hash = blocks[0].block_hash();
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut entry = cs.get_block_index(&pruned_hash).unwrap();
+        entry.status = BlockStatus::Pruned;
+        batch.block_index_puts.push((pruned_hash, entry));
+        cs.store.write_batch(batch).unwrap();
+        assert_eq!(
+            cs.test_block_validity(&blocks[0]).unwrap().as_deref(),
+            Some("duplicate"),
+            "a pruned block was judged; it is a duplicate"
         );
 
         // A block that is genuinely unknown and off the tip keeps the old
