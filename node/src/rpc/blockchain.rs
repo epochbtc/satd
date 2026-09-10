@@ -880,38 +880,34 @@ pub fn get_block_stats(
 /// `getchaintips` — return info for every chain tip known to the block index.
 ///
 /// A "tip" is any block whose hash does not appear as the `prev_blockhash` of
-/// any other indexed block.  The active tip always appears first (highest
-/// chainwork); the rest are sorted by height descending, matching Core's
-/// output.
+/// any other indexed block, plus the active tip (which Core reports
+/// unconditionally, even when a header-only descendant technically takes it
+/// out of the leaf set). Sorted by height descending, then by hash, matching
+/// Core's `CompareBlocksByHeight` with a deterministic tie-break in place of
+/// its pointer order.
+///
+/// The leaf set is maintained incrementally by `ChainState`; this used to
+/// derive it by walking the entire block index on every call, which on a
+/// mainnet node is a million-row scan to answer a question whose answer has a
+/// handful of rows in it.
 pub fn get_chain_tips(chain_state: &ChainState) -> Value {
     use crate::storage::blockindex::BlockStatus;
-    use std::collections::{HashMap, HashSet};
 
     let (active_tip_hash, _active_tip_height) = chain_state.tip_snapshot();
 
-    // Collect every block index entry and the set of hashes that are
-    // referenced as a parent by some other entry.
-    let mut entries: HashMap<bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry> =
-        HashMap::new();
-    let mut has_child: HashSet<bitcoin::BlockHash> = HashSet::new();
+    let mut tips: Vec<(bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry)> =
+        chain_state
+            .chain_tip_hashes()
+            .into_iter()
+            .filter_map(|h| chain_state.get_block_index(&h).map(|e| (h, e)))
+            .collect();
 
-    let _ = chain_state.store_ref().for_each_block_index(&mut |hash, entry| {
-        has_child.insert(entry.header.prev_blockhash);
-        entries.insert(hash, entry);
-    });
-
-    // Tips are leaf nodes of the block-index DAG (no other entry has them
-    // as `prev_blockhash`).  The active tip is always included even if it
-    // has header-only children — a header-only descendant does not extend
-    // the connected chain.
-    let mut tips: Vec<(bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry)> = entries
-        .iter()
-        .filter(|(h, _)| !has_child.contains(*h) || **h == active_tip_hash)
-        .map(|(h, e)| (*h, e.clone()))
-        .collect();
-
-    // Sort by height descending — Core's output order.
-    tips.sort_by(|(_h_a, e_a), (_h_b, e_b)| e_b.height.cmp(&e_a.height));
+    // Height descending, then hash — Core sorts by height and breaks ties on
+    // the block-index pointer, which is arbitrary but stable within a process.
+    // Hash is equally Core-compatible (Core promises no order beyond height)
+    // and stable across calls and restarts, so two `getchaintips` calls on an
+    // unchanged chain cannot disagree.
+    tips.sort_by(|(h_a, e_a), (h_b, e_b)| e_b.height.cmp(&e_a.height).then(h_a.cmp(h_b)));
 
     let result: Vec<Value> = tips
         .iter()
@@ -926,66 +922,63 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
             }
 
             // Walk back from this tip until we hit a block on the active
-            // chain.  That gives us the fork point and therefore the
-            // branch length.
+            // chain. That gives the fork point and therefore the branch
+            // length, and on the way it collects the two facts the status
+            // depends on. The walk is bounded by the branch length, not by
+            // the size of the index.
             let mut cursor = *hash;
             let mut branch_len: u32 = 0;
-            let on_active = loop {
-                if chain_state.active_chain_hash_at_height(
-                    entries.get(&cursor).map_or(0, |e| e.height),
-                ) == Some(cursor)
-                {
-                    // `cursor` itself is on the active chain — it is the
-                    // fork point.
-                    break true;
-                }
-                branch_len += 1;
-                let prev = entries
-                    .get(&cursor)
-                    .map(|e| e.header.prev_blockhash);
-                match prev {
-                    Some(p) if entries.contains_key(&p) => cursor = p,
-                    _ => break false,
-                }
-            };
-
-            // Determine status.
-            //
-            // Walk the branch from tip back `branch_len` blocks.  If ANY
-            // block on the branch is `Invalid`, the tip is `invalid`.
-            // Otherwise, if every block has full data (`DataStored` or
-            // `Valid`), it is `valid-fork` (when the fork point is on the
-            // active chain) or `valid-headers`.  If any block is
-            // `HeaderOnly`, the status is `headers-only` (when the fork
-            // point is NOT on the active chain) or `valid-headers`.
             let mut any_invalid = false;
             let mut all_have_data = true;
-            {
-                let mut c = *hash;
-                for _ in 0..branch_len {
-                    if let Some(e) = entries.get(&c) {
-                        if e.status == BlockStatus::Invalid {
-                            any_invalid = true;
-                        }
-                        if e.status == BlockStatus::HeaderOnly {
-                            all_have_data = false;
-                        }
-                        c = e.header.prev_blockhash;
-                    } else {
-                        all_have_data = false;
-                        break;
-                    }
+            let on_active = loop {
+                let Some(e) = chain_state.get_block_index(&cursor) else {
+                    // The branch runs off the end of what the index holds, so
+                    // it cannot be connected: Core's `HaveNumChainTxs()` is
+                    // false for exactly this.
+                    all_have_data = false;
+                    break false;
+                };
+                if chain_state.active_chain_hash_at_height(e.height) == Some(cursor) {
+                    // `cursor` is on the active chain — the fork point. Its
+                    // own status belongs to the active chain, not the branch.
+                    break true;
                 }
-            }
+                if e.status == BlockStatus::Invalid {
+                    any_invalid = true;
+                }
+                if e.status == BlockStatus::HeaderOnly {
+                    all_have_data = false;
+                }
+                branch_len += 1;
+                cursor = e.header.prev_blockhash;
+            };
 
+            // Core (`rpc/blockchain.cpp`) keys the status on how far
+            // validation got, not on whether the branch reaches the active
+            // chain:
+            //
+            // - `BLOCK_FAILED_VALID` anywhere → `invalid`
+            // - `!HaveNumChainTxs()` (data missing on the block or an
+            //   ancestor) → `headers-only`
+            // - `IsValid(BLOCK_VALID_SCRIPTS)` → `valid-fork`
+            // - `IsValid(BLOCK_VALID_TREE)` → `valid-headers`
+            //
+            // satd reported `valid-fork` for a branch whose blocks were only
+            // *stored*, never validated, whenever the fork point was on the
+            // active chain. Stored-but-unvalidated is Core's `valid-headers`:
+            // the difference is exactly whether the node has run the scripts.
             let status = if any_invalid {
                 "invalid"
-            } else if all_have_data && on_active {
-                "valid-fork"
-            } else if all_have_data {
-                "valid-headers"
-            } else {
+            } else if !all_have_data || !on_active {
                 "headers-only"
+            } else {
+                match entry.status {
+                    // Validated, then pruned: still a validated fork.
+                    BlockStatus::Valid | BlockStatus::Pruned => "valid-fork",
+                    BlockStatus::DataStored => "valid-headers",
+                    BlockStatus::HeaderOnly => "headers-only",
+                    BlockStatus::Invalid => "invalid",
+                }
             };
 
             json!({
