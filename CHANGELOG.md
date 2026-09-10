@@ -98,8 +98,10 @@ item below is (or will be) written up in full in the in-development
   DOM-parsed, which cost several times its size in peak memory (#664).
 - Five RPC fields that were constants stop pretending to be measurements
   (#702): `getblockchaininfo.size_on_disk` is a maintained total of block-file
-  bytes instead of `0`; `getblockchaininfo.pruneheight` is reported (and
-  persisted across restarts) on a node that has actually pruned;
+  bytes instead of `0`; `getblockchaininfo.pruneheight` is reported on a
+  pruning node with Core's meaning — the lowest height from which every block
+  up to the tip is still stored, `0` until something has been deleted — and
+  persisted across restarts;
   `getchainstates[].coins_tip_cache_bytes` reports the configured coin-cache
   budget, as Core's does; `getrpcinfo.active_commands` lists the requests
   actually executing instead of an empty array; and `getpeerinfo.inflight`

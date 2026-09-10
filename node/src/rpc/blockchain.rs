@@ -162,14 +162,12 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     // Core emits these only on a pruned node, so they follow the flag rather
     // than always appearing.
     //
-    // `pruneheight` follows a stricter rule still: Core emits it for a node
-    // that has actually deleted something, and satd now keeps a persisted
-    // floor to answer with. Absent — not zero — on a pruning node that has
-    // not yet pruned anything, because `0` claims "everything from genesis
-    // is here", which is the opposite of what an absent field means to a
-    // client deciding whether to ask this node for an old block.
-    if let Some(h) = chain_state.prune_height() {
-        out["pruneheight"] = json!(h);
+    // `pruneheight` is emitted whenever prune mode is on, `0` until
+    // something has actually been deleted — `GetPruneHeight` is `nullopt`
+    // then and the RPC writes 0 (`rpc/blockchain.cpp`). `0` is accurate on
+    // such a node: everything from genesis *is* here.
+    if prune_target_mb.is_some() {
+        out["pruneheight"] = json!(chain_state.prune_height().unwrap_or(0));
     }
     if let Some(mib) = prune_target_mb {
         // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes

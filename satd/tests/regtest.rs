@@ -3230,6 +3230,9 @@ fn test_blocksonly_and_prune_are_reported() {
         "{chain}"
     );
     assert_eq!(chain["automatic_pruning"], serde_json::json!(true), "{chain}");
+    // Emitted whenever prune mode is on, and `0` until something has been
+    // deleted — `GetPruneHeight` is `nullopt` then and Core writes 0.
+    assert_eq!(chain["pruneheight"], serde_json::json!(0), "{chain}");
     node.stop();
 }
 
@@ -14483,12 +14486,12 @@ fn the_reported_placeholders_are_real_numbers_now() {
         "five more blocks must grow it: {before} -> {after}"
     );
 
-    // Never pruned, so Core omits `pruneheight` entirely. A `0` here would
-    // claim "everything from genesis is present" on a node that had pruned.
+    // Not in prune mode, so Core omits `pruneheight` entirely (it is emitted
+    // under `IsPruneMode()` only).
     let info = node.rpc_call("getblockchaininfo").unwrap();
     assert!(
         info["result"].get("pruneheight").is_none(),
-        "an unpruned node reports no prune floor: {info}"
+        "a node not in prune mode reports no prune floor: {info}"
     );
     assert_eq!(info["result"]["pruned"], json!(false), "{info}");
 

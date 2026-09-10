@@ -7855,17 +7855,10 @@ impl ChainState {
         }
 
         // Record the new floor for `getblockchaininfo`'s `pruneheight`.
-        //
-        // The floor is the lowest height whose data survived, not
-        // `prune_below + 1`: pruning deletes whole *files*, and a file
-        // holding any block above the cut is kept whole — so blocks below
-        // the cut that share a kept file are still on disk, and claiming
-        // otherwise would tell a client a block it can have is gone. Walk up
-        // from the previous floor, which is O(blocks actually removed) rather
-        // than O(chain).
+        // The walk runs down from the tip and stops at the block just
+        // deleted, so it is O(retained window), not O(chain).
         if deleted > 0 {
-            let from = self.store.prune_height().unwrap_or(0);
-            let floor = self.lowest_stored_height(from, tip_height);
+            let floor = self.stored_run_floor();
             if let Err(e) = self.store.set_prune_height(floor) {
                 tracing::warn!("Failed to record the prune height: {}", e);
             }
@@ -7874,38 +7867,58 @@ impl ChainState {
         deleted
     }
 
-    /// The lowest height at or above `from` whose block data is still on
-    /// disk — the value behind `getblockchaininfo`'s `pruneheight`.
+    /// Core's `pruneheight`: the lowest height from which every block up to
+    /// the tip still has its data — `GetPruneHeight` (`rpc/blockchain.cpp`)
+    /// plus one. `0` when nothing on the active chain is pruned.
     ///
-    /// Walks up rather than computing `prune_below + 1`, because pruning
-    /// deletes whole *files* and keeps any file holding a block above the
-    /// cut. Blocks below the cut that share a kept file are therefore still
-    /// readable, and claiming otherwise would tell a client that a block it
-    /// can have is gone. Starting from the previous floor makes this
-    /// O(blocks actually removed), not O(chain).
-    pub(crate) fn lowest_stored_height(&self, from: u32, tip_height: u32) -> u32 {
-        let mut floor = from;
-        while floor <= tip_height {
-            match self.store.get_block_hash_by_height(floor) {
-                Some(hash)
-                    if self
-                        .store
-                        .get_block_index(&hash)
-                        .is_some_and(|e| e.status == BlockStatus::Pruned) =>
-                {
-                    floor += 1;
-                }
-                _ => break,
+    /// The walk goes *down* from the tip and stops at the first block whose
+    /// data is gone. That direction is the whole meaning of the field: a
+    /// client reads `pruneheight` as "everything at or above this is here",
+    /// so a stored straggler *below* a hole must not lower it. Pruning
+    /// deletes whole files, and satd's files interleave heights (parallel
+    /// IBD, `repair_block_data`), so a block below the cut can survive with
+    /// the blocks above it gone; the field has to answer for the blocks
+    /// above it, not for the straggler. Parent pointers, not the height
+    /// index, so a fork header in the index cannot divert it.
+    pub(crate) fn stored_run_floor(&self) -> u32 {
+        let (mut hash, mut height) = self.tip_snapshot();
+        // Genesis has no undo data and is never counted as pruned (Core
+        // starts its search at `chain[1]`).
+        while height > 0 {
+            let Some(entry) = self.store.get_block_index(&hash) else {
+                // An index hole above a stored block reads as a missing
+                // block: the run of complete blocks starts above it.
+                return height + 1;
+            };
+            if entry.status == BlockStatus::Pruned {
+                return height + 1;
             }
+            hash = entry.header.prev_blockhash;
+            height -= 1;
         }
-        floor
+        0
     }
 
-    /// Lowest height whose block data is still stored — Core's
-    /// `pruneheight`. `None` on a node that has never pruned, which is how
-    /// Core decides whether to emit the field at all.
+    /// The persisted `pruneheight`, Core's semantics (see
+    /// [`Self::stored_run_floor`]). `None` on a node that has never recorded
+    /// one; the RPC reports `0` for that on a pruning node, as Core does.
     pub fn prune_height(&self) -> Option<u32> {
         self.store.prune_height()
+    }
+
+    /// Establish the persisted `pruneheight` on a pruning node that has none
+    /// yet — a datadir pruned by a version that kept no floor. Bounded by the
+    /// retained window on a node that has pruned; a single O(chain) walk on
+    /// one that has not, which is why it runs at startup and not per RPC
+    /// call.
+    pub fn refresh_prune_height_if_unset(&self) {
+        if self.store.prune_height().is_some() {
+            return;
+        }
+        let floor = self.stored_run_floor();
+        if let Err(e) = self.store.set_prune_height(floor) {
+            tracing::warn!("Failed to record the prune height: {}", e);
+        }
     }
 
     /// Check if a block has been pruned.
@@ -12524,8 +12537,14 @@ pub(crate) mod tests {
     /// deletes whole files and keeps any file holding a block above the cut,
     /// so blocks below it can still be on disk, and reporting the cut would
     /// tell a client a block it can have is gone.
+    ///
+    /// The first shape of this walked *up* from the lowest stored block and
+    /// asserted that a hole above it did not move the floor. That is the
+    /// inverse of Core's `GetPruneHeight`, which walks down from the tip and
+    /// reports the bottom of the contiguous run — the only reading under
+    /// which "everything at or above `pruneheight` is here" holds.
     #[test]
-    fn the_prune_floor_is_the_lowest_block_still_stored() {
+    fn the_prune_floor_is_the_bottom_of_the_run_that_reaches_the_tip() {
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
@@ -12538,41 +12557,49 @@ pub(crate) mod tests {
         }
         assert_eq!(cs.tip_height(), 6);
 
-        // Nothing pruned: the floor is genesis, and the RPC reports nothing.
-        assert_eq!(cs.lowest_stored_height(0, 6), 0);
-        assert_eq!(cs.prune_height(), None, "an unpruned node has no floor");
-
-        // Mark 0..=2 pruned, as deleting the file holding them would.
-        let mut batch = crate::storage::StoreBatch::default();
-        for h in &hashes[0..3] {
+        let mark_pruned = |h: &BlockHash| {
+            let mut batch = crate::storage::StoreBatch::default();
             let mut entry = cs.get_block_index(h).unwrap();
             entry.status = BlockStatus::Pruned;
             batch.block_index_puts.push((*h, entry));
+            cs.store.write_batch(batch).unwrap();
+        };
+
+        // Nothing pruned: 0, and nothing has been recorded yet.
+        assert_eq!(cs.stored_run_floor(), 0);
+        assert_eq!(cs.prune_height(), None, "nothing recorded on a fresh node");
+
+        // Mark 1..=2 pruned, as deleting the file holding them would.
+        for h in &hashes[1..3] {
+            mark_pruned(h);
         }
-        cs.store.write_batch(batch).unwrap();
         assert_eq!(
-            cs.lowest_stored_height(0, 6),
+            cs.stored_run_floor(),
             3,
-            "the first three are gone, so block 3 is the floor"
+            "blocks 1 and 2 are gone, so 3 is the first of the complete run"
         );
 
-        // A gap: block 4 pruned while 3 survives (its file held a later
-        // block). The floor must stay at 3 — walking past a stored block
-        // would report a block the node has as unavailable.
-        let mut batch = crate::storage::StoreBatch::default();
-        let mut entry = cs.get_block_index(&hashes[4]).unwrap();
-        entry.status = BlockStatus::Pruned;
-        batch.block_index_puts.push((hashes[4], entry));
-        cs.store.write_batch(batch).unwrap();
+        // A straggler: block 4 pruned while 3 survives (its file held a
+        // later block). The run that reaches the tip now starts at 5, and
+        // that is the answer — a client told 3 would ask for 4 and be
+        // refused. The straggler at 3 does not lower it.
+        mark_pruned(&hashes[4]);
         assert_eq!(
-            cs.lowest_stored_height(0, 6),
-            3,
-            "a hole above the floor does not move it"
+            cs.stored_run_floor(),
+            5,
+            "a hole above a stored block moves the floor above the hole"
         );
 
-        // Persisted and read back, so a restart does not forget.
-        cs.store.set_prune_height(3).unwrap();
-        assert_eq!(cs.prune_height(), Some(3));
+        // The tip itself pruned: everything is, and Core answers tip + 1.
+        mark_pruned(&hashes[6]);
+        assert_eq!(cs.stored_run_floor(), 7);
+
+        // Persisted and read back, so a restart does not forget; and a
+        // datadir with no record gets one established from the index.
+        cs.store.set_prune_height(5).unwrap();
+        assert_eq!(cs.prune_height(), Some(5));
+        cs.refresh_prune_height_if_unset();
+        assert_eq!(cs.prune_height(), Some(5), "an existing record is kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

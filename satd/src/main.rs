@@ -2004,6 +2004,10 @@ async fn main() {
 
     if config.prune > 0 {
         tracing::info!(target_mb = config.prune, "Block pruning enabled");
+        // A datadir pruned before satd kept a floor has no `pruneheight`
+        // record; establish one from the block index so the RPC does not
+        // answer `0` for a node that has deleted blocks.
+        chain_state.refresh_prune_height_if_unset();
     }
 
     if config.proxy.is_some() {
