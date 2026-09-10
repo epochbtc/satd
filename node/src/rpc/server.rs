@@ -2987,31 +2987,25 @@ pub async fn start(
             ));
         }
 
-        // Core hands the string to `OpenNetworkConnection`, which `Lookup()`s
-        // it, so a hostname is as valid here as a literal — `feature_anchors`
-        // passes an `.onion`. Parsing a bare `SocketAddr`, as this did,
-        // rejected everything else.
-        let target = ctx
-            .peer_manager
-            .resolve_peer_target(
-                &address,
-                crate::net::peer::default_p2p_port(ctx.chain_state.network),
-            )
-            .await
-            .map_err(|e| {
-                ErrorObjectOwned::owned(-8, format!("Invalid address: {address}: {e}"), None::<()>)
-            })?;
-
         // -34 = RPC_CLIENT_NODE_CAPACITY_REACHED. Core capacity-checks before
         // dialling and reports that code; every other failure here is a plain
         // misc error, as Core's OpenNetworkConnection failures are.
         //
-        // The dial itself is not awaited: Core returns once the socket is
-        // connected, and its test framework binds the listener, calls this,
-        // and only then accepts — so awaiting the handshake here deadlocks
-        // against the caller until the dial times out.
+        // Neither the dial nor the name lookup is awaited. Core hands the
+        // operator's string to `OpenNetworkConnection` and returns once the
+        // socket is connected, never waiting for the peer's `version`, and its
+        // `Lookup` runs on the dial thread — so a target that does not resolve
+        // is a successful `addconnection` with a line in the log, exactly like
+        // a dial that was refused. Waiting here for either instead deadlocks
+        // against the functional-test framework, which binds a listener, calls
+        // this, and only then accepts.
         ctx.peer_manager
-            .add_connection(target, conn_type, v2transport)
+            .add_connection(
+                &address,
+                crate::net::peer::default_p2p_port(ctx.chain_state.network),
+                conn_type,
+                v2transport,
+            )
             .map_err(|e| {
                 let code = if e.starts_with("Error: Already at capacity") { -34 } else { -1 };
                 ErrorObjectOwned::owned(code, e, None::<()>)

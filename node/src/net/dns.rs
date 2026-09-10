@@ -270,15 +270,21 @@ pub async fn resolve_peer_target(
     }
 }
 
+/// Whether `s` names a `.onion` service, with or without a port.
+///
+/// Decided by inspection, never by a resolver, so a caller can refuse or
+/// route an onion target synchronously.
+pub fn is_onion_target(s: &str) -> bool {
+    if s.ends_with(".onion") {
+        return true;
+    }
+    matches!(s.rsplit_once(':'), Some((host, _)) if host.ends_with(".onion"))
+}
+
 /// Whether `s` needs a name lookup to become a socket address — i.e. it is
 /// neither a `.onion` target nor an IP literal (with or without a port).
 fn looks_like_a_name(s: &str) -> bool {
-    if s.ends_with(".onion") {
-        return false;
-    }
-    if let Some((host, _)) = s.rsplit_once(':')
-        && host.ends_with(".onion")
-    {
+    if is_onion_target(s) {
         return false;
     }
     if s.parse::<SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok() {

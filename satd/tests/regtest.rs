@@ -15418,8 +15418,11 @@ fn addconnection_returns_without_waiting_for_the_dial() {
 /// satd — like Core — dials one resolved address, so waiting for a connection
 /// here would depend on which family the runner prefers. (It hung CI for an
 /// hour when it did.) The dial itself is covered by
-/// `addconnection_returns_without_waiting_for_the_dial`, and the resolver's
-/// own behaviour by the `net::dns` unit tests.
+/// `addconnection_returns_without_waiting_for_the_dial` and by the literal
+/// address at the end of this test, which does connect; the resolver's own
+/// behaviour by the `net::dns` unit tests. Resolution now happens on the dial
+/// task, so no argument shape is refused for failing to resolve — the third
+/// block below is what proves a target still reaches the network.
 #[test]
 fn addconnection_accepts_a_hostname() {
     use addconn_listener::Inbound;
@@ -15441,8 +15444,8 @@ fn addconnection_accepts_a_hostname() {
     );
     assert_eq!(out["result"]["address"], json!(by_name), "{out}");
 
-    // A name that cannot resolve is still an error, so the acceptance above
-    // is resolution rather than a parse that stopped checking.
+    // A name that cannot resolve is a *successful* call, as it is in Core —
+    // see `addconnection_reports_success_when_the_target_does_not_resolve`.
     let out = node
         .rpc_call_with_params(
             "addconnection",
@@ -15453,10 +15456,9 @@ fn addconnection_accepts_a_hostname() {
             ],
         )
         .unwrap();
-    assert_eq!(
-        out["error"]["code"].as_i64(),
-        Some(-8),
-        "an unresolvable name is refused: {out}"
+    assert!(
+        out["error"].is_null(),
+        "an unresolvable name is a failed dial, not an RPC error: {out}"
     );
 
     // An address that needs no lookup at all is unaffected, and this one is
@@ -15486,6 +15488,106 @@ fn addconnection_accepts_a_hostname() {
         "the peer dialled by literal address must connect",
     );
     drop(stream);
+}
+
+/// Core resolves the target on its dial thread, not in the RPC.
+///
+/// `CConnman::AddConnection` (v31.1 `src/net.cpp:1875`) returns false only for
+/// a disallowed connection type or a full capacity slot; otherwise it hands
+/// the operator's *string* to `OpenNetworkConnection`, and the `Lookup` runs
+/// inside `ConnectNode` (`src/net.cpp:406`) long after the RPC has answered.
+/// A name that does not resolve is therefore a failed dial — success on the
+/// wire, a line in the log — exactly like the refused dial that
+/// `addconnection_returns_without_waiting_for_the_dial` covers. satd resolved
+/// first and answered `-8 Invalid address`, an error Core cannot produce here.
+///
+/// `-dns=0` makes the failure deterministic and keeps the test off the
+/// network: the resolver refuses every name outright, so nothing depends on
+/// what the runner's DNS does with an `.invalid` label.
+#[test]
+fn addconnection_reports_success_when_the_target_does_not_resolve() {
+    use serde_json::json;
+
+    let node = TestNode::start(&["-dns=0"]);
+    let started = std::time::Instant::now();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!("peer.example:18444"),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "an unresolvable target is a failed dial, not an RPC error: {out}"
+    );
+    assert_eq!(
+        out["result"]["address"],
+        json!("peer.example:18444"),
+        "the string is echoed back unresolved, as Core echoes it: {out}"
+    );
+    assert_eq!(out["result"]["connection_type"], json!("outbound-full-relay"));
+    assert!(
+        started.elapsed() < test_timeout(3),
+        "the lookup must not be awaited (took {:?})",
+        started.elapsed()
+    );
+
+    // Under `-proxy` the resolver refuses names for a different reason — it
+    // would leak the lookup — and that refusal must be just as silent.
+    let proxied = TestNode::start(&["-proxy=127.0.0.1:1"]);
+    let out = proxied
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!("peer.example:18444"),
+                json!("block-relay-only"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "a lookup refused to protect the proxy is still a failed dial: {out}"
+    );
+
+    // The node is otherwise unharmed by either call.
+    let info = node.rpc_call("getpeerinfo").unwrap();
+    assert!(info["error"].is_null(), "{info}");
+}
+
+/// The one refusal that is satd's own, and stays synchronous.
+///
+/// satd types a connection at `spawn_peer`, on the socket dial path; the onion
+/// dial has no way to carry a requested type yet. Core has no such limitation,
+/// so this is a divergence — and a named error is the honest way to report a
+/// call that cannot do what it says, rather than a silent success and a log
+/// line the caller never sees. Recognising an onion target needs no resolver,
+/// which is why moving resolution to the dial task did not move this.
+#[test]
+fn addconnection_refuses_an_onion_target_by_name() {
+    use serde_json::json;
+
+    let node = TestNode::start(&["-dns=0"]);
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!("abcdefghijklmnop.onion:8333"),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert_eq!(out["error"]["code"].as_i64(), Some(-1), "{out}");
+    let msg = out["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("cannot open a typed connection to an onion address"),
+        "the refusal must name the reason: {out}"
+    );
 }
 
 /// Core sizes `semOutbound` at `min(m_max_automatic_outbound,

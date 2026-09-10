@@ -1517,38 +1517,62 @@ impl PeerManager {
     ///
     /// The capacity check stays synchronous so a refusal still reaches the
     /// caller as `-34`, which is the one part of the outcome Core reports.
+    ///
+    /// The target is taken as the operator's string, as Core takes it:
+    /// `AddConnection` hands it to `OpenNetworkConnection`, and the `Lookup`
+    /// happens inside `ConnectNode` (v31.1 `src/net.cpp:406`), on the dial
+    /// thread, after the RPC has answered. A name that does not resolve is
+    /// therefore a dial that failed, which Core reports only in its log.
+    /// Resolving here instead turned that into `-8 Invalid address`, an error
+    /// Core has no way to produce for this call.
     pub fn add_connection(
         self: &Arc<Self>,
-        target: PeerAddr,
+        target: &str,
+        default_port: u16,
         conn_type: ConnType,
         use_v2: bool,
     ) -> Result<(), String> {
         if !self.is_network_active() {
             return Err("networking disabled (networkactive=false)".to_string());
         }
-        let addr = match target {
-            PeerAddr::Socket(sa) => sa,
-            // satd types a connection at `spawn_peer`, which is reached from
-            // the socket dial path; the onion dial has its own path and no
-            // way to carry a requested type through it yet. Refuse by name
-            // rather than open an untyped connection the caller would then
-            // see reported as something else.
-            PeerAddr::Onion { host, .. } => {
-                return Err(format!(
-                    "addconnection cannot open a typed connection to an onion address ({host}) yet"
-                ));
-            }
-        };
+        // satd types a connection at `spawn_peer`, which is reached from the
+        // socket dial path; the onion dial has its own path and no way to
+        // carry a requested type through it yet. Refuse by name rather than
+        // open an untyped connection the caller would then see reported as
+        // something else. This is a satd limitation Core does not have, so it
+        // stays a synchronous, named refusal instead of a line in the log —
+        // and recognising an onion target needs no resolver.
+        if crate::net::dns::is_onion_target(target) {
+            let host = target.rsplit_once(':').map_or(target, |(h, _)| h);
+            return Err(format!(
+                "addconnection cannot open a typed connection to an onion address ({host}) yet"
+            ));
+        }
         {
             let mut pending = self.pending_typed_dials.write();
             self.check_outbound_limit_for(conn_type, &pending)?;
             pending.push(conn_type);
         }
         let pm = self.clone();
+        let target = target.to_string();
         tokio::spawn(async move {
-            // Releases the reservation on every exit path, including a dial
-            // timeout or a panic below.
+            // Releases the reservation on every exit path, including a
+            // resolver failure, a dial timeout, or a panic below.
             let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type };
+            let addr = match pm.resolve_peer_target(&target, default_port).await {
+                Ok(PeerAddr::Socket(sa)) => sa,
+                // Refused synchronously above; `resolve_peer_target` cannot
+                // return this for a target that got past that check.
+                Ok(PeerAddr::Onion { .. }) => return,
+                Err(e) => {
+                    tracing::debug!(
+                        %target,
+                        ?conn_type,
+                        "addconnection: target did not resolve: {e}"
+                    );
+                    return;
+                }
+            };
             if let Err(e) = pm
                 .connect_outbound_inner(addr, Some(conn_type), Some(use_v2), false)
                 .await
