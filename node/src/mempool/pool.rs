@@ -3709,16 +3709,23 @@ impl Mempool {
             .iter()
             .any(|i| i.sequence.0 < 0xffff_fffe);
 
-        Some(serde_json::json!({
+        // Every amount goes through `format_amount`, like every other RPC
+        // surface: raw `f64` division here meant `getrawmempool verbose` and
+        // `getmempoolentry` ignored `-amountunit=sat` — reporting BTC while
+        // the rest of the node reported satoshis — and reintroduced the
+        // binary-floating-point rounding `btc_fixed_8dp` exists to avoid.
+        let unit = crate::rpc::amounts::default_unit();
+        let amount = |sats: u64| crate::rpc::amounts::format_amount(sats, unit);
+        let mut out = serde_json::json!({
             "fees": {
-                "base": entry_fee as f64 / 100_000_000.0,
-                "modified": modified_fee(entry_fee, entry_fee_delta) as f64 / 100_000_000.0,
-                "ancestor": ancestor_fees as f64 / 100_000_000.0,
-                "descendant": descendant_fees as f64 / 100_000_000.0,
+                "base": amount(entry_fee),
+                "modified": amount(modified_fee(entry_fee, entry_fee_delta)),
+                "ancestor": amount(ancestor_fees),
+                "descendant": amount(descendant_fees),
             },
             "vsize": vsize,
             "weight": entry_weight,
-            "fee": entry_fee as f64 / 100_000_000.0,
+            "fee": amount(entry_fee),
             "time": entry_time,
             "height": 0, // would need chain height at time of entry
             "descendantcount": descendant_count,
@@ -3731,7 +3738,9 @@ impl Mempool {
             "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
             "unbroadcast": is_unbroadcast,
-        }))
+        });
+        crate::rpc::amounts::annotate_units(&mut out, unit);
+        Some(out)
     }
 
     /// Dry-run transaction validation without inserting into the mempool.

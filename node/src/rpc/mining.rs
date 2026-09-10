@@ -1,7 +1,6 @@
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::template::create_template;
-use crate::rpc::descriptor::parse_descriptor;
 use crate::storage::blockindex::{sub_u256, target_to_difficulty, u256_to_f64};
 use crate::validation::pow::RETARGET_INTERVAL;
 use serde_json::{json, Value};
@@ -97,8 +96,17 @@ pub fn generate_to_descriptor(
         return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
     }
 
-    let script = parse_descriptor(descriptor, chain_state.network)
-        .map_err(|e| (-8, e))?;
+    // `descriptor_to_coinbase_script` is the full key-based parser
+    // `generateblock` already uses, and it answers `-5` as Core's
+    // `RPC_INVALID_ADDRESS_OR_KEY` does. `parse_descriptor` is
+    // `scantxoutset`'s: it handles `raw()` and `addr()` only, and its refusal
+    // names `scantxoutset` — so `generatetodescriptor` refused every
+    // key-based descriptor Core accepts, under the wrong code, in a message
+    // about a different RPC.
+    let script = crate::rpc::descriptor::descriptor_to_coinbase_script(
+        descriptor,
+        chain_state.network,
+    )?;
 
     let hashes =
         crate::mining::miner::mine_blocks_to_script(chain_state, mempool, script, nblocks, max_tries)

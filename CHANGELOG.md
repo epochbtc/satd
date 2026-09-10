@@ -75,6 +75,30 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** `verifytxoutproof` requires the block to be on the active
+  chain and the proof to cover the whole block, as Core does, and answers
+  `-5 Block not found in chain` otherwise. A proof built on a stale branch read
+  as valid (#671).
+- **Breaking:** `decoderawtransaction`'s and `converttopsbt`'s `iswitness`
+  selects the serialization it names. There was no legacy reader:
+  `iswitness=false` used the witness decoder with the full-consumption check
+  removed, so it returned the witness reading and accepted trailing bytes.
+  `converttopsbt` refused the argument outright (#671).
+- **Breaking:** `createrawtransaction`'s and `createpsbt`'s `replaceable=true`
+  check was inverted. Core refuses only when **no** input signals; satd
+  refused when any input did not, so a mixed transaction was rejected (#671).
+- `estimatesmartfee` validates `conf_target` against 1..1008, as
+  `estimaterawfee` already did (#671).
+- `generatetodescriptor` takes the descriptors Core takes. It went through
+  `scantxoutset`'s `raw()`/`addr()`-only parser, whose refusal named
+  `scantxoutset` and carried the wrong code (#671).
+- `getrawmempool verbose` and `getmempoolentry` report amounts through the
+  same formatter as every other RPC, so `-amountunit=sat` reaches them (#671).
+- `gettxoutproof` without a `blockhash` scans every output index a block can
+  hold instead of the first 100, so a transaction whose only unspent output is
+  further along is found (#671).
+- `-noincludeconf` works. It was rewritten to a valueless `--includeconf`
+  that the argument parser refused before satd's own handling saw it (#671).
 - **Breaking:** `testmempoolaccept` reports `txn-already-known` only while one
   of the transaction's outputs is still an unspent coin, as Core does; it also
   consulted the txindex, which finds a confirmed transaction forever, so a

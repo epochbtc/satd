@@ -437,10 +437,22 @@ fn try_finalize_input(input: &mut bitcoin::psbt::Input) {
 /// stripped, because the conversion is lossy and the caller may not have
 /// meant to discard them (`rawtransaction.cpp`, `Inputs must not have
 /// scriptSigs and scriptWitnesses`).
-pub fn convert_to_psbt(hex_tx: &str, permit_sigdata: bool) -> Result<Value, (i32, String)> {
+pub fn convert_to_psbt(
+    hex_tx: &str,
+    permit_sigdata: bool,
+    iswitness: Option<bool>,
+) -> Result<Value, (i32, String)> {
     let tx_bytes = hex::decode(hex_tx).map_err(|_| (-22, "TX decode failed".to_string()))?;
-    let mut tx: Transaction =
-        bitcoin::consensus::deserialize(&tx_bytes).map_err(|_| (-22, "TX decode failed".to_string()))?;
+    // Core reaches one `DecodeHexTx(tx, hex, /*try_no_witness=*/..., /*try_witness=*/...)`
+    // from `converttopsbt` and `decoderawtransaction` alike, so `iswitness`
+    // means the same thing in both. satd refused the argument here rather
+    // than accept a flag it could not honour; now it honours it.
+    let mut tx: Transaction = crate::rpc::rawtx::decode_tx(
+        &tx_bytes,
+        iswitness != Some(true),
+        iswitness != Some(false),
+    )
+    .ok_or((-22i32, "TX decode failed".to_string()))?;
 
     // Clear scriptSigs and witnesses for the PSBT unsigned tx
     for input in &mut tx.input {

@@ -1283,6 +1283,124 @@ fn test_getblocktemplate_fields() {
     node.stop();
 }
 
+/// Core validates `estimatesmartfee`'s `conf_target` range, and
+/// `estimaterawfee` in the same file already did. `estimatesmartfee` did not,
+/// so `conf_target: 0` reached the estimator and was answered with a feerate.
+#[test]
+fn estimatesmartfee_validates_its_conf_target() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    for bad in [json!(0), json!(1009)] {
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", vec![bad.clone()])
+            .unwrap();
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "{bad}: {resp}");
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("Invalid conf_target, must be between 1 and 1008")
+        );
+    }
+    // The ends of the range are inside it.
+    for ok in [json!(1), json!(1008)] {
+        let resp = node
+            .rpc_call_with_params("estimatesmartfee", vec![ok.clone()])
+            .unwrap();
+        assert!(resp["error"].is_null(), "{ok}: {resp}");
+    }
+    node.stop();
+}
+
+/// `generatetodescriptor` went through `scantxoutset`'s descriptor parser,
+/// which handles `raw()` and `addr()` only and names `scantxoutset` in its
+/// refusal. Core accepts the full descriptor language here, and answers `-5`.
+#[test]
+fn generatetodescriptor_takes_the_descriptors_core_takes() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+
+    // A key-based descriptor Core accepts and the scantxoutset parser did not.
+    let desc = "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)";
+    let resp = node
+        .rpc_call_with_params("generatetodescriptor", vec![json!(1), json!(desc)])
+        .unwrap();
+    assert!(
+        resp["error"].is_null(),
+        "a key-based descriptor must be accepted: {resp}"
+    );
+    assert_eq!(resp["result"].as_array().map(|a| a.len()), Some(1), "{resp}");
+
+    // …and a bad one is -5, Core's RPC_INVALID_ADDRESS_OR_KEY, with a message
+    // that does not name a different RPC.
+    let resp = node
+        .rpc_call_with_params("generatetodescriptor", vec![json!(1), json!("nonsense(")])
+        .unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-5), "{resp}");
+    assert!(
+        !resp["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scantxoutset"),
+        "the refusal must not name scantxoutset: {resp}"
+    );
+
+    node.stop();
+}
+
+/// `createrawtransaction`'s `replaceable` check was inverted. Core throws only
+/// when **no** input signals; satd threw when **any** input did not, so a
+/// mixed transaction — one signalling input among several that are not — was
+/// refused here and accepted by Core. One signalling input makes the whole
+/// transaction replaceable, which is what the flag asks for.
+#[test]
+fn replaceable_needs_one_signalling_input_not_all_of_them() {
+    use serde_json::json;
+
+    let mut node = TestNode::start(&[]);
+    let dest = DeterministicWallet::from_secret([0x91; 32]);
+    let outputs = json!({ dest.address.to_string(): 0.001 });
+    let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    // One input signals (sequence 0), one does not (0xffffffff).
+    let mixed = json!([
+        { "txid": txid, "vout": 0, "sequence": 0u32 },
+        { "txid": txid, "vout": 1, "sequence": 0xffff_ffffu32 },
+    ]);
+    let resp = node
+        .rpc_call_with_params(
+            "createrawtransaction",
+            vec![mixed, outputs.clone(), json!(0), json!(true)],
+        )
+        .unwrap();
+    assert!(
+        resp["error"].is_null(),
+        "one signalling input is enough for replaceable: {resp}"
+    );
+
+    // None signals: Core refuses, and so must satd.
+    let none = json!([
+        { "txid": txid, "vout": 0, "sequence": 0xffff_ffffu32 },
+        { "txid": txid, "vout": 1, "sequence": 0xffff_fffeu32 },
+    ]);
+    let resp = node
+        .rpc_call_with_params(
+            "createrawtransaction",
+            vec![none, outputs, json!(0), json!(true)],
+        )
+        .unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-8), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("contradict replaceable option"),
+        "{resp}"
+    );
+
+    node.stop();
+}
+
 /// `submitpackage` and `testmempoolaccept` both bound their array to Core's
 /// 1..25, and `submitpackage` checks Core's child-with-parents topology.
 /// Neither guard existed: an empty array was answered with an empty result,
