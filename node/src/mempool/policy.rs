@@ -23,6 +23,11 @@ pub const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 /// more than one is non-standard outright.
 pub const MAX_DUST_OUTPUTS_PER_TX: usize = 1;
 
+/// Core's `MAX_REPLACEMENT_CANDIDATES` (`src/policy/rbf.h`): the most distinct
+/// mempool *clusters* a replacement may conflict with directly. It bounds how
+/// much of the mempool a single RBF has to re-sort.
+pub const MAX_REPLACEMENT_CANDIDATES: usize = 100;
+
 /// Dust relay fee rate (sat/kvB) used to compute dust thresholds.
 /// 3000 sat/kvB = 3 sat/vB, matching Bitcoin Core's default.
 pub const DUST_RELAY_FEE_RATE: u64 = 3_000;
@@ -122,6 +127,13 @@ pub fn fee_rate_sat_per_kvb(fee: u64, weight: u64) -> u64 {
 /// An unspendable script — one starting with `OP_RETURN`, or longer than
 /// `MAX_SCRIPT_SIZE` — is never dust and returns 0.
 ///
+/// The absolute fee, in satoshis, a `rate` (sat/kvB) demands for a
+/// transaction of `weight` weight units. Core's `CFeeRate::GetFee`, which
+/// rounds **up**.
+pub fn fee_for_rate(rate: u64, weight: u64) -> u64 {
+    rate.saturating_mul(weight_to_vsize(weight)).div_ceil(1000)
+}
+
 /// Compute the dust threshold using the default dust relay fee rate.
 pub fn dust_threshold(script_pubkey: &bitcoin::ScriptBuf) -> u64 {
     dust_threshold_with_rate(script_pubkey, DUST_RELAY_FEE_RATE)

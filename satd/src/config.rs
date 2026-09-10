@@ -7800,7 +7800,10 @@ fn parse_fee_rate_value(s: &str) -> Result<u64, String> {
 
     let Some((whole, frac)) = t.split_once('.') else {
         // satd spelling: a bare integer, already in sat/kvB.
-        return t.parse::<u64>().map_err(|_| format!("{EXPECTED}, got '{s}'"));
+        let rate = t
+            .parse::<u64>()
+            .map_err(|_| format!("{EXPECTED}, got '{s}'"))?;
+        return check_money_range(rate, s);
     };
 
     // Core spelling: BTC/kvB. One satoshi is the smallest representable
@@ -7829,10 +7832,25 @@ fn parse_fee_rate_value(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|_| format!("{EXPECTED}, got '{s}'"))?;
 
-    whole
+    let rate = whole
         .checked_mul(SATS_PER_BTC)
         .and_then(|w| w.checked_add(frac))
-        .ok_or_else(|| format!("fee rate '{s}' is too large"))
+        .ok_or_else(|| format!("fee rate '{s}' is too large"))?;
+    check_money_range(rate, s)
+}
+
+/// Core's `ParseMoney` refuses anything outside `MoneyRange`, so a fee rate
+/// above 21 million BTC/kvB is an error rather than a value the node carries
+/// into arithmetic that then has to saturate around it.
+fn check_money_range(rate: u64, raw: &str) -> Result<u64, String> {
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    if rate > MAX_MONEY {
+        return Err(format!(
+            "fee rate '{raw}' is outside the valid money range \
+             (at most 21000000.00000000 BTC/kvB)"
+        ));
+    }
+    Ok(rate)
 }
 
 #[cfg(test)]
@@ -7938,6 +7956,19 @@ mod tests {
         assert_eq!(parse_fee_rate_value("1000"), Ok(1_000));
         assert_eq!(parse_fee_rate_value("0"), Ok(0));
         assert_eq!(parse_fee_rate_value("  1000  "), Ok(1_000));
+
+        // Core's `ParseMoney` refuses anything outside `MoneyRange`, so an
+        // absurd rate is an error rather than a number the node then has to
+        // saturate around in every fee computation. 21 million BTC/kvB is the
+        // ceiling, in either spelling.
+        assert_eq!(parse_fee_rate_value("21000000.0"), Ok(21_000_000 * 100_000_000));
+        assert!(parse_fee_rate_value("21000001.0").is_err());
+        assert_eq!(
+            parse_fee_rate_value("2100000000000000"),
+            Ok(21_000_000 * 100_000_000)
+        );
+        assert!(parse_fee_rate_value("2100000000000001").is_err());
+        assert!(parse_fee_rate_value(&u64::MAX.to_string()).is_err());
     }
 
     /// A value satd cannot represent is rejected rather than silently rounded

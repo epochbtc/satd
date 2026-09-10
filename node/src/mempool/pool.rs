@@ -102,13 +102,22 @@ pub enum MempoolError {
     ConflictingSpend,
     #[error("bad-txns-inputs-missingorspent")]
     MissingInputs,
+    /// The transaction's fee, and the fee the relay floor demands for its
+    /// size — both in **satoshis**, as Core's `CheckFeeRate` reports them
+    /// (`strprintf("%d < %d", package_fee, ...)`), not as feerates.
     #[error("min relay fee not met")]
     InsufficientFee(u64, u64),
     #[error("mempool full")]
     MempoolFull,
     #[error("{0}")]
     Validation(String),
-    #[error("mandatory-script-verify-flag-failed ({0})")]
+    /// A script failure on the *mempool* path. Core reports
+    /// `mempool-script-verify-flag-failed (<error>)` here and
+    /// `block-script-verify-flag-failed (<error>)` in `ConnectBlock`
+    /// (`validation.cpp`), because the two carry different consequences: a
+    /// mempool failure is `TX_NOT_STANDARD` and never bans, a block failure is
+    /// `TX_CONSENSUS`. `mandatory-script-verify-flag-failed` is neither.
+    #[error("mempool-script-verify-flag-failed ({0})")]
     Script(String),
     #[error("bad-txns-in-belowout")]
     BadAmounts,
@@ -232,7 +241,7 @@ impl MempoolError {
             MempoolError::MempoolFull => "mempool full".to_string(),
             MempoolError::Validation(s) => s.clone(),
             MempoolError::Script(s) => {
-                format!("mandatory-script-verify-flag-failed ({s})")
+                format!("mempool-script-verify-flag-failed ({s})")
             }
             MempoolError::BadAmounts => "bad-txns-in-belowout".to_string(),
             MempoolError::PrematureCoinbaseSpend => {
@@ -253,9 +262,9 @@ impl MempoolError {
             MempoolError::TooManyReplacements(..) => {
                 "too many potential replacements".to_string()
             }
-            MempoolError::DoesNotImproveFeerateDiagram(..) => {
-                "insufficient feerate: does not improve feerate diagram".to_string()
-            }
+            // Core: `state.Invalid(TX_RECONSIDERABLE, "replacement-failed",
+            // err_string)` — the diagram explanation is the *detail*.
+            MempoolError::DoesNotImproveFeerateDiagram(..) => "replacement-failed".to_string(),
             MempoolError::TooLongMempoolChain => "too-large-cluster".to_string(),
             // `ephemeral_policy.cpp`: reason "dust", debug "tx with dust
             // output must be 0-fee" — the detail goes to `reject_details`.
@@ -282,6 +291,9 @@ impl MempoolError {
                 Some("tx with dust output must be 0-fee".to_string())
             }
             MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
+            // Core: `strprintf("%d < %d", package_fee, min_relay_fee)`.
+            MempoolError::InsufficientFee(fee, required) => Some(format!("{fee} < {required}")),
+            MempoolError::Script(detail) => Some(detail.clone()),
             _ => None,
         }
     }
@@ -2289,22 +2301,39 @@ impl Mempool {
                 }
             }
 
-            // Too-many-replacements limit: reject if the replacement
-            // conflicts with more than 100 distinct clusters.
-            if conflicts.len() > 100 {
+            // Rule 5, Core's `PaysForRBF` precondition: reject a replacement
+            // that conflicts directly with more than
+            // `MAX_REPLACEMENT_CANDIDATES` distinct *clusters*. Counting the
+            // conflicts themselves over-counts a package — 101 transactions
+            // that all descend from one parent are one cluster, and Core
+            // accepts that replacement.
+            let clusters = Self::conflicting_cluster_count(
+                &inner,
+                &conflicts,
+                policy::MAX_REPLACEMENT_CANDIDATES,
+            );
+            if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
                 let detail = format!(
                     "too many potential replacements, rejecting replacement {}; \
-                     too many conflicting clusters ({} > 100)",
-                    txid,
-                    conflicts.len(),
+                     too many conflicting clusters ({} > {})",
+                    txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
                 );
                 return Err(MempoolError::TooManyReplacements(detail));
             }
 
             // Collect all txids that would be evicted (conflicts + descendants)
             // and sum their fees.
-            let (all_evicted, conflict_fee_total) =
-                Self::rbf_conflict_set(&inner, &conflicts);
+            let evict_bound = Self::rbf_eviction_bound(&cfg);
+            let Some((all_evicted, conflict_fee_total)) =
+                Self::rbf_conflict_set(&inner, &conflicts, evict_bound)
+            else {
+                let detail = format!(
+                    "too many potential replacements, rejecting replacement {}; \
+                     the eviction set exceeds {} transactions",
+                    txid, evict_bound,
+                );
+                return Err(MempoolError::TooManyReplacements(detail));
+            };
 
             // Reject if the replacement spends an output of any evicted tx
             // (direct conflict or descendant).
@@ -2348,8 +2377,12 @@ impl Mempool {
             // Check 2: additional fee must cover incremental relay fee for
             // the replacement's size.
             let additional = new_fee - conflict_fee_total;
-            let min_relay = (cfg.incremental_relay_fee
-                * policy::weight_to_vsize(weight as u64))
+            // Saturating: the release profile has no overflow checks, so a
+            // pathological `-incrementalrelayfee` would wrap and produce a
+            // *tiny* floor — the opposite of what the operator asked for.
+            let min_relay = cfg
+                .incremental_relay_fee
+                .saturating_mul(policy::weight_to_vsize(weight as u64))
                 .div_ceil(1000);
             if additional < min_relay {
                 let detail = format!(
@@ -2435,9 +2468,20 @@ impl Mempool {
         }
 
         // Check fee rate (sat/kvB, i.e. per virtual byte — matches Core).
-        let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
+        //
+        // On the *modified* fee: Core's `CheckFeeRate(ws.m_vsize,
+        // ws.m_modified_fees, ...)` counts a `prioritisetransaction` delta
+        // toward the relay floor, which is what the RPC is for. This path read
+        // the base fee while `test_accept` read the modified one, so
+        // `testmempoolaccept` and `sendrawtransaction` disagreed about a
+        // prioritised transaction — one of #660's bullets.
+        let effective_fee = modified_fee(fee, fee_delta);
+        let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight as u64);
         if fee_rate < cfg.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
+            return Err(MempoolError::InsufficientFee(
+                effective_fee,
+                policy::fee_for_rate(cfg.min_fee_rate, weight as u64),
+            ));
         }
 
         // Apply any deferred standardness error now that the fee rate check
@@ -2648,8 +2692,12 @@ impl Mempool {
         // txid (§10). (After the isolation guard above, a quarantined submission
         // can't reach here with an acting conflict, so this only filters out
         // quarantined conflicts displaced by an acting replacement.)
-        // Collect all txids to evict (conflicts + descendants).
-        let (all_evicted, _) = Self::rbf_conflict_set(&inner, &conflicts);
+        // Collect all txids to evict (conflicts + descendants). The bound was
+        // already enforced above, before anything was committed; `usize::MAX`
+        // here says so rather than re-deriving a limit that could disagree and
+        // leave the replacement half-applied.
+        let (all_evicted, _) = Self::rbf_conflict_set(&inner, &conflicts, usize::MAX)
+            .expect("an unbounded walk cannot exceed usize::MAX");
         let mut replaced: Vec<Txid> = Vec::new();
         for evict_txid in &all_evicted {
             if let Some(evict_entry) = inner.entries.remove(evict_txid) {
@@ -3104,9 +3152,15 @@ impl Mempool {
                 result.insert(*txid, (entry.fee_delta, true));
             }
         }
-        // Pending (not yet in mempool) deltas
+        // Pending deltas for transactions that are *not* in the mempool.
+        // `fee_deltas` keeps the delta for a resident transaction too, so an
+        // unconditional insert here overwrote the record above and reported
+        // `in_mempool: false` for every prioritised transaction in the pool —
+        // the opposite of what the field means.
         for (txid, delta) in &inner.fee_deltas {
-            result.insert(*txid, (*delta, false));
+            if !inner.entries.contains_key(txid) {
+                result.insert(*txid, (*delta, false));
+            }
         }
         result
     }
@@ -3362,11 +3416,23 @@ impl Mempool {
     /// sum their **modified** fees (base fee + `prioritisetransaction` delta).
     /// Returns `(all_evicted, total_modified_fee)`. `all_evicted` includes the
     /// direct conflicts and all their descendants.
+    ///
+    /// Bounded by `limit`: the walk runs under the `inner` write lock, and an
+    /// unbounded descendant walk there is a stall a peer can ask for. Core
+    /// bounds the same work with the cluster-count rule before it starts
+    /// (`policy/rbf.cpp`: "the cluster count limit ensures that we won't do too
+    /// much work on a single invocation of this function"), so the caller
+    /// checks that first and this is the belt to its braces. Returns `None`
+    /// when the set would exceed the limit.
     fn rbf_conflict_set(
         inner: &MempoolInner,
         conflicts: &HashSet<Txid>,
-    ) -> (HashSet<Txid>, u64) {
+        limit: usize,
+    ) -> Option<(HashSet<Txid>, u64)> {
         let mut all = conflicts.clone();
+        if all.len() > limit {
+            return None;
+        }
         let mut queue: Vec<Txid> = conflicts.iter().copied().collect();
         let mut buf: Vec<Txid> = Vec::new();
         while let Some(current) = queue.pop() {
@@ -3374,6 +3440,9 @@ impl Mempool {
             Self::collect_children(inner, &current, &mut buf);
             for &child in &buf {
                 if inner.entries.contains_key(&child) && all.insert(child) {
+                    if all.len() > limit {
+                        return None;
+                    }
                     queue.push(child);
                 }
             }
@@ -3383,7 +3452,72 @@ impl Mempool {
             .filter_map(|txid| inner.entries.get(txid))
             .map(|e| modified_fee(e.fee, e.fee_delta))
             .sum();
-        (all, total_fee)
+        Some((all, total_fee))
+    }
+
+    /// The most transactions an RBF may evict before satd calls it unbounded
+    /// work rather than a replacement.
+    ///
+    /// Rule 5 already bounds the *clusters* at
+    /// `MAX_REPLACEMENT_CANDIDATES`, and a cluster holds at most
+    /// `max_ancestor_count` transactions, so their product is a ceiling no
+    /// replacement Core would accept can reach. Deriving it that way — rather
+    /// than reusing the cluster limit directly — is what keeps this a
+    /// backstop against a pathological mempool instead of a second, stricter
+    /// policy that refuses replacements Core allows.
+    fn rbf_eviction_bound(cfg: &MempoolConfig) -> usize {
+        policy::MAX_REPLACEMENT_CANDIDATES.saturating_mul(cfg.max_ancestor_count.max(1))
+    }
+
+    /// The number of distinct mempool clusters the direct conflicts belong to
+    /// (Core's `CTxMemPool::GetUniqueClusterCount`).
+    ///
+    /// A cluster is the connected component of the mempool's spend graph, so
+    /// two conflicts joined by *any* chain of parent/child links — not just a
+    /// direct one — count once. satd counted the conflicts themselves, which
+    /// over-counts a package: a replacement conflicting with 101 transactions
+    /// that all descend from one parent affects a single cluster and Core
+    /// accepts it, while satd refused it as "too many potential replacements".
+    ///
+    /// The walk is bounded by `limit` clusters: once that many distinct
+    /// components have been seen the answer can only be "too many", and Rule 5
+    /// exists precisely to stop this from being unbounded work.
+    fn conflicting_cluster_count(
+        inner: &MempoolInner,
+        conflicts: &HashSet<Txid>,
+        limit: usize,
+    ) -> usize {
+        let mut seen: HashSet<Txid> = HashSet::new();
+        let mut clusters = 0usize;
+        let mut buf: Vec<Txid> = Vec::new();
+        for start in conflicts {
+            if seen.contains(start) || !inner.entries.contains_key(start) {
+                continue;
+            }
+            clusters += 1;
+            if clusters > limit {
+                return clusters;
+            }
+            // Flood the component in both directions: children through the
+            // `spends` reverse index, parents through the entry's own inputs.
+            let mut queue = vec![*start];
+            seen.insert(*start);
+            while let Some(current) = queue.pop() {
+                buf.clear();
+                Self::collect_children(inner, &current, &mut buf);
+                if let Some(entry) = inner.entries.get(&current) {
+                    for input in &entry.tx.input {
+                        buf.push(input.previous_output.txid);
+                    }
+                }
+                for &next in &buf {
+                    if inner.entries.contains_key(&next) && seen.insert(next) {
+                        queue.push(next);
+                    }
+                }
+            }
+        }
+        clusters
     }
 
     /// Get all transitive in-mempool descendants of `txid` (every transaction
@@ -3670,13 +3804,17 @@ impl Mempool {
 
         // RBF conflict checks — mirrors accept_transaction.
         if !conflicts.is_empty() {
-            // Count conflicting clusters and enforce limit.
-            if conflicts.len() > 100 {
+            // Rule 5, by cluster — see `accept_transaction`.
+            let clusters = Self::conflicting_cluster_count(
+                &inner,
+                &conflicts,
+                policy::MAX_REPLACEMENT_CANDIDATES,
+            );
+            if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
                 let detail = format!(
                     "too many potential replacements, rejecting replacement {}; \
-                     too many conflicting clusters ({} > 100)",
-                    txid,
-                    conflicts.len(),
+                     too many conflicting clusters ({} > {})",
+                    txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
                 );
                 return Err(MempoolError::TooManyReplacements(detail));
             }
@@ -3698,8 +3836,17 @@ impl Mempool {
             }
 
             // Sum modified fees of conflicts + all their descendants.
-            let (all_evicted, conflict_fee_total) =
-                Self::rbf_conflict_set(&inner, &conflicts);
+            let evict_bound = Self::rbf_eviction_bound(&cfg);
+            let Some((all_evicted, conflict_fee_total)) =
+                Self::rbf_conflict_set(&inner, &conflicts, evict_bound)
+            else {
+                let detail = format!(
+                    "too many potential replacements, rejecting replacement {}; \
+                     the eviction set exceeds {} transactions",
+                    txid, evict_bound,
+                );
+                return Err(MempoolError::TooManyReplacements(detail));
+            };
 
             // Reject if the replacement spends an output of any evicted tx.
             for input in &tx.input {
@@ -3735,8 +3882,12 @@ impl Mempool {
 
             // Check 2: additional fee must cover incremental relay fee.
             let additional = new_fee - conflict_fee_total;
-            let min_relay = (cfg.incremental_relay_fee
-                * policy::weight_to_vsize(weight as u64))
+            // Saturating: the release profile has no overflow checks, so a
+            // pathological `-incrementalrelayfee` would wrap and produce a
+            // *tiny* floor — the opposite of what the operator asked for.
+            let min_relay = cfg
+                .incremental_relay_fee
+                .saturating_mul(policy::weight_to_vsize(weight as u64))
                 .div_ceil(1000);
             if additional < min_relay {
                 let detail = format!(
@@ -3801,10 +3952,13 @@ impl Mempool {
             Self::pre_check_ephemeral(tx, fee, priority_delta, cfg.dust_relay_fee)?;
         }
 
-        let fee_rate =
-            policy::fee_rate_sat_per_kvb(modified_fee(fee, priority_delta), weight_u64);
+        let effective_fee = modified_fee(fee, priority_delta);
+        let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight_u64);
         if fee_rate < cfg.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate));
+            return Err(MempoolError::InsufficientFee(
+                effective_fee,
+                policy::fee_for_rate(cfg.min_fee_rate, weight_u64),
+            ));
         }
 
         // Standardness checks (dust, OP_RETURN, etc.) — deferred until after
@@ -4754,13 +4908,28 @@ impl Mempool {
         bytes_needed: usize,
         want_quarantined: bool,
     ) -> Vec<Txid> {
-        // Sort *this class's* entries by fee_rate ascending; the other class is
+        // Sort *this class's* entries by fee rate ascending; the other class is
         // never an eviction candidate (its own budget governs it).
+        //
+        // On the *modified* fee rate. `entry.fee_rate` is the rate as of
+        // admission and `prioritisetransaction` never rewrites it, so a
+        // transaction an operator deliberately lifted was evicted as if the
+        // delta did not exist — which defeats the point of the RPC. Core
+        // evicts on the modified feerate (`CTxMemPool::TrimToSize` sorts by
+        // descendant-modified feerate).
         let mut by_fee_rate: Vec<(Txid, u64)> = inner
             .entries
             .iter()
             .filter(|(_, entry)| entry.scope.is_quarantined() == want_quarantined)
-            .map(|(txid, entry)| (*txid, entry.fee_rate))
+            .map(|(txid, entry)| {
+                (
+                    *txid,
+                    policy::fee_rate_sat_per_kvb(
+                        modified_fee(entry.fee, entry.fee_delta),
+                        entry.weight as u64,
+                    ),
+                )
+            })
             .collect();
         by_fee_rate.sort_by_key(|(_, rate)| *rate);
 
@@ -5778,10 +5947,268 @@ mod tests {
             "too-large-cluster"
         );
 
+        // `validation.cpp:2120`. Core splits the script-failure reason by
+        // path: `mempool-script-verify-flag-failed` is `TX_NOT_STANDARD` and
+        // never bans, `block-script-verify-flag-failed` is `TX_CONSENSUS` and
+        // does. `mandatory-script-verify-flag-failed`, which satd reported for
+        // both, is neither, and told a client the wrong thing about whether
+        // its transaction had broken a consensus rule.
+        let script_err = MempoolError::Script("SIG_DER".to_string());
+        assert_eq!(
+            script_err.reject_reason(),
+            "mempool-script-verify-flag-failed (SIG_DER)"
+        );
+        // The `Display` string and the reject reason are written out
+        // separately and are read by different surfaces (`submitpackage`
+        // formats the error, `sendrawtransaction` the reason), so pin that
+        // they agree.
+        assert_eq!(script_err.to_string(), script_err.reject_reason());
+        assert_eq!(
+            crate::chain::connect::ConnectError::ScriptFailed("SIG_DER".to_string()).to_string(),
+            "block-script-verify-flag-failed (SIG_DER)"
+        );
+
+        // `validation.cpp:1031`: the reason is `replacement-failed`; the
+        // diagram explanation is the debug message, not the reason.
+        let diagram = MempoolError::DoesNotImproveFeerateDiagram(
+            "insufficient feerate: does not improve feerate diagram".to_string(),
+        );
+        assert_eq!(diagram.reject_reason(), "replacement-failed");
+        assert_eq!(
+            diagram.reject_details().as_deref(),
+            Some("insufficient feerate: does not improve feerate diagram")
+        );
+
+        // `validation.cpp:709` `CheckFeeRate`: `strprintf("%d < %d",
+        // package_fee, min_relay_fee)` — absolute satoshis for this
+        // transaction's size, not the two feerates satd used to carry.
+        let low = MempoolError::InsufficientFee(140, 1_000);
+        assert_eq!(low.reject_reason(), "min relay fee not met");
+        assert_eq!(low.reject_details().as_deref(), Some("140 < 1000"));
+
         // Both are policy failures, so both carry -26. Only missing inputs
         // (and satd's own quarantine verdict) answer -25.
         assert_eq!(MempoolError::NonStandardOpReturn.rpc_code(), -26);
         assert_eq!(MempoolError::TooLongMempoolChain.rpc_code(), -26);
+    }
+
+    /// Rule 5 counts distinct mempool *clusters*, not conflicts. A replacement
+    /// that conflicts with a hundred and one transactions which all descend
+    /// from one parent affects a single cluster, and Core accepts it; satd
+    /// counted the conflicts and refused.
+    #[test]
+    fn rule_five_counts_clusters_not_conflicts() {
+        let op = outpoint(0xE0);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(10_000_000))]);
+
+        // A parent with 120 outputs, and a child spending each one: 121
+        // transactions in one connected component.
+        let fanout: Vec<(u64, u8)> = (0..120).map(|i| (50_000, 0x90 + (i % 16) as u8)).collect();
+        let parent = tx_from(&[op], &fanout);
+        let parent_txid = parent.compute_txid();
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent");
+        for vout in 0..120u32 {
+            let child = tx_from(
+                &[OutPoint { txid: parent_txid, vout }],
+                &[(40_000, 0xA0)],
+            );
+            mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+                .expect("child");
+        }
+
+        let inner = mp.inner.read();
+        let conflicts: HashSet<Txid> = inner
+            .entries
+            .keys()
+            .copied()
+            .filter(|t| *t != parent_txid)
+            .collect();
+        assert_eq!(conflicts.len(), 120, "the fixture needs > 100 conflicts");
+        assert_eq!(
+            Mempool::conflicting_cluster_count(&inner, &conflicts, 100),
+            1,
+            "120 children of one parent are one cluster"
+        );
+        drop(inner);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and genuinely distinct clusters are counted separately, so the rule
+    /// still fires. Without this the test above would also pass against a
+    /// function that always answered 1.
+    #[test]
+    fn rule_five_counts_distinct_clusters_separately() {
+        let coins: Vec<(OutPoint, Coin)> =
+            (0..5u8).map(|i| (outpoint(0xE1 + i), coin(100_000))).collect();
+        let (cs, mp, dir) = make_funded_env(&coins);
+
+        let mut txids = HashSet::new();
+        for (op, _) in &coins {
+            let tx = tx_from(&[*op], &[(90_000, 0xB0)]);
+            txids.insert(
+                mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+                    .expect("independent tx"),
+            );
+        }
+        let inner = mp.inner.read();
+        assert_eq!(
+            Mempool::conflicting_cluster_count(&inner, &txids, 100),
+            5,
+            "five unrelated transactions are five clusters"
+        );
+        // …and the bound short-circuits rather than walking them all.
+        assert!(Mempool::conflicting_cluster_count(&inner, &txids, 2) > 2);
+        drop(inner);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end: a replacement that conflicts with more than
+    /// `MAX_REPLACEMENT_CANDIDATES` transactions in a *single* cluster is
+    /// accepted, because Rule 5 bounds clusters and not conflicts. Counting
+    /// the conflicts refused it as "too many potential replacements".
+    #[test]
+    fn a_replacement_conflicting_with_one_big_cluster_is_accepted() {
+        let op = outpoint(0xED);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(20_000_000))]);
+
+        // A parent with 120 outputs, and a child on each: 120 conflicts, one
+        // cluster.
+        const N: u32 = 120;
+        let outs: Vec<(u64, u8)> = (0..N).map(|i| (100_000, 0x90 + (i % 16) as u8)).collect();
+        let parent = tx_from(&[op], &outs);
+        let parent_txid = parent.compute_txid();
+        mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent");
+        for vout in 0..N {
+            // Signal RBF so the replacement below is allowed to displace them.
+            let mut child = tx_from(
+                &[OutPoint { txid: parent_txid, vout }],
+                &[(90_000, 0xA0)],
+            );
+            child.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+            mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+                .expect("child");
+        }
+
+        // One transaction spending every one of the parent's outputs conflicts
+        // with all 120 children at once, and pays far more than they do.
+        let ins: Vec<OutPoint> = (0..N)
+            .map(|vout| OutPoint { txid: parent_txid, vout })
+            .collect();
+        let replacement = tx_from(&ins, &[(1_000_000, 0xA1)]);
+        let r = mp.accept_transaction(replacement, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            !matches!(r, Err(MempoolError::TooManyReplacements(_))),
+            "Rule 5 fired on one cluster of {N} conflicts: {r:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The incremental-relay-fee floor multiplies a configured rate by the
+    /// replacement's vsize. Both are `u64` and the release profile has no
+    /// overflow checks, so an operator-set rate near the money ceiling would
+    /// wrap and produce a *tiny* floor — the opposite of what was asked for.
+    /// A debug build panics on the same expression, which is what this pins.
+    #[test]
+    fn a_huge_incremental_relay_fee_does_not_overflow_the_floor() {
+        let op = outpoint(0xEE);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(10_000_000))]);
+        mp.reload_policy(MempoolConfig {
+            max_size_bytes: 10_000_000,
+            min_fee_rate: 0,
+            // The largest value `parse_fee_rate_value` will accept.
+            incremental_relay_fee: 21_000_000 * 100_000_000,
+            ..Default::default()
+        });
+
+        let mut original = tx_from(&[op], &[(9_000_000, 0xA2)]);
+        original.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        mp.accept_transaction(original, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("original");
+
+        // ~40_000 weight (10_000 vbytes): 2.1e15 × 1e4 overflows a u64.
+        let outs: Vec<(u64, u8)> = (0..320).map(|i| (25_000, 0xB0 + (i % 16) as u8)).collect();
+        let replacement = tx_from(&[op], &outs);
+        assert!(
+            replacement.weight().to_wu() > 35_000,
+            "the fixture must be big enough for the product to overflow"
+        );
+        // The refusal itself is expected — what must not happen is a panic, or
+        // a wrapped floor small enough to let it through.
+        let r = mp.accept_transaction(replacement, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(r.is_err(), "a saturated floor cannot be met: {r:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `getprioritisedtransactions` reports whether the transaction is in the
+    /// mempool. The pending-delta loop overwrote the in-mempool record, so
+    /// every prioritised transaction *in* the pool reported `in_mempool:
+    /// false` — the opposite of the truth.
+    #[test]
+    fn a_prioritised_transaction_in_the_mempool_says_so() {
+        let op = outpoint(0xE9);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let tx = tx_from(&[op], &[(90_000, 0xC0)]);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("admitted");
+        mp.prioritise_transaction(&txid, 5_000).expect("delta");
+
+        let absent = outpoint(0xEA).txid;
+        mp.prioritise_transaction(&absent, 7_000).expect("delta");
+
+        let listed = mp.get_prioritised_transactions();
+        assert_eq!(listed.get(&txid), Some(&(5_000, true)), "{listed:?}");
+        assert_eq!(listed.get(&absent), Some(&(7_000, false)), "{listed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `prioritisetransaction` has to move the transaction's place in the
+    /// eviction order too. The stored `fee_rate` is the rate as of admission
+    /// and the delta never rewrote it, so an operator could lift a
+    /// transaction's fee and watch it evicted anyway.
+    #[test]
+    fn a_prioritised_transaction_survives_eviction() {
+        let cheap_op = outpoint(0xEB);
+        let rich_op = outpoint(0xEC);
+        let (cs, mp, dir) =
+            make_funded_env(&[(cheap_op, coin(100_000)), (rich_op, coin(100_000))]);
+
+        let cheap = tx_from(&[cheap_op], &[(99_800, 0xC1)]);
+        let cheap_txid = mp
+            .accept_transaction(cheap, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("cheap");
+        let rich = tx_from(&[rich_op], &[(90_000, 0xC2)]);
+        let rich_txid = mp
+            .accept_transaction(rich, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("rich");
+
+        // Lift the cheap one well above the rich one.
+        mp.prioritise_transaction(&cheap_txid, 1_000_000).expect("delta");
+
+        // Squeeze the pool until exactly one entry can stay.
+        let mut inner = mp.inner.write();
+        let half = inner.total_bytes / 2;
+        let evicted = Mempool::evict_lowest_fee_entries(&mut inner, half, false);
+        drop(inner);
+
+        assert!(
+            evicted.contains(&rich_txid),
+            "the unprioritised transaction should have gone first: {evicted:?}"
+        );
+        assert!(
+            !evicted.contains(&cheap_txid),
+            "a prioritised transaction was evicted as if the delta did not exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Core v31 gates admission on the cluster limit, not on the deprecated

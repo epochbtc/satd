@@ -60,7 +60,12 @@ pub enum ConnectError {
     BadBlockSigops,
     #[error("bad-txns-BIP30")]
     BadBip30,
-    #[error("mandatory-script-verify-flag-failed ({0})")]
+    /// Core reports `block-script-verify-flag-failed (<error>)` from
+    /// `ConnectBlock` (`validation.cpp`), and reserves
+    /// `mempool-script-verify-flag-failed` for the relay path: the two differ
+    /// in whether the failure is `TX_CONSENSUS` or `TX_NOT_STANDARD`, which is
+    /// what decides whether a peer is banned for it.
+    #[error("block-script-verify-flag-failed ({0})")]
     ScriptFailed(String),
     #[error("bad-txns-nonfinal")]
     LocktimeNotFinal,

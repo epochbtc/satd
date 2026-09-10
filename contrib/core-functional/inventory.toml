@@ -453,7 +453,7 @@ note = "needs `getprioritisedtransactions`"
 file = "mempool_limit.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(0.00000100, 0.00001) -- satd's mempool-full eviction feerate floor differs from Core's. Follow-up: mempool eviction / min-relay divergence"
+note = "re-measured after the RBF/eviction fixes: satd has no dynamic mempool minimum feerate. Core raises `getmempoolinfo.mempoolminfee` above `minrelaytxfee` once the pool has evicted, and decays it; satd reports the static relay floor. Follow-up: dynamic mempool min feerate"
 
 [[test]]
 file = "mempool_package_limits.py"
@@ -538,7 +538,7 @@ note = "measured: KeyError 'bits' on getmininginfo. Follow-up: the `bits` field 
 file = "mining_prioritisetransaction.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: assert_raises_rpc_error on a prioritisetransaction error string satd words differently. Follow-up: prioritisetransaction error parity (#671)"
+note = "re-measured after the prioritisetransaction fixes: the remaining failure is a missing *required* argument, where Core throws the method's help text (which contains the method name) and satd answers `Missing required argument txid`. Follow-up: required-argument errors carry the help text (#671)"
 
 [[test]]
 file = "mining_template_verification.py"
