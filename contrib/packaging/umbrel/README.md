@@ -20,13 +20,26 @@ release.
 
 ## Status
 
-Both packages are written. **Neither has been installed on a real Umbrel or
-StartOS instance**, which is the gap that matters: everything below is
-statically checked, and static checks did not stop this Umbrel package from
-shipping a `--mainnet` flag satd does not have or an image tag the registry
-has never held.
+The Umbrel package has been installed and run on umbrelOS 1.7.4. The StartOS
+package is written, typechecked and packs to a `.s9pk`, but **has not been
+installed on a StartOS server**.
 
-What is checked:
+That distinction is the whole point of this section. Five of the eight defects
+found in the Umbrel package were invisible to every static check — `umbrel
+lint` passes clean both before and after each of them:
+
+- The app id must be prefixed with the store id, or the store adds
+  successfully, reports no error, and lists zero apps.
+- `exports.sh` is sourced under `set -euo pipefail` with `EXPORTS_APP_DIR`
+  defined and `APP_DATA_DIR` not yet defined; naming the wrong one aborts the
+  install.
+- No published image contained `satd-init`, because this branch adds it.
+- Umbrel bind-mounts the data directory, and Docker creates the host side of a
+  bind mount root-owned, so an unprivileged init service cannot write to it.
+- `app_proxy` dials its upstream as `http://` with no TLS option, so pointing
+  it at a TLS listener 502s every request.
+
+What is checked statically:
 
 - `umbrel/` — `umbrel lint` (from `npm i -g umbrel-cli`) validates the store
   manifest, each app manifest, the compose file and `exports.sh`. It is what
