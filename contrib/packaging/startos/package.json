@@ -1,0 +1,24 @@
+{
+  "name": "satd-startos",
+  "scripts": {
+    "build": "rm -rf ./javascript && ncc build startos/index.ts -o ./javascript",
+    "prettier": "prettier --write startos test",
+    "check": "tsc --noEmit && npm run test",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@start9labs/start-sdk": "2.0.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.7",
+    "@vercel/ncc": "^0.38.4",
+    "prettier": "^3.8.1",
+    "typescript": "^6.0.3"
+  },
+  "prettier": {
+    "trailingComma": "all",
+    "tabWidth": 2,
+    "semi": false,
+    "singleQuote": true
+  }
+}

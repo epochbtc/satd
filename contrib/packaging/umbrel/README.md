@@ -20,18 +20,22 @@ release.
 
 ## Status
 
-`umbrel/` is complete and ready to publish to a community app store.
+Both packages are written. **Neither has been installed on a real Umbrel or
+StartOS instance**, which is the gap that matters: everything below is
+statically checked, and static checks did not stop this Umbrel package from
+shipping a `--mainnet` flag satd does not have or an image tag the registry
+has never held.
 
-`startos/` is **not written yet.** A StartOS package is a TypeScript project
-built with Start9's SDK, and the SDK's shape has changed across StartOS
-versions; writing one against a guessed API would produce something that
-looks right and does not build. What it needs is: pick the StartOS version
-to target, install that SDK, and copy the structure of
-`start9labs/bitcoind-startos` at the matching tag. The interfaces to declare
-are RPC (plain, app-internal), RPC-TLS, Electrum-TLS, Esplora-TLS and MCP;
-the health check maps to `/readyz` and sync progress to
-`getblockchaininfo`. Network is a config option; `txindex` is not — it stays
-forced on, because Electrum and Esplora require it.
+What is checked:
+
+- `umbrel/` — `umbrel lint` (from `npm i -g umbrel-cli`) validates the store
+  manifest, each app manifest, the compose file and `exports.sh`. It is what
+  caught the missing image digest pin, which the Umbrel app store requires.
+- `startos/` — typechecks against the SDK, tests its network table against
+  `satd-init`, and packs to a `.s9pk`. See `startos/README.md`.
+
+Neither validator understands satd's own flags, so the checks that cover
+those live in `contrib/stack/tests/compose-test.sh`.
 
 ## Publishing the Umbrel app
 

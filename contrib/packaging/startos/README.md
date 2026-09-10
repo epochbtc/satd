@@ -1,66 +1,97 @@
-# StartOS package — not written yet
+# StartOS package
 
-A StartOS package is a TypeScript project built with Start9's SDK. The SDK's
-API has changed shape across StartOS versions, and a package written against
-a guessed API produces something that looks right in review and does not
-build.
+A StartOS package for satd, built with Start9's TypeScript SDK. It is
+published from its own repository (`epochbtc/satd-startos`) — Start9's
+registry expects one repository per package — and lives here so it is
+reviewed and versioned with satd.
 
-So this directory holds the requirements rather than a package. Writing it
-is mechanical once the target version is fixed:
+**Contents: satd only** — the daemon, `sat-cli`, `sat-tui` and the MCP server.
+No Lightning, no BTCPay, no wallets: StartOS users compose those from their
+own marketplace, and a package that bundled a second copy of software the
+store already offers would be worse than useless.
 
-1. Choose the StartOS version to target, and install that SDK.
-2. Copy the structure of `start9labs/bitcoind-startos` at the matching tag —
-   satd is a drop-in for Bitcoin Core's RPC, config file and cookie format,
-   so that package's shape is the right starting point rather than a blank
-   project.
-3. Publish from its own repository (`epochbtc/satd-startos`); Start9's
-   registry expects one repository per package.
+**Image:** `ghcr.io/epochbtc/satd`, unmodified. It already carries `satd-init`
+and `mkca.sh`, so this package's first run is the same one the reference stack
+and the appliance perform and cannot drift from them.
 
-## What the package must declare
+## Who terminates TLS
 
-**Contents: satd only** — the daemon, `sat-cli`, `sat-tui` and the MCP
-server. No Lightning, no BTCPay, no wallets: StartOS users compose those
-from their own store, and a package that bundled a second copy of software
-the store already offers would be worse than useless.
+satd serves TLS itself on 8336 / 50002 / 3001, from a CA it generates per
+install. That is the right answer for the reference stack and the appliance,
+where nothing else can issue a certificate. It is the wrong answer here.
 
-**Image:** `ghcr.io/epochbtc/satd`, unmodified. It already carries
-`satd-init` and `mkca.sh`, so the package's first run is the same one the
-reference stack and the appliance perform, and cannot drift from them.
+StartOS already terminates TLS at its reverse proxy, with a certificate
+chaining to the server's root CA — the one the user's browser trusts on that
+box. Exporting satd's own listeners would ask every user to import a second
+certificate authority for a single service.
 
-**Interfaces:**
+So this package binds satd's **plain** listeners and lets the OS wrap them.
+satd's TLS listeners still run, unexported, which leaves them on `lo` and
+`lxcbr0` and off the LAN. satd-init is used unmodified.
 
-| Interface | Port | Notes |
-|---|---|---|
-| JSON-RPC | 8332 | plain, internal to the StartOS network, cookie auth |
-| JSON-RPC (TLS) | 8336 | LAN-facing |
-| Electrum (TLS) | 50002 | LAN-facing; the plain 50001 stays internal |
-| Esplora (TLS) | 3001 | LAN-facing, prefix `/api` |
-| MCP (TLS) | 8339 | bearer token from the generated authfile |
-| P2P | 8333 | mainnet |
+MCP is the exception: satd refuses to start with MCP bound off-loopback unless
+TLS and auth are both configured, so that listener speaks TLS from satd's own
+certificate. The OS re-wraps it — terminating the client's connection with the
+server's certificate and opening a fresh one inward — with
+`upstreamCertValidation: 'disable'`, because the inward leg presents a
+certificate from satd's per-install CA that the OS has no way to be taught.
 
-**Config options:** the network, and nothing else that changes indexing.
-`txindex` and `addressindex` stay forced on — Electrum and Esplora both
-require them — and there is therefore no prune option to offer.
+This is a deliberate departure from the interface table this file used to
+carry, which specified satd's own TLS ports. That table was written without
+reference to how StartOS handles TLS.
 
-**Health check:** `/readyz` on the metrics listener (port 9332, internal).
-It reports not-ready until the chainstate is loaded and every listener is
-bound, which is what a dependent package needs it to mean. Sync progress
-comes from `getblockchaininfo`.
+## Building
 
-**Backups:** a wallet-less node has no irreplaceable state; exclude the
-chain and index directories. Do include `/var/lib/satd/tls` if the
-deployment wants its CA to survive a restore — restoring without it means
-every client re-imports.
+Requires Node 22+, Docker, `jq`, and:
 
-**Actions to expose in the UI:** show the CA certificate (so a user can
-import it), show the MCP token and connection snippet, and the Electrum /
-Esplora connection strings.
+- **`start-cli` 2.0+** — from
+  [`Start9Labs/start-technologies` releases](https://github.com/Start9Labs/start-technologies/releases)
+  (`start-cli_x86_64-linux`). Note that `Start9Labs/shared-workflows` is the
+  *legacy* build line and pins start-cli `v0.4.0-beta.9`; the SDK 2.0 line
+  this package targets uses `start-technologies` instead.
+- **`squashfs-tools-ng`** — `pack` shells out to `tar2sqfs` to turn each image
+  layer set into the squashfs the `.s9pk` carries.
+- **A packaging workspace in the parent directory.** `start-cli` looks for a
+  `.startos/` marker in the directory *containing* the package repo, so
+  `contrib/packaging/.startos/` has to exist. Create it with
+  `cd contrib/packaging && start-cli s9pk init-workspace` — note that also
+  clones the whole `start-technologies` monorepo beside it, which is not
+  wanted here; only `.startos/` is required, and it is gitignored because it
+  holds a per-machine signing key.
 
-## Open question for the package
+Then:
 
-The CA and certificate are reissued by `mkca.sh` when they near expiry or
-the machine's addresses change. On the appliance a systemd timer runs that
-daily. A StartOS package has no equivalent scheduler of its own, so it would
-renew on container start — fine for a box that reboots, not fine for one
-that runs for a year. Decide whether that is acceptable or whether the
-package needs a scheduled action.
+```sh
+make            # typecheck, test, lint, bundle, and pack every arch
+make x86        # just x86_64
+make install    # sideload to the server in ~/.startos/config.yaml
+```
+
+`make` runs `tsc --noEmit`, the tests, the SDK's lint pass and `ncc` before it
+packs, so a type error or a failing test stops the build.
+
+The SDK ships the entire build as `s9pk.mk`; the `Makefile` here is one
+`include` line.
+
+## What is checked, and what is not
+
+Checked locally: the package typechecks against `@start9labs/start-sdk`
+2.0.9, `test/networks.test.ts` verifies the network list and every P2P port
+against `contrib/stack/satd/satd-init` itself (so the two cannot drift), and
+`make` produces a `.s9pk` that `start-cli s9pk inspect` reads back.
+
+**Not checked: installing on a real StartOS server.** Nothing here has been
+run on one. Until it has, treat the interface bindings, the health checks and
+the `rpcallowip` bridge range as reasoned-but-unverified — in particular
+`bridgeSubnet`, which assumes StartOS's documented fixed `10.0.3.1` gateway on
+`lxcbr0`.
+
+## Before publishing
+
+1. Bump the image tag in `startos/manifest/index.ts` and the version in
+   `startos/versions/current.ts` to the release being published.
+2. Install it on a StartOS box and confirm every interface answers.
+3. Push to `epochbtc/satd-startos` and call
+   `Start9Labs/start-technologies/.github/workflows/build.yml@master` from its
+   CI, which builds the `.s9pk` with no secrets (it generates a temporary
+   signing key when `DEV_KEY` is absent).
