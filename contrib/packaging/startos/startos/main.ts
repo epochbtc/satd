@@ -5,7 +5,6 @@ import { sdk } from './sdk'
 import {
   bridgeSubnet,
   GetBlockchainInfo,
-  metricsPort,
   p2pPorts,
   rootDir,
   satCliArgs,
@@ -13,7 +12,19 @@ import {
 } from './utils'
 
 export const main = sdk.setupMain(async ({ effects }) => {
-  const store = await storeJson.read().once()
+  /**
+   * `.const`, not `.once`: it re-runs main when the store changes, which is
+   * what makes the Network action take effect. With `.once` the action wrote
+   * `signet` to the store and nothing else happened — satd-init never re-ran,
+   * satd kept its `--chain=mainnet` argument, and the node went on syncing
+   * mainnet while the service page said signet, indefinitely. The action's own
+   * warning promises "changing the network restarts the node on a different
+   * chain"; this is what keeps that promise.
+   *
+   * interfaces.ts already reads the store this way, which is why the signet
+   * P2P port appeared on the switch while the daemon did not move.
+   */
+  const store = await storeJson.read().const(effects)
   if (!store) throw new Error('No store')
   const { network } = store
 
@@ -121,18 +132,22 @@ export const main = sdk.setupMain(async ({ effects }) => {
       ready: {
         display: i18n('Node'),
         /**
-         * satd's own readiness gate rather than a port check: /readyz reports
-         * not-ready until the chainstate is loaded and every configured
-         * listener is bound, which is what a dependent package needs "ready"
-         * to mean. The probe is in the image and speaks HTTP over bash's
-         * /dev/tcp, so it needs no curl in this thin image.
+         * Liveness, not readiness. The probe is in the image and speaks HTTP
+         * over bash's /dev/tcp, so it needs no curl in this thin image; with
+         * no SATD_HEALTH_URL it sends a getblockchaininfo to the RPC port and
+         * counts any HTTP status line, which proves the listener is bound and
+         * serving.
+         *
+         * This deliberately does NOT probe /readyz. That endpoint is 503
+         * until the tip is within six blocks of the headers tip — days away
+         * on a fresh mainnet node — and this daemon's readiness is what
+         * `sync-progress` waits on. Gating it on a synced chain left the
+         * service reading "starting" and Blockchain Sync reading "waiting"
+         * for the entire initial sync, which is exactly the period the
+         * instructions tell the user to watch Blockchain Sync.
          */
         fn: async () => {
-          const res = await satdSub.exec(['/usr/local/bin/satd-healthcheck'], {
-            env: {
-              SATD_HEALTH_URL: `http://127.0.0.1:${metricsPort}/readyz`,
-            },
-          })
+          const res = await satdSub.exec(['/usr/local/bin/satd-healthcheck'])
           return res.exitCode === 0
             ? { result: 'success' as const, message: i18n('satd is ready') }
             : {
