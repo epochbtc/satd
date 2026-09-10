@@ -16749,3 +16749,133 @@ fn combinerawtransaction_merges_two_partial_signatures() {
     assert_eq!(mempool, json!([txid]), "the combined transaction was not accepted");
     node.stop();
 }
+
+// ── `-rpcservertimeout` covers every phase of a request ──────────────────────
+//
+// Core sets one libevent bufferevent read timeout on the HTTP server
+// (`evhttp_set_timeout`, v31.1 `src/httpserver.cpp:408`), which bounds the
+// request head, the request body and the idle gap between keep-alive requests
+// alike. satd assembles the same budget from two pieces: hyper's
+// `header_read_timeout` for the head and the idle gap, and a deadline on the
+// compat layer's body collect for the body, because hyper has no body-read
+// timeout.
+//
+// Both tests give the socket its own read timeout, generously longer than the
+// window they assert. That is deliberate: without the server-side guard these
+// tests would *hang* rather than fail, and a hanging test proves nothing.
+
+/// Open a raw TCP connection to the node's JSON-RPC port.
+fn rpc_raw_socket(node: &TestNode) -> std::net::TcpStream {
+    let sock = std::net::TcpStream::connect(format!("127.0.0.1:{}", node.rpcport))
+        .expect("connect to the RPC port");
+    sock.set_read_timeout(Some(test_timeout(30)))
+        .expect("set a socket read timeout");
+    sock
+}
+
+/// Read until the peer closes, or panic if it never does.
+///
+/// Returns whatever arrived first, so a caller can assert on a status line the
+/// server chose to send before closing.
+fn read_until_eof(sock: &mut std::net::TcpStream, what: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match sock.read(&mut buf) {
+            Ok(0) => return seen,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(e) => panic!(
+                "{what}: the server never closed the connection ({e}); read {} bytes: {:?}",
+                seen.len(),
+                String::from_utf8_lossy(&seen)
+            ),
+        }
+    }
+}
+
+/// A client that sends a complete, authenticated head and then withholds the
+/// body is disconnected on the `-rpcservertimeout` budget.
+///
+/// hyper's `header_read_timeout` stops once the head is complete, so before
+/// this the connection — and the task holding it — lived forever. The
+/// authenticated head is the point: the compat layer sits inside `AuthLayer`,
+/// so an unauthenticated request never reaches the body read at all.
+#[test]
+fn rpcservertimeout_cuts_a_request_that_never_sends_its_body() {
+    use std::io::Write;
+
+    let mut node = TestNode::start(&["-rpcservertimeout=2"]);
+    let auth = base64::engine::general_purpose::STANDARD.encode(node.cookie.trim());
+
+    let mut sock = rpc_raw_socket(&node);
+    let head = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1:{}\r\n\
+         Authorization: Basic {auth}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 200\r\n\
+         \r\n",
+        node.rpcport
+    );
+    sock.write_all(head.as_bytes()).expect("write the head");
+    // Twenty bytes of a two-hundred-byte body, then silence.
+    sock.write_all(br#"{"method":"getbl"#)
+        .expect("write a partial body");
+    sock.flush().expect("flush");
+
+    let started = std::time::Instant::now();
+    let seen = read_until_eof(&mut sock, "withheld body");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the connection was closed immediately ({elapsed:?}), so nothing proves the budget ran"
+    );
+    assert!(
+        elapsed <= test_timeout(10),
+        "the withheld body was not cut on the 2s budget (took {elapsed:?})"
+    );
+    // Core sends nothing and closes; satd answers 408 first. Either shape is
+    // accepted here so the assertion is about the close, not the courtesy.
+    let text = String::from_utf8_lossy(&seen);
+    assert!(
+        text.starts_with("HTTP/1.1 408"),
+        "expected a 408 before the close, got: {text:?}"
+    );
+
+    // The node itself is unharmed: a fresh connection is served normally.
+    let info = node.rpc_call("getblockchaininfo").expect("rpc after the cut");
+    assert_eq!(info["result"]["chain"].as_str(), Some("regtest"));
+    node.stop();
+}
+
+/// The other phase, in the shape Core's `interface_http.py` uses: a head that
+/// never terminates.
+///
+/// This passes on hyper's `header_read_timeout` alone. It is here so the two
+/// phases are pinned together and a refactor cannot quietly drop one.
+#[test]
+fn rpcservertimeout_cuts_an_incomplete_head() {
+    use std::io::Write;
+
+    let mut node = TestNode::start(&["-rpcservertimeout=2"]);
+    let mut sock = rpc_raw_socket(&node);
+    sock.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .expect("write a partial head");
+    sock.flush().expect("flush");
+
+    let started = std::time::Instant::now();
+    let _ = read_until_eof(&mut sock, "incomplete head");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the connection was closed immediately ({elapsed:?})"
+    );
+    assert!(
+        elapsed <= test_timeout(10),
+        "the incomplete head was not cut on the 2s budget (took {elapsed:?})"
+    );
+    node.stop();
+}
