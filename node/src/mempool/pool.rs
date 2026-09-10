@@ -2321,24 +2321,7 @@ impl Mempool {
         }
 
         // CPFP: build full ancestor set (transitive) and enforce limits
-        if !ancestors.is_empty() {
-            let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
-            while let Some(ancestor_txid) = queue.pop() {
-                if let Some(ancestor) = inner.entries.get(&ancestor_txid) {
-                    for anc_input in &ancestor.tx.input {
-                        let grandparent = anc_input.previous_output.txid;
-                        if inner.entries.contains_key(&grandparent)
-                            && ancestors.insert(grandparent)
-                        {
-                            queue.push(grandparent);
-                        }
-                    }
-                }
-                if ancestors.len() > cfg.max_ancestor_count {
-                    return Err(MempoolError::TooLongMempoolChain);
-                }
-            }
-        }
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
         // RBF: every replacement rule, shared with `test_accept` so the two
         // cannot answer differently. See `rbf_check`.
@@ -3340,12 +3323,48 @@ impl Mempool {
     /// spends-a-conflict refusal, Rules 3 and 4 (`PaysForRBF`), and the
     /// feerate-diagram comparison (`ImprovesFeerateDiagram`).
     ///
+    /// `ancestors` must be the *transitive* in-mempool ancestor set, from
+    /// [`Self::expand_ancestors`]: the replacement's chunk is built over it.
+    ///
     /// One function so `accept_transaction` and `test_accept` cannot answer
     /// differently. They were two near-identical copies, which is the shape a
     /// "`testmempoolaccept` and `sendrawtransaction` disagree" bug takes: any
     /// fix to one is a coin flip on whether the other gets it.
     ///
     /// Returns the set of transactions the replacement would evict.
+    /// Expand `ancestors` — a transaction's direct in-mempool parents — to
+    /// the full transitive set, refusing a chain longer than
+    /// `max_ancestor_count` (Core's `too-long-mempool-chain`).
+    ///
+    /// One function for `accept_transaction` and `test_accept`. The RBF
+    /// diagram is built over this set, so the two have to hand `rbf_check`
+    /// the same one; and the chain limit is a policy `testmempoolaccept`
+    /// has to report as `sendrawtransaction` would.
+    fn expand_ancestors(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        ancestors: &mut HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        if ancestors.is_empty() {
+            return Ok(());
+        }
+        let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
+        while let Some(ancestor_txid) = queue.pop() {
+            if let Some(ancestor) = inner.entries.get(&ancestor_txid) {
+                for anc_input in &ancestor.tx.input {
+                    let grandparent = anc_input.previous_output.txid;
+                    if inner.entries.contains_key(&grandparent) && ancestors.insert(grandparent) {
+                        queue.push(grandparent);
+                    }
+                }
+            }
+            if ancestors.len() > cfg.max_ancestor_count {
+                return Err(MempoolError::TooLongMempoolChain);
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn rbf_check(
         inner: &MempoolInner,
@@ -3382,6 +3401,7 @@ impl Mempool {
             inner,
             conflicts,
             policy::MAX_REPLACEMENT_CANDIDATES,
+            Self::rbf_eviction_bound(cfg),
         );
         if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
             let detail = format!(
@@ -3490,7 +3510,9 @@ impl Mempool {
         ancestors: &HashSet<Txid>,
         all_evicted: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
-        use crate::mempool::feefrac::{DiagramOrdering, FeeFrac, compare_chunks, sort_chunks};
+        use crate::mempool::feefrac::{
+            DiagramOrdering, FeeFrac, compare_chunks, feerate_compare, sort_chunks,
+        };
 
         let vsize_of = |w: u64| policy::weight_to_vsize(w) as i64;
 
@@ -3522,6 +3544,37 @@ impl Mempool {
             {
                 simple_topology = false;
                 break;
+            }
+            // Core's second half of `CheckConflictTopology`: a conflict with
+            // a child must be that child's only in-mempool parent, and one
+            // with a parent must be that parent's only child — otherwise the
+            // cluster is bigger than two and the two-point chunking below
+            // does not describe it.
+            if let Some(child) = children.first()
+                && let Some(ce) = inner.entries.get(child)
+            {
+                let child_parents: HashSet<Txid> = ce
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .filter(|p| inner.entries.contains_key(p))
+                    .collect();
+                if child_parents.len() > 1 {
+                    simple_topology = false;
+                    break;
+                }
+            }
+            if let Some(parent) = parents.first() {
+                let mut siblings: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, parent, &mut siblings);
+                siblings.retain(|s| inner.entries.contains_key(s));
+                siblings.sort_unstable();
+                siblings.dedup();
+                if siblings.len() > 1 {
+                    simple_topology = false;
+                    break;
+                }
             }
         }
 
@@ -3592,15 +3645,20 @@ impl Mempool {
             .collect();
         let old_chunks = crate::mempool::feefrac::old_diagram(&described);
 
-        // NEW = OLD - conflicts + the replacement's chunk. Anything left over
-        // is a surviving parent of a direct conflict.
+        // NEW = OLD - conflicts + the replacement's chunk. A surviving parent
+        // of a direct conflict is left over and stands on its own — unless
+        // the replacement spends it too, in which case it belongs to the
+        // replacement's own cluster below and must not be counted twice. It
+        // was: pushed here and again inside the replacement's chunk, which
+        // inflated the new diagram by the parent's fee and size and accepted
+        // replacements Core refuses.
         let mut new_chunks: Vec<FeeFrac> = Vec::new();
         for c in conflicts {
             let Some(entry) = inner.entries.get(c) else {
                 continue;
             };
             for p in entry.tx.input.iter().map(|i| i.previous_output.txid) {
-                if all_evicted.contains(&p) {
+                if all_evicted.contains(&p) || ancestors.contains(&p) {
                     continue;
                 }
                 if let Some(pe) = inner.entries.get(&p) {
@@ -3611,21 +3669,32 @@ impl Mempool {
                 }
             }
         }
-        // The replacement itself, with the in-mempool ancestors it would be
-        // mined alongside.
-        let mut chunk = FeeFrac::new(new_fee as i64, vsize_of(weight));
+        // The replacement with the in-mempool ancestors it would be mined
+        // alongside, chunked by the rule `old_diagram` applies to a child and
+        // its parent: one chunk when the replacement's own feerate is the
+        // higher (it pulls the ancestors up), else the ancestors first and
+        // the replacement on its own.
+        let individual = FeeFrac::new(new_fee as i64, vsize_of(weight));
+        let mut package = individual;
         for anc_txid in ancestors {
             if !all_evicted.contains(anc_txid)
                 && let Some(ae) = inner.entries.get(anc_txid)
             {
-                chunk = chunk
+                package = package
                     + FeeFrac::new(
                         modified_fee(ae.fee, ae.fee_delta) as i64,
                         vsize_of(ae.weight as u64),
                     );
             }
         }
-        new_chunks.push(chunk);
+        if package.size == individual.size {
+            new_chunks.push(individual);
+        } else if feerate_compare(individual, package) == std::cmp::Ordering::Greater {
+            new_chunks.push(package);
+        } else {
+            new_chunks.push(package - individual);
+            new_chunks.push(individual);
+        }
         sort_chunks(&mut new_chunks);
 
         if compare_chunks(&new_chunks, &old_chunks) != DiagramOrdering::Better {
@@ -3711,6 +3780,7 @@ impl Mempool {
         inner: &MempoolInner,
         conflicts: &HashSet<Txid>,
         limit: usize,
+        visited_limit: usize,
     ) -> usize {
         let mut seen: HashSet<Txid> = HashSet::new();
         let mut clusters = 0usize;
@@ -3737,6 +3807,16 @@ impl Mempool {
                 }
                 for &next in &buf {
                     if inner.entries.contains_key(&next) && seen.insert(next) {
+                        // `limit` counts clusters; the flood inside one is
+                        // bounded by the component's size, which satd caps
+                        // only per-chain, not per-component. Core cannot hit
+                        // this — a cluster there is at most 64 transactions —
+                        // so a component past the bound is treated as too
+                        // many replacements rather than walked to the end
+                        // under the mempool write lock.
+                        if seen.len() > visited_limit {
+                            return limit + 1;
+                        }
                         queue.push(next);
                     }
                 }
@@ -4035,6 +4115,14 @@ impl Mempool {
             return Err(MempoolError::BadAmounts);
         }
         let fee = sum_inputs - sum_outputs;
+
+        // The same transitive ancestor set — and the same chain limit —
+        // `accept_transaction` computes. `rbf_check` builds the replacement's
+        // chunk over it, so handing it the direct parents alone here made the
+        // two paths judge different chunks: a replacement with an unconfirmed
+        // grandparent passed `testmempoolaccept` and failed
+        // `sendrawtransaction`.
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
         // RBF: the same `rbf_check` `accept_transaction` runs, so
         // `testmempoolaccept` and `sendrawtransaction` cannot disagree.
@@ -6395,9 +6483,16 @@ mod tests {
             .collect();
         assert_eq!(conflicts.len(), 120, "the fixture needs > 100 conflicts");
         assert_eq!(
-            Mempool::conflicting_cluster_count(&inner, &conflicts, 100),
+            Mempool::conflicting_cluster_count(&inner, &conflicts, 100, usize::MAX),
             1,
             "120 children of one parent are one cluster"
+        );
+        // …and the flood inside that one cluster is bounded: past the
+        // visited limit it answers "too many" rather than walking the whole
+        // component under the write lock.
+        assert!(
+            Mempool::conflicting_cluster_count(&inner, &conflicts, 100, 50) > 100,
+            "a component past the visited bound must read as too many"
         );
         drop(inner);
 
@@ -6423,14 +6518,95 @@ mod tests {
         }
         let inner = mp.inner.read();
         assert_eq!(
-            Mempool::conflicting_cluster_count(&inner, &txids, 100),
+            Mempool::conflicting_cluster_count(&inner, &txids, 100, usize::MAX),
             5,
             "five unrelated transactions are five clusters"
         );
         // …and the bound short-circuits rather than walking them all.
-        assert!(Mempool::conflicting_cluster_count(&inner, &txids, 2) > 2);
+        assert!(Mempool::conflicting_cluster_count(&inner, &txids, 2, usize::MAX) > 2);
         drop(inner);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `testmempoolaccept` and `sendrawtransaction` share `rbf_check`, but
+    /// the check is only as shared as its inputs: the replacement's chunk is
+    /// built over the *transitive* in-mempool ancestor set, and `test_accept`
+    /// used to hand it the direct parents alone — so a replacement with an
+    /// unconfirmed grandparent was judged against a different chunk on each
+    /// path. The same expansion also carries `too-long-mempool-chain`, which
+    /// `testmempoolaccept` did not report at all.
+    #[test]
+    fn test_accept_expands_ancestors_the_way_accept_transaction_does() {
+        let op = outpoint(0xD1);
+        let (cs, _, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            max_ancestor_count: 2,
+            ..Default::default()
+        });
+
+        // A → B → C is two ancestors for C: at the limit, accepted.
+        let a = tx_from(&[op], &[(90_000, 0xD2)]);
+        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(80_000, 0xD3)]);
+        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(70_000, 0xD4)]);
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        // D has three. Both paths must say so.
+        let d = tx_from(&[OutPoint { txid: c_txid, vout: 0 }], &[(60_000, 0xD5)]);
+        assert!(matches!(
+            mp.test_accept(&d, &cs, &NoopVerifier),
+            Err(MempoolError::TooLongMempoolChain)
+        ));
+        assert!(matches!(
+            mp.accept_transaction(d, &cs, &NoopVerifier, TxSource::Rpc, false),
+            Err(MempoolError::TooLongMempoolChain)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conflict's surviving parent that the replacement *also* spends was
+    /// counted twice in the new diagram: once as "left over", and again
+    /// inside the replacement's chunk. The inflated diagram accepted a
+    /// replacement whose own chunk is worth less to a miner than the one it
+    /// displaces.
+    ///
+    /// P pays 20 000 sat; its child C pays 5 000 over 82 vB. R spends both of
+    /// P's outputs, pays 5 300 over ~123 vB — more fee than C, at a lower
+    /// feerate. Old diagram: [P], [C]. New, counted once: [P], [R], which
+    /// lies *below* the old at C's endpoint. Counted twice it was [P],
+    /// [P+R], which lies above it.
+    #[test]
+    fn a_parent_shared_with_the_replacement_is_counted_once() {
+        let op = outpoint(0xD6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let parent = tx_from(&[op], &[(60_000, 0xD7), (20_000, 0xD8)]);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent");
+        let conflict = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(55_000, 0xD9)]);
+        let conflict_txid = mp
+            .accept_transaction(conflict, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("conflict");
+
+        let replacement = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(74_700, 0xDA)],
+        );
+        let verdict = mp.accept_transaction(replacement, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "a lower-feerate replacement must not improve the diagram: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &conflict_txid), "the conflict stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

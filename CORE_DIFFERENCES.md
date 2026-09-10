@@ -552,8 +552,11 @@ silently returning an empty or wrong answer.
   diagrams for every replacement (`ImprovesFeerateDiagram`), computing them
   from its cluster linearization. satd builds the diagrams the way Core did
   before the cluster mempool: exact for a conflict with at most one in-mempool
-  parent *or* one child, which is Core's own `CheckConflictTopology`
-  precondition. For anything larger — a conflict inside a longer chain — satd
+  parent *or* one child (that parent having no other child, that child no
+  other parent), which is Core's own `CheckConflictTopology` precondition. A
+  replacement's own in-mempool ancestors are chunked with it by the same
+  child/parent rule; the pre-cluster Core put the replacement in on its own.
+  For anything larger — a conflict inside a longer chain — satd
   falls back to the older per-conflict feerate rule rather than refusing the
   replacement, which would be *stricter* than Core. The fallback can therefore
   accept a replacement Core's full linearization would decline.
