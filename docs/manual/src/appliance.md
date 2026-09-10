@@ -10,7 +10,7 @@ others.
 |---|---|---|---|
 | Reference stack | compose: satd plus optional third-party overlays | `contrib/stack/` | satd supported; overlays best-effort |
 | Appliance image | a bootable VM with satd, wallets and Lightning | `contrib/appliance/` | satd supported; bundled software best-effort |
-| Store packages | satd, `sat-cli`, `sat-tui` and MCP only | `contrib/packaging/` | supported |
+| Store packages | satd, `sat-cli`, `sat-tui` and MCP only | `contrib/packaging/` | supported on `x86_64`; see below |
 
 > **The appliance image and the stack's overlays bundle third-party software
 > (wallets, Lightning, ecash, and others) so you can try satd end to end.
@@ -24,6 +24,13 @@ others.
 >
 > The Umbrel and StartOS packages carry no such notice: they contain only
 > satd.
+
+Both store packages have been installed on a real server and driven through
+every interface they export — see *What is checked, and how* below for what
+that covered. Both were installed on `x86_64`. The `aarch64` `.s9pk` and the
+`arm64` half of the container image build and pass the same automated checks,
+but neither has been installed on an `aarch64` server yet, which is why the
+table says `x86_64` rather than "supported" outright.
 
 ## The reference stack
 
@@ -262,6 +269,24 @@ rather than asserted:
   syncing to the node's tip over Neutrino, and RTL served through the proxy.
 - `contrib/appliance/tests/boot-test.sh` — the built image booted under
   QEMU, checked through the guest agent and through forwarded ports.
+- `contrib/packaging/startos/test/` — the StartOS package's type check and
+  unit tests, run by the **app-store packages** CI job. Two of them exist
+  because a typecheck cannot see the defects they guard: a store read that
+  made the **Network** action a no-op, and a ready gate pointed at
+  `/readyz`, which is 503 for the whole of a sync.
+
+The store packages were additionally installed and driven by hand — on
+StartOS 0.4.0.1 and on umbrelOS, both `x86_64`. That is where those two
+defects were found, along with an image pin that named a tag predating
+`satd-init`: none of the three was visible to any static check, and the
+`/readyz` gate had passed an earlier spot check only because the node under
+it was minutes old. What was covered: `satd-init` producing this install's
+CA, certificate, MCP token and config; both health checks; Esplora and
+Electrum answering through the OS proxy against the server's root CA with
+`Verify return code: 0 (ok)`; MCP refusing an unauthenticated call and
+completing an `initialize` with the token the package prints; switching a
+running node between chains; and satd returning by itself after a reboot.
+Not yet covered on either package: `aarch64`, and StartOS backup/restore.
 
 Every probe that verifies a certificate is paired with the negative control
 that the same handshake without the CA must fail. A probe that would pass
