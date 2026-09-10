@@ -192,10 +192,17 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # `type=sha` alone. On a pull_request the action resolves this to
-          # the PR head commit rather than the synthetic merge commit, which
-          # is the sha a developer can actually check out and rebuild.
           tags: type=sha
+        env:
+          # Without this, `type=sha` on a pull_request names `github.sha` —
+          # the synthetic `refs/pull/N/merge` commit, which exists only inside
+          # the run. The first image this workflow ever published came out as
+          # `sha-c243f0c`, and `git cat-file -t c243f0c` in the repo answers
+          # "Not a valid object name": nothing a developer can check out,
+          # bisect, or rebuild from. This switches the action to the PR head
+          # sha, which is a commit on the branch and the one whose tree the
+          # image was actually built from.
+          DOCKER_METADATA_PR_HEAD_SHA: true
 
       - name: Create + push manifest list
         working-directory: /tmp/digests
