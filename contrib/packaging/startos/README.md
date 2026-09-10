@@ -76,8 +76,11 @@ The SDK ships the entire build as `s9pk.mk`; the `Makefile` here is one
 `make` itself cannot run in CI — packing wants `start-cli`, `tar2sqfs` and a
 signing workspace, and `make install` wants a server. The parts that can are
 gated by the **app-store packages** job in `.github/workflows/appliance.yml`:
-`npm ci`, `tsc --noEmit`, the tests, and the `ncc` bundle, on any PR touching
-this directory.
+`npm ci`, `tsc --noEmit`, the tests, and the `ncc` bundle. It runs on any PR
+touching this directory, and also on one touching
+`contrib/stack/satd/satd-init`, because `test/networks.test.ts` reads that
+file — gating only on this directory would skip the drift check on the very
+change that causes drift.
 
 ### The lockfile advisories
 
@@ -131,7 +134,8 @@ answers.
 Also checked, now on every PR that touches this directory: the package
 typechecks against `@start9labs/start-sdk` 2.0.9, `test/networks.test.ts`
 verifies the network list and every P2P port against
-`contrib/stack/satd/satd-init` itself so the two cannot drift, and
+`contrib/stack/satd/satd-init` itself so the two cannot drift (which is why
+a change to that file runs this job too), and
 `test/reactivity.test.ts` guards the two defects above that a typecheck
 cannot see.
 

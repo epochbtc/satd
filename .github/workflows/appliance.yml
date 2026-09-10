@@ -8,7 +8,8 @@
 #      network. Runs on any PR that touches them.
 #   2. The app-store packages: the StartOS package's type check, unit tests
 #      and ncc bundle. Under a minute, needs only Node 22. Runs on any PR
-#      that touches contrib/packaging/startos.
+#      that touches contrib/packaging/startos — or satd-init, which its
+#      tests read.
 #   3. The reference stack (contrib/stack): brought up on regtest, with every
 #      TLS listener probed from outside the container against the CA the
 #      stack generated, plus LND syncing to the node over Neutrino and RTL
@@ -103,7 +104,14 @@ jobs:
           # compose files, the appliance CLI and the Umbrel package, so it has
           # to run when any of those change.
           echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)')" >> "$GITHUB_OUTPUT"
-          echo "packages=$(match '^contrib/packaging/startos/')" >> "$GITHUB_OUTPUT"
+          # satd-init as well as the package: test/networks.test.ts reads
+          # contrib/stack/satd/satd-init and compares its network list and
+          # P2P ports against the package's own. That guard exists because
+          # the two drifting is silent — a stale port publishes the wrong
+          # P2P port, a stale name fails at first start — and gating only on
+          # contrib/packaging/startos/ would skip it on exactly the change
+          # it is there to catch.
+          echo "packages=$(match '^(contrib/packaging/startos/|contrib/stack/satd/satd-init$)')" >> "$GITHUB_OUTPUT"
 
   # Cheap and always worth running when touched: no docker, no network.
   scripts:
@@ -143,7 +151,9 @@ jobs:
   # the three defects that install found — a `.once()` store read that made
   # the Network action a no-op, and a ready gate wired to `/readyz` — have
   # guards in test/reactivity.test.ts, and a guard nothing executes is a
-  # comment. This is the job that executes them.
+  # comment. This is the job that executes them. test/networks.test.ts is
+  # the other reason, and the reason this job's path gate reaches outside
+  # contrib/packaging/startos: it reads satd-init directly.
   #
   # Node 22 is not optional: the tests are `.ts` files run directly under
   # `node --test`, which needs --experimental-strip-types (22.6+). On Node 20
