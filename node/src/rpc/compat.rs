@@ -65,12 +65,27 @@ const MAX_URI_LENGTH: usize = 8192;
 /// is unchanged or cannot/should not be rewritten (not JSON, empty, no
 /// request object needing a fix), so the caller forwards the original
 /// bytes verbatim.
+/// What the request rewrite decided, beyond the bytes: which synthetic ids
+/// belong to notifications, and whether *every* request in the body was one.
+#[derive(Default)]
+pub(crate) struct RequestPlan {
+    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) notification_ids: Vec<String>,
+    pub(crate) all_notifications: bool,
+}
+
+#[cfg(test)]
 fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
+    plan_request(body).body
+}
+
+/// [`normalize_jsonrpc_version`] plus the notification bookkeeping.
+pub(crate) fn plan_request(body: &[u8]) -> RequestPlan {
     // The body is already size-bounded by the caller (Content-Length
     // pre-check + `Limited` read), so this only guards the empty case;
     // the length check is kept as defense-in-depth.
     if body.is_empty() || body.len() > MAX_NORMALIZE_BODY {
-        return None;
+        return RequestPlan::default();
     }
     // Each request object is read as a list of *raw* member text, not as a
     // fully-parsed `Value`. That is the difference between rewriting the
@@ -85,13 +100,21 @@ fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
     // Keeping every member as `&RawValue` re-emits it byte-for-byte, which is
     // what this module's contract already claimed for `params`.
     if let Ok(mut members) = serde_json::from_slice::<Members>(body) {
-        let fix = plan_request_fix(&members);
+        let fix = plan_request_fix(&members, 0);
         if !fix.changed() {
-            return None;
+            return RequestPlan::default();
         }
         let mut out = Vec::with_capacity(body.len() + 32);
         write_request_object(&mut out, &mut members, fix);
-        return Some(out);
+        return RequestPlan {
+            body: Some(out),
+            notification_ids: if fix.notification {
+                vec![format!("{NOTIFICATION_ID_PREFIX}0")]
+            } else {
+                Vec::new()
+            },
+            all_notifications: fix.notification,
+        };
     }
     // A batch is read element by element, not as `Vec<Members>`: one element
     // that is not an object (`[{"method":"m"}, 5]`) fails the whole-batch
@@ -102,20 +125,32 @@ fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
     // is jsonrpsee's job to reject them, not this layer's.
     if let Ok(elements) = serde_json::from_slice::<Vec<&serde_json::value::RawValue>>(body) {
         let mut parsed: Vec<Option<(Members, RequestFix)>> = Vec::with_capacity(elements.len());
-        for raw in &elements {
+        for (i, raw) in elements.iter().enumerate() {
             match serde_json::from_str::<Members>(raw.get()) {
                 Ok(members) => {
-                    let fix = plan_request_fix(&members);
+                    let fix = plan_request_fix(&members, i as u64);
                     parsed.push(Some((members, fix)));
                 }
                 Err(_) => parsed.push(None),
             }
         }
+        let notification_ids: Vec<String> = parsed
+            .iter()
+            .filter_map(|p| p.as_ref())
+            .filter(|(_, fix)| fix.notification)
+            .map(|(_, fix)| format!("{NOTIFICATION_ID_PREFIX}{}", fix.synthetic_id))
+            .collect();
+        // Core answers a batch of nothing but notifications with 204 and no
+        // body, exactly as it answers a single one.
+        let all_notifications = !elements.is_empty()
+            && parsed
+                .iter()
+                .all(|p| p.as_ref().is_some_and(|(_, fix)| fix.notification));
         if !parsed
             .iter()
             .any(|p| p.as_ref().is_some_and(|(_, fix)| fix.changed()))
         {
-            return None;
+            return RequestPlan::default();
         }
         let mut out = Vec::with_capacity(body.len() + 32 * elements.len().max(1));
         out.push(b'[');
@@ -129,9 +164,13 @@ fn normalize_jsonrpc_version(body: &[u8]) -> Option<Vec<u8>> {
             }
         }
         out.push(b']');
-        return Some(out);
+        return RequestPlan {
+            body: Some(out),
+            notification_ids,
+            all_notifications,
+        };
     }
-    None
+    RequestPlan::default()
 }
 
 /// One request object's members, in source order, each still raw text.
@@ -179,12 +218,20 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for Members<'a> {
 struct RequestFix {
     set_jsonrpc: bool,
     add_id: bool,
+    /// A JSON-RPC 2.0 request with no `id`: the method runs and no response
+    /// is sent.
+    notification: bool,
+    /// Distinguishes one notification's synthetic id from another's within a
+    /// batch. Meaningless unless `notification`.
+    synthetic_id: u64,
 }
 
 impl RequestFix {
     const NONE: Self = Self {
         set_jsonrpc: false,
         add_id: false,
+        notification: false,
+        synthetic_id: 0,
     };
 
     fn changed(&self) -> bool {
@@ -192,11 +239,34 @@ impl RequestFix {
     }
 }
 
+/// The prefix of the synthetic `id` given to a 2.0 notification.
+///
+/// A notification carries no `id`, but jsonrpsee will not run a request
+/// without one, so this layer supplies one — and then has to recognise the
+/// reply in order to drop it. A `null` id is not enough: two notifications in
+/// one batch would both come back as `null` and be indistinguishable. The NUL
+/// byte cannot appear in a JSON string a client wrote without escaping, and
+/// nothing in satd emits one, so a value starting with it is unambiguously
+/// this layer's own.
+const NOTIFICATION_ID_PREFIX: &str = "\u{0}satd-notification-";
+
+/// The prefix of the synthetic `id` given to a **1.0** request that carried
+/// no `id` member.
+///
+/// Core parses `id` as `std::optional`: absent means absent, and
+/// `JSONRPCReplyObj` pushes `id` only when it has a value
+/// (`rpc/request.cpp`, `rpc/protocol.cpp`). So a 1.0 request without an id is
+/// answered with **no `id` member at all**, while one that sent `"id": null`
+/// is answered `"id": null`. Those two look identical in the reply, so the
+/// difference has to be carried from the request — hence a sentinel here too,
+/// stripped from the response rather than the whole reply being dropped.
+const ABSENT_ID_PREFIX: &str = "\u{0}satd-absent-id-";
+
 /// If `members` is a JSON-RPC *request* object (it has a `"method"` member),
 /// decide whether its `"jsonrpc"` member needs forcing to `2.0` and whether an
 /// `"id"` must be added. Without an `id`, jsonrpsee treats the request as a
 /// 2.0 notification and returns no response; Core always responds, `id` or not.
-fn plan_request_fix(members: &Members<'_>) -> RequestFix {
+fn plan_request_fix(members: &Members<'_>, synthetic_id: u64) -> RequestFix {
     let has = |name: &str| members.iter().any(|(k, _)| k == name);
     if !has("method") {
         return RequestFix::NONE;
@@ -211,9 +281,19 @@ fn plan_request_fix(members: &Members<'_>) -> RequestFix {
         .iter()
         .rfind(|(k, _)| k == "jsonrpc")
         .is_some_and(|(_, v)| v.get().trim() == "\"2.0\"");
+    // A JSON-RPC 2.0 request with **no** `id` member is a notification: the
+    // method runs and no response is sent (HTTP 204, and no entry in a batch).
+    // An explicit `"id": null` is not a notification — it is an id, and Core
+    // echoes it.
+    //
+    // This layer used to inject `"id": null` into every request that lacked
+    // one, so jsonrpsee never saw a notification and satd always answered.
+    let notification = already_2_0 && !has("id");
     RequestFix {
         set_jsonrpc: !already_2_0,
         add_id: !has("id"),
+        notification,
+        synthetic_id,
     }
 }
 
@@ -250,7 +330,14 @@ fn write_request_object(out: &mut Vec<u8>, members: &mut Members<'_>, fix: Reque
         if wrote_any {
             out.push(b',');
         }
-        out.extend_from_slice(b"\"id\":null");
+        let prefix = if fix.notification {
+            NOTIFICATION_ID_PREFIX
+        } else {
+            ABSENT_ID_PREFIX
+        };
+        let id = format!("{prefix}{}", fix.synthetic_id);
+        out.extend_from_slice(b"\"id\":");
+        out.extend_from_slice(&serde_json::to_vec(&id).expect("a String is serialisable"));
     }
     out.push(b'}');
 }
@@ -411,11 +498,19 @@ fn rewrite_response_object(value: &serde_json::Value) -> Option<Vec<u8>> {
     let result_json = serde_json::to_string(&result_val).ok()?;
     let error_json = serde_json::to_string(&error_val).ok()?;
 
+    // Core echoes the `id` it was given, `null` included, and omits the
+    // member entirely when the request carried none (`JSONRPCReplyObj` pushes
+    // `id` only `if (id.has_value())`). satd used to omit every null id,
+    // which lost the difference between `"id": null` and no id — different
+    // requests with different replies. The synthetic id this layer added for
+    // jsonrpsee's benefit is what distinguishes them, and it is dropped here.
+    let synthetic = id
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.starts_with(ABSENT_ID_PREFIX) || s.starts_with(NOTIFICATION_ID_PREFIX));
     let mut out = format!("{{\"result\":{result_json},\"error\":{error_json}");
-    if let Some(id_val) = &id
-        && !id_val.is_null()
-    {
-        let id_json = serde_json::to_string(id_val).ok()?;
+    if !synthetic {
+        let id_json = serde_json::to_string(&id.unwrap_or(serde_json::Value::Null)).ok()?;
         out.push_str(&format!(",\"id\":{id_json}"));
     }
     out.push('}');
@@ -609,8 +704,9 @@ where
             // before the request is rewritten to 2.0 for jsonrpsee's benefit.
             let client_spoke_2_0 = request_declared_2_0(&collected);
 
-            let new_body = match normalize_jsonrpc_version(&collected) {
-                Some(rewritten) => HttpBody::from(rewritten),
+            let plan = plan_request(&collected);
+            let new_body = match &plan.body {
+                Some(rewritten) => HttpBody::from(rewritten.clone()),
                 None => HttpBody::from(collected.to_vec()),
             };
 
@@ -623,9 +719,67 @@ where
                 Ok(b) => b.to_bytes(),
                 Err(_) => bytes::Bytes::new(),
             };
+
+            // Every request in the body was a 2.0 notification: the methods
+            // ran, and Core answers with `204 No Content` and no body at all.
+            if plan.all_notifications {
+                return Ok(no_content());
+            }
+
+            // A batch with some notifications in it: their replies exist only
+            // because jsonrpsee needed an id to run them, so drop them.
+            let resp_bytes = if plan.notification_ids.is_empty() {
+                resp_bytes
+            } else {
+                bytes::Bytes::from(drop_notification_replies(
+                    &resp_bytes,
+                    &plan.notification_ids,
+                ))
+            };
+
+            // Core's HTTP status follows the JSON-RPC error code
+            // (`httprpc.cpp`): an invalid request is 400, an unknown method
+            // 404, and every other error 500. jsonrpsee answers 200 to all
+            // of them, so a client that switches on the status — Core's own
+            // `interface_rpc.py` does — could not tell them apart.
+            //
+            // But only for a **legacy** (1.0/1.1) request. Core catches
+            // errors for a 2.0 request and returns them inside an HTTP 200
+            // (`catch_errors{jreq.m_json_version == JSONRPCVersion::V2}`);
+            // `JSONErrorReply`, which does the mapping, opens with
+            // `Assume(jreq.m_json_version != JSONRPCVersion::V2)`. Mapping it
+            // for 2.0 as well is worse than cosmetic: Core's own authproxy
+            // raises `-342 non-200 HTTP status code` for a 2.0 reply with a
+            // non-200 status *before* it looks at the error object, so the
+            // real error code never reaches the caller.
+            //
+            // The mapping parses the reply, so it stops at the same cap the
+            // normalisation below does: a reply that large is a result, not
+            // an error object, and parsing it here would be the DOM parse the
+            // cap exists to avoid.
+            let oversized = resp_bytes.len() > MAX_NORMALIZE_BODY;
+            if !oversized
+                && let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0)
+            {
+                head.status = status;
+            }
+
             // Core-shaped request in, Core-shaped response out. A client that
             // asked for 2.0 gets jsonrpsee's 2.0 reply untouched.
             let out_body = if client_spoke_2_0 {
+                resp_bytes.to_vec()
+            } else if oversized {
+                // Normalisation DOM-parses the body to touch three top-level
+                // keys, which costs several times its size again. A reply
+                // over the cap — a verbosity-2 `getblock` of a full block is
+                // the realistic one — is forwarded in jsonrpsee's shape
+                // instead. Truncating or refusing it would be worse: the
+                // answer is correct JSON, only its envelope is 2.0.
+                tracing::debug!(
+                    target: "rpc::compat",
+                    bytes = resp_bytes.len(),
+                    "response too large to normalise to JSON-RPC 1.0; forwarding as 2.0"
+                );
                 resp_bytes.to_vec()
             } else {
                 normalize_response_body_bytes(&resp_bytes)
@@ -633,6 +787,69 @@ where
             Ok(HttpResponse::from_parts(head, HttpBody::from(out_body)))
         })
     }
+}
+
+/// `204 No Content` — Core's answer to a request body containing nothing but
+/// JSON-RPC 2.0 notifications.
+fn no_content() -> HttpResponse<HttpBody> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::NO_CONTENT)
+        .body(HttpBody::from(""))
+        .expect("static 204 response is always valid")
+}
+
+/// Remove the replies jsonrpsee produced for notifications, identified by the
+/// synthetic ids this layer gave them.
+///
+/// Only a batch reaches this: a lone notification is answered 204 before it.
+fn drop_notification_replies(body: &[u8], notification_ids: &[String]) -> Vec<u8> {
+    let Ok(serde_json::Value::Array(items)) =
+        serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return body.to_vec();
+    };
+    let kept: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|item| {
+            item.get("id")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| !notification_ids.iter().any(|n| n == id))
+        })
+        .collect();
+    serde_json::to_vec(&kept).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Core's HTTP status for a JSON-RPC error code (`httprpc.cpp`
+/// `HTTPReq_JSONRPC`). `None` leaves the status alone.
+///
+/// `client_spoke_2_0` is not decoration. Core maps the status only for a
+/// **legacy** request: `JSONRPCExec` is called with
+/// `catch_errors{jreq.m_json_version == JSONRPCVersion::V2}`, so a 2.0 error
+/// is caught and returned inside an HTTP 200, and `JSONErrorReply` — the only
+/// place the mapping lives — opens with
+/// `Assume(jreq.m_json_version != JSONRPCVersion::V2)`.
+///
+/// Mapping it for 2.0 too is not merely cosmetic. Core's own `authproxy`
+/// raises `-342 non-200 HTTP status code` for a 2.0 reply whose status is not
+/// 200, *before* it reads the error object — so the real code never reaches
+/// the caller and `assert_raises_rpc_error(-32601, ...)` cannot match.
+fn core_http_status(body: &[u8], client_spoke_2_0: bool) -> Option<hyper::StatusCode> {
+    if client_spoke_2_0 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    // A batch keeps 200 whatever its members say; Core only maps the status
+    // for a single request.
+    let code = value.get("error")?.get("code")?.as_i64()?;
+    // `JSONErrorReply` starts from 500 and overrides exactly two codes. Every
+    // other error a legacy request provokes — `-8`, `-5`, `-32602`, all of
+    // them — is a 500, and `interface_rpc.py` asserts that for `getblockhash`
+    // with a bad height.
+    Some(match code {
+        -32600 => hyper::StatusCode::BAD_REQUEST,
+        -32601 => hyper::StatusCode::NOT_FOUND,
+        _ => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding
@@ -766,7 +983,10 @@ mod tests {
         let out = normalize_jsonrpc_version(body).expect("should add jsonrpc + id");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#"{"a":1.10,"b":1e2}"#), "{text}");
-        assert!(text.contains(r#""id":null"#), "{text}");
+        // The id this layer supplies for jsonrpsee's benefit is a sentinel it
+        // strips from the reply, not a literal null — see
+        // `an_absent_id_and_an_explicit_null_id_are_different`.
+        assert!(text.contains("satd-absent-id-"), "{text}");
 
         // ...and in a batch.
         let body = br#"[{"method":"m","params":[{"a":1,"a":2}]},{"jsonrpc":"2.0","id":1,"method":"n","params":[]}]"#;
@@ -843,9 +1063,16 @@ mod tests {
 
     #[test]
     fn no_id_request_gets_id_added() {
+        // jsonrpsee will not run a request without an `id`, so this layer
+        // supplies one — a sentinel it can recognise and strip from the
+        // reply, since Core answers a request that carried no id with no `id`
+        // member at all.
         let out = norm(r#"{"method": "getbestblockhash"}"#).expect("should rewrite");
         assert_eq!(out["jsonrpc"], "2.0");
-        assert_eq!(out["id"], serde_json::Value::Null);
+        assert!(
+            out["id"].as_str().is_some_and(|s| s.starts_with(ABSENT_ID_PREFIX)),
+            "{out}"
+        );
         assert_eq!(out["method"], "getbestblockhash");
     }
 
@@ -872,15 +1099,137 @@ mod tests {
         );
     }
 
+    /// Core parses `id` as an `optional` and pushes it into the reply only
+    /// when the request carried one (`rpc/request.cpp`, `JSONRPCReplyObj`).
+    /// So "no id" and `"id": null` are different requests with different
+    /// replies — and satd used to answer both the same way, omitting every
+    /// null id.
     #[test]
-    fn response_with_null_id_omits_id() {
-        // A request we added synthetic `id:null` to gets the id stripped
-        // from the response, matching Core's "no id in request → no id
-        // in response" behaviour.
+    fn an_absent_id_and_an_explicit_null_id_are_different() {
+        // The synthetic id this layer gives a request that carried none: the
+        // reply drops the member entirely.
+        let synthetic = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": "ok",
+            "id": format!("{ABSENT_ID_PREFIX}0"),
+        }))
+        .unwrap();
+        assert_eq!(
+            normalize_response_body_bytes(&synthetic),
+            br#"{"result":"ok","error":null}
+"#
+        );
+
+        // An id the client actually wrote — even `null` — is echoed.
         let input = br#"{"jsonrpc":"2.0","result":"ok","id":null}"#;
-        let out = normalize_response_body_bytes(input);
-        assert_eq!(out, br#"{"result":"ok","error":null}
-"#);
+        assert_eq!(
+            normalize_response_body_bytes(input),
+            br#"{"result":"ok","error":null,"id":null}
+"#
+        );
+    }
+
+    /// A JSON-RPC 2.0 request with no `id` is a notification: the method
+    /// runs, and nothing comes back. satd injected `"id": null` into every
+    /// request that lacked one, so jsonrpsee never saw a notification and the
+    /// node always answered.
+    #[test]
+    fn a_2_0_request_without_an_id_is_a_notification() {
+        let plan = plan_request(br#"{"jsonrpc":"2.0","method":"getblockcount","params":[]}"#);
+        assert!(plan.all_notifications, "a lone 2.0 request with no id");
+        assert_eq!(plan.notification_ids.len(), 1);
+        // …and it still reaches jsonrpsee with an id, or the method would not
+        // run at all.
+        let body: serde_json::Value =
+            serde_json::from_slice(&plan.body.expect("rewritten")).expect("valid JSON");
+        assert_eq!(body["id"], serde_json::json!(plan.notification_ids[0]));
+
+        // A 1.0 request without an id is *not* a notification: only 2.0 has
+        // them. It is answered, with no `id` member.
+        let plan = plan_request(br#"{"jsonrpc":"1.0","method":"getblockcount","params":[]}"#);
+        assert!(!plan.all_notifications);
+        assert!(plan.notification_ids.is_empty());
+
+        // Neither is an explicit null id.
+        let plan =
+            plan_request(br#"{"jsonrpc":"2.0","id":null,"method":"getblockcount","params":[]}"#);
+        assert!(!plan.all_notifications);
+        assert!(plan.notification_ids.is_empty());
+    }
+
+    /// In a batch, a notification produces no entry — but its neighbours do.
+    #[test]
+    fn a_notification_in_a_batch_leaves_no_entry() {
+        let plan = plan_request(
+            br#"[{"jsonrpc":"2.0","method":"a"},{"jsonrpc":"2.0","id":7,"method":"b"}]"#,
+        );
+        assert!(!plan.all_notifications, "one member has an id");
+        assert_eq!(plan.notification_ids.len(), 1);
+
+        let reply = serde_json::to_vec(&serde_json::json!([
+            { "jsonrpc": "2.0", "result": 1, "id": plan.notification_ids[0] },
+            { "jsonrpc": "2.0", "result": 2, "id": 7 },
+        ]))
+        .unwrap();
+        let kept = drop_notification_replies(&reply, &plan.notification_ids);
+        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        let kept = kept.as_array().expect("array");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0]["id"], serde_json::json!(7));
+
+        // A batch of nothing but notifications is answered 204 whole.
+        let plan =
+            plan_request(br#"[{"jsonrpc":"2.0","method":"a"},{"jsonrpc":"2.0","method":"b"}]"#);
+        assert!(plan.all_notifications);
+        assert_eq!(plan.notification_ids.len(), 2);
+        assert_ne!(
+            plan.notification_ids[0], plan.notification_ids[1],
+            "two notifications in one batch need distinguishable ids"
+        );
+    }
+
+    /// Core's HTTP status follows the JSON-RPC error code
+    /// (`httprpc.cpp`, `JSONErrorReply`): an invalid request is 400, an
+    /// unknown method 404, and everything else — a parse error, `-8`, `-5`,
+    /// `-32602` — is 500, the value the function starts from. jsonrpsee
+    /// answers 200 to all of them. The first shape of this mapped only the
+    /// three codes the parse path produces and left an application error at
+    /// 200, which `interface_rpc.py` catches on `getblockhash`.
+    #[test]
+    fn the_http_status_follows_cores_mapping() {
+        for (code, want) in [
+            (-32700, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-32600, hyper::StatusCode::BAD_REQUEST),
+            (-32601, hyper::StatusCode::NOT_FOUND),
+            (-32602, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-8, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-5, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-1, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let body = format!(r#"{{"error":{{"code":{code},"message":"x"}},"id":1}}"#);
+            assert_eq!(
+                core_http_status(body.as_bytes(), false),
+                Some(want),
+                "code {code}"
+            );
+            // The same error answering a *2.0* request keeps 200: Core
+            // catches it and replies 200, and its own authproxy turns any
+            // non-200 on a 2.0 reply into `-342` before it ever reads the
+            // code. `rpc_generate.py` and `wallet_disable.py` both assert on
+            // -32601 through that path.
+            assert_eq!(
+                core_http_status(body.as_bytes(), true),
+                None,
+                "code {code} on a 2.0 request must stay 200"
+            );
+        }
+        // A success keeps 200, and so does a batch.
+        assert_eq!(core_http_status(br#"{"result":1,"id":1}"#, false), None);
+        assert_eq!(core_http_status(br#"{"result":1,"error":null,"id":1}"#, false), None);
+        assert_eq!(
+            core_http_status(br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#, false),
+            None
+        );
     }
 
     #[test]

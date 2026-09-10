@@ -19,7 +19,7 @@ use crate::rpc::{access, address, blockchain, indexes, mining, network, psbt, ra
 use crate::storage::Store;
 use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{
-    Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle, serve_with_graceful_shutdown,
+    Methods, RpcModule, ServerBuilder, ServerConfig, ServerHandle,
     stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
@@ -3925,6 +3925,7 @@ pub async fn start(
                 admission.clone(),
                 bearer.clone(),
                 None,
+                header_read_timeout,
             )
             .await?,
         )
@@ -4062,6 +4063,7 @@ async fn spawn_readonly_listeners(
                 admission,
                 None,
                 Some(ReadOnlyLayer::new()),
+                header_read_timeout,
             )
             .await;
             let _ = tx.send(res);
@@ -4101,6 +4103,7 @@ async fn spawn_tls_surface(
     // `Some` only for a read-only TLS listener. `None` keeps this a zero-cost
     // identity, matching `spawn_plain_surface`.
     rpc_filter: Option<ReadOnlyLayer>,
+    header_read_timeout: Option<Duration>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // mTLS policy: `Required` when the operator opted in via
     // `--rpcmtls=1`; otherwise `Disabled` (plain server-auth TLS).
@@ -4310,13 +4313,15 @@ async fn spawn_tls_surface(
                     },
                 );
 
-                // Spawn the serve future directly (no wrapping async
-                // block) — this matches the doc example and helper
-                // pattern that types correctly under HRTB inference.
-                tokio::spawn(serve_with_graceful_shutdown(
+                // The same connection server the plain surface uses, so
+                // `-rpcservertimeout` applies here too. jsonrpsee's
+                // `serve_with_graceful_shutdown` takes no timeout, which is
+                // why a TLS connection had none.
+                tokio::spawn(serve_http_connection(
                     tls_stream,
                     svc,
                     conn_stop.shutdown(),
+                    header_read_timeout,
                 ));
             });
         }
@@ -4552,13 +4557,18 @@ pub async fn spawn_plain_surface(
 /// never completes the HTTP request headers gets disconnected rather
 /// than holding a connection slot forever.  This wires Bitcoin Core's
 /// `-rpcservertimeout` knob.
-async fn serve_http_connection<S, B>(
-    io: tokio::net::TcpStream,
+async fn serve_http_connection<S, B, I>(
+    io: I,
     service: S,
     stopped: impl std::future::Future<Output = ()>,
     header_read_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
+    // Generic over the transport so the TLS surface gets the same timeouts
+    // as the plain one. It used to be `TcpStream`-only, which is why
+    // `spawn_tls_surface` fell back to jsonrpsee's helper — and so ignored
+    // `-rpcservertimeout` entirely.
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: tower::Service<
             jsonrpsee::server::HttpRequest<hyper::body::Incoming>,
             Response = jsonrpsee::server::HttpResponse<B>,
@@ -4576,10 +4586,24 @@ where
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     if let Some(timeout) = header_read_timeout {
+        // The header-read timeout covers only the gap between accepting the
+        // socket and reading a complete request head. A client that sends
+        // half a header, or a complete head and then no body, or that holds
+        // an idle keep-alive connection open, was never disconnected — so
+        // `-rpcservertimeout` bounded one phase of the connection and left
+        // the rest unbounded. HTTP/2 had no bound at all.
         builder
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(timeout);
+            .header_read_timeout(timeout)
+            // A keep-alive connection that goes quiet is closed on the same
+            // budget, which is what an operator setting this expects.
+            .keep_alive(true);
+        builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(Some(timeout))
+            .keep_alive_timeout(timeout);
     }
     let conn = builder.serve_connection_with_upgrades(io, service);
 

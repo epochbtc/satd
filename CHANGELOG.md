@@ -75,6 +75,23 @@ item below is (or will be) written up in full in the in-development
   installed packages come from — was failing the whole step, and with it every
   canary job.
 
+- **Breaking:** a JSON-RPC 2.0 request with no `id` is a notification: the
+  method runs and the node answers `204 No Content`, and in a batch it
+  produces no entry. satd injected `"id": null` into every request that lacked
+  one, so it always answered (#664).
+- **Breaking:** the `id` a request carried is echoed, `null` included, and
+  omitted entirely when the request carried none — as Core's optional `id`
+  does. satd omitted every null id, losing the difference (#664).
+- **Breaking:** the HTTP status of a *legacy* (non-2.0) request carries the
+  JSON-RPC error class as Core's does: an invalid request is 400, an unknown
+  method 404, and any other error — a parse error, `-8`, `-5` — 500. A
+  JSON-RPC 2.0 request keeps 200 and carries the error in the body, as Core
+  does (#664).
+- `-rpcservertimeout` bounds idle keep-alive connections and HTTP/2 as well
+  as the header read, and reaches the TLS listener, which had no timeout at
+  all (#664).
+- A JSON-RPC response too large to normalise is forwarded rather than
+  DOM-parsed, which cost several times its size in peak memory (#664).
 - **Breaking:** `verifytxoutproof` requires the block to be on the active
   chain and the proof to cover the whole block, as Core does, and answers
   `-5 Block not found in chain` otherwise. A proof built on a stale branch read
