@@ -96,6 +96,17 @@ item below is (or will be) written up in full in the in-development
   all (#664).
 - A JSON-RPC response too large to normalise is forwarded rather than
   DOM-parsed, which cost several times its size in peak memory (#664).
+- **Breaking:** a replacement is now compared against the *feerate diagram*
+  it displaces, as Bitcoin Core's `ImprovesFeerateDiagram` does, rather than
+  against each conflicting transaction's own feerate. A cheap transaction
+  carrying an expensive child is one chunk to a miner, so beating the parent
+  alone no longer replaces it — even when the replacement pays more in total.
+  A conflict's surviving parent that the replacement also spends counts once
+  in the diagram (#660).
+- `testmempoolaccept` and `sendrawtransaction` run one shared RBF check over
+  the same transitive ancestor set, and `testmempoolaccept` reports
+  `too-long-mempool-chain` as `sendrawtransaction` does, so
+  they cannot disagree about a replacement (#660).
 - Five RPC fields that were constants stop pretending to be measurements
   (#702): `getblockchaininfo.size_on_disk` is a maintained total of block-file
   bytes instead of `0`; `getblockchaininfo.pruneheight` is reported on a

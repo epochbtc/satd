@@ -548,6 +548,23 @@ silently returning an empty or wrong answer.
   omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
   refused with Core's message, as Core itself does off glibc.
 
+- **RBF feerate diagrams for complex topologies** — Core compares feerate
+  diagrams for every replacement (`ImprovesFeerateDiagram`), computing them
+  from its cluster linearization. satd builds the diagrams the way Core did
+  before the cluster mempool: exact for a conflict with at most one in-mempool
+  parent *or* one child (that parent having no other child, that child no
+  other parent), which is Core's own `CheckConflictTopology` precondition. A
+  replacement's own surviving in-mempool ancestors — each standing alone on
+  this path — form a star with it: one chunk with those it pulls up, the rest
+  on their own; the pre-cluster Core put the replacement in on its own.
+  An ancestor of the replacement unrelated to the conflicts stands on both
+  sides of the comparison when it has no in-mempool relatives of its own. For
+  anything larger — a conflict inside a longer chain, an ancestor with
+  relatives — satd falls back to the older per-conflict feerate rule rather
+  than refusing the replacement, which would be *stricter* than Core. The
+  fallback can therefore accept a replacement Core's full linearization would
+  decline.
+
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
   its number is the block files alone and is smaller than Core's for the same

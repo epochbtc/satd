@@ -2321,178 +2321,27 @@ impl Mempool {
         }
 
         // CPFP: build full ancestor set (transitive) and enforce limits
-        if !ancestors.is_empty() {
-            let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
-            while let Some(ancestor_txid) = queue.pop() {
-                if let Some(ancestor) = inner.entries.get(&ancestor_txid) {
-                    for anc_input in &ancestor.tx.input {
-                        let grandparent = anc_input.previous_output.txid;
-                        if inner.entries.contains_key(&grandparent)
-                            && ancestors.insert(grandparent)
-                        {
-                            queue.push(grandparent);
-                        }
-                    }
-                }
-                if ancestors.len() > cfg.max_ancestor_count {
-                    return Err(MempoolError::TooLongMempoolChain);
-                }
-            }
-        }
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
 
-        // RBF: if there are conflicts, check replacement rules
+        // RBF: every replacement rule, shared with `test_accept` so the two
+        // cannot answer differently. See `rbf_check`.
         if !conflicts.is_empty() {
-            // Opt-in RBF: each direct conflict must signal replaceability.
-            for conflict_txid in &conflicts {
-                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
-                    && !cfg.full_rbf
-                {
-                    let signals_rbf = conflict_entry
-                        .tx
-                        .input
-                        .iter()
-                        .any(|i| i.sequence.0 < 0xffff_fffe);
-                    if !signals_rbf {
-                        return Err(MempoolError::ConflictingSpend);
-                    }
-                }
-            }
-
-            // Rule 5, Core's `PaysForRBF` precondition: reject a replacement
-            // that conflicts directly with more than
-            // `MAX_REPLACEMENT_CANDIDATES` distinct *clusters*. Counting the
-            // conflicts themselves over-counts a package — 101 transactions
-            // that all descend from one parent are one cluster, and Core
-            // accepts that replacement.
-            let clusters = Self::conflicting_cluster_count(
-                &inner,
-                &conflicts,
-                policy::MAX_REPLACEMENT_CANDIDATES,
-            );
-            if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
-                let detail = format!(
-                    "too many potential replacements, rejecting replacement {}; \
-                     too many conflicting clusters ({} > {})",
-                    txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
-                );
-                return Err(MempoolError::TooManyReplacements(detail));
-            }
-
-            // Collect all txids that would be evicted (conflicts + descendants)
-            // and sum their fees.
-            let evict_bound = Self::rbf_eviction_bound(&cfg);
-            let Some((all_evicted, conflict_fee_total)) =
-                Self::rbf_conflict_set(&inner, &conflicts, evict_bound)
-            else {
-                let detail = format!(
-                    "too many potential replacements, rejecting replacement {}; \
-                     the eviction set exceeds {} transactions",
-                    txid, evict_bound,
-                );
-                return Err(MempoolError::TooManyReplacements(detail));
-            };
-
-            // Reject if the replacement spends an output of any evicted tx
-            // (direct conflict or descendant).
-            for input in &tx.input {
-                if all_evicted.contains(&input.previous_output.txid) {
-                    let detail = format!(
-                        "bad-txns-spends-conflicting-tx, {} spends conflicting \
-                         transaction {}",
-                        txid, input.previous_output.txid,
-                    );
-                    return Err(MempoolError::SpendsConflictingTx(detail));
-                }
-            }
-
-            // Compute new tx fee (base), then apply any pre-set
-            // `prioritisetransaction` delta for this txid.
             let sum_outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
             if sum_inputs < sum_outputs {
                 return Err(MempoolError::BadAmounts);
             }
-            let new_base_fee = sum_inputs - sum_outputs;
             let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
-            let new_fee = modified_fee(new_base_fee, new_delta);
-
-            // Check 1: new modified fee must be at least as much as all evicted
-            // modified fees.
-            if new_fee < conflict_fee_total {
-                let detail = format!(
-                    "insufficient fee, rejecting replacement {}, less fees than \
-                     conflicting txs; {} < {}",
-                    txid, format_btc(new_fee), format_btc(conflict_fee_total),
-                );
-                return Err(MempoolError::InsufficientReplacementFee(
-                    new_fee,
-                    conflict_fee_total,
-                    txid.to_string(),
-                    detail,
-                ));
-            }
-
-            // Check 2: additional fee must cover incremental relay fee for
-            // the replacement's size.
-            let additional = new_fee - conflict_fee_total;
-            // Saturating: the release profile has no overflow checks, so a
-            // pathological `-incrementalrelayfee` would wrap and produce a
-            // *tiny* floor — the opposite of what the operator asked for.
-            let min_relay = cfg
-                .incremental_relay_fee
-                .saturating_mul(policy::weight_to_vsize(weight as u64))
-                .div_ceil(1000);
-            if additional < min_relay {
-                let detail = format!(
-                    "insufficient fee, rejecting replacement {}, not enough \
-                     additional fees to relay; {} < {}",
-                    txid, format_btc(additional), format_btc(min_relay),
-                );
-                return Err(MempoolError::InsufficientReplacementFee(
-                    new_fee,
-                    conflict_fee_total + min_relay,
-                    txid.to_string(),
-                    detail,
-                ));
-            }
-
-            // Feerate-diagram check: the replacement (plus its non-evicted
-            // in-mempool ancestors) must have a strictly higher chunk feerate
-            // than each direct conflict it replaces. This approximates Core
-            // v31's full cluster-mempool feerate diagram by treating the
-            // replacement's ancestor set as a single chunk.
-            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
-
-            // Compute the ancestor-aware chunk feerate for the replacement.
-            // Include all in-mempool ancestors that are NOT being evicted.
-            let mut anc_fee_total: u64 = new_fee;
-            let mut anc_weight_total: u64 = weight as u64;
-            for anc_txid in &ancestors {
-                if !all_evicted.contains(anc_txid)
-                    && let Some(ae) = inner.entries.get(anc_txid)
-                {
-                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
-                    anc_weight_total += ae.weight as u64;
-                }
-            }
-            let ancestor_feerate =
-                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
-            // Use the lower of the individual and ancestor feerates as the
-            // effective feerate of the replacement "chunk".
-            let effective_feerate = new_feerate.min(ancestor_feerate);
-
-            for conflict_txid in &conflicts {
-                if let Some(ce) = inner.entries.get(conflict_txid) {
-                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
-                        modified_fee(ce.fee, ce.fee_delta),
-                        ce.weight as u64,
-                    );
-                    if effective_feerate <= conflict_mod_feerate {
-                        return Err(MempoolError::DoesNotImproveFeerateDiagram(
-                            "insufficient feerate: does not improve feerate diagram".to_string(),
-                        ));
-                    }
-                }
-            }
+            let new_fee = modified_fee(sum_inputs - sum_outputs, new_delta);
+            Self::rbf_check(
+                &inner,
+                &cfg,
+                &tx,
+                &txid,
+                weight as u64,
+                new_fee,
+                &conflicts,
+                &ancestors,
+            )?;
         }
 
         // Check amounts
@@ -3469,6 +3318,466 @@ impl Mempool {
         }
     }
 
+    /// Transitive in-mempool ancestor and descendant counts of `txid`, each
+    /// capped: a walk stops as soon as its count exceeds `cap`, so the answer
+    /// is exact up to `cap` and means "more than `cap`" beyond it. Core's
+    /// `CheckConflictTopology` only asks whether a cluster is bigger than
+    /// two, and this runs under the write lock, so counting further would be
+    /// work a peer can ask for.
+    fn relatives_capped(inner: &MempoolInner, txid: &Txid, cap: usize) -> (usize, usize) {
+        let mut ancestors: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = vec![*txid];
+        'up: while let Some(t) = queue.pop() {
+            let Some(e) = inner.entries.get(&t) else {
+                continue;
+            };
+            for input in &e.tx.input {
+                let p = input.previous_output.txid;
+                if inner.entries.contains_key(&p) && ancestors.insert(p) {
+                    if ancestors.len() > cap {
+                        break 'up;
+                    }
+                    queue.push(p);
+                }
+            }
+        }
+        let mut descendants: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = vec![*txid];
+        let mut buf: Vec<Txid> = Vec::new();
+        'down: while let Some(t) = queue.pop() {
+            Self::collect_children(inner, &t, &mut buf);
+            for c in buf.drain(..) {
+                if inner.entries.contains_key(&c) && descendants.insert(c) {
+                    if descendants.len() > cap {
+                        break 'down;
+                    }
+                    queue.push(c);
+                }
+            }
+        }
+        (ancestors.len(), descendants.len())
+    }
+
+    /// Every replace-by-fee rule, in Core's order — Rule 5 (cluster count),
+    /// the opt-in signalling gate, the eviction set, the
+    /// spends-a-conflict refusal, Rules 3 and 4 (`PaysForRBF`), and the
+    /// feerate-diagram comparison (`ImprovesFeerateDiagram`).
+    ///
+    /// `ancestors` must be the *transitive* in-mempool ancestor set, from
+    /// [`Self::expand_ancestors`]: the replacement's chunk is built over it.
+    ///
+    /// One function so `accept_transaction` and `test_accept` cannot answer
+    /// differently. They were two near-identical copies, which is the shape a
+    /// "`testmempoolaccept` and `sendrawtransaction` disagree" bug takes: any
+    /// fix to one is a coin flip on whether the other gets it.
+    ///
+    /// Returns the set of transactions the replacement would evict.
+    /// Expand `ancestors` — a transaction's direct in-mempool parents — to
+    /// the full transitive set, refusing a chain longer than
+    /// `max_ancestor_count` (Core's `too-long-mempool-chain`).
+    ///
+    /// One function for `accept_transaction` and `test_accept`. The RBF
+    /// diagram is built over this set, so the two have to hand `rbf_check`
+    /// the same one; and the chain limit is a policy `testmempoolaccept`
+    /// has to report as `sendrawtransaction` would.
+    fn expand_ancestors(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        ancestors: &mut HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        if ancestors.is_empty() {
+            return Ok(());
+        }
+        let mut queue: Vec<Txid> = ancestors.iter().copied().collect();
+        while let Some(ancestor_txid) = queue.pop() {
+            if let Some(ancestor) = inner.entries.get(&ancestor_txid) {
+                for anc_input in &ancestor.tx.input {
+                    let grandparent = anc_input.previous_output.txid;
+                    if inner.entries.contains_key(&grandparent) && ancestors.insert(grandparent) {
+                        queue.push(grandparent);
+                    }
+                }
+            }
+            if ancestors.len() > cfg.max_ancestor_count {
+                return Err(MempoolError::TooLongMempoolChain);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rbf_check(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        tx: &Transaction,
+        txid: &Txid,
+        weight: u64,
+        new_fee: u64,
+        conflicts: &HashSet<Txid>,
+        ancestors: &HashSet<Txid>,
+    ) -> Result<HashSet<Txid>, MempoolError> {
+        // Opt-in RBF: each direct conflict must signal replaceability.
+        for conflict_txid in conflicts {
+            if let Some(conflict_entry) = inner.entries.get(conflict_txid)
+                && !cfg.full_rbf
+            {
+                let signals_rbf = conflict_entry
+                    .tx
+                    .input
+                    .iter()
+                    .any(|i| i.sequence.0 < 0xffff_fffe);
+                if !signals_rbf {
+                    return Err(MempoolError::ConflictingSpend);
+                }
+            }
+        }
+
+        // Rule 5, Core's `PaysForRBF` precondition: reject a replacement that
+        // conflicts directly with more than `MAX_REPLACEMENT_CANDIDATES`
+        // distinct *clusters*. Counting the conflicts themselves over-counts
+        // a package — 101 transactions that all descend from one parent are
+        // one cluster, and Core accepts that replacement.
+        let clusters = Self::conflicting_cluster_count(
+            inner,
+            conflicts,
+            policy::MAX_REPLACEMENT_CANDIDATES,
+            Self::rbf_eviction_bound(cfg),
+        );
+        if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
+            let detail = format!(
+                "too many potential replacements, rejecting replacement {}; \
+                 too many conflicting clusters ({} > {})",
+                txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
+            );
+            return Err(MempoolError::TooManyReplacements(detail));
+        }
+
+        // Everything that would be evicted (conflicts + their descendants),
+        // and the modified fees those carry.
+        let evict_bound = Self::rbf_eviction_bound(cfg);
+        let Some((all_evicted, conflict_fee_total)) =
+            Self::rbf_conflict_set(inner, conflicts, evict_bound)
+        else {
+            let detail = format!(
+                "too many potential replacements, rejecting replacement {}; \
+                 the eviction set exceeds {} transactions",
+                txid, evict_bound,
+            );
+            return Err(MempoolError::TooManyReplacements(detail));
+        };
+
+        // Reject if the replacement spends an output of any evicted tx
+        // (direct conflict or descendant).
+        for input in &tx.input {
+            if all_evicted.contains(&input.previous_output.txid) {
+                let detail = format!(
+                    "bad-txns-spends-conflicting-tx, {} spends conflicting \
+                     transaction {}",
+                    txid, input.previous_output.txid,
+                );
+                return Err(MempoolError::SpendsConflictingTx(detail));
+            }
+        }
+
+        // Rule 3: the replacement's modified fee must cover every evicted
+        // modified fee.
+        if new_fee < conflict_fee_total {
+            let detail = format!(
+                "insufficient fee, rejecting replacement {}, less fees than \
+                 conflicting txs; {} < {}",
+                txid, format_btc(new_fee), format_btc(conflict_fee_total),
+            );
+            return Err(MempoolError::InsufficientReplacementFee(
+                new_fee,
+                conflict_fee_total,
+                txid.to_string(),
+                detail,
+            ));
+        }
+
+        // Rule 4: the additional fee must pay for the replacement's own relay.
+        let additional = new_fee - conflict_fee_total;
+        // Saturating: the release profile has no overflow checks, so a
+        // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
+        // floor — the opposite of what the operator asked for.
+        let min_relay = cfg
+            .incremental_relay_fee
+            .saturating_mul(policy::weight_to_vsize(weight))
+            .div_ceil(1000);
+        if additional < min_relay {
+            let detail = format!(
+                "insufficient fee, rejecting replacement {}, not enough \
+                 additional fees to relay; {} < {}",
+                txid, format_btc(additional), format_btc(min_relay),
+            );
+            return Err(MempoolError::InsufficientReplacementFee(
+                new_fee,
+                conflict_fee_total + min_relay,
+                txid.to_string(),
+                detail,
+            ));
+        }
+
+        Self::rbf_improves_diagram(
+            inner, cfg, weight, new_fee, conflicts, ancestors, &all_evicted,
+        )?;
+
+        Ok(all_evicted)
+    }
+
+    /// Core's `ImprovesFeerateDiagram`: the mempool the replacement would
+    /// leave behind must be no worse anywhere for a miner, and better
+    /// somewhere.
+    ///
+    /// Why not just "pays a higher feerate than the conflict": a conflicting
+    /// transaction can be carrying a high-feerate child, and a miner takes
+    /// them together. Comparing feerates one conflict at a time misses the
+    /// child entirely, so a replacement that beats a cheap parent but not the
+    /// parent-plus-child chunk was accepted — issue #660.
+    ///
+    /// The diagrams are built as Core built them before the cluster mempool
+    /// (`CTxMemPool::CalculateChunksForRBF`, commit `b22901dfa9`): the old one
+    /// from the evicted transactions, chunked with their in-mempool relatives;
+    /// the new one from the replacement plus any parent of a conflict that
+    /// survives. `compare_chunks` is Core's `CompareChunks`, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn rbf_improves_diagram(
+        inner: &MempoolInner,
+        cfg: &MempoolConfig,
+        weight: u64,
+        new_fee: u64,
+        conflicts: &HashSet<Txid>,
+        ancestors: &HashSet<Txid>,
+        all_evicted: &HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        use crate::mempool::feefrac::{
+            DiagramOrdering, FeeFrac, compare_chunks, feerate_compare, sort_chunks,
+        };
+
+        let vsize_of = |w: u64| policy::weight_to_vsize(w) as i64;
+
+        // Core computes the diagram only for a topology it can linearize
+        // trivially — a conflict with at most one ancestor or one descendant
+        // and not both (`CheckConflictTopology`). satd keeps the older
+        // per-conflict feerate rule for anything larger rather than refusing
+        // the replacement outright: refusing would be stricter than Core,
+        // which uses its full cluster linearization there. Recorded in
+        // CORE_DIFFERENCES.md.
+        let mut simple_topology = true;
+        for c in conflicts {
+            let Some(entry) = inner.entries.get(c) else {
+                continue;
+            };
+            // Core counts *transitive* relatives (`GetCountWithAncestors`,
+            // `GetCountWithDescendants`). Counting direct parents and
+            // children let a chain A → B → C through with A the conflict —
+            // A has one child, B one parent — and the two-point chunking
+            // below then described a cluster of three with a single pair,
+            // dropping A's own fee from the old diagram.
+            let (n_anc, n_desc) = Self::relatives_capped(inner, c, 1);
+            if n_anc > 1 || n_desc > 1 || (n_anc == 1 && n_desc == 1) {
+                simple_topology = false;
+                break;
+            }
+            // Core's second half of `CheckConflictTopology`: a conflict with
+            // a child must be that child's only ancestor, and one with a
+            // parent must be that parent's only descendant — otherwise the
+            // cluster is bigger than two and the chunking below does not
+            // describe it.
+            if n_desc == 1 {
+                let mut children: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, c, &mut children);
+                if let Some(child) = children.first()
+                    && Self::relatives_capped(inner, child, 1).0 > 1
+                {
+                    simple_topology = false;
+                    break;
+                }
+            }
+            if n_anc == 1
+                && let Some(parent) = entry
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .find(|p| inner.entries.contains_key(p))
+                && Self::relatives_capped(inner, &parent, 1).1 > 1
+            {
+                simple_topology = false;
+                break;
+            }
+        }
+
+        // A surviving ancestor of the replacement that is not a parent of
+        // anything evicted already sits in the old mempool, and the new
+        // diagram counts it inside the replacement's chunk. It has to be on
+        // the old side too, or the two sides describe different regions:
+        // [P, R] was compared against [C] instead of [P, C], and P's
+        // existing fee made a lower-feerate replacement look like an
+        // improvement. Standing alone — no in-mempool relatives of its own —
+        // it is one chunk on the old side; with relatives it is a cluster
+        // this builder cannot chunk, and the fallback applies.
+        let mut standalone_ancestors: Vec<FeeFrac> = Vec::new();
+        if simple_topology {
+            for u in ancestors {
+                if all_evicted.contains(u) {
+                    continue;
+                }
+                let Some(ue) = inner.entries.get(u) else {
+                    continue;
+                };
+                let mut children: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, u, &mut children);
+                if children.iter().any(|ch| all_evicted.contains(ch)) {
+                    // `old_diagram` already carries it as that transaction's
+                    // parent.
+                    continue;
+                }
+                if Self::relatives_capped(inner, u, 0) != (0, 0) {
+                    simple_topology = false;
+                    break;
+                }
+                standalone_ancestors.push(FeeFrac::new(
+                    modified_fee(ue.fee, ue.fee_delta) as i64,
+                    vsize_of(ue.weight as u64),
+                ));
+            }
+        }
+
+        if !simple_topology {
+            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight);
+            let mut anc_fee_total: u64 = new_fee;
+            let mut anc_weight_total: u64 = weight;
+            for anc_txid in ancestors {
+                if !all_evicted.contains(anc_txid)
+                    && let Some(ae) = inner.entries.get(anc_txid)
+                {
+                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
+                    anc_weight_total += ae.weight as u64;
+                }
+            }
+            let ancestor_feerate =
+                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            let effective_feerate = new_feerate.min(ancestor_feerate);
+            for conflict_txid in conflicts {
+                if let Some(ce) = inner.entries.get(conflict_txid) {
+                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
+                        modified_fee(ce.fee, ce.fee_delta),
+                        ce.weight as u64,
+                    );
+                    if effective_feerate <= conflict_mod_feerate {
+                        return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                            "insufficient feerate: does not improve feerate diagram".to_string(),
+                        ));
+                    }
+                }
+            }
+            let _ = cfg;
+            return Ok(());
+        }
+
+        // OLD: the diagram of the region this replacement would displace.
+        // The chunking rule itself lives in `feefrac::old_diagram`; this only
+        // describes each evicted transaction to it.
+        let described: Vec<crate::mempool::feefrac::EvictedTx> = all_evicted
+            .iter()
+            .filter_map(|evicted| {
+                let entry = inner.entries.get(evicted)?;
+                let mut children: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, evicted, &mut children);
+                let has_descendant =
+                    children.iter().any(|ch| inner.entries.contains_key(ch));
+                let parent = entry
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .find_map(|p| inner.entries.get(&p))
+                    .map(|pe| {
+                        FeeFrac::new(
+                            modified_fee(pe.fee, pe.fee_delta) as i64,
+                            vsize_of(pe.weight as u64),
+                        )
+                    });
+                Some(crate::mempool::feefrac::EvictedTx {
+                    individual: FeeFrac::new(
+                        modified_fee(entry.fee, entry.fee_delta) as i64,
+                        vsize_of(entry.weight as u64),
+                    ),
+                    parent,
+                    has_descendant,
+                })
+            })
+            .collect();
+        let mut old_chunks = crate::mempool::feefrac::old_diagram(&described);
+        old_chunks.extend(standalone_ancestors);
+        sort_chunks(&mut old_chunks);
+
+        // NEW = OLD - conflicts + the replacement's chunk. A surviving parent
+        // of a direct conflict is left over and stands on its own — unless
+        // the replacement spends it too, in which case it belongs to the
+        // replacement's own cluster below and must not be counted twice. It
+        // was: pushed here and again inside the replacement's chunk, which
+        // inflated the new diagram by the parent's fee and size and accepted
+        // replacements Core refuses.
+        let mut new_chunks: Vec<FeeFrac> = Vec::new();
+        for c in conflicts {
+            let Some(entry) = inner.entries.get(c) else {
+                continue;
+            };
+            for p in entry.tx.input.iter().map(|i| i.previous_output.txid) {
+                if all_evicted.contains(&p) || ancestors.contains(&p) {
+                    continue;
+                }
+                if let Some(pe) = inner.entries.get(&p) {
+                    new_chunks.push(FeeFrac::new(
+                        modified_fee(pe.fee, pe.fee_delta) as i64,
+                        vsize_of(pe.weight as u64),
+                    ));
+                }
+            }
+        }
+        // The replacement with the in-mempool ancestors it would be mined
+        // alongside. On this path every surviving ancestor stands alone —
+        // the gates above see to that — so the replacement's cluster is a
+        // star, and its linearization is: the replacement in one chunk with
+        // the parents it pulls up, each remaining parent on its own above
+        // it. Merging in ascending feerate order finds that chunk: a parent
+        // joins while it pays less than the chunk so far, which can only
+        // lower the chunk's feerate, so once one pays at least as much the
+        // rest do too. Folding every ancestor into a single pair with the
+        // replacement was right for one parent and wrong for two: with a
+        // high-feerate P and a dust-feerate Q it built [P+Q, R], where a
+        // miner takes [P, Q+R], and refused a replacement that improves the
+        // diagram.
+        let individual = FeeFrac::new(new_fee as i64, vsize_of(weight));
+        let mut parents: Vec<FeeFrac> = ancestors
+            .iter()
+            .filter(|anc| !all_evicted.contains(*anc))
+            .filter_map(|anc| inner.entries.get(anc))
+            .map(|ae| FeeFrac::new(modified_fee(ae.fee, ae.fee_delta) as i64, vsize_of(ae.weight as u64)))
+            .collect();
+        parents.sort_by(|a, b| feerate_compare(*a, *b));
+        let mut chunk = individual;
+        for parent in parents {
+            if feerate_compare(parent, chunk) == std::cmp::Ordering::Less {
+                chunk = chunk + parent;
+            } else {
+                new_chunks.push(parent);
+            }
+        }
+        new_chunks.push(chunk);
+        sort_chunks(&mut new_chunks);
+
+        if compare_chunks(&new_chunks, &old_chunks) != DiagramOrdering::Better {
+            return Err(MempoolError::DoesNotImproveFeerateDiagram(
+                "insufficient feerate: does not improve feerate diagram".to_string(),
+            ));
+        }
+        let _ = cfg;
+        Ok(())
+    }
+
     /// Collect all txids that would be evicted by replacing `conflicts` and
     /// sum their **modified** fees (base fee + `prioritisetransaction` delta).
     /// Returns `(all_evicted, total_modified_fee)`. `all_evicted` includes the
@@ -3543,6 +3852,7 @@ impl Mempool {
         inner: &MempoolInner,
         conflicts: &HashSet<Txid>,
         limit: usize,
+        visited_limit: usize,
     ) -> usize {
         let mut seen: HashSet<Txid> = HashSet::new();
         let mut clusters = 0usize;
@@ -3569,6 +3879,16 @@ impl Mempool {
                 }
                 for &next in &buf {
                     if inner.entries.contains_key(&next) && seen.insert(next) {
+                        // `limit` counts clusters; the flood inside one is
+                        // bounded by the component's size, which satd caps
+                        // only per-chain, not per-component. Core cannot hit
+                        // this — a cluster there is at most 64 transactions —
+                        // so a component past the bound is treated as too
+                        // many replacements rather than walked to the end
+                        // under the mempool write lock.
+                        if seen.len() > visited_limit {
+                            return limit + 1;
+                        }
                         queue.push(next);
                     }
                 }
@@ -3868,137 +4188,29 @@ impl Mempool {
         }
         let fee = sum_inputs - sum_outputs;
 
-        // RBF conflict checks — mirrors accept_transaction.
+        // The same transitive ancestor set — and the same chain limit —
+        // `accept_transaction` computes. `rbf_check` builds the replacement's
+        // chunk over it, so handing it the direct parents alone here made the
+        // two paths judge different chunks: a replacement with an unconfirmed
+        // grandparent passed `testmempoolaccept` and failed
+        // `sendrawtransaction`.
+        Self::expand_ancestors(&inner, &cfg, &mut ancestors)?;
+
+        // RBF: the same `rbf_check` `accept_transaction` runs, so
+        // `testmempoolaccept` and `sendrawtransaction` cannot disagree.
         if !conflicts.is_empty() {
-            // Rule 5, by cluster — see `accept_transaction`.
-            let clusters = Self::conflicting_cluster_count(
-                &inner,
-                &conflicts,
-                policy::MAX_REPLACEMENT_CANDIDATES,
-            );
-            if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
-                let detail = format!(
-                    "too many potential replacements, rejecting replacement {}; \
-                     too many conflicting clusters ({} > {})",
-                    txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
-                );
-                return Err(MempoolError::TooManyReplacements(detail));
-            }
-
-            // Opt-in RBF signaling check.
-            for conflict_txid in &conflicts {
-                if let Some(conflict_entry) = inner.entries.get(conflict_txid)
-                    && !cfg.full_rbf
-                {
-                    let signals_rbf = conflict_entry
-                        .tx
-                        .input
-                        .iter()
-                        .any(|i| i.sequence.0 < 0xffff_fffe);
-                    if !signals_rbf {
-                        return Err(MempoolError::ConflictingSpend);
-                    }
-                }
-            }
-
-            // Sum modified fees of conflicts + all their descendants.
-            let evict_bound = Self::rbf_eviction_bound(&cfg);
-            let Some((all_evicted, conflict_fee_total)) =
-                Self::rbf_conflict_set(&inner, &conflicts, evict_bound)
-            else {
-                let detail = format!(
-                    "too many potential replacements, rejecting replacement {}; \
-                     the eviction set exceeds {} transactions",
-                    txid, evict_bound,
-                );
-                return Err(MempoolError::TooManyReplacements(detail));
-            };
-
-            // Reject if the replacement spends an output of any evicted tx.
-            for input in &tx.input {
-                if all_evicted.contains(&input.previous_output.txid) {
-                    let detail = format!(
-                        "bad-txns-spends-conflicting-tx, {} spends conflicting \
-                         transaction {}",
-                        txid, input.previous_output.txid,
-                    );
-                    return Err(MempoolError::SpendsConflictingTx(detail));
-                }
-            }
-
-            // Apply any pre-set `prioritisetransaction` delta for the
-            // replacement (it is not yet in the pool).
             let new_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
             let new_fee = modified_fee(fee, new_delta);
-
-            // Check 1: new modified fee must exceed all evicted modified fees.
-            if new_fee < conflict_fee_total {
-                let detail = format!(
-                    "insufficient fee, rejecting replacement {}, less fees than \
-                     conflicting txs; {} < {}",
-                    txid, format_btc(new_fee), format_btc(conflict_fee_total),
-                );
-                return Err(MempoolError::InsufficientReplacementFee(
-                    new_fee,
-                    conflict_fee_total,
-                    txid.to_string(),
-                    detail,
-                ));
-            }
-
-            // Check 2: additional fee must cover incremental relay fee.
-            let additional = new_fee - conflict_fee_total;
-            // Saturating: the release profile has no overflow checks, so a
-            // pathological `-incrementalrelayfee` would wrap and produce a
-            // *tiny* floor — the opposite of what the operator asked for.
-            let min_relay = cfg
-                .incremental_relay_fee
-                .saturating_mul(policy::weight_to_vsize(weight as u64))
-                .div_ceil(1000);
-            if additional < min_relay {
-                let detail = format!(
-                    "insufficient fee, rejecting replacement {}, not enough \
-                     additional fees to relay; {} < {}",
-                    txid, format_btc(additional), format_btc(min_relay),
-                );
-                return Err(MempoolError::InsufficientReplacementFee(
-                    new_fee,
-                    conflict_fee_total + min_relay,
-                    txid.to_string(),
-                    detail,
-                ));
-            }
-
-            // Feerate-diagram check — mirrors accept_transaction.
-            let new_feerate = policy::fee_rate_sat_per_kvb(new_fee, weight as u64);
-
-            let mut anc_fee_total: u64 = new_fee;
-            let mut anc_weight_total: u64 = weight as u64;
-            for anc_txid in &ancestors {
-                if !all_evicted.contains(anc_txid)
-                    && let Some(ae) = inner.entries.get(anc_txid)
-                {
-                    anc_fee_total += modified_fee(ae.fee, ae.fee_delta);
-                    anc_weight_total += ae.weight as u64;
-                }
-            }
-            let ancestor_feerate =
-                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
-            let effective_feerate = new_feerate.min(ancestor_feerate);
-
-            for conflict_txid in &conflicts {
-                if let Some(ce) = inner.entries.get(conflict_txid) {
-                    let conflict_mod_feerate = policy::fee_rate_sat_per_kvb(
-                        modified_fee(ce.fee, ce.fee_delta),
-                        ce.weight as u64,
-                    );
-                    if effective_feerate <= conflict_mod_feerate {
-                        return Err(MempoolError::DoesNotImproveFeerateDiagram(
-                            "insufficient feerate: does not improve feerate diagram".to_string(),
-                        ));
-                    }
-                }
-            }
+            Self::rbf_check(
+                &inner,
+                &cfg,
+                tx,
+                &txid,
+                weight as u64,
+                new_fee,
+                &conflicts,
+                &ancestors,
+            )?;
         }
 
         // Fee rate check (sat/kvB), on Core's *modified* fee: a pending
@@ -6343,9 +6555,16 @@ mod tests {
             .collect();
         assert_eq!(conflicts.len(), 120, "the fixture needs > 100 conflicts");
         assert_eq!(
-            Mempool::conflicting_cluster_count(&inner, &conflicts, 100),
+            Mempool::conflicting_cluster_count(&inner, &conflicts, 100, usize::MAX),
             1,
             "120 children of one parent are one cluster"
+        );
+        // …and the flood inside that one cluster is bounded: past the
+        // visited limit it answers "too many" rather than walking the whole
+        // component under the write lock.
+        assert!(
+            Mempool::conflicting_cluster_count(&inner, &conflicts, 100, 50) > 100,
+            "a component past the visited bound must read as too many"
         );
         drop(inner);
 
@@ -6371,14 +6590,212 @@ mod tests {
         }
         let inner = mp.inner.read();
         assert_eq!(
-            Mempool::conflicting_cluster_count(&inner, &txids, 100),
+            Mempool::conflicting_cluster_count(&inner, &txids, 100, usize::MAX),
             5,
             "five unrelated transactions are five clusters"
         );
         // …and the bound short-circuits rather than walking them all.
-        assert!(Mempool::conflicting_cluster_count(&inner, &txids, 2) > 2);
+        assert!(Mempool::conflicting_cluster_count(&inner, &txids, 2, usize::MAX) > 2);
         drop(inner);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `testmempoolaccept` and `sendrawtransaction` share `rbf_check`, but
+    /// the check is only as shared as its inputs: the replacement's chunk is
+    /// built over the *transitive* in-mempool ancestor set, and `test_accept`
+    /// used to hand it the direct parents alone — so a replacement with an
+    /// unconfirmed grandparent was judged against a different chunk on each
+    /// path. The same expansion also carries `too-long-mempool-chain`, which
+    /// `testmempoolaccept` did not report at all.
+    #[test]
+    fn test_accept_expands_ancestors_the_way_accept_transaction_does() {
+        let op = outpoint(0xD1);
+        let (cs, _, dir) = make_funded_env(&[(op, coin(100_000))]);
+        let mp = Mempool::with_config(MempoolConfig {
+            max_size_bytes: 1_000_000,
+            min_fee_rate: 0,
+            dust_relay_fee: 3_000,
+            max_ancestor_count: 2,
+            ..Default::default()
+        });
+
+        // A → B → C is two ancestors for C: at the limit, accepted.
+        let a = tx_from(&[op], &[(90_000, 0xD2)]);
+        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(80_000, 0xD3)]);
+        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(70_000, 0xD4)]);
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        // D has three. Both paths must say so.
+        let d = tx_from(&[OutPoint { txid: c_txid, vout: 0 }], &[(60_000, 0xD5)]);
+        assert!(matches!(
+            mp.test_accept(&d, &cs, &NoopVerifier),
+            Err(MempoolError::TooLongMempoolChain)
+        ));
+        assert!(matches!(
+            mp.accept_transaction(d, &cs, &NoopVerifier, TxSource::Rpc, false),
+            Err(MempoolError::TooLongMempoolChain)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A conflict's surviving parent that the replacement *also* spends was
+    /// counted twice in the new diagram: once as "left over", and again
+    /// inside the replacement's chunk. The inflated diagram accepted a
+    /// replacement whose own chunk is worth less to a miner than the one it
+    /// displaces.
+    ///
+    /// P pays 20 000 sat; its child C pays 5 000 over 82 vB. R spends both of
+    /// P's outputs, pays 5 300 over ~123 vB — more fee than C, at a lower
+    /// feerate. Old diagram: [P], [C]. New, counted once: [P], [R], which
+    /// lies *below* the old at C's endpoint. Counted twice it was [P],
+    /// [P+R], which lies above it.
+    #[test]
+    fn a_parent_shared_with_the_replacement_is_counted_once() {
+        let op = outpoint(0xD6);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let parent = tx_from(&[op], &[(60_000, 0xD7), (20_000, 0xD8)]);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent");
+        let conflict = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(55_000, 0xD9)]);
+        let conflict_txid = mp
+            .accept_transaction(conflict, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("conflict");
+
+        let replacement = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(74_700, 0xDA)],
+        );
+        let verdict = mp.accept_transaction(replacement, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "a lower-feerate replacement must not improve the diagram: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &conflict_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's `CheckConflictTopology` counts *transitive* relatives; the gate
+    /// counted direct ones. A → B → C with A the conflict passed — A has one
+    /// child, B one parent — and the old diagram then held C with B alone,
+    /// because a transaction with a descendant is folded into it. A's fee
+    /// vanished from the comparison, and a replacement worth a third of A
+    /// to a miner won it.
+    ///
+    /// A pays 50 000 over ~82 vB; B and C 300 each. R pays 51 000 — every
+    /// evicted fee plus relay — over ~206 vB.
+    #[test]
+    fn a_conflict_inside_a_chain_of_three_is_not_a_simple_topology() {
+        let op = outpoint(0xDB);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let mut a = tx_from(&[op], &[(50_000, 0xDC)]);
+        a.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let a_weight = a.weight().to_wu();
+        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(49_700, 0xDD)]);
+        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(49_400, 0xDE)]);
+        mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let outs: Vec<(u64, u8)> = (0..5).map(|i| (9_800, 0xE0 + i)).collect();
+        let r = tx_from(&[op], &outs);
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb;
+        assert!(
+            rate(51_000, r.weight().to_wu()) < rate(50_000, a_weight),
+            "the fixture must pay a lower feerate than the conflict it evicts"
+        );
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "a lower-feerate replacement of the head of a chain must be refused: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &a_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A surviving ancestor of the replacement that has nothing to do with
+    /// the conflict was on the new side only — inside the replacement's
+    /// chunk — and absent from the old, though it already sat in the
+    /// mempool. Its fee then paid for the replacement's: [P, R] beat [C],
+    /// where the true comparison, [P, R] against [P, C], loses.
+    ///
+    /// P pays 20 000 over ~113 vB on its own. C pays 1 000 over ~82 vB. R
+    /// spends C's input and one of P's outputs, and pays 1 300 over ~123 vB —
+    /// more than C, at a lower feerate.
+    #[test]
+    fn an_unrelated_ancestor_of_the_replacement_is_on_both_sides_of_the_diagram() {
+        let op_p = outpoint(0xE7);
+        let op_c = outpoint(0xE8);
+        let (cs, mp, dir) = make_funded_env(&[(op_p, coin(100_000)), (op_c, coin(100_000))]);
+
+        let p = tx_from(&[op_p], &[(60_000, 0xE9), (20_000, 0xEA)]);
+        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let mut c = tx_from(&[op_c], &[(99_000, 0xEB)]);
+        c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let c_weight = c.weight().to_wu();
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let r = tx_from(&[op_c, OutPoint { txid: p_txid, vout: 1 }], &[(118_700, 0xEC)]);
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb;
+        assert!(
+            rate(1_300, r.weight().to_wu()) < rate(1_000, c_weight),
+            "the fixture must pay a lower feerate than the conflict it evicts"
+        );
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "an ancestor's existing fee must not pay for the replacement: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &c_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: two independent ancestors must not be folded
+    /// into one aggregate with the replacement. P pays 10 000 over ~113 vB,
+    /// Q 100 over ~113 vB, and R — conflicting with C (1 000 over ~82 vB) —
+    /// spends an output of each and pays 4 000 over ~164 vB. A miner takes
+    /// [P, Q+R], which beats [P, C, Q] everywhere; folded, [P+Q, R] earns
+    /// half of P's fee at P's size and the replacement was refused.
+    #[test]
+    fn independent_ancestors_are_chunked_separately_on_the_new_side() {
+        let op_p = outpoint(0xED);
+        let op_q = outpoint(0xEE);
+        let op_c = outpoint(0xEF);
+        let (cs, mp, dir) = make_funded_env(&[
+            (op_p, coin(100_000)),
+            (op_q, coin(100_000)),
+            (op_c, coin(100_000)),
+        ]);
+
+        let p = tx_from(&[op_p], &[(70_000, 0xF0), (20_000, 0xF1)]);
+        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let q = tx_from(&[op_q], &[(80_000, 0xF2), (19_900, 0xF3)]);
+        let q_txid = mp.accept_transaction(q, &cs, &NoopVerifier, TxSource::Rpc, false).expect("q");
+        let mut c = tx_from(&[op_c], &[(99_000, 0xF4)]);
+        c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let r = tx_from(
+            &[op_c, OutPoint { txid: p_txid, vout: 1 }, OutPoint { txid: q_txid, vout: 1 }],
+            &[(135_900, 0xF5)],
+        );
+        let r_txid = r.compute_txid();
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            verdict.is_ok(),
+            "a replacement that improves the diagram must be accepted: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &r_txid));
+        assert!(!in_pool(&mp, &c_txid), "the conflict is evicted");
+        assert!(in_pool(&mp, &p_txid) && in_pool(&mp, &q_txid), "the ancestors stay");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
