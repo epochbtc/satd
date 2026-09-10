@@ -98,7 +98,8 @@ item below is (or will be) written up in full in the in-development
   — nor at all under `-dns=0`, which was parsed and then ignored outside DNS
   seeding. Literal IPs and `.onion` targets are unaffected (#668).
 - `getpeerinfo` reports the peer's real `network` (an RFC1918, link-local or
-  loopback peer is `not_publicly_routable`, not `ipv4`/`ipv6`),
+  loopback peer is `not_publicly_routable`, not `ipv4`/`ipv6`; an IPv4-mapped
+  IPv6 address is judged as the IPv4 address it carries, as Core's is),
   `addr_relay_enabled` as Core's `SetupAddressRelay` latches it rather than as
   a function of the direction, and `servicesnames` in bit order (#668).
 - `last_block` / `last_transaction` move only when the node *accepts* the

@@ -122,12 +122,14 @@ fn dial_added_peers(
         return;
     }
     // Resolution is async now (it must not block a runtime worker on a
-    // resolver, and it consults `-proxy`/`-dns`), so it moves into the
-    // spawned task alongside the dial — the same shape `dial_added_seednodes`
-    // already uses.
-    let pm = pm.clone();
-    tokio::spawn(async move {
-        for addr_str in added {
+    // resolver, and it consults `-proxy`/`-dns`), so it moves into a spawned
+    // task alongside the dial. One task per address: a single loop would
+    // serialise the dials, and N unreachable entries would hold the N-th
+    // behind (N-1) connect timeouts — the startup path dials them
+    // concurrently, and a reload should not be slower than a restart.
+    for addr_str in added {
+        let pm = pm.clone();
+        tokio::spawn(async move {
             match pm.resolve_peer_target(&addr_str, default_port).await {
                 Ok(addr) => {
                     pm.add_peer_addr(addr.clone());
@@ -139,8 +141,8 @@ fn dial_added_peers(
                     tracing::warn!(addr = %addr_str, "invalid {label} address on reload: {e}");
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 /// `-seednode` reload: resolve + dial the entries added since the last config.

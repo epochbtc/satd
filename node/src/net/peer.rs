@@ -376,7 +376,9 @@ impl PeerInfo {
         } else if !crate::net::is_routable(self.addr.ip()) {
             "not_publicly_routable"
         } else {
-            match self.addr.ip() {
+            // An IPv4-mapped IPv6 address is the IPv4 peer it carries, as
+            // Core's `CNetAddr` unwraps it.
+            match self.addr.ip().to_canonical() {
                 std::net::IpAddr::V4(_) => "ipv4",
                 std::net::IpAddr::V6(_) => "ipv6",
             }
@@ -632,26 +634,34 @@ mod rpc_json_tests {
         // Routable.
         assert_eq!(json_for("8.8.8.8:8333"), "ipv4");
         assert_eq!(json_for("[2606:4700::1]:8333"), "ipv6");
-        // RFC1918 / RFC6598 / loopback / link-local / RFC5737 doc range.
+        // An IPv4-mapped IPv6 address — what a dual-stack `[::]` listener
+        // reports for an IPv4 peer — is that IPv4 peer, as Core's `CNetAddr`
+        // unwraps it: routable when it is, and `ipv4` rather than `ipv6`.
+        assert_eq!(json_for("[::ffff:8.8.8.8]:8333"), "ipv4");
+        // RFC1918 / RFC6598 / loopback / 0.0.0.0/8 / link-local / RFC5737 doc
+        // range, and RFC1918 behind the IPv4-mapped prefix.
         for addr in [
             "10.0.0.1:8333",
             "172.16.0.1:8333",
             "192.168.1.1:8333",
             "100.64.0.1:8333",
             "127.0.0.1:8333",
+            "0.0.0.1:8333",
             "169.254.1.1:8333",
             "192.0.2.1:8333",
-            // RFC3849 IPv6 documentation prefix is *not* in Core's
-            // unroutable set, so it is deliberately absent here.
+            "[::ffff:10.0.0.1]:8333",
+            "[::ffff:127.0.0.1]:8333",
         ] {
             assert_eq!(json_for(addr), "not_publicly_routable", "{addr}");
         }
-        // ULA / IPv6 link-local / IPv6 loopback / RFC4843 ORCHID.
+        // ULA / IPv6 link-local / IPv6 loopback / RFC4843 ORCHID / RFC3849
+        // documentation (which Core's `IsValid` refuses outright).
         for addr in [
             "[fc00::1]:8333",
             "[fe80::1]:8333",
             "[::1]:8333",
             "[2001:10::1]:8333",
+            "[2001:db8::1]:8333",
         ] {
             assert_eq!(json_for(addr), "not_publicly_routable", "{addr}");
         }

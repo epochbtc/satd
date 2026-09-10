@@ -28,11 +28,16 @@ pub mod v2transport;
 /// `not_publicly_routable`, and the proxy-dial decision, which bypassed the
 /// proxy for loopback alone.
 pub fn is_routable(ip: std::net::IpAddr) -> bool {
-    match ip {
+    // Core folds an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) into the
+    // IPv4 address it carries when the `CNetAddr` is built, so an RFC 1918
+    // peer that arrived on a dual-stack `[::]` listener is judged as the
+    // IPv4 address it is, not as a routable IPv6 one.
+    match ip.to_canonical() {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
             !(v4.is_loopback()
-                || v4.is_unspecified()
+                // Core's `IsLocal` is 127.0.0.0/8 *and* 0.0.0.0/8.
+                || o[0] == 0
                 || v4.is_broadcast()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -57,7 +62,8 @@ pub fn is_routable(ip: std::net::IpAddr) -> bool {
                 // 2001:20::/28.
                 || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010)
                 || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
-                // RFC 3849 documentation, 2001:db8::/32.
+                // RFC 3849 documentation, 2001:db8::/32 — refused by Core's
+                // `IsValid`, which `IsRoutable` requires.
                 || (s[0] == 0x2001 && s[1] == 0x0db8))
         }
     }
