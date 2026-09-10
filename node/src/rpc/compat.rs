@@ -803,6 +803,16 @@ where
             let out_body = if client_spoke_2_0 {
                 resp_bytes.to_vec()
             } else if oversized {
+                // Unreachable today, and deliberately kept: jsonrpsee is
+                // configured with the same 20 MiB cap on the response side
+                // (`max_response_body_size`, `server.rs`), and replaces any
+                // reply larger than that with `-32008 Response is too big`
+                // while serialising the envelope — so nothing over the cap
+                // ever reaches this layer. Lifting that cap is #723; this
+                // branch is what the compat layer will do when it can be
+                // reached, and is why the note in the 0.5.2 release notes
+                // describes the engine's refusal rather than this forward.
+                //
                 // Normalisation DOM-parses the body to touch three top-level
                 // keys, which costs several times its size again. A reply
                 // over the cap — a verbosity-2 `getblock` of a full block is
