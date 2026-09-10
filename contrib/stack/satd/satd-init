@@ -1,0 +1,201 @@
+#!/bin/bash
+# satd-init — one-shot preparation of the satd data volume.
+#
+# Runs to completion before satd starts (compose gates satd on
+# `service_completed_successfully`). Three jobs, all idempotent:
+#
+#   1. Issue the per-install CA and server certificate (tls/mkca.sh).
+#   2. Render bitcoin.conf from satd.conf.tmpl for the selected network.
+#   3. Generate the authfile bearer token, when MCP is enabled.
+#
+# Everything it creates lives in the data volume, never in an image. That is
+# the property that makes the appliance image redistributable: a shipped CA
+# key would be a private key shared by every download.
+#
+# Re-running is the normal case — it happens on every `compose up`. Nothing
+# here regenerates material that already exists and is still valid, so a
+# restart loop cannot churn certificates or invalidate a token an operator
+# has already configured somewhere.
+
+set -euo pipefail
+
+DATADIR="${SATD_DATADIR:-/var/lib/satd}"
+TLS_DIR="$DATADIR/tls"
+SECRETS_DIR="$DATADIR/secrets"
+TEMPLATE="${SATD_CONF_TEMPLATE:-/etc/satd/satd.conf.tmpl}"
+MKCA="${SATD_MKCA:-/usr/local/bin/satd-mkca}"
+
+NETWORK="${NETWORK:-signet}"
+SUBNET="${SATD_STACK_SUBNET:-10.77.0.0/24}"
+TLS_HOSTNAME="${SATD_TLS_HOSTNAME:-$(hostname)}"
+MCP_ENABLED="${SATD_MCP:-0}"
+
+# Fixed inside the stack, on every network. Publishing and client
+# configuration therefore do not change when the network does; only the P2P
+# port follows the chain, because that one is a protocol-level convention
+# other nodes rely on.
+RPC_PORT=8332
+RPC_TLS_PORT=8336
+ELECTRUM_PORT=50001
+ELECTRUM_TLS_PORT=50002
+ESPLORA_PORT=3000
+ESPLORA_TLS_PORT=3001
+METRICS_PORT=9332
+ZMQ_PORT=28332
+MCP_PORT=8339
+
+case "$NETWORK" in
+    mainnet) P2P_PORT=8333 ;;
+    signet)  P2P_PORT=38333 ;;
+    testnet4) P2P_PORT=48333 ;;
+    testnet) P2P_PORT=18333 ;;
+    regtest) P2P_PORT=18444 ;;
+    *)
+        echo "satd-init: unknown NETWORK '$NETWORK'" >&2
+        echo "satd-init: expected one of: mainnet signet testnet4 testnet regtest" >&2
+        exit 2
+        ;;
+esac
+
+# SATD_P2P_PORT exists so the compose file can publish the same number it
+# configures. Disagreement means the published port maps to nothing, which
+# looks like a firewall problem, so refuse rather than guess.
+if [[ -n "${SATD_P2P_PORT:-}" && "${SATD_P2P_PORT}" != "$P2P_PORT" ]]; then
+    echo "satd-init: SATD_P2P_PORT=${SATD_P2P_PORT} does not match the standard" \
+         "P2P port for $NETWORK ($P2P_PORT)." >&2
+    echo "satd-init: set SATD_P2P_PORT=$P2P_PORT in .env, or unset it." >&2
+    exit 2
+fi
+
+echo "satd-init: network=$NETWORK datadir=$DATADIR"
+
+mkdir -p "$DATADIR"
+
+# --- 1. TLS -----------------------------------------------------------------
+# `--group-readable` is not used: satd reads its own key as its own user.
+# `--extra-name satd` covers the compose service name, which is how the
+# overlay containers address this node.
+"$MKCA" \
+    --dir "$TLS_DIR" \
+    --hostname "$TLS_HOSTNAME" \
+    --extra-name satd \
+    --quiet
+
+# --- 2. Config --------------------------------------------------------------
+[[ -f "$TEMPLATE" ]] || { echo "satd-init: missing template $TEMPLATE" >&2; exit 1; }
+
+render() {
+    sed \
+        -e "s|@P2P_PORT@|$P2P_PORT|g" \
+        -e "s|@RPC_PORT@|$RPC_PORT|g" \
+        -e "s|@RPC_TLS_PORT@|$RPC_TLS_PORT|g" \
+        -e "s|@ELECTRUM_PORT@|$ELECTRUM_PORT|g" \
+        -e "s|@ELECTRUM_TLS_PORT@|$ELECTRUM_TLS_PORT|g" \
+        -e "s|@ESPLORA_PORT@|$ESPLORA_PORT|g" \
+        -e "s|@ESPLORA_TLS_PORT@|$ESPLORA_TLS_PORT|g" \
+        -e "s|@METRICS_PORT@|$METRICS_PORT|g" \
+        -e "s|@ZMQ_PORT@|$ZMQ_PORT|g" \
+        -e "s|@SUBNET@|$SUBNET|g" \
+        -e "s|@TLS_DIR@|$TLS_DIR|g" \
+        "$TEMPLATE"
+}
+
+CONF="$DATADIR/bitcoin.conf"
+render > "$CONF.new"
+
+# Any leftover @NAME@ means the template grew a placeholder this script does
+# not know about. satd would reject the line as an unknown value rather than
+# ignore it, but failing here names the actual cause.
+if grep -q '@[A-Z_]\+@' "$CONF.new"; then
+    echo "satd-init: unsubstituted placeholders in the rendered config:" >&2
+    grep -n '@[A-Z_]\+@' "$CONF.new" >&2
+    rm -f "$CONF.new"
+    exit 1
+fi
+
+# MCP is off in the plain stack and on in the appliance and the app-store
+# packages. It is appended rather than living in the template because the
+# token has to exist first.
+if [[ "$MCP_ENABLED" == "1" ]]; then
+    mkdir -p "$SECRETS_DIR"
+    chmod 0700 "$SECRETS_DIR"
+    AUTHFILE="$DATADIR/authfile.toml"
+    TOKEN_FILE="$SECRETS_DIR/mcp-token"
+
+    if [[ ! -s "$TOKEN_FILE" ]]; then
+        # 32 bytes of urandom, hex. Regenerating this on every start would
+        # break every client that had already been configured with it.
+        token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        umask 077
+        printf '%s\n' "$token" > "$TOKEN_FILE"
+        echo "satd-init: generated an MCP bearer token in $TOKEN_FILE"
+    fi
+    token="$(cat "$TOKEN_FILE")"
+    token_hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+
+    umask 077
+    cat > "$AUTHFILE" <<AUTH
+version = 1
+
+# Generated by satd-init. The secret itself is in secrets/mcp-token; only
+# its hash is stored here, so this file is not a credential.
+[[token]]
+id = "mcp"
+hash = "sha256:$token_hash"
+capabilities = ["mcp:*"]
+AUTH
+
+    cat >> "$CONF.new" <<MCPCONF
+
+# --- MCP --------------------------------------------------------------------
+# A non-loopback MCP bind requires auth and TLS; satd refuses to start
+# otherwise, which is why all four settings arrive together.
+authfile=$AUTHFILE
+mcp=1
+mcpbind=0.0.0.0
+mcpport=$MCP_PORT
+mcpallowremote=1
+mcpauth=1
+mcpcert=$TLS_DIR/fullchain.crt
+mcpkey=$TLS_DIR/leaf.key
+MCPCONF
+fi
+
+# Operator additions, appended last so they win where satd takes the last
+# value. Documented in the README; absent by default.
+LOCAL_CONF="$DATADIR/conf.d/local.conf"
+if [[ -s "$LOCAL_CONF" ]]; then
+    echo "satd-init: appending $LOCAL_CONF"
+    printf '\n# --- appended from conf.d/local.conf ---\n' >> "$CONF.new"
+    cat "$LOCAL_CONF" >> "$CONF.new"
+fi
+
+chmod 0644 "$CONF.new"
+mv "$CONF.new" "$CONF"
+echo "satd-init: wrote $CONF"
+
+# --- 2b. A stable path to the RPC cookie ------------------------------------
+# satd writes .cookie under the network's subdirectory (mainnet uses the
+# datadir root), so the path moves when NETWORK changes. Overlay containers
+# authenticate by mounting this volume read-only, and every one of them would
+# otherwise need its own copy of that per-network rule. A symlink at a fixed
+# name gives them one path that is correct on every network.
+#
+# The target does not exist yet — satd creates the cookie at startup, and
+# rotates it on every restart — which is exactly why this is a symlink and
+# not a copy.
+case "$NETWORK" in
+    mainnet) COOKIE_TARGET=".cookie" ;;
+    testnet) COOKIE_TARGET="testnet3/.cookie" ;;
+    *)       COOKIE_TARGET="$NETWORK/.cookie" ;;
+esac
+ln -sfn "$COOKIE_TARGET" "$DATADIR/rpc-cookie"
+echo "satd-init: rpc-cookie -> $COOKIE_TARGET"
+
+# --- 3. Report --------------------------------------------------------------
+# The export instruction differs by deployment — this script runs in the
+# compose stack, on the appliance and in the app-store packages — so the
+# caller supplies it. Printing the compose recipe unconditionally told
+# appliance users to run a command their machine does not have.
+echo "satd-init: CA certificate at $TLS_DIR/ca.crt"
+echo "satd-init:   export it to clients with: ${SATD_CA_EXPORT_HINT:-docker compose exec satd cat $TLS_DIR/ca.crt}"

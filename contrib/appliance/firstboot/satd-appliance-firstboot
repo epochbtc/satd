@@ -1,0 +1,127 @@
+#!/bin/bash
+# satd-appliance-firstboot — runs once, on the first boot of a downloaded
+# image, before satd starts.
+#
+# Its job is everything that must be unique per install and therefore cannot
+# exist in a shipped image: the disk's real size, the login password, the CA
+# private key, the certificates, and the MCP bearer token. An image that
+# shipped any of those would be an image where every download shared them.
+#
+# Ordering matters. satd is not enabled at build time, so nothing races this:
+# the certificates and the configuration exist before the node is started
+# for the first time.
+set -euo pipefail
+
+MARKER=/var/lib/satd-appliance/firstboot-done
+STATE=/var/lib/satd-appliance
+DATADIR=/var/lib/satd
+LIB=/usr/local/lib/satd-appliance
+USER_NAME="${APPLIANCE_USER:-satd-user}"
+
+log() { echo "satd-appliance-firstboot: $*"; }
+
+if [[ -f "$MARKER" ]]; then
+    log "already done; nothing to do"
+    exit 0
+fi
+
+mkdir -p "$STATE"
+
+# --- 1. Grow the root filesystem to the disk ---------------------------------
+# The image ships at its build size, which is smaller than any disk it will
+# be restored onto. Doing this before the node starts means the first sync
+# does not stop on a full filesystem.
+log "growing the root filesystem"
+ROOT_SRC="$(findmnt -no SOURCE /)"
+if [[ "$ROOT_SRC" =~ ^(/dev/[a-z]+|/dev/nvme[0-9]+n[0-9]+|/dev/vd[a-z]+)p?([0-9]+)$ ]]; then
+    DISK="${BASH_REMATCH[1]}"
+    PARTNUM="${BASH_REMATCH[2]}"
+    # growpart exits 1 when there is nothing to grow, which is a normal
+    # outcome on a re-run or an exactly-sized disk.
+    growpart "$DISK" "$PARTNUM" || log "partition already at full size"
+    resize2fs "$ROOT_SRC" || log "filesystem already at full size"
+else
+    log "could not parse root device '$ROOT_SRC'; skipping resize"
+fi
+
+# --- 2. A password unique to this install ------------------------------------
+# Not a default password, and not an empty one: a generated password shown
+# on the console once, which the user must change at first login.
+log "generating the console password"
+# `head` reads a fixed block FIRST rather than truncating tr's output.
+# The obvious spelling — `tr -dc ... < /dev/urandom | head -c 18` — makes
+# head close the pipe, tr die of SIGPIPE, and `set -o pipefail` abort the
+# whole first boot with "write error: Broken pipe". 512 bytes filtered down
+# to this 34-character alphabet leaves ~68 characters, comfortably more
+# than the 18 taken.
+GEN_PW="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'a-z2-9' | cut -c1-18 \
+    | sed 's/\(.\{6\}\)/\1-/g; s/-$//')"
+if [[ ${#GEN_PW} -lt 18 ]]; then
+    echo "satd-appliance-firstboot: could not generate a password" >&2
+    exit 1
+fi
+echo "$USER_NAME:$GEN_PW" | chpasswd
+# `--expire` forces a change at first login; the generated one is a
+# handover, not a credential to keep.
+chage -d 0 "$USER_NAME" 2>/dev/null || true
+printf '%s\n' "$GEN_PW" > "$STATE/initial-password"
+chmod 0600 "$STATE/initial-password"
+
+cat > /etc/issue <<ISSUE
+
+  satd appliance
+
+  Log in as: $USER_NAME
+  Password:  $GEN_PW
+             (you will be asked to change it immediately)
+
+  Then run: satd-appliance status
+
+ISSUE
+
+# --- 3. Node configuration, certificates and the MCP token -------------------
+# configure-network renders bitcoin.conf (through the compose stack's own
+# satd-init, so the two cannot drift), issues the CA and certificate, and
+# writes the chain selector into /etc/default/satd. The last of those is not
+# optional: satd accepts a `signet=1` line in a config file and then ignores
+# it, so a chain that is only expressed in the file starts a mainnet node.
+NETWORK="$(cat "$STATE/network" 2>/dev/null || echo signet)"
+log "configuring satd for $NETWORK"
+"$LIB/configure-network" "$NETWORK"
+
+# --- 4. Start the node -------------------------------------------------------
+# `--no-block` is load-bearing. satd.service is ordered After this unit (it
+# must not start before its configuration and certificates exist), so a
+# blocking `systemctl start` from inside this unit deadlocks: the start job
+# waits for this service to finish, and this service waits for the start
+# job. `--no-block` queues the job instead; systemd runs it the moment this
+# unit exits, which is exactly the intended order.
+log "starting satd"
+systemctl enable satd
+systemctl start --no-block satd
+
+# --- 5. Desktop hand-off -----------------------------------------------------
+# The MCP snippet carries a live bearer token, so it is written per install
+# into the user's home and never into the image.
+if [[ -d "/home/$USER_NAME" && -s "$DATADIR/secrets/mcp-token" ]]; then
+    TOKEN="$(cat "$DATADIR/secrets/mcp-token")"
+    install -d -o "$USER_NAME" -g "$USER_NAME" -m 0700 "/home/$USER_NAME/.satd"
+    cat > "/home/$USER_NAME/.satd/mcp.json" <<MCP
+{
+  "mcpServers": {
+    "satd": {
+      "type": "http",
+      "url": "https://$(hostname).local:8339/",
+      "headers": { "Authorization": "Bearer $TOKEN" }
+    }
+  }
+}
+MCP
+    chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.satd/mcp.json"
+    chmod 0600 "/home/$USER_NAME/.satd/mcp.json"
+    # The client also has to trust the appliance's CA; the desktop README
+    # says so, and `satd-appliance tls export-ca` prints it.
+fi
+
+touch "$MARKER"
+log "first boot complete"

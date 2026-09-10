@@ -16,3 +16,4 @@ reqwest = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 parking_lot = { workspace = true }
+tls-config = { path = "../tls-config", features = ["client"] }

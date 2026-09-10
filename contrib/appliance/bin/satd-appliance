@@ -1,0 +1,502 @@
+#!/bin/bash
+# satd-appliance — the operator command for the satd appliance image.
+#
+# Everything the image asks a person to do has a subcommand here, so that
+# the README can say "run this" instead of describing a sequence of
+# systemctl, docker compose and openssl invocations that have to be got
+# right in order.
+#
+#   satd-appliance status
+#   satd-appliance tls export-ca > satd-ca.crt
+#   satd-appliance tls renew
+#   satd-appliance set-network mainnet
+#   satd-appliance enable lightning
+#   satd-appliance disable lightning
+#   satd-appliance ssh enable
+#   satd-appliance logs [satd|<overlay>]
+#   satd-appliance install-to-disk /dev/sdX   (live ISO only)
+
+set -euo pipefail
+
+DATADIR=/var/lib/satd
+TLS_DIR="$DATADIR/tls"
+LIB=/usr/local/lib/satd-appliance
+STACK=/opt/satd/stack
+STATE=/var/lib/satd-appliance
+NETWORK_FILE="$STATE/network"
+ENABLED_DIR="$STATE/enabled"
+
+# Fixed by contrib/stack/satd/satd.conf.tmpl on every network.
+RPC_PORT=8332
+
+die() { echo "satd-appliance: $*" >&2; exit 1; }
+need_root() { [[ "$(id -u)" == 0 ]] || die "this needs root; try: sudo satd-appliance $*"; }
+
+current_network() {
+    [[ -s "$NETWORK_FILE" ]] && cat "$NETWORK_FILE" || echo signet
+}
+
+p2p_port_for() {
+    case "$1" in
+        mainnet) echo 8333 ;;
+        signet) echo 38333 ;;
+        testnet4) echo 48333 ;;
+        testnet) echo 18333 ;;
+        regtest) echo 18444 ;;
+        *) die "unknown network: $1" ;;
+    esac
+}
+
+# `--rpccookiefile` rather than a network flag: sat-cli derives the cookie's
+# location from --regtest/--testnet and has no selector for signet at all, so
+# on most of the networks this appliance runs it would look in the mainnet
+# path and fail to authenticate. `rpc-cookie` is the stable symlink satd-init
+# maintains to whichever path the cookie actually has.
+sat_cli() {
+    /usr/local/bin/sat-cli \
+        --datadir="$DATADIR" \
+        --rpcport="$RPC_PORT" \
+        --rpccookiefile="$DATADIR/rpc-cookie" \
+        "$@"
+}
+
+# The docker network's gateway is the host, which is how the overlay
+# containers reach a natively-run satd. Kept in step with the subnet in
+# compose.appliance.yml.
+stack_subnet() { echo "${SATD_STACK_SUBNET:-10.77.0.0/24}"; }
+stack_gateway() { echo "${SATD_HOST:-10.77.0.1}"; }
+
+compose_args() {
+    local args=(-f "$STACK/compose.appliance.yml")
+    local overlay
+    for overlay in $(enabled_overlays); do
+        args+=(-f "$STACK/compose.$overlay.yml")
+    done
+    printf '%s\n' "${args[@]}"
+}
+
+enabled_overlays() {
+    [[ -d "$ENABLED_DIR" ]] || return 0
+    # `find` rather than a glob: an empty directory makes a glob expand to
+    # itself, which would then be treated as an overlay name.
+    find "$ENABLED_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
+}
+
+# Every overlay secret is loaded here, in the one place that runs compose,
+# rather than at each call site. The overlays declare their secrets with
+# compose's `${VAR:?}` form, so a missing one is a hard parse error, not an
+# empty string: any caller that forgot to source overlay.env could not bring
+# the stack up, tear it down, or move it to another network. Sourcing happens
+# in the subshell so the secrets never reach the rest of this script.
+run_compose() {
+    local args=()
+    mapfile -t args < <(compose_args)
+    (
+        cd "$STACK"
+        if [[ -s "$STATE/overlay.env" ]]; then
+            set -a; . "$STATE/overlay.env"; set +a
+        fi
+        SATD_HOST="$(stack_gateway)" \
+        SATD_STACK_SUBNET="$(stack_subnet)" \
+        NETWORK="$(current_network)" \
+        SATD_P2P_PORT="$(p2p_port_for "$(current_network)")" \
+        SATD_TLS_HOSTNAME="$(hostname)" \
+        docker compose "${args[@]}" "$@"
+    )
+}
+
+# --- render the node configuration ------------------------------------------
+# One script, shared with first boot. It renders bitcoin.conf through the
+# compose stack's own satd-init — so the appliance and the stack cannot
+# drift into different node configurations — and writes the chain selector
+# into /etc/default/satd, which is the only place satd will actually read it
+# from: a `signet=1` line in a config file is accepted and then ignored.
+render_config() {
+    SATD_STACK_SUBNET="$(stack_subnet)" \
+    SATD_TLS_HOSTNAME="$(hostname)" \
+        "$LIB/configure-network" "$1"
+}
+
+cmd_status() {
+    local net; net="$(current_network)"
+    echo "network:   $net"
+    echo "satd:      $(systemctl is-active satd 2>/dev/null || true) ($(systemctl is-enabled satd 2>/dev/null || true))"
+    if info="$(sat_cli getblockchaininfo 2>/dev/null)"; then
+        python3 - "$info" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+pct = d.get("verificationprogress", 0) * 100
+print(f"chain:     {d.get('chain')} height {d.get('blocks')} ({pct:.2f}% verified)")
+print(f"headers:   {d.get('headers')}")
+PY
+    else
+        echo "chain:     (RPC not answering yet)"
+    fi
+    local overlays; overlays="$(enabled_overlays | tr '\n' ' ')"
+    echo "overlays:  ${overlays:-none}"
+    if [[ -s "$TLS_DIR/leaf.crt" ]]; then
+        echo "cert:      expires $(openssl x509 -in "$TLS_DIR/leaf.crt" -noout -enddate | cut -d= -f2)"
+        echo "           $(openssl x509 -in "$TLS_DIR/leaf.crt" -noout -ext subjectAltName | tail -n +2 | sed 's/^ *//')"
+    else
+        echo "cert:      (not issued yet)"
+    fi
+    echo
+    echo "Reach this appliance at $(hostname).local — the certificate covers that"
+    echo "name, and it keeps working when the address changes."
+}
+
+cmd_tls() {
+    case "${1:-}" in
+        export-ca)
+            [[ -s "$TLS_DIR/ca.crt" ]] || die "no CA yet; has first boot finished?"
+            cat "$TLS_DIR/ca.crt"
+            ;;
+        renew)
+            need_root tls renew
+            shift || true
+            local quiet=()
+            [[ "${1:-}" == "--quiet" ]] && quiet=(--quiet)
+            "$LIB/mkca.sh" --dir "$TLS_DIR" --hostname "$(hostname)" \
+                --owner satd:satd --group-readable "${quiet[@]}"
+            # Certificate paths are restart-only settings in satd; a reload
+            # would not pick up a reissued leaf, so a changed certificate has
+            # to restart the units that present it.
+            systemctl try-restart satd
+            run_compose restart caddy > /dev/null 2>&1 || true
+            ;;
+        show)
+            [[ -s "$TLS_DIR/leaf.crt" ]] || die "no certificate yet"
+            openssl x509 -in "$TLS_DIR/leaf.crt" -noout -text
+            ;;
+        *) die "usage: satd-appliance tls {export-ca|renew|show}" ;;
+    esac
+}
+
+cmd_set_network() {
+    need_root set-network "$@"
+    local target="${1:-}"
+    [[ -n "$target" ]] || die "usage: satd-appliance set-network <mainnet|signet|testnet4|regtest>"
+    p2p_port_for "$target" > /dev/null
+
+    if [[ "$target" == "mainnet" ]]; then
+        # No pruning is available here — Electrum and Esplora need txindex,
+        # and txindex excludes pruning — so mainnet means the full chain plus
+        # every index. Refusing up front beats filling the disk two days in.
+        local avail_gb
+        avail_gb="$(df -BG --output=avail "$DATADIR" | tail -1 | tr -dc '0-9')"
+        local required_gb=1500
+        if [[ "${avail_gb:-0}" -lt "$required_gb" ]]; then
+            echo "satd-appliance: mainnet needs at least ${required_gb} GB free on $DATADIR;" >&2
+            echo "satd-appliance: this disk has ${avail_gb} GB." >&2
+            echo >&2
+            echo "A fully indexed mainnet node stores the whole chain plus the" >&2
+            echo "address, spend and transaction indices. Pruning is not an option:" >&2
+            echo "Electrum and Esplora both require txindex, which pruning excludes." >&2
+            echo "Grow the disk, or stay on signet." >&2
+            exit 1
+        fi
+    fi
+
+    echo "satd-appliance: switching to $target"
+    systemctl stop satd 2>/dev/null || true
+    mkdir -p "$STATE"
+    echo "$target" > "$NETWORK_FILE"
+    render_config "$target"
+
+    if [[ "$target" == "mainnet" ]]; then
+        cat <<'FAST'
+
+Mainnet initial sync takes days from genesis. To start from a Bitcoin Core
+AssumeUTXO snapshot instead, so the node is usable in hours:
+
+  sudo satd-appliance fast-start
+
+satd verifies any snapshot against a hash compiled into the binary, so the
+host it came from is trusted for availability only — not for contents.
+FAST
+    fi
+
+    systemctl start satd
+    # Overlays follow the node onto the new chain; leaving them on the old
+    # one would have LND talking to a node whose chain it does not share.
+    if [[ -n "$(enabled_overlays)" ]]; then
+        echo "satd-appliance: restarting overlays on $target"
+        run_compose up -d
+    fi
+    echo "satd-appliance: now on $target"
+}
+
+cmd_fast_start() {
+    need_root fast-start
+    [[ "$(current_network)" == "mainnet" ]] || die "fast-start applies to mainnet only"
+    # Deliberately not a fixed URL in this script: snapshot files come and go,
+    # and a stale hardcoded one fails in a confusing way. The manual carries
+    # the current published location and its hash.
+    cat <<'EOF'
+Fast start loads a Bitcoin Core AssumeUTXO snapshot.
+
+satd does not host snapshots. Pick a published one whose height matches an
+anchor compiled into this binary, then:
+
+  sudo systemctl stop satd
+  sudo -u satd satd --datadir=/var/lib/satd \
+      --fast-start=https://<host>/utxo-<height>.dat \
+      --fast-start-sha256=<sha256 of that file>
+  sudo systemctl start satd
+
+satd checks the snapshot's UTXO set against the anchor hash built into the
+binary before it activates, so the host you fetch from is trusted for
+availability only. Anchor heights this build accepts:
+EOF
+    sat_cli getblockchaininfo > /dev/null 2>&1 || true
+    /usr/local/bin/satd --help 2>/dev/null | grep -A2 'fast-start' | sed 's/^/  /' || true
+    echo
+    echo "See the Operator Manual chapter 'Initial Block Download & Fast Sync'."
+}
+
+cmd_enable() {
+    need_root enable "$@"
+    local overlay="${1:-}"
+    [[ -n "$overlay" ]] || die "usage: satd-appliance enable <overlay>"
+    [[ -f "$STACK/compose.$overlay.yml" ]] || die "no such overlay: $overlay
+available: $(cd "$STACK" && ls compose.*.yml | sed 's/compose\.\(.*\)\.yml/\1/' | grep -v appliance | tr '\n' ' ')"
+
+    # Overlays that need a secret generate it here, once, rather than
+    # shipping one that every image would share.
+    mkdir -p "$STATE"
+    touch "$STATE/overlay.env"; chmod 0600 "$STATE/overlay.env"
+    # Every overlay that declares a `${VAR:?}` secret needs a branch here, or
+    # `enable` fails on compose interpolation before it starts anything.
+    case "$overlay" in
+        cashu)
+            grep -q '^MINT_PRIVATE_KEY=' "$STATE/overlay.env" || \
+                echo "MINT_PRIVATE_KEY=$(openssl rand -hex 32)" >> "$STATE/overlay.env"
+            ;;
+        btcpay)
+            grep -q '^POSTGRES_PASSWORD=' "$STATE/overlay.env" || \
+                echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
+            ;;
+        ark)
+            grep -q '^ARK_POSTGRES_PASSWORD=' "$STATE/overlay.env" || \
+                echo "ARK_POSTGRES_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
+            ;;
+        lightning)
+            # RTL's login. Without it RTL serves its own default, "password",
+            # in front of LND's admin macaroon.
+            grep -q '^RTL_PASSWORD=' "$STATE/overlay.env" || \
+                echo "RTL_PASSWORD=$(openssl rand -hex 24)" >> "$STATE/overlay.env"
+            ;;
+    esac
+
+    systemctl enable --now docker > /dev/null 2>&1 || true
+    mkdir -p "$ENABLED_DIR"
+    touch "$ENABLED_DIR/$overlay"
+    echo "satd-appliance: pulling images for $overlay (this is the first network fetch for it)"
+    run_compose pull --quiet 2>/dev/null || run_compose pull
+    run_compose up -d
+    echo "satd-appliance: $overlay enabled"
+}
+
+cmd_disable() {
+    need_root disable "$@"
+    local overlay="${1:-}"
+    [[ -n "$overlay" ]] || die "usage: satd-appliance disable <overlay>"
+    [[ -f "$ENABLED_DIR/$overlay" ]] || die "$overlay is not enabled"
+    # Bring the whole project down while the overlay is still listed, then
+    # bring back what remains: `compose down` only knows about services in
+    # the files it is given, so removing the file first would strand the
+    # overlay's containers with nothing able to name them.
+    # Not `|| true`: a teardown that failed left the overlay's containers
+    # running, and removing the marker then makes them invisible to every
+    # later command -- nothing would name them again to stop them.
+    if ! run_compose down --remove-orphans; then
+        die "could not bring the stack down; $overlay is still enabled and its
+containers are still running. Fix the error above and retry."
+    fi
+    rm -f "$ENABLED_DIR/$overlay"
+    if [[ -n "$(enabled_overlays)" ]]; then
+        run_compose up -d
+    else
+        systemctl disable --now docker > /dev/null 2>&1 || true
+    fi
+    echo "satd-appliance: $overlay disabled (its data volumes are kept)"
+}
+
+cmd_ssh() {
+    need_root ssh "$@"
+    case "${1:-}" in
+        enable)
+            apt-get install -y --no-install-recommends openssh-server > /dev/null 2>&1 || true
+            systemctl enable --now ssh
+            nft add rule inet filter input tcp dport 22 accept 2>/dev/null || true
+            # nft rules are not persistent; record it so the boot-time
+            # ruleset includes it too.
+            if ! grep -q 'dport 22 accept' /etc/nftables.conf; then
+                sed -i 's|^\t\t# SSH is closed.*|\t\ttcp dport 22 accept\n\t\t# SSH was enabled by satd-appliance.|' /etc/nftables.conf
+            fi
+            echo "satd-appliance: sshd enabled. Set a password or install a key first:"
+            echo "  sudo passwd $(stat -c %U /home/* 2>/dev/null | head -1)"
+            ;;
+        disable)
+            systemctl disable --now ssh 2>/dev/null || true
+            sed -i '/tcp dport 22 accept/d' /etc/nftables.conf
+            systemctl reload nftables 2>/dev/null || nft -f /etc/nftables.conf
+            echo "satd-appliance: sshd disabled"
+            ;;
+        *) die "usage: satd-appliance ssh {enable|disable}" ;;
+    esac
+}
+
+# Only reachable from the live ISO: a running installed system copying
+# itself over a disk is not something to make easy by accident.
+# Set by cmd_install_to_disk before it mounts anything; read only by the trap.
+INSTALL_MNT=""
+install_cleanup() {
+    [[ -n "$INSTALL_MNT" ]] || return 0
+    umount -R "$INSTALL_MNT/dev" "$INSTALL_MNT/proc" "$INSTALL_MNT/sys" 2>/dev/null || true
+    umount -R "$INSTALL_MNT" 2>/dev/null || true
+    rmdir "$INSTALL_MNT" 2>/dev/null || true
+}
+
+cmd_install_to_disk() {
+    need_root install-to-disk "$@"
+    local target="${1:-}"
+    [[ -b "$target" ]] || die "usage: satd-appliance install-to-disk /dev/sdX  (a block device)"
+
+    if ! findmnt -no FSTYPE / | grep -q overlay; then
+        die "this is not a live session; install-to-disk only runs from the ISO"
+    fi
+    if grep -q " $target" /proc/mounts; then
+        die "$target has mounted partitions; unmount them first"
+    fi
+
+    local size_gb
+    size_gb=$(( $(blockdev --getsize64 "$target") / 1000000000 ))
+    echo
+    echo "This will ERASE $target (${size_gb} GB) and install the satd appliance on it."
+    echo "Everything currently on that disk will be lost."
+    echo
+    read -r -p "Type the device path again to confirm: " confirm
+    [[ "$confirm" == "$target" ]] || die "not confirmed; nothing was changed"
+
+    echo "==> partitioning $target"
+    # The same layout build.sh writes: a BIOS boot partition and an ESP, so
+    # the installed disk boots on either firmware, exactly as the VM image
+    # does.
+    parted -s "$target" mklabel gpt
+    parted -s "$target" mkpart bios_grub 1MiB 3MiB
+    parted -s "$target" set 1 bios_grub on
+    parted -s "$target" mkpart ESP fat32 3MiB 515MiB
+    parted -s "$target" set 2 esp on
+    parted -s "$target" mkpart root ext4 515MiB 100%
+    partprobe "$target"
+    sleep 2
+
+    # /dev/sda2 but /dev/nvme0n1p2: the partition suffix depends on whether
+    # the device name ends in a digit.
+    local p=""
+    [[ "$target" =~ [0-9]$ ]] && p="p"
+
+    mkfs.vfat -F32 -n ESP "${target}${p}2" > /dev/null
+    mkfs.ext4 -q -L satd-root "${target}${p}3"
+
+    # Global, not local: the EXIT trap below runs while the shell is being
+    # torn down, and a `local` is not something to rely on still being in
+    # scope there.
+    INSTALL_MNT="$(mktemp -d)"
+    local mnt="$INSTALL_MNT"
+    # Everything from here on is unwound on the way out however it goes. A
+    # failure between the first mount and the last (a full disk, a GRUB that
+    # will not install) otherwise leaves the target's filesystems held by this
+    # shell, so the obvious next move -- run the installer again -- fails on a
+    # busy device instead.
+    trap install_cleanup EXIT
+
+    mount "${target}${p}3" "$mnt"
+    mkdir -p "$mnt/boot/efi"
+    mount "${target}${p}2" "$mnt/boot/efi"
+
+    echo "==> copying the system (several minutes)"
+    # -x keeps the copy on the live root; the pseudo-filesystems and the
+    # squashfs mounts underneath must not be walked into.
+    rsync -aHAXx --info=progress2 \
+        --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+        --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lib/live \
+        / "$mnt/"
+
+    # rsync excluded these, so none of them exist on the new filesystem. The
+    # bind mounts below would fail on the first one -- after the disk has been
+    # formatted, under `set -e` and before GRUB runs, which leaves the target
+    # erased and unbootable. The installed system needs them regardless: /run
+    # and /tmp are mountpoints systemd fills at boot, and /tmp carries the
+    # sticky bit.
+    mkdir -p "$mnt"/{dev,proc,sys,run,tmp,mnt,media}
+    chmod 0755 "$mnt"/{dev,proc,sys,run,mnt,media}
+    chmod 1777 "$mnt/tmp"
+
+    local root_uuid esp_uuid
+    root_uuid="$(blkid -s UUID -o value "${target}${p}3")"
+    esp_uuid="$(blkid -s UUID -o value "${target}${p}2")"
+    cat > "$mnt/etc/fstab" <<FSTAB
+UUID=$root_uuid  /          ext4  errors=remount-ro  0 1
+UUID=$esp_uuid   /boot/efi  vfat  umask=0077         0 1
+FSTAB
+
+    echo "==> installing the bootloader"
+    mount --bind /dev "$mnt/dev"
+    mount -t proc proc "$mnt/proc"
+    mount -t sysfs sys "$mnt/sys"
+    chroot "$mnt" grub-install --target=i386-pc --boot-directory=/boot "$target"
+    chroot "$mnt" grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+        --boot-directory=/boot --removable --no-nvram
+    chroot "$mnt" update-grub
+
+    # The installed system must run its own first boot: this live session
+    # already generated a password, a CA and a token in RAM, and copying
+    # those onto disk would put a credential that was displayed on a screen
+    # into permanent storage.
+    rm -f "$mnt/var/lib/satd-appliance/firstboot-done"
+    rm -f "$mnt/var/lib/satd-appliance/initial-password"
+    rm -rf "$mnt/var/lib/satd/tls" "$mnt/var/lib/satd/secrets"
+    rm -f "$mnt/var/lib/satd/authfile.toml"
+    : > "$mnt/etc/machine-id"
+    # live-config's session setup does not belong on an installed system.
+    rm -f "$mnt/etc/sudoers.d/live" 2>/dev/null || true
+
+    # Unmount now rather than leaving it to the trap, so a failure to flush
+    # the new filesystem is reported instead of being swallowed by cleanup.
+    trap - EXIT
+    umount -R "$mnt/dev" "$mnt/proc" "$mnt/sys" 2>/dev/null || true
+    umount -R "$mnt"
+    rmdir "$mnt"
+
+    echo
+    echo "Installed. Remove the USB stick and reboot; the first boot on disk"
+    echo "will generate this machine's own password and certificates."
+}
+
+cmd_logs() {
+    local what="${1:-satd}"
+    if [[ "$what" == "satd" ]]; then
+        journalctl -u satd -f -n 100
+    else
+        run_compose logs -f --tail 100 "$what"
+    fi
+}
+
+case "${1:-}" in
+    status) shift; cmd_status "$@" ;;
+    tls) shift; cmd_tls "$@" ;;
+    set-network) shift; cmd_set_network "$@" ;;
+    fast-start) shift; cmd_fast_start "$@" ;;
+    enable) shift; cmd_enable "$@" ;;
+    disable) shift; cmd_disable "$@" ;;
+    ssh) shift; cmd_ssh "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    install-to-disk) shift; cmd_install_to_disk "$@" ;;
+    compose) shift; run_compose "$@" ;;
+    -h|--help|help|"")
+        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *) die "unknown command: $1 (try: satd-appliance help)" ;;
+esac

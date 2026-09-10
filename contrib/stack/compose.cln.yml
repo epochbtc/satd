@@ -1,0 +1,54 @@
+# Core Lightning overlay — the alternative to compose.lightning.yml.
+#
+#   docker compose -f compose.yml -f compose.cln.yml up -d
+#
+# BEST-EFFORT. Run this OR the LND overlay, not both: they are two answers to
+# the same question, and running both doubles the stack's resource use for no
+# added coverage.
+#
+# CLN's `bcli` plugin polls Bitcoin JSON-RPC and needs no ZMQ, so unlike LND
+# it runs against satd in full-node mode rather than as a light client. That
+# makes it the overlay that exercises satd's RPC surface hardest — the
+# repository's CLN canary gates every PR on the same path.
+#
+# Authentication is by cookie: the satd data volume is mounted read-only and
+# `rpc-cookie` is a stable symlink satd-init maintains to whichever
+# per-network path the cookie actually lives at.
+
+services:
+  cln:
+    image: elementsproject/lightningd:v24.11@sha256:30cc9802955cc640a057d65b0ace5cd1c0c8b719e9a28cf516d85f9d00531e1f
+    # No `depends_on: satd`. The appliance runs satd natively under systemd
+    # and reaches it through `extra_hosts: satd:host-gateway`, so there is no
+    # satd service in that project to depend on. Nothing is lost: this
+    # service retries its connection and is `restart: unless-stopped`, so a
+    # satd that is still starting delays it rather than breaking it.
+    entrypoint: ["lightningd"]
+    command:
+      - --network=${CLN_NETWORK:-signet}
+      - --bitcoin-rpcconnect=${SATD_HOST:-satd}
+      - --bitcoin-rpcport=8332
+      - --bitcoin-rpccookiefile=/satd/rpc-cookie
+      # satd answers RPC quickly, but a node still catching up can block a
+      # call behind chainstate work; the canary uses the same allowance.
+      - --bitcoin-rpcclienttimeout=60
+      - --addr=0.0.0.0:9736
+      - --log-level=info
+      - --alias=satd-stack
+    volumes:
+      - cln-data:/root/.lightning
+      - satd-data:/satd:ro
+    ports:
+      - "${CLN_P2P_PORT:-9736}:9736"
+    networks:
+      - satd
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "lightning-cli --network=${CLN_NETWORK:-signet} getinfo > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 2m
+      retries: 5
+
+volumes:
+  cln-data:

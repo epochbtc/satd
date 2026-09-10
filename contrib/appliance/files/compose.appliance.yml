@@ -1,0 +1,43 @@
+# compose.appliance.yml — what the appliance substitutes for compose.yml.
+#
+# The appliance runs satd natively under systemd, not as a container: it is a
+# node appliance, and `systemctl status satd`, `journalctl -u satd` and a
+# local `sat-tui` are what an operator reaches for. The overlay files are
+# used unmodified; this supplies the two things compose.yml would otherwise
+# have given them.
+#
+#   1. `satd-data`, bound to the real /var/lib/satd rather than a docker
+#      volume, so the containers read the same cookie and certificate the
+#      host node wrote — and so an operator sees all of it at a normal path.
+#   2. the `satd` network, with an explicitly pinned gateway. That gateway is
+#      the host, and it is what SATD_HOST is set to: there is no satd
+#      container here to carry the name, and pinning the address means the
+#      overlays need no per-service `extra_hosts` — which could not be
+#      written here anyway without pre-declaring every overlay's services.
+#
+# `satd-appliance enable <overlay>` composes this with the overlay files and
+# exports SATD_HOST:
+#
+#   SATD_HOST=10.77.0.1 docker compose \
+#       -f compose.appliance.yml -f compose.lightning.yml up -d
+#
+# satd itself binds 0.0.0.0 so the gateway reaches it. bitcoin.conf's
+# rpcallowip limits that to this subnet, and nftables keeps every plain
+# listener off the LAN entirely.
+
+name: satd-appliance
+
+volumes:
+  satd-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/satd
+
+networks:
+  satd:
+    ipam:
+      config:
+        - subnet: ${SATD_STACK_SUBNET:-10.77.0.0/24}
+          gateway: ${SATD_HOST:-10.77.0.1}

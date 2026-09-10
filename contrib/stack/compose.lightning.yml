@@ -1,0 +1,113 @@
+# Lightning overlay — LND in Neutrino mode, plus Ride The Lightning.
+#
+#   docker compose -f compose.yml -f compose.lightning.yml up -d
+#   docker compose -f compose.yml -f compose.lightning.yml -f compose.proxy.yml up -d
+#
+# BEST-EFFORT. LND and RTL are third-party software bundled so satd's
+# compatibility claims can be exercised end to end. We do not track their
+# security advisories in real time. Do not put real funds here.
+#
+# ## Why Neutrino and not bitcoind mode
+#
+# LND's bitcoind backend requires Bitcoin Core's raw ZMQ topics
+# (zmqpubrawblock / zmqpubrawtx). satd does not implement them — it rejects
+# those settings outright, and CORE_DIFFERENCES.md records that as
+# deliberate. Neutrino needs no ZMQ at all: it pulls BIP 157/158 filter
+# headers and filters over P2P, which satd serves with `peerblockfilters=1`
+# (set in the base config). This is the same configuration the repository's
+# LND canary proves on every PR, so the overlay is a packaging of a tested
+# path rather than a new claim.
+#
+# LND supports mainnet, signet and regtest here. testnet4 is not offered:
+# the pinned LND release predates its testnet4 support.
+#
+# Wallet posture is deliberately a demo one: --noseedbackup creates an
+# unencrypted wallet with no seed to write down, so the stack comes up
+# unattended. That is the right trade for a throwaway signet node and the
+# wrong one for anything else.
+
+services:
+  lnd:
+    image: lightninglabs/lnd:v0.18.5-beta@sha256:2b560c9beb559c57ab2f2da1dfed80d286cf11a6dc6e4354cab84aafba79b6f6
+    # No `depends_on: satd`. The appliance runs satd natively under systemd
+    # and reaches it through `extra_hosts: satd:host-gateway`, so there is no
+    # satd service in that project to depend on. Nothing is lost: this
+    # service retries its connection and is `restart: unless-stopped`, so a
+    # satd that is still starting delays it rather than breaking it.
+    command:
+      - --bitcoin.active
+      - --bitcoin.${NETWORK:-signet}
+      - --bitcoin.node=neutrino
+      # The only peer LND talks to. `--nobootstrap` keeps it that way, so a
+      # green run is evidence about satd rather than about the network.
+      - --neutrino.connect=${SATD_HOST:-satd}:${SATD_P2P_PORT:-38333}
+      - --nobootstrap
+      - --noseedbackup
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      # LND generates its own self-signed certificate. It is not reissued
+      # from the stack CA: lncli, RTL and every mobile wallet already know
+      # how to pin LND's cert, and rewriting it would break that flow for
+      # no gain. Listing the names it will be reached by keeps it valid.
+      - --tlsextradomain=lnd
+      - --tlsextradomain=${SATD_TLS_HOSTNAME:-satd}
+      - --debuglevel=info
+    volumes:
+      - lnd-data:/root/.lnd
+    ports:
+      - "${LND_P2P_PORT:-9735}:9735"
+      - "${LND_REST_PORT:-8080}:8080"
+    networks:
+      - satd
+    restart: unless-stopped
+    healthcheck:
+      # `lncli getinfo` succeeds only once the wallet is unlocked and the
+      # RPC is serving, which is what RTL waits for.
+      test: ["CMD-SHELL", "lncli --network=${NETWORK:-signet} getinfo > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 2m
+      retries: 5
+
+  rtl:
+    image: shahanafarooqui/rtl:v0.15.4@sha256:f984095949b5b6c2c0c7d983e979cd34bd32a2952d106092bad0b46e6248168e
+    depends_on:
+      lnd:
+        condition: service_healthy
+    environment:
+      # RTL builds its own RTL-Config.json from these on first start. Env
+      # rather than a mounted config file because the macaroon path contains
+      # the network name, and a static file cannot follow ${NETWORK}.
+      LN_IMPLEMENTATION: LND
+      LN_SERVER_URL: https://lnd:8080
+      MACAROON_PATH: /lnd/data/chain/bitcoin/${NETWORK:-signet}
+      CONFIG_PATH: ""
+      RTL_CONFIG_PATH: /RTL/config
+      CHANNEL_BACKUP_PATH: /RTL/database/backup
+      # RTL's own login. The variable RTL reads is APP_PASSWORD -- it has no
+      # entrypoint that translates anything else, and with APP_PASSWORD unset
+      # it falls back to the `multiPass` in the config it generates, which is
+      # the literal string "password". Required rather than defaulted, so a
+      # stack cannot come up on a well-known credential that fronts LND's
+      # admin macaroon.
+      APP_PASSWORD: ${RTL_PASSWORD:?generate one with `openssl rand -hex 24` and put RTL_PASSWORD in .env}
+      PORT: "3000"
+      DEFAULT_NODE_INDEX: "1"
+    volumes:
+      # Read-only: RTL needs LND's macaroon and certificate, nothing else.
+      - lnd-data:/lnd:ro
+      - rtl-config:/RTL/config
+      - rtl-db:/RTL/database
+    networks:
+      - satd
+    restart: unless-stopped
+    # Not published. RTL speaks plain HTTP; it is reached through the proxy
+    # overlay, which terminates TLS with the stack certificate.
+    expose:
+      - "3000"
+
+volumes:
+  lnd-data:
+  rtl-config:
+  rtl-db:

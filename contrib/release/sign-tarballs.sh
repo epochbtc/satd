@@ -11,11 +11,22 @@
 #
 # Usage:
 #   contrib/release/sign-tarballs.sh [--dry-run] <tag>
+#   contrib/release/sign-tarballs.sh --images <dir> [--dry-run] <tag>
 #
 # Flags:
 #   --dry-run  Sign locally and round-trip verify, but skip the
 #              `gh release upload`. Useful before a real release to
 #              validate the maintainer's local signing setup.
+#   --images <dir>
+#              Sign the appliance images in <dir> instead of the release's
+#              tarballs. Appliance images are several GB each and exceed
+#              GitHub's 2 GB per-asset limit, so they are published to
+#              object storage; what goes on the release is a manifest of
+#              their SHA-256 sums plus a minisign signature over it. That
+#              is what this mode produces and uploads. Upload the image
+#              files themselves to object storage separately — this script
+#              deliberately does not, since it has no credentials for it
+#              and should not acquire any.
 #
 # Optional env:
 #   SATD_MINISIGN_KEY    path to encrypted minisign secret key file
@@ -26,9 +37,11 @@
 set -euo pipefail
 
 DRY_RUN=0
+IMAGES_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=1; shift ;;
+        --images) IMAGES_DIR="${2:-}"; shift 2 ;;
         --help|-h)
             sed -n '1,/^set -e/p' "$0" | sed -n '/^# /p' | sed 's/^# \?//'
             exit 0 ;;
@@ -56,6 +69,64 @@ fi
 work=$(mktemp -d -t satd-sign-XXXXXX)
 trap 'unset -v MINISIGN_PASSPHRASE 2>/dev/null; rm -rf "$work"' EXIT
 cd "$work"
+
+if [[ -n "$IMAGES_DIR" ]]; then
+    # --- appliance images -------------------------------------------------
+    # The manifest is the signed object, not the images: a signature over a
+    # list of SHA-256 sums authenticates every image in it just as well, and
+    # it is small enough to live on the release next to the tarball
+    # signatures where anyone verifying already knows to look.
+    [[ -d "$IMAGES_DIR" ]] || { echo "no such directory: $IMAGES_DIR" >&2; exit 1; }
+    IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
+
+    shopt -s nullglob
+    images=( "$IMAGES_DIR"/*.qcow2 "$IMAGES_DIR"/*.raw "$IMAGES_DIR"/*.ova "$IMAGES_DIR"/*.iso "$IMAGES_DIR"/*.vmdk )
+    shopt -u nullglob
+    if [[ ${#images[@]} -eq 0 ]]; then
+        echo "no appliance images (*.qcow2 / *.raw / *.ova / *.iso / *.vmdk) in $IMAGES_DIR" >&2
+        exit 1
+    fi
+
+    manifest="SHA256SUMS-images"
+    echo ">> Hashing ${#images[@]} image(s) — this reads several GB"
+    : > "$manifest"
+    for img in "${images[@]}"; do
+        printf '   %s\n' "$(basename "$img")"
+        ( cd "$IMAGES_DIR" && sha256sum "$(basename "$img")" ) >> "$work/$manifest"
+    done
+    sort -k2 -o "$manifest" "$manifest"
+    echo ">> Manifest:"
+    sed 's/^/   /' "$manifest"
+
+    echo ">> Signing $manifest"
+    read -rs -p "   minisign passphrase for $KEY: " MINISIGN_PASSPHRASE
+    echo
+    if ! out=$(printf '%s\n' "$MINISIGN_PASSPHRASE" | minisign -S -s "$KEY" -m "$manifest" 2>&1); then
+        echo "$out" >&2
+        echo "signing failed (wrong passphrase?)" >&2
+        exit 1
+    fi
+    unset -v MINISIGN_PASSPHRASE
+    minisign -Vm "$manifest" -P "$PUBKEY" > /dev/null
+    echo "   ok: $manifest.minisig"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo
+        echo "[dry-run] Skipping upload. Generated:"
+        ls -1 "$manifest" "$manifest.minisig"
+        exit 0
+    fi
+
+    echo ">> Uploading the manifest and its signature to release $TAG"
+    gh release upload "$TAG" --repo epochbtc/satd --clobber \
+        -- "$manifest" "$manifest.minisig"
+
+    echo
+    echo "Done. Upload the image files to object storage, then operators verify with:"
+    echo "  minisign -Vm SHA256SUMS-images -P '${PUBKEY}'"
+    echo "  sha256sum -c SHA256SUMS-images"
+    exit 0
+fi
 
 echo ">> Downloading release artifacts for $TAG"
 # Re-download every time. --skip-existing was considered but rejected:

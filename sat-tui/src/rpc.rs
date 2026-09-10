@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::path::{Path, PathBuf};
+use tls_config::client::{ClientTlsError, ClientTlsOptions};
 
 /// RPC client for communicating with satd.
 /// Automatically re-reads the cookie file on auth failure (handles satd restarts).
@@ -19,19 +20,32 @@ pub struct RpcClient {
     client: reqwest::Client,
 }
 
+/// Build the HTTP client the TUI polls with.
+///
+/// Fallible because the TLS options carry operator-supplied file paths: an
+/// unreadable CA or a half-specified client identity has to surface as an
+/// error message before the alternate screen is entered, not as a panic
+/// behind a terminal the TUI has already taken over.
+fn build_client(tls: &ClientTlsOptions) -> Result<reqwest::Client, ClientTlsError> {
+    tls.build(reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)))
+}
+
 impl RpcClient {
-    pub fn new(host: &str, port: u16, user: &str, pass: &str) -> Self {
+    pub fn new(
+        host: &str,
+        port: u16,
+        user: &str,
+        pass: &str,
+        tls: &ClientTlsOptions,
+    ) -> Result<Self, ClientTlsError> {
         let auth_header = format!("Basic {}", BASE64.encode(format!("{}:{}", user, pass)));
-        Self {
-            url: format!("http://{}:{}/", host, port),
+        Ok(Self {
+            url: tls.endpoint(host, port),
             auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: None,
             cookie_error: parking_lot::RwLock::new(None),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap(),
-        }
+            client: build_client(tls)?,
+        })
     }
 
     /// Create with cookie file path for automatic re-auth on satd restart.
@@ -42,7 +56,12 @@ impl RpcClient {
     /// e.g. "Permission denied" while satd holds the cookie `0600` until it
     /// reaches READY. `refresh_auth` retries the read on each auth failure,
     /// so the client recovers automatically once the cookie becomes readable.
-    pub fn with_cookie(host: &str, port: u16, cookie_path: PathBuf) -> Self {
+    pub fn with_cookie(
+        host: &str,
+        port: u16,
+        cookie_path: PathBuf,
+        tls: &ClientTlsOptions,
+    ) -> Result<Self, ClientTlsError> {
         let (auth_header, cookie_error) = match read_cookie_file(&cookie_path) {
             Ok((u, p)) => (
                 format!("Basic {}", BASE64.encode(format!("{}:{}", u, p))),
@@ -50,16 +69,13 @@ impl RpcClient {
             ),
             Err(e) => (String::new(), Some(e)),
         };
-        Self {
-            url: format!("http://{}:{}/", host, port),
+        Ok(Self {
+            url: tls.endpoint(host, port),
             auth_header: parking_lot::RwLock::new(auth_header),
             cookie_path: Some(cookie_path),
             cookie_error: parking_lot::RwLock::new(cookie_error),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap(),
-        }
+            client: build_client(tls)?,
+        })
     }
 
     /// The current cookie-file read error, if the cookie is unreadable.
@@ -299,7 +315,8 @@ mod tests {
     fn with_cookie_surfaces_read_error_for_missing_file() {
         let path = scratch("missing.cookie");
         let _ = std::fs::remove_file(&path);
-        let c = RpcClient::with_cookie("127.0.0.1", 8332, path);
+        let c = RpcClient::with_cookie("127.0.0.1", 8332, path, &ClientTlsOptions::default())
+            .unwrap();
         // The real read error is kept, not laundered into an empty auth
         // header that would only ever produce a confusing downstream 401.
         let err = c.cookie_error().expect("a missing cookie must surface a read error");
@@ -314,7 +331,8 @@ mod tests {
     fn refresh_auth_recovers_once_cookie_becomes_readable() {
         let path = scratch("recover.cookie");
         let _ = std::fs::remove_file(&path);
-        let c = RpcClient::with_cookie("127.0.0.1", 8332, path.clone());
+        let c = RpcClient::with_cookie("127.0.0.1", 8332, path.clone(), &ClientTlsOptions::default())
+            .unwrap();
         assert!(c.cookie_error().is_some(), "missing cookie -> error recorded");
 
         // satd relaxes the cookie to 0640 at READY; the next auth-failure
@@ -332,7 +350,7 @@ mod tests {
 
     #[test]
     fn user_pass_client_has_no_cookie_error() {
-        let c = RpcClient::new("127.0.0.1", 8332, "u", "p");
+        let c = RpcClient::new("127.0.0.1", 8332, "u", "p", &ClientTlsOptions::default()).unwrap();
         assert!(c.cookie_error().is_none());
     }
 }

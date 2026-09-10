@@ -1,0 +1,137 @@
+# Derived from contrib/stack/compose.yml. The satd service is defined there;
+# what changes here is only what Umbrel owns: the app network, its proxy,
+# and where the data lives.
+#
+# satd-init runs first and does exactly what it does in the reference stack
+# — issues this install's CA and certificate, renders bitcoin.conf, mints
+# the MCP token. It is baked into the image, so this file needs no bind
+# mounts from a repository Umbrel has not cloned.
+version: "3.7"
+
+# One definition for both services: they must be the same build, and two
+# literals drift.
+#
+# Pinned by digest as well as tag, which the Umbrel app store requires: a tag
+# is mutable, and an app store that resolved it at install time would give two
+# users different software from the same manifest. The digest is the OCI index
+# (linux/amd64 + linux/arm64), so it still resolves per-architecture.
+#
+# The tag is bare. The registry has never published a `v`-prefixed tag, so the
+# `v0.5.2` this used to name resolved to nothing on every architecture.
+#
+# It is also a per-commit tag rather than a release: no release contains
+# satd-init, which this branch adds, so the `0.5.1` this used to name could
+# not have started. `docker.yml` publishes `sha-<short>` on every build and
+# the short sha names a real commit on the branch.
+#
+# The umbrelOS install was run against a locally built copy of this image
+# served from a registry on the host, not against ghcr itself — the VM's
+# outbound path is QEMU's NAT and the package is not public yet. Same
+# Dockerfile, same tree; the registry hop is what is untested.
+#
+# Bumping both halves is a step in the release checklist.
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-8246eb9@sha256:88b7489a76a11aebf57b805f6fa97b002141fa712b530083bfa081a7dc4ec4b6
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: epochbtc-satd_server_1
+      # 3000, Esplora's plaintext listener — not 3001, its TLS one. Umbrel's
+      # app_proxy always dials its upstream as `http://`, with no option to do
+      # otherwise, so pointing it at a TLS port gets a ServerHello where node's
+      # HTTP parser wants a status line: every request 502s with
+      # `Parse Error: Expected HTTP/ [HPE_INVALID_CONSTANT]`.
+      #
+      # Plaintext is correct here rather than merely tolerable. This hop is
+      # container-to-container on the app network, which is the same place
+      # satd.conf.tmpl already puts the other plain listeners, and the proxy is
+      # what terminates TLS for the browser. The TLS listener on 3001 is for
+      # LAN clients reaching satd directly, and it stays exactly as it was.
+      APP_PORT: 3000
+      # Esplora serves public chain data and is unauthenticated by design, like
+      # every public Esplora deployment — putting Umbrel's login in front of it
+      # would break API clients rather than protect anything.
+      PROXY_AUTH_ADD: "false"
+
+  init:
+    image: *satd-image
+    # This one service starts as root and drops to satd itself, which the
+    # reference stack does not have to do.
+    #
+    # Umbrel gives an app a bind mount, and Docker creates the host side of a
+    # bind mount owned by root, mode 0755. uid 2121 cannot write into it, so
+    # satd-init's very first mkdir fails. contrib/stack/compose.yml never sees
+    # this because it uses a named volume, and Docker seeds a named volume's
+    # ownership from the image's /var/lib/satd (satd:satd 0750).
+    #
+    # `chown` therefore has to happen inside the container, as root, before
+    # anything else — and then the work itself runs unprivileged, because
+    # everything satd-init writes (the CA key, the MCP token) has to be owned
+    # by the user the server runs as. The StartOS package solves the same
+    # problem the same way, with its own-volume oneshot.
+    #
+    # setpriv rather than su/runuser: this is debian-slim, which ships
+    # util-linux but not the login utilities.
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        chown -R 2121:2121 /var/lib/satd &&
+        exec setpriv --reuid=2121 --regid=2121 --clear-groups
+        /usr/local/bin/satd-init
+    restart: on-failure
+    environment:
+      NETWORK: ${APP_SATD_NETWORK:-mainnet}
+      SATD_MCP: "1"
+      SATD_STACK_SUBNET: "10.21.0.0/16"
+      # The name clients reach this node by. Umbrel publishes <hostname>.local
+      # over mDNS, and the certificate has to carry that name or every LAN
+      # client sees a mismatch.
+      SATD_TLS_HOSTNAME: ${DEVICE_HOSTNAME:-umbrel}
+      SATD_P2P_PORT: ${APP_SATD_P2P_PORT:-8333}
+    volumes:
+      - ${APP_DATA_DIR}/data:/var/lib/satd
+
+  server:
+    image: *satd-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    # The network is an argument, never a config-file line: satd accepts
+    # `signet=1` in a file and then ignores it, which silently starts a
+    # mainnet node. `--chain=` because there is no bare `--mainnet` flag,
+    # and mainnet is this package's default.
+    command:
+      - --datadir=/var/lib/satd
+      - --chain=${APP_SATD_NETWORK:-mainnet}
+    # No SATD_HEALTH_URL, so the image's own HEALTHCHECK probes JSON-RPC
+    # liveness rather than readiness. /readyz is 503 until the tip is within
+    # six blocks of the headers tip; on this install the container read
+    # `Up 2 hours (unhealthy)` with a failing streak of 254 while satd was
+    # answering RPC, Electrum, Esplora and MCP normally. Umbrel surfaces that
+    # state to the user, so the whole initial sync would look like a fault.
+    volumes:
+      - ${APP_DATA_DIR}/data:/var/lib/satd
+    # Esplora's 3001 is deliberately NOT here. `umbrel-app.yml` sets
+    # `port: 3001`, which is the host port app_proxy binds, and app_proxy
+    # starts first — so publishing 3001 from this service too is a guaranteed
+    # "port is already allocated" on every install, not a race. The proxy
+    # reaches Esplora over the app network as epochbtc-satd_server_1:3001,
+    # which is exactly what APP_HOST/APP_PORT above already say.
+    #
+    # The rest are published on purpose: they are the LAN-facing surfaces,
+    # each TLS-terminated by satd itself, and app_proxy fronts only one port.
+    ports:
+      - "${APP_SATD_P2P_PORT:-8333}:${APP_SATD_P2P_PORT:-8333}"
+      - "8336:8336"
+      - "50002:50002"
+      - "8339:8339"
+    stop_grace_period: 10m
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/satd-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10m
+      retries: 3

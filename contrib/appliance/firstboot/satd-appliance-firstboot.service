@@ -1,0 +1,19 @@
+[Unit]
+Description=satd appliance first-boot setup
+# Everything unique to this install is created here, and satd must not start
+# before it: the node's configuration and the certificates it presents are
+# both written by this unit.
+After=network-online.target systemd-udev-settle.service
+Wants=network-online.target
+Before=satd.service
+ConditionPathExists=!/var/lib/satd-appliance/firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/satd-appliance/firstboot
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

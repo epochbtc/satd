@@ -1,0 +1,6 @@
+# Root manifest for the satd community app store.
+#
+# Umbrel adds a community store from a git URL; this file names it. Copy
+# this directory to the root of the repository that serves it.
+id: epochbtc
+name: Epoch

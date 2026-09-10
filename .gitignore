@@ -36,3 +36,7 @@ result-*
 # Core's framework seeds a cached chain next to the tests; run.sh redirects it
 # out of the tree, but a hand-run test would otherwise drop it here.
 /contrib/core-functional/cache/
+
+# Built appliance images. Multi-GB disk images and ISOs; the build writes
+# here by default and nothing in the tree should ever carry one.
+contrib/appliance/out/

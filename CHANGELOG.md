@@ -58,6 +58,22 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
+- A **reference stack** (`contrib/stack/`): docker-compose running satd with
+  RPC, Electrum, Esplora, metrics and optional MCP, each TLS-terminated by a
+  certificate the install issues for itself, plus best-effort overlays for
+  LND (Neutrino), Core Lightning, Ride The Lightning, a Cashu mint and
+  BTCPay Server.
+- A **downloadable appliance image** (`contrib/appliance/`): a bootable VM
+  with satd, its tooling and — in the desktop flavour — Sparrow, Electrum
+  and Liana already pointed at the node. Signet by default;
+  `satd-appliance set-network mainnet` switches. Built with `mmdebstrap`,
+  and gated in CI by booting the artifact under QEMU.
+- `sat-cli` and `sat-tui` can reach a TLS-terminated RPC listener:
+  `-rpctls`, `-rpccacert`, and `-rpcclientcert` / `-rpcclientkey` for mTLS.
+  Previously an operator who enabled `-rpctlsbind` had to keep the plain
+  listener up for the project's own clients.
+- The container image ships `sat-tui` and a `HEALTHCHECK`, so `docker exec
+  -it satd sat-tui` works and `depends_on: service_healthy` means something.
 - `addconnection`, Bitcoin Core's hidden regtest-only RPC for opening an
   outbound connection of a chosen type (`outbound-full-relay`,
   `block-relay-only`, `addr-fetch`, `feeler`). `getpeerinfo` now reports the

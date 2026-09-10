@@ -1,0 +1,93 @@
+# satd.conf — rendered by contrib/stack/satd/satd-init from this template.
+#
+# Do not edit the rendered copy in the data volume: satd-init overwrites it
+# on every start so that a change here reaches every existing deployment.
+# Operator additions belong in a separate file — see the README's
+# "Local overrides" section, which appends conf.d/local.conf.
+#
+# @-delimited names are substituted by satd-init. Everything else is
+# literal and is the same on every network.
+#
+# ## Which listeners are reachable from where
+#
+# Plain listeners bind the compose network only and are NOT published to
+# the host: RPC, Electrum, Esplora and the metrics endpoint are how the
+# overlay containers (LND, NBXplorer, RTL, the mint) talk to satd, and
+# those clients have no way to trust a private CA. `rpcallowip` narrows
+# the RPC surface to this stack's own subnet.
+#
+# TLS listeners bind 0.0.0.0 and ARE published. Everything that leaves the
+# host is TLS, presenting the per-install certificate from tls/mkca.sh.
+#
+# The metrics endpoint has no native TLS (and neither does the streaming
+# WebSocket), so it stays inside the network; the appliance image fronts it
+# with a reverse proxy on 443.
+
+# --- chain ------------------------------------------------------------------
+# The network is selected on the command line, never here: a `signet=1` line
+# in a config file is accepted and then ignored, which silently starts a
+# mainnet node.
+port=@P2P_PORT@
+
+# --- indices ----------------------------------------------------------------
+# Electrum and Esplora both require txindex and addressindex. Pruning is
+# incompatible with txindex, so this stack never prunes — see the README for
+# what that costs on mainnet.
+txindex=1
+addressindex=1
+prune=0
+# BIP 157/158 filters: what LND needs to run in Neutrino mode against this
+# node. `peerblockfilters` serves them over P2P and implies the index.
+blockfilterindex=basic
+peerblockfilters=1
+
+# --- JSON-RPC ---------------------------------------------------------------
+# The RPC port is fixed at 8332 on every network, not set to the chain's
+# conventional default. Every overlay, the reverse proxy and the app-store
+# packages address this node by name and port, and having that port move
+# when the network changes would push the per-network rule into each of
+# them. The cost is that in-container `sat-cli` needs `-rpcport=8332` on a
+# non-mainnet stack, since it derives its default from the chain:
+#
+#   docker compose exec satd sat-cli -rpcport=8332 getblockchaininfo
+#
+# P2P is the exception below: that port is a convention other nodes rely on.
+server=1
+rpcbind=0.0.0.0
+rpcport=@RPC_PORT@
+# The stack's own subnet, plus loopback for `docker exec satd sat-cli`.
+rpcallowip=127.0.0.1
+rpcallowip=@SUBNET@
+rpctlsbind=0.0.0.0:@RPC_TLS_PORT@
+rpctlscert=@TLS_DIR@/fullchain.crt
+rpctlskey=@TLS_DIR@/leaf.key
+
+# --- Electrum ---------------------------------------------------------------
+electrum=1
+electrumbind=0.0.0.0:@ELECTRUM_PORT@
+electrumtlsbind=0.0.0.0:@ELECTRUM_TLS_PORT@
+electrumtlscert=@TLS_DIR@/fullchain.crt
+electrumtlskey=@TLS_DIR@/leaf.key
+
+# --- Esplora ----------------------------------------------------------------
+# Unauthenticated, like every public Esplora deployment and like the Electrum
+# surface above: it serves public chain data. Set esploraauth=cookie if this
+# stack's LAN is not somewhere you want that.
+esplora=1
+esplorabind=0.0.0.0:@ESPLORA_PORT@
+esploraprefix=/api
+esploratlsbind=0.0.0.0:@ESPLORA_TLS_PORT@
+esploratlscert=@TLS_DIR@/fullchain.crt
+esploratlskey=@TLS_DIR@/leaf.key
+
+# --- observability ----------------------------------------------------------
+# /metrics, /healthz and /readyz. /readyz is the container healthcheck and
+# what every overlay's `depends_on` waits for.
+metricsbind=0.0.0.0
+metricsport=@METRICS_PORT@
+
+# --- events -----------------------------------------------------------------
+# Core-compatible hashblock/hashtx plus satd's own JSON topics. Raw block and
+# transaction topics do not exist here; that is why the Lightning overlay runs
+# LND in Neutrino mode rather than bitcoind mode.
+eventszmqbind=tcp://0.0.0.0:@ZMQ_PORT@

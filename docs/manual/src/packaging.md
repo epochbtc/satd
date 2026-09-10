@@ -164,6 +164,19 @@ Reload](configuration.md). The container ships a mainnet-loopback
 default; every value can be overridden with `-e SATD_*` environment
 variables. See the Container section.
 
+## Ready-made deployments
+
+Before packaging satd yourself, note that the repository ships three
+finished ones, described in [Appliance & Reference
+Stack](appliance.md): a docker-compose **reference stack**
+(`contrib/stack/`), a bootable **appliance image** (`contrib/appliance/`),
+and sources for **Umbrel and StartOS packages** (`contrib/packaging/`).
+
+They share one node configuration and one certificate scheme, and the
+container image below carries the first-run tooling all three use
+(`satd-init`, `satd-mkca`), so a package built on that image gets the same
+behaviour without reimplementing it.
+
 ## Container
 
 The repository ships a multi-stage `Dockerfile` at the repo root.
@@ -178,6 +191,16 @@ Properties of the image:
 - Base: `debian:bookworm-slim`.
 - Runtime user: `satd`, UID/GID 2121. A non-1000 UID avoids a
   bind-mount clash with the usual host operator UID.
+- Binaries: `satd`, `sat-cli` and `sat-tui`, so `docker exec -it satd
+  sat-tui` works against a running container.
+- First-run tooling: `satd-mkca` (issues the install's CA and server
+  certificate) and `satd-init` (renders `bitcoin.conf`, mints the MCP
+  token), plus `openssl`. These are in the image so a deployment that
+  cannot mount repository files — an Umbrel app, a StartOS package —
+  behaves identically to `contrib/stack`.
+- `HEALTHCHECK`: `satd-healthcheck`, which reports liveness by default and
+  readiness when `SATD_HEALTH_URL` points at `/readyz`. See
+  [Health and readiness](#health-and-readiness).
 - PID 1: `tini`, so SIGTERM forwards to satd cleanly.
 - Datadir: `/var/lib/satd`, declared as a `VOLUME`.
 - Exposed ports: `8333` (P2P) and `8332` (RPC). Map other ports with

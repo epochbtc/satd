@@ -31,6 +31,15 @@ means in practice for contributors.
 5. CI must be green for a PR to be merged. CI runs the same checks listed
    below plus `cargo-deny` on dep-graph-touching PRs.
 
+Two appliance jobs are release gates rather than per-PR ones, because each
+compiles satd from scratch and they cost around forty minutes of runner time
+between them: the reference-stack bring-up and the appliance image build.
+They run on release tags and on demand. If your change touches
+`contrib/stack/` or `contrib/appliance/`, add the **`appliance-ci`** label to
+your PR to run them there — applying the label starts the run, so no extra
+push is needed. The cheap static checks over those directories run on every
+PR regardless.
+
 Stacked PRs are fine. State the merge order in each PR description and
 land them in that order.
 

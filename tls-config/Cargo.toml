@@ -15,7 +15,18 @@ thiserror = { workspace = true }
 # exposes verification primitives but not subject-DN / SAN extraction;
 # x509-parser is the standard pure-Rust crate for that.
 x509-parser = "0.16"
+# Client-side only (`client` feature): sat-cli / sat-tui build their reqwest
+# client through this crate so the two ends of a satd TLS connection are
+# configured from one place. satd itself does not enable the feature.
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = []
+client = ["dep:reqwest"]
 
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = "3"
+# Handshake tests in `client`: the client half is exercised against an
+# acceptor built by this crate's own server half, which needs a runtime.
+tokio = { workspace = true }

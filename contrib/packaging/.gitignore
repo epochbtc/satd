@@ -1,0 +1,4 @@
+# start-cli's packaging workspace marker. It holds a local build signing key
+# and the registry list, is created per developer machine, and is required by
+# `start-cli s9pk pack` in the parent of a package repo — see startos/README.md.
+.startos/

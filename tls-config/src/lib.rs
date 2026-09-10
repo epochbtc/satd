@@ -30,6 +30,16 @@
 //! The acceptor and `ServerConnection` types are re-exported so
 //! consumers can refer to them through this crate without adding their
 //! own `tokio-rustls` dependency just to spell the types.
+//!
+//! ## Client side
+//!
+//! The `client` feature adds [`client::ClientTlsOptions`], the matching
+//! client-side configuration used by `sat-cli` and `sat-tui` to reach a
+//! TLS-terminated RPC listener. It is behind a feature because it pulls
+//! `reqwest`, which the server surfaces have no use for.
+
+#[cfg(feature = "client")]
+pub mod client;
 
 use std::collections::HashSet;
 use std::fs::File;
