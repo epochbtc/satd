@@ -140,10 +140,29 @@ RUN cargo chef cook --release --locked --bin satd --bin sat-cli --bin sat-tui --
 # Compile first-party crates on top of the cooked dependency artifacts already
 # sitting in target/.
 COPY . .
+# Strip unless asked not to.
+#
+# `[profile.release]` sets `debug = "line-tables-only"` (#388), which on
+# binaries this size is not a small addition: unstripped, satd is 544 MB of
+# which 506 MB is DWARF, and the runtime image comes out at 670 MB against
+# 133 MB for the same image before line tables were turned on.
+#
+# release.yml already strips what it ships, splitting a `.debug` sidecar out
+# first, so the tarball download was lean and only this path was still
+# shipping half a gigabyte of debuginfo to every `docker pull`.
+#
+# No sidecar is emitted here. It would not be interchangeable with the
+# tarball's: release.yml builds with `-Cforce-frame-pointers=yes` and a
+# `--remap-path-prefix`, so those binaries are not these binaries. To debug
+# the container image itself, rebuild it with `--build-arg STRIP_BINARIES=0`.
+ARG STRIP_BINARIES=1
 RUN cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui \
     && install -Dm755 target/release/satd /out/satd \
     && install -Dm755 target/release/sat-cli /out/sat-cli \
-    && install -Dm755 target/release/sat-tui /out/sat-tui
+    && install -Dm755 target/release/sat-tui /out/sat-tui \
+    && if [ "${STRIP_BINARIES}" = "1" ]; then \
+        strip /out/satd /out/sat-cli /out/sat-tui; \
+    fi
 
 
 FROM docker.io/library/debian:${DEBIAN_VERSION}-slim AS runtime
