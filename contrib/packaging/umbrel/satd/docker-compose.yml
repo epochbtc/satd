@@ -8,6 +8,19 @@
 # mounts from a repository Umbrel has not cloned.
 version: "3.7"
 
+# One definition for both services: they must be the same build, and two
+# literals drift.
+#
+# Pinned by digest as well as tag, which the Umbrel app store requires: a tag
+# is mutable, and an app store that resolved it at install time would give two
+# users different software from the same manifest. The digest is the OCI index
+# (linux/amd64 + linux/arm64), so it still resolves per-architecture.
+#
+# The tag is bare. The registry has never published a `v`-prefixed tag, so the
+# `v0.5.2` this used to name resolved to nothing on every architecture.
+# Bumping both halves is a step in the release checklist.
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.5.1@sha256:bcbde256a0d5191d124f36d01df3d6dbdc70d4690aa9cccdb109eebf3df1dd1f
+
 services:
   app_proxy:
     environment:
@@ -17,11 +30,8 @@ services:
       # TLS to it rather than plain HTTP.
       PROXY_AUTH_ADD: "false"
 
-  # The tag is bumped with each satd release the package is published for;
-  # v0.5.2 is the release this package was written against and does not
-  # exist until that release is cut.
   init:
-    image: ghcr.io/epochbtc/satd:v0.5.2
+    image: *satd-image
     entrypoint: ["/usr/local/bin/satd-init"]
     user: "2121:2121"
     restart: on-failure
@@ -38,7 +48,7 @@ services:
       - ${APP_DATA_DIR}/data:/var/lib/satd
 
   server:
-    image: ghcr.io/epochbtc/satd:v0.5.2
+    image: *satd-image
     depends_on:
       init:
         condition: service_completed_successfully

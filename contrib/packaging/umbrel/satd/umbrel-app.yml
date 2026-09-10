@@ -2,7 +2,7 @@ manifestVersion: 1
 id: satd
 category: bitcoin
 name: satd
-version: "0.5.2"
+version: "0.5.1"
 tagline: A Bitcoin full node in Rust, with Electrum and Esplora built in
 description: >-
   satd is a Bitcoin Core-compatible full node written in Rust. It speaks
