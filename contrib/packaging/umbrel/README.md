@@ -51,13 +51,31 @@ epochbtc/umbrel-apps/
     exports.sh
 ```
 
-Copy `umbrel/` to that repository's root. Before submitting upstream to
-`getumbrel/umbrel-apps`, re-check two things against the current store:
+Copy `umbrel/` to that repository's root.
 
-- the `manifestVersion` and the field set in `umbrel-app.yml`, which have
-  changed between store generations;
-- whether apps can now declare satd as an alternative to the `bitcoin`
-  dependency — the mechanism added so Bitcoin Knots could satisfy it. If
-  they can, `exports.sh` should export the same variable names the official
-  `bitcoin` app does, so a dependent app is satisfied by either. If they
-  cannot, satd runs standalone and dependent apps keep using Core.
+Both questions this section used to leave open have been checked against the
+current store.
+
+**`manifestVersion` is `1.1`.** Every app in `getumbrel/umbrel-apps` uses it,
+including `bitcoin` and `bitcoin-knots`. This package was on `1`.
+
+**satd must not declare `implements: bitcoin`.** The mechanism does exist —
+it is a top-level `implements:` array in the manifest, `bitcoin-knots`
+declares `implements: [bitcoin]`, and a dependent like `electrs` declares
+`dependencies: [bitcoin]` and is satisfied by either. The contract is
+`exports.sh`: Knots ends with a loop aliasing every `APP_BITCOIN_KNOTS_<VAR>`
+to `APP_BITCOIN_<VAR>`, and that variable set is what a substitute owes its
+dependents.
+
+satd cannot honour it. Two of those exports it can — it accepts Core-format
+`rpcauth`, so `RPC_USER`/`RPC_PASS` are reachable — but
+`ZMQ_RAWBLOCK_PORT` and `ZMQ_RAWTX_PORT` name topics satd does not publish.
+It serves Core-compatible `hashblock`/`hashtx` and its own JSON topics, which
+is exactly why the reference stack runs LND in Neutrino mode rather than
+bitcoind mode. There is no way to declare "implements `bitcoin`, except the
+raw topics": a dependent that needs them would install cleanly against satd
+and then fail at runtime, and the ones that do not need them would work.
+Shipping that is worse than not offering the substitution at all.
+
+Revisit this if satd grows raw block and transaction ZMQ topics. Until then
+satd runs standalone and dependent apps keep using Core.
