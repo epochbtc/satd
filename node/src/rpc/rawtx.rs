@@ -1694,9 +1694,13 @@ pub fn get_tx_out_proof(
                     let outpoint = OutPoint { txid: *txid, vout };
                     if let Some(coin) = chain_state.get_coin(&outpoint) {
                         // The coin is confirmed at `coin.height`; look up the
-                        // block at that height.
+                        // block at that height. The indexed lookup is enough
+                        // here: every requested txid is checked against the
+                        // block's actual contents below, so a candidate that
+                        // is not the active block fails closed with "Not all
+                        // transactions found" rather than producing a proof.
                         if let Some(bh) =
-                            chain_state.active_chain_hash_at_height(coin.height)
+                            chain_state.active_chain_hash_at_height_indexed(coin.height)
                         {
                             found_hash = Some(bh);
                             break 'outer;
@@ -1780,7 +1784,7 @@ pub fn verify_tx_out_proof(
     let entry = chain_state
         .get_block_index(&block_hash)
         .filter(|e| e.num_tx > 0)
-        .filter(|e| chain_state.active_chain_hash_at_height(e.height) == Some(block_hash))
+        .filter(|e| chain_state.active_chain_contains(&block_hash, e.height))
         .ok_or((
             -5i32,
             "Block not found in chain".to_string(),
@@ -1948,6 +1952,63 @@ mod tests {
     /// Helper: create a chain state for tests that use prevtxs (chain state won't be queried).
     fn make_chain_state() -> (crate::chain::state::ChainState, std::path::PathBuf) {
         crate::chain::state::tests::make_chain_state()
+    }
+
+    /// A proof for a block on the active chain verifies; the same proof stops
+    /// verifying once that block is reorged off.
+    ///
+    /// Core's `verifytxoutproof` requires `ActiveChain().Contains(pindex)`
+    /// (v31.1 `src/rpc/txoutproof.cpp:161-162`); satd's check is
+    /// `ChainState::active_chain_contains`, which reads the height index first
+    /// and walks the chain only before answering no. The reorg half is what
+    /// proves the check is still a membership test and not just an index
+    /// lookup: after the reorg the displaced block is still in the block index,
+    /// with data, at a height the new chain also occupies.
+    #[test]
+    fn verify_tx_out_proof_follows_the_active_chain_across_a_reorg() {
+        use crate::chain::state::tests::build_test_block;
+
+        let (cs, dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+
+        // Active chain: genesis -> A1 -> A2.
+        let a1 = build_test_block(genesis, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+
+        let a1_txid = a1.txdata[0].compute_txid().to_string();
+        let proof = get_tx_out_proof(&cs, std::slice::from_ref(&a1_txid), Some(&a1_hash.to_string()))
+            .expect("proof for an active block");
+        let proof_hex = proof.as_str().expect("proof is a hex string").to_string();
+
+        let verified = verify_tx_out_proof(&cs, &proof_hex).expect("verifies on the active chain");
+        assert_eq!(
+            verified.as_array().expect("array of txids").len(),
+            1,
+            "the proof covers exactly the coinbase"
+        );
+        assert_eq!(verified[0], a1_txid);
+
+        // Reorg A off with a heavier B chain: genesis -> B1 -> B2 -> B3.
+        let b1 = build_test_block(genesis, 1, 1_300_000_011);
+        let b1_hash = cs.accept_block(&b1).expect("accept B1").hash();
+        let b2 = build_test_block(b1_hash, 2, 1_300_000_012);
+        let b2_hash = cs.accept_block(&b2).expect("accept B2").hash();
+        let b3 = build_test_block(b2_hash, 3, 1_300_000_013);
+        let b3_hash = cs.accept_block(&b3).expect("accept B3").hash();
+        assert_eq!(cs.tip_hash(), b3_hash, "premise: the B chain won");
+        assert!(
+            cs.get_block_index(&a1_hash).is_some(),
+            "premise: A1 is still indexed, just no longer on the chain"
+        );
+
+        let err = verify_tx_out_proof(&cs, &proof_hex)
+            .expect_err("A1 is no longer on the active chain");
+        assert_eq!(err.0, -5);
+        assert_eq!(err.1, "Block not found in chain");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Helper: generate a key pair and return (WIF, pubkey, secret_key).

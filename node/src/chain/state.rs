@@ -2779,6 +2779,12 @@ impl ChainState {
     /// from the tip via `prev_blockhash`, so it never returns a side-chain
     /// block. Use it where active-chain membership must be exact. Cost is
     /// `O(tip_height - height)`; querying the tip itself is free.
+    ///
+    /// Consensus paths must use this. A non-consensus reader answering a
+    /// caller-chosen height — an RPC that takes a `blockhash` argument, say —
+    /// should prefer [`Self::active_chain_contains`] or
+    /// [`Self::active_chain_hash_at_height_indexed`], which answer the common
+    /// case without the walk.
     pub fn active_chain_hash_at_height(&self, height: u32) -> Option<BlockHash> {
         let (tip_hash, tip_height) = self.tip_snapshot();
         if height > tip_height {
@@ -2792,6 +2798,53 @@ impl ChainState {
             h -= 1;
         }
         Some(cur)
+    }
+
+    /// The active-chain hash at `height` for a non-consensus reader.
+    ///
+    /// Answers from the `height_hash` index — one read, no walk — under
+    /// [`Self::coherent_read`], so a row written by a connect that has not
+    /// published its tip yet, or dropped by a reorg that has not lowered it
+    /// yet, is never returned. Falls back to
+    /// [`Self::active_chain_hash_at_height`] when the index has no row for
+    /// `height` or the chain would not hold still.
+    ///
+    /// What makes the index an oracle here and not in the consensus paths is
+    /// who writes it: `connect_block` and `disconnect_block` under the accept
+    /// lock, genesis repair, and the startup audit that derives rows from tip
+    /// ancestry (`chain/height_index_repair.rs`). Nothing else. A row that
+    /// names a side-chain block therefore means a writer bug, and the callers
+    /// of this method are read-only RPCs that fail closed on one (they check
+    /// the block they were handed against what they were asked for). The
+    /// consensus paths keep the exact walk regardless.
+    pub fn active_chain_hash_at_height_indexed(&self, height: u32) -> Option<BlockHash> {
+        if height > self.tip_height() {
+            return None;
+        }
+        match self.coherent_read(|| self.store.get_block_hash_by_height(height)) {
+            Some(Some(hash)) => Some(hash),
+            // No row, or the chain kept moving: the walk is authoritative and
+            // takes its own tip snapshot.
+            _ => self.active_chain_hash_at_height(height),
+        }
+    }
+
+    /// `hash` is the active-chain block at `height`.
+    ///
+    /// The index answers *yes* without a walk. Before answering *no* the exact
+    /// walk is consulted, so a missing or stale index row can never turn into
+    /// a false "not in the chain" for a block that is in it.
+    pub fn active_chain_contains(&self, hash: &BlockHash, height: u32) -> bool {
+        if height > self.tip_height() {
+            return false;
+        }
+        // The index read is inlined rather than going through
+        // `active_chain_hash_at_height_indexed` so that a missing row costs one
+        // walk here, not two.
+        if self.coherent_read(|| self.store.get_block_hash_by_height(height)) == Some(Some(*hash)) {
+            return true;
+        }
+        self.active_chain_hash_at_height(height) == Some(*hash)
     }
 
     /// Push a block's timestamp into the MTP cache after connection.
@@ -11907,11 +11960,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn getchaintxstats_rejects_blockhash_when_height_index_polluted() {
-        // Regression for the Round-2 review finding: getchaintxstats must use
-        // an authoritative active-chain check, not the pollutable height_hash
-        // index. A side block stored via store_block clobbers height_hash at
-        // its height even though the active chain is unchanged.
+    fn getchaintxstats_answers_a_polluted_height_index_the_documented_way() {
+        // This test was `getchaintxstats_rejects_blockhash_when_height_index_polluted`,
+        // a Round-2 review regression: the RPC used the pollutable `height_hash`
+        // index directly, so a side block that had clobbered a height's row read
+        // as active. The fix then was an exact walk back from the tip.
+        //
+        // The walk is what this branch replaces, because it cost one block-index
+        // read per block of depth on a read-only RPC and Core answers the same
+        // question in constant time. `active_chain_contains` reads the index
+        // first and walks only before answering *no*, which keeps the half of
+        // the old contract that protects a correct caller — an active block
+        // whose row was clobbered is still accepted — and gives up the half that
+        // rejects a side block a bad row named.
+        //
+        // That trade is deliberate and bounded by who writes the index:
+        // `connect_block` and `disconnect_block` under the accept lock, genesis
+        // repair, and the startup audit that derives rows from tip ancestry
+        // (#565). The two historical writers that could pollute it are fixed
+        // (#322, #564) and pinned by tests at the writer. The consensus readers
+        // are unaffected: they keep `active_chain_hash_at_height`.
         let (cs, dir) = make_chain_state();
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
 
@@ -11935,13 +12003,15 @@ pub(crate) mod tests {
             "test premise: height_hash[1] polluted with the side block"
         );
 
-        // The side block must be rejected even though height_hash[1] == B1 …
-        let err = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(b1_hash))
-            .unwrap_err();
-        assert!(err.contains("not in main chain"), "got: {err}");
+        // The side block the polluted row names is now accepted: the index is
+        // the fast path, and only a writer bug can put a side block in it.
+        let stats = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(b1_hash))
+            .expect("the index row is trusted for a positive answer");
+        assert_eq!(stats["window_final_block_hash"], b1_hash.to_string());
 
-        // … and the genuinely-active A1 must be accepted even though the height
-        // index no longer points at it.
+        // The half that still matters, and the one a correct caller depends on:
+        // the genuinely-active A1 is accepted even though the height index no
+        // longer points at it. Delete the fallback walk and this fails.
         let ok = crate::rpc::blockchain::get_chain_tx_stats(&cs, Some(1), Some(a1_hash))
             .expect("A1 is on the active chain");
         assert_eq!(ok["window_final_block_height"], 1);
@@ -12116,6 +12186,127 @@ pub(crate) mod tests {
         assert_eq!(cs.get_block_hash_by_height(1), Some(b1_hash));
         assert_eq!(cs.get_block_hash_by_height(2), Some(b2_hash));
         assert_eq!(cs.get_block_hash_by_height(3), Some(b3_hash));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drop `height`'s row from the height index, reproducing the gap shape the
+    /// startup audit repairs (#565).
+    fn drop_height_hash(cs: &ChainState, height: u32) {
+        let mut batch = crate::storage::StoreBatch::default();
+        batch.height_hash_removes.push(height);
+        cs.store.write_batch(batch).unwrap();
+    }
+
+    /// Active chain genesis -> A1 -> A2, with `height_hash[1]` pointing at a
+    /// stored side block B1 instead of the active A1. Returns `(A1, B1)`.
+    fn chain_with_polluted_height_one(cs: &ChainState) -> (BlockHash, BlockHash) {
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+
+        let b1 = build_test_block(genesis_hash, 1, 1_300_000_010);
+        let b1_hash = b1.block_hash();
+        cs.store_block(&b1).expect("store B1");
+        pollute_height_hash(cs, 1, b1_hash);
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            Some(b1_hash),
+            "premise: height_hash[1] polluted with the side block"
+        );
+        (a1_hash, b1_hash)
+    }
+
+    #[test]
+    fn active_chain_contains_answers_yes_from_the_index() {
+        // The fast path is the whole point of the method: a positive answer
+        // must come out of the height index, without the walk. Proven the only
+        // way it can be proven without a read-counting store — by pointing the
+        // index at a block the walk would never return and watching the answer
+        // follow the index. Delete the index read in `active_chain_contains`
+        // and this test fails.
+        //
+        // This also pins the trust decision: the height index is written only
+        // by connect/disconnect under the accept lock and by the startup audit,
+        // so a row naming a side block is a writer bug, not a state a
+        // non-consensus reader has to defend against. The consensus paths keep
+        // the exact walk.
+        let (cs, dir) = make_chain_state();
+        let (_a1_hash, b1_hash) = chain_with_polluted_height_one(&cs);
+
+        assert!(
+            cs.active_chain_contains(&b1_hash, 1),
+            "the index row is the fast path; a walk would have said no"
+        );
+        assert_eq!(
+            cs.active_chain_hash_at_height_indexed(1),
+            Some(b1_hash),
+            "and the indexed lookup returns the row it read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_chain_contains_never_falsely_rejects() {
+        // The other half of the contract, and the one that matters for
+        // correctness: a stale or wrong index row must not turn into a false
+        // "not in the chain" for a block that is in the chain. Delete the
+        // fallback walk and this test fails.
+        let (cs, dir) = make_chain_state();
+        let (a1_hash, _b1_hash) = chain_with_polluted_height_one(&cs);
+
+        assert!(
+            cs.active_chain_contains(&a1_hash, 1),
+            "A1 is the active block at height 1; the polluted row must not hide it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_chain_hash_at_height_indexed_falls_back_on_a_missing_row() {
+        // A datadir carrying a height-index gap (the #565 shape) must still get
+        // the right answer, from the walk.
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+        let a2 = build_test_block(a1_hash, 2, 1_300_000_002);
+        cs.accept_block(&a2).expect("accept A2");
+
+        drop_height_hash(&cs, 1);
+        assert_eq!(
+            cs.get_block_hash_by_height(1),
+            None,
+            "premise: height_hash[1] is gone"
+        );
+
+        assert_eq!(cs.active_chain_hash_at_height_indexed(1), Some(a1_hash));
+        assert!(cs.active_chain_contains(&a1_hash, 1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_chain_contains_is_false_above_the_tip_and_for_unknown_blocks() {
+        let (cs, dir) = make_chain_state();
+        let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let a1 = build_test_block(genesis_hash, 1, 1_300_000_001);
+        let a1_hash = cs.accept_block(&a1).expect("accept A1").hash();
+
+        // Above the tip: no answer, from either method.
+        assert_eq!(cs.active_chain_hash_at_height_indexed(2), None);
+        assert!(!cs.active_chain_contains(&a1_hash, 2));
+
+        // A block that was never indexed at all, named at a height that exists.
+        let orphan = build_test_block(genesis_hash, 1, 1_300_000_099).block_hash();
+        assert!(!cs.active_chain_contains(&orphan, 1));
+
+        // And a real active block named at the wrong height.
+        assert!(!cs.active_chain_contains(&a1_hash, 0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

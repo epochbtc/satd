@@ -1176,13 +1176,12 @@ pub fn get_chain_tx_stats(
             let entry = chain_state
                 .get_block_index(&hash)
                 .ok_or("Block not found")?;
-            // Active-chain membership must be exact: the `height_hash` index is
-            // "best known at height" and can be clobbered by side-chain
-            // store_block/header paths (see the chain-state test
-            // `test_reorg_fork_point_immune_to_polluted_height_hash`), so it is
-            // NOT an active-chain oracle. Confirm authoritatively that the block
-            // is the tip's ancestor at its height (Core: CChain::Contains).
-            if chain_state.active_chain_hash_at_height(entry.height) != Some(hash) {
+            // Active-chain membership, Core's `chain.Contains(pindex)`.
+            // `active_chain_contains` answers yes from the height index and
+            // only walks the chain before answering no, so a caller naming an
+            // old block does not cost one index read per block of depth, and a
+            // stale index row cannot reject a block that is in the chain.
+            if !chain_state.active_chain_contains(&hash, entry.height) {
                 return Err("Block is not in main chain".to_string());
             }
             (hash, entry)
