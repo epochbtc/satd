@@ -1283,6 +1283,251 @@ fn test_getblocktemplate_fields() {
     node.stop();
 }
 
+/// A transaction spending an outpoint that exists nowhere. Structurally valid,
+/// contextually dead: the block carrying it fails at input resolution.
+fn spend_of_a_nonexistent_output() -> bitcoin::Transaction {
+    use bitcoin::hashes::Hash as _;
+    bitcoin::Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x9e; 32]),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    }
+}
+
+/// Build a regtest block on `prev` at `height`, with a BIP 34 coinbase paying
+/// exactly the subsidy, and grind its nonce to satisfy the regtest target.
+fn build_regtest_block(
+    prev: bitcoin::BlockHash,
+    height: u32,
+    time: u32,
+    extra: Vec<bitcoin::Transaction>,
+) -> bitcoin::Block {
+    use bitcoin::hashes::Hash as _;
+
+    // Regtest subsidy: 50 BTC, halving every 150 blocks.
+    let subsidy = (50u64 * 100_000_000) >> (height / 150).min(63);
+    let script_sig = bitcoin::script::Builder::new()
+        .push_int(height as i64)
+        .push_int(time as i64)
+        .push_opcode(bitcoin::opcodes::OP_FALSE)
+        .into_script();
+    let coinbase = bitcoin::Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig,
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(subsidy),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    };
+
+    let mut txdata = vec![coinbase];
+    txdata.extend(extra);
+    let mut block = bitcoin::Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(0x2000_0000),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata,
+    };
+    block.header.merkle_root = block.compute_merkle_root().expect("non-empty block");
+
+    // The regtest target has its top byte at 0x7f, so a hash whose leading
+    // byte is below 0x80 is under it — one comparison, no big-integer maths.
+    for nonce in 0u32..u32::MAX {
+        block.header.nonce = nonce;
+        let h = block.block_hash();
+        if h.as_raw_hash().as_byte_array()[31] < 0x7f {
+            return block;
+        }
+    }
+    panic!("could not grind a regtest block header");
+}
+
+/// Core's `getblocktemplate` reads `mode` before anything else: absent or JSON
+/// null means "template", a present-but-non-string value is `-8 Invalid mode`,
+/// and any other string is too. satd read a non-string `mode` as "not
+/// proposal" and quietly returned a template to a caller who had asked for
+/// something else.
+#[test]
+fn getblocktemplate_rejects_a_mode_it_does_not_understand() {
+    let mut node = TestNode::start(&[]);
+
+    for bad_mode in [serde_json::json!(1), serde_json::json!(true), serde_json::json!(["proposal"]), serde_json::json!("submit")] {
+        let resp = node
+            .rpc_call_with_params(
+                "getblocktemplate",
+                vec![serde_json::json!({ "mode": bad_mode })],
+            )
+            .expect("rpc");
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-8),
+            "mode {bad_mode} was not refused: {resp}"
+        );
+        assert_eq!(resp["error"]["message"].as_str(), Some("Invalid mode"));
+    }
+
+    // An explicit null `mode` is Core's "do nothing" case: a template.
+    let resp = node
+        .rpc_call_with_params("getblocktemplate", vec![serde_json::json!({ "mode": null })])
+        .expect("rpc");
+    assert!(resp["error"].is_null(), "an explicit null mode is a template request: {resp}");
+    assert!(resp["result"]["height"].is_number());
+
+    node.stop();
+}
+
+/// Proposal mode without usable `data` is `RPC_TYPE_ERROR` (-3) in Core, with
+/// the message `Missing data String key for proposal` — not `-8`.
+#[test]
+fn getblocktemplate_proposal_without_data_is_a_type_error() {
+    let mut node = TestNode::start(&[]);
+
+    for req in [
+        serde_json::json!({ "mode": "proposal" }),
+        serde_json::json!({ "mode": "proposal", "data": 5 }),
+        serde_json::json!({ "mode": "proposal", "data": null }),
+    ] {
+        let resp = node
+            .rpc_call_with_params("getblocktemplate", vec![req.clone()])
+            .expect("rpc");
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-3), "{req}: {resp}");
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("Missing data String key for proposal")
+        );
+    }
+
+    // Undecodable hex is Core's -22, and reaches that only because the `data`
+    // check above passed — so the two failures are distinguishable.
+    let resp = node
+        .rpc_call_with_params(
+            "getblocktemplate",
+            vec![serde_json::json!({ "mode": "proposal", "data": "zzzz" })],
+        )
+        .expect("rpc");
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-22), "{resp}");
+
+    node.stop();
+}
+
+/// Proposal mode must give the same verdict as `submitblock`. satd's
+/// hand-written validation loop skipped script verification by its own
+/// admission, so a miner asking whether a block would be accepted was told
+/// "yes" for a block the node then rejected.
+#[test]
+fn a_proposal_agrees_with_submitblock() {
+    let mut node = TestNode::start(&[]);
+
+    // A template turned into a real block, with one transaction whose input
+    // does not exist — the block is structurally fine and contextually dead.
+    let template = node.rpc_call("getblocktemplate").unwrap();
+    let t = &template["result"];
+    let height = t["height"].as_u64().unwrap() as u32;
+    let prev: bitcoin::BlockHash = t["previousblockhash"].as_str().unwrap().parse().unwrap();
+    let time = t["curtime"].as_u64().unwrap() as u32;
+
+    let bad_block = build_regtest_block(
+        prev,
+        height,
+        time,
+        vec![spend_of_a_nonexistent_output()],
+    );
+    let hex = hex::encode(bitcoin::consensus::serialize(&bad_block));
+
+    let proposal = node
+        .rpc_call_with_params(
+            "getblocktemplate",
+            vec![serde_json::json!({ "mode": "proposal", "data": hex.clone() })],
+        )
+        .expect("rpc");
+    assert!(proposal["error"].is_null(), "{proposal}");
+    let proposal_verdict = proposal["result"].as_str().unwrap_or("<null: accepted>");
+
+    let submit = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!(hex)])
+        .expect("rpc");
+    let submit_verdict = submit["result"].as_str().unwrap_or("<null: accepted>");
+
+    assert_eq!(
+        proposal_verdict, submit_verdict,
+        "proposal mode and submitblock disagree: {proposal} vs {submit}"
+    );
+    assert_eq!(proposal_verdict, "bad-txns-inputs-missingorspent");
+
+    // A well-formed block built on the same tip is accepted by both, so the
+    // agreement above is not two identical refusals of everything.
+    let good_block = build_regtest_block(prev, height, time, vec![]);
+    let good_hex = hex::encode(bitcoin::consensus::serialize(&good_block));
+    let proposal = node
+        .rpc_call_with_params(
+            "getblocktemplate",
+            vec![serde_json::json!({ "mode": "proposal", "data": good_hex.clone() })],
+        )
+        .expect("rpc");
+    assert!(
+        proposal["result"].is_null() && proposal["error"].is_null(),
+        "a valid proposal must be null: {proposal}"
+    );
+
+    // …and once it is really submitted, proposing it again is a duplicate.
+    let submit = node
+        .rpc_call_with_params("submitblock", vec![serde_json::json!(good_hex.clone())])
+        .expect("rpc");
+    assert!(submit["result"].is_null(), "{submit}");
+    let proposal = node
+        .rpc_call_with_params(
+            "getblocktemplate",
+            vec![serde_json::json!({ "mode": "proposal", "data": good_hex })],
+        )
+        .expect("rpc");
+    assert_eq!(proposal["result"].as_str(), Some("duplicate"), "{proposal}");
+
+    node.stop();
+}
+
+/// Core's regtest-only `-blockversion=<n>` overrides the template's version,
+/// which is how `mining_basic.py` tests forking scenarios. satd accepted the
+/// option in `bitcoin.conf` and ignored it.
+#[test]
+fn blockversion_overrides_the_template_version() {
+    let mut node = TestNode::start(&["--blockversion=1337"]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    assert_eq!(response["result"]["version"].as_i64(), Some(1337), "{response}");
+    node.stop();
+
+    let mut node = TestNode::start(&[]);
+    let response = node.rpc_call("getblocktemplate").unwrap();
+    assert_eq!(
+        response["result"]["version"].as_i64(),
+        Some(0x2000_0000),
+        "without the override the computed version stands: {response}"
+    );
+    node.stop();
+}
+
 // --- P2P Integration Tests ---
 
 #[test]

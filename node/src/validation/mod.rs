@@ -30,6 +30,11 @@ pub enum ValidationError {
     // bytes push a length-legal block over the weight cap (#548).
     #[error("bad-blk-weight")]
     OverweightBlock,
+    // Core's `CheckBlock` applies a legacy-only sigop ceiling before any
+    // prevout is resolved; `connect_block` applies the full accurate count
+    // under the same reject reason.
+    #[error("bad-blk-sigops")]
+    BadBlockSigops,
     #[error("bad-diffbits")]
     BadDifficulty,
     // Core folds the empty-block case into its size-limits check, which emits

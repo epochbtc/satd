@@ -462,6 +462,33 @@ fn c_bad_merkle_root(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     ))
 }
 
+/// Oversized *and* merkle-broken. Core's `CheckBlock` runs `CheckMerkleRoot`
+/// before the size limits, so it answers `bad-txnmrklroot`; satd tested size
+/// first and answered `bad-blk-length`. The block has to be wrong in both ways
+/// at once or the two orderings are indistinguishable.
+fn c_oversize_and_bad_merkle(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
+    let h = ctx.candidate_height();
+    let outputs: Vec<TxOut> = (0..40)
+        .map(|_| TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: ScriptBuf::from(vec![0x00; 30_000]),
+        })
+        .collect();
+    let cb = {
+        let mut c = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
+        c.output = outputs;
+        c
+    };
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        Some(TxMerkleNode::from_byte_array([0xde; 32])),
+        true,
+    ))
+}
+
 fn c_oversize_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let outputs: Vec<TxOut> = (0..40)
@@ -854,6 +881,7 @@ fn cases() -> Vec<Case> {
         case("multiple_coinbase", "block-structure", Some("bad-cb-multiple"), c_multiple_coinbase),
         case("bad_merkle_root", "block-structure", Some("bad-txnmrklroot"), c_bad_merkle_root),
         case("oversize_block", "block-structure", Some("bad-blk-length"), c_oversize_block),
+        case("oversize_and_bad_merkle", "block-structure", Some("bad-txnmrklroot"), c_oversize_and_bad_merkle),
         case("overweight_block", "witness", Some("bad-blk-weight"), c_overweight_block),
         case("coinbase_scriptsig_too_short", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_short),
         case("coinbase_scriptsig_too_long", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_long),

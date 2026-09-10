@@ -106,6 +106,24 @@ static BLOCK_MIN_TX_FEE: std::sync::atomic::AtomicU64 =
 /// mempool would accept them and the template would never mine them.
 pub const DEFAULT_BLOCK_MIN_TX_FEE: u64 = 1;
 
+/// Core's regtest-only `-blockversion=<n>` override, or `i64::MIN` for "not
+/// set" — the sentinel keeps this a lock-free atomic while still allowing a
+/// caller to ask for version 0.
+static BLOCK_VERSION_OVERRIDE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Record the configured `-blockversion`. Called once during startup; a
+/// `None` leaves the computed version in place.
+///
+/// Core applies it only when `MineBlocksOnDemand()` — regtest — so the caller
+/// is responsible for not passing one on any other network.
+pub fn set_block_version_override(version: Option<i64>) {
+    BLOCK_VERSION_OVERRIDE.store(
+        version.unwrap_or(i64::MIN),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Record the configured `-blockmintxfee`. Called once during startup.
 pub fn set_block_min_tx_fee(rate: u64) {
     BLOCK_MIN_TX_FEE.store(rate, std::sync::atomic::Ordering::Relaxed);
@@ -357,8 +375,15 @@ fn assemble_template(
     LAST_BLOCK_WEIGHT.store(total_weight as u64, std::sync::atomic::Ordering::Relaxed);
 
 
+    // `-blockversion` overrides the computed version on regtest only, as
+    // Core's `CreateNewBlock` does under `MineBlocksOnDemand()`.
+    let version = match BLOCK_VERSION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        i64::MIN => 0x20000000u32 as i32, // BIP 9 version bits
+        v => v as i32,
+    };
+
     BlockTemplate {
-        version: 0x20000000, // BIP 9 version bits
+        version,
         prev_hash: tip_hash,
         height,
         bits,

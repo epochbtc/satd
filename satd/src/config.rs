@@ -914,6 +914,9 @@ pub struct Config {
     pub blockmaxweight: usize,
     #[allow(dead_code)]
     pub blockmintxfee: u64,
+    /// Core's regtest-only `-blockversion=<n>`: the version stamped on a
+    /// template header, for testing forking scenarios.
+    pub blockversion: Option<i64>,
     // Misc
     pub pid: Option<String>,
     // Cache — raw budget for the static partition; see `dbcache_mode` for
@@ -3676,6 +3679,9 @@ impl Config {
                 .or_else(|| file_get("blockmaxweight").and_then(|v| v.parse().ok()))
                 .unwrap_or(4_000_000),
             blockmintxfee,
+            blockversion: cli
+                .blockversion
+                .or_else(|| file_get("blockversion").and_then(|v| v.parse().ok())),
             pid: cli.pid.or_else(|| file_get("pid")),
             mcp: cli.mcp.unwrap_or_else(|| {
                 file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
@@ -5446,6 +5452,13 @@ pub struct CliArgs {
     )]
     pub blockmintxfee: Option<u64>,
 
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Override block version to test forking scenarios (regtest only)"
+    )]
+    pub blockversion: Option<i64>,
+
     // Misc flags
     #[arg(long, value_name = "FILE", help = "Write PID to file")]
     pub pid: Option<String>,
@@ -6348,6 +6361,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "onlynet",
         "blockmaxweight",
         "blockmintxfee",
+        "blockversion",
         "pid",
         "mcp",
         "mcpport",
@@ -9403,6 +9417,7 @@ testactivationheight=bip34@2
             broadcastconfirmpeers: None,
             blockmaxweight: None,
             blockmintxfee: None,
+            blockversion: None,
             pid: None,
             server: Some(false),
             daemon: Some(false),
@@ -9697,6 +9712,7 @@ testactivationheight=bip34@2
             broadcastconfirmpeers: None,
             blockmaxweight: None,
             blockmintxfee: None,
+            blockversion: None,
             pid: None,
             server: Some(false),
             daemon: Some(false),

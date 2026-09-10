@@ -7,6 +7,9 @@ use crate::validation::ValidationError;
 /// Maximum block weight (4 million weight units, per BIP 141).
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 
+/// Bitcoin Core's `MAX_BLOCK_SIGOPS_COST`.
+const MAX_BLOCK_SIGOPS_COST: usize = 80_000;
+
 /// BIP 141 witness scale factor (Core's `WITNESS_SCALE_FACTOR`).
 pub const WITNESS_SCALE_FACTOR: usize = 4;
 
@@ -37,29 +40,13 @@ pub fn check_block(
         return Err(ValidationError::EmptyBlock);
     }
 
-    // Size limits, split exactly as Core splits them (#548):
-    //
-    // 1. `CheckBlock`'s stripped-size test — tx count and witness-stripped
-    //    serialized size, each scaled by the witness factor — rejects
-    //    `bad-blk-length`. Witness bytes cannot trigger it.
-    // (`Block::base_size` is private in rust-bitcoin 0.32; recover it exactly
-    // from the public pair via weight = base * 3 + total.)
-    let weight = block.weight().to_wu() as usize;
-    let base_size = (weight - block.total_size()) / 3;
-    if block.txdata.len() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-        || base_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-    {
-        return Err(ValidationError::OversizedBlock);
-    }
-
-    // First transaction must be coinbase
-    if !block.txdata[0].is_coinbase() {
-        return Err(ValidationError::NoCoinbase);
-    }
-
-    // Check merkle root — Core computes both the root and the mutation flag
-    // together, so the merkle-root mismatch and duplication check fire
-    // BEFORE the multiple-coinbase check.
+    // Check merkle root. Core runs `CheckMerkleRoot` FIRST, ahead of the size
+    // limits and the coinbase-position tests (`validation.cpp`, `CheckBlock`),
+    // because "all potential-corruption validation must be done before we do
+    // any transaction validation": a peer that sent the wrong transactions for
+    // a header must not get the header marked invalid. A block that is both
+    // oversized and merkle-broken therefore answers `bad-txnmrklroot`, not
+    // `bad-blk-length`.
     let computed = block.compute_merkle_root();
     match computed {
         Some(root) => {
@@ -82,6 +69,26 @@ pub fn check_block(
         return Err(ValidationError::BadTxDuplicate);
     }
 
+    // Size limits, split exactly as Core splits them (#548):
+    //
+    // 1. `CheckBlock`'s stripped-size test — tx count and witness-stripped
+    //    serialized size, each scaled by the witness factor — rejects
+    //    `bad-blk-length`. Witness bytes cannot trigger it.
+    // (`Block::base_size` is private in rust-bitcoin 0.32; recover it exactly
+    // from the public pair via weight = base * 3 + total.)
+    let weight = block.weight().to_wu() as usize;
+    let base_size = (weight - block.total_size()) / 3;
+    if block.txdata.len() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+        || base_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    {
+        return Err(ValidationError::OversizedBlock);
+    }
+
+    // First transaction must be coinbase
+    if !block.txdata[0].is_coinbase() {
+        return Err(ValidationError::NoCoinbase);
+    }
+
     // No other transaction may be coinbase — after the merkle checks so
     // that Core-order `bad-txns-duplicate` fires before `bad-cb-multiple`
     // when a coinbase is duplicated.
@@ -89,6 +96,26 @@ pub fn check_block(
         if tx.is_coinbase() {
             return Err(ValidationError::MultipleCoinbase);
         }
+    }
+
+    // Legacy sigop count. Core's `CheckBlock` runs this cheap, context-free
+    // gate before anything resolves a prevout — it "underestimates the number
+    // of sigops, because unlike ConnectBlock it does not count witness and
+    // p2sh sigops", but it is a hard ceiling a block cannot talk its way out
+    // of, and it fires ahead of `bad-txns-inputs-missingorspent`.
+    // `connect_block` still applies the full accurate count.
+    let mut legacy_sigops: usize = 0;
+    for tx in &block.txdata {
+        for input in &tx.input {
+            legacy_sigops = legacy_sigops.saturating_add(input.script_sig.count_sigops_legacy());
+        }
+        for output in &tx.output {
+            legacy_sigops =
+                legacy_sigops.saturating_add(output.script_pubkey.count_sigops_legacy());
+        }
+    }
+    if legacy_sigops.saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_SIGOPS_COST {
+        return Err(ValidationError::BadBlockSigops);
     }
 
     // Witness commitment (BIP 141), height-gated as Core gates it.
