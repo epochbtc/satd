@@ -18,8 +18,19 @@ version: "3.7"
 #
 # The tag is bare. The registry has never published a `v`-prefixed tag, so the
 # `v0.5.2` this used to name resolved to nothing on every architecture.
+#
+# It is also a per-commit tag rather than a release: no release contains
+# satd-init, which this branch adds, so the `0.5.1` this used to name could
+# not have started. `docker.yml` publishes `sha-<short>` on every build and
+# the short sha names a real commit on the branch.
+#
+# The umbrelOS install was run against a locally built copy of this image
+# served from a registry on the host, not against ghcr itself — the VM's
+# outbound path is QEMU's NAT and the package is not public yet. Same
+# Dockerfile, same tree; the registry hop is what is untested.
+#
 # Bumping both halves is a step in the release checklist.
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.5.1@sha256:bcbde256a0d5191d124f36d01df3d6dbdc70d4690aa9cccdb109eebf3df1dd1f
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-8246eb9@sha256:88b7489a76a11aebf57b805f6fa97b002141fa712b530083bfa081a7dc4ec4b6
 
 services:
   app_proxy:

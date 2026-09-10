@@ -10,9 +10,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$STACK/../.." && pwd)"
 APPLIANCE="$ROOT/contrib/appliance"
-UMBREL="$ROOT/contrib/packaging/umbrel/satd"
+UMBREL="$ROOT/contrib/packaging/umbrel/epochbtc-satd"
 
 fail=0
+
+# Every check below is a grep against a path. A stale path does not announce
+# itself: `grep -q` on a missing file just returns non-zero, so the positive
+# assertions fail with a message about the compose file's contents and the
+# negative ones ("does not contain X") pass, because nothing contains anything.
+# This directory was renamed to carry the store prefix and these checks spent
+# that time reading a file that was not there.
+for p in "$STACK/compose.yml" "$UMBREL/docker-compose.yml" "$APPLIANCE/files"; do
+    [ -e "$p" ] || { echo "compose-test.sh: no such path: $p" >&2; exit 1; }
+done
 ok()   { printf '  ok    %s\n' "$1"; }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }

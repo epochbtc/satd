@@ -20,13 +20,12 @@ release.
 
 ## Status
 
-The Umbrel package has been installed and run on umbrelOS 1.7.4. The StartOS
-package is written, typechecked and packs to a `.s9pk`, but **has not been
-installed on a StartOS server**.
+Both packages have now been installed and run on a real server: the Umbrel
+package on umbrelOS 1.7.4, the StartOS package on StartOS 0.4.0.1. Neither
+had been, and installing them is what found almost everything below.
 
-That distinction is the whole point of this section. Five of the eight defects
-found in the Umbrel package were invisible to every static check — `umbrel
-lint` passes clean both before and after each of them:
+Six of the nine defects in the Umbrel package were invisible to every static
+check — `umbrel lint` passes clean both before and after each of them:
 
 - The app id must be prefixed with the store id, or the store adds
   successfully, reports no error, and lists zero apps.
@@ -38,6 +37,13 @@ lint` passes clean both before and after each of them:
   bind mount root-owned, so an unprivileged init service cannot write to it.
 - `app_proxy` dials its upstream as `http://` with no TLS option, so pointing
   it at a TLS listener 502s every request.
+- The health check probed `/readyz`, which is 503 until the node is within six
+  blocks of its headers tip. The container reported `Up 2 hours (unhealthy)`
+  with a failing streak of 254 while serving RPC, Electrum, Esplora and MCP
+  normally, and would have done so for the whole multi-day initial sync. It
+  read healthy on the first check only because the node was minutes old and
+  its header chain had not yet outrun its blocks — a window narrow enough to
+  pass a spot check and nothing else.
 
 What is checked statically:
 
@@ -45,7 +51,8 @@ What is checked statically:
   manifest, each app manifest, the compose file and `exports.sh`. It is what
   caught the missing image digest pin, which the Umbrel app store requires.
 - `startos/` — typechecks against the SDK, tests its network table against
-  `satd-init`, and packs to a `.s9pk`. See `startos/README.md`.
+  `satd-init`, guards the two defects the install found, and packs to a
+  `.s9pk`. See `startos/README.md` for what running it on a server showed.
 
 Neither validator understands satd's own flags, so the checks that cover
 those live in `contrib/stack/tests/compose-test.sh`.
