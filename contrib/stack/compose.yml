@@ -55,11 +55,19 @@ services:
     command:
       - --datadir=/var/lib/satd
       - --chain=${NETWORK:-signet}
-    environment:
-      # Readiness, not liveness: /readyz stays negative until the chainstate
-      # is loaded and every listener is bound, which is what the overlays'
-      # `depends_on` needs to mean.
-      SATD_HEALTH_URL: http://127.0.0.1:9332/readyz
+    # No SATD_HEALTH_URL, so the image's own HEALTHCHECK probes JSON-RPC
+    # liveness: the RPC listener is bound and answering.
+    #
+    # This deliberately does NOT use /readyz. That endpoint is 503 until the
+    # tip is within six blocks of the headers tip, which on a fresh mainnet
+    # node is days away — the container went `unhealthy` on a real install
+    # after the header chain outran the block chain, with a failing streak in
+    # the hundreds, while satd was serving RPC, Electrum and Esplora
+    # perfectly. Nothing in this stack depends on satd's health either, so
+    # the readiness reading bought nothing and cost a permanent red mark.
+    #
+    # /readyz remains the right probe for a client that must not read a
+    # stale chain. It is the wrong probe for "is this container alive".
     volumes:
       - satd-data:/var/lib/satd
     ports:

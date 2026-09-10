@@ -94,8 +94,12 @@ services:
     command:
       - --datadir=/var/lib/satd
       - --chain=${APP_SATD_NETWORK:-mainnet}
-    environment:
-      SATD_HEALTH_URL: http://127.0.0.1:9332/readyz
+    # No SATD_HEALTH_URL, so the image's own HEALTHCHECK probes JSON-RPC
+    # liveness rather than readiness. /readyz is 503 until the tip is within
+    # six blocks of the headers tip; on this install the container read
+    # `Up 2 hours (unhealthy)` with a failing streak of 254 while satd was
+    # answering RPC, Electrum, Esplora and MCP normally. Umbrel surfaces that
+    # state to the user, so the whole initial sync would look like a fault.
     volumes:
       - ${APP_DATA_DIR}/data:/var/lib/satd
     # Esplora's 3001 is deliberately NOT here. `umbrel-app.yml` sets

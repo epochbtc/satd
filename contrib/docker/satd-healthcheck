@@ -4,14 +4,15 @@
 # "Healthy" means the node is answering on a surface a client would use.
 # Two probe modes, in order:
 #
-#   1. SATD_HEALTH_URL — an http:// URL to GET. Set this to satd's
-#      readiness endpoint when the metrics listener is on, which is what
-#      contrib/stack does:
-#        SATD_HEALTH_URL=http://127.0.0.1:9332/readyz
-#      /readyz is satd's real readiness gate: it reports not-ready until
-#      the chainstate is loaded and every configured listener is bound.
-#      Only a 2xx counts, so a node that is still starting reads as
-#      unhealthy rather than ready.
+#   1. SATD_HEALTH_URL — an http:// URL to GET. Only a 2xx counts.
+#
+#      Do NOT point this at /readyz for a container health gate, however
+#      natural that reads. /readyz answers 503 until the tip is within six
+#      blocks of the headers tip, which on a fresh mainnet node is days
+#      away: the packaging used to do exactly this and every container went
+#      `unhealthy` for the whole initial sync while satd served RPC,
+#      Electrum and Esplora normally. /readyz is for a client deciding
+#      whether this node's chain is current — not for "is it alive".
 #
 #   2. JSON-RPC liveness on SATD_RPCPORT (default 8332). The probe sends a
 #      getblockchaininfo and treats ANY HTTP status line as healthy —
@@ -20,7 +21,7 @@
 #      cookie may be unreadable), so authenticating is not something it can
 #      do reliably. A 401 still proves the RPC listener is bound and
 #      serving, which is the strongest claim this mode can honestly make.
-#      Use mode 1 when you want readiness rather than liveness.
+#      This is the mode every package here uses.
 #
 # Non-mainnet containers must set SATD_RPCPORT (18332 testnet, 38332
 # signet, 18443 regtest) or SATD_HEALTH_URL, since the probe cannot see
