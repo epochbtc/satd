@@ -13,13 +13,18 @@
 # runner — same split release.yml uses, which keeps arm64 off slow QEMU
 # emulation (rocksdb's C++ build is ~2h under emulation, 5-15 min native).
 #
-# Each arch does load + run, not push: we pull the built image into the
-# local daemon and actually execute both binaries (`--version`). A plain
-# `build` proves the *builder* stage compiles but says nothing about the
-# *runtime* stage — a missing libssl3, a broken tini/ENTRYPOINT, or wrong
-# datadir perms all build green and only fail at `docker run`. Running on a
-# native per-arch runner means the smoke test exercises the real arch
-# binary, not an emulated one.
+# Each arch loads and RUNS the image before anything is published: we pull
+# the built image into the local daemon and actually execute both binaries
+# (`--version`). A plain `build` proves the *builder* stage compiles but says
+# nothing about the *runtime* stage — a missing libssl3, a broken
+# tini/ENTRYPOINT, or wrong datadir perms all build green and only fail at
+# `docker run`. Running on a native per-arch runner means the smoke test
+# exercises the real arch binary, not an emulated one.
+#
+# What passes the smoke test is then pushed as `sha-<short>` and merged into
+# a two-arch manifest list. That tag is a development reference for pinning
+# the app-store packages between releases — it is unsigned, and it never
+# touches `latest` or a version alias, both of which stay with release.yml.
 #
 # Runs in its own jobs, parallel to ci.yml, so it adds no wall-clock time
 # there. Hosted-runner minutes are free for public repos.
@@ -33,6 +38,10 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-smoke:
@@ -51,6 +60,7 @@ jobs:
             slug: arm64
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -73,7 +83,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=docker-ci-${{ matrix.slug }}
           # We sign + attest provenance in release.yml's merge-docker via
           # cosign keyless; a partial buildkit attestation here would be
-          # noise. This image is never pushed, so it needs neither.
+          # noise. The sha- tag pushed below is a development reference, not
+          # a distribution artifact, and is deliberately unsigned: signing it
+          # would imply a release-grade guarantee it does not carry.
           provenance: false
 
       - name: Smoke test — both binaries run in the runtime image
@@ -87,3 +99,125 @@ jobs:
           # sat-cli isn't the entrypoint — override it.
           echo "sat-cli:"
           docker run --rm --entrypoint /usr/local/bin/sat-cli satd:ci --version
+
+      # --- publish a per-commit reference ----------------------------------
+      #
+      # Until now no image existed between releases: this workflow built one
+      # and threw it away, and release.yml published only on `v*`. That gap
+      # has a concrete cost — the app-store packages under contrib/packaging
+      # reference satd as `tag@sha256:...`, which cannot be written for an
+      # image that does not exist, and a package shipped referencing
+      # `satd-init`, a program no published image contained.
+      #
+      # What is pushed is the image that just passed the smoke test above,
+      # under `sha-<short>` only. `latest` and the version aliases stay with
+      # release.yml, so nothing here can advance what an operator pulls.
+      #
+      # Fork PRs are skipped: their GITHUB_TOKEN is read-only, and saying so
+      # in the `if` is better than letting the push fail.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push by digest
+        id: push
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Same cache scope as the build above, so this re-exports that
+          # build from cache rather than compiling anything a second time.
+          # No cache-to: the build step already populated the scope, and a
+          # second writer would just race it.
+          cache-from: type=gha,scope=docker-ci-${{ matrix.slug }}
+          provenance: false
+
+      - name: Export digest
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.push.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+  publish-sha:
+    name: publish sha- tag
+    # Both arches must have smoked clean before either is reachable under a
+    # tag: a manifest list naming a broken arch is worse than no tag, because
+    # it fails only for the users on that architecture.
+    needs: [build-smoke]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute the sha- tag
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `type=sha` alone. On a pull_request the action resolves this to
+          # the PR head commit rather than the synthetic merge commit, which
+          # is the sha a developer can actually check out and rebuild.
+          tags: type=sha
+
+      - name: Create + push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=$(jq -cr '.tags | map("--tag " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
+          digests=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          docker buildx imagetools create $tags $digests
+
+      - name: Report the pinnable reference
+        run: |
+          set -euo pipefail
+          tag=$(jq -cr '.tags[0]' <<< '${{ steps.meta.outputs.json }}')
+          # The manifest-list digest, which is what a package manifest pins:
+          # it resolves per-architecture, so one pin covers both arches.
+          digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Pin this in contrib/packaging as:"
+          echo "  ${tag}@${digest}"
+          {
+            echo "### Pinnable image reference"
+            echo
+            echo '```'
+            echo "${tag}@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
