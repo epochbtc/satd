@@ -199,22 +199,90 @@ fn wait_for_requested_esplora(
         return Ok(());
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    wait_for_listener(process, "esplora", addr, deadline)
+}
+
+/// The TLS surfaces a test asked for, as `(flag, bind address)`. Only
+/// literal `ip:port` values are recognised: that is what every test passes,
+/// and a hostname here would mean guessing which address satd resolved.
+fn requested_tls_binds(extra_args: &[&str]) -> Vec<(&'static str, std::net::SocketAddr)> {
+    const FLAGS: [&str; 3] = ["rpctlsbind", "rpcreadonlytlsbind", "esploratlsbind"];
+    let mut binds = Vec::new();
+    for arg in extra_args {
+        for flag in FLAGS {
+            let prefix = format!("--{flag}=");
+            if let Some(value) = arg.strip_prefix(prefix.as_str())
+                && let Ok(addr) = value.parse::<std::net::SocketAddr>()
+            {
+                binds.push((flag, addr));
+            }
+        }
+    }
+    binds
+}
+
+/// Same contract as [`wait_for_requested_esplora`], for the TLS surfaces.
+///
+/// `rpc::server::start` serves the plain listeners *before* it loads the
+/// certificate and binds the TLS one, so the readiness probe above (a plain
+/// RPC round trip) can succeed while the TLS port is still closed. A test
+/// that then dials the TLS port sees a bare `Connection refused`; on a
+/// loaded CI runner the window between the two binds is wide enough for
+/// that to land on a different TLS test each run. Waiting here fixes every
+/// TLS test at once instead of each growing its own poll loop.
+fn wait_for_requested_tls(
+    process: &mut Child,
+    extra_args: &[&str],
+    deadline: Instant,
+) -> Result<(), String> {
+    for (flag, addr) in requested_tls_binds(extra_args) {
+        wait_for_listener(process, flag, addr, deadline)?;
+    }
+    Ok(())
+}
+
+/// Block until `addr` accepts a TCP connection, the node exits, or the
+/// deadline passes. A plain connect is the probe because it is exactly what
+/// "the listener is bound" means, and it needs no protocol — it works the
+/// same for HTTP, TLS and mTLS listeners.
+fn wait_for_listener(
+    process: &mut Child,
+    what: &str,
+    addr: std::net::SocketAddr,
+    deadline: Instant,
+) -> Result<(), String> {
     loop {
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
             return Ok(());
         }
         if let Ok(Some(status)) = process.try_wait() {
             return Err(format!(
-                "satd exited with {status} before binding the esplora listener on port {port}"
+                "satd exited with {status} before binding the {what} listener on {addr}"
             ));
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "esplora listener on port {port} never accepted a connection"
-            ));
+            return Err(format!("{what} listener on {addr} never accepted a connection"));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn requested_tls_binds_recognises_the_three_tls_flags_and_nothing_else() {
+    let args = [
+        "--rpctlsbind=127.0.0.1:18443",
+        "--rpcreadonlytlsbind=127.0.0.1:18444",
+        "--esploratlsbind=127.0.0.1:18445",
+        "--rpcbind=127.0.0.1:18446",
+        "--rpctlscert=/nope/cert.pem",
+        "--rpctlsbind=not-an-address",
+    ];
+    let binds = requested_tls_binds(&args);
+    let got: Vec<(&str, u16)> = binds.iter().map(|(f, a)| (*f, a.port())).collect();
+    assert_eq!(
+        got,
+        vec![("rpctlsbind", 18443), ("rpcreadonlytlsbind", 18444), ("esploratlsbind", 18445)]
+    );
 }
 
 pub struct TestNode {
@@ -479,7 +547,9 @@ impl TestNode {
         // with (empty for the userpass path, which doesn't use a cookie).
         let cookie = captured_cookie;
 
-        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline) {
+        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline)
+            .and_then(|()| wait_for_requested_tls(&mut process, extra_args, deadline))
+        {
             // Same contract as the two failure paths above: kill and reap the
             // process, then remove the datadir, since no `TestNode` (and so no
             // `Drop`) will exist to do it.
@@ -595,7 +665,9 @@ impl TestNode {
         // orphans a satd that goes on holding the RPC port, the P2P port and
         // the datadir lock for the rest of the test binary's run — which then
         // fails whichever later tests draw those ports.
-        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline) {
+        if let Err(reason) = wait_for_requested_esplora(&mut process, extra_args, deadline)
+            .and_then(|()| wait_for_requested_tls(&mut process, extra_args, deadline))
+        {
             let _ = process.kill();
             let _ = process.wait();
             panic!("{reason}{}", read_stderr_tail(&stderr_log));
