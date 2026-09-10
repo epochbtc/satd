@@ -337,7 +337,7 @@ pub struct PeerManager {
     /// connects; persisted across restarts.
     addrman: RwLock<crate::net::addrman::AddrMan>,
     /// Channel to send received blocks to the processing thread.
-    block_tx: mpsc::UnboundedSender<bitcoin::Block>,
+    block_tx: mpsc::UnboundedSender<(Option<Arc<PeerStats>>, bitcoin::Block)>,
     /// Pending compact blocks awaiting missing transactions.
     pending_compact: RwLock<HashMap<bitcoin::BlockHash, compact::PendingCompact>>,
     /// Per-address reconnect backoff state.
@@ -443,6 +443,10 @@ pub struct PeerManager {
     /// peer onto its own circuit (Bitcoin Core's `-proxyrandomize`, default
     /// on). Set once at startup; only meaningful when a proxy is configured.
     proxy_randomize: std::sync::atomic::AtomicBool,
+    /// `-dns`: whether name lookups are permitted at all. Default on.
+    /// Read by `resolve_peer_target`, which is the only path that resolves
+    /// an operator-supplied peer target.
+    dns_enabled: std::sync::atomic::AtomicBool,
     /// Configured outbound .onion and hostname-based peer addresses for auto-reconnect.
     connect_peer_addrs: RwLock<Vec<PeerAddr>>,
     /// Max blocks downloaded ahead of connect cursor during IBD.
@@ -598,6 +602,7 @@ impl PeerManager {
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
+            dns_enabled: std::sync::atomic::AtomicBool::new(true),
             manual_addrs: RwLock::new(HashSet::new()),
             manual_onion_hosts: RwLock::new(HashSet::new()),
             pending_typed_dials: RwLock::new(Vec::new()),
@@ -869,6 +874,33 @@ impl PeerManager {
     /// `getnetworkinfo`'s `proxy_randomize_credentials`.
     pub fn proxy_randomize(&self) -> bool {
         self.proxy_randomize.load(Ordering::Relaxed)
+    }
+
+    /// `-dns`. Set once at startup (`-dns` is restart-required); the
+    /// atomic keeps `PeerManager`'s constructor signature untouched.
+    pub fn set_dns_enabled(&self, on: bool) {
+        self.dns_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether `-dns` permits name lookups.
+    pub fn dns_enabled(&self) -> bool {
+        self.dns_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Resolve an operator-supplied peer target under this node's `-proxy`
+    /// and `-dns` settings. See [`crate::net::dns::resolve_peer_target`].
+    pub async fn resolve_peer_target(
+        &self,
+        s: &str,
+        default_port: u16,
+    ) -> Result<PeerAddr, String> {
+        crate::net::dns::resolve_peer_target(
+            s,
+            default_port,
+            self.proxy.as_deref(),
+            self.dns_enabled(),
+        )
+        .await
     }
 
     /// The SOCKS proxy used for clearnet (ipv4/ipv6) outbound, if any.
@@ -1231,14 +1263,24 @@ impl PeerManager {
     /// an already-established peer. Returns `true` if the address was found
     /// and removed, `false` if it was not in the set.
     pub fn remove_peer_addr(&self, addr: &PeerAddr) -> bool {
+        // `add_peer_addr` registers the address in `manual_addrs` /
+        // `manual_onion_hosts` as well as the reconnect list, and this only
+        // ever cleared the reconnect list. A removed `addnode` peer therefore
+        // stayed "manual" for the life of the process: it kept being dialled
+        // as a manual connection, and `is_manual_target` kept exempting it
+        // from `-connect` gating — so `addnode <peer> remove` on a
+        // `-connect`-pinned node left the peer connectable when the whole
+        // point of that flag is that it is not.
         match addr {
             PeerAddr::Socket(sa) => {
+                self.manual_addrs.write().remove(sa);
                 let mut addrs = self.connect_addrs.write();
                 let before = addrs.len();
                 addrs.retain(|a| a != sa);
                 addrs.len() < before
             }
-            PeerAddr::Onion { .. } => {
+            PeerAddr::Onion { host, .. } => {
+                self.manual_onion_hosts.write().remove(host);
                 let mut addrs = self.connect_peer_addrs.write();
                 let before = addrs.len();
                 addrs.retain(|a| a != addr);
@@ -1336,12 +1378,16 @@ impl PeerManager {
         conn_type: ConnType,
         pending: &[ConnType],
     ) -> Result<(), String> {
+        // `None` = no *individual* limit. Core leaves addr-fetch and feeler
+        // uncapped per type deliberately, because `semOutbound` below holds
+        // them; they must still take that grant, so they cannot return early
+        // here.
         let max = match conn_type {
             ConnType::OutboundFullRelay => {
-                self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND)
+                Some(self.max_connections.load(Ordering::Relaxed).min(MAX_OUTBOUND))
             }
-            ConnType::BlockRelay => MAX_OUTBOUND_BLOCK_RELAY,
-            ConnType::AddrFetch | ConnType::Feeler => return Ok(()),
+            ConnType::BlockRelay => Some(MAX_OUTBOUND_BLOCK_RELAY),
+            ConnType::AddrFetch | ConnType::Feeler => None,
             // Core returns false rather than opening one of these.
             ConnType::Inbound | ConnType::Manual => {
                 return Err(format!(
@@ -1357,17 +1403,54 @@ impl PeerManager {
         // slot: three concurrent `addconnection` calls at a limit of two
         // produced three peers. Core is protected by the `semOutbound`
         // counting semaphore, whose grant is taken before the dial.
-        let existing = self
-            .peers
-            .read()
+        let peers = self.peers.read();
+        if let Some(max) = max {
+            let existing = peers
+                .values()
+                .filter(|h| h.info.conn_type == conn_type)
+                .count()
+                + pending.iter().filter(|t| **t == conn_type).count();
+            if existing >= max {
+                return Err(
+                    "Error: Already at capacity for specified connection type.".to_string()
+                );
+            }
+        }
+
+        // Core takes a *second* grant after the per-type check: `semOutbound`
+        // is a counting semaphore sized `min(m_max_automatic_outbound,
+        // m_max_automatic_connections)`, and `AddConnection` fails when it
+        // cannot be acquired (`net.cpp`). Without it the per-type limits are
+        // the only bound, and the types that have none — addr-fetch and
+        // feeler, which Core deliberately leaves uncapped *individually*
+        // because the semaphore holds them — are unbounded: a caller could
+        // open addr-fetch connections until the process ran out of sockets.
+        let total_outbound = peers
             .values()
-            .filter(|h| h.info.conn_type == conn_type)
+            .filter(|h| h.info.conn_type != ConnType::Inbound)
+            // Core exempts MANUAL: `-addnode` peers have their own semaphore
+            // (`semAddnode`) and do not consume an automatic slot.
+            .filter(|h| h.info.conn_type != ConnType::Manual)
             .count()
-            + pending.iter().filter(|t| **t == conn_type).count();
-        if existing >= max {
+            + pending.len();
+        if total_outbound >= Self::max_automatic_outbound(&self.max_connections) {
             return Err("Error: Already at capacity for specified connection type.".to_string());
         }
         Ok(())
+    }
+
+    /// Core's `m_max_automatic_outbound`, capped by the connection budget:
+    /// `min(full_relay + block_relay + feeler, max_connections)` (`net.h`).
+    ///
+    /// The IBD figure is deliberately *not* used here. It raises the
+    /// full-relay target while the node catches up; the semaphore Core sizes
+    /// this way is about how many automatic outbound sockets may exist at
+    /// once, which does not change with sync state.
+    fn max_automatic_outbound(max_connections: &std::sync::atomic::AtomicUsize) -> usize {
+        // One feeler slot, as Core's `m_max_feeler`.
+        const MAX_FEELER: usize = 1;
+        (MAX_OUTBOUND + MAX_OUTBOUND_BLOCK_RELAY + MAX_FEELER)
+            .min(max_connections.load(Ordering::Relaxed))
     }
 
     /// Check outbound connection limit.
@@ -1891,11 +1974,12 @@ impl PeerManager {
 
     /// Get connection count.
     pub fn connection_count(&self) -> usize {
-        let peers = self.peers.read();
-        peers
-            .values()
-            .filter(|h| h.info.state == PeerState::Connected)
-            .count()
+        // Core walks one set for both `getconnectioncount` and
+        // `getpeerinfo` (`m_nodes`), so the count and the list agree.
+        // Filtering on `Connected` here while `get_peer_info` lists every
+        // state made them disagree for as long as a handshake was in
+        // flight — which is exactly when a caller polling both notices.
+        self.peers.read().len()
     }
 
     /// Number of connected peers using the BIP 324 v2 encrypted transport.
@@ -2730,15 +2814,12 @@ impl PeerManager {
                 self.handle_headers(id, headers);
             }
             NetworkMessage::Block(block) => {
-                if let Some(h) = self.peers.read().get(&id) {
-                    h.stats.record_block();
-                }
+                // `last_block` is stamped where the block is *accepted*, not
+                // here — see `block_processor` and `handle_block_ibd`.
                 self.handle_block(id, block);
             }
             NetworkMessage::Tx(tx) => {
-                if let Some(h) = self.peers.read().get(&id) {
-                    h.stats.record_transaction();
-                }
+                // `last_transaction` likewise: only a mempool accept counts.
                 self.handle_tx(id, tx);
             }
             NetworkMessage::GetHeaders(msg) => {
@@ -2785,7 +2866,9 @@ impl PeerManager {
                 // Address relay is off in *both* directions on a
                 // block-relay-only link (Core's `SetupAddressRelay`), so
                 // nothing this peer announces enters the address book.
-                let relay_addrs = self.conn_type_of(id).relays_addrs();
+                // Otherwise this is the message that latches the link's
+                // addr relay on, inbound included.
+                let relay_addrs = self.setup_address_relay(id);
                 for (_, addr) in &addrs {
                     if relay_addrs
                         && let Ok(sock_addr) = addr.socket_addr()
@@ -2804,7 +2887,7 @@ impl PeerManager {
                 // Not on a block-relay-only link: Core's `SetupAddressRelay`
                 // refuses one outright, because answering is what lets an
                 // adversary infer the link from its addr traffic.
-                if !self.conn_type_of(id).relays_addrs() {
+                if !self.setup_address_relay(id) {
                     tracing::debug!(id, "ignoring getaddr on a block-relay-only connection");
                     return;
                 }
@@ -2928,8 +3011,8 @@ impl PeerManager {
                 // configured; without one there's no point recording them.
                 let onion_routing = self.proxy.is_some() || self.onion_proxy.is_some();
                 // As above: a block-relay-only link relays no addresses in
-                // either direction.
-                let relay_addrs = self.conn_type_of(id).relays_addrs();
+                // either direction, and anything else latches on.
+                let relay_addrs = self.setup_address_relay(id);
                 for addr_msg in addrs.iter().filter(|_| relay_addrs) {
                     match &addr_msg.addr {
                         // BIP 155 TorV3: `socket_addr()` can't represent these,
@@ -3549,6 +3632,13 @@ impl PeerManager {
         true
     }
 
+    /// The per-peer counters for `id`, if the peer is still connected.
+    /// Used to carry a peer's stats along a channel that outlives the
+    /// message dispatch, so the "last block" stamp lands on acceptance.
+    fn peer_stats(&self, id: PeerId) -> Option<Arc<PeerStats>> {
+        self.peers.read().get(&id).map(|h| h.stats.clone())
+    }
+
     fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
         if self.reject_if_mutated(id, &block) {
             return;
@@ -3600,7 +3690,7 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send(block);
+        let _ = self.block_tx.send((self.peer_stats(id), block));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -3650,6 +3740,10 @@ impl PeerManager {
         let hash = block.block_hash();
         match self.chain_state.store_block(&block) {
             Ok((_, height)) => {
+                // Stored — Core's `new_block`. See `block_processor`.
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_block();
+                }
                 let needs_more = {
                     let mut ibd = self.ibd.write();
                     if let Some(scheduler) = ibd.as_mut() {
@@ -3707,7 +3801,12 @@ impl PeerManager {
     fn store_bg_block(&self, id: PeerId, block: bitcoin::Block) {
         let hash = block.block_hash();
         match self.chain_state.store_block(&block) {
-            Ok((_, height)) => self.note_bg_block_stored(height),
+            Ok((_, height)) => {
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_block();
+                }
+                self.note_bg_block_stored(height);
+            }
             Err(crate::chain::state::ChainError::Duplicate) => {
                 if let Some(entry) = self.chain_state.get_block_index(&hash) {
                     self.note_bg_block_stored(entry.height);
@@ -4130,7 +4229,7 @@ impl PeerManager {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn block_processor(
-        mut rx: mpsc::UnboundedReceiver<bitcoin::Block>,
+        mut rx: mpsc::UnboundedReceiver<(Option<Arc<PeerStats>>, bitcoin::Block)>,
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
         fee_estimator: Arc<FeeEstimator>,
@@ -4215,12 +4314,23 @@ impl PeerManager {
             drop(ready);
 
             // Drain all available blocks from the channel
-            while let Ok(block) = rx.try_recv() {
+            while let Ok((sender_stats, block)) = rx.try_recv() {
                 let hash = block.block_hash();
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
                 match chain_state.accept_block(&block) {
                     Ok(acceptance) => {
+                        // Core sets `m_last_block_time` in `ProcessBlock`
+                        // only when `ProcessNewBlock` reports `new_block` —
+                        // i.e. the block was actually stored. `Ok` here is
+                        // that same condition (a block we already had is
+                        // `ChainError::Duplicate`). Stamping it on *receipt*
+                        // instead, as this used to, let a peer refresh its
+                        // own eviction protection for free by re-sending a
+                        // block the node already had.
+                        if let Some(stats) = &sender_stats {
+                            stats.record_block();
+                        }
                         chain_state.bump_connect_heartbeat();
                         // A successful steady-state connect disproves "the
                         // connector cannot make progress" no matter which
@@ -5167,6 +5277,13 @@ impl PeerManager {
             false,
         ) {
             Ok(_) => {
+                // Core stamps `m_last_tx_time` only on a VALID mempool
+                // accept. Stamping it on receipt let a peer keep its
+                // eviction protection alive with a stream of transactions
+                // the node rejects.
+                if let Some(h) = self.peers.read().get(&id) {
+                    h.stats.record_transaction();
+                }
                 self.broadcast_inv(id, txid);
                 // A new parent just entered the mempool — walk orphans
                 // that were waiting on it and try to admit them.
@@ -5853,6 +5970,29 @@ impl PeerManager {
         );
     }
 
+    /// Height of the fork point between a peer's locator and our active
+    /// chain — Core's `CChain::FindForkInGlobalIndex`.
+    ///
+    /// Two things this gets right that a bare block-index lookup does not:
+    ///
+    /// * A locator entry we know about but that sits on a *stale fork* is
+    ///   not a fork point. Accepting it made us start the reply at
+    ///   `stale_height + 1` on the active chain, which serves headers/invs
+    ///   the peer cannot connect to anything it holds.
+    /// * When nothing matches, the fork point is the genesis block, so the
+    ///   reply starts at height 1. Starting at 0 re-announces genesis, which
+    ///   no peer will ever accept as new.
+    fn locator_fork_height(&self, locator: &[bitcoin::BlockHash]) -> u32 {
+        for hash in locator {
+            if let Some(entry) = self.chain_state.get_block_index(hash)
+                && self.chain_state.get_block_hash_by_height(entry.height) == Some(*hash)
+            {
+                return entry.height;
+            }
+        }
+        0
+    }
+
     fn handle_getheaders(
         &self,
         id: PeerId,
@@ -5867,15 +6007,7 @@ impl PeerManager {
             return;
         }
 
-        let mut start_height = None;
-        for hash in &msg.locator_hashes {
-            if let Some(entry) = self.chain_state.get_block_index(hash) {
-                start_height = Some(entry.height + 1);
-                break;
-            }
-        }
-
-        let start = start_height.unwrap_or(0);
+        let start = self.locator_fork_height(&msg.locator_hashes) + 1;
         let tip = self.chain_state.tip_height();
         let end = std::cmp::min(start + 2000, tip + 1);
 
@@ -5884,6 +6016,13 @@ impl PeerManager {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h)
                 && let Some(entry) = self.chain_state.get_block_index(&hash) {
                     headers.push(entry.header);
+                    // Core's `nLimit`/`hashStop` loop pushes the header and
+                    // *then* breaks on the stop hash, so the stop block is
+                    // included. Ignoring `hashStop` entirely — as this did —
+                    // answers a narrow range request with up to 2000 headers.
+                    if hash == msg.stop_hash {
+                        break;
+                    }
                 }
         }
 
@@ -5908,25 +6047,22 @@ impl PeerManager {
             return;
         }
 
-        let mut start_height = None;
-        for hash in &msg.locator_hashes {
-            if let Some(entry) = self.chain_state.get_block_index(hash) {
-                start_height = Some(entry.height + 1);
-                break;
-            }
-        }
-
-        let start = start_height.unwrap_or(0);
+        let start = self.locator_fork_height(&msg.locator_hashes) + 1;
         let tip = self.chain_state.tip_height();
         let end = std::cmp::min(start + 500, tip + 1);
 
         let mut inv = Vec::new();
         for h in start..end {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h) {
-                inv.push(Inventory::Block(hash));
+                // Core breaks on the stop hash *before* pushing it
+                // (`net_processing.cpp`, "getblocks stopping at"), because
+                // the requester already has that block — it named it as the
+                // point to stop at. Pushing it first invs the peer a block
+                // it asked us not to send.
                 if hash == msg.stop_hash {
                     break;
                 }
+                inv.push(Inventory::Block(hash));
             }
         }
 
@@ -6020,7 +6156,7 @@ impl PeerManager {
                     return;
                 }
                 tracing::debug!(%block_hash, "Compact block fully reconstructed from mempool");
-                let _ = self.block_tx.send(block);
+                let _ = self.block_tx.send((self.peer_stats(id), block));
             }
             Err(pending) => {
                 if pending.missing_indices.is_empty() {
@@ -6078,7 +6214,7 @@ impl PeerManager {
                     return;
                 }
                 tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
-                let _ = self.block_tx.send(block);
+                let _ = self.block_tx.send((self.peer_stats(id), block));
             } else {
                 tracing::debug!(%block_hash, "Failed to complete compact block");
             }
@@ -6306,15 +6442,21 @@ impl PeerManager {
     /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
     /// configured), bounded by Core's `-timeout`.
     ///
-    /// Loopback addresses (127.0.0.0/8, `::1`) always connect directly,
-    /// bypassing any configured proxy. Bitcoin Core does the same: the
-    /// proxy is for reaching the public internet (especially via Tor),
-    /// and routing localhost connections through it is both unnecessary
-    /// and breaks regtest/functional-test topologies where the proxy is a
-    /// placeholder that never accepts connections.
+    /// An address Core calls unroutable — loopback, RFC 1918 private space,
+    /// link-local and the rest of `IsRoutable`'s list — connects directly,
+    /// bypassing any configured proxy. Core's `ConnectNode` reaches the proxy
+    /// through `GetProxy(addr.GetNetwork(), proxy)`, and an unroutable
+    /// address has no proxy configured for its network.
+    ///
+    /// satd bypassed for *loopback only*, so a `-proxy` node dialling a peer
+    /// on 192.168.x.x or 10.x.x.x sent the dial through the proxy — which for
+    /// a private address is at best pointless and at worst a leak of the
+    /// local topology to whatever is on the other end of it. It also breaks
+    /// the functional tests, whose nodes talk over a private range with a
+    /// placeholder proxy that never accepts.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
         let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
-        let use_proxy = self.proxy.is_some() && !addr.ip().is_loopback();
+        let use_proxy = self.proxy.is_some() && crate::net::is_routable(addr.ip());
         if let Some(ref proxy_addr) = self.proxy {
             if use_proxy {
                 // Per-dial random SOCKS credentials isolate this peer on its own Tor
@@ -6331,7 +6473,7 @@ impl PeerManager {
                     })?
                     .map_err(|e| e.to_string());
             }
-            let _ = proxy_addr; // suppress unused warning on the loopback path
+            let _ = proxy_addr; // suppress unused warning on the direct path
         }
         tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
             .await
@@ -6564,6 +6706,14 @@ impl PeerManager {
         writer.send(NetworkMessage::FeeFilter(self.mempool.min_fee_rate() as i64))
             .await
             .map_err(|e| format!("send feefilter: {}", e))?;
+
+        // Core enables address relay on an outbound link as the handshake
+        // completes — that is when it sends its one-shot `getaddr` — and
+        // skips block-relay-only peers. Inbound links latch lazily instead,
+        // in the addr handlers.
+        if direction == Direction::Outbound {
+            self.setup_address_relay(id);
+        }
 
         // Proactively request addresses from outbound peers when running over a
         // proxy. Onion peers are discovered only through gossip (the hardcoded
@@ -6999,6 +7149,26 @@ impl PeerManager {
     /// The connection type of a registered peer, defaulting to full-relay for
     /// a peer that has already gone away (nothing downstream of this reads it
     /// for a peer that no longer exists).
+    /// Core's `SetupAddressRelay`: latch address relay on for this link and
+    /// report whether it is on at all.
+    ///
+    /// A block-relay-only connection never participates, in either
+    /// direction — answering or accepting addr traffic on one is exactly
+    /// what would let an observer infer the link. For every other peer the
+    /// flag latches on the first addr-related message, which is what
+    /// `getpeerinfo.addr_relay_enabled` reports.
+    fn setup_address_relay(&self, id: PeerId) -> bool {
+        let mut peers = self.peers.write();
+        let Some(handle) = peers.get_mut(&id) else {
+            return false;
+        };
+        if !handle.info.conn_type.relays_addrs() {
+            return false;
+        }
+        handle.info.addr_relay_enabled = true;
+        true
+    }
+
     fn conn_type_of(&self, id: PeerId) -> ConnType {
         self.peers
             .read()
@@ -7778,6 +7948,179 @@ mod tests {
             Ok(NetworkMessage::Tx(tx)) => assert_eq!(tx.compute_txid(), template_q),
             other => panic!("on-template tx must be served via getdata, got {other:?}"),
         }
+    }
+
+    /// Mine `n` blocks onto the manager's chain and return their hashes in
+    /// height order (index 0 = height 1). `tag` goes in the coinbase output
+    /// so a re-mine at the same height produces a *different* block.
+    fn mine_onto(pm: &Arc<PeerManager>, n: usize, tag: u8) -> Vec<bitcoin::BlockHash> {
+        use bitcoin::ScriptBuf;
+        let mempool = Mempool::new(1_000_000, 0);
+        let mut hashes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let block = crate::mining::miner::build_block_to_script(
+                &pm.chain_state,
+                &mempool,
+                ScriptBuf::new_op_return([tag]),
+                None,
+            )
+            .expect("mine regtest block");
+            pm.chain_state.accept_block(&block).expect("accept block");
+            hashes.push(block.block_hash());
+        }
+        hashes
+    }
+
+    fn sent_invs(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<bitcoin::BlockHash> {
+        match rx.try_recv() {
+            Ok(NetworkMessage::Inv(inv)) => inv
+                .into_iter()
+                .map(|i| match i {
+                    Inventory::Block(h) => h,
+                    other => panic!("expected a block inv, got {other:?}"),
+                })
+                .collect(),
+            Ok(other) => panic!("expected an inv, got {other:?}"),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Three separate `getblocks` defects, all in the same loop.
+    ///
+    /// * An unmatched locator fell back to `unwrap_or(0)` and so announced
+    ///   the *genesis* block, which no peer will ever accept as new. Core's
+    ///   `FindForkInGlobalIndex` returns genesis as the fork *point* and then
+    ///   takes `Next()`, i.e. height 1.
+    /// * `hashStop` was pushed and *then* broken on, so the peer was invd the
+    ///   one block it explicitly said it already had.
+    /// * A locator entry sitting on a stale fork was accepted as a fork point,
+    ///   so the reply started at `stale_height + 1` on the *active* chain —
+    ///   blocks the peer cannot connect to anything it holds.
+    #[tokio::test]
+    async fn getblocks_answers_from_cores_fork_point() {
+        use bitcoin::BlockHash;
+        use bitcoin::hashes::Hash;
+        use bitcoin::p2p::message_blockdata::GetBlocksMessage;
+
+        let pm = empty_peer_manager();
+        let chain = mine_onto(&pm, 5, 0);
+        let genesis = pm.chain_state.get_block_hash_by_height(0).unwrap();
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        let no_stop = BlockHash::all_zeros();
+
+        // 1. Nothing in the locator matches: start at height 1, not genesis.
+        pm.handle_getblocks(
+            1,
+            GetBlocksMessage::new(vec![BlockHash::from_byte_array([9u8; 32])], no_stop),
+        );
+        let invd = sent_invs(&mut rx1);
+        assert_eq!(invd, chain, "an unmatched locator starts at height 1");
+        assert!(!invd.contains(&genesis), "genesis is never announced");
+
+        // 2. `hashStop` is the block at height 3: the peer gets 1 and 2 and
+        //    not the stop block itself.
+        pm.handle_getblocks(1, GetBlocksMessage::new(vec![genesis], chain[2]));
+        assert_eq!(sent_invs(&mut rx1), chain[..2], "stop hash is not announced");
+
+        // 3. A locator entry on a stale fork is not a fork point. Roll the
+        //    chain back and re-mine so `stale` is a known block that is no
+        //    longer on the active chain.
+        pm.chain_state.invalidate_block(chain[2]).expect("invalidate");
+        assert_eq!(pm.chain_state.tip_height(), 2);
+        let stale = chain[2];
+        pm.chain_state.reconsider_block(stale).expect("reconsider");
+        // `reconsider` puts the original chain back; take a block from the
+        // *other* side by invalidating the tip and mining a replacement.
+        pm.chain_state.invalidate_block(chain[4]).expect("invalidate tip");
+        let forked = mine_onto(&pm, 1, 1);
+        assert_eq!(pm.chain_state.tip_height(), 5);
+        assert_ne!(forked[0], chain[4], "the new height-5 block is a different one");
+        assert!(
+            pm.chain_state.get_block_index(&chain[4]).is_some(),
+            "the displaced block is still in the index"
+        );
+        let _ = rx1.try_recv();
+        // A locator naming only the displaced block must not be honoured as
+        // "you are at height 5"; Core falls back to genesis.
+        pm.handle_getblocks(1, GetBlocksMessage::new(vec![chain[4]], no_stop));
+        let invd = sent_invs(&mut rx1);
+        assert_eq!(
+            invd.first(),
+            Some(&chain[0]),
+            "a stale-fork locator entry falls back to genesis, so the reply starts at height 1"
+        );
+        assert_eq!(invd.len(), 5, "heights 1..=5 of the active chain: {invd:?}");
+    }
+
+    /// `getheaders` shared the genesis and stale-fork bugs, and ignored
+    /// `hashStop` altogether — answering a request for one header with up to
+    /// 2000. Core pushes the stop header and *then* breaks, so the stop block
+    /// is included.
+    #[tokio::test]
+    async fn getheaders_honours_the_stop_hash() {
+        use bitcoin::BlockHash;
+        use bitcoin::hashes::Hash;
+        use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+
+        let pm = empty_peer_manager();
+        let chain = mine_onto(&pm, 5, 0);
+        let genesis = pm.chain_state.get_block_hash_by_height(0).unwrap();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        let headers_for = |rx: &mut mpsc::Receiver<NetworkMessage>| match rx.try_recv() {
+            Ok(NetworkMessage::Headers(hs)) => {
+                hs.into_iter().map(|h| h.block_hash()).collect::<Vec<_>>()
+            }
+            other => panic!("expected headers, got {other:?}"),
+        };
+
+        pm.handle_getheaders(1, GetHeadersMessage::new(vec![genesis], chain[1]));
+        assert_eq!(
+            headers_for(&mut rx1),
+            chain[..2],
+            "the stop header is the last one sent"
+        );
+
+        // An unmatched locator starts at height 1, never at genesis.
+        pm.handle_getheaders(
+            1,
+            GetHeadersMessage::new(
+                vec![BlockHash::from_byte_array([9u8; 32])],
+                BlockHash::all_zeros(),
+            ),
+        );
+        assert_eq!(headers_for(&mut rx1), chain);
+    }
+
+    /// `addnode <peer> remove` cleared the reconnect list but left the
+    /// address in `manual_addrs`, so the peer stayed "manual" for the life of
+    /// the process: still dialled as a manual connection, and still exempt
+    /// from `-connect` gating — which is precisely what that flag is for.
+    #[test]
+    fn removing_an_added_node_drops_its_manual_status() {
+        let pm = empty_peer_manager();
+        let sa: SocketAddr = "10.0.0.7:18444".parse().unwrap();
+        assert!(pm.addnode_add("10.0.0.7:18444", PeerAddr::Socket(sa)));
+        assert!(pm.manual_addrs.read().contains(&sa), "added nodes are manual");
+
+        assert!(pm.addnode_remove(&PeerAddr::Socket(sa)));
+        assert!(
+            !pm.manual_addrs.read().contains(&sa),
+            "a removed added-node is no longer manual"
+        );
+
+        // Same for an onion entry, which is tracked in its own set.
+        let host = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
+        let onion = PeerAddr::Onion { host: host.to_string(), port: 8333 };
+        assert!(pm.addnode_add(&format!("{host}:8333"), onion.clone()));
+        assert!(pm.manual_onion_hosts.read().contains(host));
+        assert!(pm.addnode_remove(&onion));
+        assert!(!pm.manual_onion_hosts.read().contains(host));
     }
 
     /// Core disconnects a peer that sends an oversized locator; it does not

@@ -26,8 +26,12 @@ impl PeerAddr {
     }
 
     /// Parse an address string, using `default_port` when the input has no port.
-    /// Matches Core's `LookupHost` which resolves shorthand IPs and appends the
-    /// network's default port when none is specified.
+    ///
+    /// Pure: `.onion` targets and IP literals only. Anything needing a name
+    /// lookup belongs to [`crate::net::dns::resolve_peer_target`], which is
+    /// async and honours `-proxy` and `-dns`; this used to call the
+    /// **blocking** `ToSocketAddrs` from inside async handlers, and did it
+    /// with the local resolver even under `-proxy`.
     pub fn parse_with_default_port(s: &str, default_port: u16) -> Result<Self, String> {
         // Check if it's a .onion address
         if let Some((host, port_str)) = s.rsplit_once(':') {
@@ -48,28 +52,19 @@ impl PeerAddr {
         if let Ok(sa) = s.parse::<SocketAddr>() {
             return Ok(PeerAddr::Socket(sa));
         }
-        // Fallback: DNS / host resolution (matches Core's `LookupHost`).
-        // Handles shorthand notations like "127.1:8333" which the strict
-        // parse rejects but getaddrinfo resolves to 127.0.0.1:8333.
-        use std::net::ToSocketAddrs;
-        if let Some(sa) = s.to_socket_addrs().ok().and_then(|mut it| it.next()) {
-            return Ok(PeerAddr::Socket(sa));
-        }
         // A bare IP literal takes the default port. Checked before the
-        // colon test below, because every IPv6 literal contains colons: with
-        // only that test, `-connect=2001:db8::1` fell through to "could not
+        // bracket form below, because every IPv6 literal contains colons: with
+        // only a colon test, `-connect=2001:db8::1` fell through to "could not
         // resolve" while `-connect=1.2.3.4` worked. Core's `Lookup(…,
         // default_port)` accepts both.
         if let Ok(ip) = s.parse::<std::net::IpAddr>() {
             return Ok(PeerAddr::Socket(SocketAddr::new(ip, default_port)));
         }
-        // A hostname with no port. The colon test keeps `host:notaport` from
-        // being retried as `host:notaport:<default>`.
-        if !s.contains(':') {
-            let with_port = format!("{}:{}", s, default_port);
-            if let Some(sa) = with_port.to_socket_addrs().ok().and_then(|mut it| it.next()) {
-                return Ok(PeerAddr::Socket(sa));
-            }
+        // `[2001:db8::1]` — bracketed, portless.
+        if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']'))
+            && let Ok(ip) = inner.parse::<std::net::Ipv6Addr>()
+        {
+            return Ok(PeerAddr::Socket(SocketAddr::new(ip.into(), default_port)));
         }
         Err(format!("invalid address '{}': could not resolve", s))
     }
@@ -227,6 +222,15 @@ pub struct PeerInfo {
     pub prefers_headers: bool,
     /// Peer signaled BIP 155 addrv2 support via SendAddrV2.
     pub wants_addrv2: bool,
+    /// Whether address relay is set up on this link — Core's
+    /// `Peer::m_addr_relay_enabled`, latched by `SetupAddressRelay`.
+    ///
+    /// A block-relay-only link never enables it, in either direction. An
+    /// outbound link enables it once the handshake completes (that is when
+    /// Core sends its one-shot `getaddr`); an *inbound* link enables it
+    /// lazily, on the first addr-related message the peer sends, so a peer
+    /// that never participates in addr relay is never counted as doing so.
+    pub addr_relay_enabled: bool,
     /// Peer's minimum fee rate for tx relay (BIP 133 feefilter), in sat/kvB.
     pub fee_filter: u64,
     pub conn_time: SystemTime,
@@ -248,10 +252,6 @@ pub struct PeerInfo {
     /// How this connection came about. Drives `getpeerinfo`'s
     /// `connection_type`, the `fRelay` flag we send, and address relay.
     pub conn_type: ConnType,
-    /// Whether this peer relays transactions. Set from the version message's
-    /// `relay` flag; defaults to true (matching Core's assumption for peers
-    /// that predate BIP 37's optional relay field).
-    pub relay_txes: bool,
 }
 
 /// Render a per-message-type byte tally as `getpeerinfo` reports it.
@@ -285,6 +285,7 @@ impl PeerInfo {
             compact_blocks: false,
             prefers_headers: false,
             wants_addrv2: false,
+            addr_relay_enabled: false,
             fee_filter: 0,
             conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),
             permissions: crate::net::permissions::NetPermissions::NONE,
@@ -294,7 +295,6 @@ impl PeerInfo {
                 Direction::Inbound => ConnType::Inbound,
                 Direction::Outbound => ConnType::OutboundFullRelay,
             },
-            relay_txes: false,
         }
     }
 
@@ -303,7 +303,9 @@ impl PeerInfo {
         self.services = version.services;
         self.best_height = version.start_height;
         self.user_agent = version.user_agent.clone();
-        self.relay_txes = version.relay;
+        // The peer's own `fRelay` is kept on the stored `version` message;
+        // `relays_txs()` is the answer to "do *we* relay to them", which
+        // depends on the connection type rather than on what they asked for.
         self.version = Some(version);
     }
 
@@ -371,49 +373,40 @@ impl PeerInfo {
         let network = if let Some(ref onion) = self.onion_host {
             let _ = onion; // suppress unused
             "onion"
+        } else if !crate::net::is_routable(self.addr.ip()) {
+            "not_publicly_routable"
         } else {
-            match self.addr.ip() {
-                std::net::IpAddr::V4(ip) => {
-                    if ip.is_loopback() || ip.is_unspecified() {
-                        "not_publicly_routable"
-                    } else {
-                        "ipv4"
-                    }
-                }
-                std::net::IpAddr::V6(ip) => {
-                    if ip.is_loopback() || ip.is_unspecified() {
-                        "not_publicly_routable"
-                    } else {
-                        "ipv6"
-                    }
-                }
+            // An IPv4-mapped IPv6 address is the IPv4 peer it carries, as
+            // Core's `CNetAddr` unwraps it.
+            match self.addr.ip().to_canonical() {
+                std::net::IpAddr::V4(_) => "ipv4",
+                std::net::IpAddr::V6(_) => "ipv6",
             }
         };
 
         // Build the services-name list matching Core's format.
         let svc_u64 = self.services.to_u64();
+        // Core's `serviceFlagsToStr` (`protocol.cpp`) walks bits 0..64 in
+        // order and emits each set bit's name, falling back to
+        // `UNKNOWN[2^i]`. satd listed every known flag first and then every
+        // unknown one, so a peer advertising bits 0, 1 and 2 came back as
+        // `[NETWORK, BLOOM, UNKNOWN[2^1]]` where Core says
+        // `[NETWORK, UNKNOWN[2^1], BLOOM]` — and `rpc_net.py` compares the
+        // list.
         let mut svc_names: Vec<String> = Vec::new();
-        // Known service flags (matching Core's getservicesnames).
-        const KNOWN_FLAGS: &[(u64, &str)] = &[
-            (1 << 0, "NETWORK"),
-            (1 << 2, "BLOOM"),
-            (1 << 3, "WITNESS"),
-            (1 << 6, "COMPACT_FILTERS"),
-            (1 << 10, "NETWORK_LIMITED"),
-            (1 << 11, "P2P_V2"),
-        ];
-        for &(bit, name) in KNOWN_FLAGS {
-            if svc_u64 & bit != 0 {
-                svc_names.push(name.to_string());
+        for bit in 0..64u32 {
+            if svc_u64 & (1u64 << bit) == 0 {
+                continue;
             }
-        }
-        // Unknown bits: report as UNKNOWN[2^N]
-        let known_mask: u64 = KNOWN_FLAGS.iter().map(|(b, _)| b).fold(0, |a, b| a | b);
-        let unknown = svc_u64 & !known_mask;
-        for bit in 0..64 {
-            if unknown & (1u64 << bit) != 0 {
-                svc_names.push(format!("UNKNOWN[2^{bit}]"));
-            }
+            svc_names.push(match bit {
+                0 => "NETWORK".to_string(),
+                2 => "BLOOM".to_string(),
+                3 => "WITNESS".to_string(),
+                6 => "COMPACT_FILTERS".to_string(),
+                10 => "NETWORK_LIMITED".to_string(),
+                11 => "P2P_V2".to_string(),
+                other => format!("UNKNOWN[2^{other}]"),
+            });
         }
 
         let connection_type = self.conn_type.as_str();
@@ -453,9 +446,12 @@ impl PeerInfo {
             "addr_processed": 0,
             "addr_rate_limited": 0,
             // Core withholds address relay from block-relay-only peers --
-            // that is the whole point of the connection type.
-            "addr_relay_enabled": self.direction == Direction::Outbound
-                && self.conn_type.relays_addrs(),
+            // that is the whole point of the connection type. For everyone
+            // else this is latched by `SetupAddressRelay`, not derived from
+            // the direction: an inbound peer that has exchanged addr traffic
+            // does relay addresses, and reporting it as `false` misdescribes
+            // every inbound link on the node.
+            "addr_relay_enabled": self.addr_relay_enabled,
             "bip152_hb_from": false,
             "bip152_hb_to": false,
             "inv_to_send": 0,
@@ -618,6 +614,107 @@ mod rpc_json_tests {
         // The unconditional keys are still there.
         assert!(v["bytessent_per_msg"].is_object());
         assert!(v["bytesrecv_per_msg"].is_object());
+    }
+
+    /// `network` is Core's `GetNetworkName(stats.m_network)`, and
+    /// `CNetAddr::GetNetwork()` folds *every* unroutable address into
+    /// `NET_UNROUTABLE` before the ipv4/ipv6 split. Classifying by address
+    /// family alone reported a peer on a private LAN or a link-local
+    /// address as `ipv4`/`ipv6`, which `feature_proxy.py` asserts against
+    /// directly.
+    #[test]
+    fn unroutable_peers_are_not_reported_as_ipv4_or_ipv6() {
+        let json_for = |addr: &str| {
+            let info = PeerInfo::new(1, addr.parse().unwrap(), Direction::Outbound);
+            info.to_rpc_json(&PeerStats::new(NetTotals::new()))["network"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Routable.
+        assert_eq!(json_for("8.8.8.8:8333"), "ipv4");
+        assert_eq!(json_for("[2606:4700::1]:8333"), "ipv6");
+        // An IPv4-mapped IPv6 address — what a dual-stack `[::]` listener
+        // reports for an IPv4 peer — is that IPv4 peer, as Core's `CNetAddr`
+        // unwraps it: routable when it is, and `ipv4` rather than `ipv6`.
+        assert_eq!(json_for("[::ffff:8.8.8.8]:8333"), "ipv4");
+        // RFC1918 / RFC6598 / loopback / 0.0.0.0/8 / link-local / RFC5737 doc
+        // range, and RFC1918 behind the IPv4-mapped prefix.
+        for addr in [
+            "10.0.0.1:8333",
+            "172.16.0.1:8333",
+            "192.168.1.1:8333",
+            "100.64.0.1:8333",
+            "127.0.0.1:8333",
+            "0.0.0.1:8333",
+            "169.254.1.1:8333",
+            "192.0.2.1:8333",
+            "[::ffff:10.0.0.1]:8333",
+            "[::ffff:127.0.0.1]:8333",
+        ] {
+            assert_eq!(json_for(addr), "not_publicly_routable", "{addr}");
+        }
+        // ULA / IPv6 link-local / IPv6 loopback / RFC4843 ORCHID / RFC3849
+        // documentation (which Core's `IsValid` refuses outright).
+        for addr in [
+            "[fc00::1]:8333",
+            "[fe80::1]:8333",
+            "[::1]:8333",
+            "[2001:10::1]:8333",
+            "[2001:db8::1]:8333",
+        ] {
+            assert_eq!(json_for(addr), "not_publicly_routable", "{addr}");
+        }
+    }
+
+    /// `rpc_net.py` compares `servicesnames` element by element against the
+    /// bits it set, so the list has to come out in bit order with exactly
+    /// the named bits Core knows.
+    #[test]
+    fn servicesnames_is_emitted_in_bit_order() {
+        let mut info = PeerInfo::new(1, "203.0.113.9:8333".parse().unwrap(), Direction::Outbound);
+        // NETWORK (bit 0) | WITNESS (bit 3) | NETWORK_LIMITED (bit 10),
+        // plus an unnamed high bit that must not appear.
+        info.services = ServiceFlags::from(
+            (1 << 0) | (1 << 3) | (1 << 10) | (1u64 << 40),
+        );
+        let v = info.to_rpc_json(&PeerStats::new(NetTotals::new()));
+        let names: Vec<&str> = v["servicesnames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        // Core's `serviceFlagToStr` falls through to `UNKNOWN[2^<bit>]`
+        // rather than dropping a bit it has no name for, so the list is a
+        // faithful rendering of the flags word.
+        assert_eq!(
+            names,
+            ["NETWORK", "WITNESS", "NETWORK_LIMITED", "UNKNOWN[2^40]"],
+            "{v}"
+        );
+    }
+
+    /// Core latches `addr_relay_enabled` in `SetupAddressRelay`; it is not a
+    /// function of the direction. Deriving it from `Direction::Outbound`
+    /// reported every inbound peer as `false` even while it was actively
+    /// exchanging addr messages with us.
+    #[test]
+    fn addr_relay_enabled_reports_the_latch_not_the_direction() {
+        let mut inbound = PeerInfo::new(1, "203.0.113.9:8333".parse().unwrap(), Direction::Inbound);
+        inbound.conn_type = ConnType::Inbound;
+        let stats = PeerStats::new(NetTotals::new());
+        assert_eq!(
+            inbound.to_rpc_json(&stats)["addr_relay_enabled"],
+            false,
+            "no addr traffic yet"
+        );
+        inbound.addr_relay_enabled = true;
+        assert_eq!(
+            inbound.to_rpc_json(&stats)["addr_relay_enabled"],
+            true,
+            "an inbound peer that has exchanged addrs does relay them"
+        );
     }
 
     /// Core emits only non-zero entries.

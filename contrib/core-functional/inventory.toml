@@ -256,8 +256,8 @@ note = "measured: expects the node to exit with 'Witness data for blocks after h
 [[test]]
 file = "feature_proxy.py"
 status = "skip"
-reason = "needs-triage"
-note = "observed: AssertionError: Predicate 'find_conn(from_connection, to_connection_subver, inbound=False) is not None' not true after 60 seconds -- an outbound peer dialed through -proxy never appears in getpeerinfo"
+reason = "feature-missing"
+note = "re-measured 2026-09-09: the earlier proxy-dial failure is gone; the test now cannot start at all -- setup_nodes passes -i2psam, which satd refuses by name (I2P is out of scope; Tor is satd's anonymity network). The test also exercises -cjdnsreachable and unix-socket proxies."
 
 [[test]]
 file = "feature_pruning.py"
@@ -978,7 +978,7 @@ status = "run"
 file = "rpc_net.py"
 status = "skip"
 reason = "feature-missing"
-note = "test starts nodes with -proxy; satd's SOCKS5 proxy support fails to connect through it"
+note = "re-measured 2026-09-09: the proxy blocker is gone (the nodes connect and getpeerinfo is reached). It now fails on `assert \"(ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)\" in help(\"getpeerinfo\")` -- satd's `help <command>` returns the method name, not Core's per-method help text."
 
 [[test]]
 file = "rpc_orphans.py"

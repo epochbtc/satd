@@ -218,6 +218,81 @@ pub async fn resolve_seeds(network: Network, proxy: Option<&str>) -> Vec<PeerAdd
 ///   for remote resolution; use a `.onion` or literal IP there instead).
 ///
 /// Entries that fail to resolve are logged and dropped — never fatal.
+/// Resolve an `-addnode` / `-connect` / `addnode`-RPC target into something
+/// dialable, honouring `-proxy` and `-dns`.
+///
+/// This is the single entry point for operator-supplied peer targets.
+/// `PeerAddr::parse_with_default_port` stays the pure parser; everything
+/// that can touch the network goes through here, because the parser was
+/// doing three things it must not:
+///
+/// * it resolved hostnames with the **blocking** `std::net::ToSocketAddrs`,
+///   from inside async handlers — a slow or unreachable resolver parked a
+///   tokio worker for the whole DNS timeout;
+/// * it resolved them with the **local** resolver even under `-proxy`,
+///   which leaks to the network operator exactly the peer names a proxied
+///   node exists to hide (the same leak `resolve_operator_seeds` already
+///   refuses for `-seednode`);
+/// * it ignored `-dns=0` entirely, so a node told not to do name lookups
+///   did them anyway.
+///
+/// `.onion` targets and literal IPs never reach a resolver and so are
+/// accepted in every mode.
+pub async fn resolve_peer_target(
+    s: &str,
+    default_port: u16,
+    proxy: Option<&str>,
+    dns: bool,
+) -> Result<PeerAddr, String> {
+    // `.onion` and literal-IP forms: no lookup, no leak, always allowed.
+    // (`parse_with_default_port` handles these without touching the
+    // resolver; `looks_like_a_name` decides which forms those are.)
+    if !looks_like_a_name(s) {
+        return PeerAddr::parse_with_default_port(s, default_port);
+    }
+    let (host, port) = split_seed_host_port(s, default_port);
+    if !dns {
+        return Err(format!(
+            "cannot resolve '{host}': DNS lookups are disabled (-dns=0);              use a literal IP address or a .onion address"
+        ));
+    }
+    if proxy.is_some() {
+        return Err(format!(
+            "refusing to resolve '{host}' locally under -proxy (it would leak              the lookup to your resolver); use a literal IP address or a              .onion address"
+        ));
+    }
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(mut it) => it
+            .next()
+            .map(PeerAddr::Socket)
+            .ok_or_else(|| format!("invalid address '{s}': could not resolve")),
+        Err(e) => Err(format!("invalid address '{s}': could not resolve: {e}")),
+    }
+}
+
+/// Whether `s` needs a name lookup to become a socket address — i.e. it is
+/// neither a `.onion` target nor an IP literal (with or without a port).
+fn looks_like_a_name(s: &str) -> bool {
+    if s.ends_with(".onion") {
+        return false;
+    }
+    if let Some((host, _)) = s.rsplit_once(':')
+        && host.ends_with(".onion")
+    {
+        return false;
+    }
+    if s.parse::<SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    // `[2001:db8::1]:8333` parses as a SocketAddr above; a bracketed literal
+    // without a port does not, so check it explicitly rather than sending it
+    // to a resolver.
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return inner.parse::<std::net::Ipv6Addr>().is_err();
+    }
+    true
+}
+
 pub async fn resolve_operator_seeds(
     seeds: &[String],
     network: Network,
@@ -619,6 +694,99 @@ mod tests {
                 assert_eq!(*port, 38333);
             }
             _ => panic!("expected first seed to be an Onion variant"),
+        }
+    }
+
+    /// `-dns=0` means "do not do name lookups". It was parsed and then only
+    /// consulted for DNS *seeding*, so `-addnode=example.com` resolved
+    /// anyway — the one thing the flag exists to prevent.
+    #[tokio::test]
+    async fn dns_disabled_refuses_a_hostname_but_not_a_literal() {
+        let err = resolve_peer_target("example.invalid:8333", 8333, None, false)
+            .await
+            .expect_err("a hostname needs a lookup");
+        assert!(err.contains("-dns=0"), "{err}");
+
+        // Literals and onion targets never touch a resolver, so they are
+        // still accepted.
+        assert_eq!(
+            resolve_peer_target("1.2.3.4", 8333, None, false).await.unwrap(),
+            PeerAddr::Socket("1.2.3.4:8333".parse().unwrap())
+        );
+        assert_eq!(
+            resolve_peer_target("[2001:db8::1]:1234", 8333, None, false).await.unwrap(),
+            PeerAddr::Socket("[2001:db8::1]:1234".parse().unwrap())
+        );
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion:8333";
+        assert!(matches!(
+            resolve_peer_target(onion, 8333, None, false).await.unwrap(),
+            PeerAddr::Onion { .. }
+        ));
+    }
+
+    /// Resolving a peer hostname with the *local* resolver while `-proxy` is
+    /// set hands the operator's network exactly the peer names the proxy
+    /// exists to hide. `resolve_operator_seeds` already refuses this for
+    /// `-seednode`; the addnode/connect path did it anyway.
+    #[tokio::test]
+    async fn a_hostname_is_not_resolved_locally_under_a_proxy() {
+        let err = resolve_peer_target("example.invalid:8333", 8333, Some("127.0.0.1:9050"), true)
+            .await
+            .expect_err("a proxied node must not leak the lookup");
+        assert!(err.contains("-proxy"), "{err}");
+
+        // A .onion target under the same proxy is the supported form and is
+        // handed on untouched, for the proxy itself to resolve.
+        let onion = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion:8333";
+        assert!(matches!(
+            resolve_peer_target(onion, 8333, Some("127.0.0.1:9050"), true).await.unwrap(),
+            PeerAddr::Onion { .. }
+        ));
+        // As is a literal IP.
+        assert_eq!(
+            resolve_peer_target("1.2.3.4:1234", 8333, Some("127.0.0.1:9050"), true).await.unwrap(),
+            PeerAddr::Socket("1.2.3.4:1234".parse().unwrap())
+        );
+    }
+
+    /// A name still resolves when nothing forbids it — and `localhost` is
+    /// the one name guaranteed present on any machine running the suite.
+    #[tokio::test]
+    async fn a_hostname_still_resolves_with_no_proxy_and_dns_on() {
+        let addr = resolve_peer_target("localhost:18444", 8333, None, true)
+            .await
+            .expect("localhost resolves");
+        match addr {
+            PeerAddr::Socket(sa) => {
+                assert!(sa.ip().is_loopback(), "{sa}");
+                assert_eq!(sa.port(), 18444);
+            }
+            other => panic!("expected a socket, got {other}"),
+        }
+        // No port given: the network default is applied.
+        let addr = resolve_peer_target("localhost", 18444, None, true).await.unwrap();
+        assert_eq!(addr.port(), 18444);
+    }
+
+    /// The classifier decides which inputs may reach a resolver at all, so
+    /// every literal form has to be recognised as *not* a name — otherwise a
+    /// `-proxy` node would refuse to dial a bare IP.
+    #[test]
+    fn only_real_names_are_classified_as_needing_a_lookup() {
+        for literal in [
+            "1.2.3.4",
+            "1.2.3.4:8333",
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "[2001:db8::1]:8333",
+            "::1",
+            "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion",
+            "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion:8333",
+        ] {
+            assert!(!looks_like_a_name(literal), "{literal} is a literal");
+        }
+        for name in ["example.com", "example.com:8333", "localhost", "127.1:8333"] {
+            assert!(looks_like_a_name(name), "{name} needs a lookup");
         }
     }
 }

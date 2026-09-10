@@ -194,7 +194,7 @@ startup error.
 | `maxconnections` | 125 | hot | core | Maximum total connections. `0` (or any value ≤ 0) soft-sets `listen=0`, as in Core — see `listen`. That half is a startup decision: changing `maxconnections` over SIGHUP applies the new cap but does not start or stop the listener. |
 | `maxinboundperip` | 3 | hot | satd | Max simultaneous inbound peers from one source IP (Core-style flood guard; no Core flag). |
 | `maxuploadtarget` | 0 (unlimited) | hot | core | Soft cap (bytes/24h) on historical block upload. |
-| `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. |
+| `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. With `dns=0` those options accept only literal IP addresses and `.onion` targets; a hostname is refused. |
 | `dnsseed` | true | restart | core | Query DNS seeds for peer addresses (requires `dns`). |
 | `forcednsseed` | false | restart | core | Always query DNS seeds even with a populated address book. |
 | `fixedseeds` | true | restart | core | Allow the compiled-in fixed-seed fallback. |
@@ -220,7 +220,7 @@ startup error.
 
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
-| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections. |
+| `proxy` | none | restart | core | SOCKS5 proxy for all outbound connections. A **hostname** in `-addnode`/`-seednode`/`-connect` is refused while this is set, rather than resolved by the local resolver — that lookup would leak the peer names the proxy is there to hide. Use a literal IP or a `.onion` address. |
 | `proxyrandomize` | on | restart | core | Use fresh random SOCKS5 credentials per connection so Tor isolates each peer on its own circuit (`IsolateSOCKSAuth`). Relies on Tor's default SocksPort isolation; a no-op on a non-Tor SOCKS proxy (or one with `IsolateSOCKSAuth` disabled), where credentials are not negotiated. Set `=0` to opt out. |
 | `onion` | = `-proxy` | restart | core | SOCKS5 proxy for `.onion` connections. |
 | `torcontrol` | `127.0.0.1:9051` | restart | core | Tor control port for the hidden service. Auth is negotiated via `PROTOCOLINFO`: SAFECOOKIE (stock-Tor default) when no password is set, else password, else null. |
