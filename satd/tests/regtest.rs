@@ -1391,13 +1391,17 @@ fn the_http_status_carries_the_jsonrpc_error_class() {
     assert_eq!(status, 200, "a 2.0 unknown method stays 200: {body}");
     assert!(body.contains("-32601"), "the code is still reported: {body}");
 
-    // A well-formed call to a real method is still 200, error or not.
+    // A well-formed 2.0 call to a real method is 200, error or not.
     let (status, body) =
         node.rpc_post_raw_status(r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[99999999]}"#);
     assert_eq!(status, 200, "an application error keeps 200: {body}");
+    // …but the same error on the legacy path is 500: `JSONErrorReply` starts
+    // from `HTTP_INTERNAL_SERVER_ERROR` and overrides only -32600 and
+    // -32601. `interface_rpc.py` asserts exactly this call.
     let (status, body) =
         node.rpc_post_raw_status(r#"{"id":1,"method":"getblockhash","params":[99999999]}"#);
-    assert_eq!(status, 200, "…on the legacy path too: {body}");
+    assert_eq!(status, 500, "a legacy application error is 500: {body}");
+    assert!(body.contains("-8"), "the code is still reported: {body}");
 
     node.stop();
 }

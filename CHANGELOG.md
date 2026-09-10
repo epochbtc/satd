@@ -83,11 +83,13 @@ item below is (or will be) written up in full in the in-development
   omitted entirely when the request carried none — as Core's optional `id`
   does. satd omitted every null id, losing the difference (#664).
 - **Breaking:** the HTTP status of a *legacy* (non-2.0) request carries the
-  JSON-RPC error class as Core's does: a parse error is 500, an invalid
-  request 400, an unknown method 404. A JSON-RPC 2.0 request keeps 200 and
-  carries the error in the body, as Core does (#664).
-- `-rpcservertimeout` bounds the whole connection, not just the header read,
-  and reaches the TLS listener, which had no timeout at all (#664).
+  JSON-RPC error class as Core's does: an invalid request is 400, an unknown
+  method 404, and any other error — a parse error, `-8`, `-5` — 500. A
+  JSON-RPC 2.0 request keeps 200 and carries the error in the body, as Core
+  does (#664).
+- `-rpcservertimeout` bounds idle keep-alive connections and HTTP/2 as well
+  as the header read, and reaches the TLS listener, which had no timeout at
+  all (#664).
 - A JSON-RPC response too large to normalise is forwarded rather than
   DOM-parsed, which cost several times its size in peak memory (#664).
 - **Breaking:** `verifytxoutproof` requires the block to be on the active

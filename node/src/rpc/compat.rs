@@ -738,9 +738,9 @@ where
             };
 
             // Core's HTTP status follows the JSON-RPC error code
-            // (`httprpc.cpp`): a parse error is 500, an invalid request 400,
-            // and an unknown method 404. jsonrpsee answers 200 for all three,
-            // so a client that switches on the status — Core's own
+            // (`httprpc.cpp`): an invalid request is 400, an unknown method
+            // 404, and every other error 500. jsonrpsee answers 200 to all
+            // of them, so a client that switches on the status — Core's own
             // `interface_rpc.py` does — could not tell them apart.
             //
             // But only for a **legacy** (1.0/1.1) request. Core catches
@@ -752,7 +752,15 @@ where
             // raises `-342 non-200 HTTP status code` for a 2.0 reply with a
             // non-200 status *before* it looks at the error object, so the
             // real error code never reaches the caller.
-            if let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0) {
+            //
+            // The mapping parses the reply, so it stops at the same cap the
+            // normalisation below does: a reply that large is a result, not
+            // an error object, and parsing it here would be the DOM parse the
+            // cap exists to avoid.
+            let oversized = resp_bytes.len() > MAX_NORMALIZE_BODY;
+            if !oversized
+                && let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0)
+            {
                 head.status = status;
             }
 
@@ -760,7 +768,7 @@ where
             // asked for 2.0 gets jsonrpsee's 2.0 reply untouched.
             let out_body = if client_spoke_2_0 {
                 resp_bytes.to_vec()
-            } else if resp_bytes.len() > MAX_NORMALIZE_BODY {
+            } else if oversized {
                 // Normalisation DOM-parses the body to touch three top-level
                 // keys, which costs several times its size again. A reply
                 // over the cap — a verbosity-2 `getblock` of a full block is
@@ -833,12 +841,15 @@ fn core_http_status(body: &[u8], client_spoke_2_0: bool) -> Option<hyper::Status
     // A batch keeps 200 whatever its members say; Core only maps the status
     // for a single request.
     let code = value.get("error")?.get("code")?.as_i64()?;
-    match code {
-        -32700 => Some(hyper::StatusCode::INTERNAL_SERVER_ERROR),
-        -32600 => Some(hyper::StatusCode::BAD_REQUEST),
-        -32601 => Some(hyper::StatusCode::NOT_FOUND),
-        _ => None,
-    }
+    // `JSONErrorReply` starts from 500 and overrides exactly two codes. Every
+    // other error a legacy request provokes — `-8`, `-5`, `-32602`, all of
+    // them — is a 500, and `interface_rpc.py` asserts that for `getblockhash`
+    // with a bad height.
+    Some(match code {
+        -32600 => hyper::StatusCode::BAD_REQUEST,
+        -32601 => hyper::StatusCode::NOT_FOUND,
+        _ => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding
@@ -1178,14 +1189,22 @@ mod tests {
     }
 
     /// Core's HTTP status follows the JSON-RPC error code
-    /// (`httprpc.cpp`): a parse error is 500, an invalid request 400, an
-    /// unknown method 404. jsonrpsee answers 200 to all three.
+    /// (`httprpc.cpp`, `JSONErrorReply`): an invalid request is 400, an
+    /// unknown method 404, and everything else — a parse error, `-8`, `-5`,
+    /// `-32602` — is 500, the value the function starts from. jsonrpsee
+    /// answers 200 to all of them. The first shape of this mapped only the
+    /// three codes the parse path produces and left an application error at
+    /// 200, which `interface_rpc.py` catches on `getblockhash`.
     #[test]
     fn the_http_status_follows_cores_mapping() {
         for (code, want) in [
             (-32700, hyper::StatusCode::INTERNAL_SERVER_ERROR),
             (-32600, hyper::StatusCode::BAD_REQUEST),
             (-32601, hyper::StatusCode::NOT_FOUND),
+            (-32602, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-8, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-5, hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            (-1, hyper::StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let body = format!(r#"{{"error":{{"code":{code},"message":"x"}},"id":1}}"#);
             assert_eq!(
@@ -1204,11 +1223,9 @@ mod tests {
                 "code {code} on a 2.0 request must stay 200"
             );
         }
-        // An application error keeps 200, as Core does.
-        let body = br#"{"error":{"code":-8,"message":"x"},"id":1}"#;
-        assert_eq!(core_http_status(body, false), None);
-        // …and so does a success, and a batch.
+        // A success keeps 200, and so does a batch.
         assert_eq!(core_http_status(br#"{"result":1,"id":1}"#, false), None);
+        assert_eq!(core_http_status(br#"{"result":1,"error":null,"id":1}"#, false), None);
         assert_eq!(
             core_http_status(br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#, false),
             None
