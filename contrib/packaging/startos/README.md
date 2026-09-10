@@ -73,18 +73,41 @@ packs, so a type error or a failing test stops the build.
 The SDK ships the entire build as `s9pk.mk`; the `Makefile` here is one
 `include` line.
 
-## What is checked, and what is not
+## Status
 
-Checked locally: the package typechecks against `@start9labs/start-sdk`
-2.0.9, `test/networks.test.ts` verifies the network list and every P2P port
-against `contrib/stack/satd/satd-init` itself (so the two cannot drift), and
-`make` produces a `.s9pk` that `start-cli s9pk inspect` reads back.
+Installed and run on **StartOS 0.4.0.1** (x86_64), sideloaded with
+`start-cli package install -s`. What that proved:
 
-**Not checked: installing on a real StartOS server.** Nothing here has been
-run on one. Until it has, treat the interface bindings, the health checks and
-the `rpcallowip` bridge range as reasoned-but-unverified — in particular
-`bridgeSubnet`, which assumes StartOS's documented fixed `10.0.3.1` gateway on
-`lxcbr0`.
+- satd-init runs unmodified from the image and produces this install's CA,
+  certificate, MCP token, `authfile.toml` and `bitcoin.conf`, all owned by
+  `satd` with the right modes.
+- The node syncs, and both health checks report as documented — **Node**
+  "satd is ready", **Blockchain Sync** "Syncing blocks: …%".
+- Every exported interface answers through StartOS's reverse proxy with a
+  certificate chaining to the server's root CA: Esplora
+  `GET /api/blocks/tip/height` → 200, Electrum `server.version` →
+  `satd-electrs-compatible`, both verifying against that CA with
+  `Verify return code: 0 (ok)`. MCP is 401 without a token and returns a
+  full `initialize` result with the token the **MCP Token** action prints.
+- The **Network** action moves a running node between chains, re-rendering
+  the config and rebinding the P2P port each time.
+
+Three defects came out of it, none of them visible to a typecheck: the ready
+gate probed `/readyz` and so never went green during a sync; the **Network**
+action wrote the store without restarting the node; and the manifest pinned
+an image tag that predates `satd-init`, so the package as first written could
+not have started at all.
+
+`bridgeSubnet` is now checked rather than assumed — the `rpcallowip` range it
+feeds is what admits the OS proxy on the real bridge, and the RPC interface
+answers.
+
+Also checked, locally: the package typechecks against `@start9labs/start-sdk`
+2.0.9, and `test/networks.test.ts` verifies the network list and every P2P
+port against `contrib/stack/satd/satd-init` itself, so the two cannot drift.
+
+Still unverified: `aarch64` — only the x86_64 `.s9pk` has been installed —
+and backup/restore.
 
 ## Before publishing
 
