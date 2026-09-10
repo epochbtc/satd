@@ -141,7 +141,11 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
         "verificationprogress": if is_ibd { time as f64 / now as f64 } else { 1.0 },
         "initialblockdownload": is_ibd,
         "chainwork": format!("{:0>64}", chainwork),
-        "size_on_disk": 0,
+        // Core's is `blk*.dat` + `rev*.dat`; satd keeps undo data in
+        // RocksDB, so there is no `rev*` term (CORE_DIFFERENCES.md). A
+        // literal 0 told an operator sizing a disk that the chain occupied
+        // nothing.
+        "size_on_disk": chain_state.size_on_disk(),
         // Whether the node is actually pruning, not a constant `false`. satd
         // implements `-prune` in full, so the old value told the operator of
         // a pruned node that it held the whole chain -- and a client reading
@@ -156,9 +160,15 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
         },
     });
     // Core emits these only on a pruned node, so they follow the flag rather
-    // than always appearing. `pruneheight` is deliberately absent: satd keeps
-    // no prune floor to read, and deriving one would mean walking the chain
-    // on every call. Recorded in CORE_DIFFERENCES.md.
+    // than always appearing.
+    //
+    // `pruneheight` is emitted whenever prune mode is on, `0` until
+    // something has actually been deleted — `GetPruneHeight` is `nullopt`
+    // then and the RPC writes 0 (`rpc/blockchain.cpp`). `0` is accurate on
+    // such a node: everything from genesis *is* here.
+    if prune_target_mb.is_some() {
+        out["pruneheight"] = json!(chain_state.prune_height().unwrap_or(0));
+    }
     if let Some(mib) = prune_target_mb {
         // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes
         // `uint64_t(nPruneArg) * 1024 * 1024` and `getblockchaininfo` reports
@@ -412,13 +422,24 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
     // fields used to be a flat `0` while `getsysteminfo` reported real cache
     // figures off the same `ChainState`.
     //
-    // `coins_tip_cache_bytes` is deliberately absent rather than zero: satd's
-    // in-memory coin cache is bounded by entry count, not bytes, so there is
-    // no byte figure to report and inventing one would be the defect this
-    // change removes. Recorded in CORE_DIFFERENCES.md.
+    // `coins_tip_cache_bytes` is the *configured* budget, as Core's is —
+    // its field is the cache size, not current usage. satd's coin cache is
+    // bounded by entry count, and that count is derived from a byte budget,
+    // so the budget is the honest figure to report. Absent for a backend
+    // with no coin cache at all rather than reported as zero.
     let coins_db_cache_bytes = chain_state.store_ref().block_cache_capacity_bytes();
+    let coins_tip_cache_bytes = chain_state.store_ref().coins_tip_cache_bytes();
 
-    let mut chainstates = Vec::new();
+    let mut chainstates: Vec<Value> = Vec::new();
+    // Core pushes `coins_tip_cache_bytes` on every chainstate entry
+    // alongside `coins_db_cache_bytes`; a backend with no coin cache omits
+    // it rather than reporting zero.
+    let with_tip_cache = |mut v: Value| -> Value {
+        if let Some(b) = coins_tip_cache_bytes {
+            v["coins_tip_cache_bytes"] = json!(b);
+        }
+        v
+    };
 
     match chain_state.background() {
         // AssumeUTXO snapshot loaded: this chainstate serves the tip but
@@ -428,7 +449,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
             // `assumeutxo_rejected` (satd extension) is set when background
             // validation has proven this snapshot invalid — distinct from
             // the merely-not-yet-validated state.
-            chainstates.push(json!({
+            chainstates.push(with_tip_cache(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
                 "difficulty": difficulty,
@@ -437,7 +458,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 "snapshot_blockhash": bg.snapshot_hash().to_string(),
                 "validated": false,
                 "assumeutxo_rejected": bg.is_rejected(),
-            }));
+            })));
 
             let bg_height = bg.tip_height();
             let bg_difficulty = chain_state
@@ -449,25 +470,25 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
             } else {
                 1.0
             };
-            chainstates.push(json!({
+            chainstates.push(with_tip_cache(json!({
                 "blocks": bg_height,
                 "bestblockhash": bg.tip_hash().to_string(),
                 "difficulty": bg_difficulty,
                 "verificationprogress": bg_progress,
                 "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
-            }));
+            })));
         }
         // No snapshot: a single, fully validated chainstate.
         None => {
-            chainstates.push(json!({
+            chainstates.push(with_tip_cache(json!({
                 "blocks": tip_height,
                 "bestblockhash": tip_hash.to_string(),
                 "difficulty": difficulty,
                 "verificationprogress": verificationprogress,
                 "coins_db_cache_bytes": coins_db_cache_bytes,
                 "validated": true,
-            }));
+            })));
         }
     }
 

@@ -593,12 +593,15 @@ pub struct RpcContext {
     /// entry in the Core-compatible response.
     pub txindex_enabled: bool,
     /// Whether `-coinstatsindex` was explicitly enabled at runtime.
-    /// satd does not implement this index; the flag is accepted for
-    /// Core compat and reported as always-synced in `getindexinfo`.
+    /// satd does not implement this index; the flag is accepted so a Core
+    /// `bitcoin.conf` drops in unchanged, and `getindexinfo` reports it
+    /// **never synced** — telling a client following Core's poll-then-query
+    /// pattern that the data is ready would hand it answers satd computes for
+    /// the tip only. See `rpc::indexes`.
     pub coinstatsindex_enabled: bool,
     /// Whether `-txospenderindex` was explicitly enabled at runtime.
-    /// satd does not implement this index; the flag is accepted for
-    /// Core compat and reported as always-synced in `getindexinfo`.
+    /// `getindexinfo` reports its real completeness, read from the store's
+    /// `outpoint_spend_complete` marker — not a constant. See `rpc::indexes`.
     pub txospenderindex_enabled: bool,
     /// Runtime listener status — read by `getserverstatus`. Mutated by
     /// the satd binary after each optional listener (Esplora,
@@ -3606,7 +3609,17 @@ pub async fn start(
 
     module.register_method("getrpcinfo", |_params, _ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "active_commands": [],
+            // Core's `g_rpc_server_info.active_commands`, including this call
+            // — see `crate::rpc::active_commands`. A constant `[]` read as
+            // "nothing is running", which is the opposite of the answer an
+            // operator is asking for when the node is unresponsive.
+            "active_commands": crate::rpc::active_commands::as_json(),
+            // Deliberately empty, and not a plausible-looking path. satd has
+            // no `debug.log`: it logs to stdout and delegates rotation to
+            // journald or the container runtime, which is why
+            // `-debuglogfile` / `-shrinkdebugfile` / `-printtoconsole` are
+            // recognised-and-refused with that message. Naming a file that
+            // does not exist is the class of defect #702 is about.
             "logpath": "",
         }))
     })?;
@@ -4188,6 +4201,11 @@ async fn spawn_tls_surface(
                 // before anything downstream inspects them, so the filters and
                 // every handler see one shape.
                 .layer(NamedParamsLayer::new())
+                // Inside the rewrite but outside the filters: a request that
+                // is about to be *rejected* is not executing, so it has no
+                // business appearing in `getrpcinfo`; one that is dispatched
+                // is tracked for exactly as long as its handler runs.
+                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new())
                 .option_layer(rpc_filter)
                 .option_layer(capability_filter),
         )
@@ -4435,6 +4453,8 @@ pub async fn spawn_plain_surface(
                 // before anything downstream inspects them, so the filters and
                 // every handler see one shape.
                 .layer(NamedParamsLayer::new())
+                // See the TLS builder above for the placement.
+                .layer(crate::rpc::active_commands::ActiveCommandsLayer::new())
                 .option_layer(warmup)
                 .option_layer(rpc_filter)
                 .option_layer(capability_filter),

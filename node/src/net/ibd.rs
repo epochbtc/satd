@@ -545,6 +545,27 @@ impl IbdScheduler {
             .unwrap_or(0)
     }
 
+    /// Heights currently requested from `peer_id`, ascending — behind
+    /// `getpeerinfo`'s `inflight`.
+    ///
+    /// Scope, so a caller does not over-read it: this is the *IBD
+    /// scheduler's* assignment set. Bitcoin Core fills the field from
+    /// `mapBlocksInFlight`, which also covers the block requests a
+    /// steady-state node makes off an `inv`; satd does not track those per
+    /// peer, so once IBD is done this reports empty. That is still strictly
+    /// better than the hardcoded `[]` it replaces — during the sync, when the
+    /// field is the one that tells an operator which peer is stalling a
+    /// download, it is now real.
+    pub fn peer_inflight_heights(&self, peer_id: PeerId) -> Vec<u32> {
+        let mut heights = self
+            .peer_slots
+            .get(&peer_id)
+            .map(|s| s.assigned.clone())
+            .unwrap_or_default();
+        heights.sort_unstable();
+        heights
+    }
+
     /// Release a height that is in-flight to `owner_peer`. Returns
     /// `true` if the release happened. Returns `false` if the height
     /// is not in-flight or is held by a different peer (we don't want
@@ -785,6 +806,51 @@ mod tests {
         sorted.sort();
         // With 100 elements shuffled, it's astronomically unlikely to be sorted
         assert_ne!(heights, sorted, "Blocks should be shuffled, not sequential");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `getpeerinfo.inflight` was a hardcoded `[]`, which reads as "this peer
+    /// owes us nothing" — the opposite of the answer when the question is
+    /// which peer is stalling the download. The set is per peer, ascending,
+    /// and shrinks as blocks arrive.
+    #[test]
+    fn peer_inflight_heights_reports_what_that_peer_owes() {
+        let (cs, dir) = make_chain_state_with_headers(100);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+
+        assert!(
+            sched.peer_inflight_heights(1).is_empty(),
+            "a peer with no assignment owes nothing"
+        );
+
+        sched.assign_blocks(1);
+        sched.assign_blocks(2);
+        let one = sched.peer_inflight_heights(1);
+        let two = sched.peer_inflight_heights(2);
+        assert!(!one.is_empty(), "peer 1 was assigned work");
+        assert!(!two.is_empty(), "peer 2 was assigned work");
+        assert_eq!(one.len(), sched.peer_inflight_count(1));
+
+        // Ascending, and belonging to exactly one peer.
+        let mut sorted = one.clone();
+        sorted.sort_unstable();
+        assert_eq!(one, sorted, "heights come out in order");
+        for h in &one {
+            assert!(!two.contains(h), "height {h} is assigned to one peer only");
+        }
+
+        // Delivering a block removes just that height.
+        let delivered = one[0];
+        sched.block_received(1, delivered);
+        let after = sched.peer_inflight_heights(1);
+        assert!(
+            !after.contains(&delivered),
+            "a delivered height is no longer outstanding: {after:?}"
+        );
+        assert_eq!(after.len(), one.len() - 1);
+        // The other peer is untouched.
+        assert_eq!(sched.peer_inflight_heights(2), two);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -548,17 +548,22 @@ silently returning an empty or wrong answer.
   omitted, since clients index into it unconditionally. `mode="mallocinfo"` is
   refused with Core's message, as Core itself does off glibc.
 
-- **Fields satd still reports as a placeholder** — each is a value satd has no
-  source for, kept at Core's shape rather than derived, and each is a `0` or an
-  empty list rather than an invented figure:
-  `getblockchaininfo.size_on_disk` (satd tracks no running total of block-file
-  bytes; computing it would mean a directory walk per call),
-  `getblockchaininfo.pruneheight` (absent entirely — satd keeps no prune floor,
-  and deriving one means walking the chain), `getchainstates[].coins_tip_cache_bytes`
-  (absent — satd's coin cache is bounded by entry count, not bytes),
-  `getrpcinfo.active_commands` (needs a dispatcher hook satd does not have), and
-  `getpeerinfo.inflight` (the real per-peer set is the IBD scheduler's, surfaced
-  by `getibdprogress.peer_download_stats[].assigned`).
+- **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
+  `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so
+  its number is the block files alone and is smaller than Core's for the same
+  chain by roughly the undo volume.
+
+- **`getpeerinfo.inflight`** — Core fills this from `mapBlocksInFlight`, which
+  covers every outstanding block request. satd's is the IBD scheduler's
+  assignment set: real and useful during the sync, when the field answers
+  "which peer is stalling the download", but empty in steady state, where satd
+  does not track per-peer block requests made off an `inv`.
+
+- **`getrpcinfo.logpath`** — empty. satd has no `debug.log`: it logs to stdout
+  and delegates rotation to journald or the container runtime, which is why
+  `-debuglogfile`, `-shrinkdebugfile` and `-printtoconsole` are recognised and
+  refused with that explanation. Naming a file that does not exist would be
+  worse than the empty string.
 
 - **`analyzepsbt.estimated_vsize` / `.estimated_feerate`** — Core measures a
   *dummy-signed* transaction: `AnalyzePSBT` (`src/node/psbt.cpp`) signs every

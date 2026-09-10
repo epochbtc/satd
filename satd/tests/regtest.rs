@@ -3230,6 +3230,9 @@ fn test_blocksonly_and_prune_are_reported() {
         "{chain}"
     );
     assert_eq!(chain["automatic_pruning"], serde_json::json!(true), "{chain}");
+    // Emitted whenever prune mode is on, and `0` until something has been
+    // deleted — `GetPruneHeight` is `nullopt` then and Core writes 0.
+    assert_eq!(chain["pruneheight"], serde_json::json!(0), "{chain}");
     node.stop();
 }
 
@@ -14450,6 +14453,78 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
          optional argument a method declares (#687). Offending lines in \
          node/src/rpc/server.rs:\n{offenders:#?}"
     );
+}
+
+/// #702: four fields that were constants chosen to look plausible.
+///
+/// `size_on_disk: 0` told an operator sizing a disk that the chain occupied
+/// nothing; `active_commands: []` said nothing was running, which is the
+/// opposite of the answer when the node is unresponsive;
+/// `coins_tip_cache_bytes` was absent; `inflight: []` said the peer owed us
+/// nothing. A zero that looks like a measurement is worse than an absent
+/// field, because a client cannot tell it apart from a real reading.
+#[test]
+fn the_reported_placeholders_are_real_numbers_now() {
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
+
+    // Nothing mined yet: genesis alone is still bytes on disk.
+    let before = node.rpc_call("getblockchaininfo").unwrap()["result"]["size_on_disk"]
+        .as_u64()
+        .expect("size_on_disk must be a number");
+    assert!(before > 0, "genesis is stored: {before}");
+
+    node.rpc_call_with_params("generatetoaddress", vec![json!(5), json!(addr)])
+        .unwrap();
+    let after = node.rpc_call("getblockchaininfo").unwrap()["result"]["size_on_disk"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        after > before,
+        "five more blocks must grow it: {before} -> {after}"
+    );
+
+    // Not in prune mode, so Core omits `pruneheight` entirely (it is emitted
+    // under `IsPruneMode()` only).
+    let info = node.rpc_call("getblockchaininfo").unwrap();
+    assert!(
+        info["result"].get("pruneheight").is_none(),
+        "a node not in prune mode reports no prune floor: {info}"
+    );
+    assert_eq!(info["result"]["pruned"], json!(false), "{info}");
+
+    // `coins_tip_cache_bytes` is the configured budget, as Core's is.
+    let cs = node.rpc_call("getchainstates").unwrap();
+    let entry = &cs["result"]["chainstates"][0];
+    let tip_cache = entry["coins_tip_cache_bytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("coins_tip_cache_bytes must be a number: {cs}"));
+    assert!(tip_cache > 0, "{cs}");
+
+    // `getrpcinfo` sees itself running, as Core's does — that is exactly what
+    // `interface_rpc.py` asserts on an otherwise idle node.
+    let rpcinfo = node.rpc_call("getrpcinfo").unwrap();
+    let active = rpcinfo["result"]["active_commands"]
+        .as_array()
+        .expect("active_commands must be an array");
+    assert_eq!(active.len(), 1, "only this call is running: {rpcinfo}");
+    assert_eq!(active[0]["method"], "getrpcinfo", "{rpcinfo}");
+    assert!(
+        active[0]["duration"].as_u64().is_some(),
+        "duration in microseconds: {rpcinfo}"
+    );
+
+    // `logpath` stays empty on purpose: satd has no debug.log, and naming a
+    // file that does not exist is the defect this test is about.
+    assert_eq!(rpcinfo["result"]["logpath"], json!(""), "{rpcinfo}");
+
+    // `inflight` is an array, not a hardcoded literal in the JSON. With no
+    // IBD scheduler running there is nothing outstanding, which is the
+    // truthful answer here.
+    let peers = node.rpc_call("getpeerinfo").unwrap();
+    assert!(peers["result"].as_array().is_some(), "{peers}");
 }
 
 /// #666 / #692: `getdeploymentinfo` reported the buried deployments under the
