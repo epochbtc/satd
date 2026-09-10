@@ -556,10 +556,13 @@ silently returning an empty or wrong answer.
   other parent), which is Core's own `CheckConflictTopology` precondition. A
   replacement's own in-mempool ancestors are chunked with it by the same
   child/parent rule; the pre-cluster Core put the replacement in on its own.
-  For anything larger — a conflict inside a longer chain — satd
-  falls back to the older per-conflict feerate rule rather than refusing the
-  replacement, which would be *stricter* than Core. The fallback can therefore
-  accept a replacement Core's full linearization would decline.
+  An ancestor of the replacement unrelated to the conflicts stands on both
+  sides of the comparison when it has no in-mempool relatives of its own. For
+  anything larger — a conflict inside a longer chain, an ancestor with
+  relatives — satd falls back to the older per-conflict feerate rule rather
+  than refusing the replacement, which would be *stricter* than Core. The
+  fallback can therefore accept a replacement Core's full linearization would
+  decline.
 
 - **`getblockchaininfo.size_on_disk`** — Core's figure is `blk*.dat` plus
   `rev*.dat`. satd keeps undo data in RocksDB rather than in `rev*` files, so

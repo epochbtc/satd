@@ -3318,6 +3318,46 @@ impl Mempool {
         }
     }
 
+    /// Transitive in-mempool ancestor and descendant counts of `txid`, each
+    /// capped: a walk stops as soon as its count exceeds `cap`, so the answer
+    /// is exact up to `cap` and means "more than `cap`" beyond it. Core's
+    /// `CheckConflictTopology` only asks whether a cluster is bigger than
+    /// two, and this runs under the write lock, so counting further would be
+    /// work a peer can ask for.
+    fn relatives_capped(inner: &MempoolInner, txid: &Txid, cap: usize) -> (usize, usize) {
+        let mut ancestors: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = vec![*txid];
+        'up: while let Some(t) = queue.pop() {
+            let Some(e) = inner.entries.get(&t) else {
+                continue;
+            };
+            for input in &e.tx.input {
+                let p = input.previous_output.txid;
+                if inner.entries.contains_key(&p) && ancestors.insert(p) {
+                    if ancestors.len() > cap {
+                        break 'up;
+                    }
+                    queue.push(p);
+                }
+            }
+        }
+        let mut descendants: HashSet<Txid> = HashSet::new();
+        let mut queue: Vec<Txid> = vec![*txid];
+        let mut buf: Vec<Txid> = Vec::new();
+        'down: while let Some(t) = queue.pop() {
+            Self::collect_children(inner, &t, &mut buf);
+            for c in buf.drain(..) {
+                if inner.entries.contains_key(&c) && descendants.insert(c) {
+                    if descendants.len() > cap {
+                        break 'down;
+                    }
+                    queue.push(c);
+                }
+            }
+        }
+        (ancestors.len(), descendants.len())
+    }
+
     /// Every replace-by-fee rule, in Core's order — Rule 5 (cluster count),
     /// the opt-in signalling gate, the eviction set, the
     /// spends-a-conflict refusal, Rules 3 and 4 (`PaysForRBF`), and the
@@ -3528,53 +3568,79 @@ impl Mempool {
             let Some(entry) = inner.entries.get(c) else {
                 continue;
             };
-            let parents: Vec<Txid> = entry
-                .tx
-                .input
-                .iter()
-                .map(|i| i.previous_output.txid)
-                .filter(|p| inner.entries.contains_key(p))
-                .collect();
-            let mut children: Vec<Txid> = Vec::new();
-            Self::collect_children(inner, c, &mut children);
-            children.retain(|ch| inner.entries.contains_key(ch));
-            children.sort_unstable();
-            children.dedup();
-            if parents.len() > 1 || children.len() > 1 || (!parents.is_empty() && !children.is_empty())
-            {
+            // Core counts *transitive* relatives (`GetCountWithAncestors`,
+            // `GetCountWithDescendants`). Counting direct parents and
+            // children let a chain A → B → C through with A the conflict —
+            // A has one child, B one parent — and the two-point chunking
+            // below then described a cluster of three with a single pair,
+            // dropping A's own fee from the old diagram.
+            let (n_anc, n_desc) = Self::relatives_capped(inner, c, 1);
+            if n_anc > 1 || n_desc > 1 || (n_anc == 1 && n_desc == 1) {
                 simple_topology = false;
                 break;
             }
             // Core's second half of `CheckConflictTopology`: a conflict with
-            // a child must be that child's only in-mempool parent, and one
-            // with a parent must be that parent's only child — otherwise the
-            // cluster is bigger than two and the two-point chunking below
-            // does not describe it.
-            if let Some(child) = children.first()
-                && let Some(ce) = inner.entries.get(child)
-            {
-                let child_parents: HashSet<Txid> = ce
-                    .tx
-                    .input
-                    .iter()
-                    .map(|i| i.previous_output.txid)
-                    .filter(|p| inner.entries.contains_key(p))
-                    .collect();
-                if child_parents.len() > 1 {
+            // a child must be that child's only ancestor, and one with a
+            // parent must be that parent's only descendant — otherwise the
+            // cluster is bigger than two and the chunking below does not
+            // describe it.
+            if n_desc == 1 {
+                let mut children: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, c, &mut children);
+                if let Some(child) = children.first()
+                    && Self::relatives_capped(inner, child, 1).0 > 1
+                {
                     simple_topology = false;
                     break;
                 }
             }
-            if let Some(parent) = parents.first() {
-                let mut siblings: Vec<Txid> = Vec::new();
-                Self::collect_children(inner, parent, &mut siblings);
-                siblings.retain(|s| inner.entries.contains_key(s));
-                siblings.sort_unstable();
-                siblings.dedup();
-                if siblings.len() > 1 {
+            if n_anc == 1
+                && let Some(parent) = entry
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid)
+                    .find(|p| inner.entries.contains_key(p))
+                && Self::relatives_capped(inner, &parent, 1).1 > 1
+            {
+                simple_topology = false;
+                break;
+            }
+        }
+
+        // A surviving ancestor of the replacement that is not a parent of
+        // anything evicted already sits in the old mempool, and the new
+        // diagram counts it inside the replacement's chunk. It has to be on
+        // the old side too, or the two sides describe different regions:
+        // [P, R] was compared against [C] instead of [P, C], and P's
+        // existing fee made a lower-feerate replacement look like an
+        // improvement. Standing alone — no in-mempool relatives of its own —
+        // it is one chunk on the old side; with relatives it is a cluster
+        // this builder cannot chunk, and the fallback applies.
+        let mut standalone_ancestors: Vec<FeeFrac> = Vec::new();
+        if simple_topology {
+            for u in ancestors {
+                if all_evicted.contains(u) {
+                    continue;
+                }
+                let Some(ue) = inner.entries.get(u) else {
+                    continue;
+                };
+                let mut children: Vec<Txid> = Vec::new();
+                Self::collect_children(inner, u, &mut children);
+                if children.iter().any(|ch| all_evicted.contains(ch)) {
+                    // `old_diagram` already carries it as that transaction's
+                    // parent.
+                    continue;
+                }
+                if Self::relatives_capped(inner, u, 0) != (0, 0) {
                     simple_topology = false;
                     break;
                 }
+                standalone_ancestors.push(FeeFrac::new(
+                    modified_fee(ue.fee, ue.fee_delta) as i64,
+                    vsize_of(ue.weight as u64),
+                ));
             }
         }
 
@@ -3643,7 +3709,9 @@ impl Mempool {
                 })
             })
             .collect();
-        let old_chunks = crate::mempool::feefrac::old_diagram(&described);
+        let mut old_chunks = crate::mempool::feefrac::old_diagram(&described);
+        old_chunks.extend(standalone_ancestors);
+        sort_chunks(&mut old_chunks);
 
         // NEW = OLD - conflicts + the replacement's chunk. A surviving parent
         // of a direct conflict is left over and stands on its own — unless
@@ -6607,6 +6675,82 @@ mod tests {
             "a lower-feerate replacement must not improve the diagram: {verdict:?}"
         );
         assert!(in_pool(&mp, &conflict_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's `CheckConflictTopology` counts *transitive* relatives; the gate
+    /// counted direct ones. A → B → C with A the conflict passed — A has one
+    /// child, B one parent — and the old diagram then held C with B alone,
+    /// because a transaction with a descendant is folded into it. A's fee
+    /// vanished from the comparison, and a replacement worth a third of A
+    /// to a miner won it.
+    ///
+    /// A pays 50 000 over ~82 vB; B and C 300 each. R pays 51 000 — every
+    /// evicted fee plus relay — over ~206 vB.
+    #[test]
+    fn a_conflict_inside_a_chain_of_three_is_not_a_simple_topology() {
+        let op = outpoint(0xDB);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let mut a = tx_from(&[op], &[(50_000, 0xDC)]);
+        a.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let a_weight = a.weight().to_wu();
+        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(49_700, 0xDD)]);
+        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
+        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(49_400, 0xDE)]);
+        mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let outs: Vec<(u64, u8)> = (0..5).map(|i| (9_800, 0xE0 + i)).collect();
+        let r = tx_from(&[op], &outs);
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb;
+        assert!(
+            rate(51_000, r.weight().to_wu()) < rate(50_000, a_weight),
+            "the fixture must pay a lower feerate than the conflict it evicts"
+        );
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "a lower-feerate replacement of the head of a chain must be refused: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &a_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A surviving ancestor of the replacement that has nothing to do with
+    /// the conflict was on the new side only — inside the replacement's
+    /// chunk — and absent from the old, though it already sat in the
+    /// mempool. Its fee then paid for the replacement's: [P, R] beat [C],
+    /// where the true comparison, [P, R] against [P, C], loses.
+    ///
+    /// P pays 20 000 over ~113 vB on its own. C pays 1 000 over ~82 vB. R
+    /// spends C's input and one of P's outputs, and pays 1 300 over ~123 vB —
+    /// more than C, at a lower feerate.
+    #[test]
+    fn an_unrelated_ancestor_of_the_replacement_is_on_both_sides_of_the_diagram() {
+        let op_p = outpoint(0xE7);
+        let op_c = outpoint(0xE8);
+        let (cs, mp, dir) = make_funded_env(&[(op_p, coin(100_000)), (op_c, coin(100_000))]);
+
+        let p = tx_from(&[op_p], &[(60_000, 0xE9), (20_000, 0xEA)]);
+        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let mut c = tx_from(&[op_c], &[(99_000, 0xEB)]);
+        c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let c_weight = c.weight().to_wu();
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let r = tx_from(&[op_c, OutPoint { txid: p_txid, vout: 1 }], &[(118_700, 0xEC)]);
+        let rate = crate::mempool::policy::fee_rate_sat_per_kvb;
+        assert!(
+            rate(1_300, r.weight().to_wu()) < rate(1_000, c_weight),
+            "the fixture must pay a lower feerate than the conflict it evicts"
+        );
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            matches!(verdict, Err(MempoolError::DoesNotImproveFeerateDiagram(_))),
+            "an ancestor's existing fee must not pay for the replacement: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &c_txid), "the conflict stays");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
