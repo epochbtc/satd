@@ -24,7 +24,7 @@ x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.5.1@sha256:bcbde256a0d5191d124
 services:
   app_proxy:
     environment:
-      APP_HOST: satd_server_1
+      APP_HOST: epochbtc-satd_server_1
       APP_PORT: 3001
       # Esplora is served over TLS by satd itself; the proxy has to speak
       # TLS to it rather than plain HTTP.

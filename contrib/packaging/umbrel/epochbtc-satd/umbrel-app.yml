@@ -1,5 +1,5 @@
 manifestVersion: 1.1
-id: satd
+id: epochbtc-satd
 category: bitcoin
 name: satd
 version: "0.5.1"
