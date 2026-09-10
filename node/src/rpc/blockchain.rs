@@ -355,7 +355,11 @@ pub fn get_deployment_info(
     let taproot_info = vb::Bip9Info {
         current_state: taproot_state,
         next_state: taproot_state,
-        since: heights.taproot,
+        // Core's `since` is the height the *current* state began. For a
+        // deployment still `defined` that is 0, not the height it will
+        // activate at — `StateSinceHeight` cannot know about a future
+        // transition.
+        since: if taproot_active { heights.taproot } else { 0 },
         stats: None,
         signalling: None,
         active_since: taproot_active.then_some(heights.taproot),
