@@ -439,6 +439,80 @@ fn raw_outputs_sequence(raw_params: &str, index: usize) -> Option<Vec<serde_json
 /// Shared state for RPC handlers.
 /// The network data directory (Core's `GetDataDirNet`), from the effective
 /// config. `None` when the config carries no datadir — embedded uses only.
+/// Core's `AmountFromValue` (`rpc/util.cpp`): a number or a decimal string in
+/// BTC, converted to satoshis and bounded by `MoneyRange`. Absent or JSON null
+/// takes the default.
+fn parse_btc_amount_arg(
+    raw: Option<&serde_json::Value>,
+    default_sat: u64,
+) -> Result<u64, ErrorObjectOwned> {
+    const MAX_MONEY_SAT: f64 = 21_000_000.0 * 100_000_000.0;
+    let btc = match raw {
+        None | Some(serde_json::Value::Null) => return Ok(default_sat),
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        Some(_) => {
+            return Err(ErrorObjectOwned::owned(
+                -3,
+                "Amount is not a number or string",
+                None::<()>,
+            ));
+        }
+    };
+    let Some(btc) = btc.filter(|v| v.is_finite()) else {
+        return Err(ErrorObjectOwned::owned(-3, "Invalid amount", None::<()>));
+    };
+    let sat = (btc * 100_000_000.0).round();
+    if !(0.0..=MAX_MONEY_SAT).contains(&sat) {
+        return Err(ErrorObjectOwned::owned(-3, "Amount out of range", None::<()>));
+    }
+    Ok(sat as u64)
+}
+
+/// Core's `ParseFeeRate` (`rpc/util.cpp`): `AmountFromValue`, then a hard
+/// ceiling — a rate of one whole BTC per kvB or more is refused outright,
+/// because at that point the caller has almost certainly confused the units.
+fn parse_fee_rate_arg(
+    raw: Option<&serde_json::Value>,
+    default_sat_per_kvb: u64,
+) -> Result<u64, ErrorObjectOwned> {
+    let rate = parse_btc_amount_arg(raw, default_sat_per_kvb)?;
+    if rate >= 100_000_000 {
+        return Err(ErrorObjectOwned::owned(
+            -8,
+            "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+            None::<()>,
+        ));
+    }
+    Ok(rate)
+}
+
+/// Core's `IsChildWithParentsTree` (`src/policy/packages.cpp`): the package is
+/// one child and its direct parents, and no parent spends another parent.
+///
+/// The package is expected to be sorted, so the child is last.
+fn is_child_with_parents_tree(txs: &[bitcoin::Transaction]) -> bool {
+    if txs.len() < 2 {
+        return false;
+    }
+    let (parents, child) = txs.split_at(txs.len() - 1);
+    let child = &child[0];
+    let child_inputs: std::collections::HashSet<bitcoin::Txid> =
+        child.input.iter().map(|i| i.previous_output.txid).collect();
+    // Every other member must be a parent of the child…
+    let parent_txids: std::collections::HashSet<bitcoin::Txid> =
+        parents.iter().map(|t| t.compute_txid()).collect();
+    if !parent_txids.iter().all(|t| child_inputs.contains(t)) {
+        return false;
+    }
+    // …and no parent may spend another.
+    parents.iter().all(|p| {
+        !p.input
+            .iter()
+            .any(|i| parent_txids.contains(&i.previous_output.txid))
+    })
+}
+
 fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
     let base = ctx
         .effective_config
@@ -1939,23 +2013,27 @@ pub async fn start(
         // Optional maxfeerate (AMOUNT: numeric or string, BTC/kvB, default 0.10).
         let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
         args.check()?;
-        let maxfeerate_sat_per_kvb: u64 = match &maxfeerate_raw {
-            None | Some(serde_json::Value::Null) => 10_000_000, // 0.10 BTC/kvB
-            Some(serde_json::Value::Number(n)) => {
-                let f = n.as_f64().unwrap_or(0.10);
-                (f * 100_000_000.0).round() as u64
-            }
-            Some(serde_json::Value::String(s)) => {
-                let f: f64 = s.parse().unwrap_or(0.10);
-                (f * 100_000_000.0).round() as u64
-            }
-            _ => 10_000_000,
-        };
+        // Core's `ParseFeeRate`. The old parser silently substituted the
+        // default for anything it could not read, so a negative rate, a rate
+        // above Core's 1 BTC/kvB ceiling, and a typo all became 0.10 —
+        // exactly the values a caller passes `maxfeerate` to be protected
+        // from.
+        let maxfeerate_sat_per_kvb = parse_fee_rate_arg(maxfeerate_raw.as_ref(), 10_000_000)?;
 
-        // Pre-decode all transactions and check for package-level duplicates
-        // (Core: "package-contains-duplicates"). A package with two copies of
-        // the same transaction is invalid regardless of whether each copy is
-        // individually valid.
+        // Core (`rpc/mempool.cpp`) bounds the array before decoding anything:
+        // an empty array was accepted and answered with `[]`, and 26 became a
+        // package-level error instead of an argument error.
+        if rawtxs.is_empty() || rawtxs.len() > crate::mempool::pool::MAX_PACKAGE_COUNT {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!(
+                    "Array must contain between 1 and {} transactions.",
+                    crate::mempool::pool::MAX_PACKAGE_COUNT
+                ),
+                None::<()>,
+            ));
+        }
+
         let mut decoded: Vec<bitcoin::Transaction> = Vec::with_capacity(rawtxs.len());
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
@@ -1965,31 +2043,50 @@ pub async fn start(
             decoded.push(tx);
         }
 
-        if decoded.len() > 1 {
-            let mut seen = std::collections::HashSet::with_capacity(decoded.len());
-            let has_dups = decoded.iter().any(|tx| !seen.insert(tx.compute_txid()));
-            if has_dups {
-                let results: Vec<serde_json::Value> = decoded
-                    .iter()
-                    .map(|tx| {
-                        serde_json::json!({
-                            "txid": tx.compute_txid().to_string(),
-                            "package-error": "package-contains-duplicates",
-                        })
+        // Package-level well-formedness, from the one implementation the
+        // mempool uses (`check_well_formed_package`): duplicates, the weight
+        // cap, parents-before-children, and two members spending one outpoint.
+        // The inline check here saw only duplicates, so an out-of-order or
+        // self-conflicting package was answered per-transaction with a reason
+        // that described a consequence.
+        if decoded.len() > 1
+            && let Err(reason) = crate::mempool::pool::check_well_formed_package(&decoded)
+        {
+            let results: Vec<serde_json::Value> = decoded
+                .iter()
+                .map(|tx| {
+                    serde_json::json!({
+                        "txid": tx.compute_txid().to_string(),
+                        "wtxid": tx.compute_wtxid().to_string(),
+                        "package-error": reason,
                     })
-                    .collect();
-                return Ok(serde_json::json!(results));
-            }
+                })
+                .collect();
+            return Ok(serde_json::json!(results));
         }
 
         let mut results = Vec::new();
         for tx in &decoded {
             // Check if tx is already confirmed.
             let txid_check = tx.compute_txid();
-            if ctx.chain_state.get_coin(&bitcoin::OutPoint { txid: txid_check, vout: 0 }).is_some()
-                || ctx.chain_state.get_tx_location(&txid_check).is_some() {
+            // Core (`validation.cpp`) reports `txn-already-known` only when
+            // one of *this* transaction's outputs is still an unspent coin.
+            // satd looked at output 0 alone, and also at the txindex — which
+            // finds a confirmed transaction forever, so a fully-spent one was
+            // reported as "already known" where Core says `missing-inputs`,
+            // its own inputs having been spent.
+            let any_output_unspent = (0..tx.output.len() as u32).any(|vout| {
+                ctx.chain_state
+                    .get_coin(&bitcoin::OutPoint { txid: txid_check, vout })
+                    .is_some()
+            });
+            if any_output_unspent {
+                // `wtxid` is on *every* Core result, including the refusals.
+                // Omitting it here made `mempool_accept.py` fail on a
+                // `KeyError` before it could compare anything.
                 results.push(serde_json::json!({
                     "txid": txid_check.to_string(),
+                    "wtxid": tx.compute_wtxid().to_string(),
                     "allowed": false,
                     "reject-reason": "txn-already-known",
                 }));
@@ -2011,6 +2108,10 @@ pub async fn start(
                             "reject-reason": "max-fee-exceeded",
                         }));
                     } else {
+                        // Core reports what it judged the transaction by, not
+                        // just its base fee: for a single transaction the
+                        // effective feerate is its own modified feerate and
+                        // `effective-includes` is its own wtxid.
                         results.push(serde_json::json!({
                             "txid": txid.to_string(),
                             "wtxid": wtxid.to_string(),
@@ -2018,6 +2119,11 @@ pub async fn start(
                             "vsize": vsize,
                             "fees": {
                                 "base": format_amount(fees, default_unit()),
+                                "effective-feerate": format_amount(
+                                    feerate_sat_per_kvb,
+                                    default_unit(),
+                                ),
+                                "effective-includes": [wtxid.to_string()],
                             },
                         }));
                     }
@@ -2025,6 +2131,20 @@ pub async fn start(
                 Err(e) => {
                     let txid = tx.compute_txid();
                     let wtxid = tx.compute_wtxid();
+                    // Core (`rpc/mempool.cpp`) reports a missing input as
+                    // `missing-inputs`, not by the reject reason the mempool
+                    // recorded, and gives it no `reject-details`: it is the
+                    // one refusal that says nothing about the transaction
+                    // itself, only about what the node has not seen yet.
+                    if matches!(e, crate::mempool::pool::MempoolError::MissingInputs) {
+                        results.push(serde_json::json!({
+                            "txid": txid.to_string(),
+                            "wtxid": wtxid.to_string(),
+                            "allowed": false,
+                            "reject-reason": "missing-inputs",
+                        }));
+                        continue;
+                    }
                     let mut entry = serde_json::json!({
                         "txid": txid.to_string(),
                         "wtxid": wtxid.to_string(),
@@ -2045,52 +2165,73 @@ pub async fn start(
     module.register_method("submitpackage", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let rawtxs: Vec<String> = args.required("package")?;
-        // Core's `maxfeerate` (default 0.10 BTC/kvB) and `maxburnamount`
-        // (default 0) are the caller's own safety limits. satd applies
-        // neither to a package yet, and silently accepting a limit it does
-        // not enforce is the one failure mode worth avoiding here: a client
-        // passing `maxburnamount` to protect itself would get no protection
-        // and no warning. Read the slots so a Core-shaped call is no longer
-        // rejected outright, then refuse a supplied value by name.
+        // Core's `maxfeerate` (default 0.10 BTC/kvB, `0` meaning no check) and
+        // `maxburnamount` (default 0) are the caller's own safety limits.
         let maxfeerate_raw: Option<serde_json::Value> = args.raw("maxfeerate")?;
         let maxburnamount_raw: Option<serde_json::Value> = args.raw("maxburnamount")?;
         args.check()?;
-        for (name, given) in
-            [("maxfeerate", &maxfeerate_raw), ("maxburnamount", &maxburnamount_raw)]
-        {
-            if given.is_some() {
-                return Err(ErrorObjectOwned::owned(
-                    -8,
-                    format!(
-                        "{name} is not yet applied to a package by this node; \
-                         omit it or submit the transactions individually with \
-                         sendrawtransaction, which does enforce it"
-                    ),
-                    None::<()>,
-                ));
-            }
+        let maxfeerate_sat_per_kvb = parse_fee_rate_arg(maxfeerate_raw.as_ref(), 10_000_000)?;
+        let maxburnamount_sat = parse_btc_amount_arg(maxburnamount_raw.as_ref(), 0)?;
+
+        // Core bounds the array before decoding anything.
+        if rawtxs.is_empty() || rawtxs.len() > crate::mempool::pool::MAX_PACKAGE_COUNT {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                format!(
+                    "Array must contain between 1 and {} transactions.",
+                    crate::mempool::pool::MAX_PACKAGE_COUNT
+                ),
+                None::<()>,
+            ));
         }
 
-        // Decode all transactions.
+        // Decode all transactions, applying `maxburnamount` per output as
+        // Core does at decode time — an unspendable output above the ceiling
+        // is an RPC error, not a per-transaction result.
         let mut txs = Vec::with_capacity(rawtxs.len());
         for hex_tx in &rawtxs {
             let tx_bytes = hex::decode(hex_tx)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
             let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
                 .map_err(|_| ErrorObjectOwned::owned(-22, "TX decode failed", None::<()>))?;
+            for out in &tx.output {
+                if rawtx::is_burn_output(out) && out.value.to_sat() > maxburnamount_sat {
+                    return Err(ErrorObjectOwned::owned(
+                        -25,
+                        "Unspendable output exceeds maximum configured by user \
+                         (maxburnamount)",
+                        None::<()>,
+                    ));
+                }
+            }
             txs.push(tx);
         }
 
-        let (package_msg, tx_results) = ctx.mempool.accept_package(
+        // Core's `IsChildWithParentsTree`: a package is one child and its
+        // direct parents, and no parent may spend another. Without this a
+        // package of unrelated transactions was accepted and judged
+        // member by member, which is not what package acceptance means.
+        if txs.len() > 1 && !is_child_with_parents_tree(&txs) {
+            return Err(ErrorObjectOwned::owned(
+                -25,
+                "package topology disallowed. not child-with-parents or parents \
+                 depend on each other.",
+                None::<()>,
+            ));
+        }
+
+        let result = ctx.mempool.accept_package_with(
             txs,
             &ctx.chain_state,
             ctx.chain_state.script_verifier(),
+            Some(maxfeerate_sat_per_kvb),
         );
 
         // Announce any newly-accepted transactions to peers.
-        for (_wtxid, result) in &tx_results {
-            if result.get("error").is_none()
-                && let Some(txid_str) = result.get("txid").and_then(|v| v.as_str())
+        for (_wtxid, entry) in &result.tx_results {
+            if entry.get("error").is_none()
+                && entry.get("other-wtxid").is_none()
+                && let Some(txid_str) = entry.get("txid").and_then(|v| v.as_str())
                 && let Ok(txid) = txid_str.parse::<bitcoin::Txid>()
             {
                 ctx.peer_manager.announce_tx(txid);
@@ -2098,8 +2239,15 @@ pub async fn start(
         }
 
         Ok::<_, ErrorObjectOwned>(serde_json::json!({
-            "package_msg": package_msg,
-            "tx-results": tx_results,
+            "package_msg": result.package_msg,
+            "tx-results": result.tx_results,
+            // Core emits this unconditionally, empty when nothing was
+            // replaced; a client that reads it had to guess.
+            "replaced-transactions": result
+                .replaced
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>(),
         }))
     })?;
 

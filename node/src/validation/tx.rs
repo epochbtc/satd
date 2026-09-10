@@ -37,6 +37,11 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), ValidationError> {
     let mut total_out: u64 = 0;
     for output in &tx.output {
         let value = output.value.to_sat();
+        // Core reads the eight-byte value as `int64_t`, so the high bit means
+        // negative and gets its own reject reason.
+        if (value as i64) < 0 {
+            return Err(ValidationError::BadTxOutputNegative);
+        }
         if value > MAX_MONEY {
             return Err(ValidationError::BadTxOutputTooLarge);
         }
