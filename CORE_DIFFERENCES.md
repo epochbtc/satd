@@ -554,8 +554,9 @@ silently returning an empty or wrong answer.
   before the cluster mempool: exact for a conflict with at most one in-mempool
   parent *or* one child (that parent having no other child, that child no
   other parent), which is Core's own `CheckConflictTopology` precondition. A
-  replacement's own in-mempool ancestors are chunked with it by the same
-  child/parent rule; the pre-cluster Core put the replacement in on its own.
+  replacement's own surviving in-mempool ancestors — each standing alone on
+  this path — form a star with it: one chunk with those it pulls up, the rest
+  on their own; the pre-cluster Core put the replacement in on its own.
   An ancestor of the replacement unrelated to the conflicts stands on both
   sides of the comparison when it has no in-mempool relatives of its own. For
   anything larger — a conflict inside a longer chain, an ancestor with

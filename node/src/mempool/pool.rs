@@ -3738,31 +3738,35 @@ impl Mempool {
             }
         }
         // The replacement with the in-mempool ancestors it would be mined
-        // alongside, chunked by the rule `old_diagram` applies to a child and
-        // its parent: one chunk when the replacement's own feerate is the
-        // higher (it pulls the ancestors up), else the ancestors first and
-        // the replacement on its own.
+        // alongside. On this path every surviving ancestor stands alone —
+        // the gates above see to that — so the replacement's cluster is a
+        // star, and its linearization is: the replacement in one chunk with
+        // the parents it pulls up, each remaining parent on its own above
+        // it. Merging in ascending feerate order finds that chunk: a parent
+        // joins while it pays less than the chunk so far, which can only
+        // lower the chunk's feerate, so once one pays at least as much the
+        // rest do too. Folding every ancestor into a single pair with the
+        // replacement was right for one parent and wrong for two: with a
+        // high-feerate P and a dust-feerate Q it built [P+Q, R], where a
+        // miner takes [P, Q+R], and refused a replacement that improves the
+        // diagram.
         let individual = FeeFrac::new(new_fee as i64, vsize_of(weight));
-        let mut package = individual;
-        for anc_txid in ancestors {
-            if !all_evicted.contains(anc_txid)
-                && let Some(ae) = inner.entries.get(anc_txid)
-            {
-                package = package
-                    + FeeFrac::new(
-                        modified_fee(ae.fee, ae.fee_delta) as i64,
-                        vsize_of(ae.weight as u64),
-                    );
+        let mut parents: Vec<FeeFrac> = ancestors
+            .iter()
+            .filter(|anc| !all_evicted.contains(*anc))
+            .filter_map(|anc| inner.entries.get(anc))
+            .map(|ae| FeeFrac::new(modified_fee(ae.fee, ae.fee_delta) as i64, vsize_of(ae.weight as u64)))
+            .collect();
+        parents.sort_by(|a, b| feerate_compare(*a, *b));
+        let mut chunk = individual;
+        for parent in parents {
+            if feerate_compare(parent, chunk) == std::cmp::Ordering::Less {
+                chunk = chunk + parent;
+            } else {
+                new_chunks.push(parent);
             }
         }
-        if package.size == individual.size {
-            new_chunks.push(individual);
-        } else if feerate_compare(individual, package) == std::cmp::Ordering::Greater {
-            new_chunks.push(package);
-        } else {
-            new_chunks.push(package - individual);
-            new_chunks.push(individual);
-        }
+        new_chunks.push(chunk);
         sort_chunks(&mut new_chunks);
 
         if compare_chunks(&new_chunks, &old_chunks) != DiagramOrdering::Better {
@@ -6751,6 +6755,47 @@ mod tests {
             "an ancestor's existing fee must not pay for the replacement: {verdict:?}"
         );
         assert!(in_pool(&mp, &c_txid), "the conflict stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: two independent ancestors must not be folded
+    /// into one aggregate with the replacement. P pays 10 000 over ~113 vB,
+    /// Q 100 over ~113 vB, and R — conflicting with C (1 000 over ~82 vB) —
+    /// spends an output of each and pays 4 000 over ~164 vB. A miner takes
+    /// [P, Q+R], which beats [P, C, Q] everywhere; folded, [P+Q, R] earns
+    /// half of P's fee at P's size and the replacement was refused.
+    #[test]
+    fn independent_ancestors_are_chunked_separately_on_the_new_side() {
+        let op_p = outpoint(0xED);
+        let op_q = outpoint(0xEE);
+        let op_c = outpoint(0xEF);
+        let (cs, mp, dir) = make_funded_env(&[
+            (op_p, coin(100_000)),
+            (op_q, coin(100_000)),
+            (op_c, coin(100_000)),
+        ]);
+
+        let p = tx_from(&[op_p], &[(70_000, 0xF0), (20_000, 0xF1)]);
+        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let q = tx_from(&[op_q], &[(80_000, 0xF2), (19_900, 0xF3)]);
+        let q_txid = mp.accept_transaction(q, &cs, &NoopVerifier, TxSource::Rpc, false).expect("q");
+        let mut c = tx_from(&[op_c], &[(99_000, 0xF4)]);
+        c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+
+        let r = tx_from(
+            &[op_c, OutPoint { txid: p_txid, vout: 1 }, OutPoint { txid: q_txid, vout: 1 }],
+            &[(135_900, 0xF5)],
+        );
+        let r_txid = r.compute_txid();
+        let verdict = mp.accept_transaction(r, &cs, &NoopVerifier, TxSource::Rpc, false);
+        assert!(
+            verdict.is_ok(),
+            "a replacement that improves the diagram must be accepted: {verdict:?}"
+        );
+        assert!(in_pool(&mp, &r_txid));
+        assert!(!in_pool(&mp, &c_txid), "the conflict is evicted");
+        assert!(in_pool(&mp, &p_txid) && in_pool(&mp, &q_txid), "the ancestors stay");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
