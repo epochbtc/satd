@@ -70,6 +70,41 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- CI: every `apt-get update` drops the runner image's third-party apt sources
+  first. A hash-sum mismatch on Google's Chrome repository — which none of the
+  installed packages come from — was failing the whole step, and with it every
+  canary job.
+
+- **Breaking:** dust thresholds are Bitcoin Core's. satd charged 68 vbytes to
+  spend a witness output where Core charges 67, 107 for P2SH where Core charges
+  148, and truncated a fee Core rounds up — so P2WPKH was 297 against Core's
+  294, P2TR 333 against 330, and P2SH 417 against 540 (#661).
+- **Breaking:** one dust output is standard, as Core's
+  `MAX_DUST_OUTPUTS_PER_TX` allows, and a dusty transaction that pays any fee
+  — base or `prioritisetransaction` delta — is refused
+  `dust, tx with dust output must be 0-fee` on the single-transaction path as
+  well as in `submitpackage` (#661).
+- **Breaking:** bare P2PK outputs and witness programs at versions satd has no
+  name for — pay-to-anchor among them — are standard, as Core's `Solver` and
+  `IsStandard` have them. A bare P2PK payment was refused outright, and bare
+  multisig is now bounded at x-of-3 as Core bounds it (#661).
+- `-dustrelayfee` reaches every dust decision. `prioritisetransaction`, the
+  package path and the stranded-parent unwind read the built-in rate instead of
+  the configured one, so `-dustrelayfee=0` did not switch dust policy off
+  (#661).
+- The block template refuses a spend of an immature coinbase. A reorg can
+  leave one in the mempool, and `connect_block` rejects the whole block for it
+  (#670).
+- `-blockmintxfee` is applied. It was parsed and then read nowhere, so the
+  template floor did not exist; it is judged on the package feerate, as Core's
+  `addPackageTxs` does, so a zero-fee parent still rides in on its child. Its
+  default is now Core's 1 sat/kvB rather than 1000 — the old value matched the
+  default `-minrelaytxfee`, which would have stranded every transaction on a
+  node with a lower relay floor. It takes Core's BTC/kvB spelling in
+  `bitcoin.conf` like the other fee-rate options (#661).
+- `reorg` is documented as a mempool eviction reason. The node has emitted it
+  on every carrier since the reorg sweep landed, but the wire spec and the
+  Operator Manual listed only some of the reasons (#670).
 - The ephemeral dust rule is enforced on the single-transaction path, as Core
   does: a transaction that spends a resident dust parent without sweeping its
   dust is refused `missing-ephemeral-spends` instead of accepted (#703).

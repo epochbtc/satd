@@ -2608,6 +2608,16 @@ impl Config {
         }
         .unwrap_or(3_000); // sat/kvB
 
+        // `-blockmintxfee` is a fee rate like the three above, so it takes
+        // Core's BTC/kvB spelling and an unparseable value stops the node.
+        // It used to go through `.parse().ok()`, which turned
+        // `blockmintxfee=0.00001` into the default without a word.
+        let blockmintxfee = match cli.blockmintxfee {
+            Some(v) => Some(v),
+            None => file_fee_rate("blockmintxfee")?,
+        }
+        .unwrap_or(node::mining::template::DEFAULT_BLOCK_MIN_TX_FEE);
+
         // Core v31 changed the default from 83 (MAX_OP_RETURN_RELAY, the
         // historical value) to MAX_STANDARD_TX_WEIGHT / 4 = 100 000,
         // making the relay cap effectively uncapped.  Match that default
@@ -3665,10 +3675,7 @@ impl Config {
                 .blockmaxweight
                 .or_else(|| file_get("blockmaxweight").and_then(|v| v.parse().ok()))
                 .unwrap_or(4_000_000),
-            blockmintxfee: cli
-                .blockmintxfee
-                .or_else(|| file_get("blockmintxfee").and_then(|v| v.parse().ok()))
-                .unwrap_or(1_000),
+            blockmintxfee,
             pid: cli.pid.or_else(|| file_get("pid")),
             mcp: cli.mcp.unwrap_or_else(|| {
                 file_get("mcp").and_then(|v| parse_bool(&v)).unwrap_or(false)
@@ -5433,8 +5440,9 @@ pub struct CliArgs {
 
     #[arg(
         long,
-        value_name = "RATE",
-        help = "Minimum tx fee for block template in sat/kvB (default: 1000)"
+        value_name = "AMT",
+        value_parser = parse_fee_rate_value,
+        help = "Minimum fee rate for a transaction to enter a block template, as BTC/kvB (Bitcoin Core's spelling, e.g. 0.00001) or a bare integer of sat/kvB (default: 1)"
     )]
     pub blockmintxfee: Option<u64>,
 
@@ -7981,10 +7989,12 @@ mod tests {
 
         let cfg = build("minrelaytxfee=0.00002
 dustrelayfee=0.00005
+blockmintxfee=0.00001
 ")
             .expect("Core-spelled fee rates must be honoured");
         assert_eq!(cfg.minrelaytxfee, 2_000, "BTC/kvB was not applied");
         assert_eq!(cfg.dustrelayfee, 5_000, "BTC/kvB was not applied");
+        assert_eq!(cfg.blockmintxfee, 1_000, "BTC/kvB was not applied");
 
         // satd's own spelling keeps working.
         let cfg = build("minrelaytxfee=1500
@@ -7994,6 +8004,9 @@ dustrelayfee=0.00005
         let err = build("minrelaytxfee=wat
 ").expect_err("garbage must not be accepted");
         assert!(err.contains("minrelaytxfee"), "unhelpful error: {err}");
+        let err = build("blockmintxfee=wat
+").expect_err("garbage must not be accepted");
+        assert!(err.contains("blockmintxfee"), "unhelpful error: {err}");
     }
 
     /// Bitcoin Core takes the LAST value when a command-line option is given

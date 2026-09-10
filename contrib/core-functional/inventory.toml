@@ -435,9 +435,7 @@ status = "run"
 
 [[test]]
 file = "mempool_dust.py"
-status = "skip"
-reason = "feature-missing"
-note = "satd accepts an output Core's dust rule rejects: `testmempoolaccept` reports allowed=true where Core reports false"
+status = "run"
 
 [[test]]
 file = "mempool_ephemeral_dust.py"
@@ -498,9 +496,7 @@ note = "sigop-equivalent vsize differs by one (satd 344, Core 345) for the same 
 
 [[test]]
 file = "mempool_spend_coinbase.py"
-status = "skip"
-reason = "rpc-missing"
-note = "`sendrawtransaction` returns the right reason (`bad-txns-premature-spend-of-coinbase`) under the wrong code: satd `-25`, Core `-26`"
+status = "run"
 
 [[test]]
 file = "mempool_truc.py"
