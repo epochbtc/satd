@@ -4829,9 +4829,16 @@ impl Mempool {
         // whenever both are present (`src/validation.cpp`).
         let unspent_dust = !stranded.is_empty()
             || parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid));
+        //
+        // A member refused for the caller's `maxfeerate` ceiling never enters
+        // the acceptance loop, so it is in `over_maxfeerate` and not `failed`
+        // — and Core reports that refusal at package level too
+        // (`PCKG_TX, "transaction failed"`, `AcceptMultipleTransactions`).
+        // Counting only `failed` answered `success` for a package whose
+        // every member was refused.
         let package_msg = if unspent_dust {
             "unspent-dust".to_string()
-        } else if !failed.is_empty() {
+        } else if !failed.is_empty() || !over_maxfeerate.is_empty() {
             "transaction failed".to_string()
         } else {
             "success".to_string()
@@ -10230,12 +10237,52 @@ mod tests {
             serde_json::json!("max feerate exceeded")
         );
         assert!(!in_pool(&mp, &txid), "a refused transaction reached the mempool");
+        // The refusal is the package's verdict as well: Core sets `PCKG_TX,
+        // "transaction failed"` alongside the member's error, and
+        // `rpc_packages.py` asserts both. A caller that keys "retry?" off
+        // `package_msg` read `success` here for a package nothing of which
+        // was admitted.
+        assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
 
         // …and the same package under a ceiling it clears is accepted, so the
         // refusal is the ceiling and not the transaction.
         let r = mp.accept_package_with(vec![tx], &cs, &NoopVerifier, Some(10_000_000));
         assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
         assert!(in_pool(&mp, &txid));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling is judged per member, so an ordinary parent under it is
+    /// admitted on its own while its child above it is refused — Core's
+    /// `AcceptPackage` admits the parent in single-transaction evaluation and
+    /// quits early on the child. The package's verdict is still
+    /// `transaction failed`: half a package is not `success`.
+    #[test]
+    fn maxfeerate_refusing_one_member_fails_the_package() {
+        let op = outpoint(0xF6);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(100_000))]);
+
+        // 1_000 sats over ~82 vbytes is ~12_000 sat/kvB: under the ceiling.
+        let parent = tx_from(&[op], &[(99_000, 0xD5)]);
+        let parent_txid = parent.compute_txid();
+        let parent_wtxid = parent.compute_wtxid().to_string();
+        // 50_000 sats over ~82 vbytes is ~610_000 sat/kvB: over it.
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(49_000, 0xD6)]);
+        let child_txid = child.compute_txid();
+        let child_wtxid = child.compute_wtxid().to_string();
+
+        let r = mp.accept_package_with(vec![parent, child], &cs, &NoopVerifier, Some(100_000));
+        assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
+        assert!(r.tx_results[&parent_wtxid]["error"].is_null(), "{:?}", r.tx_results);
+        assert_eq!(
+            r.tx_results[&child_wtxid]["error"],
+            serde_json::json!("max feerate exceeded"),
+            "{:?}",
+            r.tx_results
+        );
+        assert!(in_pool(&mp, &parent_txid), "the parent under the ceiling is admitted");
+        assert!(!in_pool(&mp, &child_txid), "the child over the ceiling is not");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
