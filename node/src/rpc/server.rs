@@ -2984,16 +2984,31 @@ pub async fn start(
             ));
         }
 
-        let sock: std::net::SocketAddr = address
-            .parse()
-            .map_err(|_| ErrorObjectOwned::owned(-8, format!("Invalid address: {address}"), None::<()>))?;
+        // Core hands the string to `OpenNetworkConnection`, which `Lookup()`s
+        // it, so a hostname is as valid here as a literal — `feature_anchors`
+        // passes an `.onion`. Parsing a bare `SocketAddr`, as this did,
+        // rejected everything else.
+        let target = ctx
+            .peer_manager
+            .resolve_peer_target(
+                &address,
+                crate::net::peer::default_p2p_port(ctx.chain_state.network),
+            )
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(-8, format!("Invalid address: {address}: {e}"), None::<()>)
+            })?;
 
         // -34 = RPC_CLIENT_NODE_CAPACITY_REACHED. Core capacity-checks before
-        // dialling and reports that code; every other dial failure here is a
-        // plain misc error, as Core's OpenNetworkConnection failures are.
+        // dialling and reports that code; every other failure here is a plain
+        // misc error, as Core's OpenNetworkConnection failures are.
+        //
+        // The dial itself is not awaited: Core returns once the socket is
+        // connected, and its test framework binds the listener, calls this,
+        // and only then accepts — so awaiting the handshake here deadlocks
+        // against the caller until the dial times out.
         ctx.peer_manager
-            .connect_outbound_as(sock, Some(conn_type), Some(v2transport))
-            .await
+            .add_connection(target, conn_type, v2transport)
             .map_err(|e| {
                 let code = if e.starts_with("Error: Already at capacity") { -34 } else { -1 };
                 ErrorObjectOwned::owned(code, e, None::<()>)

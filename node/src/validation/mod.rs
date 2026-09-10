@@ -3,6 +3,7 @@ pub mod pow;
 pub mod script;
 pub mod signet;
 pub mod tx;
+pub mod versionbits;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {

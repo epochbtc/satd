@@ -188,6 +188,12 @@ async fn main() {
             .expect("test activation overrides installed twice");
     }
 
+    // Same for `-vbparams` (regtest only, `testdummy` only).
+    if let Some(dep) = config.vbparams_testdummy {
+        node::validation::versionbits::set_testdummy_override(dep)
+            .expect("vbparams override installed twice");
+    }
+
     // `-mocktime=N`: install the mock clock at startup (regtest only).
     if let Some(t) = config.mocktime
         && t > 0

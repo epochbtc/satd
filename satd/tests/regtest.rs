@@ -14452,21 +14452,26 @@ fn rpc_handlers_do_not_reintroduce_the_params_poisoning_idiom() {
     );
 }
 
-/// #666: `getdeploymentinfo` reported the buried deployments under the names
-/// `-testactivationheight` takes, not the names Core reports.
+/// #666 / #692: `getdeploymentinfo` reported the buried deployments under the
+/// names `-testactivationheight` takes, not the names Core reports — and then
+/// described every deployment as `buried`, including the two Core models as
+/// BIP 9.
 ///
-/// Core carries this asymmetry itself: `GetBuriedDeployment` reads `cltv` and
-/// `dersig` on the way in, `DeploymentName` writes `bip65` and `bip66` on the
-/// way out (`src/deploymentinfo.cpp`). Core's test framework keys on the
-/// reported spelling, so satd's output was unreachable.
+/// Core carries the naming asymmetry itself: `GetBuriedDeployment` reads
+/// `cltv` and `dersig` on the way in, `DeploymentName` writes `bip65` and
+/// `bip66` on the way out (`src/deploymentinfo.cpp`). Core's test framework
+/// keys on the reported spelling.
+///
+/// v31.1's `DeploymentInfo` emits seven entries: five buried, then
+/// `testdummy` and `taproot` as `type: "bip9"`. The result object also
+/// carries `script_flags`, which satd omitted entirely.
 #[test]
-fn getdeploymentinfo_uses_core_s_deployment_names_and_honours_blockhash() {
+fn getdeploymentinfo_reports_cores_deployment_set_and_honours_blockhash() {
     let node = TestNode::start(&[]);
 
     let info = node.rpc_call("getdeploymentinfo").unwrap();
     let deployments = &info["result"]["deployments"];
 
-    // Exactly Core's `DeploymentName` set, plus taproot.
     let mut got: Vec<&str> = deployments
         .as_object()
         .expect("deployments must be an object")
@@ -14476,8 +14481,8 @@ fn getdeploymentinfo_uses_core_s_deployment_names_and_honours_blockhash() {
     got.sort_unstable();
     assert_eq!(
         got,
-        ["bip34", "bip65", "bip66", "csv", "segwit", "taproot"],
-        "must be Core v31's DeploymentName strings: {info}"
+        ["bip34", "bip65", "bip66", "csv", "segwit", "taproot", "testdummy"],
+        "must be Core v31.1's DeploymentInfo set: {info}"
     );
     for gone in ["dersig", "cltv"] {
         assert!(
@@ -14485,12 +14490,69 @@ fn getdeploymentinfo_uses_core_s_deployment_names_and_honours_blockhash() {
             "{gone} is the *input* spelling; Core never reports it: {info}"
         );
     }
-    for (name, _) in deployments.as_object().unwrap() {
+    for name in ["bip34", "bip65", "bip66", "csv", "segwit"] {
         let d = &deployments[name];
         assert_eq!(d["type"], "buried", "{name}: {info}");
         assert!(d["active"].is_boolean(), "{name}: {info}");
         assert!(d["height"].is_number(), "{name}: {info}");
     }
+
+    // `taproot` is always active on regtest, so Core reports it as a bip9
+    // deployment with `start_time: -1` (ALWAYS_ACTIVE), no `bit` (there are
+    // no statistics to read one against), status `active` and `height: 0`.
+    let taproot = &deployments["taproot"];
+    assert_eq!(taproot["type"], "bip9", "{info}");
+    assert_eq!(taproot["active"], serde_json::json!(true), "{info}");
+    assert_eq!(taproot["height"], serde_json::json!(0), "{info}");
+    assert_eq!(taproot["bip9"]["start_time"], serde_json::json!(-1), "{info}");
+    assert_eq!(
+        taproot["bip9"]["timeout"],
+        serde_json::json!(9_223_372_036_854_775_807i64),
+        "{info}"
+    );
+    assert_eq!(taproot["bip9"]["min_activation_height"], serde_json::json!(0));
+    assert_eq!(taproot["bip9"]["status"], "active", "{info}");
+    assert_eq!(taproot["bip9"]["status_next"], "active", "{info}");
+    assert_eq!(taproot["bip9"]["since"], serde_json::json!(0), "{info}");
+    assert!(
+        taproot["bip9"].get("bit").is_none(),
+        "an always-active deployment has no signalling bit to report: {info}"
+    );
+
+    // `testdummy` on regtest starts at time 0 with a 144-block period, so a
+    // fresh chain is still `defined` — it cannot reach `started` before the
+    // first period boundary.
+    let td = &deployments["testdummy"];
+    assert_eq!(td["type"], "bip9", "{info}");
+    assert_eq!(td["active"], serde_json::json!(false), "{info}");
+    assert!(td.get("height").is_none(), "not active, so no height: {info}");
+    assert_eq!(td["bip9"]["start_time"], serde_json::json!(0), "{info}");
+    assert_eq!(td["bip9"]["min_activation_height"], serde_json::json!(0));
+    assert_eq!(td["bip9"]["status"], "defined", "{info}");
+    assert_eq!(td["bip9"]["since"], serde_json::json!(0), "{info}");
+
+    // `script_flags` was missing entirely. Core emits the names sorted (it
+    // reads them out of a `std::map<std::string, …>`), and on regtest every
+    // buried deployment but bip34 is active from genesis.
+    let flags: Vec<&str> = info["result"]["script_flags"]
+        .as_array()
+        .expect("script_flags must be an array")
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            "CHECKLOCKTIMEVERIFY",
+            "CHECKSEQUENCEVERIFY",
+            "DERSIG",
+            "NULLDUMMY",
+            "P2SH",
+            "TAPROOT",
+            "WITNESS"
+        ],
+        "{info}"
+    );
 
     // `blockhash` was accepted and ignored. Mine, then ask about genesis and
     // check the answer describes genesis, not the tip.
@@ -14526,6 +14588,42 @@ fn getdeploymentinfo_uses_core_s_deployment_names_and_honours_blockhash() {
         .unwrap();
     assert_eq!(missing["error"]["code"], serde_json::json!(-5), "{missing}");
     assert_eq!(missing["error"]["message"], "Block not found", "{missing}");
+}
+
+/// Core's `-vbparams=deployment:start:end[:min_activation_height]` moves the
+/// BIP 9 window. satd had no such option, so a test framework that sets one
+/// got a node whose reported deployment did not match what it asked for.
+///
+/// satd honours it for `testdummy` — the only deployment an override can
+/// change, since taproot is height-gated here — and refuses any other name
+/// rather than accepting it and reporting parameters it does not honour.
+#[test]
+fn vbparams_moves_the_testdummy_window_and_refuses_what_it_cannot_honour() {
+    let node = TestNode::start(&["-vbparams=testdummy:1:2:0"]);
+    let info = node.rpc_call("getdeploymentinfo").unwrap();
+    let td = &info["result"]["deployments"]["testdummy"];
+    assert_eq!(td["bip9"]["start_time"], serde_json::json!(1), "{info}");
+    assert_eq!(td["bip9"]["timeout"], serde_json::json!(2), "{info}");
+    drop(node);
+
+    // A deployment satd cannot drive is named in the refusal, and so is a
+    // malformed value: an accepted-and-ignored -vbparams would report a
+    // window the node does not honour.
+    let refusal = |arg: &str| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
+            .args(["--regtest", arg])
+            .output()
+            .expect("spawn satd");
+        assert!(!out.status.success(), "satd should refuse {arg}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    let err = refusal("--vbparams=taproot:1:2");
+    assert!(
+        err.contains("testdummy") && err.contains("taproot"),
+        "the refusal must name both: {err}"
+    );
+    let err = refusal("--vbparams=testdummy:1");
+    assert!(err.contains("deployment:start:end"), "{err}");
 }
 
 /// `validateaddress` parsed the address without checking the network and then
@@ -14603,6 +14701,16 @@ fn dumptxoutset_takes_core_s_type_argument_and_resolves_paths_like_core() {
     assert!(path.ends_with("regtest/txoutset.dat"), "{out}");
     assert!(std::path::Path::new(path).is_file(), "the file must be where it says: {out}");
 
+    // `nchaintx` was missing entirely. It is one of the three numbers an
+    // AssumeUTXO anchor is made of (base hash, nchaintx, hash_serialized_3),
+    // so a snapshot dumped without it cannot be turned into one — and at
+    // height 1 the count is genesis's coinbase plus this block's.
+    assert_eq!(
+        out["result"]["nchaintx"],
+        serde_json::json!(2),
+        "cumulative tx count at the base block: {out}"
+    );
+
     // An omitted type still means "latest", so callers that predate the
     // argument keep working.
     let legacy = node
@@ -14676,11 +14784,37 @@ mod addconn_listener {
 
         /// Accept the dial satd makes and read messages until its `version`
         /// arrives. Returns the stream (mid-handshake) and that version.
+        ///
+        /// The accept is bounded, not blocking. `TcpListener::accept` has no
+        /// timeout, so a satd that never dials — because the dial failed, or
+        /// resolved to an address this listener is not on — hung the test
+        /// until CI's own hour-long job timeout killed it, with no indication
+        /// of which test was stuck. Polling turns that into a named failure
+        /// within `timeout`.
         pub fn accept_version(&self, timeout: Duration) -> (TcpStream, VersionMessage) {
+            let accept_deadline = Instant::now() + timeout;
+            self.listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
+            let mut stream = loop {
+                match self.listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < accept_deadline,
+                            "satd never dialled us within {timeout:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
             self.listener
                 .set_nonblocking(false)
                 .expect("blocking listener");
-            let (mut stream, _) = self.listener.accept().expect("satd never dialled us");
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted stream");
             stream.set_read_timeout(Some(timeout)).unwrap();
             stream.set_write_timeout(Some(timeout)).unwrap();
             stream.set_nodelay(true).unwrap();
@@ -14954,6 +15088,130 @@ fn a_peers_last_block_and_last_tx_only_move_on_acceptance() {
         test_timeout(20),
         "an accepted transaction must stamp last_transaction",
     );
+}
+
+/// Core's `AddConnection` returns as soon as the capacity grant is taken:
+/// `OpenNetworkConnection` connects the socket and never waits for the peer's
+/// `version`, and the RPC returns `true` even when the dial itself fails.
+///
+/// satd awaited the dial *and* the transport handshake inside the RPC. That
+/// inverts the order Core's own test framework uses — bind a listener, call
+/// `addconnection`, then accept and speak — so the RPC blocked against a
+/// caller that was waiting for it to return, until the dial timed out.
+#[test]
+fn addconnection_returns_without_waiting_for_the_dial() {
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+
+    // Nothing is listening here: bind a port and drop it, so the address is
+    // valid and the connection is refused.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let started = std::time::Instant::now();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!(dead.to_string()),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "a failed dial is still a successful addconnection in Core: {out}"
+    );
+    assert_eq!(out["result"]["address"], json!(dead.to_string()));
+    // The default `-timeout` is 5s and the onion floor is 20s; anything in
+    // that range means the RPC waited for the dial.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "addconnection must not await the dial (took {:?})",
+        started.elapsed()
+    );
+}
+
+/// Core hands the address string to `OpenNetworkConnection`, which resolves
+/// it — `feature_anchors.py` passes an `.onion`. satd parsed a bare
+/// `SocketAddr` and rejected everything else, including `localhost:<port>`.
+///
+/// The assertion is that the *argument* is accepted, not that a peer appears:
+/// `localhost` resolves to `::1` on some hosts and `127.0.0.1` on others, and
+/// satd — like Core — dials one resolved address, so waiting for a connection
+/// here would depend on which family the runner prefers. (It hung CI for an
+/// hour when it did.) The dial itself is covered by
+/// `addconnection_returns_without_waiting_for_the_dial`, and the resolver's
+/// own behaviour by the `net::dns` unit tests.
+#[test]
+fn addconnection_accepts_a_hostname() {
+    use addconn_listener::Inbound;
+    use serde_json::json;
+
+    let node = TestNode::start(&[]);
+    let peer = Inbound::bind();
+    let by_name = format!("localhost:{}", peer.addr.port());
+
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![json!(by_name), json!("outbound-full-relay"), json!(false)],
+        )
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "a hostname must be resolved, not rejected: {out}"
+    );
+    assert_eq!(out["result"]["address"], json!(by_name), "{out}");
+
+    // A name that cannot resolve is still an error, so the acceptance above
+    // is resolution rather than a parse that stopped checking.
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!("no-such-host.invalid:8333"),
+                json!("outbound-full-relay"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        out["error"]["code"].as_i64(),
+        Some(-8),
+        "an unresolvable name is refused: {out}"
+    );
+
+    // An address that needs no lookup at all is unaffected, and this one is
+    // dialled for real.
+    let peer2 = Inbound::bind();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![
+                json!(peer2.addr.to_string()),
+                json!("block-relay-only"),
+                json!(false),
+            ],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "{out}");
+    let (mut stream, _) = peer2.accept_version(test_timeout(20));
+    peer2.complete_handshake(&mut stream);
+    poll_until(
+        || {
+            node.rpc_call("getpeerinfo")
+                .ok()
+                .and_then(|i| i["result"].as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false)
+        },
+        test_timeout(20),
+        "the peer dialled by literal address must connect",
+    );
+    drop(stream);
 }
 
 /// Core sizes `semOutbound` at `min(m_max_automatic_outbound,

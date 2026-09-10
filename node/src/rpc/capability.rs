@@ -50,6 +50,14 @@ fn required_capability(method: &str) -> Capability {
         // and must be granted on its own. The operator principal (cookie /
         // rpcauth) holds every capability and is unaffected.
         "setmocktime" => Capability::TestClock,
+        // `addconnection` dials an address of the caller's choosing and
+        // picks the connection's type, which decides whether that peer is
+        // asked for transactions and whether it relays addresses. That is
+        // reshaping the node's peer set, not an ordinary write, so it gets
+        // its own capability the way `setmocktime` does. The operator
+        // principal (cookie / rpcauth) holds every capability and is
+        // unaffected; the RPC is regtest-only regardless.
+        "addconnection" => Capability::TestNet,
         _ => match classify(method) {
             Some(RpcAccess::Read) => Capability::RpcRead,
             _ => Capability::RpcWrite,
@@ -330,5 +338,57 @@ mod tests {
             .await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    /// `addconnection` dials an address the caller chooses and picks the
+    /// connection's type, so a write token must not reach it — the same
+    /// reasoning that carved `setmocktime` out into `test:clock`. Falling
+    /// back to `rpc:write` for it, as the classifier did, let any delegated
+    /// write token reshape the node's peer set.
+    #[test]
+    fn the_test_capabilities_are_not_implied_by_write() {
+        for (method, cap) in [
+            ("setmocktime", Capability::TestClock),
+            ("addconnection", Capability::TestNet),
+        ] {
+            assert_eq!(required_capability(method), cap, "{method}");
+            assert_ne!(
+                required_capability(method),
+                Capability::RpcWrite,
+                "{method} must not fall through to rpc:write"
+            );
+        }
+        // The two are distinct: a clock token cannot dial, and vice versa.
+        assert_ne!(Capability::TestClock, Capability::TestNet);
+        assert_eq!(Capability::TestNet.as_str(), "test:net");
+        assert_eq!(Capability::parse("test:net"), Some(Capability::TestNet));
+    }
+
+    #[tokio::test]
+    async fn a_write_token_is_forbidden_on_addconnection() {
+        let write_token = Principal::token(
+            Arc::from("rw"),
+            CapabilitySet::EMPTY
+                .with(Capability::RpcRead)
+                .with(Capability::RpcWrite),
+            None,
+            None,
+            Principal::operator().accounting().clone(),
+        );
+        let (svc, dispatched) = filter();
+        let rp = svc
+            .call(req_with("addconnection", Some(write_token)))
+            .await;
+        assert!(rp.is_error());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(rp.as_json().get().contains("test:net"), "{}", rp.as_json().get());
+
+        // The operator principal still reaches it.
+        let (svc, dispatched) = filter();
+        let rp = svc
+            .call(req_with("addconnection", Some(Principal::operator())))
+            .await;
+        assert!(rp.is_success());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 }

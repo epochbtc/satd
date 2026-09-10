@@ -621,6 +621,12 @@ pub struct Config {
     /// block is validated. `None` on every other network (the option is
     /// rejected there, as Core rejects it).
     pub test_activation_overrides: Option<node::validation::script::TestActivationOverrides>,
+    /// Regtest-only BIP 9 deployment override from Core's
+    /// `-vbparams=deployment:start:end[:min_activation_height]`. Only
+    /// `testdummy` is accepted — see the parse site for why `taproot` is
+    /// refused rather than accepted and ignored. `None` off regtest (the
+    /// option is warned about and dropped there, as Core never reads it).
+    pub vbparams_testdummy: Option<node::validation::versionbits::Bip9Deployment>,
     /// `-mocktime=N`: set the mock clock at startup (regtest only).
     pub mocktime: Option<u64>,
     // Mempool policy
@@ -2544,6 +2550,66 @@ impl Config {
             }
         };
 
+        // `-vbparams=deployment:start:end[:min_activation_height]`
+        // (Core-compatible, regtest only). Core reads it in
+        // `ReadRegTestArgs`, which runs only on the regtest branch, so off
+        // regtest the key is never looked at — warn and ignore rather than
+        // refusing to start, exactly as `-testactivationheight` above.
+        let vbparams_testdummy = {
+            let mut values: Vec<String> = cli.vbparams.clone();
+            values.extend(file_get_all("vbparams"));
+            if values.is_empty() {
+                None
+            } else if network != Network::Regtest {
+                eprintln!("Warning: ignoring -vbparams, which applies only to regtest");
+                None
+            } else {
+                let mut out: Option<node::validation::versionbits::Bip9Deployment> = None;
+                for v in &values {
+                    let parts: Vec<&str> = v.split(':').collect();
+                    if parts.len() < 3 || parts.len() > 4 {
+                        return Err(format!("Invalid vbparams (expecting deployment:start:end[:min_activation_height]): {v}"));
+                    }
+                    // satd has no version-bits enforcement: every consensus
+                    // rule it has is gated on a height. `testdummy` exists
+                    // solely so `getdeploymentinfo` can report a `bip9`
+                    // deployment the way Core does, and it is the only one an
+                    // override can actually change. Core accepts `taproot`
+                    // here too; accepting it and then ignoring it would
+                    // report parameters the node does not honour, so refuse
+                    // it by name instead.
+                    if parts[0] != "testdummy" {
+                        return Err(format!(
+                            "Invalid deployment ({}) in -vbparams: satd only supports 'testdummy'. \
+                             satd activates taproot at a fixed height and counts no signalling, so a \
+                             -vbparams override for it would have no effect.",
+                            parts[0]
+                        ));
+                    }
+                    let start: i64 = parts[1]
+                        .parse()
+                        .map_err(|_| format!("Invalid nStartTime ({}) for -vbparams", parts[1]))?;
+                    let timeout: i64 = parts[2]
+                        .parse()
+                        .map_err(|_| format!("Invalid nTimeout ({}) for -vbparams", parts[2]))?;
+                    let min_activation_height: u32 = match parts.get(3) {
+                        None => 0,
+                        Some(h) => h.parse().map_err(|_| {
+                            format!("Invalid min_activation_height ({h}) for -vbparams")
+                        })?,
+                    };
+                    let base = node::validation::versionbits::testdummy_deployment(network);
+                    out = Some(node::validation::versionbits::Bip9Deployment {
+                        start_time: start,
+                        timeout,
+                        min_activation_height,
+                        ..base
+                    });
+                }
+                out
+            }
+        };
+
         let mocktime = cli
             .mocktime
             .or_else(|| file_get("mocktime").and_then(|v| v.parse().ok()));
@@ -3514,6 +3580,7 @@ impl Config {
             assumevalidage,
             stopatheight,
             test_activation_overrides,
+            vbparams_testdummy,
             mocktime,
             mempoolfullrbf,
             maxmempool,
@@ -4742,6 +4809,15 @@ pub struct CliArgs {
         help = "Regtest only: override a buried softfork deployment's activation height (repeatable; names: bip34, dersig, cltv, csv, segwit; matches Core's -testactivationheight)"
     )]
     pub testactivationheight: Vec<String>,
+
+    /// Core's `-vbparams=deployment:start:end[:min_activation_height]`
+    /// (regtest only, repeatable).
+    #[arg(
+        long,
+        value_name = "deployment:start:end[:min_activation_height]",
+        help = "Regtest only: use given start/end times and min_activation_height for specified BIP9 deployment (regtest-only; matches Core's -vbparams)"
+    )]
+    pub vbparams: Vec<String>,
 
     /// Regtest only: set the mock clock at startup.
     #[arg(long, value_name = "TIME")]
@@ -6294,6 +6370,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "assumevalidage",
         "stopatheight",
         "testactivationheight",
+        "vbparams",
         "mempoolfullrbf",
         "maxmempool",
         "quarantinemempool",
@@ -7036,6 +7113,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "assumevalidage",
     "stopatheight",
     "testactivationheight",
+    "vbparams",
     "consensus",
     // Indexing
     "txindex",
@@ -9389,6 +9467,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            vbparams: Vec::new(),
             mocktime: None,
             mempoolfullrbf: None,
             maxmempool: None,
@@ -9684,6 +9763,7 @@ testactivationheight=bip34@2
             assumevalidage: None,
             stopatheight: None,
             testactivationheight: Vec::new(),
+            vbparams: Vec::new(),
             mocktime: None,
             mempoolfullrbf: None,
             maxmempool: None,

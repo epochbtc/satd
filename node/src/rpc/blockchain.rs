@@ -175,27 +175,135 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     out
 }
 
-/// `getdeploymentinfo` — report the activation status of buried softfork
-/// deployments, at the chain tip or at a caller-named block.
+/// A [`BlockView`](crate::validation::versionbits::BlockView) over the block
+/// index, so the BIP 9 machinery can walk parents for any block the caller
+/// names — including one on a stale fork, where the height index is no help.
+struct ChainBlockView<'a>(&'a ChainState);
+
+impl crate::validation::versionbits::BlockView for ChainBlockView<'_> {
+    fn header(&self, hash: &BlockHash) -> Option<crate::validation::versionbits::HeaderInfo> {
+        let entry = self.0.get_block_index(hash)?;
+        Some(crate::validation::versionbits::HeaderInfo {
+            prev: entry.header.prev_blockhash,
+            height: entry.height,
+            version: entry.header.version.to_consensus(),
+            time: entry.header.time,
+        })
+    }
+}
+
+/// Core's `GetScriptFlagNames(GetBlockScriptFlags(block))`, for the
+/// `script_flags` array.
 ///
-/// Core models both BIP 9 (versionbits) and buried (height-gated)
-/// deployments. satd has no BIP 9 deployments — everything is buried — so
-/// the output is a map of `{ name: { type, active, height } }`.
+/// Core keeps P2SH, WITNESS and TAPROOT on unconditionally (bar two
+/// historical exception blocks) and adds the rest as their buried deployments
+/// become active *at* this block — `DeploymentActiveAt`, i.e. `height >=
+/// activation`, one lower than the `active` field of a deployment entry,
+/// which is `DeploymentActiveAfter`. The names come out sorted because Core
+/// reads them from a `std::map<std::string, …>`.
+fn block_script_flag_names(network: Network, height: u32) -> Vec<&'static str> {
+    let h = crate::validation::script::activation_heights(network);
+    let mut names = vec!["P2SH", "TAPROOT", "WITNESS"];
+    if height >= h.dersig {
+        names.push("DERSIG");
+    }
+    if height >= h.cltv {
+        names.push("CHECKLOCKTIMEVERIFY");
+    }
+    if height >= h.csv {
+        names.push("CHECKSEQUENCEVERIFY");
+    }
+    if height >= h.segwit {
+        names.push("NULLDUMMY");
+    }
+    names.sort_unstable();
+    names
+}
+
+/// One BIP 9 deployment as `getdeploymentinfo` reports it — Core's
+/// `SoftForkDescPushBack` for a `DeploymentPos`.
+fn bip9_entry(
+    dep: &crate::validation::versionbits::Bip9Deployment,
+    info: &crate::validation::versionbits::Bip9Info,
+    height: u32,
+) -> Value {
+    let mut bip9 = serde_json::Map::new();
+    // Core emits `bit` only when there are signalling statistics to read it
+    // against, so an always-active or never-active deployment omits it.
+    if info.stats.is_some() {
+        bip9.insert("bit".to_string(), json!(dep.bit));
+    }
+    bip9.insert("start_time".to_string(), json!(dep.start_time));
+    bip9.insert("timeout".to_string(), json!(dep.timeout));
+    bip9.insert(
+        "min_activation_height".to_string(),
+        json!(dep.min_activation_height),
+    );
+    bip9.insert("status".to_string(), json!(info.current_state.as_str()));
+    bip9.insert("since".to_string(), json!(info.since));
+    bip9.insert("status_next".to_string(), json!(info.next_state.as_str()));
+    if let Some(stats) = &info.stats {
+        let mut st = serde_json::Map::new();
+        st.insert("period".to_string(), json!(stats.period));
+        st.insert("elapsed".to_string(), json!(stats.elapsed));
+        st.insert("count".to_string(), json!(stats.count));
+        // Core drops both once locked in, where they say nothing.
+        if stats.threshold > 0 || stats.possible {
+            st.insert("threshold".to_string(), json!(stats.threshold));
+            st.insert("possible".to_string(), json!(stats.possible));
+        }
+        bip9.insert("statistics".to_string(), Value::Object(st));
+        if let Some(sig) = &info.signalling {
+            bip9.insert("signalling".to_string(), json!(sig));
+        }
+    }
+
+    let mut rv = serde_json::Map::new();
+    rv.insert("type".to_string(), json!("bip9"));
+    let mut is_active = false;
+    if let Some(active_since) = info.active_since {
+        rv.insert("height".to_string(), json!(active_since));
+        is_active = active_since <= height + 1;
+    }
+    rv.insert("active".to_string(), json!(is_active));
+    rv.insert("bip9".to_string(), Value::Object(bip9));
+    Value::Object(rv)
+}
+
+/// `getdeploymentinfo` — report the activation status of every deployment
+/// Bitcoin Core reports, at the chain tip or at a caller-named block.
+///
+/// Core models two kinds. **Buried** deployments are height-gated and report
+/// `{type: "buried", active, height}`; satd's are `bip34`, `bip66`, `bip65`,
+/// `csv` and `segwit`. **BIP 9** deployments report `{type: "bip9", active,
+/// height?, bip9: {…}}`; Core v31.1 has exactly two, `testdummy` and
+/// `taproot` (`DeploymentInfo`, `src/rpc/blockchain.cpp`).
 ///
 /// The deployment *names* are Core's reporting spellings from
-/// `DeploymentName()` in `src/deploymentinfo.cpp`: `bip34`, `bip65`,
-/// `bip66`, `csv`, `segwit`. Note the asymmetry Core itself carries —
-/// `-testactivationheight` takes `cltv`/`dersig` on the way in
-/// (`GetBuriedDeployment()`) but `getdeploymentinfo` reports `bip65`/`bip66`
+/// `DeploymentName()` in `src/deploymentinfo.cpp`. Note the asymmetry Core
+/// itself carries — `-testactivationheight` takes `cltv`/`dersig` on the way
+/// in (`GetBuriedDeployment()`) but `getdeploymentinfo` reports `bip65`/`bip66`
 /// on the way out. Core's test framework keys on the reporting spelling.
 ///
 /// `active` follows Core's `DeploymentActiveAfter`: a buried deployment is
 /// active for the block *after* the one queried, i.e.
 /// `height + 1 >= activation_height`.
+///
+/// **`taproot` is reported, not computed.** satd activates taproot at a fixed
+/// height and never counts signalling, so its status here is derived from
+/// that height rather than from a version-bits walk. On every network satd
+/// supports the outcome is already settled (regtest, signet and testnet4
+/// activate it from genesis; mainnet and testnet3 at their historical
+/// heights), so the values agree with Core's for any block at or above the
+/// activation height. Running the real state machine over a 2016-block period
+/// back to mainnet height 709,632 would read hundreds of thousands of index
+/// entries to answer one RPC.
 pub fn get_deployment_info(
     chain_state: &ChainState,
     blockhash: Option<&str>,
 ) -> Result<Value, (i32, String)> {
+    use crate::validation::versionbits as vb;
+
     // One read: a tip hash and a tip height taken separately can straddle a
     // connect and describe two different blocks.
     let (hash, height) = match blockhash {
@@ -209,9 +317,10 @@ pub fn get_deployment_info(
         }
     };
     let next_height = height + 1;
-    let heights = crate::validation::script::activation_heights(chain_state.network);
+    let network = chain_state.network;
+    let heights = crate::validation::script::activation_heights(network);
 
-    // Helper: one deployment object.
+    // Helper: one buried deployment object.
     let buried = |height: u32| -> Value {
         json!({
             "type": "buried",
@@ -226,12 +335,45 @@ pub fn get_deployment_info(
     map.insert("bip65".to_string(), buried(heights.cltv));
     map.insert("csv".to_string(), buried(heights.csv));
     map.insert("segwit".to_string(), buried(heights.segwit));
-    map.insert("taproot".to_string(), buried(heights.taproot));
+
+    let view = ChainBlockView(chain_state);
+    let testdummy = vb::testdummy_deployment_configured(network);
+    map.insert(
+        "testdummy".to_string(),
+        bip9_entry(&testdummy, &vb::info(&view, &hash, &testdummy), height),
+    );
+
+    // Taproot: satd's height model, rendered in Core's BIP 9 shape. See the
+    // doc comment above for why this does not run the state machine.
+    let taproot_dep = vb::taproot_deployment(network);
+    let taproot_active = next_height >= heights.taproot.max(1) || heights.taproot == 0;
+    let taproot_state = if taproot_active {
+        vb::ThresholdState::Active
+    } else {
+        vb::ThresholdState::Defined
+    };
+    let taproot_info = vb::Bip9Info {
+        current_state: taproot_state,
+        next_state: taproot_state,
+        // Core's `since` is the height the *current* state began. For a
+        // deployment still `defined` that is 0, not the height it will
+        // activate at — `StateSinceHeight` cannot know about a future
+        // transition.
+        since: if taproot_active { heights.taproot } else { 0 },
+        stats: None,
+        signalling: None,
+        active_since: taproot_active.then_some(heights.taproot),
+    };
+    map.insert(
+        "taproot".to_string(),
+        bip9_entry(&taproot_dep, &taproot_info, height),
+    );
 
     Ok(json!({
-        "deployments": map,
         "hash": hash.to_string(),
         "height": height,
+        "script_flags": block_script_flag_names(network, height),
+        "deployments": map,
     }))
 }
 
@@ -1327,7 +1469,7 @@ pub fn save_mempool(
 /// satd via `loadtxoutset`.
 ///
 /// Returns a JSON object matching Core's shape:
-///   `{coins_written, base_hash, base_height, path, txoutset_hash}`.
+///   `{coins_written, base_hash, base_height, path, txoutset_hash, nchaintx}`.
 ///
 /// `txoutset_hash` is Core's `hash_serialized_3` UTXO-set hash, NOT the
 /// SHA-256 of the file. It is the double SHA-256 (`HashWriter::GetHash`)
@@ -1348,6 +1490,15 @@ pub fn dump_txout_set(chain_state: &ChainState, path: &str) -> Result<Value, (i3
             "base_height": summary.base_height,
             "path": summary.path.to_string_lossy(),
             "txoutset_hash": hex::encode(summary.hash_serialized_3),
+            // Core's `nChainTx` at the base block: the cumulative
+            // transaction count of the chain up to and including it. This
+            // was missing, and `loadtxoutset` on the other side needs it —
+            // it is one of the three numbers an AssumeUTXO anchor is made
+            // of (`chain::assumeutxo`), so a snapshot dumped without it
+            // cannot be turned into one.
+            "nchaintx": chain_state
+                .cumulative_tx_count(&summary.base_hash)
+                .unwrap_or(0),
         })),
         Err(DumpError::RefuseOverwrite(p)) => Err((
             -8,
