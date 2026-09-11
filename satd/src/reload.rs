@@ -1018,6 +1018,9 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("mcpmtlsclientallow", mcp_mtls_client_allow),
         restart!("mcpauth", mcp_auth),
         restart!("mcpallowremote", mcp_allow_remote),
+        // The allowlist is baked into the transport's config when the service
+        // is constructed, so it moves with a restart like the rest of them.
+        restart!("mcpallowedhost", mcp_allowed_hosts),
         // ---- Metrics / health ----
         restart!("metricsport", metricsport),
         restart!("metricsbind", metricsbind),

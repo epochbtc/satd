@@ -624,6 +624,42 @@ pub struct McpTls {
     pub handshake_timeout: std::time::Duration,
 }
 
+/// `Host` authorities the MCP transport accepts unconditionally.
+///
+/// These are the loopback names, and they are always in the allowlist: a
+/// listener that stopped answering `Host: localhost` would break `sat-cli`,
+/// the container healthcheck, and every same-host client, whatever else the
+/// operator has configured.
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// Build the `Host` allowlist for the MCP transport.
+///
+/// The transport validates `Host` to blunt DNS rebinding. An attacker who can
+/// make a browser on the operator's network resolve a name they control to
+/// this listener's address gets the browser to issue same-origin requests to
+/// it; the `Host` header is what still names the attacker's domain, and so is
+/// what distinguishes that request from a real one. TLS does not help — the
+/// handshake succeeds either way — and rmcp's `Origin` validation is off by
+/// default, which leaves `Host` as the only browser-facing check.
+///
+/// So this is additive, and never subtractive: `extra` widens the list,
+/// [`LOOPBACK_HOSTS`] is always present, and there is no configuration that
+/// empties it (which rmcp reads as "accept every Host").
+fn allowed_hosts(extra: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = LOOPBACK_HOSTS.iter().map(|h| h.to_string()).collect();
+    for host in extra {
+        let host = host.trim();
+        // rmcp matches case-insensitively, so a case-variant duplicate is
+        // redundant rather than additive — drop it so the logged list is the
+        // set actually in effect.
+        if host.is_empty() || hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            continue;
+        }
+        hosts.push(host.to_string());
+    }
+    hosts
+}
+
 /// Serve MCP over streamable HTTP (optionally TLS).
 ///
 /// When `auth` is `Some` (operator set `-mcpauth`, which requires `authfile`),
@@ -636,11 +672,16 @@ pub struct McpTls {
 /// (server-auth, plus mTLS when `mtls_enabled`) before HTTP is served. The
 /// caller refuses a non-loopback bind without TLS, so a remote MCP listener
 /// always encrypts the bearer token in transit.
+///
+/// `extra_allowed_hosts` (`-mcpallowedhost`) names further `Host` authorities
+/// the transport accepts, on top of the loopback names it always accepts. See
+/// [`allowed_hosts`] for why the check exists and why this is additive.
 pub async fn serve_http(
     ctx: Arc<McpContext>,
     bind_addr: std::net::SocketAddr,
     auth: Option<Arc<satd_auth::TokenStore>>,
     tls: Option<Arc<McpTls>>,
+    extra_allowed_hosts: &[String],
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::transport::streamable_http_server::{
@@ -653,6 +694,13 @@ pub async fn serve_http(
     let mut config = StreamableHttpServerConfig::default();
     config.stateful_mode = true;
     config.cancellation_token = cancel.clone();
+    config.allowed_hosts = allowed_hosts(extra_allowed_hosts);
+    if !extra_allowed_hosts.is_empty() {
+        tracing::info!(
+            allowed_hosts = %config.allowed_hosts.join(", "),
+            "MCP Host allowlist"
+        );
+    }
 
     let session_manager = std::sync::Arc::new(LocalSessionManager::default());
 
@@ -877,5 +925,38 @@ mod conn_tests {
         // The connection task must finish cleanly (a panic would make this
         // join return an Err and fail the test).
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn allowed_hosts_always_keeps_loopback() {
+        // The regression this guards: an empty `-mcpallowedhost` must leave
+        // the allowlist at the loopback names, not empty. rmcp reads an empty
+        // list as "accept every Host", which would silently drop the
+        // DNS-rebinding check for every existing deployment.
+        assert_eq!(super::allowed_hosts(&[]), ["localhost", "127.0.0.1", "::1"]);
+
+        let with_name = super::allowed_hosts(&["node.example".to_string()]);
+        assert_eq!(
+            with_name,
+            ["localhost", "127.0.0.1", "::1", "node.example"],
+            "configured hosts must be additive, not a replacement"
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_drops_redundant_entries() {
+        let hosts = super::allowed_hosts(&[
+            "  padded.example  ".to_string(),
+            "LOCALHOST".to_string(),
+            "node.example".to_string(),
+            "Node.Example".to_string(),
+            String::new(),
+        ]);
+        // `LOCALHOST` and the second `Node.Example` match case-insensitively in
+        // rmcp, so carrying them would only make the logged list misleading.
+        assert_eq!(
+            hosts,
+            ["localhost", "127.0.0.1", "::1", "padded.example", "node.example"]
+        );
     }
 }

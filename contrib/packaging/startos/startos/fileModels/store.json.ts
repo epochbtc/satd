@@ -13,6 +13,12 @@ export const shape = z
     network: z
       .enum(['mainnet', 'signet', 'testnet4', 'testnet', 'regtest'])
       .catch('mainnet'),
+    /**
+     * Comma-separated names for MCP's Host allowlist, from the MCP Hostnames
+     * action. Empty means loopback only, which is satd's own default and
+     * which refuses every request that arrives by name.
+     */
+    mcpHostnames: z.string().catch(''),
   })
   .strip()
 

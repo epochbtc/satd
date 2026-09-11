@@ -49,15 +49,27 @@ Requires Node 22+, Docker, `jq`, and:
   (`start-cli_x86_64-linux`). Note that `Start9Labs/shared-workflows` is the
   *legacy* build line and pins start-cli `v0.4.0-beta.9`; the SDK 2.0 line
   this package targets uses `start-technologies` instead.
-- **`squashfs-tools-ng`** — `pack` shells out to `tar2sqfs` to turn each image
-  layer set into the squashfs the `.s9pk` carries.
+- **`squashfs-tools-ng`** *and* **`squashfs-tools`** — two separate projects,
+  and `pack` needs a binary from each: `tar2sqfs` from the former to turn each
+  image layer set into a squashfs, `mksquashfs` from the latter for the
+  `.s9pk` itself. A build with only one of them fails partway with a bare
+  `No such file or directory` naming the missing binary. Homebrew has no
+  `squashfs-tools-ng` formula, so on macOS this step wants a `linux/arm64`
+  container rather than a host toolchain.
+- **A container runtime.** `pack` resolves the image pinned in the manifest
+  and embeds its layers. `start-cli` reaches for `podman` first and reports
+  `Docker Error: podman: No such file or directory` when it is absent, even
+  with Docker working — set `STARTOS_USE_PODMAN=false` to use Docker.
 - **A packaging workspace in the parent directory.** `start-cli` looks for a
   `.startos/` marker in the directory *containing* the package repo, so
   `contrib/packaging/.startos/` has to exist. Create it with
   `cd contrib/packaging && start-cli s9pk init-workspace` — note that also
   clones the whole `start-technologies` monorepo beside it, which is not
-  wanted here; only `.startos/` is required, and it is gitignored because it
-  holds a per-machine signing key.
+  wanted here. An empty `.startos/` is *not* enough: start-cli 2.0.0 refuses
+  to pack with `Uninitialized: No packaging workspace found` unless it holds
+  the `config.yaml` and `build.key.pem` that `init-workspace` generates. Run
+  it in a scratch directory and copy those two files across to avoid the
+  clone. `.startos/` is gitignored because it holds a per-machine signing key.
 
 Then:
 
@@ -116,8 +128,9 @@ Installed and run on **StartOS 0.4.0.1** (x86_64), sideloaded with
   certificate chaining to the server's root CA: Esplora
   `GET /api/blocks/tip/height` → 200, Electrum `server.version` →
   `satd-electrs-compatible`, both verifying against that CA with
-  `Verify return code: 0 (ok)`. MCP is 401 without a token and returns a
-  full `initialize` result with the token the **MCP Token** action prints.
+  `Verify return code: 0 (ok)`. MCP is 401 without a token and, once the
+  **MCP Hostnames** action names the address the client uses, returns a full
+  `initialize` result with the token the **MCP Token** action prints.
 - The **Network** action moves a running node between chains, re-rendering
   the config and rebinding the P2P port each time.
 
@@ -139,8 +152,26 @@ a change to that file runs this job too), and
 `test/reactivity.test.ts` guards the two defects above that a typecheck
 cannot see.
 
-Still unverified: `aarch64` — only the x86_64 `.s9pk` has been installed —
-and backup/restore.
+The `aarch64` package has since been built and installed the same way, on an
+arm64 machine, against StartOS 0.4.0.1. Everything above holds there: the
+image's binaries are genuinely `aarch64` (`e_machine` 0xb7, not an emulated
+x86_64), satd-init produces the same artefacts, the node syncs, and every
+interface answers through the proxy. Nothing failed for a reason that had
+anything to do with the architecture.
+
+That install is also what surfaced the fourth defect, which x86_64 would have
+shown just as readily had anything reached MCP by name: satd left the MCP
+transport's `Host` allowlist at its loopback-only default, so every request
+arriving by hostname was answered 403 before authentication ran. The StartOS
+proxy forwards the client's `Host` unchanged and performs no validation of
+its own, which makes satd's check the only DNS-rebinding defence on that
+path — so it is kept, and the **MCP Hostnames** action is how the names
+clients use reach it. The package cannot derive them: `getHostInfo` carries
+only operator-added custom domains, the `.local` name comes from the server's
+own hostname, which no effect exposes, and the container's hostname is a
+generated id.
+
+Still unverified: backup/restore.
 
 ## Before publishing
 

@@ -451,6 +451,7 @@ the taxonomy and the details each event carries.
 | `mcpmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values. |
 | `mcpauth` | false | restart | satd | Require bearer tokens (`mcp:*`) on the MCP HTTP server (requires `authfile`). |
 | `mcpallowremote` | false | restart | satd | Permit a non-loopback MCP HTTP bind (requires `mcpauth` + TLS). |
+| `mcpallowedhost` | loopback only | restart | satd | Extra `Host` values the MCP listener accepts, as `host` or `host:port` (repeatable, comma-separated). Loopback names are always accepted. Required to reach MCP by hostname. |
 
 ## Metrics / health
 

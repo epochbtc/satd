@@ -87,7 +87,8 @@ item below is (or will be) written up in full in the in-development
   `sat-cli`, `sat-tui` and MCP, sharing the reference stack's `satd-init` and
   certificate scheme rather than re-implementing them. Each has been
   installed on a real server of its own kind and driven through every
-  interface it exports; `x86_64` on both, `aarch64` not yet.
+  interface it exports: `x86_64` on both, and `aarch64` for StartOS. The
+  `aarch64` Umbrel package is still unverified.
 - `sat-cli` and `sat-tui` can reach a TLS-terminated RPC listener:
   `-rpctls`, `-rpccacert`, and `-rpcclientcert` / `-rpcclientkey` for mTLS.
   Previously an operator who enabled `-rpctlsbind` had to keep the plain
@@ -98,6 +99,14 @@ item below is (or will be) written up in full in the in-development
   outbound connection of a chosen type (`outbound-full-relay`,
   `block-relay-only`, `addr-fetch`, `feeler`). `getpeerinfo` now reports the
   real `connection_type`, and each type behaves as Core's does.
+- `-mcpallowedhost=<host[:port]>` (repeatable, comma-separated) names further
+  `Host` header values the MCP listener accepts, on top of the loopback names
+  it always accepts. Required to reach MCP by hostname — see the fix below.
+  `satd-init` derives it from the hostname it issues the certificate for, and
+  honours `SATD_MCP_ALLOWED_HOSTS` for a proxy or alias it cannot know about.
+- An **MCP Hostnames** action on the StartOS package, for the names that
+  install is reached by. StartOS assigns them, and nothing the package can
+  read reports them, so they are asked for rather than derived.
 - `validateaddress` reports *why* an address is invalid: Core's `error`
   string plus `error_locations` for a Bech32 checksum failure.
 - `-vbparams=deployment:start:end[:min_activation_height]`, Core's
@@ -110,6 +119,13 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- MCP answered `403 Forbidden` to every request that did not arrive with a
+  loopback `Host` header, so a listener reached by hostname — which is every
+  reverse-proxied and app-store deployment — was unreachable even with
+  `-mcpallowremote`, `-mcpauth` and TLS all correctly configured. The
+  transport's DNS-rebinding allowlist was left at its loopback-only default;
+  `-mcpallowedhost` now extends it. The check itself is unchanged, and cannot
+  be turned off.
 - CI: every `apt-get update` drops the runner image's third-party apt sources
   first. A hash-sum mismatch on Google's Chrome repository — which none of the
   installed packages come from — was failing the whole step, and with it every

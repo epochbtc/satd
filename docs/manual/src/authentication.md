@@ -183,6 +183,12 @@ everything the connection carries:
 `-eventsgrpcmtls` satisfies the events-gRPC requirement on its own: it already
 requires the certificate and key, and it authenticates without a token.
 
+MCP has one further requirement that is not an authentication gate: its
+transport validates the `Host` header against an allowlist that defaults to
+loopback, so a remote MCP bind also needs `-mcpallowedhost` naming every
+hostname clients use, or it answers `403` before auth runs. See
+[MCP](mcp.md#authentication).
+
 `-streamwsallowremote` is the exception, because that transport has no TLS of
 its own. A remote streamws bind sends its bearer token in cleartext unless a
 TLS-terminating proxy fronts it — prefer the loopback bind plus a proxy.

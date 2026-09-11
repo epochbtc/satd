@@ -15,6 +15,13 @@ const dict = {
   'satd-init mints the token on the first start. Start the service once, then run this action again.': 10,
   'Send this as `Authorization: Bearer <token>` to the MCP interface.': 11,
   'Bearer token': 12,
+  // startos/actions/mcpHostnames.ts
+  'MCP Hostnames': 36,
+  'The names this server is reached by, for MCP clients': 37,
+  'Hostnames': 38,
+  'The hostname you type in the address bar to reach this server, such as my-server.local. Separate several with commas. Add one for every name clients use — an address reached by a name not listed here is refused.': 39,
+  'MCP only. The other interfaces are unaffected by this setting.': 40,
+  'A hostname, or hostname:port, separated by commas. Not a full URL — no https:// and no path.': 41,
   // startos/actions/network.ts
   'Network': 13,
   'Which Bitcoin network this node runs on': 14,

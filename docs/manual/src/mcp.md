@@ -58,6 +58,15 @@ MCP uses the [unified auth system](authentication.md):
   `--mcpallowremote` (which in turn requires `--mcpauth` and `--authfile`) and
   TLS (`--mcpcert`/`--mcpkey`). satd refuses to start a routable MCP listener
   that lacks either auth or TLS.
+- **The `Host` header is validated.** The transport accepts only the names in
+  its allowlist, which is loopback (`localhost`, `127.0.0.1`, `::1`) plus
+  whatever `--mcpallowedhost` adds; anything else gets `403` before auth runs.
+  This is a DNS-rebinding defence, and TLS does not substitute for it: a
+  browser induced to resolve an attacker's name to this address completes a
+  perfectly valid handshake, and `Host` is what still names that domain.
+  **A listener reached by hostname needs `--mcpallowedhost` or every request
+  is refused.** The option is additive — loopback stays allowed, and no value
+  empties the list.
 
 A single capability, `mcp:*`, gates all of MCP. There is no read-only versus
 mutating split, so any token with `mcp:*` can call every tool.
@@ -101,11 +110,19 @@ capability:
 satd --datadir=/path/to/node --mcp --mcpport=18888 \
   --mcpbind=0.0.0.0 --mcpallowremote \
   --mcpauth --authfile=/etc/satd/auth.toml \
-  --mcpcert=/etc/satd/mcp.crt --mcpkey=/etc/satd/mcp.key
+  --mcpcert=/etc/satd/mcp.crt --mcpkey=/etc/satd/mcp.key \
+  --mcpallowedhost=NODE_HOST
 ```
 
 The server is then reachable at `https://NODE_HOST:18888/`. Clients
-authenticate with an `Authorization: Bearer <token>` header. See
+authenticate with an `Authorization: Bearer <token>` header.
+
+`--mcpallowedhost` must name every hostname clients put in the URL — the name
+in the certificate is not consulted, and neither is the machine's own
+hostname. Repeat the option, or give it a comma-separated list, for more than
+one. An entry may be a bare host (any port) or a `host:port` authority (that
+port only). Without it, every request to `https://NODE_HOST:18888/` is
+answered `403 Forbidden`. See
 [Authentication](#authentication) and [Transport security](#transport-security-tls).
 
 ### Claude Code

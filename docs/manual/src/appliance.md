@@ -10,7 +10,7 @@ others.
 |---|---|---|---|
 | Reference stack | compose: satd plus optional third-party overlays | `contrib/stack/` | satd supported; overlays best-effort |
 | Appliance image | a bootable VM with satd, wallets and Lightning | `contrib/appliance/` | satd supported; bundled software best-effort |
-| Store packages | satd, `sat-cli`, `sat-tui` and MCP only | `contrib/packaging/` | supported on `x86_64`; see below |
+| Store packages | satd, `sat-cli`, `sat-tui` and MCP only | `contrib/packaging/` | StartOS supported; Umbrel supported on `x86_64`; see below |
 
 > **The appliance image and the stack's overlays bundle third-party software
 > (wallets, Lightning, ecash, and others) so you can try satd end to end.
@@ -27,10 +27,15 @@ others.
 
 Both store packages have been installed on a real server and driven through
 every interface they export — see *What is checked, and how* below for what
-that covered. Both were installed on `x86_64`. The `aarch64` `.s9pk` and the
-`arm64` half of the container image build and pass the same automated checks,
-but neither has been installed on an `aarch64` server yet, which is why the
-table says `x86_64` rather than "supported" outright.
+that covered. Both on `x86_64`, and the StartOS package on `aarch64` as well:
+built and installed on an arm64 machine, with every interface answering as it
+does on `x86_64`, and the binaries in the image genuinely `aarch64` rather
+than emulated. Nothing there failed for a reason to do with the architecture.
+
+The Umbrel package has not been installed on `aarch64`, which is why the table
+still qualifies that one. The `arm64` half of the container image is exercised
+by the reference stack's own test suite on an arm64 host, but umbrelOS ships
+`aarch64` only as a Raspberry Pi image, with no supported path to a VM.
 
 ## The reference stack
 
@@ -276,17 +281,20 @@ rather than asserted:
   `/readyz`, which is 503 for the whole of a sync.
 
 The store packages were additionally installed and driven by hand — on
-StartOS 0.4.0.1 and on umbrelOS, both `x86_64`. That is where those two
-defects were found, along with an image pin that named a tag predating
-`satd-init`: none of the three was visible to any static check, and the
-`/readyz` gate had passed an earlier spot check only because the node under
-it was minutes old. What was covered: `satd-init` producing this install's
+StartOS 0.4.0.1 and on umbrelOS on `x86_64`, and on StartOS 0.4.0.1 again on
+`aarch64`. That is where those two defects were found, along with an image
+pin that named a tag predating `satd-init`: none of the three was visible to
+any static check, and the `/readyz` gate had passed an earlier spot check only
+because the node under it was minutes old. A fourth came out of the `aarch64`
+install and was not about the architecture at all — MCP refused every request
+that arrived by hostname, because satd had left the transport's `Host`
+allowlist at its loopback-only default. See [MCP](mcp.md#authentication). What was covered: `satd-init` producing this install's
 CA, certificate, MCP token and config; both health checks; Esplora and
 Electrum answering through the OS proxy against the server's root CA with
 `Verify return code: 0 (ok)`; MCP refusing an unauthenticated call and
 completing an `initialize` with the token the package prints; switching a
 running node between chains; and satd returning by itself after a reboot.
-Not yet covered on either package: `aarch64`, and StartOS backup/restore.
+Not yet covered: `aarch64` on Umbrel, and StartOS backup/restore.
 
 Every probe that verifies a certificate is paired with the negative control
 that the same handshake without the CA must fail. A probe that would pass

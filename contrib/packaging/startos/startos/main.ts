@@ -31,7 +31,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
    */
   const store = await storeJson.read().const(effects)
   if (!store) throw new Error('No store')
-  const { network } = store
+  const { network, mcpHostnames } = store
 
   const satdSub = await sdk.SubContainer.eager(
     effects,
@@ -115,6 +115,25 @@ export const main = sdk.setupMain(async ({ effects }) => {
           // itself, so this only labels satd's own certificate — the one used
           // on the bridge and for MCP.
           SATD_TLS_HOSTNAME: 'satd.startos',
+          /**
+           * And the names they actually type, which are not that one.
+           *
+           * The OS proxy forwards the client's `Host` unchanged, and MCP's
+           * transport refuses any `Host` outside its allowlist — a
+           * DNS-rebinding defence, and on StartOS the only one, since the
+           * proxy does no `Host` validation itself. So every name a client
+           * uses has to be listed or its requests are answered 403.
+           *
+           * The package cannot work these out: `getHostInfo` carries only
+           * operator-added custom domains, the `.local` name comes from the
+           * server's hostname which no effect exposes, and the container's
+           * own hostname is a generated id. Hence the MCP Hostnames action.
+           *
+           * `.const` above is what makes editing that action take effect:
+           * main re-runs, satd-init re-renders the config, and satd restarts
+           * onto it. Same mechanism the Network action relies on.
+           */
+          SATD_MCP_ALLOWED_HOSTS: mcpHostnames,
           SATD_P2P_PORT: String(p2pPorts[network]),
           SATD_CA_EXPORT_HINT:
             'the CA certificate is shown by this service’s "CA Certificate" action',

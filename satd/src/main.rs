@@ -2736,11 +2736,27 @@ async fn main() {
             };
             let ctx = mcp_ctx.clone();
             let rx = shutdown_rx.clone();
+            // The MCP transport validates `Host` against a loopback-only
+            // allowlist. A listener reached by hostname — which is every
+            // reverse-proxied or appliance deployment — answers 403 to every
+            // request until the operator names that hostname.
+            if !mcp_bind.ip().is_loopback() && config.mcp_allowed_hosts.is_empty() {
+                tracing::warn!(
+                    "MCP is bound to {mcp_bind} but --mcpallowedhost is not set. Only requests \
+                     whose Host header is a loopback name are accepted; a client reaching this \
+                     listener by hostname will get 403. Set --mcpallowedhost=<hostname> for each \
+                     name clients use."
+                );
+            }
+            let mcp_allowed_hosts = config.mcp_allowed_hosts.clone();
             // MCP HTTP stays on the consensus runtime: it exposes a
             // block-connecting `generate_blocks` tool, so — like JSON-RPC — it
             // must not originate block connection from the API runtime.
             tokio::spawn(async move {
-                if let Err(e) = satd_mcp::serve_http(ctx, mcp_bind, mcp_auth, mcp_tls, rx).await {
+                if let Err(e) =
+                    satd_mcp::serve_http(ctx, mcp_bind, mcp_auth, mcp_tls, &mcp_allowed_hosts, rx)
+                        .await
+                {
                     tracing::error!("MCP HTTP server error: {}", e);
                 }
             });
