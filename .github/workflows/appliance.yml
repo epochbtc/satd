@@ -96,14 +96,22 @@ jobs:
           files="$(git diff --name-only "$base"...HEAD)"
           echo "changed files:"; echo "$files" | sed 's/^/  /'
           match() { grep -qE "$1" <<< "$files" && echo true || echo false; }
+          # This file gates itself. Every filter below carries it, because a
+          # workflow that cannot be triggered by its own edits cannot test
+          # them: the four dependabot action bumps that landed as #728-#731
+          # each rewrote a `uses:` line in this file and each skipped every
+          # job that consumes it. The two expensive jobs stay behind the
+          # `appliance-ci` label regardless, so what this actually buys is
+          # the two cheap ones running on a workflow edit.
+          self='^\.github/workflows/appliance\.yml$'
           # The stack job also covers the runtime image, since it ships
           # mkca.sh, satd-init and the config template.
-          echo "stack=$(match '^(contrib/stack/|contrib/docker/|Dockerfile$)')" >> "$GITHUB_OUTPUT"
-          echo "appliance=$(match '^(contrib/appliance/|contrib/stack/|contrib/systemd/)')" >> "$GITHUB_OUTPUT"
+          echo "stack=$(match "^(contrib/stack/|contrib/docker/|Dockerfile$)|$self")" >> "$GITHUB_OUTPUT"
+          echo "appliance=$(match "^(contrib/appliance/|contrib/stack/|contrib/systemd/)|$self")" >> "$GITHUB_OUTPUT"
           # Widened past tls/tests: compose-test.sh asserts invariants over the
           # compose files, the appliance CLI and the Umbrel package, so it has
           # to run when any of those change.
-          echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)')" >> "$GITHUB_OUTPUT"
+          echo "scripts=$(match "^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)|$self")" >> "$GITHUB_OUTPUT"
           # satd-init as well as the package: test/networks.test.ts reads
           # contrib/stack/satd/satd-init and compares its network list and
           # P2P ports against the package's own. That guard exists because
@@ -111,7 +119,7 @@ jobs:
           # P2P port, a stale name fails at first start — and gating only on
           # contrib/packaging/startos/ would skip it on exactly the change
           # it is there to catch.
-          echo "packages=$(match '^(contrib/packaging/startos/|contrib/stack/satd/satd-init$)')" >> "$GITHUB_OUTPUT"
+          echo "packages=$(match "^(contrib/packaging/startos/|contrib/stack/satd/satd-init$)|$self")" >> "$GITHUB_OUTPUT"
 
   # Cheap and always worth running when touched: no docker, no network.
   scripts:
