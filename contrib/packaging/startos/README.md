@@ -104,15 +104,40 @@ typescript-eslint]`, which makes 127 of the 158 entries in
 than edges npm resolves. `overrides` regenerates the lockfile and leaves
 those versions exactly as they were, and 2.0.9 is the newest SDK published.
 
-They are also not reachable. eslint and typescript-eslint are the SDK's own
-linting toolchain; nothing in `package.json`'s scripts invokes either, and
-the bundle the `.s9pk` actually ships (`javascript/index.js`) contains no
-`js-yaml` or `brace-expansion` code at all — its only matches for `eslint`
-are `// eslint-disable-next-line` comments in vendored source.
+Nine alerts over five instances: three advisory ranges each against
+`brace-expansion` 1.1.15 (at three paths), `brace-expansion` 5.0.6, and
+`js-yaml` 4.2.0. Every one sits under the SDK's bundled `eslint`,
+`@eslint/eslintrc`, `@eslint/config-array` or
+`@typescript-eslint/typescript-estree`. GitHub scopes them `runtime`, which
+reflects their sitting inside a runtime package, not anything at runtime
+reaching them.
 
-`.github/dependabot.yml` records this and scopes an `ignore` to those two
-package names, so an advisory against something this package really does
-resolve still surfaces.
+That toolchain does run. `s9pk.mk` calls the SDK's `lint.mjs` as part of the
+`javascript/index.js` build gate, so eslint executes on every `make` — the
+reachability argument cannot rest on nothing invoking it. What does not run
+is the vulnerable code. Instrumenting all five instances and running the
+whole gate (`lint.mjs`, `npm run check`, `npm run build`):
+
+- `brace-expansion` is required by `minimatch` — eight loads — and its
+  export is called **zero** times. The advisories are all about expanding
+  `{}` groups, and the only glob in play is `startos/**/*.ts`, which has no
+  braces. `eslint.config.base.mjs` supplies exactly that one pattern.
+- `js-yaml` is **never loaded**. `lint.mjs` passes `overrideConfigFile: true`
+  with an inline config, so `eslintrc` never searches for a YAML config file
+  to parse.
+
+None of it ships, either. `javascript/index.js` requires nothing outside
+Node's builtins, and carries no `brace-expansion` or `js-yaml` code — its
+only matches for `eslint` are `eslint-disable` comments in vendored source.
+One false lead worth recording: the bundle does contain
+`tag:yaml.org,2002:`, 102 times. That is `yaml` 2.9.0, a different library
+under no advisory here — `YAMLParseError` and `LineCounter` are present,
+`YAMLException` and `DEFAULT_SCHEMA` are not.
+
+The nine alerts are dismissed as `not_used` on that evidence.
+`.github/dependabot.yml` scopes an `ignore` to those two package names, so
+an advisory against something this package really does resolve still
+surfaces.
 
 ## Status
 
