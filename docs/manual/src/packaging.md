@@ -136,14 +136,26 @@ unauthenticated HTTP endpoints on that port (default bind 127.0.0.1):
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | The process is alive and the event loop responds. Cheap. |
-| `GET /readyz` | RocksDB is open, headers are syncing, and peer count is above zero. Returns 503 during IBD. |
+| `GET /readyz` | The tip is within six blocks of the best headers tip seen from peers, and the block connector is making progress. 503 otherwise — for the whole of a sync, and whenever the connector has persistently failed. |
 | `GET /metrics` | Prometheus exposition format. |
 
-Wire these endpoints to a Docker `HEALTHCHECK`, Kubernetes liveness
-and readiness probes, or a systemd `ExecStartPost=` poll. The shipped
-`Type=notify` unit (see the systemd section) signals startup with
-`sd_notify(READY=1)`. Supervisors without notify support can poll
-`/readyz` instead.
+The two are not interchangeable, and the difference matters most where it
+is easiest to get wrong. `/readyz` returns 503 until the tip is within six
+blocks of the headers tip — on a fresh mainnet node, days — so it answers
+"should clients be sent here yet", not "is this process healthy". Wire it to
+a Kubernetes *readiness* probe or a load-balancer pool check, where 503
+means "route elsewhere for now".
+
+Do **not** wire `/readyz` to a Docker `HEALTHCHECK`, a Kubernetes *liveness*
+probe, or anything that restarts or alarms on a failure: a syncing node will
+sit unhealthy for the entire initial sync and be killed or reported as
+broken while it is working correctly. Use `/healthz`, or the image's own
+`satd-healthcheck`, which probes JSON-RPC liveness by default and is what
+every deployment in `contrib/` uses.
+
+The shipped `Type=notify` unit (see the systemd section) signals startup
+with `sd_notify(READY=1)`. Supervisors without notify support can poll
+`/healthz`.
 
 ## Configuration
 
@@ -198,9 +210,10 @@ Properties of the image:
   token), plus `openssl`. These are in the image so a deployment that
   cannot mount repository files — an Umbrel app, a StartOS package —
   behaves identically to `contrib/stack`.
-- `HEALTHCHECK`: `satd-healthcheck`, which reports liveness by default and
-  readiness when `SATD_HEALTH_URL` points at `/readyz`. See
-  [Health and readiness](#health-and-readiness).
+- `HEALTHCHECK`: `satd-healthcheck`, which probes JSON-RPC liveness. Point
+  `SATD_HEALTH_URL` at an HTTP endpoint to gate on that instead — but not at
+  `/readyz`, for the reason in [Health and
+  readiness](#health-and-readiness).
 - PID 1: `tini`, so SIGTERM forwards to satd cleanly.
 - Datadir: `/var/lib/satd`, declared as a `VOLUME`.
 - Exposed ports: `8333` (P2P) and `8332` (RPC). Map other ports with

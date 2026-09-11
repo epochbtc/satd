@@ -73,6 +73,35 @@ packs, so a type error or a failing test stops the build.
 The SDK ships the entire build as `s9pk.mk`; the `Makefile` here is one
 `include` line.
 
+`make` itself cannot run in CI — packing wants `start-cli`, `tar2sqfs` and a
+signing workspace, and `make install` wants a server. The parts that can are
+gated by the **app-store packages** job in `.github/workflows/appliance.yml`:
+`npm ci`, `tsc --noEmit`, the tests, and the `ncc` bundle. It runs on any PR
+touching this directory, and also on one touching
+`contrib/stack/satd/satd-init`, because `test/networks.test.ts` reads that
+file — gating only on this directory would skip the drift check on the very
+change that causes drift.
+
+### The lockfile advisories
+
+`npm audit` reports high-severity DoS advisories against `brace-expansion`
+and `js-yaml`, and they cannot be fixed here. `@start9labs/start-sdk`
+declares `bundleDependencies: [@start9labs/start-core, eslint,
+typescript-eslint]`, which makes 127 of the 158 entries in
+`package-lock.json` `inBundle: true` — files inside the SDK's tarball rather
+than edges npm resolves. `overrides` regenerates the lockfile and leaves
+those versions exactly as they were, and 2.0.9 is the newest SDK published.
+
+They are also not reachable. eslint and typescript-eslint are the SDK's own
+linting toolchain; nothing in `package.json`'s scripts invokes either, and
+the bundle the `.s9pk` actually ships (`javascript/index.js`) contains no
+`js-yaml` or `brace-expansion` code at all — its only matches for `eslint`
+are `// eslint-disable-next-line` comments in vendored source.
+
+`.github/dependabot.yml` records this and scopes an `ignore` to those two
+package names, so an advisory against something this package really does
+resolve still surfaces.
+
 ## Status
 
 Installed and run on **StartOS 0.4.0.1** (x86_64), sideloaded with
@@ -102,9 +131,13 @@ not have started at all.
 feeds is what admits the OS proxy on the real bridge, and the RPC interface
 answers.
 
-Also checked, locally: the package typechecks against `@start9labs/start-sdk`
-2.0.9, and `test/networks.test.ts` verifies the network list and every P2P
-port against `contrib/stack/satd/satd-init` itself, so the two cannot drift.
+Also checked, now on every PR that touches this directory: the package
+typechecks against `@start9labs/start-sdk` 2.0.9, `test/networks.test.ts`
+verifies the network list and every P2P port against
+`contrib/stack/satd/satd-init` itself so the two cannot drift (which is why
+a change to that file runs this job too), and
+`test/reactivity.test.ts` guards the two defects above that a typecheck
+cannot see.
 
 Still unverified: `aarch64` — only the x86_64 `.s9pk` has been installed —
 and backup/restore.

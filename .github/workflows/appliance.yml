@@ -1,22 +1,26 @@
 # Appliance CI — the reference stack and the downloadable VM image.
 #
-# Three things are gated here, in increasing cost. Only the first runs on an
+# Four things are gated here, in increasing cost. Only the first two run on an
 # ordinary pull request:
 #
 #   1. The static checks: the certificate script, the container healthcheck
 #      probe, and the compose/appliance invariants. Seconds, no docker, no
 #      network. Runs on any PR that touches them.
-#   2. The reference stack (contrib/stack): brought up on regtest, with every
+#   2. The app-store packages: the StartOS package's type check, unit tests
+#      and ncc bundle. Under a minute, needs only Node 22. Runs on any PR
+#      that touches contrib/packaging/startos — or satd-init, which its
+#      tests read.
+#   3. The reference stack (contrib/stack): brought up on regtest, with every
 #      TLS listener probed from outside the container against the CA the
 #      stack generated, plus LND syncing to the node over Neutrino and RTL
 #      served through the proxy. This is where a claim like "Sparrow can talk
 #      to this" is actually checked. ~20 minutes.
-#   3. The appliance image: built with mmdebstrap, booted under QEMU, and
+#   4. The appliance image: built with mmdebstrap, booted under QEMU, and
 #      inspected through the guest agent. This is the "the image is not
 #      broken" gate, and it boots the artifact itself rather than a
 #      test-only variant. ~20 minutes.
 #
-# 2 and 3 each compile satd from scratch, so together they cost around forty
+# 3 and 4 each compile satd from scratch, so together they cost around forty
 # minutes of runner time. They run on `v*` tags — the same trigger the release
 # workflow uses — and on workflow_dispatch, not on every pull request.
 #
@@ -73,6 +77,7 @@ jobs:
       stack: ${{ steps.filter.outputs.stack }}
       appliance: ${{ steps.filter.outputs.appliance }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      packages: ${{ steps.filter.outputs.packages }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,6 +89,7 @@ jobs:
             echo "stack=true"     >> "$GITHUB_OUTPUT"
             echo "appliance=true" >> "$GITHUB_OUTPUT"
             echo "scripts=true"   >> "$GITHUB_OUTPUT"
+            echo "packages=true"  >> "$GITHUB_OUTPUT"
             exit 0
           fi
           base="${{ github.event.pull_request.base.sha }}"
@@ -98,6 +104,14 @@ jobs:
           # compose files, the appliance CLI and the Umbrel package, so it has
           # to run when any of those change.
           echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)')" >> "$GITHUB_OUTPUT"
+          # satd-init as well as the package: test/networks.test.ts reads
+          # contrib/stack/satd/satd-init and compares its network list and
+          # P2P ports against the package's own. That guard exists because
+          # the two drifting is silent — a stale port publishes the wrong
+          # P2P port, a stale name fails at first start — and gating only on
+          # contrib/packaging/startos/ would skip it on exactly the change
+          # it is there to catch.
+          echo "packages=$(match '^(contrib/packaging/startos/|contrib/stack/satd/satd-init$)')" >> "$GITHUB_OUTPUT"
 
   # Cheap and always worth running when touched: no docker, no network.
   scripts:
@@ -129,6 +143,54 @@ jobs:
             contrib/appliance/firstboot/satd-appliance-firstboot \
             contrib/appliance/provision/*.sh \
             contrib/stack/tests/compose-test.sh
+
+  # The StartOS package is TypeScript, and until now nothing compiled or ran
+  # it here: `make` needs a StartOS server to sideload to, so the packaging
+  # jobs cannot run on a hosted runner, and the type check and the unit tests
+  # were left running only on whichever machine last built an .s9pk. Two of
+  # the three defects that install found — a `.once()` store read that made
+  # the Network action a no-op, and a ready gate wired to `/readyz` — have
+  # guards in test/reactivity.test.ts, and a guard nothing executes is a
+  # comment. This is the job that executes them. test/networks.test.ts is
+  # the other reason, and the reason this job's path gate reaches outside
+  # contrib/packaging/startos: it reads satd-init directly.
+  #
+  # Node 22 is not optional: the tests are `.ts` files run directly under
+  # `node --test`, which needs --experimental-strip-types (22.6+). On Node 20
+  # the run fails with `node: bad option: --experimental-strip-types`, which
+  # reads like a broken test rather than a stale toolchain.
+  #
+  # `npm run prettier` is deliberately not gated. It is a convenience for
+  # whoever is editing, and enforcing it would reflow the whole daemon chain
+  # in main.ts — a comment-dense file where the formatter's `return (...)`
+  # rewrap costs readability and proves nothing.
+  packages:
+    name: app-store packages (typecheck + tests)
+    needs: changes
+    if: needs.changes.outputs.packages == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: contrib/packaging/startos/package-lock.json
+      - name: Install
+        working-directory: contrib/packaging/startos
+        # `ci`, not `install`: the lockfile is committed and this must fail
+        # rather than quietly resolve something else.
+        run: npm ci
+      - name: Typecheck and test
+        working-directory: contrib/packaging/startos
+        run: npm run check
+      - name: The bundle the .s9pk ships still builds
+        working-directory: contrib/packaging/startos
+        # `make` proper needs a server to sideload to; this is the part of it
+        # that can run anywhere, and it is the part that catches an import
+        # the type checker accepts but ncc cannot resolve.
+        run: npm run build
 
   stack:
     name: reference stack (regtest, TLS probed)

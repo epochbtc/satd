@@ -12,6 +12,8 @@
 #   - github-actions: watches the `uses:` pins across all workflows
 #     (checkout, buildx, build-push-action, cosign, etc.) so action
 #     versions don't rot past upstream security/bugfix releases.
+#   - npm (contrib/packaging/startos): present only to carry the `ignore`
+#     entries below. Version updates are off; see the comment on that entry.
 version: 2
 updates:
   - package-ecosystem: "docker"
@@ -27,3 +29,37 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci(actions)"
+
+  # The StartOS package's lockfile, and this entry exists for one reason: to
+  # tell Dependabot which advisories here it cannot act on.
+  #
+  # `@start9labs/start-sdk` declares `bundleDependencies: [@start9labs/
+  # start-core, eslint, typescript-eslint]`, so 127 of the 158 packages in
+  # this lockfile are `inBundle: true` — they are files inside the SDK's own
+  # tarball, not edges npm resolves. npm cannot update or override a bundled
+  # dependency; `overrides` on brace-expansion and js-yaml regenerates the
+  # lockfile and leaves the pinned versions untouched, and there is no newer
+  # start-sdk to move to (2.0.9 is latest). Dependabot's security-update jobs
+  # for this manifest fail for exactly that reason.
+  #
+  # Nothing here reaches the shipped artifact or this repository's build.
+  # eslint and typescript-eslint are the SDK's own linting toolchain; the
+  # package's scripts are ncc, tsc, prettier and `node --test`, none of which
+  # invoke them. The bundle the .s9pk ships (`javascript/index.js`, 2.6 MB)
+  # contains zero occurrences of `js-yaml` or `brace-expansion` — the 24
+  # matches for `eslint` in it are all `// eslint-disable-next-line` comments
+  # in vendored source.
+  #
+  # Scoped to these two packages, not blanket: an advisory against something
+  # this package actually resolves still needs to surface.
+  - package-ecosystem: "npm"
+    directory: "/contrib/packaging/startos"
+    schedule:
+      interval: "weekly"
+    # Version updates off. The toolchain versions are chosen to match what
+    # the StartOS SDK expects, and a Dependabot bump of tsc or ncc would be a
+    # PR nobody can validate short of packing and sideloading an .s9pk.
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "brace-expansion"
+      - dependency-name: "js-yaml"

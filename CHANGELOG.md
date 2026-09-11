@@ -55,6 +55,17 @@ item below is (or will be) written up in full in the in-development
   listing deliberately omits, and the listing itself now names every method
   satd registers — thirty were missing, among them the PSBT builders and
   satd's own index, quarantine and address-index RPCs (#692).
+- The container image is stripped: **670 MB → 136 MB**. `[profile.release]`
+  has carried `debug = "line-tables-only"` since 0.4.0, and every `docker
+  pull` since has been half a gigabyte of DWARF. Tarballs were never
+  affected — `release.yml` already stripped them and split out a signed
+  `.debug` sidecar. Rebuild with `--build-arg STRIP_BINARIES=0` to get an
+  unstripped image back.
+- The container's `HEALTHCHECK` is a liveness probe, and the reference stack
+  no longer overrides it with `SATD_HEALTH_URL=…/readyz`. `/readyz` is 503
+  until the tip is within six blocks of the headers tip, so pointing a
+  container health gate at it reports every initial sync as a fault — days
+  of it on mainnet.
 
 ### Added
 
@@ -68,6 +79,11 @@ item below is (or will be) written up in full in the in-development
   and Liana already pointed at the node. Signet by default;
   `satd-appliance set-network mainnet` switches. Built with `mmdebstrap`,
   and gated in CI by booting the artifact under QEMU.
+- **App-store packages for Umbrel and StartOS** (`contrib/packaging/`): satd,
+  `sat-cli`, `sat-tui` and MCP, sharing the reference stack's `satd-init` and
+  certificate scheme rather than re-implementing them. Each has been
+  installed on a real server of its own kind and driven through every
+  interface it exports; `x86_64` on both, `aarch64` not yet.
 - `sat-cli` and `sat-tui` can reach a TLS-terminated RPC listener:
   `-rpctls`, `-rpccacert`, and `-rpcclientcert` / `-rpcclientkey` for mTLS.
   Previously an operator who enabled `-rpctlsbind` had to keep the plain

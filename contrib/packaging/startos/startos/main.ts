@@ -14,12 +14,17 @@ import {
 export const main = sdk.setupMain(async ({ effects }) => {
   /**
    * `.const`, not `.once`: it re-runs main when the store changes, which is
-   * what makes the Network action take effect. With `.once` the action wrote
-   * `signet` to the store and nothing else happened — satd-init never re-ran,
-   * satd kept its `--chain=mainnet` argument, and the node went on syncing
-   * mainnet while the service page said signet, indefinitely. The action's own
-   * warning promises "changing the network restarts the node on a different
-   * chain"; this is what keeps that promise.
+   * what makes the Network action take effect.
+   *
+   * Everything downstream is computed inside this function from `network` —
+   * satd-init's environment below, and the `--chain=${network}` on satd's own
+   * command line. None of that is wrong; it is simply never re-evaluated
+   * unless main runs again. With `.once` main did not, so the action wrote
+   * `signet` to the store and nothing else happened: the containers already
+   * running kept the arguments they had been started with, and the node went
+   * on syncing mainnet while the service page said signet, indefinitely.
+   * The action's own warning promises "changing the network restarts the node
+   * on a different chain"; re-entering main is what keeps that promise.
    *
    * interfaces.ts already reads the store this way, which is why the signet
    * P2P port appeared on the switch while the daemon did not move.
