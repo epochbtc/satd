@@ -61,6 +61,10 @@ item below is (or will be) written up in full in the in-development
   affected — `release.yml` already stripped them and split out a signed
   `.debug` sidecar. Rebuild with `--build-arg STRIP_BINARIES=0` to get an
   unstripped image back.
+- `contrib/stack/tests/smoke.sh` runs on macOS. `timeout` and `sha256sum`
+  are GNU and macOS has neither, so the script resolves `gtimeout` and
+  `shasum -a 256`; it now preflights every tool it needs by name, and
+  refuses LibreSSL rather than emitting TLS passes that verified nothing.
 - The container's `HEALTHCHECK` is a liveness probe, and the reference stack
   no longer overrides it with `SATD_HEALTH_URL=…/readyz`. `/readyz` is 503
   until the tip is within six blocks of the headers tip, so pointing a

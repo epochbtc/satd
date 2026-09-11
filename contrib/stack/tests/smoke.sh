@@ -16,9 +16,48 @@
 # `-verify_return_error`, and a probe that would pass without verification
 # is not a probe.
 #
-# Requires: docker (with compose v2) and openssl.
+# Requires: docker (with compose v2), openssl, curl and python3. On macOS,
+# also GNU coreutils (`brew install coreutils`) and a real OpenSSL
+# (`brew install openssl@3`) — see the preflight below.
 
 set -euo pipefail
+
+# --- preflight --------------------------------------------------------------
+# Named up front rather than discovered two hundred lines in. A missing
+# `timeout` used to surface as an Electrum probe that simply never returned.
+missing=()
+for c in docker openssl curl python3 awk sed grep cut head tr od dirname; do
+    command -v "$c" > /dev/null 2>&1 || missing+=("$c")
+done
+
+# `timeout` and `sha256sum` are GNU; macOS ships neither. Homebrew's
+# coreutils installs them g-prefixed, and `shasum` is in the base system, so
+# resolve rather than require — this script is the same test either way.
+if command -v timeout > /dev/null 2>&1; then TIMEOUT=(timeout)
+elif command -v gtimeout > /dev/null 2>&1; then TIMEOUT=(gtimeout)
+else missing+=("timeout (macOS: brew install coreutils)"); TIMEOUT=(); fi
+
+if command -v sha256sum > /dev/null 2>&1; then SHA256=(sha256sum)
+elif command -v gsha256sum > /dev/null 2>&1; then SHA256=(gsha256sum)
+elif command -v shasum > /dev/null 2>&1; then SHA256=(shasum -a 256)
+else missing+=("sha256sum"); SHA256=(); fi
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "smoke.sh: missing required tools:" >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    exit 2
+fi
+
+# LibreSSL is what /usr/bin/openssl is on macOS, and it is not a drop-in for
+# what the TLS probes below do: `-verify_return_error` with `-quiet` is the
+# whole point of this test, and a probe that silently stops verifying is
+# worse than no probe. Say so rather than emit passes that mean less than
+# they read.
+if openssl version 2>/dev/null | grep -qi libressl; then
+    echo "smoke.sh: $(openssl version) is not supported — the TLS probes need OpenSSL." >&2
+    echo "  macOS: brew install openssl@3, then put its bin directory first on PATH." >&2
+    exit 2
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="$(cd "$HERE/.." && pwd)"
@@ -110,9 +149,9 @@ if raw:
     sleep 3
 done
 if [[ "$ready" == 1 ]]; then
-    pass "satd reaches the healthy state (/readyz)"
+    pass "satd reaches the healthy state"
 else
-    fail "satd reaches the healthy state (/readyz)" "$(compose logs --no-color --tail 60 satd 2>&1)"
+    fail "satd reaches the healthy state" "$(compose logs --no-color --tail 60 satd 2>&1)"
     COMPLETED=1
     echo "$FAILURES failure(s)" >&2
     exit 1
@@ -227,7 +266,7 @@ fi
 # its stdin closes and Electrum keeps the session up waiting for the next
 # request, so without a bound this probe never returns.
 electrum_reply="$(printf '{"jsonrpc":"2.0","id":1,"method":"server.version","params":["smoke","1.4"]}\n' \
-    | timeout 20 openssl s_client -connect "127.0.0.1:$SATD_ELECTRUM_TLS_PORT" -servername localhost \
+    | "${TIMEOUT[@]}" 20 openssl s_client -connect "127.0.0.1:$SATD_ELECTRUM_TLS_PORT" -servername localhost \
         -CAfile "$CA" -verify_return_error -quiet 2>/dev/null | head -1 || true)"
 if grep -q '"result"' <<< "$electrum_reply"; then
     pass "Electrum over TLS answers server.version"
@@ -333,7 +372,7 @@ $(compose logs --no-color --tail 30 rtl 2>&1)"
                 rtl_xsrf="$(awk '$6=="XSRF-TOKEN"{print $7}' "$rtl_jar" 2>/dev/null || true)"
                 rtl_login() {
                     local hash
-                    hash="$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"
+                    hash="$(printf '%s' "$1" | "${SHA256[@]}" | cut -d' ' -f1)"
                     rtl_curl -b "$rtl_jar" -c "$rtl_jar" \
                         -H "X-XSRF-TOKEN: $rtl_xsrf" \
                         -H 'Content-Type: application/json' \
