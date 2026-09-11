@@ -287,6 +287,9 @@ Electrum answering through the OS proxy against the server's root CA with
 completing an `initialize` with the token the package prints; switching a
 running node between chains; and satd returning by itself after a reboot.
 Not yet covered on either package: `aarch64`, and StartOS backup/restore.
+`contrib/validation/arm64/` holds the harness for closing the `aarch64` gap
+— a preflight, a scripted stack run, a scripted package build, and a runbook
+for the two legs that need a server rather than a container.
 
 Every probe that verifies a certificate is paired with the negative control
 that the same handshake without the CA must fail. A probe that would pass

@@ -103,7 +103,7 @@ jobs:
           # Widened past tls/tests: compose-test.sh asserts invariants over the
           # compose files, the appliance CLI and the Umbrel package, so it has
           # to run when any of those change.
-          echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)')" >> "$GITHUB_OUTPUT"
+          echo "scripts=$(match '^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/|validation/)')" >> "$GITHUB_OUTPUT"
           # satd-init as well as the package: test/networks.test.ts reads
           # contrib/stack/satd/satd-init and compares its network list and
           # P2P ports against the package's own. That guard exists because
@@ -142,7 +142,9 @@ jobs:
             contrib/appliance/bin/satd-appliance \
             contrib/appliance/firstboot/satd-appliance-firstboot \
             contrib/appliance/provision/*.sh \
-            contrib/stack/tests/compose-test.sh
+            contrib/stack/tests/compose-test.sh \
+            contrib/stack/tests/smoke.sh \
+            contrib/validation/arm64/*.sh
 
   # The StartOS package is TypeScript, and until now nothing compiled or ran
   # it here: `make` needs a StartOS server to sideload to, so the packaging
