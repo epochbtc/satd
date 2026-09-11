@@ -928,6 +928,28 @@ async fn main() {
         }
     }
 
+    // The rows ABOVE the tip are the best-header chain, and a previous satd
+    // wrote them for every accepted header, fork or not, so a datadir can
+    // carry a row that names a block no peer serves. Every reader of "the
+    // next block to fetch" trusts that row; on testnet4 it held one node at
+    // the same height for a day with a full peer set. Re-derive them from the
+    // best header's ancestry before the scheduler snapshots them. Runs ahead
+    // of the block-index hole repair below, which reads this region.
+    match chain_state.repair_header_rows_above_tip() {
+        Ok((0, 0)) => {}
+        Ok((rewritten, removed)) => {
+            tracing::warn!(
+                rewritten,
+                removed,
+                "Height index rows above the tip did not follow the best-header \
+                 chain; re-derived them from the best header's ancestry"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Header-row repair above the tip failed; continuing startup");
+        }
+    }
+
     // Check that the tip is standing on blocks this chainstate actually
     // connected. Unlike the height index above, this is not derived state that
     // can be rewritten: a hole means the UTXO set is missing those blocks'

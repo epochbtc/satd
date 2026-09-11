@@ -535,6 +535,16 @@ item below is (or will be) written up in full in the in-development
 - P2P: answering `getaddr` no longer re-enters the peer-table read lock, which
   `parking_lot` does not allow re-entrantly — a writer arriving between the two
   acquisitions deadlocked the manager's event loop.
+- **Initial block download could wedge for good on a fork-heavy network.**
+  Header acceptance wrote the height→hash row above the tip for *every*
+  accepted header, so a competing header at an already-mapped height replaced
+  the row and nothing put it back; the IBD scheduler and the connector then
+  waited on a block no peer serves — which Bitcoin Core answers with silence,
+  not `notfound`. A testnet4 node sat at one height for a day with eighteen
+  peers. Rows above the tip now follow the best-header chain only, are
+  re-derived down to the fork point when it switches branches, the scheduler
+  re-keys the affected heights, and a startup pass repairs a datadir the old
+  writer left behind.
 
 ## Releases
 
