@@ -51,3 +51,31 @@ test('the ready gate probes liveness, not readiness', () => {
   doesNotMatch(src, /readyz/)
   doesNotMatch(src, /SATD_HEALTH_URL/)
 })
+
+/**
+ * MCP's transport refuses any `Host` outside its allowlist, and the StartOS
+ * proxy forwards the client's `Host` unchanged rather than validating or
+ * rewriting it — so on this platform satd's check is the only one on that
+ * path, and it sees whatever name the user typed. The MCP Hostnames action is
+ * how those names reach it: the action writes the store, main reads the store
+ * reactively, and satd-init turns the value into `mcpallowedhost=` lines.
+ *
+ * Dropping the environment variable is not a type error and breaks nothing
+ * visible — every other interface keeps working, the action keeps accepting
+ * input, and only MCP-by-hostname goes back to answering 403.
+ */
+test('the MCP hostnames reach satd-init', () => {
+  const src = read('../startos/main.ts')
+  match(src, /SATD_MCP_ALLOWED_HOSTS:\s*mcpHostnames/)
+  match(src, /const \{[^}]*mcpHostnames[^}]*\} = store/)
+})
+
+/**
+ * satd is deliberately never told to accept any `Host`: the allowlist is
+ * additive, and a package that emptied it would hand a rebound browser the
+ * whole MCP tool surface.
+ */
+test('the package never disables the MCP Host check', () => {
+  const src = read('../startos/main.ts')
+  doesNotMatch(src, /mcpallowanyhost|disable_allowed_hosts|mcptrustedproxy/i)
+})

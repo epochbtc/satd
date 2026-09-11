@@ -11,12 +11,30 @@ REST API from the same process.
 | **RPC** | Bitcoin Core-compatible JSON-RPC, with cookie authentication. Other services on this server reach it over the container bridge; you reach it from your LAN over TLS. |
 | **Electrum** | For Sparrow, Electrum, BlueWallet and Zeus. Point the wallet at the Electrum address on the Interfaces tab. |
 | **Esplora** | Blockstream-compatible REST API under `/api`. |
-| **MCP** | Lets an AI assistant query your own node instead of a public explorer. Needs the bearer token from the **MCP Token** action. |
+| **MCP** | Lets an AI assistant query your own node instead of a public explorer. Needs the bearer token from the **MCP Token** action, and the address you use listed under **MCP Hostnames**. |
 | **Peer** | Inbound connections from other Bitcoin nodes. |
 
 TLS is handled by StartOS, with a certificate chaining to this server's root
 CA — the one your browser already trusts here. There is no second certificate
 authority to import.
+
+## Before an AI assistant can reach MCP
+
+Two settings, both one-time.
+
+**MCP Token** prints the bearer token. Clients send it as
+`Authorization: Bearer <token>`.
+
+**MCP Hostnames** needs the name you type in the address bar to reach this
+server — usually something like `my-server.local`. Enter it once and MCP
+starts answering; until then every request that arrives by name is refused
+with `403 Forbidden`, token or no token.
+
+That check is worth the one step. It is what stops a web page you happen to
+be visiting from pointing a name it controls at this server and driving your
+node through MCP from inside your own browser. Listing your server's real
+name tells satd which requests are yours. If you reach this server by more
+than one name, list them all, separated by commas.
 
 ## Disk
 
