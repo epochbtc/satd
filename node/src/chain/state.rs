@@ -2161,16 +2161,15 @@ impl ChainState {
         // the tip, whatever the tip was when they were staged.
         batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
         let mut new_best = None;
+        let mut row_changes: Vec<(u32, Option<BlockHash>)> = Vec::new();
         if let Some((hash, work)) = best_in_batch {
             let (old_hash, old_work) = *self.best_header.read();
             if compare_u256(&work, &old_work) > 0 {
                 let (puts, removes) =
                     self.header_chain_rows(batch_index, hash, old_hash, tip_height);
-                if !puts.is_empty() || !removes.is_empty() {
-                    let mut changes = self.header_row_changes.lock();
-                    changes.extend(puts.iter().map(|&(h, x)| (h, Some(x))));
-                    changes.extend(removes.iter().map(|&h| (h, None)));
-                }
+                row_changes.reserve(puts.len() + removes.len());
+                row_changes.extend(puts.iter().map(|&(h, x)| (h, Some(x))));
+                row_changes.extend(removes.iter().map(|&h| (h, None)));
                 batch.height_hash_puts.extend(puts);
                 batch.height_hash_removes.extend(removes);
                 new_best = Some((hash, work));
@@ -2181,6 +2180,16 @@ impl ChainState {
         self.headers_tip_height.fetch_max(max_height, Ordering::Relaxed);
         if let Some((h, w)) = new_best {
             self.update_best_header(h, w);
+        }
+        // Publish the re-keyed rows last: only after the write that made them
+        // true, and after `best_header` names the chain they were derived
+        // from. A failed write must not leave the scheduler keyed to rows
+        // that were never persisted, and a drain racing this one reads
+        // `best_header` for the target height — seeing the changes but the
+        // old best would truncate the download target. Still under
+        // `accept_lock`, so the pair is atomic w.r.t. another header batch.
+        if !row_changes.is_empty() {
+            self.header_row_changes.lock().extend(row_changes);
         }
         Ok(())
     }
@@ -4167,6 +4176,17 @@ impl ChainState {
         // disagrees with the row at its height is a fork block, and letting it
         // overwrite the row is the same corruption through a second door — the
         // connector and the scheduler would then wait on a block no peer serves.
+        //
+        // The gap this leaves is deliberate: a block can be stored without its
+        // own header ever being accepted (only the PARENT must be indexed —
+        // the crash-resume and out-of-order cases this write exists for), so a
+        // fork block above `best_header` finds no row and creates one that is
+        // not on the best-header chain. Bounding the write by
+        // `best_header_height` would close it at the cost of the case it is
+        // here for. It is inert rather than harmful: the scheduler's target
+        // never exceeds `best_header`, so no reader asks for that height, and
+        // the next best-chain advance past it (or `repair_header_rows_above_tip`
+        // on the following start) rewrites the row.
         //
         // The above-tip test and the write are atomic w.r.t. block connection:
         // hold `accept_lock` so a concurrent `accept_block` (submitblock /

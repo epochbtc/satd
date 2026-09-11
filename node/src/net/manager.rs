@@ -3904,7 +3904,7 @@ impl PeerManager {
                 let needs_more = {
                     let mut ibd = self.ibd.write();
                     if let Some(scheduler) = ibd.as_mut() {
-                        scheduler.block_received(id, height)
+                        scheduler.block_received(id, height, hash)
                     } else {
                         false
                     }
@@ -3931,7 +3931,7 @@ impl PeerManager {
                     {
                         let mut ibd = self.ibd.write();
                         if let Some(scheduler) = ibd.as_mut() {
-                            scheduler.block_received(id, entry.height);
+                            scheduler.block_received(id, entry.height, hash);
                         }
                     }
                     if self.chain_state.has_background() {

@@ -323,17 +323,42 @@ impl IbdScheduler {
     }
 
     /// Record that a block has been received and stored.
+    ///
+    /// A height is satisfied only by the block this scheduler currently wants
+    /// there. `hash` is what the peer actually delivered, and it is checked
+    /// against the row rather than trusted: once `header_rows_changed` re-keys
+    /// a height from `A` to `B`, a late delivery of `A` — still in flight when
+    /// the headers arrived — would otherwise mark the height downloaded. `B`
+    /// would then never be requested again (`release_stale_inflight` only
+    /// scans what is still in flight) and the connector would park on it for
+    /// good: the very wedge the best-header rows exist to prevent, reached
+    /// through the delivery door instead of the index.
+    ///
     /// Returns `true` if the peer has capacity for more work.
-    pub fn block_received(&mut self, peer_id: PeerId, height: u32) -> bool {
-        self.in_flight.remove(&height);
-        self.in_flight_at.remove(&height);
-        self.downloaded.insert(height);
-        // The peer just proved it is alive and delivering. Drop any cooldown
-        // entries for this height and reset its consecutive-failure count.
-        self.height_peer_cooldown.remove(&height);
+    pub fn block_received(&mut self, peer_id: PeerId, height: u32, hash: BlockHash) -> bool {
+        let wanted = self.height_to_hash.get(&height) == Some(&hash);
+        if wanted {
+            // Clear the height from whichever peer actually holds it. After a
+            // re-key and reassignment that need not be the peer delivering it,
+            // and leaving the holder's slot occupied would leak its capacity.
+            if let Some(holder) = self.in_flight.remove(&height)
+                && holder != peer_id
+                && let Some(slots) = self.peer_slots.get_mut(&holder)
+            {
+                slots.assigned.retain(|&h| h != height);
+            }
+            self.in_flight_at.remove(&height);
+            self.downloaded.insert(height);
+            // Drop any cooldown entries for this height.
+            self.height_peer_cooldown.remove(&height);
+        }
 
         if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
-            slots.assigned.retain(|&h| h != height);
+            // The peer proved it is alive and delivering, whether or not the
+            // block is still one we want.
+            if wanted {
+                slots.assigned.retain(|&h| h != height);
+            }
             slots.blocks_received += 1;
             slots.last_activity = Instant::now();
             slots.consecutive_failures = 0;
@@ -889,7 +914,7 @@ mod tests {
         let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
         // Peer 1 takes the priority zone, heights 1..=16; height 2 arrives.
         assert_eq!(sched.assign_blocks(1).len(), 16);
-        sched.block_received(1, 2);
+        sched.block_received(1, 2, cs.get_block_hash_by_height(2).unwrap());
         assert!(sched.is_downloaded(2));
         let old1 = cs.get_block_hash_by_height(1).unwrap();
 
@@ -947,7 +972,7 @@ mod tests {
 
         // Delivering a block removes just that height.
         let delivered = one[0];
-        sched.block_received(1, delivered);
+        sched.block_received(1, delivered, cs.get_block_hash_by_height(delivered).unwrap());
         let after = sched.peer_inflight_heights(1);
         assert!(
             !after.contains(&delivered),
@@ -1209,7 +1234,7 @@ mod tests {
             .get(&1)
             .and_then(|s| s.assigned.first().copied());
         if let Some(h) = delivered {
-            sched.block_received(1, h);
+            sched.block_received(1, h, cs.get_block_hash_by_height(h).unwrap());
             assert_eq!(sched.peer_slots[&1].consecutive_failures, 0);
             assert!(sched.peer_slots[&1].last_failure_at.is_none());
         }
@@ -1382,6 +1407,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The delivery-door version of the wedge this scheduler's best-header
+    /// rows exist to prevent. A height goes out under hash `A`; the headers
+    /// move and `header_rows_changed` re-keys it to `B` and requeues it; the
+    /// in-flight response carrying `A` then lands. It must not satisfy the
+    /// height — `B` was never fetched, nothing else would ever ask for it,
+    /// and the connector would wait on it forever.
+    #[test]
+    fn a_late_block_under_the_old_hash_does_not_satisfy_a_re_keyed_height() {
+        use bitcoin::hashes::Hash as _;
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+        assert_eq!(sched.assign_blocks(1).len(), 16);
+        let stale = cs.get_block_hash_by_height(3).unwrap();
+        assert!(sched.in_flight_contains(3), "height 3 went out under the old hash");
+
+        // The best-header chain moves: height 3 now names a different block.
+        let fresh = BlockHash::from_byte_array([0x33; 32]);
+        sched.header_rows_changed(&[(3, Some(fresh))], 20);
+        assert!(sched.pending_contains(3), "requeued under the new hash");
+
+        // Peer 1's in-flight response for the OLD hash arrives late.
+        sched.block_received(1, 3, stale);
+
+        assert!(!sched.is_downloaded(3), "the old block does not satisfy the height");
+        assert!(sched.pending_contains(3), "height 3 is still owed");
+        // And it is handed out again, under the new hash.
+        let hashes = sched.assign_blocks(2);
+        assert!(hashes.contains(&fresh), "re-requested as {fresh}: {hashes:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a re-key the height can be back in flight to a DIFFERENT peer by
+    /// the time the right block arrives. Satisfying it must free the slot of
+    /// the peer that actually holds it, not just the one that delivered.
+    #[test]
+    fn delivering_a_re_assigned_height_frees_the_holding_peers_slot() {
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+        let real3 = cs.get_block_hash_by_height(3).unwrap();
+        assert_eq!(sched.assign_blocks(1).len(), 16);
+
+        // Re-key height 3 to the same hash it already has? No — take it out of
+        // flight the way a row change does, then let peer 2 pick it up.
+        assert!(sched.release_from_flight(3));
+        sched.pending.push_front(3);
+        let _ = sched.assign_blocks(2);
+        assert!(
+            sched.peer_inflight_heights(2).contains(&3),
+            "peer 2 now holds height 3"
+        );
+
+        // Peer 1's original request lands — the right block, wrong peer.
+        sched.block_received(1, 3, real3);
+
+        assert!(sched.is_downloaded(3), "the right block satisfies the height");
+        assert!(
+            !sched.peer_inflight_heights(2).contains(&3),
+            "peer 2's slot is freed, not leaked: {:?}",
+            sched.peer_inflight_heights(2)
+        );
+        assert!(!sched.in_flight_contains(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_completion() {
         let (cs, dir) = make_chain_state_with_headers(10);
@@ -1392,7 +1483,7 @@ mod tests {
 
         // Mark all as received
         for h in 1..=10 {
-            sched.block_received(1, h);
+            sched.block_received(1, h, cs.get_block_hash_by_height(h).unwrap());
         }
 
         assert!(sched.is_complete());
