@@ -142,7 +142,8 @@ jobs:
             contrib/appliance/bin/satd-appliance \
             contrib/appliance/firstboot/satd-appliance-firstboot \
             contrib/appliance/provision/*.sh \
-            contrib/stack/tests/compose-test.sh
+            contrib/stack/tests/compose-test.sh \
+            contrib/stack/tests/smoke.sh
 
   # The StartOS package is TypeScript, and until now nothing compiled or ran
   # it here: `make` needs a StartOS server to sideload to, so the packaging
