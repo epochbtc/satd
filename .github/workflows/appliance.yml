@@ -79,7 +79,7 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       packages: ${{ steps.filter.outputs.packages }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: mkca.sh
         run: contrib/stack/tests/mkca-test.sh
       - name: satd-healthcheck
@@ -172,7 +172,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -205,7 +205,7 @@ jobs:
     # and two stack bring-ups follow it.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         run: |
           set -euo pipefail
@@ -269,7 +269,7 @@ jobs:
       matrix:
         flavor: ${{ github.event_name == 'pull_request' && fromJSON('["core"]') || fromJSON('["core","desktop"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         run: |
           set -euo pipefail
