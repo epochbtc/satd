@@ -313,7 +313,7 @@ jobs:
           contrib/appliance/tests/boot-test.sh --image "$image" --in-docker
       - name: Upload
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: satd-appliance-${{ matrix.flavor }}
           # The raw image is large and reconstructible from the qcow2; the
