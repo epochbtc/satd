@@ -289,6 +289,11 @@ pub struct ChainState {
     /// "best-known-at-height" index), this names the actual most-work chain, so
     /// a competing chain that is heavier-but-shorter is still pursued.
     best_header: RwLock<(BlockHash, [u8; 32])>,
+    /// Height-index rows above the tip that the last best-header change
+    /// rewrote (`Some(hash)`) or dropped (`None`), waiting for the IBD
+    /// scheduler to re-key its in-memory copy. Drained by
+    /// [`Self::take_header_row_changes`].
+    header_row_changes: Mutex<Vec<(u32, Option<BlockHash>)>>,
     /// Every leaf of the block-index tree: the hashes no other indexed entry
     /// names as its `prev_blockhash`.
     ///
@@ -716,6 +721,7 @@ impl ChainState {
                     enforce_checkpoints: true,
                     headers_tip_height: AtomicU32::new(htip),
                     best_header: RwLock::new(best_header),
+                    header_row_changes: Mutex::new(Vec::new()),
                     tips: RwLock::new(tips),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     connector_scan_last: Mutex::new(None),
@@ -827,6 +833,7 @@ impl ChainState {
             enforce_checkpoints: true,
             headers_tip_height: AtomicU32::new(0),
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
+            header_row_changes: Mutex::new(Vec::new()),
             tips: RwLock::new(std::collections::HashSet::from([genesis_hash])),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             connector_scan_last: Mutex::new(None),
@@ -2107,36 +2114,199 @@ impl ChainState {
         };
 
         let mut batch = crate::storage::StoreBatch::default();
-        batch.block_index_puts.push((hash, entry));
-        // The height->hash index is the ACTIVE (connected) chain. Header-only
-        // acceptance must never write into its active region (heights <= the
-        // block tip): a competing fork announced *below* our tip would
-        // otherwise clobber the active entry there (last-write-wins), silently
-        // corrupting the index that `--reindex-chainstate` faithfully replays
-        // — the root cause of the 951k `bad-cb-height` reindex loop. Heights
-        // *above* the tip are header-chain territory (the IBD scheduler and the
-        // getheaders locator legitimately need them); the block stays reachable
-        // by hash + `best_header` regardless, so the fork-aware competing-chain
-        // pull (#315) is unaffected.
-        //
-        // The above-tip test and the write must be ATOMIC w.r.t. block
-        // connection: `accept_block` (submitblock / internal mine, on an RPC
-        // thread) advances the tip under `accept_lock`, so without holding it
-        // here a height that was above-tip at the test could be at-tip by the
-        // write and still clobber. Take the lock across the test+commit.
-        {
-            let _accept_guard = self.accept_lock.lock();
-            if new_height > self.tip_height() {
-                batch.height_hash_puts.push((new_height, hash));
-            }
-            self.write_chain_batch(batch)?;
-        }
-
-        // Track highest header for locator construction
-        self.headers_tip_height.fetch_max(new_height, Ordering::Relaxed);
-        self.update_best_header(hash, chainwork);
+        batch.block_index_puts.push((hash, entry.clone()));
+        let batch_index = std::collections::HashMap::from([(hash, entry)]);
+        // The height->hash rows this header may earn are decided in one
+        // place for both acceptance paths; see `commit_accepted_headers`.
+        self.commit_accepted_headers(batch, &batch_index, Some((hash, chainwork)), new_height)?;
 
         Ok(hash)
+    }
+
+    /// Commit accepted header-only entries together with the height-index
+    /// rows they earn.
+    ///
+    /// The height->hash index has two regions. At and below the active tip it
+    /// is the connected chain, written only by block connection; header
+    /// acceptance must never touch it, or a competing fork announced below
+    /// the tip clobbers the active entry (the 951k `bad-cb-height` reindex
+    /// loop). Above the tip it is the *best-header chain*: the one every
+    /// reader of "the next block to fetch" — the IBD scheduler, the
+    /// connector's `next_block_to_connect`, the getheaders locator — takes as
+    /// the truth. That region used to be written for every accepted header,
+    /// whatever branch it was on, so a competing header at an already-mapped
+    /// height overwrote the row and nothing ever put it back: the scheduler
+    /// then asked every peer for a block none of them serve, Bitcoin Core
+    /// answers such a `getdata` with silence rather than `notfound`, and the
+    /// node sat at the same height for days with a full peer set (testnet4,
+    /// 2026-09-10, height 151508). Rows above the tip are now written only
+    /// when the batch produces a new most-work header, and then re-derived
+    /// along that chain down to where it meets the previous best, so every
+    /// row above the tip is an ancestor of `best_header` by construction.
+    ///
+    /// Held under `accept_lock` end to end: `accept_block` advances the tip
+    /// under the same lock, so a row staged as above-tip cannot become at-tip
+    /// between the test and the write. `best_header` moves inside the lock for
+    /// the same reason — a reader must not see the pointer ahead of its rows.
+    fn commit_accepted_headers(
+        &self,
+        mut batch: crate::storage::StoreBatch,
+        batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
+        best_in_batch: Option<(BlockHash, [u8; 32])>,
+        max_height: u32,
+    ) -> Result<(), StoreError> {
+        let _accept_guard = self.accept_lock.lock();
+        let tip_height = self.tip_height();
+        // Crash-resume repair rows staged by the caller: never at or below
+        // the tip, whatever the tip was when they were staged.
+        batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
+        let mut new_best = None;
+        if let Some((hash, work)) = best_in_batch {
+            let (old_hash, old_work) = *self.best_header.read();
+            if compare_u256(&work, &old_work) > 0 {
+                let (puts, removes) =
+                    self.header_chain_rows(batch_index, hash, old_hash, tip_height);
+                if !puts.is_empty() || !removes.is_empty() {
+                    let mut changes = self.header_row_changes.lock();
+                    changes.extend(puts.iter().map(|&(h, x)| (h, Some(x))));
+                    changes.extend(removes.iter().map(|&h| (h, None)));
+                }
+                batch.height_hash_puts.extend(puts);
+                batch.height_hash_removes.extend(removes);
+                new_best = Some((hash, work));
+            }
+        }
+        self.write_chain_batch(batch)?;
+        // Track highest header for locator construction.
+        self.headers_tip_height.fetch_max(max_height, Ordering::Relaxed);
+        if let Some((h, w)) = new_best {
+            self.update_best_header(h, w);
+        }
+        Ok(())
+    }
+
+    /// The height-index rows above the tip that change when `new_best`
+    /// replaces `old_best` as the most-work header.
+    ///
+    /// Returns the rows to write — every ancestor of `new_best` down to the
+    /// block where the two chains meet — and the heights to drop: rows the old
+    /// chain held above the new best's height, which a heavier-but-shorter
+    /// switch (routine on testnet4, where one real-difficulty block outworks
+    /// a run of min-difficulty ones) would otherwise leave pointing at a
+    /// branch nobody extends. Both lists stop at the tip: rows at or below it
+    /// belong to the connected chain. `batch_index` resolves entries not yet
+    /// committed, so a header batch can be walked before it is written.
+    fn header_chain_rows(
+        &self,
+        batch_index: &std::collections::HashMap<BlockHash, BlockIndexEntry>,
+        new_best: BlockHash,
+        old_best: BlockHash,
+        tip_height: u32,
+    ) -> (Vec<(u32, BlockHash)>, Vec<u32>) {
+        let lookup = |h: &BlockHash| {
+            batch_index
+                .get(h)
+                .cloned()
+                .or_else(|| self.store.get_block_index(h))
+        };
+        let mut puts: Vec<(u32, BlockHash)> = Vec::new();
+        let mut removes: Vec<u32> = Vec::new();
+        let Some(mut new_entry) = lookup(&new_best) else {
+            return (puts, removes);
+        };
+        let mut new_hash = new_best;
+        let mut old_hash = old_best;
+        let mut old_entry = lookup(&old_best);
+
+        // The old chain's rows above the new best's height are stale.
+        while let Some(e) = old_entry.as_ref() {
+            if e.height <= new_entry.height {
+                break;
+            }
+            if e.height > tip_height {
+                removes.push(e.height);
+            }
+            old_hash = e.header.prev_blockhash;
+            old_entry = lookup(&old_hash);
+        }
+
+        // Bring the new chain down to the old best's height, taking a row at
+        // every step: none of these heights can be shared with the old chain.
+        let old_height = old_entry.as_ref().map(|e| e.height).unwrap_or(0);
+        while new_entry.height > old_height {
+            if new_entry.height <= tip_height {
+                return (puts, removes);
+            }
+            puts.push((new_entry.height, new_hash));
+            new_hash = new_entry.header.prev_blockhash;
+            match lookup(&new_hash) {
+                Some(e) => new_entry = e,
+                None => return (puts, removes),
+            }
+        }
+
+        // Same height on both chains: descend in step until they meet.
+        while new_hash != old_hash && new_entry.height > tip_height {
+            puts.push((new_entry.height, new_hash));
+            new_hash = new_entry.header.prev_blockhash;
+            let Some(e) = lookup(&new_hash) else { break };
+            new_entry = e;
+            let Some(oe) = old_entry.as_ref() else { break };
+            old_hash = oe.header.prev_blockhash;
+            old_entry = lookup(&old_hash);
+        }
+        (puts, removes)
+    }
+
+    /// Hand back, and clear, the height-index rows above the tip that
+    /// best-header changes have rewritten since the last call.
+    pub fn take_header_row_changes(&self) -> Vec<(u32, Option<BlockHash>)> {
+        std::mem::take(&mut *self.header_row_changes.lock())
+    }
+
+    /// Re-derive every height-index row above the active tip from the
+    /// best-header chain, and drop any row above the best header.
+    ///
+    /// A startup pass for datadirs written by a satd that mapped every
+    /// accepted header, fork or not, into the region above the tip (see
+    /// [`Self::commit_accepted_headers`]): such a row points at a block no
+    /// peer serves, and every reader of "the next block" trusts it. Walks
+    /// parent pointers from the best header down to the tip, so the cost is
+    /// the number of headers the node is ahead by. Returns
+    /// `(rows rewritten, rows removed)`.
+    pub fn repair_header_rows_above_tip(&self) -> Result<(usize, usize), StoreError> {
+        let tip_height = self.tip_height();
+        let best = self.best_header_hash();
+        let Some(mut entry) = self.store.get_block_index(&best) else {
+            return Ok((0, 0));
+        };
+        let best_height = entry.height;
+        let mut batch = crate::storage::StoreBatch::default();
+        let mut hash = best;
+        while entry.height > tip_height {
+            if self.store.get_block_hash_by_height(entry.height) != Some(hash) {
+                batch.height_hash_puts.push((entry.height, hash));
+            }
+            hash = entry.header.prev_blockhash;
+            match self.store.get_block_index(&hash) {
+                Some(parent) => entry = parent,
+                None => break,
+            }
+        }
+        // `headers_tip_height` is a high-water mark, so it bounds where a
+        // heavier-but-shorter switch can have left rows behind.
+        let ceiling = self.headers_tip_height().max(best_height);
+        for h in (best_height + 1)..=ceiling {
+            if self.store.get_block_hash_by_height(h).is_some() {
+                batch.height_hash_removes.push(h);
+            }
+        }
+        let counts = (batch.height_hash_puts.len(), batch.height_hash_removes.len());
+        if counts != (0, 0) {
+            let _accept_guard = self.accept_lock.lock();
+            self.write_chain_batch(batch)?;
+        }
+        Ok(counts)
     }
 
     /// Accept a batch of headers in a single write transaction.
@@ -2146,6 +2316,13 @@ impl ChainState {
         headers: &[bitcoin::block::Header],
     ) -> (u32, Option<ChainError>) {
         let mut batch = crate::storage::StoreBatch::default();
+        // Entries staged in this batch, by hash and by height, so consecutive
+        // headers resolve their parent and their retarget ancestors before
+        // anything is committed.
+        let mut batch_index: std::collections::HashMap<BlockHash, BlockIndexEntry> =
+            std::collections::HashMap::new();
+        let mut staged_by_height: std::collections::HashMap<u32, BlockHash> =
+            std::collections::HashMap::new();
         let mut accepted = 0u32;
         let mut max_height = 0u32;
         let mut best_in_batch: Option<(BlockHash, [u8; 32])> = None;
@@ -2179,13 +2356,7 @@ impl ChainState {
             let parent = self
                 .store
                 .get_block_index(&header.prev_blockhash)
-                .or_else(|| {
-                    batch
-                        .block_index_puts
-                        .iter()
-                        .find(|(h, _)| *h == header.prev_blockhash)
-                        .map(|(_, e)| e.clone())
-                });
+                .or_else(|| batch_index.get(&header.prev_blockhash).cloned());
 
             let parent = match parent {
                 Some(p) => p,
@@ -2207,17 +2378,9 @@ impl ChainState {
                 |h| {
                     // Retarget seed by height: check batch first for recently
                     // accepted headers, then store.
-                    batch
-                        .height_hash_puts
-                        .iter()
-                        .find(|(bh, _)| *bh == h)
-                        .and_then(|(_, hash)| {
-                            batch
-                                .block_index_puts
-                                .iter()
-                                .find(|(bih, _)| bih == hash)
-                                .map(|(_, e)| e.clone())
-                        })
+                    staged_by_height
+                        .get(&h)
+                        .and_then(|hash| batch_index.get(hash).cloned())
                         .or_else(|| {
                             let hash = self.store.get_block_hash_by_height(h)?;
                             self.store.get_block_index(&hash)
@@ -2228,11 +2391,9 @@ impl ChainState {
                     // (this batch's predecessors) first, then the store. Using
                     // parent pointers — not the height index — makes the walk
                     // immune to height→hash gaps.
-                    batch
-                        .block_index_puts
-                        .iter()
-                        .find(|(bih, _)| bih == h)
-                        .map(|(_, e)| e.clone())
+                    batch_index
+                        .get(h)
+                        .cloned()
                         .or_else(|| self.store.get_block_index(h))
                 },
             ) {
@@ -2253,14 +2414,12 @@ impl ChainState {
                 chainwork,
             };
 
-            batch.block_index_puts.push((hash, entry));
-            // Stage the height->hash write for every accepted header; the
-            // authoritative "strictly above the active tip" filter is applied
-            // once, atomically under `accept_lock`, just before the commit below
-            // (see there for the rationale). Staging all of them keeps the
-            // in-batch difficulty-ancestor lookup above able to resolve
-            // consecutive headers by height within this batch.
-            batch.height_hash_puts.push((new_height, hash));
+            batch.block_index_puts.push((hash, entry.clone()));
+            batch_index.insert(hash, entry);
+            // Staged for the in-batch retarget lookup only. Which heights get a
+            // height->hash row is decided once, from the best-header chain, in
+            // `commit_accepted_headers`.
+            staged_by_height.insert(new_height, hash);
             accepted += 1;
             max_height = max_height.max(new_height);
             if best_in_batch
@@ -2271,29 +2430,11 @@ impl ChainState {
             }
         }
 
-        if accepted > 0 || !batch.height_hash_puts.is_empty() {
-            // Commit the height->hash writes atomically w.r.t. block connection.
-            // `accept_block` (submitblock / internal mine, on an RPC thread)
-            // advances the active tip under `accept_lock`; without holding it
-            // here, an entry staged as above-tip during the loop could be at-tip
-            // by the time we write and clobber the active-chain entry there. Take
-            // the lock, drop any staged height->hash entry that is no longer
-            // strictly above the (possibly just-advanced) tip, then write — so
-            // only genuine header-chain entries reach the index. `block_index_puts`
-            // are hash-keyed and need no such filter.
-            {
-                let _accept_guard = self.accept_lock.lock();
-                let tip_height = self.tip_height();
-                batch.height_hash_puts.retain(|(h, _)| *h > tip_height);
-                if let Err(e) = self.write_chain_batch(batch) {
-                    return (0, Some(e.into()));
-                }
-            }
-            self.headers_tip_height
-                .fetch_max(max_height, Ordering::Relaxed);
-            if let Some((h, w)) = best_in_batch {
-                self.update_best_header(h, w);
-            }
+        if (accepted > 0 || !batch.height_hash_puts.is_empty())
+            && let Err(e) =
+                self.commit_accepted_headers(batch, &batch_index, best_in_batch, max_height)
+        {
+            return (0, Some(e.into()));
         }
 
         (accepted, None)
@@ -4021,6 +4162,12 @@ impl ChainState {
         // bad-cb-height pollution, reached through the block-store door. The
         // block stays reachable by hash for the competing-chain pull.
         //
+        // And only where no row exists yet. Above the tip the rows follow the
+        // best-header chain (`commit_accepted_headers`); a stored block that
+        // disagrees with the row at its height is a fork block, and letting it
+        // overwrite the row is the same corruption through a second door — the
+        // connector and the scheduler would then wait on a block no peer serves.
+        //
         // The above-tip test and the write are atomic w.r.t. block connection:
         // hold `accept_lock` so a concurrent `accept_block` (submitblock /
         // internal mine) can't advance the tip onto this height between the test
@@ -4029,7 +4176,9 @@ impl ChainState {
         // the normal IBD path and contends only with a racing RPC submit.)
         {
             let _accept_guard = self.accept_lock.lock();
-            if new_height > self.tip_height() {
+            if new_height > self.tip_height()
+                && self.store.get_block_hash_by_height(new_height).is_none()
+            {
                 batch.height_hash_puts.push((new_height, block_hash));
             }
             self.write_chain_batch(batch)?;
@@ -9150,6 +9299,172 @@ pub(crate) mod tests {
         // The structural audit stays clean — a subsequent --reindex-chainstate
         // would replay the true active chain, never the fork.
         assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rows above the tip are the best-header chain: the scheduler and
+    /// the connector read them as "the next block to fetch", and a peer asked
+    /// for a block on a branch it does not hold answers with silence. So a
+    /// competing header at a height that already has a row must not take the
+    /// row over — through either acceptance path, or through the block store.
+    ///
+    /// Perturbation: put the pre-fix `height_hash_puts.push((new_height,
+    /// hash))` back in the accept loop and the assertion after the fork
+    /// header fails.
+    #[test]
+    fn a_fork_header_above_the_tip_does_not_take_over_the_best_chain_row() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let tip = blocks[4].block_hash();
+        let a6 = build_test_block(tip, 6, 1_400_000_006);
+        let a7 = build_test_block(a6.block_hash(), 7, 1_400_000_007);
+        cs.accept_header(&a6.header).unwrap();
+        cs.accept_header(&a7.header).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(7), Some(a7.block_hash()));
+        assert_eq!(cs.best_header_hash(), a7.block_hash());
+        let _ = cs.take_header_row_changes();
+
+        // A competing header at height 6: the same work as a6, less than a7.
+        let b6 = build_test_block(tip, 6, 1_500_000_006);
+        assert_ne!(b6.block_hash(), a6.block_hash());
+        cs.accept_header(&b6.header).unwrap();
+        assert!(cs.get_block_index(&b6.block_hash()).is_some(), "still known by hash");
+        assert_eq!(
+            cs.get_block_hash_by_height(6),
+            Some(a6.block_hash()),
+            "the row names the best chain, not the last header seen"
+        );
+        assert_eq!(cs.best_header_hash(), a7.block_hash());
+        assert!(cs.take_header_row_changes().is_empty(), "nothing to re-key");
+
+        // Same through the batch path: b7 ties a7 on work, first seen wins.
+        let b7 = build_test_block(b6.block_hash(), 7, 1_500_000_007);
+        let (accepted, err) = cs.accept_headers(&[b7.header]);
+        assert!(err.is_none());
+        assert_eq!(accepted, 1);
+        assert_eq!(cs.get_block_hash_by_height(7), Some(a7.block_hash()));
+
+        // And through the block store: the fork block's data arrives.
+        cs.store_block(&b6).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a competing branch becomes the most-work chain above the tip,
+    /// every row down to the fork point follows it, the scheduler is told
+    /// which heights changed, and nothing at or below the tip moves.
+    #[test]
+    fn a_best_chain_switch_above_the_tip_rewrites_rows_down_to_the_fork_point() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let tip = blocks[4].block_hash();
+        let a6 = build_test_block(tip, 6, 1_400_000_006);
+        let a7 = build_test_block(a6.block_hash(), 7, 1_400_000_007);
+        cs.accept_header(&a6.header).unwrap();
+        cs.accept_header(&a7.header).unwrap();
+        let _ = cs.take_header_row_changes();
+
+        let b6 = build_test_block(tip, 6, 1_500_000_006);
+        let b7 = build_test_block(b6.block_hash(), 7, 1_500_000_007);
+        let b8 = build_test_block(b7.block_hash(), 8, 1_500_000_008);
+        let (accepted, err) = cs.accept_headers(&[b6.header, b7.header, b8.header]);
+        assert!(err.is_none());
+        assert_eq!(accepted, 3);
+
+        assert_eq!(cs.best_header_hash(), b8.block_hash());
+        assert_eq!(cs.get_block_hash_by_height(6), Some(b6.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(7), Some(b7.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(8), Some(b8.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(5), Some(tip), "connected chain untouched");
+        let mut changes = cs.take_header_row_changes();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (6, Some(b6.block_hash())),
+                (7, Some(b7.block_hash())),
+                (8, Some(b8.block_hash())),
+            ]
+        );
+        assert_eq!(cs.check_block_index(None), Ok(5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A heavier-but-shorter switch — one real-difficulty block outworking a
+    /// run of min-difficulty ones, routine on testnet4 — must drop the rows
+    /// the old chain held above the new best, or they keep naming a branch
+    /// nobody extends. Regtest cannot mint unequal work, so the row
+    /// derivation is exercised directly with the old and new tips named.
+    #[test]
+    fn header_chain_rows_drops_the_old_chain_rows_above_a_shorter_new_best() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 3);
+        let tip = blocks[2].block_hash();
+        let a4 = build_test_block(tip, 4, 1_400_000_004);
+        let a5 = build_test_block(a4.block_hash(), 5, 1_400_000_005);
+        let a6 = build_test_block(a5.block_hash(), 6, 1_400_000_006);
+        for b in [&a4, &a5, &a6] {
+            cs.accept_header(&b.header).unwrap();
+        }
+        let b4 = build_test_block(tip, 4, 1_500_000_004);
+        cs.accept_header(&b4.header).unwrap();
+
+        let (mut puts, mut removes) = cs.header_chain_rows(
+            &std::collections::HashMap::new(),
+            b4.block_hash(),
+            a6.block_hash(),
+            3,
+        );
+        puts.sort();
+        removes.sort();
+        assert_eq!(puts, vec![(4, b4.block_hash())]);
+        assert_eq!(removes, vec![5, 6]);
+
+        // Rows at or below the tip are never touched, whichever way the
+        // chains diverge: a switch that forks below the tip stops there.
+        let (puts, removes) = cs.header_chain_rows(
+            &std::collections::HashMap::new(),
+            b4.block_hash(),
+            a6.block_hash(),
+            4,
+        );
+        assert!(puts.is_empty());
+        assert_eq!(removes, vec![6, 5]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A datadir written by a satd that mapped every accepted header carries
+    /// rows above the tip that name fork blocks. The startup pass puts the
+    /// best header's ancestry back, and is a no-op once it has.
+    #[test]
+    fn startup_repair_rederives_rows_above_the_tip_from_the_best_header() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 5);
+        let tip = blocks[4].block_hash();
+        let a6 = build_test_block(tip, 6, 1_400_000_006);
+        let a7 = build_test_block(a6.block_hash(), 7, 1_400_000_007);
+        cs.accept_header(&a6.header).unwrap();
+        cs.accept_header(&a7.header).unwrap();
+        let b6 = build_test_block(tip, 6, 1_500_000_006);
+        cs.accept_header(&b6.header).unwrap();
+
+        // What the old writer left behind.
+        let mut pollute = crate::storage::StoreBatch::default();
+        pollute.height_hash_puts.push((6, b6.block_hash()));
+        cs.store.write_batch(pollute).unwrap();
+        assert_eq!(cs.get_block_hash_by_height(6), Some(b6.block_hash()));
+
+        assert_eq!(cs.repair_header_rows_above_tip().unwrap(), (1, 0));
+        assert_eq!(cs.get_block_hash_by_height(6), Some(a6.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(7), Some(a7.block_hash()));
+        assert_eq!(cs.get_block_hash_by_height(5), Some(tip));
+        assert_eq!(cs.repair_header_rows_above_tip().unwrap(), (0, 0), "idempotent");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

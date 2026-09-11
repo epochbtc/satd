@@ -2582,6 +2582,9 @@ impl PeerManager {
                         // gets its in-flight heights back via peer_disconnected.
                         self.handle_peer_disconnected(peer_id);
                     }
+                    // A header accepted off the P2P path (`submitheader`)
+                    // rewrites rows without passing through `handle_headers`.
+                    self.apply_header_row_changes();
                     // Assign work to any idle peers
                     self.assign_all_peers();
                 }
@@ -3360,12 +3363,45 @@ impl PeerManager {
         }
     }
 
+    /// Hand the IBD scheduler every height-index row above the tip that a
+    /// best-header change rewrote, so the block it fetches for those heights
+    /// is the one on the chain. Without this the scheduler keeps its
+    /// creation-time hash for the height and asks for a block no peer has —
+    /// which Bitcoin Core answers with silence, not `notfound`.
+    fn apply_header_row_changes(&self) {
+        let changes = self.chain_state.take_header_row_changes();
+        if changes.is_empty() {
+            return;
+        }
+        let best_height = self
+            .chain_state
+            .get_block_index(&self.chain_state.best_header_hash())
+            .map(|e| e.height)
+            .unwrap_or(0);
+        let mut ibd = self.ibd.write();
+        let Some(scheduler) = ibd.as_mut() else {
+            return;
+        };
+        let (requeued, dropped) = scheduler.header_rows_changed(&changes, best_height);
+        if requeued + dropped > 0 {
+            tracing::info!(
+                changed = changes.len(),
+                requeued,
+                dropped,
+                "IBD: best-header chain moved above the tip; re-keyed the affected heights"
+            );
+        }
+    }
+
     fn handle_headers(&self, id: PeerId, headers: Vec<bitcoin::block::Header>) {
         if headers.is_empty() {
             return;
         }
 
         let (accepted, err) = self.chain_state.accept_headers(&headers);
+        // Whatever the batch did to the rows above the tip, the scheduler
+        // must hear about it before its next assignment.
+        self.apply_header_row_changes();
         if let Some(e) = err {
             match e {
                 crate::chain::state::ChainError::Duplicate => {}

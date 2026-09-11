@@ -627,6 +627,73 @@ impl IbdScheduler {
         self.height_peer_cooldown.remove(&height);
     }
 
+    /// Follow a change to the height-index rows above the tip: the
+    /// best-header chain moved to another branch, so the hash this scheduler
+    /// holds for each changed height names a block nobody will serve.
+    ///
+    /// A height with a new hash is re-keyed and, if it had been assigned or
+    /// delivered under the old hash, put back at the front of the queue so
+    /// the block actually on the chain is fetched next. A height with no row
+    /// any more (`None`) is dropped from every set. `best_header_height`
+    /// pulls the target down after a heavier-but-shorter switch; a later
+    /// `extend_target` raises it again. Returns `(requeued, dropped)`.
+    pub fn header_rows_changed(
+        &mut self,
+        changes: &[(u32, Option<BlockHash>)],
+        best_header_height: u32,
+    ) -> (usize, usize) {
+        let mut requeued = 0;
+        let mut dropped = 0;
+        for &(height, new_hash) in changes {
+            if height <= self.connect_cursor {
+                continue;
+            }
+            match new_hash {
+                Some(hash) => {
+                    if self.height_to_hash.get(&height) == Some(&hash) {
+                        continue;
+                    }
+                    self.height_to_hash.insert(height, hash);
+                    let was_taken = self.downloaded.remove(&height)
+                        | self.release_from_flight(height);
+                    self.height_peer_cooldown.remove(&height);
+                    if was_taken && height <= self.target_height {
+                        self.pending.push_front(height);
+                        requeued += 1;
+                    }
+                }
+                None => {
+                    if self.height_to_hash.remove(&height).is_some() {
+                        dropped += 1;
+                    }
+                    self.downloaded.remove(&height);
+                    self.release_from_flight(height);
+                    self.height_peer_cooldown.remove(&height);
+                    // A pending entry with no mapping is skipped and discarded
+                    // by `assign_blocks`; nothing to do here.
+                }
+            }
+        }
+        if best_header_height < self.target_height {
+            self.target_height = best_header_height.max(self.connect_cursor);
+        }
+        (requeued, dropped)
+    }
+
+    /// Take a height out of flight without judging the peer that held it —
+    /// the block it was asked for stopped being the right block. Returns
+    /// whether it was in flight.
+    fn release_from_flight(&mut self, height: u32) -> bool {
+        let Some(peer_id) = self.in_flight.remove(&height) else {
+            return false;
+        };
+        self.in_flight_at.remove(&height);
+        if let Some(slots) = self.peer_slots.get_mut(&peer_id) {
+            slots.assigned.retain(|&h| h != height);
+        }
+        true
+    }
+
     /// Extend the target height as more headers arrive.
     /// Adds newly available heights to the pending pool (shuffled).
     pub fn extend_target(&mut self, new_target: u32, chain_state: &ChainState) {
@@ -806,6 +873,44 @@ mod tests {
         sorted.sort();
         // With 100 elements shuffled, it's astronomically unlikely to be sorted
         assert_ne!(heights, sorted, "Blocks should be shuffled, not sequential");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The best-header chain moved above the tip. A height the scheduler had
+    /// in flight, or had already delivered, under the old hash goes back to
+    /// the front of the queue under the new one; a height whose row vanished
+    /// is dropped; heights at or below the cursor are ignored; and the next
+    /// assignment asks for the new hashes.
+    #[test]
+    fn header_rows_changed_requeues_reassigned_heights_under_the_new_hash() {
+        use bitcoin::hashes::Hash as _;
+        let (cs, dir) = make_chain_state_with_headers(20);
+        let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
+        // Peer 1 takes the priority zone, heights 1..=16; height 2 arrives.
+        assert_eq!(sched.assign_blocks(1).len(), 16);
+        sched.block_received(1, 2);
+        assert!(sched.is_downloaded(2));
+        let old1 = cs.get_block_hash_by_height(1).unwrap();
+
+        let new1 = BlockHash::from_byte_array([0x11; 32]);
+        let new2 = BlockHash::from_byte_array([0x22; 32]);
+        let changes = [(1, Some(new1)), (2, Some(new2)), (20, None), (0, Some(old1))];
+        assert_eq!(sched.header_rows_changed(&changes, 19), (2, 1));
+
+        assert!(!sched.in_flight_contains(1), "no longer owed under the old hash");
+        assert!(!sched.is_downloaded(2), "the delivered fork block is not the block");
+        assert!(sched.pending_contains(1) && sched.pending_contains(2));
+        assert!(!sched.peer_inflight_heights(1).contains(&1));
+        assert!(!sched.height_to_hash_contains(20));
+        assert_eq!(sched.target_height(), 19, "pulled down to the best header");
+
+        let next = sched.assign_blocks(2);
+        assert!(next.contains(&new1) && next.contains(&new2), "asks for the chain's blocks");
+        assert!(!next.contains(&old1));
+
+        // Re-keying an unchanged row is a no-op.
+        assert_eq!(sched.header_rows_changed(&[(3, cs.get_block_hash_by_height(3))], 19), (0, 0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
