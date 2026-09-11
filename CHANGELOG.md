@@ -127,11 +127,16 @@ item below is (or will be) written up in full in the in-development
   method 404, and any other error — a parse error, `-8`, `-5` — 500. A
   JSON-RPC 2.0 request keeps 200 and carries the error in the body, as Core
   does (#664).
-- `-rpcservertimeout` bounds idle keep-alive connections and HTTP/2 as well
-  as the header read, and reaches the TLS listener, which had no timeout at
-  all (#664).
-- A JSON-RPC response too large to normalise is forwarded rather than
-  DOM-parsed, which cost several times its size in peak memory (#664).
+- `-rpcservertimeout` bounds the request body, idle keep-alive connections
+  and HTTP/2 as well as the header read, and reaches the TLS listener, which
+  had no timeout at all (#664).
+- A JSON-RPC response too large to normalise is no longer DOM-parsed, which
+  cost several times its size in peak memory (#664).
+- `verifytxoutproof`, `gettxoutproof` and `getchaintxstats` answer
+  active-chain membership from the height index instead of walking the chain
+  from the tip.
+- `addconnection` reports success for a target that does not resolve, as
+  Core does; the failed dial is logged.
 - **Breaking:** a replacement is now compared against the *feerate diagram*
   it displaces, as Bitcoin Core's `ImprovesFeerateDiagram` does, rather than
   against each conflicting transaction's own feerate. A cheap transaction

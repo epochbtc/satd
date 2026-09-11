@@ -1197,20 +1197,13 @@ pub fn get_silent_payment_block_data(
     let height = entry.height;
 
     // Active-chain check: the tweak index is height-keyed, so a stale/fork/
-    // header-only hash must not resolve to the active block's row. The
-    // `height_hash` index is "best known at height" and is pollutable by
-    // side-chain / header-first `store_block` paths, so a bare index lookup can
-    // reject a *valid active* block whose entry was clobbered (a false
-    // negative). Use it only as a fast agree-path; on any disagreement fall back
-    // to the authoritative `active_chain_hash_at_height`, which walks back from
-    // the active tip and never returns a side-chain block. (The self-
-    // authenticating `row.block_hash` check below is the ultimate arbiter, so a
-    // side-chain hash the fast path happened to accept is still rejected there.)
-    let on_active_chain = match chain.get_block_hash_by_height(height) {
-        Some(active) if active == block_hash => true,
-        _ => chain.active_chain_hash_at_height(height) == Some(block_hash),
-    };
-    if !on_active_chain {
+    // header-only hash must not resolve to the active block's row.
+    // `active_chain_contains` answers yes from the height index and falls back
+    // to the walk before answering no, so a valid active block whose index row
+    // was clobbered is not rejected. (The self-authenticating `row.block_hash`
+    // check below is the ultimate arbiter, so a side-chain hash the fast path
+    // happened to accept is still rejected there.)
+    if !chain.active_chain_contains(&block_hash, height) {
         return Err((-5, "tweak data not found for non-active block".to_string()));
     }
 

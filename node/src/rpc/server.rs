@@ -744,9 +744,10 @@ pub async fn start(
     // TLS surfaces as a single node-wide RPC work budget.
     rpc_threads: usize,
     rpc_workqueue: usize,
-    // Per-connection header-read timeout (Bitcoin Core `-rpcservertimeout`).
-    // `None` disables; `Some(dur)` causes hyper to close the TCP connection
-    // if a complete HTTP request header is not received within `dur`.
+    // Per-connection request timeout (Bitcoin Core `-rpcservertimeout`).
+    // `None` disables. `Some(dur)` is the budget a client gets to deliver a
+    // complete request — head (hyper's `header_read_timeout`) and body (the
+    // compat layer's collect) — and to sit idle between keep-alive requests.
     header_read_timeout: Option<Duration>,
     chain_state: Arc<ChainState>,
     mempool: Arc<Mempool>,
@@ -2987,31 +2988,25 @@ pub async fn start(
             ));
         }
 
-        // Core hands the string to `OpenNetworkConnection`, which `Lookup()`s
-        // it, so a hostname is as valid here as a literal — `feature_anchors`
-        // passes an `.onion`. Parsing a bare `SocketAddr`, as this did,
-        // rejected everything else.
-        let target = ctx
-            .peer_manager
-            .resolve_peer_target(
-                &address,
-                crate::net::peer::default_p2p_port(ctx.chain_state.network),
-            )
-            .await
-            .map_err(|e| {
-                ErrorObjectOwned::owned(-8, format!("Invalid address: {address}: {e}"), None::<()>)
-            })?;
-
         // -34 = RPC_CLIENT_NODE_CAPACITY_REACHED. Core capacity-checks before
         // dialling and reports that code; every other failure here is a plain
         // misc error, as Core's OpenNetworkConnection failures are.
         //
-        // The dial itself is not awaited: Core returns once the socket is
-        // connected, and its test framework binds the listener, calls this,
-        // and only then accepts — so awaiting the handshake here deadlocks
-        // against the caller until the dial times out.
+        // Neither the dial nor the name lookup is awaited. Core hands the
+        // operator's string to `OpenNetworkConnection` and returns once the
+        // socket is connected, never waiting for the peer's `version`, and its
+        // `Lookup` runs on the dial thread — so a target that does not resolve
+        // is a successful `addconnection` with a line in the log, exactly like
+        // a dial that was refused. Waiting here for either instead deadlocks
+        // against the functional-test framework, which binds a listener, calls
+        // this, and only then accepts.
         ctx.peer_manager
-            .add_connection(target, conn_type, v2transport)
+            .add_connection(
+                &address,
+                crate::net::peer::default_p2p_port(ctx.chain_state.network),
+                conn_type,
+                v2transport,
+            )
             .map_err(|e| {
                 let code = if e.starts_with("Error: Already at capacity") { -34 } else { -1 };
                 ErrorObjectOwned::owned(code, e, None::<()>)
@@ -4191,7 +4186,10 @@ async fn spawn_tls_surface(
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth, bearer))
-        .layer(JsonRpcCompatLayer::new());
+        // The same `-rpcservertimeout` budget hyper applies to the request
+        // head: this layer is the only place satd reads a request *body*, so
+        // it is the only place the body phase can be bounded.
+        .layer(JsonRpcCompatLayer::new(header_read_timeout));
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(tls_middleware)
@@ -4417,11 +4415,11 @@ pub async fn spawn_plain_surface(
     // node comes up: answers every other method with Core's `-28 RPC in
     // warmup` instead of `-32601 Method not found`. `None` elsewhere.
     warmup: Option<crate::rpc::warmup::WarmupLayer>,
-    // Per-connection HTTP header-read timeout (`-rpcservertimeout`).
-    // `None` disables (hyper's default). When set, hyper closes any
-    // connection whose client does not complete the HTTP request
-    // header within this window — the Core libevent equivalent of
-    // `evhttp_set_timeout`.
+    // Per-connection request timeout (`-rpcservertimeout`), the satd
+    // equivalent of Core's `evhttp_set_timeout`. `None` disables. When set,
+    // hyper closes any connection whose client does not complete a request
+    // head within the window, and the compat layer closes one whose body does
+    // not arrive within it.
     header_read_timeout: Option<Duration>,
 ) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     // Bind synchronously so a port conflict is a startup-fatal error
@@ -4439,7 +4437,8 @@ pub async fn spawn_plain_surface(
         .layer(CoreHttpPreludeLayer::new())
         .layer(AdmissionLayer::new(admission))
         .layer(AuthLayer::new(auth, bearer))
-        .layer(JsonRpcCompatLayer::new());
+        // See the TLS builder above: the body phase of `-rpcservertimeout`.
+        .layer(JsonRpcCompatLayer::new(header_read_timeout));
     let rpc_svc = ServerBuilder::new()
         .set_config(server_cfg)
         .set_http_middleware(plain_middleware)
@@ -4588,16 +4587,20 @@ pub async fn spawn_plain_surface(
     Ok(server_handle)
 }
 
-/// Serve a single HTTP connection with an optional header-read timeout.
+/// Serve a single HTTP connection under an optional per-request timeout.
 ///
 /// This is the plain-HTTP equivalent of jsonrpsee's
 /// [`serve_with_graceful_shutdown`], with one addition: when
-/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1
-/// builder is configured with a matching `header_read_timeout` (plus
-/// the required timer), so a client that opens a TCP connection but
-/// never completes the HTTP request headers gets disconnected rather
-/// than holding a connection slot forever.  This wires Bitcoin Core's
-/// `-rpcservertimeout` knob.
+/// `header_read_timeout` is `Some`, the underlying hyper HTTP/1.1 builder is
+/// configured with a matching `header_read_timeout` (plus the required
+/// timer), so a client that opens a TCP connection but never completes a
+/// request head — including the head of the *next* request on an idle
+/// keep-alive connection — gets disconnected rather than holding a connection
+/// slot forever. HTTP/2 gets the same budget as a keep-alive ping deadline.
+///
+/// The other half of Bitcoin Core's `-rpcservertimeout` is the request body,
+/// which hyper cannot time out; that budget is applied where satd reads the
+/// body, in [`crate::rpc::compat::JsonRpcCompatLayer`].
 async fn serve_http_connection<S, B, I>(
     io: I,
     service: S,
@@ -4627,12 +4630,11 @@ where
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     if let Some(timeout) = header_read_timeout {
-        // The header-read timeout covers only the gap between accepting the
-        // socket and reading a complete request head. A client that sends
-        // half a header, or a complete head and then no body, or that holds
-        // an idle keep-alive connection open, was never disconnected — so
-        // `-rpcservertimeout` bounded one phase of the connection and left
-        // the rest unbounded. HTTP/2 had no bound at all.
+        // hyper's timer is armed each time a request head is awaited, so this
+        // covers both the first head and the idle gap before the next request
+        // on a keep-alive connection. It stops once the head is complete: the
+        // body phase is bounded in the compat layer instead, because that is
+        // where satd reads the body and hyper offers no body-read timeout.
         builder
             .http1()
             .timer(hyper_util::rt::TokioTimer::new())

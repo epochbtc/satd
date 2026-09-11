@@ -607,11 +607,23 @@ where
 
 /// Tower layer installing the JSON-RPC version-compatibility shim.
 #[derive(Clone, Default)]
-pub struct JsonRpcCompatLayer;
+pub struct JsonRpcCompatLayer {
+    body_timeout: Option<std::time::Duration>,
+}
 
 impl JsonRpcCompatLayer {
-    pub fn new() -> Self {
-        Self
+    /// `body_timeout` is `-rpcservertimeout`: the budget a client gets to
+    /// deliver the request body once its head has arrived. `None` disables
+    /// it, matching `-rpcservertimeout=0`.
+    ///
+    /// The budget belongs here because this is the only place satd reads a
+    /// request body — jsonrpsee is handed a fully buffered one — and hyper
+    /// has no body-read timeout of its own. Core gets the whole connection
+    /// covered for free: `evhttp_set_timeout` (v31.1
+    /// `src/httpserver.cpp:408`) is a bufferevent read timeout, so it bounds
+    /// the head, the body and the idle gap alike.
+    pub fn new(body_timeout: Option<std::time::Duration>) -> Self {
+        Self { body_timeout }
     }
 }
 
@@ -619,7 +631,10 @@ impl<S> tower::Layer<S> for JsonRpcCompatLayer {
     type Service = JsonRpcCompatMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        JsonRpcCompatMiddleware { inner }
+        JsonRpcCompatMiddleware {
+            inner,
+            body_timeout: self.body_timeout,
+        }
     }
 }
 
@@ -628,6 +643,7 @@ impl<S> tower::Layer<S> for JsonRpcCompatLayer {
 #[derive(Clone)]
 pub struct JsonRpcCompatMiddleware<S> {
     inner: S,
+    body_timeout: Option<std::time::Duration>,
 }
 
 impl<S> tower::Service<HttpRequest<hyper::body::Incoming>> for JsonRpcCompatMiddleware<S>
@@ -659,6 +675,7 @@ where
         // own tower pattern (the cloned service is the one polled to
         // completion; `self.inner` stays ready for the next call).
         let mut inner = self.inner.clone();
+        let body_timeout = self.body_timeout;
         Box::pin(async move {
             let (mut parts, body) = req.into_parts();
 
@@ -692,12 +709,29 @@ where
             // (transport) error yields an empty body so the inner service
             // produces a normal parse/te error rather than this layer
             // panicking.
-            let collected = match Limited::new(body, MAX_NORMALIZE_BODY).collect().await {
-                Ok(buf) => buf.to_bytes(),
-                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+            //
+            // The read is also the phase `-rpcservertimeout` has to cover.
+            // hyper's `header_read_timeout` stops once the head is complete,
+            // so without a deadline here a client that sends a valid head and
+            // then withholds the body holds a connection and a task open
+            // indefinitely. Core's libevent timeout covers head and body with
+            // one bufferevent read timeout.
+            let collect = Limited::new(body, MAX_NORMALIZE_BODY).collect();
+            let collected = match with_optional_timeout(body_timeout, collect).await {
+                Some(Ok(buf)) => buf.to_bytes(),
+                Some(Err(e))
+                    if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() =>
+                {
                     return Ok(payload_too_large());
                 }
-                Err(_) => bytes::Bytes::new(),
+                Some(Err(_)) => bytes::Bytes::new(),
+                None => {
+                    tracing::debug!(
+                        target: "rpc::compat",
+                        "request body did not arrive within -rpcservertimeout; closing"
+                    );
+                    return Ok(request_timeout());
+                }
             };
 
             // Decide the response shape from what the client actually spoke,
@@ -769,6 +803,16 @@ where
             let out_body = if client_spoke_2_0 {
                 resp_bytes.to_vec()
             } else if oversized {
+                // Unreachable today, and deliberately kept: jsonrpsee is
+                // configured with the same 20 MiB cap on the response side
+                // (`max_response_body_size`, `server.rs`), and replaces any
+                // reply larger than that with `-32008 Response is too big`
+                // while serialising the envelope — so nothing over the cap
+                // ever reaches this layer. Lifting that cap is #723; this
+                // branch is what the compat layer will do when it can be
+                // reached, and is why the note in the 0.5.2 release notes
+                // describes the engine's refusal rather than this forward.
+                //
                 // Normalisation DOM-parses the body to touch three top-level
                 // keys, which costs several times its size again. A reply
                 // over the cap — a verbosity-2 `getblock` of a full block is
@@ -850,6 +894,34 @@ fn core_http_status(body: &[u8], client_spoke_2_0: bool) -> Option<hyper::Status
         -32601 => hyper::StatusCode::NOT_FOUND,
         _ => hyper::StatusCode::INTERNAL_SERVER_ERROR,
     })
+}
+
+/// Await `fut`, giving up after `limit`. `None` for the limit means "no
+/// deadline"; a `None` result means the deadline passed.
+async fn with_optional_timeout<F: std::future::Future>(
+    limit: Option<std::time::Duration>,
+    fut: F,
+) -> Option<F::Output> {
+    match limit {
+        Some(dur) => tokio::time::timeout(dur, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
+/// `408 Request Timeout` — the client took longer than `-rpcservertimeout` to
+/// deliver its request body.
+///
+/// Core answers nothing at all: libevent's timeout closes the connection. The
+/// status is sent first here because it costs one line and can only help a
+/// client that is still listening; `Connection: close` then makes hyper close
+/// the connection after writing it, which is the part that matters — neither
+/// the socket nor its task may outlive the budget.
+fn request_timeout() -> HttpResponse<HttpBody> {
+    hyper::Response::builder()
+        .status(hyper::StatusCode::REQUEST_TIMEOUT)
+        .header(hyper::header::CONNECTION, "close")
+        .body(HttpBody::from(""))
+        .expect("static 408 response is always valid")
 }
 
 /// `413 Payload Too Large` — the response for a request body exceeding
