@@ -1029,6 +1029,21 @@ pub struct Config {
     /// `authfile`). Default false — a non-loopback `mcpbind` without this is
     /// refused at startup, so MCP can never be exposed remotely unauthenticated.
     pub mcp_allow_remote: bool,
+    /// Additional `Host` header authorities the MCP listener accepts, on top of
+    /// the loopback names (`localhost`, `127.0.0.1`, `::1`) it always allows.
+    ///
+    /// The MCP transport validates `Host` to blunt DNS rebinding: a browser on
+    /// the operator's network can be induced to resolve an attacker-controlled
+    /// name to the listener's address, and `Host` is what distinguishes that
+    /// request from a legitimate one — TLS does not, because the browser
+    /// completes a valid handshake either way. The default list is loopback
+    /// only, so a listener reached by hostname answers 403 to every request
+    /// until the operator names the hostname here.
+    ///
+    /// An entry may be a bare host (`node.example`), which matches that host on
+    /// any port, or a `host:port` authority (`node.example:8339`), which
+    /// matches only that port. Matching is case-insensitive.
+    pub mcp_allowed_hosts: Vec<String>,
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     pub metricsport: Option<u16>,
     pub metricsbind: String,
@@ -3086,6 +3101,35 @@ impl Config {
         if !mcp_mtls && !mcp_mtls_client_allow.is_empty() {
             return Err("--mcpmtlsclientallow requires --mcpmtls=1".to_string());
         }
+        // Host-header allowlist for the MCP transport. Additive: the loopback
+        // names stay allowed whatever is set here, so naming a hostname widens
+        // the allowlist without ever disabling the rebinding check.
+        let mcp_allowed_hosts: Vec<String> = {
+            let mut values: Vec<String> = cli.mcpallowedhost.clone();
+            if values.is_empty() {
+                values = file_get_all("mcpallowedhost");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        // A `Host` header carries an authority and nothing else. Operators
+        // reach for a URL here, and a value with a scheme or a path would
+        // silently match nothing — a 403 with no hint as to why.
+        for host in &mcp_allowed_hosts {
+            if host.contains("://") || host.contains('/') {
+                return Err(format!(
+                    "--mcpallowedhost={host} is not a Host value: give a bare `host` or \
+                     `host:port` authority, with no scheme and no path"
+                ));
+            }
+        }
         // A remote MCP bind must be encrypted: bearer tokens cross the wire, so
         // TLS is mandatory whenever the listener is reachable off-host. This is
         // enforced here (`mcpallowremote`) and again in main.rs against the
@@ -3789,6 +3833,7 @@ impl Config {
             mcp_mtls,
             mcp_mtls_client_ca,
             mcp_mtls_client_allow,
+            mcp_allowed_hosts,
             dbcache: {
                 // Pre-compute static-partition size: the initial budget that
                 // the coin/rocksdb partition is built from. For Auto we use
@@ -5772,6 +5817,14 @@ pub struct CliArgs {
     )]
     pub mcpallowremote: Option<bool>,
 
+    /// Extra Host authorities the MCP listener accepts.
+    #[arg(
+        long,
+        value_name = "HOST",
+        help = "Additional Host header values the MCP server accepts, as `host` or `host:port` (repeatable, comma-separated). Loopback names are always accepted. Required to reach MCP by hostname."
+    )]
+    pub mcpallowedhost: Vec<String>,
+
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     #[arg(
         long,
@@ -6473,6 +6526,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mcpmtlsclientallow",
         "mcpauth",
         "mcpallowremote",
+        "mcpallowedhost",
         "metricsport",
         "metricsbind",
         "server",
@@ -7260,6 +7314,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "mcpmtlsclientallow",
     "mcpauth",
     "mcpallowremote",
+    "mcpallowedhost",
     // Metrics / health
     "metricsport",
     "metricsbind",
@@ -9575,6 +9630,7 @@ testactivationheight=bip34@2
             mcpmtlsclientallow: Vec::new(),
             mcpauth: None,
             mcpallowremote: None,
+            mcpallowedhost: Vec::new(),
             metricsport: None,
             metricsbind: None,
             maxahead: None,
@@ -9871,6 +9927,7 @@ testactivationheight=bip34@2
             mcpmtlsclientallow: Vec::new(),
             mcpauth: None,
             mcpallowremote: None,
+            mcpallowedhost: Vec::new(),
             metricsport: None,
             metricsbind: None,
             maxahead: None,
@@ -10857,6 +10914,53 @@ testactivationheight=bip34@2
     }
 
     #[test]
+    fn mcpallowedhost_is_repeatable_and_comma_separated() {
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test3",
+            "--mcpallowedhost=node.example",
+            "--mcpallowedhost=other.example:8339, spaced.example",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(
+            cfg.mcp_allowed_hosts,
+            vec!["node.example", "other.example:8339", "spaced.example"]
+        );
+    }
+
+    #[test]
+    fn mcpallowedhost_rejects_a_url() {
+        // The `Host` header is an authority. An operator who pastes a URL here
+        // would otherwise match nothing and see an unexplained 403.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test4",
+            "--mcpallowedhost=https://node.example/mcp",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert!(err.contains("mcpallowedhost"), "got: {err}");
+    }
+
+    #[test]
+    fn mcpallowedhost_defaults_to_empty() {
+        // Empty means "loopback only" downstream — the pre-existing behaviour.
+        let cli = CliArgs::try_parse_from([
+            "satd",
+            "--regtest",
+            "--datadir=/tmp/satd-mcp-test5",
+            "--mcp=1",
+            "--mcpport=8339",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.mcp_allowed_hosts.is_empty());
+    }
+
+    #[test]
     fn eventsgrpcallowremote_requires_eventsgrpcauth() {
         // A remote events-gRPC bind without bearer auth would be an
         // unauthenticated public firehose — must hard-error at startup.
@@ -11634,6 +11738,64 @@ rpcport=39999
             !cfg.listen,
             "an uninterpretable listen= must not suppress the -connect interaction"
         );
+    }
+
+    /// `satd-init` writes one `mcpallowedhost=` line per name, so the
+    /// conf-file path has to accumulate repeats rather than keep the last —
+    /// and the key has to be in `KNOWN_CONFIG_KEYS`, or the file is rejected.
+    #[test]
+    fn mcpallowedhost_accumulates_from_the_conf_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmpdir.path().join("bitcoin.conf"),
+            "mcpallowedhost=node.example
+mcpallowedhost=node.local
+",
+        )
+        .unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd]).expect("starts");
+        assert_eq!(cfg.mcp_allowed_hosts, vec!["node.example", "node.local"]);
+    }
+
+    /// The single-dash spelling is how it appears in every operator-facing
+    /// example, so `normalize_args` has to know the flag.
+    #[test]
+    fn mcpallowedhost_accepts_the_single_dash_spelling() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "-mcpallowedhost=node.example",
+        ])
+        .expect("starts");
+        assert_eq!(cfg.mcp_allowed_hosts, vec!["node.example"]);
+    }
+
+    /// A command-line value replaces the file's list rather than adding to it,
+    /// matching how `mcpmtlsclientallow` already behaves.
+    #[test]
+    fn mcpallowedhost_on_the_command_line_beats_the_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmpdir.path().join("bitcoin.conf"),
+            "mcpallowedhost=from.file
+",
+        )
+        .unwrap();
+        let dd = tmpdir.path().to_str().unwrap();
+        let cfg = parse_negation(&[
+            "satd",
+            "--regtest",
+            "--datadir",
+            dd,
+            "-mcpallowedhost=from.cli",
+        ])
+        .expect("starts");
+        assert_eq!(cfg.mcp_allowed_hosts, vec!["from.cli"]);
     }
 
     /// Core's condition is `maxconnections <= 0`. Parsing the file value as

@@ -98,6 +98,9 @@ item below is (or will be) written up in full in the in-development
   outbound connection of a chosen type (`outbound-full-relay`,
   `block-relay-only`, `addr-fetch`, `feeler`). `getpeerinfo` now reports the
   real `connection_type`, and each type behaves as Core's does.
+- `-mcpallowedhost=<host[:port]>` (repeatable, comma-separated) names further
+  `Host` header values the MCP listener accepts, on top of the loopback names
+  it always accepts. Required to reach MCP by hostname — see the fix below.
 - `validateaddress` reports *why* an address is invalid: Core's `error`
   string plus `error_locations` for a Bech32 checksum failure.
 - `-vbparams=deployment:start:end[:min_activation_height]`, Core's
@@ -110,6 +113,13 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- MCP answered `403 Forbidden` to every request that did not arrive with a
+  loopback `Host` header, so a listener reached by hostname — which is every
+  reverse-proxied and app-store deployment — was unreachable even with
+  `-mcpallowremote`, `-mcpauth` and TLS all correctly configured. The
+  transport's DNS-rebinding allowlist was left at its loopback-only default;
+  `-mcpallowedhost` now extends it. The check itself is unchanged, and cannot
+  be turned off.
 - CI: every `apt-get update` drops the runner image's third-party apt sources
   first. A hash-sum mismatch on Google's Chrome repository — which none of the
   installed packages come from — was failing the whole step, and with it every

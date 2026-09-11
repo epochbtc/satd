@@ -29,6 +29,10 @@ NETWORK="${NETWORK:-signet}"
 SUBNET="${SATD_STACK_SUBNET:-10.77.0.0/24}"
 TLS_HOSTNAME="${SATD_TLS_HOSTNAME:-$(hostname)}"
 MCP_ENABLED="${SATD_MCP:-0}"
+# Further names to put in MCP's Host allowlist, comma-separated. The names
+# derived below cover the install's own hostname; this is for a reverse proxy
+# or a DNS alias in front of it, which satd-init cannot know about.
+MCP_EXTRA_HOSTS="${SATD_MCP_ALLOWED_HOSTS:-}"
 
 # Fixed inside the stack, on every network. Publishing and client
 # configuration therefore do not change when the network does; only the P2P
@@ -145,6 +149,24 @@ hash = "sha256:$token_hash"
 capabilities = ["mcp:*"]
 AUTH
 
+    # MCP's transport validates the Host header against an allowlist that
+    # defaults to loopback only, as a DNS-rebinding defence. A client reaching
+    # this node by name gets 403 unless that name is listed — so the names
+    # listed here are the same ones the certificate carries, which is by
+    # construction the set of names clients use for this install. Kept in step
+    # with the SAN set mkca.sh builds from the same TLS_HOSTNAME: the hostname,
+    # its mDNS form when the hostname is not already a FQDN, and the compose
+    # service name passed as --extra-name.
+    declare -a mcp_hosts=("$TLS_HOSTNAME" "satd")
+    [[ "$TLS_HOSTNAME" == *.* ]] || mcp_hosts+=("${TLS_HOSTNAME}.local")
+    if [[ -n "$MCP_EXTRA_HOSTS" ]]; then
+        IFS=',' read -r -a extra_hosts <<< "$MCP_EXTRA_HOSTS"
+        for h in ${extra_hosts[@]+"${extra_hosts[@]}"}; do
+            h="${h// /}"
+            [[ -n "$h" ]] && mcp_hosts+=("$h")
+        done
+    fi
+
     cat >> "$CONF.new" <<MCPCONF
 
 # --- MCP --------------------------------------------------------------------
@@ -159,6 +181,12 @@ mcpauth=1
 mcpcert=$TLS_DIR/fullchain.crt
 mcpkey=$TLS_DIR/leaf.key
 MCPCONF
+
+    # Loopback is always accepted by satd itself and is deliberately not
+    # repeated here.
+    for h in "${mcp_hosts[@]}"; do
+        printf 'mcpallowedhost=%s\n' "$h" >> "$CONF.new"
+    done
 fi
 
 # Operator additions, appended last so they win where satd takes the last

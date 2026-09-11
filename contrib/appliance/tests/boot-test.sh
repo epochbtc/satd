@@ -351,15 +351,43 @@ TOKEN="$(guest 'cat /var/lib/satd/secrets/mcp-token' 2>/dev/null | tr -d '\r\n' 
 if [[ -n "$TOKEN" ]]; then
     # Unauthenticated first: a listener that answers without the token would
     # mean the bearer gate is not installed, which no amount of TLS fixes.
+    #
+    # 401 specifically, not "401 or 403". MCP's transport checks the Host
+    # header before it checks anything else and answers 403 when the name is
+    # not in its allowlist — so accepting 403 here passed this test on a
+    # listener that was refusing every request for a reason that has nothing
+    # to do with authentication, and would go on refusing them with the token.
     anon_code="$(curl -sS --cacert "$CA" --resolve "satd:$MCP_TLS:127.0.0.1" \
         -o /dev/null -w '%{http_code}' -X POST \
         -H 'Content-Type: application/json' \
         --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
         "https://satd:$MCP_TLS/" 2>&1 || true)"
-    if [[ "$anon_code" == "401" || "$anon_code" == "403" ]]; then
-        pass "MCP refuses an unauthenticated request ($anon_code)"
+    if [[ "$anon_code" == "401" ]]; then
+        pass "MCP refuses an unauthenticated request (401)"
+    elif [[ "$anon_code" == "403" ]]; then
+        fail "MCP refuses an unauthenticated request" \
+             "http 403 — the Host header was rejected before auth ran. Check that \
+satd-init wrote an mcpallowedhost= line for the name this request uses."
     else
         fail "MCP refuses an unauthenticated request" "http $anon_code"
+    fi
+
+    # And then that it *answers* with the token. Refusing everything passes a
+    # refusal test, so the negative check above proves nothing on its own.
+    # This is also the end-to-end check on the Host allowlist: the request is
+    # addressed to the node by name, which is how a real client reaches it.
+    auth_body="$(curl -sS --cacert "$CA" --resolve "satd:$MCP_TLS:127.0.0.1" \
+        -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json, text/event-stream' \
+        --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"boot-test","version":"0"}}}' \
+        "https://satd:$MCP_TLS/" 2>&1 || true)"
+    if grep -q '"serverInfo"' <<< "$auth_body"; then
+        pass "MCP answers initialize when addressed by name with a token"
+    else
+        fail "MCP answers initialize when addressed by name with a token" \
+             "$(head -c 300 <<< "$auth_body")"
     fi
 else
     fail "the MCP token was generated"
