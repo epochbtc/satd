@@ -210,7 +210,7 @@ Override it if you would rather not advertise the token, or need a different one
 for another client:
 
 ```ini
-electrumservername=satd/0.5.1
+electrumservername=satd/0.5.2
 ```
 
 Keep an override from *beginning* with `electrs`. Several clients test that
