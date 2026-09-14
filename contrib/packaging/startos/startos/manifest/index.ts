@@ -31,7 +31,7 @@ export const manifest = setupManifest({
         //
         // Pinning the 0.6.0 release, with versions/current.ts, is a step in the
         // release checklist.
-        dockerTag: 'ghcr.io/epochbtc/satd:sha-e7665f3@sha256:177d037aedde5c87e858398cf0358bc17ad675dafe438d8c52ddec126f39b3e9',
+        dockerTag: 'ghcr.io/epochbtc/satd:sha-77d834b@sha256:78a134649c259c1c9cf0c4489b0b12b7a83b48e2d13fcc40f6250f3e5e339dee',
       },
       // The image publishes linux/amd64 and linux/arm64 and nothing else, so
       // there is no riscv64 here and nothing to emulate it from.
