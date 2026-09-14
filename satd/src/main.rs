@@ -2811,6 +2811,62 @@ async fn main() {
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
         };
+        // The TLS listener is set up before the plain one is spawned, and
+        // every failure in it is fatal: an operator who asked for a
+        // LAN-facing encrypted scrape endpoint must not get a node that came
+        // up without one. Config::load already refused partial settings.
+        if let Some(addr_str) = config.metrics_tls_bind.as_ref() {
+            let (Some(cert), Some(key)) =
+                (config.metrics_tls_cert.as_ref(), config.metrics_tls_key.as_ref())
+            else {
+                eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
+                auth.cleanup();
+                std::process::exit(1);
+            };
+            let tls_bind: SocketAddr = match addr_str.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: invalid --metricstlsbind {addr_str:?}: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            let client_ca = if config.metrics_mtls {
+                config.metrics_mtls_client_ca.as_deref()
+            } else {
+                None
+            };
+            let tls = match node::metrics::MetricsTls::new(
+                cert,
+                key,
+                client_ca,
+                config.metrics_mtls_client_allow.iter().cloned(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: metrics TLS config: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            let tls_listener = match tokio::net::TcpListener::bind(tls_bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error: metrics TLS listener could not bind to {tls_bind}: {e}");
+                    auth.cleanup();
+                    std::process::exit(1);
+                }
+            };
+            let tls_ctx = metrics_ctx.clone();
+            let rx = shutdown_rx.clone();
+            api_handle.spawn(async move {
+                if let Err(e) =
+                    node::metrics::serve_metrics_https(tls_ctx, tls_listener, tls, rx).await
+                {
+                    tracing::error!("Metrics HTTPS server error: {}", e);
+                }
+            });
+        }
         let rx = shutdown_rx.clone();
         api_handle.spawn(async move {
             if let Err(e) = node::metrics::serve_metrics_http(metrics_ctx, metrics_bind, rx).await {

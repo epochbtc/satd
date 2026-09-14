@@ -16943,3 +16943,167 @@ fn verificationprogress_matches_bitcoin_core() {
         check(offset, core, "a header above the tip");
     }
 }
+
+/// Poll `url` with `client` until it answers at all, so a test does not race
+/// the listener being spawned after the RPC server.
+fn wait_for_https(client: &reqwest::blocking::Client, url: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.get(url).send().is_err() {
+        if Instant::now() >= deadline {
+            panic!("{url} did not come up");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `--metricstlsbind` serves the metrics endpoints over TLS, verified against
+/// the CA that signed the server certificate (not with verification off), and
+/// the plain listener keeps answering alongside it.
+#[test]
+fn test_metrics_tls_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "prometheus");
+    let metrics_port = find_available_port();
+    let tls_port = find_available_port();
+
+    let mut node = TestNode::start(&[
+        &format!("--metricsport={metrics_port}"),
+        &format!("--metricstlsbind=127.0.0.1:{tls_port}"),
+        &format!("--metricstlscert={}", pki.server_cert_path.display()),
+        &format!("--metricstlskey={}", pki.server_key_path.display()),
+    ]);
+
+    let client = https_mtls_client(&pki.ca_pem, None);
+    let base = format!("https://localhost:{tls_port}");
+    wait_for_https(&client, &format!("{base}/healthz"));
+
+    let r = client.get(format!("{base}/healthz")).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = client.get(format!("{base}/readyz")).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = client.get(format!("{base}/metrics")).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.text().unwrap().contains("satd_tip_height"));
+
+    // Plain HTTP on the TLS port is not answered as HTTP.
+    let plain = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let r = plain.get(format!("http://127.0.0.1:{tls_port}/healthz")).send();
+    assert!(
+        !matches!(&r, Ok(resp) if resp.status().is_success()),
+        "the TLS port answered plain HTTP: {r:?}"
+    );
+
+    // And the plain listener is unchanged.
+    let r = plain
+        .get(format!("http://127.0.0.1:{metrics_port}/healthz"))
+        .send()
+        .expect("plain metrics listener");
+    assert_eq!(r.status().as_u16(), 200);
+
+    node.stop();
+}
+
+/// With `--metricsmtls=1` the TLS listener refuses a client without a
+/// certificate, serves one whose certificate the CA signed, and with an
+/// allowlist drops a CA-signed client whose name is not on it.
+#[test]
+fn test_metrics_mtls_requires_listed_client_cert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(tmp.path(), "prometheus");
+    let metrics_port = find_available_port();
+    let tls_port = find_available_port();
+
+    let mut node = TestNode::start(&[
+        &format!("--metricsport={metrics_port}"),
+        &format!("--metricstlsbind=127.0.0.1:{tls_port}"),
+        &format!("--metricstlscert={}", pki.server_cert_path.display()),
+        &format!("--metricstlskey={}", pki.server_key_path.display()),
+        "--metricsmtls=1",
+        &format!("--metricsmtlsclientca={}", pki.ca_path.display()),
+        "--metricsmtlsclientallow=prometheus",
+    ]);
+    let url = format!("https://localhost:{tls_port}/metrics");
+
+    let with_cert = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    wait_for_https(&with_cert, &url);
+    let r = with_cert.get(&url).send().expect("listed client cert");
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.text().unwrap().contains("satd_tip_height"));
+
+    let no_cert = https_mtls_client(&pki.ca_pem, None);
+    let r = no_cert.get(&url).send();
+    assert!(r.is_err(), "a client without a certificate was served: {r:?}");
+    node.stop();
+
+    // Same CA, a name that is not on the allowlist.
+    let other = tempfile::tempdir().unwrap();
+    let pki = mint_mtls_pki(other.path(), "grafana");
+    let tls_port = find_available_port();
+    let mut node = TestNode::start(&[
+        &format!("--metricsport={}", find_available_port()),
+        &format!("--metricstlsbind=127.0.0.1:{tls_port}"),
+        &format!("--metricstlscert={}", pki.server_cert_path.display()),
+        &format!("--metricstlskey={}", pki.server_key_path.display()),
+        "--metricsmtls=1",
+        &format!("--metricsmtlsclientca={}", pki.ca_path.display()),
+        "--metricsmtlsclientallow=prometheus",
+    ]);
+    let url = format!("https://localhost:{tls_port}/metrics");
+    // The plain listener tells us the node is up; the TLS one must not
+    // serve this client at any point.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let unlisted = https_mtls_client(&pki.ca_pem, Some(&pki.client_identity_pem));
+    let no_cert = https_mtls_client(&pki.ca_pem, None);
+    // A no-cert handshake failing proves the listener is up and doing TLS;
+    // wait until the port accepts connections at all.
+    while std::net::TcpStream::connect(("127.0.0.1", tls_port)).is_err() {
+        assert!(Instant::now() < deadline, "metrics TLS listener did not come up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(no_cert.get(&url).send().is_err());
+    let r = unlisted.get(&url).send();
+    assert!(
+        r.is_err(),
+        "a CA-signed client missing from the allowlist was served: {r:?}"
+    );
+    node.stop();
+}
+
+/// A metrics TLS listener that cannot bind is a startup error, not a node
+/// that came up without the endpoint it was told to serve.
+#[test]
+fn test_metrics_tls_bind_failure_aborts_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = mint_test_tls_cert(tmp.path());
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_port = taken.local_addr().unwrap().port();
+    let datadir = fresh_test_datadir("satd-test-metricstls-bind");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+        .arg("--regtest")
+        .arg(format!("--datadir={}", datadir.display()))
+        .arg(format!("--rpcport={}", find_available_port()))
+        .arg(format!("--port={}", find_available_port()))
+        .arg(format!("--metricsport={}", find_available_port()))
+        .arg(format!("--metricstlsbind=127.0.0.1:{taken_port}"))
+        .arg(format!("--metricstlscert={}", cert_path.display()))
+        .arg(format!("--metricstlskey={}", key_path.display()))
+        .output()
+        .expect("spawn satd");
+    drop(taken);
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "satd started without its metrics TLS listener: {combined}");
+    assert!(
+        combined.contains("metrics TLS listener could not bind"),
+        "error should name the metrics TLS listener; got: {combined}"
+    );
+    let _ = std::fs::remove_dir_all(&datadir);
+}

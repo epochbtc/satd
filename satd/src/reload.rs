@@ -1024,6 +1024,12 @@ fn field_specs() -> Vec<FieldSpec> {
         // ---- Metrics / health ----
         restart!("metricsport", metricsport),
         restart!("metricsbind", metricsbind),
+        restart!("metricstlsbind", metrics_tls_bind),
+        restart!("metricstlscert", metrics_tls_cert),
+        restart!("metricstlskey", metrics_tls_key),
+        restart!("metricsmtls", metrics_mtls),
+        restart!("metricsmtlsclientca", metrics_mtls_client_ca),
+        restart!("metricsmtlsclientallow", metrics_mtls_client_allow),
     ]
 }
 
