@@ -21,7 +21,11 @@
 //!
 //! The JSON shape is internal to the page and unstable (`STABILITY_POLICY.md`).
 
+pub mod advertise;
 pub mod indexes;
+pub mod render;
+
+pub use advertise::{Advertised, Surface};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -50,6 +54,8 @@ pub struct StatusSources {
     pub electrum_enabled: bool,
     /// Whether the previous run shut down cleanly.
     pub last_shutdown_clean: bool,
+    /// `statusadvertise`, in the order given.
+    pub advertise: Vec<Advertised>,
     rates: Mutex<Rates>,
     latest_block: Mutex<Option<LatestBlock>>,
 }
@@ -67,6 +73,7 @@ impl StatusSources {
         esplora_enabled: bool,
         electrum_enabled: bool,
         last_shutdown_clean: bool,
+        advertise: Vec<Advertised>,
     ) -> Self {
         Self {
             listener_status,
@@ -78,6 +85,7 @@ impl StatusSources {
             esplora_enabled,
             electrum_enabled,
             last_shutdown_clean,
+            advertise,
             rates: Mutex::new(Rates::default()),
             latest_block: Mutex::new(None),
         }
@@ -150,6 +158,8 @@ pub struct StatusSnapshot {
     pub assumeutxo: Option<AssumeUtxoStatus>,
     pub indexes: Vec<NamedIndex>,
     pub services: Services,
+    /// The operator's `statusadvertise` values.
+    pub connect: Vec<Advertised>,
     pub peers: Peers,
     pub mempool: MempoolStatus,
     /// Absent while syncing, when there is no mempool to estimate from.
@@ -432,6 +442,7 @@ fn build_at(ctx: &MetricsContext, sources: &StatusSources, now: u64) -> StatusSn
             electrum,
             wallets_ready,
         },
+        connect: sources.advertise.clone(),
         peers: Peers {
             inbound: peer_summary.inbound,
             outbound: peer_summary.outbound,

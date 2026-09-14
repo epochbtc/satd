@@ -100,6 +100,60 @@ labels) and does not consume an RPC worker on every scrape.
 > variant for, undecodable frames, and v2 decoy packets are all counted under
 > `*other*`, matching Core.
 
+## Status page
+
+`--statuspage=1` adds a browser page to the metrics listener, a simplified,
+single-page `sat-tui`: whether the node is syncing or ready, sync progress and
+its ETA, AssumeUTXO background validation, each index and whether a wallet can
+connect yet, the latest block, the mempool, fee estimates and peer counts. It
+is off by default, and it needs `--metricsport`, since that is the listener it
+is served on.
+
+```
+statuspage=1
+metricsport=9332
+statusadvertise=electrum=ssl://node.local:50002
+statusadvertise=esplora=https://node.local:3001/api
+```
+
+Open `http://<metricsbind>:<metricsport>/status`. The page is complete as
+served and works with JavaScript off. With JavaScript on it refreshes itself
+from `/status.json` every 5 seconds, pauses while the tab is hidden, backs off
+when the node stops answering, and after about 12 seconds without an answer
+says **stale** instead of going on showing the last reading.
+
+What the top line means:
+
+| Shown | Means |
+|---|---|
+| **stalled** | The node cannot connect the next block. `/readyz` is 503. |
+| **syncing headers** | The newest header is more than a day old, so the header chain is still downloading. `/readyz` can read 200 here, because blocks keep pace with the headers known so far. |
+| **syncing blocks** | Blocks trail the headers by more than `/readyz` allows. |
+| **validating history** | Serving from an AssumeUTXO snapshot while the history behind it validates. |
+| **building indexes** | At the tip, with an enabled index still incomplete, so Electrum and Esplora answers that read through it are partial. |
+| **ready** | At the tip, every enabled index complete. |
+
+The page says **ready** only when `/readyz` is 200. Sync progress is weighted
+by how much work each part of the chain takes, so it trails the plain
+height ratio for most of a mainnet sync, as the time does.
+
+**Connection strings come only from `statusadvertise`.** The page never builds
+one from the request's `Host` header, which a client can set to anything and
+which names the proxy in front of the node rather than the port a wallet
+should dial. Set one per surface a user should connect to, as they should type
+it. Leave them out where the platform shows its own addresses.
+
+**It is unauthenticated, like `/metrics`, and safe that way.** It carries no
+cookie, password, token or key, no peer or listen address, and no warning or
+error text, which can name host paths; warnings appear by id, and
+`getwarnings` has the detail. Peers appear as counts and client versions.
+Every value is escaped, and the page is served with a
+`Content-Security-Policy` that allows its own script and requests only.
+Building it takes no lock that block connection needs.
+
+`/status.json` is internal to the page and unstable: any field may change in
+any release. Monitor with `/metrics` and `/readyz`.
+
 ### Index readiness
 
 Each DB-backed index exports whether it is switched on, whether it is ready to

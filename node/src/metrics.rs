@@ -1251,6 +1251,9 @@ async fn handle_request(
                 .body(body)
                 .unwrap()
         }
+        "/status" | "/status.json" | "/status.js" if ctx.status.is_some() => {
+            status_response(ctx, req.uri().path())
+        }
         "/healthz" => plain_response(200, "ok\n"),
         "/readyz" => match ctx.is_ready() {
             Ok(()) => plain_response(200, "ok\n"),
@@ -1258,6 +1261,46 @@ async fn handle_request(
         },
         _ => plain_response(404, "not found\n"),
     }
+}
+
+/// The status page's policy. No external assets, no inline script, and the
+/// page's only request is its own `/status.json`. Inline styles are allowed
+/// for the stylesheet and the bars' widths. `frame-ancestors` is left unset
+/// until the app platforms that embed satd confirm how they frame it.
+pub const STATUS_CSP: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
+     style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+
+fn status_response(ctx: &MetricsContext, path: &str) -> hyper::Response<String> {
+    let Some(sources) = ctx.status.as_deref() else {
+        return plain_response(404, "not found\n");
+    };
+    let (content_type, body) = match path {
+        "/status.js" => (
+            "text/javascript; charset=utf-8",
+            crate::status::render::SCRIPT.to_string(),
+        ),
+        _ => {
+            let snapshot = crate::status::build(ctx, sources);
+            let view = crate::status::render::view(&snapshot, crate::time::now_secs());
+            if path == "/status.json" {
+                (
+                    "application/json",
+                    crate::status::render::json(&snapshot, &view),
+                )
+            } else {
+                ("text/html; charset=utf-8", crate::status::render::html(&view))
+            }
+        }
+    };
+    hyper::Response::builder()
+        .status(200)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(hyper::header::CONTENT_SECURITY_POLICY, STATUS_CSP)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header(hyper::header::REFERRER_POLICY, "no-referrer")
+        .body(body)
+        .unwrap()
 }
 
 fn plain_response(status: u16, body: &str) -> hyper::Response<String> {

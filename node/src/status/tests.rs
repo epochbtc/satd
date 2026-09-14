@@ -132,6 +132,7 @@ fn fixture(n: u32) -> Fixture {
         true,
         true,
         true,
+        vec![Advertised::parse("electrum=ssl://node.local:50002").unwrap()],
     );
     Fixture { ctx, sources, dir }
 }

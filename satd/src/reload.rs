@@ -1030,6 +1030,8 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("metricsmtls", metrics_mtls),
         restart!("metricsmtlsclientca", metrics_mtls_client_ca),
         restart!("metricsmtlsclientallow", metrics_mtls_client_allow),
+        restart!("statuspage", statuspage),
+        restart!("statusadvertise", statusadvertise),
     ]
 }
 

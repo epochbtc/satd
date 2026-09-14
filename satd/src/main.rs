@@ -352,6 +352,10 @@ async fn main() {
     // startup always results in "dirty" on the next run.
     let prior_shutdown = node::shutdown::consume_marker(&net_datadir);
     let last_shutdown_clean = prior_shutdown.is_some();
+    // A datadir with no chainstate has had no previous run to shut down. The
+    // marker is absent there too, which reads as unclean; the status page
+    // must not warn a new install about a crash it never had.
+    let first_run = !net_datadir.join("chainstate").exists();
     match &prior_shutdown {
         Some(rec) => tracing::info!(
             tip_height = rec.tip_height,
@@ -2810,7 +2814,23 @@ async fn main() {
             filter_enabled: config.blockfilterindex,
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
-            status: None,
+            // Off unless `statuspage=1`: the routes 404 without it.
+            status: config.statuspage.then(|| {
+                Arc::new(node::status::StatusSources::new(
+                    listener_status.clone(),
+                    Some(backfill_handle.clone()),
+                    Some(sp_backfill_handle.clone()),
+                    // Unconditional, as for `RpcContext`: `node`'s
+                    // `block-filter-index` feature is unified on in every
+                    // workspace build of satd.
+                    Some(filter_backfill_handle.clone()),
+                    fee_estimator.clone(),
+                    config.esplora,
+                    config.electrum,
+                    last_shutdown_clean || first_run,
+                    config.statusadvertise.clone(),
+                ))
+            }),
         };
         // The TLS listener is set up before the plain one is spawned, and
         // every failure in it is fatal: an operator who asked for a
