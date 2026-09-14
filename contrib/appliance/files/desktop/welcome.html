@@ -47,9 +47,13 @@ does not.</p>
 </table>
 
 <h2>Wallets on this desktop</h2>
-<p>Sparrow, Electrum and Liana are installed and already pointed at this node's
-Electrum server. They pin the server certificate the first time they connect,
-so you will be asked to accept it once.</p>
+<!-- provision/40-wallets.sh rewrites both marked elements with the wallets
+     it actually installed, which differ by architecture. -->
+<p>Installed and already pointed at this node's Electrum server:
+<strong data-wallets>Sparrow, Electrum, Liana</strong>. Each pins the server
+certificate the first time it connects, so you will be asked to accept it
+once.</p>
+<p data-wallets-skipped hidden></p>
 
 <p>There is no Cashu wallet on the desktop: its CLI does not currently build on
 this Debian release. Run the mint with <code>satd-appliance enable cashu</code>

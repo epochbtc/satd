@@ -21,9 +21,15 @@ SATD_VERSION="${SATD_VERSION:-}"
 # would use.
 SATD_MINISIGN_PUBKEY="${SATD_MINISIGN_PUBKEY:-RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3}"
 
+# Rust target triples, because that is what the release tarballs are named
+# after: the `tarball` job in .github/workflows/release.yml stages each
+# build as satd-<version>-<target>.tar.zst. Anything else 404s. The gnu
+# targets rather than musl: the release ships one SBOM per binary covering
+# exactly the gnu-linux pair (see docs/manual/src/packaging.md), so a gnu
+# image is the one whose dependency graph the published SBOM describes.
 case "$DEB_ARCH" in
-    amd64) TARBALL_ARCH="x86_64-linux-gnu" ;;
-    arm64) TARBALL_ARCH="aarch64-linux-gnu" ;;
+    amd64) TARBALL_ARCH="x86_64-unknown-linux-gnu" ;;
+    arm64) TARBALL_ARCH="aarch64-unknown-linux-gnu" ;;
 esac
 
 step "installing satd from source=$SATD_SOURCE"
@@ -32,7 +38,7 @@ install -d -m 0755 /usr/local/bin
 if [[ "$SATD_SOURCE" == "release" ]]; then
     [[ -n "$SATD_VERSION" ]] || { echo "SATD_SOURCE=release requires SATD_VERSION" >&2; exit 1; }
     base="https://github.com/epochbtc/satd/releases/download/v${SATD_VERSION}"
-    tarball="satd-${SATD_VERSION}-${TARBALL_ARCH}.tar.gz"
+    tarball="satd-${SATD_VERSION}-${TARBALL_ARCH}.tar.zst"
     tmp="$(mktemp -d)"
     fetch "$base/$tarball" "$tmp/$tarball"
     fetch "$base/$tarball.minisig" "$tmp/$tarball.minisig"
@@ -42,7 +48,9 @@ if [[ "$SATD_SOURCE" == "release" ]]; then
     step "verifying $tarball against the published minisign key"
     minisign -Vm "$tmp/$tarball" -P "$SATD_MINISIGN_PUBKEY"
 
-    tar -xzf "$tmp/$tarball" -C "$tmp"
+    # zstd, not gzip: PACKAGING.md commits the release to .tar.zst. tar
+    # shells out to the zstd binary for this, which 00-base.sh installs.
+    tar --zstd -xf "$tmp/$tarball" -C "$tmp"
     found=0
     for bin in satd sat-cli sat-tui; do
         # `find ... | head -1` would abort here under pipefail whenever find
