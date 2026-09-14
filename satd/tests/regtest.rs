@@ -17126,3 +17126,171 @@ fn test_metrics_tls_bind_failure_aborts_startup() {
     );
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+/// Wait for the metrics listener and return a client and its base URL.
+fn metrics_client(port: u16) -> (reqwest::blocking::Client, String) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    poll_until(
+        || client.get(format!("{base}/healthz")).send().is_ok(),
+        Duration::from_secs(15),
+        "the metrics listener did not come up",
+    );
+    (client, base)
+}
+
+/// The status page is off unless asked for. With `metricsport` alone, its
+/// three routes are the listener's ordinary 404 and the existing endpoints
+/// are untouched: the default path is unchanged.
+#[test]
+fn status_page_is_404_when_disabled() {
+    let port = find_available_port();
+    let node = TestNode::start(&[&format!("--metricsport={port}")]);
+    let (client, base) = metrics_client(port);
+    for path in ["/status", "/status.json", "/status.js"] {
+        let r = client.get(format!("{base}{path}")).send().unwrap();
+        assert_eq!(r.status().as_u16(), 404, "{path}");
+        assert_eq!(r.text().unwrap(), "not found\n", "{path}");
+    }
+    // The same listener still serves what it always has, so the 404s above
+    // are the routes being off rather than the listener refusing everything.
+    assert_eq!(client.get(format!("{base}/metrics")).send().unwrap().status().as_u16(), 200);
+    assert_eq!(client.get(format!("{base}/readyz")).send().unwrap().status().as_u16(), 200);
+    drop(node);
+}
+
+#[test]
+fn status_page_serves_html_with_csp() {
+    let port = find_available_port();
+    let node = TestNode::start(&[
+        &format!("--metricsport={port}"),
+        "--statuspage=1",
+        "--statusadvertise=electrum=ssl://node.local:50002",
+    ]);
+    let (client, base) = metrics_client(port);
+
+    let expect_headers = |r: &reqwest::blocking::Response, ct: &str| {
+        let h = |name: &str| r.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(h("content-type").starts_with(ct), "content-type {}", h("content-type"));
+        assert_eq!(h("x-content-type-options"), "nosniff");
+        let csp = h("content-security-policy");
+        for directive in ["default-src 'none'", "script-src 'self'", "connect-src 'self'"] {
+            assert!(csp.contains(directive), "CSP lacks {directive}: {csp}");
+        }
+        assert!(!csp.contains("unsafe-eval") && !csp.contains("script-src 'unsafe-inline'"), "{csp}");
+        assert_eq!(h("cache-control"), "no-store");
+    };
+
+    let r = client.get(format!("{base}/status")).send().unwrap();
+    expect_headers(&r, "text/html");
+    let page = r.text().unwrap();
+    assert!(page.contains("<script src=\"status.js\""), "the page loads its script");
+    assert!(!page.contains("<script>"), "no inline script");
+    assert!(page.contains("ssl://node.local:50002"), "the advertised connection string is shown");
+    assert!(page.contains("data-t=\"sync.blocks\""));
+
+    let r = client.get(format!("{base}/status.json")).send().unwrap();
+    expect_headers(&r, "application/json");
+    let body: serde_json::Value = r.json().unwrap();
+    assert_eq!(body["snapshot"]["sync"]["blocks"], 0);
+    assert_eq!(body["snapshot"]["network"], "regtest");
+    assert_eq!(body["snapshot"]["connect"][0]["surface"], "electrum");
+    assert_eq!(body["poll_ms"], 5000);
+
+    let r = client.get(format!("{base}/status.js")).send().unwrap();
+    expect_headers(&r, "text/javascript");
+    assert!(r.text().unwrap().contains("textContent"));
+    drop(node);
+}
+
+/// The page may be served with nothing in front of it, so it must hold
+/// nothing a stranger could use: not the RPC cookie, not the address of a
+/// connected peer.
+#[test]
+fn status_never_contains_credentials() {
+    let port = find_available_port();
+    let p2p = find_available_port();
+    let node = TestNode::start(&[
+        &format!("--metricsport={port}"),
+        "--statuspage=1",
+        &format!("--port={p2p}"),
+    ]);
+    let peer = TestNode::start(&[&format!("--connect=127.0.0.1:{p2p}")]);
+    poll_until(
+        || get_rpc_u64(&node, "getconnectioncount").unwrap_or(0) >= 1,
+        Duration::from_secs(20),
+        "the peer did not connect",
+    );
+    let (client, base) = metrics_client(port);
+    let secret = node.cookie.split_once(':').map(|(_, p)| p.to_string()).unwrap();
+    assert!(secret.len() >= 32, "cookie secret {secret:?}");
+    let peer_port = node.rpc_ok("getpeerinfo", vec![])[0]["addr"]
+        .as_str()
+        .unwrap()
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .to_string();
+
+    // The peer appears as a count once its handshake completes, which is what
+    // proves the page read the peer table at all.
+    poll_until(
+        || {
+            let body: serde_json::Value =
+                client.get(format!("{base}/status.json")).send().unwrap().json().unwrap();
+            let peers = &body["snapshot"]["peers"];
+            peers["inbound"].as_u64().unwrap_or(0) + peers["outbound"].as_u64().unwrap_or(0) == 1
+        },
+        Duration::from_secs(20),
+        "the status page never counted the connected peer",
+    );
+
+    for path in ["/status", "/status.json"] {
+        let text = client.get(format!("{base}{path}")).send().unwrap().text().unwrap();
+        assert!(!text.contains(&secret), "{path} contains the RPC cookie");
+        assert!(!text.contains("127.0.0.1"), "{path} contains a peer or listen address");
+        assert!(!text.contains(&format!(":{peer_port}")), "{path} contains the peer's port");
+        assert!(!text.contains(&format!(":{p2p}")), "{path} contains the P2P listen port");
+        assert!(!text.contains(&node.datadir.display().to_string()), "{path} contains the datadir");
+    }
+    drop(peer);
+    drop(node);
+}
+
+#[test]
+fn statuspage_without_metricsport_is_a_startup_error() {
+    let datadir = fresh_test_datadir("satd-statuspage-nometrics");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
+        .args(["--regtest", &format!("--datadir={}", datadir.display()), "--statuspage=1"])
+        .output()
+        .expect("spawn satd");
+    assert!(!out.status.success(), "satd started with a status page and no listener");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("statuspage") && stderr.contains("metricsport"),
+        "the error names both keys: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&datadir);
+}
+
+#[test]
+fn statusadvertise_rejects_unknown_surface_at_startup() {
+    let datadir = fresh_test_datadir("satd-statusadvertise-bad");
+    for (arg, needle) in [
+        ("--statusadvertise=lightning=ssl://node:9735", "unknown surface `lightning`"),
+        ("--statusadvertise=electrum=node.local:50002", "no scheme"),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_satd"))
+            .args(["--regtest", &format!("--datadir={}", datadir.display()), arg])
+            .output()
+            .expect("spawn satd");
+        assert!(!out.status.success(), "satd accepted {arg}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{arg}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&datadir);
+}

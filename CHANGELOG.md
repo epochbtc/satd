@@ -26,6 +26,7 @@ item below is (or will be) written up in full in the in-development
   arm64 servers. The arm64 desktop carries Sparrow only, since Electrum and
   Liana publish no arm64 build; its welcome page names what is installed
   (#742).
+- A status page on the metrics listener, `statuspage=1`: a single-page, self-refreshing `sat-tui` for a browser, with connection strings from `statusadvertise`. Off by default (#749).
 
 ### Fixed
 

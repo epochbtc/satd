@@ -1065,6 +1065,12 @@ pub struct Config {
     /// Accepted client-cert CN / DNS-SAN values; empty accepts any cert the
     /// CA signed.
     pub metrics_mtls_client_allow: Vec<String>,
+    /// Serve the status page (`/status`, `/status.json`, `/status.js`) on the
+    /// metrics listener. Requires `metricsport`.
+    pub statuspage: bool,
+    /// Connection strings the status page shows, one per surface. The page
+    /// never derives them from the request, so these are the only ones it has.
+    pub statusadvertise: Vec<node::status::Advertised>,
     /// Emit structured `data` payloads (category, suggestion, debug) on
     /// RPC errors. Default off to preserve Bitcoin-Core wire format.
     pub rpc_extended_errors: bool,
@@ -3648,6 +3654,42 @@ impl Config {
             return Err("rpcuser and rpcpassword must both be set or both be unset".to_string());
         }
 
+        // Parsed here rather than inline below: `statuspage` is validated
+        // against it.
+        let metricsport: Option<u16> = cli
+            .metricsport
+            .or_else(|| file_get("metricsport").and_then(|v| v.parse().ok()));
+        let statuspage = cli
+            .statuspage
+            .or_else(|| file_get("statuspage").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        if statuspage && metricsport.is_none() {
+            return Err(
+                "--statuspage=1 requires --metricsport: the status page is served on the \
+                 metrics listener"
+                    .to_string(),
+            );
+        }
+        let statusadvertise = {
+            let mut values: Vec<String> = cli.statusadvertise.clone();
+            if values.is_empty() {
+                values = file_get_all("statusadvertise");
+            }
+            let mut parsed: Vec<node::status::Advertised> = Vec::new();
+            for v in values {
+                let a = node::status::Advertised::parse(&v)
+                    .map_err(|e| format!("--statusadvertise={v}: {e}"))?;
+                if parsed.iter().any(|p| p.surface == a.surface) {
+                    return Err(format!(
+                        "--statusadvertise: {} is given more than once",
+                        a.surface.name()
+                    ));
+                }
+                parsed.push(a);
+            }
+            parsed
+        };
+
         Ok(Config {
             network,
             datadir: base_datadir,
@@ -4041,9 +4083,9 @@ impl Config {
             daemon: cli.daemon.unwrap_or_else(|| {
                 file_get("daemon").and_then(|v| parse_bool(&v)).unwrap_or(false)
             }),
-            metricsport: cli
-                .metricsport
-                .or_else(|| file_get("metricsport").and_then(|v| v.parse().ok())),
+            metricsport,
+            statuspage,
+            statusadvertise,
             metricsbind: cli
                 .metricsbind
                 .or_else(|| file_get("metricsbind"))
@@ -4329,6 +4371,8 @@ impl Config {
                 "tls_bind": self.metrics_tls_bind,
                 "mtls": self.metrics_mtls,
                 "mtls_client_allow_count": self.metrics_mtls_client_allow.len(),
+                "statuspage": self.statuspage,
+                "statusadvertise": self.statusadvertise,
             },
             "log_format": match self.log_format {
                 LogFormat::Text => "text",
@@ -5974,6 +6018,23 @@ pub struct CliArgs {
     )]
     pub metricsmtlsclientallow: Vec<String>,
 
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Serve a status page at /status on the metrics listener (default: false). Requires --metricsport. Unauthenticated, like /metrics."
+    )]
+    pub statuspage: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "SURFACE=URL",
+        help = "A connection string the status page shows: electrum, esplora, rpc or mcp, then = and a URL, e.g. electrum=ssl://node.local:50002 (repeatable, one per surface)."
+    )]
+    pub statusadvertise: Vec<String>,
+
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(
         long,
@@ -6669,6 +6730,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "metricsmtls",
         "metricsmtlsclientca",
         "metricsmtlsclientallow",
+        "statuspage",
+        "statusadvertise",
         "server",
         "daemon",
         "dbcache",
@@ -7464,6 +7527,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "metricsmtls",
     "metricsmtlsclientca",
     "metricsmtlsclientallow",
+    "statuspage",
+    "statusadvertise",
 ];
 
 // Disposition of a Bitcoin Core config key that satd does not honor.
@@ -9785,6 +9850,8 @@ testactivationheight=bip34@2
             metricsmtls: None,
             metricsmtlsclientca: None,
             metricsmtlsclientallow: vec![],
+            statuspage: None,
+            statusadvertise: Vec::new(),
             maxahead: None,
             maxopenfiles: None,
             storageprofile: None,
@@ -10088,6 +10155,8 @@ testactivationheight=bip34@2
             metricsmtls: None,
             metricsmtlsclientca: None,
             metricsmtlsclientallow: vec![],
+            statuspage: None,
+            statusadvertise: Vec::new(),
             maxahead: None,
             maxopenfiles: None,
             storageprofile: None,

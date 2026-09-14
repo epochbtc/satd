@@ -43,6 +43,7 @@ Must be clearly documented as unstable in the surface itself (`--help`, endpoint
 - IPC / gRPC experimental surfaces.
 - MCP tool schemas (the `rmcp` crate is version-gated; downstream MCP clients pin versions).
 - Debug RPCs (`debug_*`, `test_*`).
+- The status page's `/status.json`. It exists for the page's own refresh; build on `/metrics` or RPC instead.
 - Undocumented fields (their existence alone does not make them Tier 1).
 
 ### Explicitly out of scope

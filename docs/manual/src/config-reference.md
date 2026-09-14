@@ -465,6 +465,8 @@ the taxonomy and the details each event carries.
 | `metricsmtls` | false | restart | satd | Require a client certificate on the metrics TLS listener (requires `metricsmtlsclientca`). |
 | `metricsmtlsclientca` | none | restart | satd | PEM CA bundle client certs must chain to when `metricsmtls=1`. |
 | `metricsmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values on the metrics TLS listener. |
+| `statuspage` | `0` | restart | satd | Serve the [status page](observability.md#status-page) at `/status`, `/status.json` and `/status.js` on the metrics listener. Requires `metricsport`. |
+| `statusadvertise` | none | restart | satd | Repeatable, one per surface. `<surface>=<url>`, where surface is `electrum`, `esplora`, `rpc` or `mcp`: a connection string the status page shows, e.g. `electrum=ssl://node.local:50002`. |
 
 ---
 
