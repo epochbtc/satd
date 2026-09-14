@@ -116,7 +116,8 @@ jobs:
       - name: Pre-pull Bitcoin Core image
         run: |
           set -euo pipefail
-          for i in 1 2 3; do docker pull lncm/bitcoind:v27.0 && break || sleep $((i * 2)); done
+          . scripts/canary/PINS
+          for i in 1 2 3; do docker pull "$CORE_IMAGE" && break || sleep $((i * 2)); done
 
       - name: Run block-differential fuzz
         id: fuzz

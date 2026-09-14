@@ -21,15 +21,16 @@
 #     output (proves getutxout + CLN's block scan over satd RPC).
 #
 # `--offline` keeps CLN from doing any Lightning P2P (we only test the
-# chain backend). Pin: elementsproject/lightningd:v24.11.
+# chain backend). Pin: CLN_IMAGE in scripts/canary/PINS.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-CLN_IMAGE="elementsproject/lightningd:v24.11"
 CLN_CONTAINER="satd-canary-cln-$$"
 CLN_DIR="/root/.lightning"
 

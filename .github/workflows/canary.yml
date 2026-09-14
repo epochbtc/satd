@@ -101,6 +101,60 @@ env:
 
 jobs:
 
+  # Pin freshness — compares every downstream pin in scripts/canary/PINS with
+  # upstream's newest stable release and keeps one tracking issue current:
+  # opened or updated while anything is behind, closed once nothing is. The
+  # table also marks pins that break the release gate (STABILITY_POLICY.md,
+  # "Keeping the pins current").
+  #
+  # Weekly and on dispatch only. A PR never gets this job, so the `issues:
+  # write` token is never handed to code from a fork.
+  pin-freshness:
+    name: Canary pin freshness
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TITLE: "Canary pins are behind upstream"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compare pins with upstream
+        run: |
+          set -euo pipefail
+          python3 scripts/canary/pins.py report --json > pins.json
+          python3 scripts/canary/pins.py report > pins.md
+          cat pins.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update the tracking issue
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+                        --jq ".[] | select(.title == env.TITLE) | .number" | head -1)"
+          if jq -e 'any(.[]; .behind)' pins.json >/dev/null; then
+            {
+              echo "The weekly canary run found downstream pins behind their newest stable release."
+              echo
+              cat pins.md
+              echo
+              echo "Bump in \`scripts/canary/PINS\` and let the canaries run; a release that breaks a canary is"
+              echo "held back with \`HOLD_<NAME>=<issue>\` and its own issue. Procedure: STABILITY_POLICY.md,"
+              echo "\"Keeping the pins current\". Updated by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+            } > body.md
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" --body-file body.md
+            else
+              gh issue create --title "$TITLE" --body-file body.md
+            fi
+          elif [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "Every canary pin is at upstream's newest stable release."
+          fi
+
   # Docs-only skip gate. Detects whether the PR changes any non-docs file.
   # Every other job is gated on this (the canaries via `build`, which
   # `needs: [changes]`); when a PR touches only Markdown / docs / LICENSE /
@@ -528,7 +582,7 @@ jobs:
 
   # Live block-acceptance consensus differential vs Bitcoin Core — the deepest
   # Core-parity gate in the fleet. Spawns BOTH a satd regtest node and a real
-  # bitcoind (lncm/bitcoind:v27.0, in Docker) and submits identical adversarial
+  # bitcoind (CORE_IMAGE in scripts/canary/PINS, in Docker) and submits identical adversarial
   # blocks / transactions to each via `submitblock` / `testmempoolaccept`,
   # asserting they reach the IDENTICAL accept/reject verdict — Core is the live
   # oracle. Where the interop canary above checks P2P relay, this checks
@@ -603,7 +657,8 @@ jobs:
       - name: Pre-pull Bitcoin Core image
         run: |
           set -euo pipefail
-          for i in 1 2 3; do docker pull lncm/bitcoind:v27.0 && break || sleep $((i * 2)); done
+          . scripts/canary/PINS
+          for i in 1 2 3; do docker pull "$CORE_IMAGE" && break || sleep $((i * 2)); done
 
       - name: Run block-acceptance differential
         env:

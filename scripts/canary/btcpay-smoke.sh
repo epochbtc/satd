@@ -15,8 +15,8 @@
 # NBXplorer-backed BTC chain is fully synced, so it exercises the full
 # satd -> NBXplorer -> BTCPay path without needing an API key.
 #
-# Pins: btcpayserver/btcpayserver:2.3.9, nicolasdorier/nbxplorer:2.5.21,
-# postgres:16-alpine. Pin bumps are deliberate maintenance steps in a
+# Pins: BTCPAY_IMAGE, NBXPLORER_IMAGE and POSTGRES_IMAGE in
+# scripts/canary/PINS. Pin bumps are deliberate maintenance steps in a
 # follow-up PR after verifying the new images still work.
 
 set -euo pipefail
@@ -24,10 +24,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-NBXPLORER_IMAGE="nicolasdorier/nbxplorer:2.5.21"
-BTCPAY_IMAGE="btcpayserver/btcpayserver:2.3.9"
-POSTGRES_IMAGE="postgres:16-alpine"
 
 SUFFIX="$$"
 PG_CONTAINER="satd-canary-btcpay-pg-$SUFFIX"

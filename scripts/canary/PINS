@@ -1,0 +1,45 @@
+# Downstream software the canaries run, pinned by version and digest.
+#
+# Every canary script, workflow step and Rust harness that runs one of these
+# reads it from here (or, for the Rust constants, is checked against it by
+# `pins.py check`), so a bump is one edit. Images are pinned by digest as well
+# as tag: a tag can be re-pushed, a digest cannot.
+#
+# Cadence (STABILITY_POLICY.md, "Keeping the pins current"):
+#   - The weekly canary run compares every pin with upstream's newest stable
+#     release and keeps one tracking issue current.
+#   - Every pin is bumped to latest stable at the start of each release cycle.
+#   - A downstream major or security release is taken within two weeks.
+#   - A pin held back because a newer release breaks is recorded with a
+#     HOLD_<NAME>=<issue number> line, which `pins.py gate` accepts.
+#
+# Format: NAME=value, shell-sourceable. `pins.py` knows where each one's
+# upstream releases are published.
+
+# Bitcoin Core: the P2P interop canary and the block-acceptance differential
+# (canary, nightly fuzz, satd/tests/common/core_node.rs, the fuzz target).
+CORE_IMAGE=lncm/bitcoind:v27.0@sha256:324fec72192e8a1c7b79e7ab91003e47678b808d46da2c1943e72ec212ab348f
+
+# LND as a Neutrino light client.
+LND_IMAGE=lightninglabs/lnd:v0.18.5-beta@sha256:2b560c9beb559c57ab2f2da1dfed80d286cf11a6dc6e4354cab84aafba79b6f6
+
+# Core Lightning over the bcli plugin.
+CLN_IMAGE=elementsproject/lightningd:v24.11@sha256:30cc9802955cc640a057d65b0ace5cd1c0c8b719e9a28cf516d85f9d00531e1f
+
+# NBXplorer, alone and under BTCPay Server.
+NBXPLORER_IMAGE=nicolasdorier/nbxplorer:2.5.21@sha256:0eaa2b165873face1ac699297b45f5110d57b557558d68588896dc386c7eb3cb
+
+# BTCPay Server.
+BTCPAY_IMAGE=btcpayserver/btcpayserver:2.3.9@sha256:7c4b79fd578d919da1bc3bb52fd4695c156fe309ab8c0b6602c36026f1780d27
+
+# Electrum, the reference wallet: the AppImage and its SHA-256.
+ELECTRUM_VERSION=4.5.8
+ELECTRUM_APPIMAGE_SHA256=ca09bd6315d338b27bb90f6f855f5a49ef971e999ae29b2ee1a701c55ee75640
+
+# Sidecars. Their major versions are chosen, not tracked: the weekly check
+# does not report them, and a bump refreshes the digest.
+POSTGRES_IMAGE=postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+ELECTRUM_BASE_IMAGE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+
+# BDK is pinned by scripts/canary/bdk-canary/Cargo.lock, not here; the weekly
+# check reads bdk_wallet's version from that lockfile.

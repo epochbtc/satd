@@ -392,6 +392,13 @@ jobs:
         env:
           ACTIONLINT_VERSION: '1.7.7'
 
+      # Every canary script, workflow and Rust harness that runs a pinned
+      # downstream image must take it from scripts/canary/PINS, and every image
+      # there must be pinned by digest. Offline; the freshness half runs weekly
+      # in canary.yml.
+      - name: Check canary pins
+        run: python3 scripts/canary/pins.py check
+
   # Seed the dependency cache from master so a fresh branch's FIRST CI run is
   # warm instead of paying the full ~8 min rocksdb-and-deps rebuild. The
   # Tests/Lint jobs run only on pull_request, so nothing otherwise populates a

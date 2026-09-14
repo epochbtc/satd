@@ -12,7 +12,7 @@
 #   GET /v1/cryptos/btc/status     — IsFullySynched, sync height
 #   Mine, poll, verify NBXplorer follows
 #
-# Pin: nicolasdorier/nbxplorer:2.5.21 (Docker Hub tag). Bumping the
+# Pin: NBXPLORER_IMAGE in scripts/canary/PINS. Bumping the
 # pin is a deliberate maintenance step — pin updates land in a
 # follow-up PR after verifying the new image still works.
 
@@ -21,8 +21,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-NBXPLORER_IMAGE="nicolasdorier/nbxplorer:2.5.21"
 NBXPLORER_CONTAINER="satd-canary-nbxplorer-$$"
 NBXPLORER_PORT=18204
 
@@ -30,7 +31,6 @@ NBXPLORER_PORT=18204
 # upstream). We boot a throwaway postgres alongside the NBXplorer
 # container; both share the host's network namespace so they reach
 # each other via 127.0.0.1.
-POSTGRES_IMAGE="postgres:16-alpine"
 POSTGRES_CONTAINER="satd-canary-nbxplorer-pg-$$"
 POSTGRES_PORT=18205
 POSTGRES_PASSWORD="$(head -c 16 /dev/urandom | xxd -p)"

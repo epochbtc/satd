@@ -55,7 +55,14 @@ use node::validation::script::ConsensusVerifier;
 
 use satd_fuzz::{genesis_hash, grind, BLOCK_SPACING, GENESIS_TIME, POWLIMIT_BITS};
 
-const CORE_IMAGE: &str = "lncm/bitcoind:v27.0";
+/// The canary manifest's Core image, so the fuzzer and the canaries run the
+/// same reference node.
+static CORE_IMAGE: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+    include_str!("../../scripts/canary/PINS")
+        .lines()
+        .find_map(|line| line.strip_prefix("CORE_IMAGE="))
+        .expect("scripts/canary/PINS has a CORE_IMAGE line")
+});
 const CORE_CONTAINER: &str = "satd-fuzz-core";
 const CORE_RPC_PORT: u16 = 28443;
 const CORE_USER: &str = "fuzz";
@@ -90,7 +97,7 @@ fn spawn_base() -> Base {
         .status();
     for attempt in 1..=3u64 {
         let ok = Command::new("docker")
-            .args(["pull", CORE_IMAGE])
+            .args(["pull", *CORE_IMAGE])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -108,7 +115,7 @@ fn spawn_base() -> Base {
             "--name",
             CORE_CONTAINER,
             "--network=host",
-            CORE_IMAGE,
+            *CORE_IMAGE,
             "-regtest",
             "-server",
             "-listen=0",
