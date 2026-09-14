@@ -1138,43 +1138,55 @@ impl StreamClient {
     /// headers (`STABILITY_POLICY.md` → "Streaming API & SDK compatibility").
     fn check_compat(&self, md: &MetadataMap) -> Result<(), StreamError> {
         let (raw, node) = compat::node_version_from(md);
-        let mut state = self.compat.lock().unwrap_or_else(|e| e.into_inner());
-        state.node_version = raw.clone();
-
         let schema = compat::schema_from(md);
-        if schema != satd_events_proto::SCHEMA_VERSION {
-            return Err(StreamError::SchemaMismatch {
-                node: schema,
-                sdk: satd_events_proto::SCHEMA_VERSION,
-            });
-        }
-
         let sdk = compat::parse(compat::SDK_VERSION).expect("the crate version parses");
-        let warn = match compat::classify(sdk, node) {
-            Compat::Ok => false,
-            Compat::OneBehind => true,
-            Compat::TooOld if self.allow_old_node => true,
-            Compat::TooOld => {
-                return Err(StreamError::NodeTooOld {
-                    node: compat::display_node_version(raw.as_deref()),
-                    sdk: compat::SDK_VERSION,
+
+        // Decide under the lock, log after releasing it: a `tracing` subscriber
+        // is user code, and one that calls `node_version()` (or blocks) must not
+        // deadlock or stall every other stream open on this client.
+        let warn_for = {
+            let mut state = self.compat.lock().unwrap_or_else(|e| e.into_inner());
+            state.node_version = raw.clone();
+
+            if schema != satd_events_proto::SCHEMA_VERSION {
+                return Err(StreamError::SchemaMismatch {
+                    node: schema,
+                    sdk: satd_events_proto::SCHEMA_VERSION,
                 });
             }
+
+            let warn = match compat::classify(sdk, node) {
+                Compat::Ok => false,
+                Compat::OneBehind => true,
+                Compat::TooOld if self.allow_old_node => true,
+                Compat::TooOld => {
+                    return Err(StreamError::NodeTooOld {
+                        node: compat::display_node_version(raw.as_deref()),
+                        sdk: compat::SDK_VERSION,
+                    });
+                }
+            };
+            // Once per observed version: a reconnect loop against the same node
+            // stays quiet, a node upgraded (or downgraded) in between warns again.
+            if warn && state.warned_for.as_ref() != Some(&raw) {
+                state.warned_for = Some(raw.clone());
+                Some(compat::display_node_version(raw.as_deref()))
+            } else {
+                None
+            }
         };
-        // Once per observed version: a reconnect loop against the same node
-        // stays quiet, a node upgraded (or downgraded) in between warns again.
-        if warn && state.warned_for.as_ref() != Some(&raw) {
+
+        if let Some(shown) = warn_for {
             tracing::warn!(
                 target: "satd_events_client::compat",
-                node_version = %compat::display_node_version(raw.as_deref()),
+                node_version = %shown,
                 sdk_version = compat::SDK_VERSION,
                 "satd node {} is older than this SDK ({}); features added after the node's \
                  release are unavailable and request fields it does not recognise are ignored. \
                  Upgrade the node — connections are refused once it is two minor versions behind.",
-                compat::display_node_version(raw.as_deref()),
+                shown,
                 compat::SDK_VERSION,
             );
-            state.warned_for = Some(raw);
         }
         Ok(())
     }
@@ -1912,6 +1924,51 @@ mod version_check_tests {
         client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
         client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
         assert_eq!(logs.warnings().len(), 2, "{:?}", logs.warnings());
+    }
+
+    /// The warning is logged with the compat lock released. A subscriber is user
+    /// code: one that reads `node_version()` from inside the event would
+    /// otherwise deadlock, and a slow one would stall every stream open.
+    #[tokio::test]
+    async fn warning_is_logged_without_holding_the_compat_lock() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Records, for each event, whether the client's compat lock was free.
+        struct ProbeLock {
+            compat: Arc<Mutex<CompatState>>,
+            free: Arc<Mutex<Vec<bool>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLock {
+            fn on_event(
+                &self,
+                _: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let free = self.compat.try_lock().is_ok();
+                self.free.lock().unwrap().push(free);
+            }
+        }
+
+        let (behind, allow) = match minors_behind(1) {
+            Some(v) => (v, false),
+            None => (too_old(), true),
+        };
+        let fake = FakeNode::new(Some(&behind));
+        let mut builder = StreamClient::builder(serve(fake.clone()).await);
+        if allow {
+            builder = builder.allow_old_node();
+        }
+        let mut client = builder.connect().await.unwrap();
+
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(ProbeLock { compat: client.compat.clone(), free: free.clone() });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        let seen = free.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the warning was not logged");
+        assert!(seen.iter().all(|f| *f), "an event was logged under the compat lock: {seen:?}");
     }
 
     #[tokio::test]
