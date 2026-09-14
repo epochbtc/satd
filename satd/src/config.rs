@@ -3407,77 +3407,27 @@ impl Config {
             });
 
         // ── Stratum ──────────────────────────────────────────────
-        let stratum = cli
-            .stratum
-            .or_else(|| file_get("stratum").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
-        let stratum_bind = cli
-            .stratumbind
-            .or_else(|| file_get("stratumbind"))
-            .unwrap_or_else(|| "127.0.0.1:3333".to_string());
-        let stratum_tls_bind = cli.stratumtlsbind.or_else(|| file_get("stratumtlsbind"));
-        let stratum_tls_cert = cli
-            .stratumtlscert
-            .or_else(|| file_get("stratumtlscert").map(std::path::PathBuf::from));
-        let stratum_tls_key = cli
-            .stratumtlskey
-            .or_else(|| file_get("stratumtlskey").map(std::path::PathBuf::from));
-        let stratum_mtls = cli
-            .stratummtls
-            .or_else(|| file_get("stratummtls").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
-        let stratum_mtls_client_ca = cli
-            .stratummtlsclientca
-            .or_else(|| file_get("stratummtlsclientca").map(std::path::PathBuf::from));
-        let stratum_mtls_client_allow: Vec<String> = {
-            let mut values: Vec<String> = cli.stratummtlsclientallow.clone();
-            if values.is_empty() {
-                values = file_get_all("stratummtlsclientallow");
-            }
-            values
-                .into_iter()
-                .flat_map(|v| {
-                    v.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
-        let stratum_address = cli.stratumaddress.or_else(|| file_get("stratumaddress"));
-        let stratum_difficulty = match cli.stratumdifficulty {
-            Some(d) => Some(d),
-            None => match file_get("stratumdifficulty") {
-                Some(v) => Some(
-                    v.trim()
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid stratumdifficulty={v:?}: expected a positive integer"))?,
-                ),
-                None => None,
-            },
-        };
-        let stratum_max_conns = cli
-            .stratummaxconns
-            .or_else(|| file_get("stratummaxconns").and_then(|v| v.parse().ok()))
-            .unwrap_or(64);
-        let stratum_allow_plaintext_remote = cli
-            .stratumallowplaintextremote
-            .or_else(|| file_get("stratumallowplaintextremote").and_then(|v| parse_bool(&v)))
-            .unwrap_or(false);
-        validate_stratum(&StratumSettings {
+        // Resolved in a helper, to keep `from_cli`'s debug-build stack frame from
+        // growing further.
+        let StratumFields {
+            stratum,
+            stratum_bind,
+            stratum_tls_bind,
+            stratum_tls_cert,
+            stratum_tls_key,
+            stratum_mtls,
+            stratum_mtls_client_ca,
+            stratum_mtls_client_allow,
+            stratum_address,
+            stratum_difficulty,
+            stratum_max_conns,
+            stratum_allow_plaintext_remote,
+        } = resolve_stratum(
+            cli.stratum_args,
             network,
-            enabled: stratum,
-            bind: &stratum_bind,
-            tls_bind: stratum_tls_bind.as_deref(),
-            tls_cert: stratum_tls_cert.is_some(),
-            tls_key: stratum_tls_key.is_some(),
-            mtls: stratum_mtls,
-            mtls_client_ca: stratum_mtls_client_ca.is_some(),
-            mtls_client_allow: !stratum_mtls_client_allow.is_empty(),
-            address: stratum_address.as_deref(),
-            difficulty: stratum_difficulty,
-            allow_plaintext_remote: stratum_allow_plaintext_remote,
-        })?;
+            &file_get,
+            &file_get_all,
+        )?;
 
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
@@ -5574,98 +5524,10 @@ pub struct CliArgs {
     )]
     pub electrumservername: Option<String>,
 
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = parse_bool_arg,
-        num_args = 0..=1,
-        default_missing_value = "1",
-        help = "Run the Stratum V1 solo-mining server (default: false). Not available on signet."
-    )]
-    pub stratum: Option<bool>,
-
-    #[arg(
-        long,
-        value_name = "ADDR:PORT",
-        help = "Bind the plaintext Stratum listener (default: 127.0.0.1:3333)"
-    )]
-    pub stratumbind: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "ADDR:PORT",
-        help = "Bind the Stratum TLS listener (requires --stratumtlscert and --stratumtlskey)"
-    )]
-    pub stratumtlsbind: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Path to PEM-encoded TLS certificate for the Stratum server"
-    )]
-    pub stratumtlscert: Option<std::path::PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Path to PEM-encoded TLS private key for the Stratum server"
-    )]
-    pub stratumtlskey: Option<std::path::PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = parse_bool_arg,
-        num_args = 0..=1,
-        default_missing_value = "1",
-        help = "Require mutual TLS on the Stratum TLS listener (default: false). Requires --stratumtlsbind and --stratummtlsclientca."
-    )]
-    pub stratummtls: Option<bool>,
-
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Path to PEM CA bundle used to verify client certificates when --stratummtls=1"
-    )]
-    pub stratummtlsclientca: Option<std::path::PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "NAME",
-        help = "Allowlist of accepted Stratum client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
-    )]
-    pub stratummtlsclientallow: Vec<String>,
-
-    #[arg(
-        long,
-        value_name = "ADDRESS",
-        help = "Payout address for a miner whose username is not a valid address for this network"
-    )]
-    pub stratumaddress: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "N",
-        help = "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)"
-    )]
-    pub stratumdifficulty: Option<u64>,
-
-    #[arg(
-        long,
-        value_name = "N",
-        help = "Hard cap on simultaneously-open Stratum connections (default: 64)"
-    )]
-    pub stratummaxconns: Option<usize>,
-
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = parse_bool_arg,
-        num_args = 0..=1,
-        default_missing_value = "1",
-        help = "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)"
-    )]
-    pub stratumallowplaintextremote: Option<bool>,
+    /// The Stratum mining server flags; see [`StratumArgs`] for why they are
+    /// a separate, hand-built group.
+    #[command(flatten)]
+    pub stratum_args: StratumArgs,
 
     #[arg(
         long,
@@ -6790,8 +6652,239 @@ fn translate_index_aliases(args: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
-/// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
+/// The Stratum mining server flags (see [`CliArgs::stratum_args`]).
+///
+/// `clap::Args` is implemented by hand rather than derived. A derived
+/// implementation builds every argument in one function whose debug-build
+/// stack frame grows by several KiB per argument, and it runs nested inside
+/// `CliArgs`'s own derived builder, whose frame is already close to a test
+/// thread's 2 MiB stack. Building the arguments from [`STRATUM_ARG_SPECS`] one
+/// at a time keeps the nested frame small.
+#[derive(Debug, Clone, Default)]
+pub struct StratumArgs {
+    pub stratum: Option<bool>,
+    pub stratumbind: Option<String>,
+    pub stratumtlsbind: Option<String>,
+    pub stratumtlscert: Option<std::path::PathBuf>,
+    pub stratumtlskey: Option<std::path::PathBuf>,
+    pub stratummtls: Option<bool>,
+    pub stratummtlsclientca: Option<std::path::PathBuf>,
+    pub stratummtlsclientallow: Vec<String>,
+    pub stratumaddress: Option<String>,
+    pub stratumdifficulty: Option<u64>,
+    pub stratummaxconns: Option<usize>,
+    pub stratumallowplaintextremote: Option<bool>,
+}
+
+/// How a Stratum flag's value is parsed.
+#[derive(Clone, Copy)]
+enum StratumArgKind {
+    Bool,
+    Text,
+    Path,
+    TextList,
+    U64,
+    Usize,
+}
+
+/// `(name, value name, kind, help)` for every Stratum flag.
+const STRATUM_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    ("stratum", "BOOL", StratumArgKind::Bool, "Run the Stratum V1 solo-mining server (default: false). Not available on signet."),
+    ("stratumbind", "ADDR:PORT", StratumArgKind::Text, "Bind the plaintext Stratum listener (default: 127.0.0.1:3333)"),
+    ("stratumtlsbind", "ADDR:PORT", StratumArgKind::Text, "Bind the Stratum TLS listener (requires --stratumtlscert and --stratumtlskey)"),
+    ("stratumtlscert", "PATH", StratumArgKind::Path, "Path to PEM-encoded TLS certificate for the Stratum server"),
+    ("stratumtlskey", "PATH", StratumArgKind::Path, "Path to PEM-encoded TLS private key for the Stratum server"),
+    ("stratummtls", "BOOL", StratumArgKind::Bool, "Require mutual TLS on the Stratum TLS listener (default: false). Requires --stratumtlsbind and --stratummtlsclientca."),
+    ("stratummtlsclientca", "PATH", StratumArgKind::Path, "Path to PEM CA bundle used to verify client certificates when --stratummtls=1"),
+    ("stratummtlsclientallow", "NAME", StratumArgKind::TextList, "Allowlist of accepted Stratum client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."),
+    ("stratumaddress", "ADDRESS", StratumArgKind::Text, "Payout address for a miner whose username is not a valid address for this network"),
+    ("stratumdifficulty", "N", StratumArgKind::U64, "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)"),
+    ("stratummaxconns", "N", StratumArgKind::Usize, "Hard cap on simultaneously-open Stratum connections (default: 64)"),
+    ("stratumallowplaintextremote", "BOOL", StratumArgKind::Bool, "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)"),
+];
+
+#[inline(never)]
+fn stratum_arg(spec: &(&'static str, &'static str, StratumArgKind, &'static str)) -> clap::Arg {
+    use clap::{Arg, ArgAction, value_parser};
+    let (name, value_name, kind, help) = *spec;
+    let arg = Arg::new(name).long(name).value_name(value_name).help(help);
+    match kind {
+        StratumArgKind::Bool => arg
+            .action(ArgAction::Set)
+            .value_parser(parse_bool_arg)
+            .num_args(0..=1)
+            .default_missing_value("1"),
+        StratumArgKind::Text => arg.action(ArgAction::Set).value_parser(value_parser!(String)),
+        StratumArgKind::Path => {
+            arg.action(ArgAction::Set).value_parser(value_parser!(std::path::PathBuf))
+        }
+        StratumArgKind::TextList => {
+            arg.action(ArgAction::Append).value_parser(value_parser!(String))
+        }
+        StratumArgKind::U64 => arg.action(ArgAction::Set).value_parser(value_parser!(u64)),
+        StratumArgKind::Usize => arg.action(ArgAction::Set).value_parser(value_parser!(usize)),
+    }
+}
+
+impl clap::Args for StratumArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in STRATUM_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for StratumArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            stratum: m.remove_one("stratum"),
+            stratumbind: m.remove_one("stratumbind"),
+            stratumtlsbind: m.remove_one("stratumtlsbind"),
+            stratumtlscert: m.remove_one("stratumtlscert"),
+            stratumtlskey: m.remove_one("stratumtlskey"),
+            stratummtls: m.remove_one("stratummtls"),
+            stratummtlsclientca: m.remove_one("stratummtlsclientca"),
+            stratummtlsclientallow: m
+                .remove_many("stratummtlsclientallow")
+                .map(|v| v.collect())
+                .unwrap_or_default(),
+            stratumaddress: m.remove_one("stratumaddress"),
+            stratumdifficulty: m.remove_one("stratumdifficulty"),
+            stratummaxconns: m.remove_one("stratummaxconns"),
+            stratumallowplaintextremote: m.remove_one("stratumallowplaintextremote"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
+/// The resolved Stratum [`Config`] fields.
+struct StratumFields {
+    stratum: bool,
+    stratum_bind: String,
+    stratum_tls_bind: Option<String>,
+    stratum_tls_cert: Option<std::path::PathBuf>,
+    stratum_tls_key: Option<std::path::PathBuf>,
+    stratum_mtls: bool,
+    stratum_mtls_client_ca: Option<std::path::PathBuf>,
+    stratum_mtls_client_allow: Vec<String>,
+    stratum_address: Option<String>,
+    stratum_difficulty: Option<u64>,
+    stratum_max_conns: usize,
+    stratum_allow_plaintext_remote: bool,
+}
+
+/// Resolve the Stratum keys from CLI then config file, and validate them.
+#[inline(never)]
+fn resolve_stratum(
+    cli: StratumArgs,
+    network: bitcoin::Network,
+    file_get: &dyn Fn(&str) -> Option<String>,
+    file_get_all: &dyn Fn(&str) -> Vec<String>,
+) -> Result<StratumFields, String> {
+    let stratum = cli
+        .stratum
+        .or_else(|| file_get("stratum").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false);
+    let stratum_bind = cli
+        .stratumbind
+        .or_else(|| file_get("stratumbind"))
+        .unwrap_or_else(|| "127.0.0.1:3333".to_string());
+    let stratum_tls_bind = cli.stratumtlsbind.or_else(|| file_get("stratumtlsbind"));
+    let stratum_tls_cert = cli
+        .stratumtlscert
+        .or_else(|| file_get("stratumtlscert").map(std::path::PathBuf::from));
+    let stratum_tls_key = cli
+        .stratumtlskey
+        .or_else(|| file_get("stratumtlskey").map(std::path::PathBuf::from));
+    let stratum_mtls = cli
+        .stratummtls
+        .or_else(|| file_get("stratummtls").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false);
+    let stratum_mtls_client_ca = cli
+        .stratummtlsclientca
+        .or_else(|| file_get("stratummtlsclientca").map(std::path::PathBuf::from));
+    let stratum_mtls_client_allow: Vec<String> = {
+        let mut values: Vec<String> = cli.stratummtlsclientallow;
+        if values.is_empty() {
+            values = file_get_all("stratummtlsclientallow");
+        }
+        values
+            .into_iter()
+            .flat_map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let stratum_address = cli.stratumaddress.or_else(|| file_get("stratumaddress"));
+    let stratum_difficulty = match cli.stratumdifficulty {
+        Some(d) => Some(d),
+        None => match file_get("stratumdifficulty") {
+            Some(v) => Some(
+                v.trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid stratumdifficulty={v:?}: expected a positive integer"))?,
+            ),
+            None => None,
+        },
+    };
+    let stratum_max_conns = cli
+        .stratummaxconns
+        .or_else(|| file_get("stratummaxconns").and_then(|v| v.parse().ok()))
+        .unwrap_or(64);
+    let stratum_allow_plaintext_remote = cli
+        .stratumallowplaintextremote
+        .or_else(|| file_get("stratumallowplaintextremote").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false);
+validate_stratum(&StratumSettings {
+        network,
+        enabled: stratum,
+        bind: &stratum_bind,
+        tls_bind: stratum_tls_bind.as_deref(),
+        tls_cert: stratum_tls_cert.is_some(),
+        tls_key: stratum_tls_key.is_some(),
+        mtls: stratum_mtls,
+        mtls_client_ca: stratum_mtls_client_ca.is_some(),
+        mtls_client_allow: !stratum_mtls_client_allow.is_empty(),
+        address: stratum_address.as_deref(),
+        difficulty: stratum_difficulty,
+        allow_plaintext_remote: stratum_allow_plaintext_remote,
+    })?;
+    Ok(StratumFields {
+        stratum,
+        stratum_bind,
+        stratum_tls_bind,
+        stratum_tls_cert,
+        stratum_tls_key,
+        stratum_mtls,
+        stratum_mtls_client_ca,
+        stratum_mtls_client_allow,
+        stratum_address,
+        stratum_difficulty,
+        stratum_max_conns,
+        stratum_allow_plaintext_remote,
+    })
+}
+
 /// The Stratum settings [`validate_stratum`] judges, resolved from CLI and
 /// config file.
 struct StratumSettings<'a> {
@@ -6872,6 +6965,8 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
+/// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     // Translate index-control aliases first so the rest of the
     // pipeline sees the canonical `--addressindex` form.
@@ -10124,18 +10219,7 @@ testactivationheight=bip34@2
             electrumfeehistogramttl: None,
             electrumbanner: None,
             electrumservername: None,
-            stratum: None,
-            stratumbind: None,
-            stratumtlsbind: None,
-            stratumtlscert: None,
-            stratumtlskey: None,
-            stratummtls: None,
-            stratummtlsclientca: None,
-            stratummtlsclientallow: vec![],
-            stratumaddress: None,
-            stratumdifficulty: None,
-            stratummaxconns: None,
-            stratumallowplaintextremote: None,
+            stratum_args: StratumArgs::default(),
             blockfilterindex: None,
             coinstatsindex: None,
             txospenderindex: None,
@@ -10441,18 +10525,7 @@ testactivationheight=bip34@2
             electrumfeehistogramttl: None,
             electrumbanner: None,
             electrumservername: None,
-            stratum: None,
-            stratumbind: None,
-            stratumtlsbind: None,
-            stratumtlscert: None,
-            stratumtlskey: None,
-            stratummtls: None,
-            stratummtlsclientca: None,
-            stratummtlsclientallow: vec![],
-            stratumaddress: None,
-            stratumdifficulty: None,
-            stratummaxconns: None,
-            stratumallowplaintextremote: None,
+            stratum_args: StratumArgs::default(),
             blockfilterindex: None,
             coinstatsindex: None,
             txospenderindex: None,
@@ -11293,6 +11366,52 @@ testactivationheight=bip34@2
 
         // With the server off, the bind is not judged.
         stratum_config(&["--regtest", "--stratumbind=0.0.0.0:3333"]).unwrap();
+    }
+
+    /// The Stratum flags are built by hand (see `StratumArgs`); every value
+    /// shape must still parse the way the derived flags do.
+    #[test]
+    fn stratum_flags_parse_every_value_shape() {
+        let config = Config::from_cli(
+            CliArgs::try_parse_from(normalize_args(
+                [
+                    "satd",
+                    "-regtest",
+                    "-datadir=/tmp/satd-test",
+                    "-stratum",
+                    "--stratumbind=127.0.0.1:3400",
+                    "--stratumtlsbind=127.0.0.1:4400",
+                    "--stratumtlscert=/tmp/cert.pem",
+                    "--stratumtlskey=/tmp/key.pem",
+                    "--stratummtls",
+                    "--stratummtlsclientca=/tmp/ca.pem",
+                    "--stratummtlsclientallow=alice,bob",
+                    "--stratummtlsclientallow=carol",
+                    "--stratumdifficulty=42",
+                    "--stratummaxconns=5",
+                    "--stratumallowplaintextremote=0",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(config.stratum, "a bare flag means 1");
+        assert_eq!(config.stratum_bind, "127.0.0.1:3400");
+        assert_eq!(config.stratum_tls_bind.as_deref(), Some("127.0.0.1:4400"));
+        assert_eq!(config.stratum_tls_key, Some(std::path::PathBuf::from("/tmp/key.pem")));
+        assert!(config.stratum_mtls);
+        let mut names = config.stratum_mtls_client_allow.clone();
+        names.sort();
+        assert_eq!(names, ["alice", "bob", "carol"]);
+        assert_eq!(config.stratum_difficulty, Some(42));
+        assert_eq!(config.stratum_max_conns, 5);
+        assert!(!config.stratum_allow_plaintext_remote);
+
+        assert!(CliArgs::try_parse_from(["satd", "--stratumdifficulty=many"]).is_err());
+        assert!(CliArgs::try_parse_from(["satd", "--stratum=maybe"]).is_err());
     }
 
     #[test]

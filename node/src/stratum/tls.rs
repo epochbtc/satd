@@ -82,15 +82,15 @@ mod tests {
 
     #[test]
     fn the_last_certificate_in_the_file_is_measured() {
-        // 28 + 1 + body + 1 + 25 + 1 bytes.
+        // 27 + 1 + body + 1 + 25 + 1 bytes.
         let small = block(400);
-        assert_eq!(small.len(), 456);
+        assert_eq!(small.len(), 455);
         assert_eq!(oversized_miner_ca(&small), None);
         let big = block(600);
-        assert_eq!(oversized_miner_ca(&big), Some(656));
+        assert_eq!(oversized_miner_ca(&big), Some(655));
         // A large leaf followed by a small CA is fine; the reverse is not.
         assert_eq!(oversized_miner_ca(&format!("{big}{small}")), None);
-        assert_eq!(oversized_miner_ca(&format!("{small}{big}")), Some(656));
+        assert_eq!(oversized_miner_ca(&format!("{small}{big}")), Some(655));
         assert_eq!(oversized_miner_ca("not a certificate"), None);
     }
 }
