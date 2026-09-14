@@ -46,7 +46,7 @@ item below is (or will be) written up in full in the in-development
   release build with a diagnostic that showed the service running (#742).
 - The Umbrel package takes its own host ports (8430, 8433, 8436, 8439, 50012), so it installs beside Bitcoin Node, Fulcrum and Ride The Lightning, and its backups leave the chain out (#743).
 - The StartOS package's backups skip the AssumeUTXO background chainstate, and its sync check no longer reports `verificationprogress`, which read about 69% at genesis (#743).
-- `getblocktemplate` now carries the retargeted difficulty at a retarget boundary (and after a testnet 20-minute gap) instead of the tip's bits, and reports `mintime` as median time past + 1 instead of `curtime`.
+- `getblocktemplate` now carries the retargeted difficulty at a retarget boundary (and after a testnet 20-minute gap) instead of the tip's bits, and reports `mintime` as median time past + 1 instead of `curtime` (#746).
 
 ## Releases
 
