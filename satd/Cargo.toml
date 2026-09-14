@@ -82,6 +82,11 @@ hex = { workspace = true }
 base64 = { workspace = true }
 tempfile = "3"
 rcgen = { workspace = true }
+# Raw TLS client for the Stratum TLS/mTLS tests: Stratum is a line protocol,
+# not HTTP, so reqwest cannot drive it. Already in the graph through
+# `node -> tls-config` with the workspace's ring + tls12 features, so this adds
+# no crate and no second crypto provider.
+tokio-rustls = { workspace = true }
 # Raw column-family inspection for the silent-payment index rebuild-parity
 # test (tests/regtest.rs). The point of that test is byte-identity between the
 # rows the live connect path wrote and the rows a backfill rebuilt, so it reads

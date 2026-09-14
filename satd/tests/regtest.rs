@@ -17294,3 +17294,466 @@ fn statusadvertise_rejects_unknown_surface_at_startup() {
     }
     let _ = std::fs::remove_dir_all(&datadir);
 }
+
+// ── Stratum V1 solo-mining server ─────────────────────────────────
+
+/// A minimal Stratum V1 miner-side client, generic over the transport so the
+/// plaintext and TLS listeners are driven by the same code.
+struct StratumClient<S> {
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<S>>,
+    writer: tokio::io::WriteHalf<S>,
+    next_id: u64,
+    /// Notifications that arrived while waiting for a response.
+    pending: std::collections::VecDeque<serde_json::Value>,
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> StratumClient<S> {
+    fn new(stream: S) -> Self {
+        let (r, writer) = tokio::io::split(stream);
+        Self {
+            reader: tokio::io::BufReader::new(r),
+            writer,
+            next_id: 1,
+            pending: Default::default(),
+        }
+    }
+
+    /// The next line from the server, or `None` on EOF / error / timeout.
+    async fn read_message(&mut self, timeout: Duration) -> Option<serde_json::Value> {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        match tokio::time::timeout(timeout, self.reader.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(line.trim_end()).expect("server sent JSON")),
+            _ => None,
+        }
+    }
+
+    async fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use tokio::io::AsyncWriteExt;
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = serde_json::json!({"id": id, "method": method, "params": params}).to_string() + "\n";
+        self.writer.write_all(line.as_bytes()).await.expect("write request");
+        loop {
+            let msg = self
+                .read_message(Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|| panic!("no response to {method}"));
+            if msg["id"] == serde_json::json!(id) {
+                return msg;
+            }
+            self.pending.push_back(msg);
+        }
+    }
+
+    async fn notification(&mut self, method: &str, timeout: Duration) -> serde_json::Value {
+        if let Some(pos) = self.pending.iter().position(|m| m["method"] == method) {
+            return self.pending.remove(pos).unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let msg = self
+                .read_message(left)
+                .await
+                .unwrap_or_else(|| panic!("no {method} within {timeout:?}"));
+            if msg["method"] == method {
+                return msg;
+            }
+            self.pending.push_back(msg);
+        }
+    }
+
+    /// configure + subscribe + authorize, returning the extranonce1 and the
+    /// first `mining.notify` params.
+    async fn handshake(&mut self, username: &str) -> (Vec<u8>, serde_json::Value) {
+        use serde_json::json;
+        let configure = self
+            .call("mining.configure", json!([["version-rolling"], {"version-rolling.mask": "ffffffff"}]))
+            .await;
+        assert_eq!(configure["result"]["version-rolling.mask"], "1fffe000", "{configure}");
+        let sub = self.call("mining.subscribe", json!(["test-miner/1.0"])).await;
+        let result = &sub["result"];
+        assert_eq!(result[0][1][0], "mining.notify", "{sub}");
+        assert_eq!(result[2], 4, "extranonce2 size: {sub}");
+        let extranonce1 = hex::decode(result[1].as_str().expect("extranonce1")).unwrap();
+        assert_eq!(extranonce1.len(), 4);
+        let auth = self.call("mining.authorize", json!([username, "x"])).await;
+        assert_eq!(auth["result"], true, "{auth}");
+        let diff = self.notification("mining.set_difficulty", Duration::from_secs(10)).await;
+        assert_eq!(diff["params"][0], 1, "regtest initial difficulty: {diff}");
+        let notify = self.notification("mining.notify", Duration::from_secs(10)).await;
+        (extranonce1, notify["params"].clone())
+    }
+}
+
+/// Retry the TCP connect: `TestNode::start` returns once RPC answers, which
+/// can be a moment before the Stratum listener is serving.
+fn stratum_connect(port: u16) -> std::net::TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => {
+                s.set_nonblocking(true).unwrap();
+                return s;
+            }
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("stratum listener on {port} never accepted: {e}"),
+        }
+    }
+}
+
+fn plain_stratum_client(port: u16) -> StratumClient<tokio::net::TcpStream> {
+    StratumClient::new(tokio::net::TcpStream::from_std(stratum_connect(port)).unwrap())
+}
+
+/// The block height a notify's coinb1 commits to (BIP 34).
+fn notify_height(params: &serde_json::Value) -> u64 {
+    let coinb1 = hex::decode(params[2].as_str().unwrap()).unwrap();
+    // version (4) | input count (1) | prevout (36) | scriptSig length (1)
+    let op = coinb1[42];
+    match op {
+        0x51..=0x60 => u64::from(op - 0x50),
+        1..=8 => {
+            let n = op as usize;
+            let mut bytes = [0u8; 8];
+            bytes[..n].copy_from_slice(&coinb1[43..43 + n]);
+            u64::from_le_bytes(bytes)
+        }
+        other => panic!("unexpected height push opcode {other:#x}"),
+    }
+}
+
+/// Undo the stratum word swap and return the display-order block hash.
+fn notify_prevhash(params: &serde_json::Value) -> String {
+    let mut bytes = hex::decode(params[1].as_str().unwrap()).unwrap();
+    for word in bytes.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    bytes.reverse();
+    hex::encode(bytes)
+}
+
+/// Build the header a miner would from a notify, grinding the nonce until it
+/// meets the block target. Returns `(extranonce2, ntime, nonce)`.
+fn grind_stratum_block(extranonce1: &[u8], params: &serde_json::Value) -> ([u8; 4], u32, u32) {
+    use bitcoin::hashes::{Hash, sha256d};
+    let extranonce2 = [0xde, 0xad, 0xbe, 0xef];
+    let mut coinbase = hex::decode(params[2].as_str().unwrap()).unwrap();
+    coinbase.extend_from_slice(extranonce1);
+    coinbase.extend_from_slice(&extranonce2);
+    coinbase.extend_from_slice(&hex::decode(params[3].as_str().unwrap()).unwrap());
+    let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
+    for branch in params[4].as_array().unwrap() {
+        let mut buf = root.to_vec();
+        buf.extend_from_slice(&hex::decode(branch.as_str().unwrap()).unwrap());
+        root = sha256d::Hash::hash(&buf).to_byte_array();
+    }
+    let mut prev = hex::decode(params[1].as_str().unwrap()).unwrap();
+    for word in prev.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    let hex_u32 = |i: usize| u32::from_str_radix(params[i].as_str().unwrap(), 16).unwrap();
+    let mut header = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(hex_u32(5) as i32),
+        prev_blockhash: bitcoin::BlockHash::from_byte_array(prev.try_into().unwrap()),
+        merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
+        time: hex_u32(7),
+        bits: bitcoin::CompactTarget::from_consensus(hex_u32(6)),
+        nonce: 0,
+    };
+    while header.validate_pow(header.target()).is_err() {
+        header.nonce += 1;
+    }
+    (extranonce2, header.time, header.nonce)
+}
+
+const STRATUM_MINER_SECRET: [u8; 32] = [0x5a; 32];
+
+#[test]
+fn stratum_v1_subscribe_authorize_notify() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(20), json!(addr)]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (_, mut params) = client.handshake(&format!("{addr}.rig1")).await;
+        // The first notify can be work built before the last generated block
+        // connected; the one after it is current.
+        let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
+        while notify_prevhash(&params) != best {
+            params = client.notification("mining.notify", Duration::from_secs(10)).await["params"].clone();
+        }
+        assert_eq!(notify_height(&params), tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1);
+        assert_eq!(params[6], "207fffff", "regtest nbits");
+        assert_eq!(params[5], "20000000", "version");
+
+        // An address for another network is refused by name.
+        let mut other = plain_stratum_client(port);
+        let mainnet = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let refused = other.call("mining.authorize", json!([mainnet, "x"])).await;
+        assert_eq!(refused["error"][0], 24, "{refused}");
+        assert!(refused["error"][1].as_str().unwrap().contains("not a valid address"), "{refused}");
+        // A submit before authorizing is refused too.
+        let submit = other.call("mining.submit", json!(["x", "1", "00000000", "00000000", "00000000"])).await;
+        assert_eq!(submit["error"][0], 24, "{submit}");
+        assert_eq!(other.call("mining.ping", json!([])).await["result"], "pong");
+    });
+
+    // getserverstatus reports the bound listener.
+    let status = node.rpc_ok("getserverstatus", vec![]);
+    assert_eq!(status["stratum"]["bind"], format!("127.0.0.1:{port}"), "{status}");
+    assert!(status["stratum_tls"].is_null(), "{status}");
+}
+
+#[test]
+fn stratum_v1_mined_share_connects_block() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let funder = DeterministicWallet::from_secret([0x5b; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    // A segwit spend in the mempool, so the template carries a witness and the
+    // coinbase's witness commitment has something to commit to.
+    let dest = DeterministicWallet::from_secret([0x5c; 32]);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &funder,
+        dest.address.script_pubkey(),
+        2_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let submitted_height = rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (extranonce1, _) = client.handshake(&format!("{miner}.rig1")).await;
+        // Move the tip without mining the mempool transaction, so the work
+        // rebuilt for the new tip includes it.
+        tokio::task::block_in_place(|| node.rpc_ok("generateblock", vec![json!(funder.address.to_string()), json!([])]));
+        let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
+        let params = loop {
+            let n = client.notification("mining.notify", Duration::from_secs(10)).await;
+            if notify_prevhash(&n["params"]) == best {
+                assert_eq!(n["params"][8], true, "a new tip is a clean job: {n}");
+                break n["params"].clone();
+            }
+        };
+        assert_eq!(params[4].as_array().unwrap().len(), 1, "one transaction beside the coinbase");
+        let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
+        let submit = json!([
+            format!("{miner}.rig1"),
+            params[0],
+            hex::encode(extranonce2),
+            format!("{ntime:08x}"),
+            format!("{nonce:08x}"),
+        ]);
+        let reply = client.call("mining.submit", submit.clone()).await;
+        assert_eq!(reply["result"], true, "{reply}");
+        // The same solution again is a duplicate.
+        let again = client.call("mining.submit", submit).await;
+        assert_eq!(again["error"][0], 22, "{again}");
+        notify_height(&params)
+    });
+
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(submitted_height),
+        test_timeout(10),
+        "the submitted block connects",
+    );
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+    let block = node.rpc_ok("getblock", vec![json!(best), json!(2)]);
+    let txs = block["tx"].as_array().unwrap();
+    assert_eq!(txs.len(), 2, "{block}");
+    assert_eq!(txs[1]["txid"], txid, "the mempool transaction was mined");
+    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner, "coinbase pays the username");
+    let mempool = node.rpc_ok("getrawmempool", vec![]);
+    assert_eq!(mempool, json!([]), "the mined transaction left the mempool");
+}
+
+#[test]
+fn stratum_v1_new_block_pushes_clean_job() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (_, first) = client.handshake(&addr).await;
+        assert_eq!(first[8], true, "the first job is clean");
+        let hashes = tokio::task::block_in_place(|| node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]));
+        let new_tip = hashes[0].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = client.notification("mining.notify", left).await;
+            if notify_prevhash(&n["params"]) == new_tip {
+                assert_eq!(n["params"][8], true, "{n}");
+                assert_eq!(notify_height(&n["params"]), 2);
+                // A share for the job on the old tip is now stale.
+                let stale = client
+                    .call("mining.submit", json!([addr, first[0], "00000000", first[7], "00000000"]))
+                    .await;
+                assert_eq!(stale["error"][0], 21, "{stale}");
+                break;
+            }
+        }
+    });
+}
+
+/// A CA, a server certificate for `localhost`, and two client certificates
+/// (`alice`, `mallory`) signed by the CA.
+struct StratumPki {
+    dir: tempfile::TempDir,
+    ca: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+    clients: Vec<(tokio_rustls::rustls::pki_types::CertificateDer<'static>, Vec<u8>)>,
+}
+
+fn mint_stratum_pki() -> StratumPki {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "stratum-test-ca");
+    let ca_kp = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+    let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let server_kp = rcgen::KeyPair::generate().unwrap();
+    let server_cert = server_params.signed_by(&server_kp, &ca_cert, &ca_kp).unwrap();
+    std::fs::write(dir.path().join("server.pem"), server_cert.pem() + &ca_cert.pem()).unwrap();
+    std::fs::write(dir.path().join("server.key"), server_kp.serialize_pem()).unwrap();
+    std::fs::write(dir.path().join("ca.pem"), ca_cert.pem()).unwrap();
+
+    let clients = ["alice", "mallory"]
+        .iter()
+        .map(|cn| {
+            let mut p = rcgen::CertificateParams::new(vec![format!("{cn}.miners.test")]).unwrap();
+            p.distinguished_name.push(rcgen::DnType::CommonName, *cn);
+            let kp = rcgen::KeyPair::generate().unwrap();
+            let cert = p.signed_by(&kp, &ca_cert, &ca_kp).unwrap();
+            (cert.der().clone(), kp.serialize_der())
+        })
+        .collect();
+    StratumPki { ca: ca_cert.der().clone(), dir, clients }
+}
+
+impl StratumPki {
+    fn path(&self, name: &str) -> String {
+        self.dir.path().join(name).display().to_string()
+    }
+
+    /// A TLS client trusting the test CA, optionally presenting client `i`.
+    fn connector(&self, client: Option<usize>) -> tokio_rustls::TlsConnector {
+        use tokio_rustls::rustls;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.ca.clone()).unwrap();
+        // An explicit provider: the process may link more than one, and the
+        // test must not depend on which is installed as the default.
+        let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+        let config = match client {
+            None => builder.with_no_client_auth(),
+            Some(i) => {
+                let (cert, key) = &self.clients[i];
+                let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.clone().into());
+                builder.with_client_auth_cert(vec![cert.clone()], key).unwrap()
+            }
+        };
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+}
+
+async fn tls_stratum_client(
+    pki: &StratumPki,
+    port: u16,
+    client: Option<usize>,
+) -> std::io::Result<StratumClient<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>> {
+    let tcp = tokio::net::TcpStream::from_std(stratum_connect(port)).unwrap();
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = pki.connector(client).connect(name, tcp).await?;
+    Ok(StratumClient::new(tls))
+}
+
+#[test]
+fn stratum_v1_tls_listener_serves_same_protocol() {
+    let pki = mint_stratum_pki();
+    let port = find_available_port();
+    let tls_port = find_available_port();
+    let node = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        &format!("--stratumtlsbind=127.0.0.1:{tls_port}"),
+        &format!("--stratumtlscert={}", pki.path("server.pem")),
+        &format!("--stratumtlskey={}", pki.path("server.key")),
+    ]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = tls_stratum_client(&pki, tls_port, None).await.expect("TLS handshake");
+        let (_, params) = client.handshake(&addr).await;
+        assert_eq!(notify_height(&params), 1);
+    });
+    let status = node.rpc_ok("getserverstatus", vec![]);
+    assert_eq!(status["stratum_tls"]["bind"], format!("127.0.0.1:{tls_port}"), "{status}");
+}
+
+#[test]
+fn stratum_v1_mtls_rejects_unlisted_client() {
+    use serde_json::json;
+    let pki = mint_stratum_pki();
+    let port = find_available_port();
+    let tls_port = find_available_port();
+    let _node = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        &format!("--stratumtlsbind=127.0.0.1:{tls_port}"),
+        &format!("--stratumtlscert={}", pki.path("server.pem")),
+        &format!("--stratumtlskey={}", pki.path("server.key")),
+        "--stratummtls=1",
+        &format!("--stratummtlsclientca={}", pki.path("ca.pem")),
+        "--stratummtlsclientallow=alice",
+    ]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // The listed client is served — without this the refusal below would
+        // pass against a listener that refuses everyone.
+        let mut alice = tls_stratum_client(&pki, tls_port, Some(0)).await.expect("alice handshake");
+        let (_, params) = alice.handshake(&addr).await;
+        assert_eq!(notify_height(&params), 1);
+
+        // mallory's certificate is CA-signed but not listed: the connection
+        // closes after the handshake, before any reply.
+        if let Ok(mut mallory) = tls_stratum_client(&pki, tls_port, Some(1)).await {
+            use tokio::io::AsyncWriteExt;
+            let line = json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
+            let _ = mallory.writer.write_all(line.as_bytes()).await;
+            assert!(
+                mallory.read_message(Duration::from_secs(5)).await.is_none(),
+                "an unlisted client must not be answered"
+            );
+        }
+        // No certificate at all fails the handshake or is dropped unanswered.
+        if let Ok(mut anon) = tls_stratum_client(&pki, tls_port, None).await {
+            use tokio::io::AsyncWriteExt;
+            let line = json!({"id": 1, "method": "mining.subscribe", "params": []}).to_string() + "\n";
+            let _ = anon.writer.write_all(line.as_bytes()).await;
+            assert!(anon.read_message(Duration::from_secs(5)).await.is_none());
+        }
+    });
+}

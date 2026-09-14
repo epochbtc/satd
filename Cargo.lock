@@ -4101,6 +4101,7 @@ dependencies = [
  "tikv-jemallocator",
  "tls-config",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tonic",
