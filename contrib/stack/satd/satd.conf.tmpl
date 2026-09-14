@@ -19,9 +19,9 @@
 # TLS listeners bind 0.0.0.0 and ARE published. Everything that leaves the
 # host is TLS, presenting the per-install certificate from tls/mkca.sh.
 #
-# The metrics endpoint has no native TLS (and neither does the streaming
-# WebSocket), so it stays inside the network; the appliance image fronts it
-# with a reverse proxy on 443.
+# The plain metrics listener stays inside the network. satd-init adds its TLS
+# listener (9336) for a satd that has one; the streaming WebSocket has no
+# native TLS and is fronted by the proxy overlay.
 
 # --- chain ------------------------------------------------------------------
 # The network is selected on the command line, never here: a `signet=1` line
