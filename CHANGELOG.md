@@ -17,7 +17,7 @@ item below is (or will be) written up in full in the in-development
 
 ### Added
 
-- The metrics and health endpoints can be served over TLS on a second port (`-metricstlsbind`), with optional client certificates (`-metricsmtls`), so Prometheus can scrape a node across a network without a reverse proxy.
+- The metrics and health endpoints can be served over TLS on a second port (`-metricstlsbind`), with optional client certificates (`-metricsmtls`), so Prometheus can scrape a node across a network without a reverse proxy (#752).
 
 ### Fixed
 
