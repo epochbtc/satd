@@ -92,6 +92,9 @@ echo "starting Electrum daemon + wallet..."
 el daemon -d >/dev/null 2>&1 || true
 sleep 3
 el setconfig oneserver true >/dev/null 2>&1 || true
+# Electrum 4.6+ resets `server` at startup when oneserver and auto_connect are
+# both on, and auto_connect defaults to on.
+el setconfig auto_connect false >/dev/null 2>&1 || true
 el setconfig server "127.0.0.1:$SATD_ELECTRUM_PORT:t" >/dev/null 2>&1 || true
 el create >/dev/null 2>&1 || true
 el stop >/dev/null 2>&1 || true
