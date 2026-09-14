@@ -822,6 +822,38 @@ pub struct Config {
     /// An empty value is treated as unset, with a warning: it would otherwise
     /// advertise a nameless server and silently switch every gating client off.
     pub electrum_server_name: Option<String>,
+    /// Native Stratum V1 solo-mining server (see `docs/manual/src/stratum.md`).
+    /// Off by default; `--stratum=1` enables. Refused on signet, whose blocks
+    /// need the network's signing key.
+    pub stratum: bool,
+    /// `host:port` for the plaintext Stratum listener. Defaults to loopback
+    /// on port 3333. A non-loopback address with no TLS listener is refused
+    /// unless `stratum_allow_plaintext_remote` is set.
+    pub stratum_bind: String,
+    /// Optional TLS listener. When set, `stratum_tls_cert` and
+    /// `stratum_tls_key` MUST also be set.
+    pub stratum_tls_bind: Option<String>,
+    /// PEM certificate (or full chain) for the Stratum TLS listener.
+    pub stratum_tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for the Stratum TLS listener.
+    pub stratum_tls_key: Option<std::path::PathBuf>,
+    /// Require a client certificate on the Stratum TLS listener. Requires
+    /// `stratum_tls_bind` and `stratum_mtls_client_ca`.
+    pub stratum_mtls: bool,
+    /// PEM CA bundle for Stratum client certificates.
+    pub stratum_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Accepted client-certificate CN / DNS-SAN names. Empty accepts any
+    /// certificate the CA signed. Repeatable or comma-separated.
+    pub stratum_mtls_client_allow: Vec<String>,
+    /// Payout address for a miner whose username is not an address on this
+    /// network. Validated against the network at load.
+    pub stratum_address: Option<String>,
+    /// Initial share difficulty. `None` uses the per-network default.
+    pub stratum_difficulty: Option<u64>,
+    /// Cap on simultaneous Stratum connections across both listeners.
+    pub stratum_max_conns: usize,
+    /// Accept a non-loopback `stratum_bind` with no TLS listener.
+    pub stratum_allow_plaintext_remote: bool,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
@@ -3374,6 +3406,79 @@ impl Config {
                 }
             });
 
+        // ── Stratum ──────────────────────────────────────────────
+        let stratum = cli
+            .stratum
+            .or_else(|| file_get("stratum").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let stratum_bind = cli
+            .stratumbind
+            .or_else(|| file_get("stratumbind"))
+            .unwrap_or_else(|| "127.0.0.1:3333".to_string());
+        let stratum_tls_bind = cli.stratumtlsbind.or_else(|| file_get("stratumtlsbind"));
+        let stratum_tls_cert = cli
+            .stratumtlscert
+            .or_else(|| file_get("stratumtlscert").map(std::path::PathBuf::from));
+        let stratum_tls_key = cli
+            .stratumtlskey
+            .or_else(|| file_get("stratumtlskey").map(std::path::PathBuf::from));
+        let stratum_mtls = cli
+            .stratummtls
+            .or_else(|| file_get("stratummtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let stratum_mtls_client_ca = cli
+            .stratummtlsclientca
+            .or_else(|| file_get("stratummtlsclientca").map(std::path::PathBuf::from));
+        let stratum_mtls_client_allow: Vec<String> = {
+            let mut values: Vec<String> = cli.stratummtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("stratummtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let stratum_address = cli.stratumaddress.or_else(|| file_get("stratumaddress"));
+        let stratum_difficulty = match cli.stratumdifficulty {
+            Some(d) => Some(d),
+            None => match file_get("stratumdifficulty") {
+                Some(v) => Some(
+                    v.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid stratumdifficulty={v:?}: expected a positive integer"))?,
+                ),
+                None => None,
+            },
+        };
+        let stratum_max_conns = cli
+            .stratummaxconns
+            .or_else(|| file_get("stratummaxconns").and_then(|v| v.parse().ok()))
+            .unwrap_or(64);
+        let stratum_allow_plaintext_remote = cli
+            .stratumallowplaintextremote
+            .or_else(|| file_get("stratumallowplaintextremote").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        validate_stratum(&StratumSettings {
+            network,
+            enabled: stratum,
+            bind: &stratum_bind,
+            tls_bind: stratum_tls_bind.as_deref(),
+            tls_cert: stratum_tls_cert.is_some(),
+            tls_key: stratum_tls_key.is_some(),
+            mtls: stratum_mtls,
+            mtls_client_ca: stratum_mtls_client_ca.is_some(),
+            mtls_client_allow: !stratum_mtls_client_allow.is_empty(),
+            address: stratum_address.as_deref(),
+            difficulty: stratum_difficulty,
+            allow_plaintext_remote: stratum_allow_plaintext_remote,
+        })?;
+
         // BIP 158 filter index. CLI `--blockfilterindex=<0|1|basic>`,
         // config `blockfilterindex=<0|1|basic>`, or
         // `-noindex=blockfilter` (translated to `--blockfilterindex=0`
@@ -3806,6 +3911,18 @@ impl Config {
             electrum_fee_histogram_ttl,
             electrum_banner,
             electrum_server_name,
+            stratum,
+            stratum_bind,
+            stratum_tls_bind,
+            stratum_tls_cert,
+            stratum_tls_key,
+            stratum_mtls,
+            stratum_mtls_client_ca,
+            stratum_mtls_client_allow,
+            stratum_address,
+            stratum_difficulty,
+            stratum_max_conns,
+            stratum_allow_plaintext_remote,
             blockfilterindex,
             coinstatsindex,
             txospenderindex,
@@ -4415,6 +4532,25 @@ impl Config {
                 "mtls": if self.electrum { Some(self.electrum_mtls) } else { None },
                 "mtls_client_allow_count": if self.electrum {
                     Some(self.electrum_mtls_client_allow.len())
+                } else {
+                    None
+                },
+            },
+            "stratum": {
+                "enabled": self.stratum,
+                "bind": if self.stratum { Some(self.stratum_bind.clone()) } else { None },
+                "tls_bind": if self.stratum { self.stratum_tls_bind.clone() } else { None },
+                "mtls": if self.stratum { Some(self.stratum_mtls) } else { None },
+                "mtls_client_allow_count": if self.stratum {
+                    Some(self.stratum_mtls_client_allow.len())
+                } else {
+                    None
+                },
+                "address": if self.stratum { self.stratum_address.clone() } else { None },
+                "difficulty": if self.stratum { self.stratum_difficulty } else { None },
+                "max_conns": if self.stratum { Some(self.stratum_max_conns) } else { None },
+                "allow_plaintext_remote": if self.stratum {
+                    Some(self.stratum_allow_plaintext_remote)
                 } else {
                     None
                 },
@@ -5437,6 +5573,99 @@ pub struct CliArgs {
         help = "Server name reported by server.version (default satd-electrs-compatible/<version>)"
     )]
     pub electrumservername: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Run the Stratum V1 solo-mining server (default: false). Not available on signet."
+    )]
+    pub stratum: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the plaintext Stratum listener (default: 127.0.0.1:3333)"
+    )]
+    pub stratumbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Bind the Stratum TLS listener (requires --stratumtlscert and --stratumtlskey)"
+    )]
+    pub stratumtlsbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the Stratum server"
+    )]
+    pub stratumtlscert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the Stratum server"
+    )]
+    pub stratumtlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require mutual TLS on the Stratum TLS listener (default: false). Requires --stratumtlsbind and --stratummtlsclientca."
+    )]
+    pub stratummtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --stratummtls=1"
+    )]
+    pub stratummtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted Stratum client-cert CN / DNS-SAN values (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub stratummtlsclientallow: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        help = "Payout address for a miner whose username is not a valid address for this network"
+    )]
+    pub stratumaddress: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)"
+    )]
+    pub stratumdifficulty: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Hard cap on simultaneously-open Stratum connections (default: 64)"
+    )]
+    pub stratummaxconns: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)"
+    )]
+    pub stratumallowplaintextremote: Option<bool>,
 
     #[arg(
         long,
@@ -6563,6 +6792,86 @@ fn translate_index_aliases(args: Vec<String>) -> Vec<String> {
 
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
 /// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
+/// The Stratum settings [`validate_stratum`] judges, resolved from CLI and
+/// config file.
+struct StratumSettings<'a> {
+    network: bitcoin::Network,
+    enabled: bool,
+    bind: &'a str,
+    tls_bind: Option<&'a str>,
+    tls_cert: bool,
+    tls_key: bool,
+    mtls: bool,
+    mtls_client_ca: bool,
+    mtls_client_allow: bool,
+    address: Option<&'a str>,
+    difficulty: Option<u64>,
+    allow_plaintext_remote: bool,
+}
+
+/// Refuse Stratum configurations that cannot work or would be unsafe.
+///
+/// The TLS rules hold whether or not the server is enabled, as they do for
+/// Electrum. The rest apply only to an enabled server.
+fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
+    if s.tls_bind.is_some() && !(s.tls_cert && s.tls_key) {
+        return Err("--stratumtlsbind requires --stratumtlscert AND --stratumtlskey".to_string());
+    }
+    if s.mtls && s.tls_bind.is_none() {
+        return Err("--stratummtls=1 requires --stratumtlsbind".to_string());
+    }
+    if s.mtls && !s.mtls_client_ca {
+        return Err("--stratummtls=1 requires --stratummtlsclientca".to_string());
+    }
+    // Without a client certificate there is nothing for the allowlist to
+    // match, and it would refuse every connection.
+    if !s.mtls && s.mtls_client_allow {
+        return Err("--stratummtlsclientallow requires --stratummtls=1".to_string());
+    }
+    if !s.enabled {
+        return Ok(());
+    }
+    // No template carries a signet block solution (BIP 325), so every block
+    // a miner found would be invalid.
+    if s.network == bitcoin::Network::Signet {
+        return Err(
+            "--stratum is not available on signet: signet blocks require the network's signing key"
+                .to_string(),
+        );
+    }
+    let bind: std::net::SocketAddr = s
+        .bind
+        .parse()
+        .map_err(|e| format!("invalid --stratumbind {:?}: {e}", s.bind))?;
+    if let Some(tls_bind) = s.tls_bind {
+        tls_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid --stratumtlsbind {tls_bind:?}: {e}"))?;
+    }
+    // A Stratum V1 session carries the payout address in the clear on every
+    // `mining.authorize`, and an on-path attacker can rewrite it.
+    if !bind.ip().is_loopback() && s.tls_bind.is_none() && !s.allow_plaintext_remote {
+        return Err(format!(
+            "--stratumbind={} is not a loopback address and no\n\
+             --stratumtlsbind is configured. Miners on the network would receive work\n\
+             and submit shares in cleartext. Set --stratumtlsbind (recommended) or\n\
+             --stratumallowplaintextremote=1 to accept this.",
+            s.bind
+        ));
+    }
+    if let Some(address) = s.address {
+        address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .map_err(|e| format!("invalid --stratumaddress {address:?}: {e}"))?
+            .require_network(s.network)
+            .map_err(|_| format!("--stratumaddress {address:?} is not an address for this network"))?;
+    }
+    if s.difficulty == Some(0) {
+        return Err("--stratumdifficulty must be at least 1".to_string());
+    }
+    Ok(())
+}
+
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     // Translate index-control aliases first so the rest of the
     // pipeline sees the canonical `--addressindex` form.
@@ -6674,6 +6983,18 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "electrumfeehistogramttl",
         "electrumbanner",
         "electrumservername",
+        "stratum",
+        "stratumbind",
+        "stratumtlsbind",
+        "stratumtlscert",
+        "stratumtlskey",
+        "stratummtls",
+        "stratummtlsclientca",
+        "stratummtlsclientallow",
+        "stratumaddress",
+        "stratumdifficulty",
+        "stratummaxconns",
+        "stratumallowplaintextremote",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -7435,6 +7756,18 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "electrumfeehistogramttl",
     "electrumbanner",
     "electrumservername",
+    "stratum",
+    "stratumbind",
+    "stratumtlsbind",
+    "stratumtlscert",
+    "stratumtlskey",
+    "stratummtls",
+    "stratummtlsclientca",
+    "stratummtlsclientallow",
+    "stratumaddress",
+    "stratumdifficulty",
+    "stratummaxconns",
+    "stratumallowplaintextremote",
     // Storage / pruning / reindex
     "prune",
     "reindex",
@@ -9791,6 +10124,18 @@ testactivationheight=bip34@2
             electrumfeehistogramttl: None,
             electrumbanner: None,
             electrumservername: None,
+            stratum: None,
+            stratumbind: None,
+            stratumtlsbind: None,
+            stratumtlscert: None,
+            stratumtlskey: None,
+            stratummtls: None,
+            stratummtlsclientca: None,
+            stratummtlsclientallow: vec![],
+            stratumaddress: None,
+            stratumdifficulty: None,
+            stratummaxconns: None,
+            stratumallowplaintextremote: None,
             blockfilterindex: None,
             coinstatsindex: None,
             txospenderindex: None,
@@ -10096,6 +10441,18 @@ testactivationheight=bip34@2
             electrumfeehistogramttl: None,
             electrumbanner: None,
             electrumservername: None,
+            stratum: None,
+            stratumbind: None,
+            stratumtlsbind: None,
+            stratumtlscert: None,
+            stratumtlskey: None,
+            stratummtls: None,
+            stratummtlsclientca: None,
+            stratummtlsclientallow: vec![],
+            stratumaddress: None,
+            stratumdifficulty: None,
+            stratummaxconns: None,
+            stratumallowplaintextremote: None,
             blockfilterindex: None,
             coinstatsindex: None,
             txospenderindex: None,
@@ -10891,6 +11248,89 @@ testactivationheight=bip34@2
             err.contains("electrummtlsclientallow") && err.contains("electrummtls"),
             "expected allowlist-without-mtls error, got: {err}"
         );
+    }
+
+    fn stratum_config(args: &[&str]) -> Result<Config, String> {
+        let mut argv = vec!["satd", "--datadir=/tmp/satd-test"];
+        argv.extend_from_slice(args);
+        Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+    }
+
+    /// A Stratum V1 session carries the payout address in cleartext, so a
+    /// network-reachable plaintext listener needs TLS beside it or an
+    /// explicit override.
+    #[test]
+    fn plaintext_remote_bind_without_tls_is_refused() {
+        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumbind=0.0.0.0:3333"])
+            .unwrap_err();
+        assert!(
+            err.contains("--stratumbind=0.0.0.0:3333 is not a loopback address")
+                && err.contains("--stratumallowplaintextremote=1"),
+            "got: {err}"
+        );
+
+        // Each way out is accepted: the override, a TLS listener, loopback.
+        stratum_config(&[
+            "--regtest",
+            "--stratum=1",
+            "--stratumbind=0.0.0.0:3333",
+            "--stratumallowplaintextremote=1",
+        ])
+        .unwrap();
+        stratum_config(&[
+            "--regtest",
+            "--stratum=1",
+            "--stratumbind=0.0.0.0:3333",
+            "--stratumtlsbind=0.0.0.0:4333",
+            "--stratumtlscert=/tmp/cert.pem",
+            "--stratumtlskey=/tmp/key.pem",
+        ])
+        .unwrap();
+        let config = stratum_config(&["--regtest", "--stratum=1"]).unwrap();
+        assert_eq!(config.stratum_bind, "127.0.0.1:3333");
+        assert_eq!(config.stratum_max_conns, 64);
+        assert_eq!(config.stratum_difficulty, None);
+
+        // With the server off, the bind is not judged.
+        stratum_config(&["--regtest", "--stratumbind=0.0.0.0:3333"]).unwrap();
+    }
+
+    #[test]
+    fn stratum_refused_on_signet() {
+        let err = stratum_config(&["--signet", "--stratum=1"]).unwrap_err();
+        assert!(
+            err.contains("--stratum is not available on signet"),
+            "got: {err}"
+        );
+        stratum_config(&["--signet"]).unwrap();
+    }
+
+    #[test]
+    fn stratum_tls_address_and_difficulty_validation() {
+        let err = stratum_config(&["--regtest", "--stratumtlsbind=127.0.0.1:4333"]).unwrap_err();
+        assert!(err.contains("--stratumtlsbind requires"), "got: {err}");
+        let err = stratum_config(&[
+            "--regtest",
+            "--stratumtlsbind=127.0.0.1:4333",
+            "--stratumtlscert=/tmp/cert.pem",
+            "--stratumtlskey=/tmp/key.pem",
+            "--stratummtls=1",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--stratummtls=1 requires --stratummtlsclientca"), "got: {err}");
+        let err = stratum_config(&["--regtest", "--stratummtlsclientallow=rig"]).unwrap_err();
+        assert!(err.contains("--stratummtlsclientallow requires --stratummtls=1"), "got: {err}");
+
+        // A mainnet address is not a regtest payout.
+        let err = stratum_config(&[
+            "--regtest",
+            "--stratum=1",
+            "--stratumaddress=bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        ])
+        .unwrap_err();
+        assert!(err.contains("not an address for this network"), "got: {err}");
+        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumdifficulty=0"]).unwrap_err();
+        assert!(err.contains("--stratumdifficulty must be at least 1"), "got: {err}");
     }
 
     // ---- PR-1: --rpcbind / --rpcallowip / --rpcauth / cookie tests ----

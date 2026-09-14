@@ -51,3 +51,46 @@ pub async fn accept(
     }
     Some(tls)
 }
+
+/// Bytes of custom CA certificate ESP-Miner-based firmware (AxeOS) keeps: a
+/// 512-byte buffer filled with `strlcpy`, so 511 characters of PEM. Anything
+/// longer is truncated without an error and never verifies.
+pub const MINER_CA_PEM_LIMIT: usize = 511;
+
+/// The PEM size of the last certificate in a certificate file — in a full
+/// chain, the CA a miner would import — when it exceeds
+/// [`MINER_CA_PEM_LIMIT`].
+pub fn oversized_miner_ca(pem: &str) -> Option<usize> {
+    const END: &str = "-----END CERTIFICATE-----";
+    let end = pem.rfind(END)? + END.len();
+    let begin = pem[..end].rfind("-----BEGIN CERTIFICATE-----")?;
+    // Count the newline that terminates the block, as a pasted file has one.
+    let size = end - begin + 1;
+    (size > MINER_CA_PEM_LIMIT).then_some(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(body_len: usize) -> String {
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            "A".repeat(body_len)
+        )
+    }
+
+    #[test]
+    fn the_last_certificate_in_the_file_is_measured() {
+        // 28 + 1 + body + 1 + 25 + 1 bytes.
+        let small = block(400);
+        assert_eq!(small.len(), 456);
+        assert_eq!(oversized_miner_ca(&small), None);
+        let big = block(600);
+        assert_eq!(oversized_miner_ca(&big), Some(656));
+        // A large leaf followed by a small CA is fine; the reverse is not.
+        assert_eq!(oversized_miner_ca(&format!("{big}{small}")), None);
+        assert_eq!(oversized_miner_ca(&format!("{small}{big}")), Some(656));
+        assert_eq!(oversized_miner_ca("not a certificate"), None);
+    }
+}
