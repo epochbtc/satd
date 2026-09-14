@@ -18192,6 +18192,13 @@ fn stratum_v2_extended_share_connects_block() {
         let mut payload = miner.expect(0x1c, Duration::from_secs(10)).await;
         let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
         assert_eq!(ok.last_sequence_number, 3);
+        // The found block's connect event moves the channel to the new tip.
+        loop {
+            let (_, new_prev, _, _) = miner.set_new_prev_hash(Duration::from_secs(5)).await;
+            if new_prev != best {
+                break;
+            }
+        }
         next_height
     });
     poll_until(
