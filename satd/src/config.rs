@@ -3261,6 +3261,12 @@ impl Config {
         if metrics_mtls && metrics_mtls_client_ca.is_none() {
             return Err("--metricsmtls=1 requires --metricsmtlsclientca".to_string());
         }
+        // The inverse too: a CA without `--metricsmtls=1` would be ignored,
+        // and an operator who set only the CA would believe clients must
+        // present a certificate while the listener serves any TLS client.
+        if !metrics_mtls && metrics_mtls_client_ca.is_some() {
+            return Err("--metricsmtlsclientca requires --metricsmtls=1".to_string());
+        }
         if !metrics_mtls && !metrics_mtls_client_allow.is_empty() {
             return Err("--metricsmtlsclientallow requires --metricsmtls=1".to_string());
         }
@@ -10368,7 +10374,11 @@ testactivationheight=bip34@2
         let mut allow = full.to_vec();
         allow.push("--metricsmtlsclientallow=prometheus");
         let err = load(&allow).unwrap_err();
-        assert!(err.contains("requires --metricsmtls=1"), "got: {err}");
+        assert!(err.contains("--metricsmtlsclientallow requires --metricsmtls=1"), "got: {err}");
+        let mut ca_only = full.to_vec();
+        ca_only.push("--metricsmtlsclientca=/tmp/ca.pem");
+        let err = load(&ca_only).unwrap_err();
+        assert!(err.contains("--metricsmtlsclientca requires --metricsmtls=1"), "got: {err}");
 
         let config = load(&full).expect("a complete --metricstls* set loads");
         assert_eq!(config.metricsport, Some(9332));

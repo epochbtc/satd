@@ -463,7 +463,7 @@ the taxonomy and the details each event carries.
 | `metricstlscert` | none | restart | satd | PEM certificate for the metrics TLS listener. |
 | `metricstlskey` | none | restart | satd | PEM private key for the metrics TLS listener. |
 | `metricsmtls` | false | restart | satd | Require a client certificate on the metrics TLS listener (requires `metricsmtlsclientca`). |
-| `metricsmtlsclientca` | none | restart | satd | PEM CA bundle client certs must chain to when `metricsmtls=1`. |
+| `metricsmtlsclientca` | none | restart | satd | PEM CA bundle client certs must chain to; only valid with `metricsmtls=1`. |
 | `metricsmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values on the metrics TLS listener. |
 
 ---
