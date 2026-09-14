@@ -2454,6 +2454,34 @@ impl ChainState {
         self.headers_tip_height.load(Ordering::Relaxed)
     }
 
+    /// Bitcoin Core's `GuessVerificationProgress` for the block `hash`: the
+    /// share of all transactions confirmed so far that the chain through it
+    /// holds. See [`crate::chain::verification_progress`]. 0.0 for a block
+    /// the index does not know or holds no transaction count for, as Core
+    /// reports an unset `m_chain_tx_count`.
+    pub fn verification_progress(&self, hash: &BlockHash) -> f64 {
+        use crate::chain::verification_progress as vp;
+        let Some(entry) = self.get_block_index(hash) else {
+            return 0.0;
+        };
+        let block = vp::BlockPosition {
+            height: entry.height,
+            time: entry.header.time,
+            chain_tx_count: self.store.get_cumulative_tx_count(hash),
+        };
+        let data = vp::chain_tx_data(self.network, self.signet_challenge.is_some());
+        // Clamped like Core's own clock read: `now_secs` is a u64 and the
+        // estimate works in i64 seconds.
+        let now = i64::try_from(crate::time::now_secs()).unwrap_or(i64::MAX);
+        // Core's `m_best_header` is never below the active tip. satd's headers
+        // tip can be, for blocks that arrived whole (`submitblock`, a local
+        // miner) rather than header-first, so take the larger: a lower value
+        // would fail the height-based branch and report a just-mined tip as
+        // behind.
+        let best_header = self.headers_tip_height().max(self.tip_height());
+        vp::guess_verification_progress(data, block, best_header, now)
+    }
+
     /// Advance the best-header pointer if `chainwork` is strictly more than the
     /// current best (first-seen wins ties, matching consensus).
     fn update_best_header(&self, hash: BlockHash, chainwork: [u8; 32]) {
