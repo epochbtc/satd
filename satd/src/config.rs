@@ -6855,7 +6855,7 @@ fn resolve_stratum(
         .stratumallowplaintextremote
         .or_else(|| file_get("stratumallowplaintextremote").and_then(|v| parse_bool(&v)))
         .unwrap_or(false);
-validate_stratum(&StratumSettings {
+    validate_stratum(&StratumSettings {
         network,
         enabled: stratum,
         bind: &stratum_bind,
