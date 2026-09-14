@@ -191,7 +191,7 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         "coinbaseaux": { "flags": "" },
         "coinbasevalue": template.coinbase_value,
         "target": format!("{:0>64}", target_hex),
-        "mintime": template.cur_time,
+        "mintime": template.min_time,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
         "capabilities": ["proposal"],
