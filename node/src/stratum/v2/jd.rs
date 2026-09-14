@@ -87,8 +87,9 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// Issue a token for `payout` to connection `owner`.
-    pub fn allocate(&self, owner: u32, payout: Payout) -> [u8; TOKEN_LEN] {
+    /// Issue a token for `payout` to connection `owner`, or `None` when the
+    /// table is full of other connections' declared jobs.
+    pub fn allocate(&self, owner: u32, payout: Payout) -> Option<[u8; TOKEN_LEN]> {
         self.insert(owner, TokenState::Allocated(payout), Instant::now())
     }
 
@@ -109,8 +110,9 @@ impl Tokens {
         }
     }
 
-    /// Record a job declared by connection `owner` under a new token.
-    pub fn declare(&self, owner: u32, job: Arc<DeclaredJob>) -> [u8; TOKEN_LEN] {
+    /// Record a job declared by connection `owner` under a new token, or
+    /// `None` when the table is full of other connections' declared jobs.
+    pub fn declare(&self, owner: u32, job: Arc<DeclaredJob>) -> Option<[u8; TOKEN_LEN]> {
         self.insert(owner, TokenState::Declared(job), Instant::now())
     }
 
@@ -127,14 +129,15 @@ impl Tokens {
         }
     }
 
-    fn insert(&self, owner: u32, state: TokenState, now: Instant) -> [u8; TOKEN_LEN] {
+    fn insert(&self, owner: u32, state: TokenState, now: Instant) -> Option<[u8; TOKEN_LEN]> {
         let token: [u8; TOKEN_LEN] = rand::random();
         let declared = matches!(state, TokenState::Declared(_));
         let mut inner = self.inner.lock();
         inner.retain(|_, t| t.fresh(now));
         // The owner's own oldest of this kind makes room first, then the
-        // table's oldest allocated token, and a declared job (which miners
-        // may be hashing on) only when nothing else is left.
+        // table's oldest allocated token, then the owner's own oldest declared
+        // job. Another connection's declared job, which miners may be hashing
+        // on, is never evicted: a full table of those refuses the request.
         let oldest = |inner: &HashMap<[u8; TOKEN_LEN], Token>, pick: &dyn Fn(&Token) -> bool| {
             inner.iter().filter(|(_, t)| pick(t)).min_by_key(|(_, t)| t.issued).map(|(k, _)| *k)
         };
@@ -143,7 +146,8 @@ impl Tokens {
         let evict = if owned >= TOKENS_PER_CONNECTION {
             oldest(&inner, &|t| t.owner == owner && same_kind(t))
         } else if inner.len() >= MAX_TOKENS {
-            oldest(&inner, &|t| matches!(t.state, TokenState::Allocated(_))).or_else(|| oldest(&inner, &|_| true))
+            let allocated = oldest(&inner, &|t| matches!(t.state, TokenState::Allocated(_)));
+            Some(allocated.or_else(|| oldest(&inner, &|t| t.owner == owner))?)
         } else {
             None
         };
@@ -151,7 +155,7 @@ impl Tokens {
             inner.remove(&key);
         }
         inner.insert(token, Token { issued: now, owner, state });
-        token
+        Some(token)
     }
 }
 
@@ -835,7 +839,7 @@ mod tests {
     #[test]
     fn tokens_declare_once() {
         let tokens = Tokens::default();
-        let t = tokens.allocate(1, payout(1));
+        let t = tokens.allocate(1, payout(1)).unwrap();
         assert!(tokens.take_allocated(&t).is_some());
         assert!(tokens.take_allocated(&t).is_none(), "a token declares once");
         assert!(tokens.take_allocated(&[0u8; 3]).is_none());
@@ -845,8 +849,8 @@ mod tests {
     fn tokens_expire_by_time() {
         let tokens = Tokens::default();
         let (work, _) = setup(Vec::new());
-        let allocated = tokens.allocate(1, payout(1));
-        let declared = tokens.declare(1, Arc::new(declared_job(&work)));
+        let allocated = tokens.allocate(1, payout(1)).unwrap();
+        let declared = tokens.declare(1, Arc::new(declared_job(&work))).unwrap();
         let later = Instant::now() + TOKEN_TTL;
         assert!(tokens.declared_at(&declared, later).is_none());
         assert!(tokens.take_allocated_at(&allocated, later).is_none());
@@ -858,11 +862,11 @@ mod tests {
     fn a_connection_cannot_evict_another_connections_tokens() {
         let tokens = Tokens::default();
         let (work, _) = setup(Vec::new());
-        let theirs = tokens.allocate(1, payout(1));
-        let their_job = tokens.declare(1, Arc::new(declared_job(&work)));
-        let first_own = tokens.allocate(2, payout(2));
+        let theirs = tokens.allocate(1, payout(1)).unwrap();
+        let their_job = tokens.declare(1, Arc::new(declared_job(&work))).unwrap();
+        let first_own = tokens.allocate(2, payout(2)).unwrap();
         for _ in 0..MAX_TOKENS {
-            tokens.allocate(2, payout(2));
+            tokens.allocate(2, payout(2)).unwrap();
         }
         assert!(tokens.declared(&their_job).is_some());
         assert!(tokens.take_allocated(&first_own).is_none(), "a connection's own oldest token goes first");
@@ -871,12 +875,30 @@ mod tests {
         // A full table of allocated tokens from many connections gives up an
         // allocated token before a declared job.
         let tokens = Tokens::default();
-        let their_job = tokens.declare(0, Arc::new(declared_job(&work)));
+        let their_job = tokens.declare(0, Arc::new(declared_job(&work))).unwrap();
         for owner in 1..=(MAX_TOKENS as u32) {
-            tokens.allocate(owner, payout(2));
+            tokens.allocate(owner, payout(2)).unwrap();
         }
         assert!(tokens.declared(&their_job).is_some());
         assert_eq!(tokens.inner.lock().len(), MAX_TOKENS);
+    }
+
+    #[test]
+    fn a_table_full_of_declared_jobs_refuses_rather_than_evicts() {
+        let (work, _) = setup(Vec::new());
+        let tokens = Tokens::default();
+        let jobs: Vec<_> =
+            (0..MAX_TOKENS as u32).map(|owner| tokens.declare(owner, Arc::new(declared_job(&work))).unwrap()).collect();
+        let stranger = MAX_TOKENS as u32;
+        assert!(tokens.declare(stranger, Arc::new(declared_job(&work))).is_none());
+        assert!(tokens.allocate(stranger, payout(2)).is_none());
+        assert!(jobs.iter().all(|job| tokens.declared(job).is_some()), "no one else's declared job was evicted");
+
+        // A connection with a job in the table replaces its own.
+        let replacement = tokens.declare(0, Arc::new(declared_job(&work))).unwrap();
+        assert!(tokens.declared(&jobs[0]).is_none());
+        assert!(tokens.declared(&replacement).is_some());
+        assert!(jobs[1..].iter().all(|job| tokens.declared(job).is_some()));
     }
 
     fn declared_job(work: &Work) -> DeclaredJob {

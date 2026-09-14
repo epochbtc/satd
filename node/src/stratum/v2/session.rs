@@ -382,7 +382,14 @@ impl Session {
             }
         };
         let outputs = jd::coinbase_outputs(&payout.script);
-        let token = jd.tokens.allocate(self.owner(), payout);
+        let Some(token) = jd.tokens.allocate(self.owner(), payout) else {
+            tracing::warn!(
+                target: "node::stratum",
+                peer = %self.peer,
+                "Stratum V2 job token refused: the token table is full of other connections' declared jobs; closing"
+            );
+            return Err(Close);
+        };
         self.send(
             wire::ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
             &wire::allocate_mining_job_token_success(req.request_id, &token, &outputs),
@@ -422,6 +429,15 @@ impl Session {
         match checked {
             Ok(Ok(job)) => {
                 let job = Arc::new(job);
+                let Some(token) = jd.tokens.declare(self.owner(), job.clone()) else {
+                    return self
+                        .declare_error(
+                            request_id,
+                            "invalid-mining-job-token",
+                            "the server holds as many declared jobs as it can; try again later",
+                        )
+                        .await;
+                };
                 tracing::info!(
                     target: "node::stratum",
                     peer = %self.peer,
@@ -430,7 +446,6 @@ impl Session {
                     fees = job.fees,
                     "Stratum V2 mining job declared"
                 );
-                let token = jd.tokens.declare(self.owner(), job.clone());
                 if self.declared.len() == DECLARED_JOB_HISTORY {
                     self.declared.pop_front();
                 }
