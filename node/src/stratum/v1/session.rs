@@ -1,0 +1,483 @@
+//! One Stratum V1 connection.
+//!
+//! The expected exchange: `mining.configure` (optional, for version rolling),
+//! `mining.subscribe`, `mining.suggest_difficulty` (optional),
+//! `mining.authorize`. After a successful authorize the server sends
+//! `mining.set_difficulty` and a `mining.notify`, and from then on a new
+//! notify whenever the work changes; the miner answers with `mining.submit`.
+
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bitcoin::BlockHash;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
+use tokio::sync::watch;
+use tokio::time::Instant;
+
+use super::{
+    EXTRANONCE1_LEN, EXTRANONCE2_LEN, MAX_LINE_BYTES, Request, StratumError, VERSION_ROLLING_MASK,
+    error_response, notification, notify_params, parse_difficulty, parse_hex_u32, parse_request,
+    response,
+};
+use crate::stratum::config::{Payout, resolve_payout};
+use crate::stratum::job::{Job, JobManager};
+use crate::stratum::server::{Shared, submit_block};
+use crate::stratum::share::{ShareResult, effective_share_target, network_difficulty, validate_share};
+use crate::stratum::template::{ActiveTemplate, Work};
+use crate::stratum::vardiff::Vardiff;
+
+/// A connection that sends nothing for this long is dropped.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A write that cannot complete in this long drops the connection.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often vardiff is reconsidered, independent of share arrival — a
+/// miner that has gone quiet must still have its difficulty lowered.
+const VARDIFF_TICK: Duration = Duration::from_secs(10);
+/// Bound on remembered solutions, in case a tip stays put for a long time.
+const MAX_SEEN_SHARES: usize = 100_000;
+
+/// The connection must close.
+struct Close;
+
+type SeenKey = (u32, [u8; EXTRANONCE2_LEN], u32, u32, i32);
+
+struct Session<S> {
+    peer: SocketAddr,
+    shared: Arc<Shared>,
+    writer: WriteHalf<S>,
+    extranonce1: [u8; EXTRANONCE1_LEN],
+    version_mask: u32,
+    payout: Option<Payout>,
+    vardiff: Vardiff,
+    jobs: JobManager,
+    /// The previous-block hash of the last job issued. A job on a different
+    /// one is a clean job: everything before it is stale.
+    job_prev_hash: Option<BlockHash>,
+    seen: HashSet<SeenKey>,
+}
+
+/// Serve one connection until it closes, idles out, or the node shuts down.
+pub(crate) async fn run<S>(
+    stream: S,
+    peer: SocketAddr,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tracing::debug!(target: "node::stratum", %peer, "Stratum connection opened");
+    let (read_half, writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut buf = Vec::with_capacity(512);
+    let mut work_rx = shared.work.subscribe();
+    let config = shared.config.clone();
+    let mut session = Session {
+        peer,
+        extranonce1: shared.next_extranonce1(),
+        shared,
+        writer,
+        version_mask: 0,
+        payout: None,
+        vardiff: Vardiff::new(config.vardiff.clone(), config.initial_difficulty, std::time::Instant::now()),
+        jobs: JobManager::new(),
+        job_prev_hash: None,
+        seen: HashSet::new(),
+    };
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    let mut vardiff_tick = tokio::time::interval(VARDIFF_TICK);
+    vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let authorized = session.payout.is_some();
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            line = read_line_bounded(&mut reader, &mut buf) => {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(reason) => {
+                        tracing::debug!(target: "node::stratum", %peer, reason, "Stratum connection closed");
+                        break;
+                    }
+                };
+                buf.clear();
+                idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
+                session.handle_line(&line, &work_rx).await
+            }
+            changed = work_rx.changed(), if authorized => {
+                if changed.is_err() {
+                    break;
+                }
+                let work = work_rx.borrow_and_update().clone();
+                match work {
+                    Some(work) => session.issue_job(work).await,
+                    None => Ok(()),
+                }
+            }
+            _ = vardiff_tick.tick(), if authorized => session.check_vardiff().await,
+            _ = &mut idle => {
+                tracing::debug!(target: "node::stratum", %peer, "Stratum connection idle; closing");
+                break;
+            }
+        };
+        if result.is_err() {
+            break;
+        }
+    }
+    let _ = session.writer.shutdown().await;
+}
+
+/// Read one `\n`-terminated line of at most [`MAX_LINE_BYTES`].
+///
+/// Cancel-safe: a partial line stays in `buf` when `select!` drops this
+/// future, so the caller clears `buf` only after taking a returned line.
+async fn read_line_bounded<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+) -> Result<String, &'static str> {
+    loop {
+        let chunk = reader.fill_buf().await.map_err(|_| "read error")?;
+        if chunk.is_empty() {
+            return Err("end of stream");
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > MAX_LINE_BYTES {
+                return Err("line too long");
+            }
+            buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            break;
+        }
+        if buf.len() + chunk.len() > MAX_LINE_BYTES {
+            return Err("line too long");
+        }
+        buf.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    String::from_utf8(buf.clone()).map_err(|_| "invalid UTF-8")
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
+    async fn write(&mut self, line: String) -> Result<(), Close> {
+        let write = async {
+            self.writer.write_all(line.as_bytes()).await?;
+            self.writer.write_all(b"\n").await?;
+            self.writer.flush().await
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                tracing::debug!(target: "node::stratum", peer = %self.peer, "Stratum write failed; closing");
+                Err(Close)
+            }
+        }
+    }
+
+    async fn handle_line(
+        &mut self,
+        line: &str,
+        work_rx: &watch::Receiver<Option<Arc<Work>>>,
+    ) -> Result<(), Close> {
+        if line.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(req) = parse_request(line) else {
+            return self.write(error_response(&Value::Null, StratumError::Other, Some("Malformed request"))).await;
+        };
+        match req.method.as_str() {
+            "mining.subscribe" => {
+                let subid = hex::encode(self.extranonce1);
+                let result = json!([
+                    [["mining.set_difficulty", subid], ["mining.notify", subid]],
+                    hex::encode(self.extranonce1),
+                    EXTRANONCE2_LEN,
+                ]);
+                self.write(response(&req.id, result)).await
+            }
+            "mining.configure" => self.configure(&req).await,
+            "mining.authorize" => self.authorize(&req, work_rx).await,
+            "mining.suggest_difficulty" => self.suggest_difficulty(&req).await,
+            "mining.submit" => self.submit(&req).await,
+            "mining.extranonce.subscribe" => self.write(response(&req.id, json!(true))).await,
+            "mining.ping" => self.write(response(&req.id, json!("pong"))).await,
+            _ => self.write(error_response(&req.id, StratumError::UnknownMethod, None)).await,
+        }
+    }
+
+    /// BIP 310 `mining.configure`. Only version rolling is supported; the
+    /// mask granted is the intersection of what the miner asked for and the
+    /// BIP 320 bits.
+    async fn configure(&mut self, req: &Request) -> Result<(), Close> {
+        let extensions: Vec<&str> = req
+            .params
+            .first()
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut result = serde_json::Map::new();
+        if extensions.contains(&"version-rolling") {
+            let requested = req
+                .params
+                .get(1)
+                .and_then(|o| o.get("version-rolling.mask"))
+                .and_then(parse_hex_u32)
+                .unwrap_or(u32::MAX);
+            self.version_mask = requested & VERSION_ROLLING_MASK;
+            result.insert("version-rolling".into(), json!(self.version_mask != 0));
+            result.insert("version-rolling.mask".into(), json!(format!("{:08x}", self.version_mask)));
+        }
+        result.insert("minimum-difficulty".into(), json!(false));
+        result.insert("subscribe-extranonce".into(), json!(false));
+        self.write(response(&req.id, Value::Object(result))).await
+    }
+
+    async fn authorize(
+        &mut self,
+        req: &Request,
+        work_rx: &watch::Receiver<Option<Arc<Work>>>,
+    ) -> Result<(), Close> {
+        let username = req.params.first().and_then(Value::as_str).unwrap_or("");
+        let config = &self.shared.config;
+        let payout = match resolve_payout(username, config.network, config.fallback_address.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    username,
+                    "Stratum authorize refused: {e}"
+                );
+                let detail = format!("{}: {e}", StratumError::Unauthorized.message());
+                return self
+                    .write(error_response(&req.id, StratumError::Unauthorized, Some(&detail)))
+                    .await;
+            }
+        };
+        tracing::info!(
+            target: "node::stratum",
+            peer = %self.peer,
+            address = payout.address.as_deref().unwrap_or("<--stratumaddress>"),
+            worker = payout.worker.as_deref().unwrap_or(""),
+            script = %payout.script.to_hex_string(),
+            "Stratum miner authorized"
+        );
+        let first = self.payout.is_none();
+        self.payout = Some(payout);
+        self.write(response(&req.id, json!(true))).await?;
+        if first {
+            self.write(notification("mining.set_difficulty", json!([self.vardiff.difficulty()])))
+                .await?;
+            let work = work_rx.borrow().clone();
+            if let Some(work) = work {
+                self.issue_job(work).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn suggest_difficulty(&mut self, req: &Request) -> Result<(), Close> {
+        let Some(d) = req.params.first().and_then(parse_difficulty) else {
+            return self.write(error_response(&req.id, StratumError::InvalidParams, None)).await;
+        };
+        let adopted = self.vardiff.suggest(d, std::time::Instant::now());
+        self.write(response(&req.id, json!(true))).await?;
+        if self.payout.is_some() {
+            self.difficulty_changed(adopted).await?;
+        }
+        Ok(())
+    }
+
+    /// Tell the miner its new difficulty and give it a job at that difficulty.
+    async fn difficulty_changed(&mut self, difficulty: u64) -> Result<(), Close> {
+        self.write(notification("mining.set_difficulty", json!([difficulty]))).await?;
+        let work = self.jobs.latest().map(|j| j.template.work.clone());
+        match work {
+            Some(work) => self.issue_job(work).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn check_vardiff(&mut self) -> Result<(), Close> {
+        let Some(latest) = self.jobs.latest() else { return Ok(()) };
+        let ceiling = network_difficulty(&latest.template.work.block_target);
+        match self.vardiff.retarget(std::time::Instant::now(), ceiling) {
+            Some(d) => {
+                tracing::debug!(target: "node::stratum", peer = %self.peer, difficulty = d, "Stratum vardiff retarget");
+                self.difficulty_changed(d).await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Build a job on `work` for this miner and send it.
+    async fn issue_job(&mut self, work: Arc<Work>) -> Result<(), Close> {
+        let Some(payout) = self.payout.as_ref() else { return Ok(()) };
+        let clean = self.job_prev_hash != Some(work.prev_hash);
+        if clean {
+            self.jobs.mark_all_stale();
+            self.seen.clear();
+            self.job_prev_hash = Some(work.prev_hash);
+        }
+        let job_id = self.jobs.next_job_id();
+        let extranonce_len = EXTRANONCE1_LEN + EXTRANONCE2_LEN;
+        let template = match ActiveTemplate::build(work, job_id, payout.script.clone(), extranonce_len) {
+            Ok(t) => t,
+            Err(e) => {
+                // Unreachable with the fixed SV1 extranonce length; if it ever
+                // is reached, no job can be issued on this connection.
+                tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum job build failed");
+                return Err(Close);
+            }
+        };
+        let difficulty = self.vardiff.difficulty();
+        let share_target = effective_share_target(difficulty, &template.work.block_target);
+        let params = notify_params(&template, clean);
+        self.jobs.push(Job { template: Arc::new(template), difficulty, share_target });
+        self.write(notification("mining.notify", params)).await
+    }
+
+    async fn submit(&mut self, req: &Request) -> Result<(), Close> {
+        let reply = self.judge_submit(req).await;
+        let line = match reply {
+            Ok(()) => response(&req.id, json!(true)),
+            Err(err) => error_response(&req.id, err, None),
+        };
+        self.write(line).await
+    }
+
+    async fn judge_submit(&mut self, req: &Request) -> Result<(), StratumError> {
+        let Some(payout) = self.payout.clone() else {
+            return Err(StratumError::Unauthorized);
+        };
+        let p = &req.params;
+        let job_id = p
+            .get(1)
+            .and_then(Value::as_str)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+            .ok_or(StratumError::InvalidParams)?;
+        let extranonce2: [u8; EXTRANONCE2_LEN] = p
+            .get(2)
+            .and_then(Value::as_str)
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| b.try_into().ok())
+            .ok_or(StratumError::InvalidParams)?;
+        let ntime = p.get(3).and_then(parse_hex_u32).ok_or(StratumError::InvalidParams)?;
+        let nonce = p.get(4).and_then(parse_hex_u32).ok_or(StratumError::InvalidParams)?;
+        let Some(job) = self.jobs.get(job_id).cloned() else {
+            self.reject(job_id, "stale or unknown job");
+            return Err(StratumError::JobNotFound);
+        };
+        let base = job.template.work.version as u32;
+        // Miners send the rolled bits either as the full version or as the
+        // XOR against the job's; with no mask bits set in the job's version
+        // the two agree, and taking only the masked bits enforces that
+        // nothing outside the negotiated mask changes.
+        let version = match p.get(5).and_then(parse_hex_u32) {
+            Some(bits) if self.version_mask != 0 => {
+                ((base & !self.version_mask) | (bits & self.version_mask)) as i32
+            }
+            _ => base as i32,
+        };
+        let key = (job_id, extranonce2, ntime, nonce, version);
+        if self.seen.contains(&key) {
+            self.reject(job_id, "duplicate");
+            return Err(StratumError::Duplicate);
+        }
+        let mut extranonce = [0u8; EXTRANONCE1_LEN + EXTRANONCE2_LEN];
+        extranonce[..EXTRANONCE1_LEN].copy_from_slice(&self.extranonce1);
+        extranonce[EXTRANONCE1_LEN..].copy_from_slice(&extranonce2);
+        let now = crate::time::now_secs();
+        let result = validate_share(&job.template, &extranonce, ntime, nonce, version, &job.share_target, now)
+            .map_err(|_| StratumError::InvalidParams)?;
+        match result {
+            ShareResult::Block(block) => {
+                self.accepted(key);
+                self.submit_block(*block, &job, &payout).await;
+                Ok(())
+            }
+            ShareResult::Share => {
+                self.accepted(key);
+                tracing::debug!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    job_id,
+                    difficulty = job.difficulty,
+                    "Stratum share accepted"
+                );
+                Ok(())
+            }
+            ShareResult::LowDifficulty => {
+                self.reject(job_id, "low difficulty");
+                Err(StratumError::LowDifficulty)
+            }
+            ShareResult::Stale => {
+                self.reject(job_id, "stale ntime");
+                Err(StratumError::JobNotFound)
+            }
+            ShareResult::Duplicate => {
+                self.reject(job_id, "duplicate");
+                Err(StratumError::Duplicate)
+            }
+            ShareResult::BadTime => {
+                self.reject(job_id, "ntime out of range");
+                Err(StratumError::InvalidTime)
+            }
+        }
+    }
+
+    fn accepted(&mut self, key: SeenKey) {
+        if self.seen.len() >= MAX_SEEN_SHARES {
+            self.seen.clear();
+        }
+        self.seen.insert(key);
+        self.vardiff.record_share();
+    }
+
+    fn reject(&self, job_id: u32, reason: &str) {
+        tracing::warn!(target: "node::stratum", peer = %self.peer, job_id, reason, "Stratum share rejected");
+    }
+
+    /// Hand a found block to the chain. The miner is told `true` whatever
+    /// happens here: it did its part.
+    async fn submit_block(&self, block: bitcoin::Block, job: &Job, payout: &Payout) {
+        let hash = block.block_hash();
+        let height = job.template.work.height;
+        let chain = self.shared.chain.clone();
+        let mempool = self.shared.mempool.clone();
+        let outcome = tokio::task::spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
+        let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
+        match outcome {
+            Ok(Ok(true)) => tracing::info!(
+                target: "node::stratum",
+                peer = %self.peer,
+                height,
+                %hash,
+                address,
+                worker = payout.worker.as_deref().unwrap_or(""),
+                "Stratum miner found a block"
+            ),
+            Ok(Ok(false)) => tracing::warn!(
+                target: "node::stratum",
+                height,
+                %hash,
+                "Stratum block was valid but did not join the active chain"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                target: "node::stratum",
+                height,
+                %hash,
+                error = %e,
+                "Stratum block was not accepted"
+            ),
+            Err(e) => tracing::error!(target: "node::stratum", %hash, error = %e, "Stratum block submission panicked"),
+        }
+    }
+}

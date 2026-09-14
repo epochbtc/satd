@@ -47,6 +47,9 @@ sha3 = "0.10"
 data-encoding = "2"
 bip324 = "0.10"
 tls-config = { path = "../tls-config" }
+# Names the server-side TLS stream type for the Stratum listener. Already in
+# the graph through `tls-config`, with the same features.
+tokio-rustls = { workspace = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
