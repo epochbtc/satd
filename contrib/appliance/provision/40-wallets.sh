@@ -112,6 +112,31 @@ verify_from_manifest() {
     ( cd "$(dirname "$manifest")" && printf '%s\n' "$line" | sha256sum -c - )
 }
 
+# Whether a release asset exists — as distinct from whether it could be
+# fetched. A skipped wallet has to mean "this project publishes no build for
+# this architecture", never "the network hiccuped": an optional wallet
+# guarded by `if fetch ...` would otherwise let a transient failure ship an
+# amd64 image quietly missing a wallet it is meant to carry. So a 404 is an
+# answer, and anything else that persists stops the build.
+asset_exists() {
+    local url="$1" code=""
+    for attempt in 1 2 3; do
+        code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)"
+        case "$code" in
+            200) return 0 ;;
+            404) return 1 ;;
+        esac
+        sleep $((attempt * 3))
+    done
+    echo "  cannot tell whether $url exists (last HTTP status: ${code:-none})" >&2
+    exit 1
+}
+
+# What was installed and what this architecture cannot have, for the welcome
+# page at the end.
+WALLETS_INSTALLED=()
+WALLETS_SKIPPED=()
+
 # --- Sparrow ---------------------------------------------------------------
 step "Sparrow Wallet $SPARROW_VERSION"
 base="https://github.com/sparrowwallet/sparrow/releases/download/$SPARROW_VERSION"
@@ -130,6 +155,7 @@ verify_from_manifest "$TMP/$manifest" "$deb" \
     || { echo "  $deb does not match the signed manifest" >&2; exit 1; }
 apt-get install -y "$TMP/$deb"
 step "  Sparrow verified and installed"
+WALLETS_INSTALLED+=(Sparrow)
 
 # --- Electrum --------------------------------------------------------------
 step "Electrum $ELECTRUM_VERSION"
@@ -167,8 +193,11 @@ Icon=electrum
 Terminal=false
 Categories=Office;Finance;
 DESK
+    WALLETS_INSTALLED+=(Electrum)
 else
+    # Electrum publishes an x86_64 AppImage only.
     step "  no published Electrum AppImage for $DEB_ARCH; skipping"
+    WALLETS_SKIPPED+=(Electrum)
 fi
 
 # --- Liana -----------------------------------------------------------------
@@ -176,7 +205,12 @@ step "Liana $LIANA_VERSION"
 lbase="https://github.com/wizardsardine/liana/releases/download/v$LIANA_VERSION"
 ldeb="liana-${LIANA_VERSION}-1_${DEB_ARCH}.deb"
 lsums="liana-${LIANA_VERSION}-shasums.txt"
-if fetch "$lbase/$ldeb" "$TMP/$ldeb" && fetch "$lbase/$lsums" "$TMP/$lsums"; then
+# Liana 15.0 publishes no arm64 package. Existence is probed first so that
+# is a skip, while a failed download of a package that does exist still fails
+# the build instead of silently dropping the wallet.
+if asset_exists "$lbase/$ldeb"; then
+    fetch "$lbase/$ldeb" "$TMP/$ldeb"
+    fetch "$lbase/$lsums" "$TMP/$lsums"
     # Liana signs a shasums file; the signature covers the manifest, the
     # manifest covers the .deb. A keyserver that cannot be reached is not a
     # reason to install something unchecked, so failure here fails the build.
@@ -189,8 +223,10 @@ if fetch "$lbase/$ldeb" "$TMP/$ldeb" && fetch "$lbase/$lsums" "$TMP/$lsums"; the
         || { echo "  $ldeb does not match the signed shasums" >&2; exit 1; }
     apt-get install -y "$TMP/$ldeb"
     step "  Liana verified and installed"
+    WALLETS_INSTALLED+=(Liana)
 else
-    step "  no Liana package for $DEB_ARCH at v$LIANA_VERSION; skipping"
+    step "  Liana $LIANA_VERSION publishes no $DEB_ARCH package; skipping"
+    WALLETS_SKIPPED+=(Liana)
 fi
 
 # --- Cashu (nutshell wallet CLI) -------------------------------------------
@@ -295,3 +331,24 @@ done
     cp /usr/share/applications/electrum.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
 chown -R "$APPLIANCE_USER:$APPLIANCE_USER" "$USER_HOME/Desktop" 2>/dev/null || true
 chmod +x "$USER_HOME"/Desktop/*.desktop 2>/dev/null || true
+
+# --- the welcome page ------------------------------------------------------
+# The desktop welcome page names the wallets this image carries. That set
+# depends on the architecture, so it is written here, by the one script that
+# knows what it actually installed, rather than hardcoded in the page — where
+# it told arm64 users about two wallets they did not have.
+list_of() { local out; out="$(printf '%s, ' "$@")"; printf '%s' "${out%, }"; }
+WELCOME=/usr/share/satd-appliance/welcome.html
+if [[ -f "$WELCOME" ]]; then
+    installed="$(list_of "${WALLETS_INSTALLED[@]}")"
+    sed -i "s|<strong data-wallets>[^<]*</strong>|<strong data-wallets>${installed}</strong>|" "$WELCOME"
+    # An unreplaced marker would mean the page and this script have drifted
+    # apart, and the page would go on naming the wrong wallets unnoticed.
+    grep -qF "<strong data-wallets>${installed}</strong>" "$WELCOME" \
+        || { echo "  welcome.html has no data-wallets marker to fill in" >&2; exit 1; }
+    if [[ ${#WALLETS_SKIPPED[@]} -gt 0 ]]; then
+        skipped="$(list_of "${WALLETS_SKIPPED[@]}")"
+        sed -i "s|<p data-wallets-skipped hidden></p>|<p data-wallets-skipped>Not on this ${DEB_ARCH} image, because no ${DEB_ARCH} build is published: ${skipped}.</p>|" "$WELCOME"
+    fi
+    step "  welcome page lists: $installed${WALLETS_SKIPPED[*]:+ (not available on $DEB_ARCH: $(list_of "${WALLETS_SKIPPED[@]}"))}"
+fi

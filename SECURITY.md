@@ -23,7 +23,7 @@ satd releases are signed across three independent surfaces:
 
 | Surface | Mechanism | Custody |
 |---|---|---|
-| Tarballs (`.tar.zst`) | minisign Ed25519 | Offline maintainer keys; passphrases in 1Password gated by YubiKey |
+| Tarballs (`.tar.zst`) and appliance images | minisign Ed25519 | Offline maintainer keys; passphrases in 1Password gated by YubiKey |
 | Container image | cosign keyless OIDC (Sigstore) | None — short-lived cert from GitHub Actions OIDC, attested to Rekor |
 | Git tags | SSH-key signatures | Maintainer's GitHub-published SSH keys |
 
@@ -37,10 +37,12 @@ not silently weaken verification on the others.
 |---|---|---|
 | Ben Keroack | [@bkeroack](https://github.com/bkeroack) | `ben@keroack.com` |
 
-## 1. Tarballs — minisign
+## 1. Tarballs and appliance images — minisign
 
 Each tarball published to a GitHub Release is accompanied by a
-detached `.minisig` signature. Two minisign pubkeys are trusted;
+detached `.minisig` signature. The appliance images (`.qcow2`, `.ova`)
+are release assets signed the same way and verified with the same
+command, so there is no separate procedure for them. Two minisign pubkeys are trusted;
 either may sign a release. Both are reproduced here verbatim and
 should match what 1Password / hardware-backed channels deliver to
 maintainers — flag any mismatch.

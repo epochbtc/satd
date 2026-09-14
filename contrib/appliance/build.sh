@@ -286,7 +286,13 @@ mount --bind /dev "$WORK/mnt/dev"
 mount -t proc proc "$WORK/mnt/proc"
 mount -t sysfs sys "$WORK/mnt/sys"
 
-cat > "$WORK/mnt/etc/default/grub" <<'GRUB'
+# The serial port is a different device on each machine type: a 16550 at
+# ttyS0 on amd64's q35, a PL011 at ttyAMA0 on arm64's virt. Naming the wrong
+# one loses every serial console message, which on a headless boot is the
+# only diagnostic there is — and the boot test reads exactly this.
+if [[ "$ARCH" == amd64 ]]; then SERIAL_TTY=ttyS0; else SERIAL_TTY=ttyAMA0; fi
+
+cat > "$WORK/mnt/etc/default/grub" <<GRUB
 GRUB_DEFAULT=0
 # Short but not zero: an operator who needs to reach recovery on a headless
 # VM has no other way in.
@@ -294,12 +300,16 @@ GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="satd appliance"
 # console= twice: the kernel logs to both the graphical console and the
 # serial port, which is the only console a headless boot test has.
-GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"
+GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=${SERIAL_TTY},115200n8"
 GRUB_CMDLINE_LINUX=""
 GRUB_TERMINAL="console serial"
 GRUB_SERIAL_COMMAND="serial --speed=115200"
 GRUB
-chroot "$WORK/mnt" grub-install --target=i386-pc --boot-directory=/boot "$LOOP"
+# BIOS boot is an amd64 notion, and carrying it is what lets one amd64 image
+# start under either firmware. arm64 has no i386-pc target at all.
+if [[ "$ARCH" == amd64 ]]; then
+    chroot "$WORK/mnt" grub-install --target=i386-pc --boot-directory=/boot "$LOOP"
+fi
 chroot "$WORK/mnt" grub-install --target="$( [[ $ARCH == amd64 ]] && echo x86_64 || echo arm64 )-efi" \
     --efi-directory=/boot/efi --boot-directory=/boot --removable --no-nvram
 chroot "$WORK/mnt" update-grub 2>&1 | sed 's/^/    /'
@@ -347,7 +357,19 @@ if [[ "$FLAVOR" == "desktop" ]]; then
         --out "$OUT/$IMAGE_NAME.ova"
 fi
 
-( cd "$OUT" && sha256sum "$IMAGE_NAME".* > "$IMAGE_NAME.SHA256SUMS" )
+# Only the artifacts that get published. The raw disk stays a build
+# intermediate — reconstructible from the qcow2, and far over GitHub's
+# per-asset limit — so hashing it here would hand operators a sums file
+# whose `sha256sum -c` exits non-zero on a file that was never shipped.
+published=()
+for ext in qcow2 ova iso; do
+    [[ -f "$OUT/$IMAGE_NAME.$ext" ]] && published+=( "$IMAGE_NAME.$ext" )
+done
+# Guarded because `sha256sum` with no arguments reads stdin and would hang
+# rather than fail. Unreachable today — a disk build always writes a qcow2,
+# and --rootfs-only exits above — but silent-hang is a bad way to find out.
+[[ ${#published[@]} -gt 0 ]] || { echo "build.sh: no publishable image in $OUT" >&2; exit 1; }
+( cd "$OUT" && sha256sum "${published[@]}" > "$IMAGE_NAME.SHA256SUMS" )
 
 say "built:"
 ls -lh "$OUT/$IMAGE_NAME".* | sed 's/^/    /'

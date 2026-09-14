@@ -53,10 +53,27 @@ on:
         default: "core"
         type: choice
         options: ["core", "desktop", "both"]
+      satd_version:
+        description: >-
+          Build the image around this published release (e.g. 0.5.2) instead
+          of compiling the checkout. The tarball is verified against the
+          minisign key pinned in provision/10-satd.sh. Required to publish.
+        required: false
+        type: string
+      publish:
+        description: >-
+          Attach the built images to that release as assets. Needs
+          satd_version, and the release must already exist and be signed.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: appliance-${{ github.ref }}
-  cancel-in-progress: true
+  # A publishing run writes to a public release. Cancelling one partway
+  # through `gh release upload` would leave a partial set of assets attached,
+  # so those runs are not superseded; everything else still is.
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
 permissions:
   contents: read
@@ -78,10 +95,43 @@ jobs:
       appliance: ${{ steps.filter.outputs.appliance }}
       scripts: ${{ steps.filter.outputs.scripts }}
       packages: ${{ steps.filter.outputs.packages }}
+      flavors: ${{ steps.flavors.outputs.list }}
+      arches: ${{ steps.flavors.outputs.arches }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # Which flavours the image job builds. This is computed here rather
+      # than inlined into the matrix because the dispatch input has three
+      # values and one of them expands to two flavours; as a nested ternary
+      # in the matrix expression it was unreadable enough that the input was
+      # declared and then never referenced at all.
+      - id: flavors
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+              pull_request) list='["core"]' ;;
+              workflow_dispatch)
+                  case "${{ inputs.flavor }}" in
+                      core)    list='["core"]' ;;
+                      desktop) list='["desktop"]' ;;
+                      *)       list='["core","desktop"]' ;;
+                  esac ;;
+              *) list='["core","desktop"]' ;;
+          esac
+          echo "flavours: $list"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          # Both architectures wherever the heavy jobs run at all. Apple
+          # Silicon is most of the audience for a downloadable VM, so an
+          # amd64-only image set would miss the people most likely to want
+          # one. A labelled PR still builds amd64 only — it is a gate on the
+          # commit, not a release.
+          case "${{ github.event_name }}" in
+              pull_request) arches='["amd64"]' ;;
+              *)            arches='["amd64","arm64"]' ;;
+          esac
+          echo "arches: $arches"
+          echo "arches=$arches" >> "$GITHUB_OUTPUT"
       - id: filter
         run: |
           set -euo pipefail
@@ -270,13 +320,29 @@ jobs:
     needs: changes
     # Same gate as `stack`: tags, dispatch, or the `appliance-ci` label.
     if: needs.changes.outputs.appliance == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'appliance-ci'))
-    runs-on: ubuntu-24.04
+    # Each image is built on its own architecture: debootstrap and the chroot
+    # the provisioning runs in are native that way, with no emulation in the
+    # build at all.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
+    # Only the publish step writes, and only when explicitly dispatched to.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        flavor: ${{ github.event_name == 'pull_request' && fromJSON('["core"]') || fromJSON('["core","desktop"]') }}
+        flavor: ${{ fromJSON(needs.changes.outputs.flavors) }}
+        arch: ${{ fromJSON(needs.changes.outputs.arches) }}
     steps:
+      # First, so a misdispatch costs seconds rather than a 40-minute build
+      # that then attaches nothing and reports success.
+      - name: Publishing needs a version to publish to
+        if: inputs.publish && inputs.satd_version == ''
+        run: |
+          echo "::error::publish=true requires satd_version (e.g. 0.5.2) —" \
+               "it names both the release to attach to and the signed" \
+               "tarball the image is built around."
+          exit 1
       - uses: actions/checkout@v7
       - name: Free disk space
         run: |
@@ -304,12 +370,30 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Build the binaries the image installs
+        # Skipped when building around a published release: that path
+        # installs the signed tarball, so compiling the checkout would cost
+        # fifteen minutes to produce binaries nothing then uses.
+        if: inputs.satd_version == ''
         run: cargo build --release --locked --bin satd --bin sat-cli --bin sat-tui
       - name: Build the image
+        # satd_version is free-form text, so it reaches the shell through the
+        # environment rather than being pasted into the script body by the
+        # expression evaluator.
+        env:
+          SATD_RELEASE_VERSION: ${{ inputs.satd_version }}
+          FLAVOR: ${{ matrix.flavor }}
+          IMAGE_ARCH: ${{ matrix.arch }}
         run: |
-          contrib/appliance/build-in-docker.sh \
-            --flavor ${{ matrix.flavor }} \
-            --out "$GITHUB_WORKSPACE/appliance-out"
+          set -euo pipefail
+          args=(--flavor "$FLAVOR" --arch "$IMAGE_ARCH" --out "$GITHUB_WORKSPACE/appliance-out")
+          if [[ -n "$SATD_RELEASE_VERSION" ]]; then
+              # An image we publish has to carry the binary operators can
+              # verify, not a rebuild of this checkout that was never signed
+              # or released. 10-satd.sh checks the tarball against the
+              # minisign key from SECURITY.md before unpacking it.
+              args+=(--satd-source release --satd-version "$SATD_RELEASE_VERSION")
+          fi
+          contrib/appliance/build-in-docker.sh "${args[@]}"
           ls -lh "$GITHUB_WORKSPACE/appliance-out"
       - name: Boot it and check every surface
         run: |
@@ -318,12 +402,16 @@ jobs:
           # hardware acceleration; the test falls back to TCG where it is not.
           ls -l /dev/kvm || echo "no /dev/kvm; the boot test will use TCG"
           image="$(ls "$GITHUB_WORKSPACE"/appliance-out/*.qcow2 | head -1)"
-          contrib/appliance/tests/boot-test.sh --image "$image" --in-docker
+          contrib/appliance/tests/boot-test.sh --image "$image" \
+            --arch "${{ matrix.arch }}" --in-docker
       - name: Upload
-        if: github.event_name != 'pull_request'
+        # `always()` so a failed boot check still preserves the image. Until
+        # now the upload ran only after the boot test passed, so the one run
+        # whose image most needed inspecting was the one that kept nothing.
+        if: always() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
-          name: satd-appliance-${{ matrix.flavor }}
+          name: satd-appliance-${{ matrix.flavor }}-${{ matrix.arch }}
           # The raw image is large and reconstructible from the qcow2; the
           # checksums cover everything the build produced.
           path: |
@@ -332,3 +420,45 @@ jobs:
             appliance-out/*.SHA256SUMS
           retention-days: 14
           compression-level: 0
+      - name: Attach the images to the release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SATD_RELEASE_VERSION: ${{ inputs.satd_version }}
+        run: |
+          set -euo pipefail
+          # GitHub caps a release asset at 2 GiB but places no limit on a
+          # release's total size or on download bandwidth. The images are
+          # comfortably inside that — the core qcow2 is ~612 MB and the
+          # desktop qcow2 and OVA ~1.34 GiB each — and qemu-img already
+          # compressed them, so they need neither object storage nor
+          # splitting. Signatures are a manual post-tag step, as they are
+          # for tarballs: contrib/release/sign-tarballs.sh --images.
+          cd "$GITHUB_WORKSPACE/appliance-out"
+          shopt -s nullglob
+          assets=( *.qcow2 *.ova *.SHA256SUMS )
+          [[ ${#assets[@]} -gt 0 ]] || { echo "no images to attach" >&2; exit 1; }
+          printf '  %s\n' "${assets[@]}"
+
+          # An image that has already been signed must not be replaced. These
+          # builds are not bit-reproducible, so clobbering the bytes would
+          # leave the published .minisig verifying nothing — and the sums file
+          # would be rewritten to match the new bytes, so nothing would look
+          # wrong until an operator checked a signature.
+          existing="$(gh release view "v$SATD_RELEASE_VERSION" \
+                        --repo "$GITHUB_REPOSITORY" --json assets \
+                        --jq '.assets[].name')"
+          signed=()
+          for a in "${assets[@]}"; do
+            grep -qxF -- "$a.minisig" <<< "$existing" && signed+=( "$a" )
+          done
+          if [[ ${#signed[@]} -gt 0 ]]; then
+            echo "::error::already signed on v$SATD_RELEASE_VERSION:" \
+                 "${signed[*]}. Replacing them would strand the published" \
+                 ".minisig. Delete each asset and its .minisig first if you" \
+                 "really mean to republish."
+            exit 1
+          fi
+
+          gh release upload "v$SATD_RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" --clobber -- "${assets[@]}"

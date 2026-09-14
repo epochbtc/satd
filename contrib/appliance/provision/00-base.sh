@@ -24,14 +24,19 @@ apt_install \
     initramfs-tools \
     dosfstools e2fsprogs parted cloud-guest-utils \
     qemu-guest-agent \
-    minisign
+    minisign zstd
 
 # GRUB is installed to the disk by build.sh, from outside the chroot, so the
 # `-bin` packages are what is wanted here: the full grub-pc / grub-efi
 # packages run grub-install from their postinst against a device that does
 # not exist yet in a chroot.
 step "bootloader components"
-apt_install grub2-common grub-common grub-pc-bin "grub-efi-${GRUB_EFI_ARCH}-bin"
+# grub-pc-bin is the BIOS bootloader, and it is published for amd64 only —
+# arm64 is UEFI-only. Asking for it on arm64 fails the whole apt invocation,
+# not just that package.
+GRUB_PKGS=(grub2-common grub-common "grub-efi-${GRUB_EFI_ARCH}-bin")
+[[ "$DEB_ARCH" == amd64 ]] && GRUB_PKGS+=(grub-pc-bin)
+apt_install "${GRUB_PKGS[@]}"
 
 step "hostname and hosts"
 echo "$APPLIANCE_HOSTNAME" > /etc/hostname

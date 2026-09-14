@@ -28,6 +28,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 
 IMAGE=""
+ARCH=""
 IN_DOCKER=0
 MEMORY=2560
 CPUS=2
@@ -38,6 +39,7 @@ PORT_BASE="${SATD_BOOT_TEST_PORT_BASE:-22400}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
+        --arch) ARCH="$2"; shift 2 ;;
         --in-docker) IN_DOCKER=1; shift ;;
         --memory) MEMORY="$2"; shift 2 ;;
         --timeout) BOOT_TIMEOUT="$2"; shift 2 ;;
@@ -52,6 +54,26 @@ done
 [[ -s "$IMAGE" ]] || { echo "boot-test.sh: no such image: $IMAGE" >&2; exit 2; }
 IMAGE="$(readlink -f "$IMAGE")"
 
+# The image name carries the architecture it was built for, and that is what
+# has to be booted — not the host's. An explicit --arch wins; a name that
+# says neither falls back to the host, which is what a developer booting
+# something hand-built will want.
+if [[ -z "$ARCH" ]]; then
+    case "$IMAGE" in
+        *-amd64.*) ARCH=amd64 ;;
+        *-arm64.*) ARCH=arm64 ;;
+        *) ARCH="$(dpkg --print-architecture 2> /dev/null || uname -m)" ;;
+    esac
+fi
+# ipxe-qemu for arm64 because -device virtio-net-pci loads efi-virtio.rom,
+# which qemu-system-x86 pulls in as a dependency and qemu-system-arm does
+# not. Without it qemu reports "failed to find romfile" for the NIC.
+case "$ARCH" in
+    amd64|x86_64)  ARCH=amd64; QEMU=qemu-system-x86_64;  QEMU_PKG=qemu-system-x86 ;;
+    arm64|aarch64) ARCH=arm64; QEMU=qemu-system-aarch64; QEMU_PKG="qemu-system-arm qemu-efi-aarch64 ipxe-qemu" ;;
+    *) echo "boot-test.sh: unsupported architecture: $ARCH" >&2; exit 2 ;;
+esac
+
 if [[ "$IN_DOCKER" == 1 ]]; then
     # qemu, python3 and openssl in a container, so the host needs none of
     # them. Not privileged: /dev/kvm is passed through when it exists, and
@@ -62,18 +84,21 @@ if [[ "$IN_DOCKER" == 1 ]]; then
         -v "$REPO:/repo" -v "$(dirname "$IMAGE"):/image" \
         -w /repo \
         -e DEBIAN_FRONTEND=noninteractive \
+        -e "QEMU_PKG=$QEMU_PKG" \
         debian:trixie bash -c '
 set -euo pipefail
 apt-get update -qq
+# shellcheck disable=SC2086 # QEMU_PKG is a deliberate word-split package list
 apt-get install -y -qq --no-install-recommends \
-    qemu-system-x86 qemu-utils python3 openssl curl ca-certificates > /dev/null
+    $QEMU_PKG qemu-utils python3 openssl curl ca-certificates > /dev/null
 exec "$@"
 ' -- /repo/contrib/appliance/tests/boot-test.sh --image "/image/$(basename "$IMAGE")" \
+        --arch "$ARCH" \
         --memory "$MEMORY" --timeout "$BOOT_TIMEOUT" --port-base "$PORT_BASE" \
         $([[ "$KEEP" == 1 ]] && echo --keep)
 fi
 
-for tool in qemu-system-x86_64 qemu-img openssl python3; do
+for tool in "$QEMU" qemu-img openssl python3; do
     command -v "$tool" > /dev/null || { echo "boot-test.sh: missing $tool (try --in-docker)" >&2; exit 1; }
 done
 
@@ -191,9 +216,32 @@ echo "boot-test.sh: booting $(basename "$IMAGE")"
 # line comments out every argument after it, and qemu then starts with none
 # — no serial file, no agent socket, and a boot that hangs until the test's
 # own timeout rather than failing.
-qemu-system-x86_64 \
-    -machine q35,accel=kvm:tcg \
-    -cpu max \
+if [[ "$ARCH" == amd64 ]]; then
+    MACHINE_ARGS=( -machine "q35,accel=kvm:tcg" -cpu max )
+else
+    # arm64's `virt` has no BIOS to fall back on: with no UEFI image in
+    # pflash the machine starts with no firmware at all and never reaches a
+    # bootloader, which looks exactly like an image that does not boot. The
+    # variable store has to be writable, so the template is copied.
+    AAVMF_CODE=/usr/share/AAVMF/AAVMF_CODE.fd
+    AAVMF_VARS=/usr/share/AAVMF/AAVMF_VARS.fd
+    for fd in "$AAVMF_CODE" "$AAVMF_VARS"; do
+        [[ -f "$fd" ]] || {
+            echo "boot-test.sh: missing $fd (install qemu-efi-aarch64, or use --in-docker)" >&2
+            exit 1
+        }
+    done
+    cp "$AAVMF_VARS" "$WORK/efivars.fd"
+    MACHINE_ARGS=(
+        -machine "virt,accel=kvm:tcg"
+        -cpu max
+        -drive "if=pflash,format=raw,readonly=on,file=$AAVMF_CODE"
+        -drive "if=pflash,format=raw,file=$WORK/efivars.fd"
+    )
+fi
+
+"$QEMU" \
+    "${MACHINE_ARGS[@]}" \
     -m "$MEMORY" -smp "$CPUS" \
     -drive "file=$WORK/overlay.qcow2,if=virtio,format=qcow2" \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$RPC_TLS-:8336,hostfwd=tcp:127.0.0.1:$ELECTRUM_TLS-:50002,hostfwd=tcp:127.0.0.1:$ESPLORA_TLS-:3001,hostfwd=tcp:127.0.0.1:$MCP_TLS-:8339" \
@@ -252,7 +300,25 @@ for path in /var/lib/satd/tls/ca.key /var/lib/satd/tls/ca.crt /var/lib/satd/tls/
 done
 
 # --- the node ---------------------------------------------------------------
-if guest 'systemctl is-active --quiet satd' > /dev/null 2>&1; then
+# satd is started as first boot finishes, and `is-active` reports
+# "activating" until the node has opened its databases and signalled
+# readiness. Every other wait in this file polls to a deadline; this one
+# asked once, and duly failed a release build with a diagnostic that showed
+# the unit "active (running) since 358ms ago" — the check had run a fraction
+# of a second early.
+echo "boot-test.sh: waiting for satd to become active..."
+deadline=$(($(date +%s) + 180))
+satd_active=0
+while [[ $(date +%s) -lt $deadline ]]; do
+    if guest 'systemctl is-active --quiet satd' > /dev/null 2>&1; then
+        satd_active=1; break
+    fi
+    # A unit that has already given up will never become active, so stop
+    # rather than spending the rest of the deadline on it.
+    if guest 'systemctl is-failed --quiet satd' > /dev/null 2>&1; then break; fi
+    sleep 5
+done
+if [[ "$satd_active" == 1 ]]; then
     pass "satd is running under systemd"
 else
     fail "satd is running under systemd" "$(guest 'systemctl status satd --no-pager -l | tail -30' 2>&1)"

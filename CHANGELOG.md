@@ -18,10 +18,26 @@ item below is (or will be) written up in full in the in-development
 ### Added
 
 - The metrics and health endpoints can be served over TLS on a second port (`-metricstlsbind`), with optional client certificates (`-metricsmtls`), so Prometheus can scrape a node across a network without a reverse proxy (#752).
+- The appliance images are published as release assets, alongside the
+  tarballs and signed with the same minisign key. They fit GitHub's 2 GiB
+  per-asset limit — `qemu-img` compresses them during the build — so there is
+  no separate download host and nothing to reassemble (#742).
+- Appliance images for **arm64** as well as amd64, for Apple Silicon and
+  arm64 servers. The arm64 desktop carries Sparrow only, since Electrum and
+  Liana publish no arm64 build; its welcome page names what is installed
+  (#742).
 
 ### Fixed
 
 - `verificationprogress` in `getblockchaininfo` and `getchainstates` is Bitcoin Core's transaction-count estimate, equal to Core's; it was the tip's timestamp over the current time and read 0.69 at genesis (#744).
+- An appliance image can be built around a published release. The
+  `--satd-source release` path asked for
+  `satd-<version>-x86_64-linux-gnu.tar.gz`, a target triple and compression
+  format the release has never used, so it always 404'd; released images now
+  carry the signed release binary rather than a rebuild (#742).
+- The appliance boot test waits for satd to finish starting instead of asking
+  `systemctl is-active` once. The single call raced the unit and failed a
+  release build with a diagnostic that showed the service running (#742).
 
 ## Releases
 

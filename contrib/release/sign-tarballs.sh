@@ -19,14 +19,12 @@
 #              validate the maintainer's local signing setup.
 #   --images <dir>
 #              Sign the appliance images in <dir> instead of the release's
-#              tarballs. Appliance images are several GB each and exceed
-#              GitHub's 2 GB per-asset limit, so they are published to
-#              object storage; what goes on the release is a manifest of
-#              their SHA-256 sums plus a minisign signature over it. That
-#              is what this mode produces and uploads. Upload the image
-#              files themselves to object storage separately — this script
-#              deliberately does not, since it has no credentials for it
-#              and should not acquire any.
+#              tarballs, and upload each image and its .minisig to the
+#              release. Images fit GitHub's 2 GiB per-asset limit with room
+#              to spare, and a release has no total-size or bandwidth cap,
+#              so they are release assets like everything else rather than
+#              being hosted off GitHub. An image already attached by the
+#              appliance workflow (same name, same size) is not re-uploaded.
 #
 # Optional env:
 #   SATD_MINISIGN_KEY    path to encrypted minisign secret key file
@@ -72,59 +70,132 @@ cd "$work"
 
 if [[ -n "$IMAGES_DIR" ]]; then
     # --- appliance images -------------------------------------------------
-    # The manifest is the signed object, not the images: a signature over a
-    # list of SHA-256 sums authenticates every image in it just as well, and
-    # it is small enough to live on the release next to the tarball
-    # signatures where anyone verifying already knows to look.
+    # Each image is signed in its own right, exactly as a tarball is, because
+    # the images are ordinary release assets. This script used to sign a
+    # manifest of SHA-256 sums instead, on the stated premise that the images
+    # were "several GB each" and so had to be hosted off GitHub. Measured,
+    # the core qcow2 is ~612 MB and the desktop qcow2 and OVA ~1.34 GiB each,
+    # against a 2 GiB per-asset cap and no cap at all on a release's total
+    # size or its download bandwidth. The premise was wrong, so the second
+    # verification ritual it forced on operators is gone with it.
     [[ -d "$IMAGES_DIR" ]] || { echo "no such directory: $IMAGES_DIR" >&2; exit 1; }
     IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
 
+    # Only the formats that are actually published. `build.sh` leaves the raw
+    # disk in the same directory — 6 or 16 GiB, sparse on disk but its full
+    # size on the wire — and a .vmdk is an intermediate that ships inside the
+    # .ova. Globbing those in when the files were merely hashed was harmless;
+    # now that they are uploaded it would push an asset GitHub refuses.
     shopt -s nullglob
-    images=( "$IMAGES_DIR"/*.qcow2 "$IMAGES_DIR"/*.raw "$IMAGES_DIR"/*.ova "$IMAGES_DIR"/*.iso "$IMAGES_DIR"/*.vmdk )
+    images=( "$IMAGES_DIR"/*.qcow2 "$IMAGES_DIR"/*.ova "$IMAGES_DIR"/*.iso )
     shopt -u nullglob
     if [[ ${#images[@]} -eq 0 ]]; then
-        echo "no appliance images (*.qcow2 / *.raw / *.ova / *.iso / *.vmdk) in $IMAGES_DIR" >&2
+        echo "no appliance images (*.qcow2 / *.ova / *.iso) in $IMAGES_DIR" >&2
         exit 1
     fi
 
-    manifest="SHA256SUMS-images"
-    echo ">> Hashing ${#images[@]} image(s) — this reads several GB"
-    : > "$manifest"
+    # GitHub rejects an asset of 2 GiB or more, and it rejects it partway
+    # through the batch — after the earlier assets are already attached. Fail
+    # before anything is uploaded rather than halfway through.
+    limit=$((2 * 1024 * 1024 * 1024))
+    oversize=()
     for img in "${images[@]}"; do
-        printf '   %s\n' "$(basename "$img")"
-        ( cd "$IMAGES_DIR" && sha256sum "$(basename "$img")" ) >> "$work/$manifest"
+        [[ "$(stat -c %s "$img")" -ge "$limit" ]] && oversize+=( "$(basename "$img")" )
     done
-    sort -k2 -o "$manifest" "$manifest"
-    echo ">> Manifest:"
-    sed 's/^/   /' "$manifest"
+    if [[ ${#oversize[@]} -gt 0 ]]; then
+        echo "at or over GitHub's 2 GiB per-asset limit:" >&2
+        printf '  %s\n' "${oversize[@]}" >&2
+        exit 1
+    fi
 
-    echo ">> Signing $manifest"
+    # Decide what to upload before signing anything, so a mismatch is caught
+    # before the passphrase is asked for. Whether an image is already
+    # published is judged on content, not size: a same-size, different-content
+    # asset would otherwise keep its published bytes and receive a signature
+    # computed over the local ones, which then verifies nothing. The sums
+    # files the appliance build ships alongside each image carry the published
+    # hashes, and are cheap to fetch.
+    upload=()
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        sumsdir="$work/published-sums"
+        mkdir -p "$sumsdir"
+        gh release download "$TAG" --repo epochbtc/satd \
+            --pattern '*.SHA256SUMS' --dir "$sumsdir" > /dev/null 2>&1 || true
+        declare -A published_sha=()
+        for f in "$sumsdir"/*.SHA256SUMS; do
+            [[ -e "$f" ]] || continue
+            while read -r sha sname; do
+                [[ -n "$sname" ]] && published_sha["$sname"]="$sha"
+            done < "$f"
+        done
+
+        declare -A present=()
+        while read -r aname; do
+            [[ -n "$aname" ]] && present["$aname"]=1
+        done < <(gh release view "$TAG" --repo epochbtc/satd \
+                     --json assets --jq '.assets[].name')
+
+        for img in "${images[@]}"; do
+            name="$(basename "$img")"
+            if [[ -z "${present[$name]:-}" ]]; then
+                upload+=( "$img" )
+                continue
+            fi
+            remote_sha="${published_sha[$name]:-}"
+            local_sha="$(sha256sum "$img" | cut -d' ' -f1)"
+            if [[ -z "$remote_sha" ]]; then
+                echo "$name is on $TAG but no published SHA256SUMS covers it," >&2
+                echo "so the local copy cannot be shown to match it. Download the" >&2
+                echo "release copy and sign that instead." >&2
+                exit 1
+            fi
+            if [[ "$remote_sha" != "$local_sha" ]]; then
+                echo "$name differs from the copy already on $TAG:" >&2
+                echo "  published $remote_sha" >&2
+                echo "  local     $local_sha" >&2
+                echo "Signing the local bytes would publish a signature the" >&2
+                echo "released asset fails. Download the release copy and sign that." >&2
+                exit 1
+            fi
+            echo "   already on the release, contents match: $name"
+        done
+    fi
+
+    echo ">> Signing ${#images[@]} image(s) — this reads several GB"
     read -rs -p "   minisign passphrase for $KEY: " MINISIGN_PASSPHRASE
     echo
-    if ! out=$(printf '%s\n' "$MINISIGN_PASSPHRASE" | minisign -S -s "$KEY" -m "$manifest" 2>&1); then
-        echo "$out" >&2
-        echo "signing failed (wrong passphrase?)" >&2
-        exit 1
-    fi
+    sigs=()
+    for img in "${images[@]}"; do
+        name="$(basename "$img")"
+        printf '   %s\n' "$name"
+        if ! out=$(printf '%s\n' "$MINISIGN_PASSPHRASE" \
+                   | minisign -S -s "$KEY" -m "$img" -x "$work/$name.minisig" 2>&1); then
+            echo "$out" >&2
+            echo "signing failed (wrong passphrase?)" >&2
+            exit 1
+        fi
+        # Verify before it goes anywhere, so a bad signature is caught here
+        # rather than by the first operator who tries to check one.
+        minisign -Vm "$img" -x "$work/$name.minisig" -P "$PUBKEY" > /dev/null
+        sigs+=( "$work/$name.minisig" )
+    done
     unset -v MINISIGN_PASSPHRASE
-    minisign -Vm "$manifest" -P "$PUBKEY" > /dev/null
-    echo "   ok: $manifest.minisig"
+    echo "   ok: ${#sigs[@]} signature(s) verified against the published key"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo
         echo "[dry-run] Skipping upload. Generated:"
-        ls -1 "$manifest" "$manifest.minisig"
+        ls -1 "${sigs[@]}"
         exit 0
     fi
 
-    echo ">> Uploading the manifest and its signature to release $TAG"
-    gh release upload "$TAG" --repo epochbtc/satd --clobber \
-        -- "$manifest" "$manifest.minisig"
+    assets=( "${upload[@]}" "${sigs[@]}" )
+    echo ">> Uploading ${#upload[@]} image(s) and ${#sigs[@]} signature(s) to release $TAG"
+    gh release upload "$TAG" --repo epochbtc/satd --clobber -- "${assets[@]}"
 
     echo
-    echo "Done. Upload the image files to object storage, then operators verify with:"
-    echo "  minisign -Vm SHA256SUMS-images -P '${PUBKEY}'"
-    echo "  sha256sum -c SHA256SUMS-images"
+    echo "Done. Operators verify an image with:"
+    echo "  minisign -Vm <image> -P '${PUBKEY}'"
     exit 0
 fi
 

@@ -183,10 +183,48 @@ them.
 ## The appliance image
 
 A bootable VM: `core` is headless, `desktop` adds XFCE with Sparrow,
-Electrum and Liana already pointed at the node. Each bundled wallet is
+Electrum and Liana already pointed at the node. On arm64 the desktop has
+Sparrow alone, because Electrum and Liana publish no arm64 build. Each bundled wallet is
 installed from its project's own release, with the download checked against
 a signature from a pinned key; the build fails rather than installing
 anything that does not verify.
+
+### Downloading a built image
+
+Images are attached to the [GitHub release](https://github.com/epochbtc/satd/releases)
+for each version, alongside the tarballs, and are signed with the same
+minisign key:
+
+Both architectures are published. Pick `arm64` on Apple Silicon and on an
+arm64 server; `amd64` on an Intel or AMD host. Running an image under
+emulation works but is slow enough to be unpleasant for a syncing node.
+
+```sh
+# core is headless and ~600 MB; desktop is ~1.4 GB.
+ver=0.5.2
+arch=arm64   # or amd64
+base="https://github.com/epochbtc/satd/releases/download/v$ver"
+curl -fLO "$base/satd-appliance-$ver-core-$arch.qcow2"
+curl -fLO "$base/satd-appliance-$ver-core-$arch.qcow2.minisig"
+
+minisign -Vm "satd-appliance-$ver-core-$arch.qcow2" \
+  -P RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3
+```
+
+An arm64 guest is UEFI-only — there is no BIOS to fall back on — so give it
+a UEFI firmware. UTM on macOS does this for you; with plain QEMU, pass
+`-machine virt` and an `AAVMF_CODE.fd` in pflash.
+
+The `.qcow2` boots under QEMU/libvirt as it is — `qemu-img` already
+compressed it, so there is nothing to unpack. The `.ova` that accompanies
+the desktop flavour imports into VirtualBox or VMware.
+
+The satd inside a released image is the same signed tarball published on
+that release, verified against the key above during the build — not a
+rebuild. Images you build yourself install the binaries from your working
+tree instead, and say so on the console.
+
+### Building one yourself
 
 ```sh
 contrib/appliance/build-in-docker.sh --flavor core --out out/

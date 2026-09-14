@@ -10,8 +10,15 @@ than a sentence in a README.
 
 ## Support
 
-**satd in this image is supported** — the same release artifact as the
-tarballs and the container image.
+**satd in a released image is supported** — it is the signed release
+tarball, fetched and verified against the minisign key from `SECURITY.md`
+while the image is built, so it is the same artifact the tarball and
+container users run.
+
+An image you build yourself installs the binaries from your working tree
+(`--satd-source local`, the default), which is what CI does to gate the
+commit under review. That build prints the source on the console rather
+than implying an unsigned binary was checked.
 
 **The bundled third-party software is best-effort, for evaluation and
 testing, and is not a production deployment.** Its security advisories are
@@ -22,10 +29,18 @@ components yourself.
 
 ## Flavours
 
+Built for `amd64` and `arm64`; each is built on its own architecture, so
+nothing in the build is emulated.
+
 | Flavour | Contents | Disk | Built for |
 |---|---|---|---|
 | `core` | satd, `sat-cli`, `sat-tui`, MCP, the container overlays staged but idle | 6 GB grown at first boot | headless VMs, mini-PCs, the CI boot gate |
 | `desktop` | the above plus XFCE, Firefox, Sparrow, Electrum, Liana | 16 GB grown at first boot | trying it on a laptop |
+
+On `arm64` the desktop carries **Sparrow only**: Electrum publishes an
+x86_64 AppImage and nothing else, and Liana 15.0 has no arm64 package. The
+welcome page is written at build time from what was actually installed, so
+it names only the wallets that are there.
 
 Both boot on **signet** by default. It is the only network on which the
 whole thing is a one-evening exercise: a fully indexed node syncs in well
@@ -53,7 +68,40 @@ sudo contrib/appliance/build.sh --flavor core --out out/
 ```
 
 Output: a raw image and a qcow2, plus a VMDK and OVA for the desktop
-flavour, and a `SHA256SUMS`.
+flavour, and a `SHA256SUMS` over the artifacts that get published (the raw
+disk is a build intermediate). `--arch arm64` builds the arm64 image; it
+needs an arm64 host, since the provisioning runs in a chroot.
+
+## Publishing
+
+Images are release assets, next to the tarballs. GitHub caps one asset at
+2 GiB and the largest image is about 1.34 GiB — `qemu-img convert -c`
+compresses the disk during the build — and a release has no total-size or
+bandwidth limit, so there is no object storage and nothing to split.
+
+Building the image happens **after** the release exists, because the image
+installs the release's own signed tarball; the tag build cannot use it,
+since the tarballs do not exist while it runs. So the tag build stays a
+gate on the commit, and publishing is a dispatch:
+
+```sh
+# Build from the signed 0.5.2 tarball and attach the images to v0.5.2.
+gh workflow run appliance.yml --ref master \
+    -f flavor=both -f satd_version=0.5.2 -f publish=true
+
+# Then sign them, as for tarballs. Signing hashes the bytes, so the images
+# have to be local: download what the workflow attached, or point this at
+# the output directory if you built them yourself — the raw disk sitting
+# there is skipped, being a build intermediate rather than a published
+# format. An image already on the release is checked against the published
+# SHA256SUMS and not re-uploaded, so this pushes only the signatures; if it
+# differs from the released copy the script stops rather than publishing a
+# signature that would not verify.
+contrib/release/sign-tarballs.sh --images <dir> v0.5.2
+```
+
+`--ref` matters: it selects the workflow *and* the provisioning tree the
+image is built from, while `satd_version` selects the satd inside it.
 
 ### Live ISO
 
