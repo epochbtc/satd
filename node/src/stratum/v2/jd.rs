@@ -25,6 +25,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Transaction, TxOut, Txid, Witness};
 
 use super::wire::{DeclareMiningJob, SetCustomMiningJob};
+use crate::mempool::pool::Mempool;
 use crate::stratum::config::Payout;
 use crate::stratum::template::{Work, merkle_branch};
 
@@ -43,6 +44,8 @@ pub struct DeclaredJob {
     pub payout: Payout,
     pub prev_hash: BlockHash,
     pub height: u32,
+    /// The difficulty the job's blocks need: the work's when it was declared.
+    pub bits: bitcoin::CompactTarget,
     /// The declared coinbase, split where the extranonce goes.
     pub coinbase_tx_prefix: Vec<u8>,
     pub coinbase_tx_suffix: Vec<u8>,
@@ -59,56 +62,95 @@ enum TokenState {
     Declared(Arc<DeclaredJob>),
 }
 
+struct Token {
+    issued: Instant,
+    /// The connection the token was issued to.
+    owner: u32,
+    state: TokenState,
+}
+
+impl Token {
+    fn fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.issued) < TOKEN_TTL
+    }
+}
+
+/// Tokens of one kind (allocated, or declared) a connection may hold. A
+/// connection that asks for more loses its own oldest, not another's.
+const TOKENS_PER_CONNECTION: usize = 16;
+
 /// Tokens issued by this server, shared by every connection: a token is
 /// allocated on a Job Declaration connection and redeemed on a mining one.
 #[derive(Default)]
 pub struct Tokens {
-    inner: parking_lot::Mutex<HashMap<[u8; TOKEN_LEN], (Instant, TokenState)>>,
+    inner: parking_lot::Mutex<HashMap<[u8; TOKEN_LEN], Token>>,
 }
 
 impl Tokens {
-    /// Issue a token for `payout`.
-    pub fn allocate(&self, payout: Payout) -> [u8; TOKEN_LEN] {
-        self.insert(TokenState::Allocated(payout))
+    /// Issue a token for `payout` to connection `owner`.
+    pub fn allocate(&self, owner: u32, payout: Payout) -> [u8; TOKEN_LEN] {
+        self.insert(owner, TokenState::Allocated(payout), Instant::now())
     }
 
     /// Redeem an allocated token for a declaration. A token declares once.
     pub fn take_allocated(&self, token: &[u8]) -> Option<Payout> {
+        self.take_allocated_at(token, Instant::now())
+    }
+
+    fn take_allocated_at(&self, token: &[u8], now: Instant) -> Option<Payout> {
         let key: [u8; TOKEN_LEN] = token.try_into().ok()?;
         let mut inner = self.inner.lock();
-        match inner.get(&key) {
-            Some((_, TokenState::Allocated(_))) => match inner.remove(&key) {
-                Some((_, TokenState::Allocated(p))) => Some(p),
-                _ => None,
-            },
-            _ => None,
+        if !matches!(inner.get(&key), Some(t) if t.fresh(now) && matches!(t.state, TokenState::Allocated(_))) {
+            return None;
+        }
+        match inner.remove(&key)?.state {
+            TokenState::Allocated(payout) => Some(payout),
+            TokenState::Declared(_) => None,
         }
     }
 
-    /// Record a declared job under a new token.
-    pub fn declare(&self, job: Arc<DeclaredJob>) -> [u8; TOKEN_LEN] {
-        self.insert(TokenState::Declared(job))
+    /// Record a job declared by connection `owner` under a new token.
+    pub fn declare(&self, owner: u32, job: Arc<DeclaredJob>) -> [u8; TOKEN_LEN] {
+        self.insert(owner, TokenState::Declared(job), Instant::now())
     }
 
     /// The declared job a token names.
     pub fn declared(&self, token: &[u8]) -> Option<Arc<DeclaredJob>> {
+        self.declared_at(token, Instant::now())
+    }
+
+    fn declared_at(&self, token: &[u8], now: Instant) -> Option<Arc<DeclaredJob>> {
         let key: [u8; TOKEN_LEN] = token.try_into().ok()?;
         match self.inner.lock().get(&key) {
-            Some((at, TokenState::Declared(job))) if at.elapsed() < TOKEN_TTL => Some(job.clone()),
+            Some(t @ Token { state: TokenState::Declared(job), .. }) if t.fresh(now) => Some(job.clone()),
             _ => None,
         }
     }
 
-    fn insert(&self, state: TokenState) -> [u8; TOKEN_LEN] {
+    fn insert(&self, owner: u32, state: TokenState, now: Instant) -> [u8; TOKEN_LEN] {
         let token: [u8; TOKEN_LEN] = rand::random();
+        let declared = matches!(state, TokenState::Declared(_));
         let mut inner = self.inner.lock();
-        inner.retain(|_, (at, _)| at.elapsed() < TOKEN_TTL);
-        if inner.len() >= MAX_TOKENS
-            && let Some(oldest) = inner.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| *k)
-        {
-            inner.remove(&oldest);
+        inner.retain(|_, t| t.fresh(now));
+        // The owner's own oldest of this kind makes room first, then the
+        // table's oldest allocated token, and a declared job (which miners
+        // may be hashing on) only when nothing else is left.
+        let oldest = |inner: &HashMap<[u8; TOKEN_LEN], Token>, pick: &dyn Fn(&Token) -> bool| {
+            inner.iter().filter(|(_, t)| pick(t)).min_by_key(|(_, t)| t.issued).map(|(k, _)| *k)
+        };
+        let same_kind = |t: &Token| matches!(t.state, TokenState::Declared(_)) == declared;
+        let owned = inner.values().filter(|t| t.owner == owner && same_kind(t)).count();
+        let evict = if owned >= TOKENS_PER_CONNECTION {
+            oldest(&inner, &|t| t.owner == owner && same_kind(t))
+        } else if inner.len() >= MAX_TOKENS {
+            oldest(&inner, &|t| matches!(t.state, TokenState::Allocated(_))).or_else(|| oldest(&inner, &|_| true))
+        } else {
+            None
+        };
+        if let Some(key) = evict {
+            inner.remove(&key);
         }
-        inner.insert(token, (Instant::now(), state));
+        inner.insert(token, Token { issued: now, owner, state });
         token
     }
 }
@@ -132,12 +174,104 @@ fn refuse(code: &'static str, details: impl Into<String>) -> Refusal {
     Refusal { code, details: details.into() }
 }
 
-/// The mempool, as a declaration is checked against it.
+/// Job Declaration state shared by every connection.
+#[derive(Default)]
+pub struct JobDeclaration {
+    pub tokens: Tokens,
+    pub wtxids: WtxidIndex,
+}
+
+/// The mempool's transactions by wtxid, which the mempool itself does not
+/// index. Kept up to date incrementally: a refresh walks the mempool's keys
+/// and hashes only transactions it has not seen before, and runs at most
+/// once per [`INDEX_REFRESH_INTERVAL`] however many declarations arrive.
+#[derive(Default)]
+pub struct WtxidIndex {
+    inner: parking_lot::Mutex<IndexState>,
+}
+
+#[derive(Default)]
+struct IndexState {
+    by_txid: HashMap<Txid, bitcoin::Wtxid>,
+    by_wtxid: HashMap<bitcoin::Wtxid, Txid>,
+    refreshed: Option<Instant>,
+}
+
+const INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+impl WtxidIndex {
+    /// The txid of each of `wtxids` that the mempool holds, as far as the
+    /// index knows; an unknown wtxid refreshes the index first, rate limits
+    /// permitting. A txid may be stale: callers confirm the wtxid against the
+    /// entry they fetch.
+    pub fn lookup(&self, mempool: &Mempool, wtxids: &[bitcoin::Wtxid]) -> Vec<Option<Txid>> {
+        let mut state = self.inner.lock();
+        let due = state.refreshed.is_none_or(|at| at.elapsed() >= INDEX_REFRESH_INTERVAL);
+        if due && wtxids.iter().any(|w| !state.by_wtxid.contains_key(w)) {
+            let state = &mut *state;
+            mempool.with_entries(|entries| {
+                state.by_txid.retain(|txid, _| entries.contains_key(txid));
+                state.by_wtxid.retain(|_, txid| entries.contains_key(txid));
+                for (txid, entry) in entries {
+                    if !state.by_txid.contains_key(txid) {
+                        let wtxid = entry.tx.compute_wtxid();
+                        state.by_txid.insert(*txid, wtxid);
+                        state.by_wtxid.insert(wtxid, *txid);
+                    }
+                }
+            });
+            state.refreshed = Some(Instant::now());
+        }
+        wtxids.iter().map(|w| state.by_wtxid.get(w).copied()).collect()
+    }
+}
+
+/// The part of the mempool a declaration is checked against.
+#[derive(Default)]
 pub struct MempoolView {
-    /// Template-eligible transactions by wtxid: `(transaction, fee, weight)`.
+    /// The declared transactions this node holds and would mine, by wtxid:
+    /// `(transaction, fee, weight)`.
     pub by_wtxid: HashMap<bitcoin::Wtxid, (Transaction, u64, u64)>,
-    /// Every transaction in the mempool, eligible or not.
+    /// Inputs of those transactions that spend another mempool transaction,
+    /// eligible or not: the parents a block must include first.
     pub txids: HashSet<Txid>,
+    /// The declared transactions outweigh a block; lookup stopped copying.
+    pub over_weight: bool,
+}
+
+impl MempoolView {
+    /// Look up the declared `wtxids` under one read of the mempool, copying
+    /// only those transactions, and no more than a block's weight of them.
+    pub fn for_declaration(mempool: &Mempool, index: &WtxidIndex, wtxids: &[[u8; 32]]) -> MempoolView {
+        let wtxids: Vec<bitcoin::Wtxid> = wtxids.iter().map(|w| bitcoin::Wtxid::from_byte_array(*w)).collect();
+        let txids = index.lookup(mempool, &wtxids);
+        mempool.with_entries(|entries| {
+            let mut view = MempoolView::default();
+            let mut weight = 0u64;
+            for (wtxid, txid) in wtxids.iter().zip(txids) {
+                let Some(entry) = txid.and_then(|txid| entries.get(&txid)) else { continue };
+                if !entry.scope.assists_template()
+                    || view.by_wtxid.contains_key(wtxid)
+                    || entry.tx.compute_wtxid() != *wtxid
+                {
+                    continue;
+                }
+                weight = weight.saturating_add(entry.weight as u64);
+                if weight > MAX_BLOCK_WEIGHT {
+                    view.over_weight = true;
+                    break;
+                }
+                for input in &entry.tx.input {
+                    let parent = input.previous_output.txid;
+                    if entries.contains_key(&parent) {
+                        view.txids.insert(parent);
+                    }
+                }
+                view.by_wtxid.insert(*wtxid, (entry.tx.clone(), entry.fee, entry.weight as u64));
+            }
+            view
+        })
+    }
 }
 
 /// Check a `DeclareMiningJob` against the current work and mempool.
@@ -155,6 +289,10 @@ pub fn check_declaration(
             "invalid-job-param-value-coinbase_tx_prefix",
             format!("the coinbase does not commit to height {}, the next block on the current tip", work.height),
         ));
+    }
+
+    if mempool.over_weight {
+        return Err(refuse("invalid-job-param-value-wtxid_list", "the declared transactions outweigh a block"));
     }
 
     // Every transaction is in the mempool, eligible for a template, and after
@@ -183,8 +321,8 @@ pub fn check_declaration(
                 ));
             }
         }
-        fees += fee;
-        weight += tx_weight;
+        fees = fees.saturating_add(*fee);
+        weight = weight.saturating_add(*tx_weight);
         txdata.push(tx.clone());
     }
     if missing > 0 {
@@ -197,7 +335,7 @@ pub fn check_declaration(
         return Err(refuse("invalid-job-param-value-wtxid_list", format!("the block would weigh {weight} WU")));
     }
 
-    let max_coinbase_value = subsidy + fees;
+    let max_coinbase_value = subsidy.saturating_add(fees);
     check_outputs(&coinbase.output, &payout.script, max_coinbase_value)
         .map_err(|d| refuse("invalid-job-param-value-coinbase_tx_suffix", d))?;
 
@@ -214,6 +352,7 @@ pub fn check_declaration(
         payout,
         prev_hash: work.prev_hash,
         height: work.height,
+        bits: work.bits,
         coinbase_tx_prefix: msg.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: msg.coinbase_tx_suffix.clone(),
         extranonce_len,
@@ -263,7 +402,7 @@ pub fn check_custom_job(
     }
     let outputs: Vec<TxOut> = bitcoin::consensus::deserialize(&msg.coinbase_tx_outputs)
         .map_err(|_| refuse("invalid-job-param-value-coinbase_tx_outputs", "the outputs do not decode"))?;
-    check_outputs(&outputs, &job.payout.script, job.max_coinbase_value)
+    let coinbase_value = check_outputs(&outputs, &job.payout.script, job.max_coinbase_value)
         .map_err(|d| refuse("invalid-job-param-value-coinbase_tx_outputs", d))?;
 
     // version | input count | null prevout | scriptSig length | prefix | hole
@@ -290,7 +429,7 @@ pub fn check_custom_job(
         cur_time: msg.min_ntime,
         min_time: work.min_time,
         min_difficulty_after: work.min_difficulty_after,
-        coinbase_value: outputs.iter().map(|o| o.value.to_sat()).sum(),
+        coinbase_value,
         fees: job.fees,
         witness_commitment: [0u8; 32],
         merkle_branch: job.merkle_branch.clone(),
@@ -316,7 +455,10 @@ pub fn check_custom_job(
 }
 
 /// Assemble the block a `PushSolution` describes from a declared job, if the
-/// extranonce fits it and the header builds on the job's tip.
+/// extranonce fits it, the header builds on the job's tip at the job's
+/// difficulty, and the header's proof of work holds. The declared
+/// transactions are copied only after all of that: a frame that names no real
+/// block costs one coinbase decode per job, not a block's worth of copying.
 pub fn solution_block(
     job: &DeclaredJob,
     extranonce: &[u8],
@@ -326,7 +468,10 @@ pub fn solution_block(
     nbits: u32,
     version: u32,
 ) -> Option<Block> {
-    if extranonce.len() != job.extranonce_len || *prev_hash != job.prev_hash.to_byte_array() {
+    if extranonce.len() != job.extranonce_len
+        || *prev_hash != job.prev_hash.to_byte_array()
+        || nbits != job.bits.to_consensus()
+    {
         return None;
     }
     let mut bytes = job.coinbase_tx_prefix.clone();
@@ -340,32 +485,35 @@ pub fn solution_block(
         coinbase.compute_txid().to_raw_hash().to_byte_array(),
         &job.merkle_branch,
     );
+    let header = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(version as i32),
+        prev_blockhash: job.prev_hash,
+        merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
+        time: ntime,
+        bits: job.bits,
+        nonce,
+    };
+    header.validate_pow(header.target()).ok()?;
     let mut txdata = Vec::with_capacity(job.txdata.len() + 1);
     txdata.push(coinbase);
     txdata.extend(job.txdata.iter().cloned());
-    Some(Block {
-        header: bitcoin::block::Header {
-            version: bitcoin::block::Version::from_consensus(version as i32),
-            prev_blockhash: job.prev_hash,
-            merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
-            time: ntime,
-            bits: bitcoin::CompactTarget::from_consensus(nbits),
-            nonce,
-        },
-        txdata,
-    })
+    Some(Block { header, txdata })
 }
 
 /// Pays `payout` something, and claims no more than `max_value` in total.
-fn check_outputs(outputs: &[TxOut], payout: &ScriptBuf, max_value: u64) -> Result<(), String> {
-    let total: u64 = outputs.iter().map(|o| o.value.to_sat()).sum();
+/// Returns the total. Output values come from the client, so the sum is
+/// checked: a wrapped total would pass for a small one.
+fn check_outputs(outputs: &[TxOut], payout: &ScriptBuf, max_value: u64) -> Result<u64, String> {
+    let Some(total) = outputs.iter().try_fold(0u64, |sum, o| sum.checked_add(o.value.to_sat())) else {
+        return Err("the coinbase's output values overflow".into());
+    };
     if total > max_value {
         return Err(format!("the coinbase claims {total} sat; at most {max_value} is available"));
     }
     if !outputs.iter().any(|o| o.script_pubkey == *payout && o.value > Amount::ZERO) {
         return Err("the coinbase does not pay the address the token was issued for".into());
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Find the extranonce length that makes `prefix ++ zeros ++ suffix` exactly
@@ -490,6 +638,7 @@ mod tests {
                 .map(|t| (t.compute_wtxid(), (t.clone(), FEE, t.weight().to_wu())))
                 .collect(),
             txids: txs.iter().map(|t| t.compute_txid()).collect(),
+            over_weight: false,
         };
         (Arc::new(Work::new(template, Network::Regtest, 1_699_999_900)), mempool)
     }
@@ -657,24 +806,119 @@ mod tests {
         let (work, mempool) = setup(txs.clone());
         let declared = check_declaration(&declaration(&work, &payout(1), wtxids(&txs)), payout(1), &work, SUBSIDY, &mempool).unwrap();
         let prev = work.prev_hash.to_byte_array();
-        let block = solution_block(&declared, &[3; 8], &prev, work.cur_time, 7, 0x207fffff, 0x2000_0000).unwrap();
+        let solve = |nonce| solution_block(&declared, &[3; 8], &prev, work.cur_time, nonce, 0x207fffff, 0x2000_0000);
+        let nonce = (0..).find(|n| solve(*n).is_some()).unwrap();
+        let block = solve(nonce).unwrap();
         assert!(block.check_merkle_root());
         assert!(block.check_witness_commitment());
-        assert!(solution_block(&declared, &[3; 4], &prev, work.cur_time, 7, 0x207fffff, 0x2000_0000).is_none());
-        assert!(solution_block(&declared, &[3; 8], &[0; 32], work.cur_time, 7, 0x207fffff, 0x2000_0000).is_none());
+        assert!(block.header.validate_pow(block.header.target()).is_ok());
+        assert!((0..).any(|n| solve(n).is_none()), "a header short of its target assembles nothing");
+        assert!(solution_block(&declared, &[3; 4], &prev, work.cur_time, nonce, 0x207fffff, 0x2000_0000).is_none());
+        assert!(solution_block(&declared, &[3; 8], &[0; 32], work.cur_time, nonce, 0x207fffff, 0x2000_0000).is_none());
+        // An easier nbits than the job's is not the job's block.
+        let easier = solution_block(&declared, &[3; 8], &prev, work.cur_time, nonce, 0x2100ffff, 0x2000_0000);
+        assert!(easier.is_none());
     }
 
     #[test]
-    fn tokens_declare_once_and_expire_by_count() {
+    fn coinbase_output_total_cannot_wrap() {
+        let script = payout(1).script;
+        let outputs = vec![
+            TxOut { value: Amount::from_sat(u64::MAX), script_pubkey: script.clone() },
+            TxOut { value: Amount::from_sat(2), script_pubkey: script.clone() },
+        ];
+        assert!(check_outputs(&outputs, &script, SUBSIDY).is_err(), "a total that wraps to 1 sat is refused");
+        let fair = vec![TxOut { value: Amount::from_sat(SUBSIDY), script_pubkey: script.clone() }];
+        assert_eq!(check_outputs(&fair, &script, SUBSIDY), Ok(SUBSIDY));
+    }
+
+    #[test]
+    fn tokens_declare_once() {
         let tokens = Tokens::default();
-        let t = tokens.allocate(payout(1));
+        let t = tokens.allocate(1, payout(1));
         assert!(tokens.take_allocated(&t).is_some());
         assert!(tokens.take_allocated(&t).is_none(), "a token declares once");
         assert!(tokens.take_allocated(&[0u8; 3]).is_none());
-        let first = tokens.allocate(payout(1));
+    }
+
+    #[test]
+    fn tokens_expire_by_time() {
+        let tokens = Tokens::default();
+        let (work, _) = setup(Vec::new());
+        let allocated = tokens.allocate(1, payout(1));
+        let declared = tokens.declare(1, Arc::new(declared_job(&work)));
+        let later = Instant::now() + TOKEN_TTL;
+        assert!(tokens.declared_at(&declared, later).is_none());
+        assert!(tokens.take_allocated_at(&allocated, later).is_none());
+        assert!(tokens.declared(&declared).is_some(), "both are live now");
+        assert!(tokens.take_allocated(&allocated).is_some());
+    }
+
+    #[test]
+    fn a_connection_cannot_evict_another_connections_tokens() {
+        let tokens = Tokens::default();
+        let (work, _) = setup(Vec::new());
+        let theirs = tokens.allocate(1, payout(1));
+        let their_job = tokens.declare(1, Arc::new(declared_job(&work)));
+        let first_own = tokens.allocate(2, payout(2));
         for _ in 0..MAX_TOKENS {
-            tokens.allocate(payout(2));
+            tokens.allocate(2, payout(2));
         }
-        assert!(tokens.take_allocated(&first).is_none(), "the oldest token was evicted");
+        assert!(tokens.declared(&their_job).is_some());
+        assert!(tokens.take_allocated(&first_own).is_none(), "a connection's own oldest token goes first");
+        assert!(tokens.take_allocated(&theirs).is_some());
+
+        // A full table of allocated tokens from many connections gives up an
+        // allocated token before a declared job.
+        let tokens = Tokens::default();
+        let their_job = tokens.declare(0, Arc::new(declared_job(&work)));
+        for owner in 1..=(MAX_TOKENS as u32) {
+            tokens.allocate(owner, payout(2));
+        }
+        assert!(tokens.declared(&their_job).is_some());
+        assert_eq!(tokens.inner.lock().len(), MAX_TOKENS);
+    }
+
+    fn declared_job(work: &Work) -> DeclaredJob {
+        DeclaredJob {
+            payout: payout(1),
+            prev_hash: work.prev_hash,
+            height: work.height,
+            bits: work.bits,
+            coinbase_tx_prefix: Vec::new(),
+            coinbase_tx_suffix: Vec::new(),
+            extranonce_len: 8,
+            txdata: Vec::new(),
+            merkle_branch: Vec::new(),
+            max_coinbase_value: SUBSIDY,
+            fees: 0,
+        }
+    }
+
+    #[test]
+    fn the_mempool_view_copies_only_declared_transactions() {
+        let mempool = Mempool::new(300_000_000, 1_000);
+        let parent = tx(OutPoint { txid: Txid::from_byte_array([1; 32]), vout: 0 }, 1);
+        let child = tx(OutPoint { txid: parent.compute_txid(), vout: 0 }, 2);
+        let bystander = tx(OutPoint { txid: Txid::from_byte_array([3; 32]), vout: 0 }, 3);
+        for t in [&parent, &child, &bystander] {
+            mempool.insert_entry_for_test(t.compute_txid(), t.clone(), FEE);
+        }
+        let index = WtxidIndex::default();
+        let absent = tx(OutPoint { txid: Txid::from_byte_array([4; 32]), vout: 0 }, 4);
+        let view = MempoolView::for_declaration(&mempool, &index, &wtxids(&[child.clone(), absent.clone()]));
+        assert_eq!(view.by_wtxid.len(), 1, "only the declared transaction the mempool holds");
+        assert!(view.by_wtxid.contains_key(&child.compute_wtxid()));
+        assert_eq!(view.txids, HashSet::from([parent.compute_txid()]), "its in-mempool parent is known");
+        assert!(!view.over_weight);
+
+        // A transaction that arrives later is found once the index refreshes,
+        // which hashes only what it has not seen.
+        let late = tx(OutPoint { txid: Txid::from_byte_array([5; 32]), vout: 0 }, 5);
+        mempool.insert_entry_for_test(late.compute_txid(), late.clone(), FEE);
+        index.inner.lock().refreshed = None;
+        let view = MempoolView::for_declaration(&mempool, &index, &wtxids(&[late.clone()]));
+        assert!(view.by_wtxid.contains_key(&late.compute_wtxid()));
+        assert_eq!(index.inner.lock().by_txid.len(), 4);
     }
 }

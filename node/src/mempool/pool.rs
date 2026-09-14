@@ -2078,6 +2078,13 @@ impl Mempool {
         }
     }
 
+    /// Run `f` over every entry, under one read lock and without copying
+    /// any: for callers that need a handful of entries, or something derived
+    /// from all of them. `f` must not call back into the mempool.
+    pub fn with_entries<R>(&self, f: impl FnOnce(&FxHashMap<Txid, MempoolEntry>) -> R) -> R {
+        f(&self.inner.read().entries)
+    }
+
     /// Every txid currently in the mempool, regardless of quarantine
     /// scope. Template assembly uses this to distinguish "input is a
     /// confirmed coin" from "input depends on another mempool

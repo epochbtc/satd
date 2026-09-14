@@ -28,7 +28,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use super::jd::{self, DeclaredJob, Tokens};
+use super::jd::{self, DeclaredJob, JobDeclaration};
 use super::noise::{self, TransportError};
 use super::wire;
 use crate::stratum::config::{Payout, resolve_payout};
@@ -58,8 +58,8 @@ pub(crate) struct V2Context {
     pub authority_public: [u8; 32],
     pub authority_private: zeroize::Zeroizing<[u8; 32]>,
     pub max_channels: usize,
-    /// Job Declaration tokens, when Job Declaration is enabled.
-    pub jd: Option<Arc<Tokens>>,
+    /// Job Declaration state, when Job Declaration is enabled.
+    pub jd: Option<Arc<JobDeclaration>>,
 }
 
 /// The connection must close.
@@ -109,7 +109,7 @@ struct Session {
     channels: HashMap<u32, Channel>,
     next_channel_id: u32,
     max_channels: usize,
-    jd: Option<Arc<Tokens>>,
+    jd: Option<Arc<JobDeclaration>>,
     /// Jobs this Job Declaration connection declared, newest last.
     declared: VecDeque<Arc<DeclaredJob>>,
 }
@@ -357,12 +357,17 @@ impl Session {
             .await
     }
 
+    /// This connection, as the owner of the job tokens it is issued.
+    fn owner(&self) -> u32 {
+        u32::from_be_bytes(self.extranonce)
+    }
+
     /// `AllocateMiningJobToken`: issue a token for the address the user
     /// identifier names. There is no error reply in the protocol, so a
     /// request that names no usable address closes the connection.
     async fn allocate_token(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_allocate_mining_job_token(payload))?;
-        let Some(tokens) = self.jd.clone() else { return Err(Close) };
+        let Some(jd) = self.jd.clone() else { return Err(Close) };
         let config = self.shared.config.clone();
         let payout = match resolve_payout(&req.user_identifier, config.network, config.fallback_address.as_ref()) {
             Ok(p) => p,
@@ -377,7 +382,7 @@ impl Session {
             }
         };
         let outputs = jd::coinbase_outputs(&payout.script);
-        let token = tokens.allocate(payout);
+        let token = jd.tokens.allocate(self.owner(), payout);
         self.send(
             wire::ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
             &wire::allocate_mining_job_token_success(req.request_id, &token, &outputs),
@@ -389,9 +394,9 @@ impl Session {
     /// mempool and the current work.
     async fn declare_job(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_declare_mining_job(payload))?;
-        let Some(tokens) = self.jd.clone() else { return Err(Close) };
+        let Some(jd) = self.jd.clone() else { return Err(Close) };
         let request_id = req.request_id;
-        let Some(payout) = tokens.take_allocated(&req.mining_job_token) else {
+        let Some(payout) = jd.tokens.take_allocated(&req.mining_job_token) else {
             return self
                 .declare_error(request_id, "invalid-mining-job-token", "the token is unknown, expired or already used")
                 .await;
@@ -407,18 +412,9 @@ impl Session {
         };
         let mempool = self.shared.mempool.clone();
         let network = self.shared.config.network;
+        let shared_jd = jd.clone();
         let checked = tokio::task::spawn_blocking(move || {
-            let view = jd::MempoolView {
-                by_wtxid: mempool
-                    .get_template_entries()
-                    .into_iter()
-                    .map(|(_, e)| {
-                        let weight = e.weight as u64;
-                        (e.tx.compute_wtxid(), (e.tx, e.fee, weight))
-                    })
-                    .collect(),
-                txids: mempool.all_txids(),
-            };
+            let view = jd::MempoolView::for_declaration(&mempool, &shared_jd.wtxids, &req.wtxid_list);
             let subsidy = crate::chain::connect::block_subsidy(network, work.height);
             jd::check_declaration(&req, payout, &work, subsidy, &view)
         })
@@ -434,7 +430,7 @@ impl Session {
                     fees = job.fees,
                     "Stratum V2 mining job declared"
                 );
-                let token = tokens.declare(job.clone());
+                let token = jd.tokens.declare(self.owner(), job.clone());
                 if self.declared.len() == DECLARED_JOB_HISTORY {
                     self.declared.pop_front();
                 }
@@ -461,7 +457,6 @@ impl Session {
         let msg = self.decode(wire::decode_push_solution(payload))?;
         let found = self.declared.iter().rev().find_map(|job| {
             let block = jd::solution_block(job, &msg.extranonce, &msg.prev_hash, msg.ntime, msg.nonce, msg.nbits, msg.version)?;
-            block.header.validate_pow(block.header.target()).ok()?;
             Some((block, job.height, job.payout.clone()))
         });
         match found {
@@ -510,10 +505,11 @@ impl Session {
 
     fn check_custom_job(&mut self, msg: &wire::SetCustomMiningJob) -> Result<u32, jd::Refusal> {
         let refuse = |code: &'static str, details: &str| jd::Refusal { code, details: details.to_string() };
-        let Some(tokens) = self.jd.clone().filter(|_| self.work_selection) else {
+        let Some(jd) = self.jd.clone().filter(|_| self.work_selection) else {
             return Err(refuse("invalid-mining-job-token", "this connection did not negotiate work selection"));
         };
-        let job = tokens
+        let job = jd
+            .tokens
             .declared(&msg.token)
             .ok_or_else(|| refuse("invalid-mining-job-token", "the token names no declared job"))?;
         let work = self

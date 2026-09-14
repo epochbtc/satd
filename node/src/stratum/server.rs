@@ -478,7 +478,7 @@ async fn bind_v2(config: &super::config::V2Config) -> Result<V2Listener, Stratum
             authority_public: public,
             authority_private: private,
             max_channels: config.max_channels,
-            jd: config.job_declaration.then(|| Arc::new(super::v2::jd::Tokens::default())),
+            jd: config.job_declaration.then(|| Arc::new(super::v2::jd::JobDeclaration::default())),
         }),
     })
 }
