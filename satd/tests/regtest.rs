@@ -17857,3 +17857,425 @@ fn stratum_v1_mtls_rejects_unlisted_client() {
         }
     });
 }
+
+// ── Stratum V2 ────────────────────────────────────────────────────
+
+/// A minimal Stratum V2 miner: the reference Noise initiator and message types,
+/// with frame handling written here, so the server is checked against an
+/// implementation it does not share code with.
+#[cfg(feature = "stratum-v2")]
+mod sv2 {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use stratum_core::binary_sv2::{self, Serialize, Str0255, U256};
+    use stratum_core::binary_sv2::GetSize;
+    use stratum_core::noise_sv2::{Initiator, NoiseCodec};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub struct Client {
+        stream: tokio::net::TcpStream,
+        codec: NoiseCodec,
+        pending: VecDeque<(u8, Vec<u8>)>,
+    }
+
+    impl Client {
+        /// Connect and handshake. `pinned` is the authority key the miner
+        /// requires; `None` trusts whatever the server presents.
+        pub async fn connect(port: u16, pinned: Option<[u8; 32]>) -> Result<Self, String> {
+            let std_stream = super::stratum_connect(port);
+            let mut stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+            let mut initiator = match pinned {
+                Some(key) => Initiator::from_raw_k(key).map_err(|e| format!("{e:?}"))?,
+                None => Initiator::without_pk().map_err(|e| format!("{e:?}"))?,
+            };
+            let first = initiator.step_0().map_err(|e| format!("{e:?}"))?;
+            stream.write_all(&first).await.map_err(|e| e.to_string())?;
+            let mut reply = [0u8; 234];
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut reply))
+                .await
+                .map_err(|_| "handshake reply timed out".to_string())?
+                .map_err(|e| e.to_string())?;
+            let codec = initiator.step_2(reply).map_err(|e| format!("handshake: {e:?}"))?;
+            Ok(Self { stream, codec, pending: VecDeque::new() })
+        }
+
+        pub async fn send<T: Serialize + GetSize>(&mut self, msg_type: u8, msg: T) {
+            let payload = binary_sv2::to_bytes(msg).unwrap();
+            let mut header = vec![0u8, 0, msg_type];
+            header.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
+            self.codec.encrypt(&mut header).unwrap();
+            let mut body = payload;
+            self.codec.encrypt(&mut body).unwrap();
+            self.stream.write_all(&header).await.unwrap();
+            self.stream.write_all(&body).await.unwrap();
+        }
+
+        async fn read(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
+            let read = async {
+                let mut header = vec![0u8; 22];
+                self.stream.read_exact(&mut header).await.ok()?;
+                self.codec.decrypt(&mut header).ok()?;
+                let len = u32::from_le_bytes([header[3], header[4], header[5], 0]) as usize;
+                let mut payload = Vec::new();
+                let mut left = len;
+                while left > 0 {
+                    let n = left.min(65_535 - 16);
+                    let mut chunk = vec![0u8; n + 16];
+                    self.stream.read_exact(&mut chunk).await.ok()?;
+                    self.codec.decrypt(&mut chunk).ok()?;
+                    payload.extend_from_slice(&chunk);
+                    left -= n;
+                }
+                Some((header[2], payload))
+            };
+            tokio::time::timeout(timeout, read).await.ok().flatten()
+        }
+
+        /// The next message of `msg_type`, keeping others for later.
+        pub async fn expect(&mut self, msg_type: u8, timeout: Duration) -> Vec<u8> {
+            if let Some(pos) = self.pending.iter().position(|(t, _)| *t == msg_type) {
+                return self.pending.remove(pos).unwrap().1;
+            }
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (t, p) = self
+                    .read(left)
+                    .await
+                    .unwrap_or_else(|| panic!("no message {msg_type:#04x} within {timeout:?}"));
+                if t == msg_type {
+                    return p;
+                }
+                self.pending.push_back((t, p));
+            }
+        }
+
+        pub async fn setup(&mut self) {
+            use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
+            let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
+            let msg = SetupConnection {
+                protocol: Protocol::MiningProtocol,
+                min_version: 2,
+                max_version: 2,
+                flags: 0b100,
+                endpoint_host: s("127.0.0.1"),
+                endpoint_port: 0,
+                vendor: s("test-miner"),
+                hardware_version: s(""),
+                firmware: s(""),
+                device_id: s(""),
+            };
+            self.send(0x00, msg).await;
+            self.expect(0x01, Duration::from_secs(10)).await;
+        }
+
+        /// Open a standard channel: `(channel_id, target_le)`.
+        pub async fn open_standard(&mut self, user: &str) -> (u32, [u8; 32]) {
+            use stratum_core::mining_sv2::{OpenStandardMiningChannel, OpenStandardMiningChannelSuccess};
+            let msg = OpenStandardMiningChannel {
+                request_id: 7u32.into(),
+                user_identity: Str0255::try_from(user.to_string()).unwrap(),
+                nominal_hash_rate: 1e9,
+                max_target: U256::from([0xffu8; 32]),
+            };
+            self.send(0x10, msg).await;
+            let mut payload = self.expect(0x11, Duration::from_secs(10)).await;
+            let ok: OpenStandardMiningChannelSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+            assert_eq!(ok.get_request_id_as_u32(), 7);
+            (ok.channel_id, ok.target.inner_as_ref().try_into().unwrap())
+        }
+
+        /// Open an extended channel: `(channel_id, extranonce_prefix, extranonce_size)`.
+        pub async fn open_extended(&mut self, user: &str, min_extranonce: u16) -> (u32, Vec<u8>, u16) {
+            use stratum_core::mining_sv2::{OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess};
+            let msg = OpenExtendedMiningChannel {
+                request_id: 9,
+                user_identity: Str0255::try_from(user.to_string()).unwrap(),
+                nominal_hash_rate: 1e9,
+                max_target: U256::from([0xffu8; 32]),
+                min_extranonce_size: min_extranonce,
+            };
+            self.send(0x13, msg).await;
+            let mut payload = self.expect(0x14, Duration::from_secs(10)).await;
+            let ok: OpenExtendedMiningChannelSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+            assert_eq!(ok.request_id, 9);
+            (ok.channel_id, ok.extranonce_prefix.inner_as_ref().to_vec(), ok.extranonce_size)
+        }
+
+        /// The next `SetNewPrevHash`: `(job_id, prev_hash display hex, min_ntime, nbits)`.
+        pub async fn set_new_prev_hash(&mut self, timeout: Duration) -> (u32, String, u32, u32) {
+            use stratum_core::mining_sv2::SetNewPrevHash;
+            let mut payload = self.expect(0x20, timeout).await;
+            let m: SetNewPrevHash = binary_sv2::from_bytes(&mut payload).unwrap();
+            let mut prev = m.prev_hash.inner_as_ref().to_vec();
+            prev.reverse();
+            (m.job_id, hex::encode(prev), m.min_ntime, m.nbits)
+        }
+    }
+
+    /// Grind a nonce until the header meets its own `nbits`.
+    pub fn grind(version: u32, prev_internal: [u8; 32], merkle_root: [u8; 32], ntime: u32, nbits: u32) -> u32 {
+        use bitcoin::hashes::Hash;
+        let mut header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(version as i32),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array(prev_internal),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array(merkle_root),
+            time: ntime,
+            bits: bitcoin::CompactTarget::from_consensus(nbits),
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        header.nonce
+    }
+
+    pub fn internal(display_hex: &str) -> [u8; 32] {
+        let mut b = hex::decode(display_hex).unwrap();
+        b.reverse();
+        b.try_into().unwrap()
+    }
+}
+
+#[cfg(feature = "stratum-v2")]
+fn start_stratum_v2_node(extra: &[&str]) -> (TestNode, u16, u16) {
+    let v1 = find_available_port();
+    let v2 = find_available_port();
+    let mut args = vec![
+        "--stratum=1".to_string(),
+        format!("--stratumbind=127.0.0.1:{v1}"),
+        format!("--stratumv2bind=127.0.0.1:{v2}"),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    (TestNode::start(&refs), v1, v2)
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_handshake_and_standard_channel() {
+    use serde_json::json;
+    use stratum_core::binary_sv2;
+    use stratum_core::mining_sv2::{NewMiningJob, SubmitSharesStandard, SubmitSharesSuccess};
+    let (node, _, v2_port) = start_stratum_v2_node(&[]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(5), json!(addr)]);
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner.setup().await;
+        let (channel_id, target_le) = miner.open_standard(&format!("{addr}.rig")).await;
+        assert_ne!(target_le, [0u8; 32]);
+        // A future job, then the SetNewPrevHash that activates it. The first
+        // job can predate the last generated block; take the current one.
+        let (job_id, prev, min_ntime, nbits, merkle_root, version) = loop {
+            let mut payload = miner.expect(0x15, Duration::from_secs(10)).await;
+            let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
+            assert!(job.is_future(), "a channel's first job on a tip is a future job");
+            let (job_id, root, version) =
+                (job.job_id, job.merkle_root.inner_as_ref().to_vec(), job.version);
+            let (activated, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            assert_eq!(activated, job_id);
+            assert_eq!(nbits, 0x207fffff);
+            if prev == best {
+                break (job_id, prev, min_ntime, nbits, root, version);
+            }
+        };
+        let root: [u8; 32] = merkle_root.try_into().unwrap();
+        let nonce = sv2::grind(version, sv2::internal(&prev), root, min_ntime, nbits);
+        miner
+            .send(
+                0x1a,
+                SubmitSharesStandard {
+                    channel_id,
+                    sequence_number: 1,
+                    job_id,
+                    nonce,
+                    ntime: min_ntime,
+                    version,
+                },
+            )
+            .await;
+        let mut payload = miner.expect(0x1c, Duration::from_secs(10)).await;
+        let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!((ok.channel_id, ok.last_sequence_number), (channel_id, 1));
+    });
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(6),
+        test_timeout(10),
+        "the standard-channel block connects",
+    );
+    let status = node.rpc_ok("getserverstatus", vec![]);
+    assert_eq!(status["stratum_v2"]["bind"], format!("127.0.0.1:{v2_port}"), "{status}");
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_extended_share_connects_block() {
+    use bitcoin::hashes::{Hash, sha256d};
+    use serde_json::json;
+    use stratum_core::binary_sv2::{self, B032};
+    use stratum_core::mining_sv2::{NewExtendedMiningJob, SubmitSharesExtended, SubmitSharesSuccess};
+    let (node, _, v2_port) = start_stratum_v2_node(&[]);
+    let funder = DeterministicWallet::from_secret([0x6b; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    let dest = DeterministicWallet::from_secret([0x6c; 32]);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &funder,
+        dest.address.script_pubkey(),
+        2_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex)]);
+    let miner_addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let height = rt.block_on(async {
+        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner.setup().await;
+        let (channel_id, prefix, size) = miner.open_extended(&miner_addr, 2).await;
+        assert_eq!(size, 2, "the requested extranonce range is granted");
+        assert_eq!(prefix.len(), 8);
+        // A new tip whose block leaves the mempool transaction for the next.
+        tokio::task::block_in_place(|| {
+            node.rpc_ok("generateblock", vec![json!(funder.address.to_string()), json!([])])
+        });
+        let best = tokio::task::block_in_place(|| get_rpc_str(&node, "getbestblockhash")).unwrap();
+        let next_height = tokio::task::block_in_place(|| get_rpc_u64(&node, "getblockcount")).unwrap() + 1;
+        let (job, prev, min_ntime, nbits) = loop {
+            let mut payload = miner.expect(0x1f, Duration::from_secs(10)).await;
+            let job: NewExtendedMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
+            let job = (
+                job.job_id,
+                job.version,
+                job.merkle_path.inner_as_ref().iter().map(|p| p.to_vec()).collect::<Vec<_>>(),
+                job.coinbase_tx_prefix.inner_as_ref().to_vec(),
+                job.coinbase_tx_suffix.inner_as_ref().to_vec(),
+            );
+            let (activated, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            assert_eq!(activated, job.0);
+            if prev == best {
+                break (job, prev, min_ntime, nbits);
+            }
+        };
+        let (job_id, version, path, cb_prefix, cb_suffix) = job;
+        assert_eq!(path.len(), 1, "one transaction beside the coinbase");
+        let miner_extranonce = [0xab, 0xcd];
+        let mut coinbase = cb_prefix;
+        coinbase.extend_from_slice(&prefix);
+        coinbase.extend_from_slice(&miner_extranonce);
+        coinbase.extend_from_slice(&cb_suffix);
+        let mut root = sha256d::Hash::hash(&coinbase).to_byte_array();
+        for sibling in &path {
+            let mut buf = root.to_vec();
+            buf.extend_from_slice(sibling);
+            root = sha256d::Hash::hash(&buf).to_byte_array();
+        }
+        let nonce = sv2::grind(version, sv2::internal(&prev), root, min_ntime, nbits);
+        miner
+            .send(
+                0x1b,
+                SubmitSharesExtended {
+                    channel_id,
+                    sequence_number: 3,
+                    job_id,
+                    nonce,
+                    ntime: min_ntime,
+                    version,
+                    extranonce: B032::try_from(miner_extranonce.to_vec()).unwrap(),
+                },
+            )
+            .await;
+        let mut payload = miner.expect(0x1c, Duration::from_secs(10)).await;
+        let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!(ok.last_sequence_number, 3);
+        next_height
+    });
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(height),
+        test_timeout(10),
+        "the extended-channel block connects",
+    );
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+    let block = node.rpc_ok("getblock", vec![json!(best), json!(2)]);
+    let txs = block["tx"].as_array().unwrap();
+    assert_eq!(txs[1]["txid"], txid, "{block}");
+    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner_addr);
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_authority_key_persists_across_restart() {
+    let (mut node, v1_port, v2_port) = start_stratum_v2_node(&[]);
+    let key_path = node.datadir.join("regtest").join("stratum_v2.key");
+    let read_pubkey = || {
+        let hex_key = std::fs::read_to_string(&key_path).expect("the key file was created");
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(hex_key.trim()).unwrap()).unwrap();
+        let secp = bitcoin::secp256k1::Secp256k1::signing_only();
+        secret.x_only_public_key(&secp).0.serialize()
+    };
+    let pubkey = read_pubkey();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        sv2::Client::connect(v2_port, Some(pubkey)).await.expect("the pinned key verifies");
+        let other = {
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
+            secret.x_only_public_key(&bitcoin::secp256k1::Secp256k1::signing_only()).0.serialize()
+        };
+        assert!(
+            sv2::Client::connect(v2_port, Some(other)).await.is_err(),
+            "a miner pinning a different key refuses the server"
+        );
+    });
+
+    node.restart_preserving_datadir(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{v1_port}"),
+        &format!("--stratumv2bind=127.0.0.1:{v2_port}"),
+    ]);
+    assert_eq!(read_pubkey(), pubkey, "the key file is reused, not regenerated");
+    rt.block_on(async {
+        sv2::Client::connect(v2_port, Some(pubkey))
+            .await
+            .expect("a miner that pinned the key before the restart still connects");
+    });
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v1_and_v2_share_one_job_stream() {
+    use serde_json::json;
+    let (node, v1_port, v2_port) = start_stratum_v2_node(&[]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut v1 = plain_stratum_client(v1_port);
+        v1.handshake(&addr).await;
+        let mut v2 = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        v2.setup().await;
+        v2.open_standard(&addr).await;
+        v2.set_new_prev_hash(Duration::from_secs(10)).await;
+
+        let hashes = tokio::task::block_in_place(|| {
+            node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)])
+        });
+        let tip = hashes[0].as_str().unwrap().to_string();
+        let deadline = Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        loop {
+            let n = v1.notification("mining.notify", deadline.saturating_sub(start.elapsed())).await;
+            if notify_prevhash(&n["params"]) == tip {
+                break;
+            }
+        }
+        loop {
+            let (_, prev, _, _) = v2.set_new_prev_hash(deadline.saturating_sub(start.elapsed())).await;
+            if prev == tip {
+                break;
+            }
+        }
+    });
+}

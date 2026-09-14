@@ -34,6 +34,17 @@ pub enum StratumServerError {
     TlsMissingPaths,
     #[error("--stratummtls=1 requires --stratummtlsclientca")]
     MtlsMissingCa,
+    #[error("Stratum V2 authority key {path}: {source}")]
+    AuthorityKey { path: std::path::PathBuf, source: io::Error },
+    #[error("this build has no Stratum V2 support (the `stratum-v2` feature is off)")]
+    V2Unavailable,
+}
+
+/// The bound Stratum V2 listener.
+#[cfg(feature = "stratum-v2")]
+struct V2Listener {
+    listener: TcpListener,
+    ctx: Arc<super::v2::session::V2Context>,
 }
 
 /// State every connection shares.
@@ -67,6 +78,8 @@ pub struct StratumServer {
     semaphore: Arc<Semaphore>,
     shared: Arc<Shared>,
     peers: Option<Arc<PeerManager>>,
+    #[cfg(feature = "stratum-v2")]
+    v2: Option<V2Listener>,
 }
 
 impl StratumServer {
@@ -109,6 +122,15 @@ impl StratumServer {
             }
             (Some(_), _, _) => return Err(StratumServerError::TlsMissingPaths),
         };
+        #[cfg(feature = "stratum-v2")]
+        let v2 = match config.v2.as_ref() {
+            None => None,
+            Some(v2) => Some(bind_v2(v2).await?),
+        };
+        #[cfg(not(feature = "stratum-v2"))]
+        if config.v2.is_some() {
+            return Err(StratumServerError::V2Unavailable);
+        }
         let allow = ClientAllowList::new(config.mtls_client_allow.iter().cloned());
         let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
         let (work, _) = watch::channel(None);
@@ -120,7 +142,16 @@ impl StratumServer {
             core,
             next_extranonce1: AtomicU32::new(rand::random()),
         });
-        Ok(Self { listener, tls, allow, semaphore, shared, peers })
+        Ok(Self {
+            listener,
+            tls,
+            allow,
+            semaphore,
+            shared,
+            peers,
+            #[cfg(feature = "stratum-v2")]
+            v2,
+        })
     }
 
     /// The plaintext listener's bound address.
@@ -131,6 +162,22 @@ impl StratumServer {
     /// The TLS listener's bound address, when one is configured.
     pub fn local_tls_addr(&self) -> Option<io::Result<SocketAddr>> {
         self.tls.as_ref().map(|(l, _)| l.local_addr())
+    }
+
+    /// The Stratum V2 listener's bound address, when one is configured.
+    pub fn local_v2_addr(&self) -> Option<io::Result<SocketAddr>> {
+        #[cfg(feature = "stratum-v2")]
+        return self.v2.as_ref().map(|v| v.listener.local_addr());
+        #[cfg(not(feature = "stratum-v2"))]
+        None
+    }
+
+    /// The Stratum V2 authority public key (x-only), when V2 is configured.
+    pub fn authority_pubkey(&self) -> Option<[u8; 32]> {
+        #[cfg(feature = "stratum-v2")]
+        return self.v2.as_ref().map(|v| v.ctx.authority_public);
+        #[cfg(not(feature = "stratum-v2"))]
+        None
     }
 
     /// Serve until `shutdown` flips to `true`.
@@ -152,6 +199,14 @@ impl StratumServer {
                         let _permit = permit;
                         super::v1::session::run(stream, peer, shared, conn_shutdown).await;
                     });
+                }
+                accept = self.accept_v2() => {
+                    let Some((stream, peer)) = self.admit(accept) else { continue };
+                    let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                        self.at_capacity(peer);
+                        continue;
+                    };
+                    self.spawn_v2(stream, peer, permit, shutdown.clone());
                 }
                 accept = accept_tls(self.tls.as_ref()) => {
                     let Some((stream, peer)) = self.admit(accept) else { continue };
@@ -175,6 +230,42 @@ impl StratumServer {
         }
     }
 
+    /// The next Stratum V2 connection; never resolves without a V2 listener.
+    async fn accept_v2(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        #[cfg(feature = "stratum-v2")]
+        if let Some(v2) = self.v2.as_ref() {
+            return v2.listener.accept().await;
+        }
+        std::future::pending().await
+    }
+
+    #[cfg(feature = "stratum-v2")]
+    fn spawn_v2(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        shutdown: watch::Receiver<bool>,
+    ) {
+        let Some(v2) = self.v2.as_ref() else { return };
+        let ctx = v2.ctx.clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            super::v2::session::run(stream, peer, shared, ctx, shutdown).await;
+        });
+    }
+
+    #[cfg(not(feature = "stratum-v2"))]
+    fn spawn_v2(
+        &self,
+        _stream: TcpStream,
+        _peer: SocketAddr,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        _shutdown: watch::Receiver<bool>,
+    ) {
+    }
+
     fn admit(&self, accept: io::Result<(TcpStream, SocketAddr)>) -> Option<(TcpStream, SocketAddr)> {
         match accept {
             Ok((stream, peer)) => {
@@ -196,6 +287,38 @@ impl StratumServer {
             "Stratum connection refused: at --stratummaxconns"
         );
     }
+}
+
+
+/// Load (or create) the authority key and bind the Stratum V2 listener.
+#[cfg(feature = "stratum-v2")]
+async fn bind_v2(config: &super::config::V2Config) -> Result<V2Listener, StratumServerError> {
+    use super::v2::authority;
+    let key_error = |source| StratumServerError::AuthorityKey { path: config.key_path.clone(), source };
+    let (private, origin) = authority::load_or_create(&config.key_path).map_err(key_error)?;
+    let private = zeroize::Zeroizing::new(private);
+    let public = authority::authority_pubkey(&private)
+        .map_err(|e| key_error(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .map_err(|source| StratumServerError::Bind { addr: config.bind, source })?;
+    tracing::info!(
+        target: "node::stratum",
+        path = %config.key_path.display(),
+        created = origin == authority::KeyOrigin::Created,
+        authority_pubkey = %hex::encode(public),
+        authority_pubkey_base58 = %authority::authority_pubkey_base58(&public),
+        "Stratum V2 authority key; miners that pin the server's key need this value, \
+         and the key file must be backed up with the datadir"
+    );
+    Ok(V2Listener {
+        listener,
+        ctx: Arc::new(super::v2::session::V2Context {
+            authority_public: public,
+            authority_private: private,
+            max_channels: config.max_channels,
+        }),
+    })
 }
 
 async fn accept_tls(
@@ -325,6 +448,47 @@ async fn next_event(
     match rx.recv().await {
         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Some(()),
         Err(broadcast::error::RecvError::Closed) => None,
+    }
+}
+
+/// Hand a found block to the chain and log the outcome. The miner is told the
+/// share was accepted whatever happens here: it did its part.
+pub(crate) async fn submit_found_block(
+    shared: &Shared,
+    block: Block,
+    height: u32,
+    payout: &super::config::Payout,
+    peer: SocketAddr,
+) {
+    let hash = block.block_hash();
+    let chain = shared.chain.clone();
+    let mempool = shared.mempool.clone();
+    let outcome = shared.core.spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
+    let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
+    match outcome {
+        Ok(Ok(true)) => tracing::info!(
+            target: "node::stratum",
+            %peer,
+            height,
+            %hash,
+            address,
+            worker = payout.worker.as_deref().unwrap_or(""),
+            "Stratum miner found a block"
+        ),
+        Ok(Ok(false)) => tracing::warn!(
+            target: "node::stratum",
+            height,
+            %hash,
+            "Stratum block was valid but did not join the active chain"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            target: "node::stratum",
+            height,
+            %hash,
+            error = %e,
+            "Stratum block was not accepted"
+        ),
+        Err(e) => tracing::error!(target: "node::stratum", %hash, error = %e, "Stratum block submission panicked"),
     }
 }
 

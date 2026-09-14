@@ -61,6 +61,23 @@ impl JobManager {
         self.jobs.back()
     }
 
+    /// Make every job accept shares at `target` if that is easier than the
+    /// target it was issued with.
+    ///
+    /// Stratum V2 sets one target per channel, and a miner applies a new one
+    /// to the jobs it already holds. When the target gets easier, shares on
+    /// those jobs arrive at the new target at once; judging them by the old
+    /// one would reject honest work. When it gets harder nothing changes: a
+    /// share that met the old target was valid when the miner found it.
+    pub fn relax_share_targets(&mut self, target: &[u8; 32], difficulty: u64) {
+        for job in &mut self.jobs {
+            if *target > job.share_target {
+                job.share_target = *target;
+                job.difficulty = difficulty;
+            }
+        }
+    }
+
     /// Forget every job: the chain tip moved and none of them can make a
     /// block any more.
     pub fn mark_all_stale(&mut self) {

@@ -7,11 +7,13 @@ publish.workspace = true
 repository.workspace = true
 
 [features]
-default = ["block-filter-index"]
+default = ["block-filter-index", "stratum-v2"]
 # Forwards `node`'s `block-filter-index` feature so a `cargo build
 # --no-default-features` on the satd binary produces a consensus-only
 # build with no BIP 158 codec compiled in.
 block-filter-index = ["node/block-filter-index"]
+# Forwards `node`'s `stratum-v2` feature: the Stratum V2 listener.
+stratum-v2 = ["node/stratum-v2"]
 # Marker for the E2E integration test target — see the `[[test]]`
 # section below. The general `cargo test --all --locked` step in CI
 # skips the e2e binary because its `required-features = ["e2e"]`
@@ -87,6 +89,9 @@ rcgen = { workspace = true }
 # `node -> tls-config` with the workspace's ring + tls12 features, so this adds
 # no crate and no second crypto provider.
 tokio-rustls = { workspace = true }
+# In-test Stratum V2 miner: a Noise NX initiator and the SV2 message types, so
+# the server is checked against an independent implementation of both.
+stratum-core = { workspace = true }
 # Raw column-family inspection for the silent-payment index rebuild-parity
 # test (tests/regtest.rs). The point of that test is byte-identity between the
 # rows the live connect path wrote and the rows a backfill rebuilt, so it reads

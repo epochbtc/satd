@@ -854,6 +854,14 @@ pub struct Config {
     pub stratum_max_conns: usize,
     /// Accept a non-loopback `stratum_bind` with no TLS listener.
     pub stratum_allow_plaintext_remote: bool,
+    /// Stratum V2 listener. Noise-encrypted, so it may bind a non-loopback
+    /// address without TLS. Requires `stratum`.
+    pub stratum_v2_bind: Option<String>,
+    /// Stratum V2 authority key file. `None` means `stratum_v2.key` in the
+    /// network datadir.
+    pub stratum_v2_key: Option<std::path::PathBuf>,
+    /// Channels one Stratum V2 connection may open.
+    pub stratum_v2_max_channels: usize,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
@@ -3422,6 +3430,9 @@ impl Config {
             stratum_difficulty,
             stratum_max_conns,
             stratum_allow_plaintext_remote,
+            stratum_v2_bind,
+            stratum_v2_key,
+            stratum_v2_max_channels,
         } = resolve_stratum(
             cli.stratum_args,
             network,
@@ -3873,6 +3884,9 @@ impl Config {
             stratum_difficulty,
             stratum_max_conns,
             stratum_allow_plaintext_remote,
+            stratum_v2_bind,
+            stratum_v2_key,
+            stratum_v2_max_channels,
             blockfilterindex,
             coinstatsindex,
             txospenderindex,
@@ -4356,6 +4370,34 @@ impl Config {
     /// Secret fields (rpcpassword, tor password) are replaced with a
     /// placeholder so the output can be safely logged or shared.
     pub fn effective_view(&self) -> serde_json::Value {
+        // Built apart: one more field in the object below exceeds `json!`'s
+        // macro recursion limit.
+        let stratum = serde_json::json!({
+            "enabled": self.stratum,
+            "bind": if self.stratum { Some(self.stratum_bind.clone()) } else { None },
+            "tls_bind": if self.stratum { self.stratum_tls_bind.clone() } else { None },
+            "mtls": if self.stratum { Some(self.stratum_mtls) } else { None },
+            "mtls_client_allow_count": if self.stratum {
+                Some(self.stratum_mtls_client_allow.len())
+            } else {
+                None
+            },
+            "address": if self.stratum { self.stratum_address.clone() } else { None },
+            "difficulty": if self.stratum { self.stratum_difficulty } else { None },
+            "max_conns": if self.stratum { Some(self.stratum_max_conns) } else { None },
+            "allow_plaintext_remote": if self.stratum {
+                Some(self.stratum_allow_plaintext_remote)
+            } else {
+                None
+            },
+            "v2_bind": if self.stratum { self.stratum_v2_bind.clone() } else { None },
+            "v2_key": if self.stratum {
+                self.stratum_v2_key.as_ref().map(|p| p.display().to_string())
+            } else {
+                None
+            },
+            "v2_max_channels": if self.stratum { Some(self.stratum_v2_max_channels) } else { None },
+        });
         serde_json::json!({
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
@@ -4486,25 +4528,7 @@ impl Config {
                     None
                 },
             },
-            "stratum": {
-                "enabled": self.stratum,
-                "bind": if self.stratum { Some(self.stratum_bind.clone()) } else { None },
-                "tls_bind": if self.stratum { self.stratum_tls_bind.clone() } else { None },
-                "mtls": if self.stratum { Some(self.stratum_mtls) } else { None },
-                "mtls_client_allow_count": if self.stratum {
-                    Some(self.stratum_mtls_client_allow.len())
-                } else {
-                    None
-                },
-                "address": if self.stratum { self.stratum_address.clone() } else { None },
-                "difficulty": if self.stratum { self.stratum_difficulty } else { None },
-                "max_conns": if self.stratum { Some(self.stratum_max_conns) } else { None },
-                "allow_plaintext_remote": if self.stratum {
-                    Some(self.stratum_allow_plaintext_remote)
-                } else {
-                    None
-                },
-            },
+            "stratum": stratum,
             "block_filter_index": {
                 "enabled": self.blockfilterindex,
                 "peer_serve": self.peerblockfilters,
@@ -6674,6 +6698,9 @@ pub struct StratumArgs {
     pub stratumdifficulty: Option<u64>,
     pub stratummaxconns: Option<usize>,
     pub stratumallowplaintextremote: Option<bool>,
+    pub stratumv2bind: Option<String>,
+    pub stratumv2key: Option<std::path::PathBuf>,
+    pub stratumv2maxchannels: Option<usize>,
 }
 
 /// How a Stratum flag's value is parsed.
@@ -6701,6 +6728,9 @@ const STRATUM_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
     ("stratumdifficulty", "N", StratumArgKind::U64, "Initial Stratum share difficulty (default: 10000 mainnet, 1000 testnet, 1 regtest)"),
     ("stratummaxconns", "N", StratumArgKind::Usize, "Hard cap on simultaneously-open Stratum connections (default: 64)"),
     ("stratumallowplaintextremote", "BOOL", StratumArgKind::Bool, "Accept a non-loopback --stratumbind with no --stratumtlsbind (default: false)"),
+    ("stratumv2bind", "ADDR:PORT", StratumArgKind::Text, "Bind the Stratum V2 listener (Noise-encrypted; requires --stratum=1)"),
+    ("stratumv2key", "PATH", StratumArgKind::Path, "Stratum V2 authority key file (default: <datadir>/stratum_v2.key; created if absent)"),
+    ("stratumv2maxchannels", "N", StratumArgKind::Usize, "Channels one Stratum V2 connection may open (default: 16)"),
 ];
 
 #[inline(never)]
@@ -6761,6 +6791,9 @@ impl clap::FromArgMatches for StratumArgs {
             stratumdifficulty: m.remove_one("stratumdifficulty"),
             stratummaxconns: m.remove_one("stratummaxconns"),
             stratumallowplaintextremote: m.remove_one("stratumallowplaintextremote"),
+            stratumv2bind: m.remove_one("stratumv2bind"),
+            stratumv2key: m.remove_one("stratumv2key"),
+            stratumv2maxchannels: m.remove_one("stratumv2maxchannels"),
         })
     }
 
@@ -6788,6 +6821,9 @@ struct StratumFields {
     stratum_difficulty: Option<u64>,
     stratum_max_conns: usize,
     stratum_allow_plaintext_remote: bool,
+    stratum_v2_bind: Option<String>,
+    stratum_v2_key: Option<std::path::PathBuf>,
+    stratum_v2_max_channels: usize,
 }
 
 /// Resolve the Stratum keys from CLI then config file, and validate them.
@@ -6855,6 +6891,14 @@ fn resolve_stratum(
         .stratumallowplaintextremote
         .or_else(|| file_get("stratumallowplaintextremote").and_then(|v| parse_bool(&v)))
         .unwrap_or(false);
+    let stratum_v2_bind = cli.stratumv2bind.or_else(|| file_get("stratumv2bind"));
+    let stratum_v2_key = cli
+        .stratumv2key
+        .or_else(|| file_get("stratumv2key").map(std::path::PathBuf::from));
+    let stratum_v2_max_channels = cli
+        .stratumv2maxchannels
+        .or_else(|| file_get("stratumv2maxchannels").and_then(|v| v.parse().ok()))
+        .unwrap_or(16);
     validate_stratum(&StratumSettings {
         network,
         enabled: stratum,
@@ -6868,6 +6912,8 @@ fn resolve_stratum(
         address: stratum_address.as_deref(),
         difficulty: stratum_difficulty,
         allow_plaintext_remote: stratum_allow_plaintext_remote,
+        v2_bind: stratum_v2_bind.as_deref(),
+        v2_max_channels: stratum_v2_max_channels,
     })?;
     Ok(StratumFields {
         stratum,
@@ -6882,6 +6928,9 @@ fn resolve_stratum(
         stratum_difficulty,
         stratum_max_conns,
         stratum_allow_plaintext_remote,
+        stratum_v2_bind,
+        stratum_v2_key,
+        stratum_v2_max_channels,
     })
 }
 
@@ -6900,6 +6949,8 @@ struct StratumSettings<'a> {
     address: Option<&'a str>,
     difficulty: Option<u64>,
     allow_plaintext_remote: bool,
+    v2_bind: Option<&'a str>,
+    v2_max_channels: usize,
 }
 
 /// Refuse Stratum configurations that cannot work or would be unsafe.
@@ -6922,6 +6973,9 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
         return Err("--stratummtlsclientallow requires --stratummtls=1".to_string());
     }
     if !s.enabled {
+        if s.v2_bind.is_some() {
+            return Err("--stratumv2bind requires --stratum=1".to_string());
+        }
         return Ok(());
     }
     // No template carries a signet block solution (BIP 325), so every block
@@ -6961,6 +7015,16 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
     }
     if s.difficulty == Some(0) {
         return Err("--stratumdifficulty must be at least 1".to_string());
+    }
+    // Stratum V2 is Noise-encrypted and authenticated by the authority key,
+    // so the plaintext-remote refusal above does not apply to its bind.
+    if let Some(v2_bind) = s.v2_bind {
+        v2_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid --stratumv2bind {v2_bind:?}: {e}"))?;
+    }
+    if s.v2_max_channels == 0 {
+        return Err("--stratumv2maxchannels must be at least 1".to_string());
     }
     Ok(())
 }
@@ -7090,6 +7154,9 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "stratumdifficulty",
         "stratummaxconns",
         "stratumallowplaintextremote",
+        "stratumv2bind",
+        "stratumv2key",
+        "stratumv2maxchannels",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -7863,6 +7930,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stratumdifficulty",
     "stratummaxconns",
     "stratumallowplaintextremote",
+    "stratumv2bind",
+    "stratumv2key",
+    "stratumv2maxchannels",
     // Storage / pruning / reindex
     "prune",
     "reindex",
@@ -11412,6 +11482,32 @@ testactivationheight=bip34@2
 
         assert!(CliArgs::try_parse_from(["satd", "--stratumdifficulty=many"]).is_err());
         assert!(CliArgs::try_parse_from(["satd", "--stratum=maybe"]).is_err());
+    }
+
+    /// Stratum V2 is encrypted and authenticated, so its bind may be
+    /// network-reachable without TLS; it still needs the server enabled.
+    #[test]
+    fn stratum_v2_bind_rules() {
+        let config = stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=0.0.0.0:3336"]).unwrap();
+        assert_eq!(config.stratum_v2_bind.as_deref(), Some("0.0.0.0:3336"));
+        assert_eq!(config.stratum_v2_max_channels, 16);
+        assert_eq!(config.stratum_v2_key, None);
+
+        let err = stratum_config(&["--regtest", "--stratumv2bind=127.0.0.1:3336"]).unwrap_err();
+        assert!(err.contains("--stratumv2bind requires --stratum=1"), "got: {err}");
+        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2bind=nope"]).unwrap_err();
+        assert!(err.contains("invalid --stratumv2bind"), "got: {err}");
+        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2maxchannels=0"]).unwrap_err();
+        assert!(err.contains("--stratumv2maxchannels must be at least 1"), "got: {err}");
+        let config = stratum_config(&[
+            "--regtest",
+            "--stratum=1",
+            "--stratumv2key=/tmp/k.key",
+            "--stratumv2maxchannels=2",
+        ])
+        .unwrap();
+        assert_eq!(config.stratum_v2_key, Some(std::path::PathBuf::from("/tmp/k.key")));
+        assert_eq!(config.stratum_v2_max_channels, 2);
     }
 
     #[test]

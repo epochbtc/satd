@@ -50,6 +50,9 @@ tls-config = { path = "../tls-config" }
 # Names the server-side TLS stream type for the Stratum listener. Already in
 # the graph through `tls-config`, with the same features.
 tokio-rustls = { workspace = true }
+# Stratum V2 transport (Noise NX) and message types. Optional: the
+# consensus-only build (`--no-default-features`) does not pull it.
+stratum-core = { workspace = true, optional = true }
 
 consensus = { path = "../consensus" }
 node-index = { path = "../node-index" }
@@ -61,13 +64,16 @@ satd-auth = { path = "../satd-auth" }
 satd-policy = { path = "../satd-policy" }
 
 [features]
-default = ["block-filter-index"]
+default = ["block-filter-index", "stratum-v2"]
 # Compile in the BIP 158 compact-block-filter index. Default-on; turn
 # off with `--no-default-features` for a consensus-only build (no
 # filter codec, no `index::filter::emit`). The runtime knob
 # `--blockfilterindex` decides per-block emission once the feature is
 # compiled in.
 block-filter-index = []
+# Compile in the Stratum V2 listener (`stratum::v2`). Default-on; the SV1
+# server does not depend on it.
+stratum-v2 = ["dep:stratum-core"]
 
 # `libc` is used by stall_watchdog.rs for raw signal raise (POSIX
 # sd_notify is irrelevant — this is the libc::raise SIGTERM path).
