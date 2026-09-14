@@ -168,12 +168,12 @@ satd makes that a runtime flag.
 
 ### Stratum solo-mining server (`node::stratum`)
 
-A Stratum V1 server inside the node (`--stratum=1`), so a miner connects to
-satd directly instead of to `getblocktemplate` through pool software such as
+A Stratum V1 and V2 server inside the node (`--stratum=1`, plus
+`--stratumv2bind` for V2), so a miner connects to satd directly instead of to `getblocktemplate` through pool software such as
 ckpool. Solo only: the `mining.authorize` username is the payout address.
 Plaintext listener on loopback by default, with an optional TLS/mTLS listener;
-a non-loopback plaintext bind without TLS is refused unless explicitly
-allowed. No work is issued during initial block download (regtest exempt), and
+a non-loopback plaintext V1 bind without TLS is refused unless explicitly
+allowed. The V2 listener is Noise-encrypted with a persisted authority key. No work is issued during initial block download (regtest exempt), and
 the server is refused on signet. See `docs/manual/src/stratum.md`.
 
 Bitcoin Core has no Stratum server; operators run a pool daemon beside it.

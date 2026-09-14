@@ -1,6 +1,7 @@
 # Stratum Mining Server
 
-satd ships a **Stratum V1** solo-mining server built into the node. A miner —
+satd ships a **Stratum V1 and Stratum V2** solo-mining server built into the
+node. A miner —
 a BitAxe, an NerdQAxe, any ASIC or firmware that speaks Stratum — connects to
 the node directly, receives work built from satd's own block template, and
 has any block it finds accepted, taken out of the mempool and relayed by the
@@ -13,7 +14,8 @@ splitting and no share database; shares exist only so the miner (and its
 operator) can see that it is hashing. This is the same model as
 `ckpool -B` solo mode.
 
-The server is off by default. Enable it with `--stratum=1`.
+The server is off by default. Enable it with `--stratum=1`; add
+`--stratumv2bind` for a Stratum V2 listener beside the V1 one.
 
 ## Quick start
 
@@ -122,6 +124,59 @@ in a full-chain file) is larger than 511 bytes of PEM. It is a warning, not an
 error: firmware that uses a system CA bundle, or keeps a larger buffer, is not
 affected.
 
+## Stratum V2
+
+Stratum V2 runs the mining protocol over a Noise-encrypted connection
+(`Noise_NX_Secp256k1+EllSwift_ChaChaPoly_SHA256`), authenticated by the
+server's **authority key**. Enable it with `--stratumv2bind`:
+
+```sh
+satd --stratum=1 --stratumv2bind=0.0.0.0:3336
+```
+
+Because the connection is encrypted and the server authenticated, the V2
+listener may bind a network address without TLS; the plaintext refusal above
+applies only to the V1 listener. ESP-Miner-based firmware (AxeOS 2.14 and
+later) speaks Stratum V2 natively, using an extended channel by default.
+
+**The authority key.** On first start satd creates the key at
+`<datadir>/stratum_v2.key` (override with `--stratumv2key`), readable only by
+its owner, and logs the public key in both forms the ecosystem uses:
+
+```
+Stratum V2 authority key ... created=true authority_pubkey=<64 hex characters> authority_pubkey_base58=<base58check>
+```
+
+A miner either trusts the key it sees on first connection or is configured
+with it in advance; either way it refuses a server that later presents a
+different one. **Back the key file up with the rest of the datadir.** Losing it
+means reconfiguring every miner that pinned the old key. A key file that
+exists but cannot be read, or does not hold a valid key, stops the node rather
+than being replaced. The base58check form — a little-endian key version of 1
+followed by the 32-byte x-only key — is what AxeOS and most Stratum V2 tooling
+accept as the pool's authority public key.
+
+**Channels.** Both channel types are served. An extended channel receives the
+coinbase split around an extranonce hole, the merkle path and an extranonce
+range, and rolls its own extranonce; this is what AxeOS uses. A standard
+channel receives a finished merkle root and rolls only the nonce, timestamp
+and version bits. `--stratumv2maxchannels` caps channels per connection. The
+`user_identity` a channel is opened with is the payout address, resolved
+exactly as a V1 username is; without a usable address the channel is refused
+with `unknown-user`.
+
+**Jobs.** Each channel's first job on a tip is sent as a future job followed by
+the `SetNewPrevHash` that activates it; a new tip repeats that for every
+channel, and the 30-second refresh sends a job that is active at once. Vardiff
+changes are sent as `SetTarget`. Shares are judged exactly as V1 shares are;
+rejections carry the Stratum V2 codes `stale-share`, `difficulty-too-low`,
+`duplicate-share`, `invalid-share`, `invalid-timestamp` and
+`invalid-channel-id`.
+
+A connection must complete the handshake within 10 seconds. Job Declaration
+(`SetupConnection` with `REQUIRES_WORK_SELECTION`) is refused with
+`unsupported-feature-flags`.
+
 ## Configuration
 
 Every Stratum key is restart-only.
@@ -140,11 +195,14 @@ Every Stratum key is restart-only.
 | `--stratumdifficulty=<n>` | `10000` mainnet, `1000` testnet3/testnet4, `1` regtest | Initial share difficulty. |
 | `--stratummaxconns=<n>` | `64` | Connection cap across both listeners. |
 | `--stratumallowplaintextremote=<0\|1>` | `0` | Accept a non-loopback `--stratumbind` with no TLS listener. |
+| `--stratumv2bind=<addr:port>` | none | Stratum V2 listener. Noise-encrypted; may bind a network address without TLS. Requires `--stratum=1`. |
+| `--stratumv2key=<path>` | `<datadir>/stratum_v2.key` | Authority key file, created if absent. Back it up: miners pin the key. |
+| `--stratumv2maxchannels=<n>` | `16` | Channels one Stratum V2 connection may open. |
 
 The server runs on satd's [isolated API runtime](api-scaling.md), and block
 submission runs on a blocking thread, so a found block does not stall the
-other API listeners. `getserverstatus` reports the bound `stratum` and
-`stratum_tls` listeners, including the real port when a bind used `:0`.
+other API listeners. `getserverstatus` reports the bound `stratum`, `stratum_tls`
+and `stratum_v2` listeners, including the real port when a bind used `:0`.
 
 ## Payout address
 
@@ -178,11 +236,15 @@ floor vardiff will not go below. It is clamped to `[1, 2^48]`.
 A ~1.2 TH/s BitAxe-class device at the mainnet default of 10,000 finds a share
 about every 35 seconds, so it starts close to the target rate.
 
+Stratum V2 channels start at the same difficulty and are steered the same
+way; a channel's target also never exceeds the `max_target` the miner opened
+it with.
+
 A share is checked against the easier of the share target and the block
 target. On regtest, where the block target is far easier than difficulty 1,
 that is what lets a block-winning header through.
 
-## Protocol
+## Stratum V1 protocol
 
 Methods served: `mining.configure` (BIP 310 version rolling, mask
 `1fffe000`), `mining.subscribe`, `mining.authorize`,
@@ -250,5 +312,6 @@ rejected, is logged at `warn`.
 - Pool operation: multiple payout addresses per share stream, PPLNS or any
   other reward splitting, share accounting.
 - The Stratum V2 Template Distribution Protocol (the `TemplateProvider`
-  role).
-- Stratum V2 is not yet available; it is planned for a later 0.6.0 change.
+  role), and group channels.
+- Stratum V2 Job Declaration is not yet available; it is planned for a later
+  0.6.0 change.

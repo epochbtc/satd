@@ -29,7 +29,7 @@
 </div>
 
 <p align="center">
-<code>satd</code> provides the core node, plus the wallet-server protocols operators usually wire up alongside it (Esplora REST, Electrum, BIP&nbsp;157/158) and a Stratum V1 solo-mining server.
+<code>satd</code> provides the core node, plus the wallet-server protocols operators usually wire up alongside it (Esplora REST, Electrum, BIP&nbsp;157/158) and a Stratum V1/V2 solo-mining server.
 </p>
 
 ---

@@ -32,6 +32,7 @@ item below is (or will be) written up in full in the in-development
 - Go SDK: the same check (`ErrNodeTooOld`, `WithAllowOldNode`, `ErrSchemaMismatch`, `WithLogger`, `Client.NodeVersion`); `Watch` now waits for response headers; the module is versioned with the node (`satdevents.Version`), next tag `clients/go/v0.6.0`.
 - The Umbrel and StartOS packages open onto the status page, and the appliance turns it on; Umbrel publishes Esplora over TLS on 8431; the reference stack and the appliance serve metrics and the status page over native TLS on 9336 (#750).
 - **Stratum V1 solo-mining server** (`--stratum=1`): miners connect to the node directly; the username is the payout address. Loopback by default, TLS/mTLS listener, refused on signet (#746).
+- **Stratum V2** on the same server (`--stratumv2bind`): Noise NX transport, standard and extended channels, and an authority key persisted at `<datadir>/stratum_v2.key` so miners that pin it survive a restart.
 
 ### Fixed
 
