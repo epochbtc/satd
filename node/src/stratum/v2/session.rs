@@ -157,20 +157,12 @@ pub(crate) async fn run(
 
     loop {
         let has_channels = !session.channels.is_empty();
+        // New work and the vardiff tick come before the miner's frames, as on
+        // the V1 listener: they are rare, and a miner that submits without
+        // pause would otherwise never be sent the next job.
         let result = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
-            frame = frames.recv() => match frame {
-                Some(Ok((msg_type, payload))) => {
-                    idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                    session.handle(msg_type, &payload, &mut work_rx).await
-                }
-                Some(Err(e)) => {
-                    tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 connection closed");
-                    break;
-                }
-                None => break,
-            },
             changed = work_rx.changed(), if has_channels => {
                 if changed.is_err() {
                     break;
@@ -182,6 +174,17 @@ pub(crate) async fn run(
                 }
             }
             _ = vardiff_tick.tick(), if has_channels => session.check_vardiff().await,
+            frame = frames.recv() => match frame {
+                Some(Ok((msg_type, payload))) => {
+                    idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
+                    session.handle(msg_type, &payload, &mut work_rx).await
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 connection closed");
+                    break;
+                }
+                None => break,
+            },
             _ = &mut idle => {
                 tracing::debug!(target: "node::stratum", %peer, "Stratum V2 connection idle; closing");
                 break;

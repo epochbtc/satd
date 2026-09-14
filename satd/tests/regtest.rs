@@ -17912,24 +17912,41 @@ mod sv2 {
         }
 
         async fn read(&mut self, timeout: Duration) -> Option<(u8, Vec<u8>)> {
-            let read = async {
-                let mut header = vec![0u8; 22];
-                self.stream.read_exact(&mut header).await.ok()?;
-                self.codec.decrypt(&mut header).ok()?;
-                let len = u32::from_le_bytes([header[3], header[4], header[5], 0]) as usize;
-                let mut payload = Vec::new();
-                let mut left = len;
-                while left > 0 {
-                    let n = left.min(65_535 - 16);
-                    let mut chunk = vec![0u8; n + 16];
-                    self.stream.read_exact(&mut chunk).await.ok()?;
-                    self.codec.decrypt(&mut chunk).ok()?;
-                    payload.extend_from_slice(&chunk);
-                    left -= n;
+            tokio::time::timeout(timeout, read_frame(&mut self.stream, &mut self.codec)).await.ok().flatten()
+        }
+
+        /// Send `msgs` one after another, as fast as the socket takes them.
+        /// Returns the reader half, to find what the server sends meanwhile,
+        /// and the sending task.
+        pub fn flood<T: Serialize + GetSize + Send + 'static>(
+            self,
+            msg_type: u8,
+            msgs: impl Iterator<Item = T> + Send + 'static,
+        ) -> (FloodReader, tokio::task::JoinHandle<()>) {
+            let (read, mut write) = self.stream.into_split();
+            let mut codec = self.codec.clone();
+            let reader = FloodReader { stream: read, codec: self.codec };
+            let task = tokio::spawn(async move {
+                // A thousand frames a write, so the server always has a
+                // backlog rather than one frame at a time.
+                let mut msgs = msgs.peekable();
+                while msgs.peek().is_some() {
+                    let mut batch = Vec::new();
+                    for msg in msgs.by_ref().take(1_000) {
+                        let mut body = binary_sv2::to_bytes(msg).unwrap();
+                        let mut header = vec![0u8, 0, msg_type];
+                        header.extend_from_slice(&(body.len() as u32).to_le_bytes()[..3]);
+                        codec.encrypt(&mut header).unwrap();
+                        codec.encrypt(&mut body).unwrap();
+                        batch.extend_from_slice(&header);
+                        batch.extend_from_slice(&body);
+                    }
+                    if write.write_all(&batch).await.is_err() {
+                        return;
+                    }
                 }
-                Some((header[2], payload))
-            };
-            tokio::time::timeout(timeout, read).await.ok().flatten()
+            });
+            (reader, task)
         }
 
         /// The next message of `msg_type`, keeping others for later.
@@ -18012,6 +18029,50 @@ mod sv2 {
             prev.reverse();
             (m.job_id, hex::encode(prev), m.min_ntime, m.nbits)
         }
+    }
+
+    pub struct FloodReader {
+        stream: tokio::net::tcp::OwnedReadHalf,
+        codec: NoiseCodec,
+    }
+
+    impl FloodReader {
+        /// The next message of `msg_type` for which `accept` holds, skipping
+        /// everything else, or `None` after `timeout`.
+        pub async fn find(
+            &mut self,
+            msg_type: u8,
+            timeout: Duration,
+            mut accept: impl FnMut(&mut Vec<u8>) -> bool,
+        ) -> Option<Vec<u8>> {
+            let search = async {
+                loop {
+                    let (t, mut p) = read_frame(&mut self.stream, &mut self.codec).await?;
+                    if t == msg_type && accept(&mut p) {
+                        return Some(p);
+                    }
+                }
+            };
+            tokio::time::timeout(timeout, search).await.ok().flatten()
+        }
+    }
+
+    async fn read_frame<R: tokio::io::AsyncRead + Unpin>(stream: &mut R, codec: &mut NoiseCodec) -> Option<(u8, Vec<u8>)> {
+        let mut header = vec![0u8; 22];
+        stream.read_exact(&mut header).await.ok()?;
+        codec.decrypt(&mut header).ok()?;
+        let len = u32::from_le_bytes([header[3], header[4], header[5], 0]) as usize;
+        let mut payload = Vec::new();
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(65_535 - 16);
+            let mut chunk = vec![0u8; n + 16];
+            stream.read_exact(&mut chunk).await.ok()?;
+            codec.decrypt(&mut chunk).ok()?;
+            payload.extend_from_slice(&chunk);
+            left -= n;
+        }
+        Some((header[2], payload))
     }
 
     /// Grind a nonce until the header meets its own `nbits`.
@@ -18110,6 +18171,71 @@ fn stratum_v2_handshake_and_standard_channel() {
     );
     let status = node.rpc_ok("getserverstatus", vec![]);
     assert_eq!(status["stratum_v2"]["bind"], format!("127.0.0.1:{v2_port}"), "{status}");
+}
+
+/// A channel whose miner never stops submitting still gets the new tip, as on
+/// the V1 listener (see `stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting`).
+/// On regtest every share is a block, so a miner that keeps hashing its job
+/// sends block after block: the first joins the chain, and the session must
+/// still find time to send the job for the tip that block made.
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_new_work_reaches_a_miner_that_never_stops_submitting() {
+    use serde_json::json;
+    use stratum_core::binary_sv2;
+    use bitcoin::hashes::Hash as _;
+    use stratum_core::mining_sv2::{NewMiningJob, SetNewPrevHash, SubmitSharesStandard};
+    let (node, _, v2_port) = start_stratum_v2_node(&[]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut miner = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner.setup().await;
+        let (channel_id, _) = miner.open_standard(&addr).await;
+        let (job_id, prev, min_ntime, nbits, root, version) = loop {
+            let mut payload = miner.expect(0x15, Duration::from_secs(10)).await;
+            let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).unwrap();
+            let (job_id, root, version) = (job.job_id, job.merkle_root.inner_as_ref().to_vec(), job.version);
+            let (_, prev, min_ntime, nbits) = miner.set_new_prev_hash(Duration::from_secs(10)).await;
+            if prev == best {
+                break (job_id, prev, min_ntime, nbits, <[u8; 32]>::try_from(root).unwrap(), version);
+            }
+        };
+
+        // An endless run of distinct shares for that job, each a regtest
+        // block, found the way a miner finds them: by trying the next nonce.
+        let mut header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(version as i32),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array(sv2::internal(&prev)),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
+            time: min_ntime,
+            bits: bitcoin::CompactTarget::from_consensus(nbits),
+            nonce: 0,
+        };
+        let mut sequence_number = 0u32;
+        let shares = std::iter::from_fn(move || loop {
+            header.nonce = header.nonce.wrapping_add(1);
+            if header.validate_pow(header.target()).is_ok() {
+                sequence_number += 1;
+                return Some(SubmitSharesStandard { channel_id, sequence_number, job_id, nonce: header.nonce, ntime: min_ntime, version });
+            }
+        });
+        let (mut reader, flood) = miner.flood(0x1a, shares);
+
+        let found = reader
+            .find(0x20, Duration::from_secs(10), |payload| {
+                let m: SetNewPrevHash = binary_sv2::from_bytes(payload).unwrap();
+                let mut p = m.prev_hash.inner_as_ref().to_vec();
+                p.reverse();
+                hex::encode(p) != best
+            })
+            .await;
+        flood.abort();
+        assert!(found.is_some(), "no SetNewPrevHash for the tip the miner's own block made");
+    });
 }
 
 #[cfg(feature = "stratum-v2")]
