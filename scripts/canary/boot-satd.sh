@@ -90,6 +90,7 @@ ALERTS
             --stratum=1
             --stratumbind=127.0.0.1:0
             --stratumv2bind=127.0.0.1:0
+            --stratumv2jd=1
         )
         echo "boot_satd: 0.5.0 feature profile ON: ${feature_args[*]}"
     fi
