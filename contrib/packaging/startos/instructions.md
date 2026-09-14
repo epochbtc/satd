@@ -12,11 +12,16 @@ REST API from the same process.
 | **Electrum** | For Sparrow, Electrum, BlueWallet and Zeus. Point the wallet at the Electrum address on the Interfaces tab. |
 | **Esplora** | Blockstream-compatible REST API under `/api`. |
 | **MCP** | Lets an AI assistant query your own node instead of a public explorer. Needs the bearer token from the **MCP Token** action, and the address you use listed under **MCP Hostnames**. |
-| **Peer** | Inbound connections from other Bitcoin nodes. |
+| **Peer** | Inbound connections from other Bitcoin nodes. The port follows the network: 8333 on mainnet, 38333 on signet, 48333 on testnet4, 18333 on testnet3, 18444 on regtest. |
 
 TLS is handled by StartOS, with a certificate chaining to this server's root
 CA — the one your browser already trusts here. There is no second certificate
 authority to import.
+
+The one exception is a client that connects to satd's own TLS listeners
+directly rather than through StartOS, such as another service on this server.
+Those present a certificate from a CA satd generates for this install; the
+**CA Certificate** action prints it.
 
 ## Before an AI assistant can reach MCP
 
@@ -46,7 +51,9 @@ again in indices.
 ## First start
 
 The node syncs from scratch. **Blockchain Sync** on the service's page tracks
-it: block headers first, then blocks. Electrum and Esplora answer for the part
+it: block headers first, then blocks, shown as the block count against the
+header count. Early blocks are small and go quickly, so the count runs well
+ahead of the time remaining. Electrum and Esplora answer for the part
 of the chain that has been indexed so far, so wallet balances are not
 trustworthy until the sync completes.
 
@@ -56,6 +63,35 @@ The **Network** action switches chains. Each network keeps its own directory,
 so switching away and back does not discard what was already synced — but the
 new network syncs from scratch the first time, and the peer port changes with
 it.
+
+## Actions
+
+| Action | What it does |
+|---|---|
+| **Network** | Switches the chain this node runs on. Restarts the node. |
+| **CA Certificate** | Prints this install's certificate authority. |
+| **MCP Token** | Prints the bearer token MCP clients send. |
+| **MCP Hostnames** | Sets the names MCP accepts requests by. Restarts the node. |
+
+## Storage
+
+Everything lives on one volume: the chain, the chainstate with its indices,
+the certificate authority, the MCP token and the rendered `bitcoin.conf`.
+
+## Dependencies
+
+None. satd is a full node on its own and does not need Bitcoin Core or any
+other service.
+
+## Limitations
+
+- **No pruning**, for the reasons under Disk.
+- **No wallet.** satd is a node. Use a wallet app such as Sparrow against the
+  Electrum interface.
+- **Other services cannot use satd in place of Bitcoin Core.** satd speaks
+  Core's JSON-RPC, but it does not publish the `rawblock` and `rawtx` ZMQ
+  topics that Lightning implementations in bitcoind mode require.
+- **English only.** There are no translations yet.
 
 ## Backups
 

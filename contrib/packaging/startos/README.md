@@ -196,14 +196,52 @@ only operator-added custom domains, the `.local` name comes from the server's
 own hostname, which no effect exposes, and the container's hostname is a
 generated id.
 
-Still unverified: backup/restore.
+Still unverified: backup and restore. The exclusions were corrected against a
+datadir satd 0.5.2 actually wrote: they named Bitcoin Core's `indexes/` and
+`debug.log`, which satd never creates, and missed `chainstate_background/`,
+which it does. `test/backups.test.ts` checks the names against satd's storage
+code. Whether a restore brings back a working node has not been tried.
 
-## Before publishing
+The **Blockchain Sync** check used to print `verificationprogress` as a
+percentage. satd 0.5.2 computes that field from timestamps, so a node at
+genesis reported roughly 69%. It now shows the block count against the header
+count.
 
-1. Bump the image tag in `startos/manifest/index.ts` and the version in
-   `startos/versions/current.ts` to the release being published.
+## Publishing
+
+Start9's community registry takes packages by email and then owns them:
+
+1. The package goes in a public repository, `epochbtc/satd-startos`, with
+   `main` as its default branch. `contrib/packaging/sync-store.sh startos`
+   fills a clean clone of it from this directory.
+2. Email **submissions@start9.com** with the link.
+3. Start9 forks it into `Start9-Community` and reviews it as a pull request on
+   the fork. **The fork is the upstream from then on**: every later version is
+   a pull request against it, synced from here the same way.
+4. A merged pull request builds, tags and publishes to **community-beta**.
+5. Promotion to **community production** is ours to ask for, by email.
+
+`.github/workflows/` holds the four workflows accepted packages use. They are
+inert here, since GitHub only runs workflows at a repository's root, and live
+once synced. `build.yml` runs on pull requests with no signing key. The other
+three publish, need Start9's key, and run only in the `Start9-Community` fork.
+
+The version tag is the package version with `:` replaced by `_` and no
+prefix: `0.5.2:0` is tagged `v0.5.2_0`.
+
+Two tests read satd's own files. Outside this repository `test/upstream.ts`
+falls back to copies the sync vendors into `test/upstream/`, from the same satd
+commit; the storage-layout test has no copy and skips.
+
+For each release:
+
+1. Bump the image tag and digest in `startos/manifest/index.ts` and the
+   version and release notes in `startos/versions/current.ts`. A new
+   upstream version resets the revision to `0`; a package-only change bumps
+   it.
 2. Install it on a StartOS box and confirm every interface answers.
-3. Push to `epochbtc/satd-startos` and call
-   `Start9Labs/start-technologies/.github/workflows/build.yml@master` from its
-   CI, which builds the `.s9pk` with no secrets (it generates a temporary
-   signing key when `DEV_KEY` is absent).
+3. Sync, review the diff, and push, or open the pull request against the fork:
+
+   ```sh
+   contrib/packaging/sync-store.sh startos ../satd-startos
+   ```

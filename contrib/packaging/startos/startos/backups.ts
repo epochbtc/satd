@@ -14,19 +14,25 @@ import { sdk } from './sdk'
  */
 export const { createBackup, restoreInit } = sdk.setupBackups(async () =>
   sdk.Backups.ofVolumes('main').setOptions({
+    // Checked against a datadir satd 0.5.2 wrote, not against Bitcoin
+    // Core's layout. satd keeps every index inside `chainstate/`, so there is
+    // no `indexes/`, and it logs to stdout, so there is no `debug.log`; both
+    // were here and matched nothing. `chainstate_background/` exists only
+    // while an AssumeUTXO snapshot's background validation runs, which is
+    // exactly when it is large.
     exclude: [
       'blocks/',
       'chainstate/',
-      'indexes/',
-      // Per-network subdirectories hold the same three, plus the cookie.
+      'chainstate_background/',
+      'mempool.dat',
+      '.cookie',
+      // Every network but mainnet is a subdirectory with the same layout.
       '*/blocks/',
       '*/chainstate/',
-      '*/indexes/',
-      '.cookie',
+      '*/chainstate_background/',
+      '*/mempool.dat',
       '*/.cookie',
       'rpc-cookie',
-      'debug.log',
-      '*/debug.log',
     ],
   }),
 )

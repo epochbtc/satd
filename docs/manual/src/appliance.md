@@ -37,6 +37,55 @@ still qualifies that one. The `arm64` half of the container image is exercised
 by the reference stack's own test suite on an arm64 host, but umbrelOS ships
 `aarch64` only as a Raspberry Pi image, with no supported path to a VM.
 
+## Installing from an app store
+
+### Umbrel
+
+satd is in a community app store rather than Umbrel's own:
+
+1. In umbrelOS, open the **App Store**, then **⋯ → Community App Stores**.
+2. Add `https://github.com/epochbtc/umbrel-apps`.
+3. Open the **satd** store and install **satd**.
+
+The app takes its own host ports, clear of every other app in the Umbrel store,
+so it installs alongside Bitcoin Node, Fulcrum and Ride The Lightning:
+
+| Port | Surface |
+|---|---|
+| 8430 | the app page, through Umbrel's proxy and login |
+| 8433 | Bitcoin P2P |
+| 50012 | Electrum, TLS |
+| 8436 | JSON-RPC, TLS |
+| 8439 | MCP, TLS and a bearer token |
+
+Point a wallet at `umbrel.local:50012` over SSL. Sparrow and Electrum pin the
+certificate on first use; a client that verifies against a CA needs the
+install's, and the MCP token lives beside it. In this release reading either
+takes SSH, since the app has no page of its own yet:
+
+```sh
+sudo cat ~/umbrel/app-data/epochbtc-satd/data/tls/ca.crt
+sudo cat ~/umbrel/app-data/epochbtc-satd/data/secrets/mcp-token
+```
+
+See [Trusting it](#trusting-it) for importing the CA. Other
+apps on the device reach JSON-RPC in plain text on the app network, as
+`epochbtc-satd_server_1:8332` with the cookie at `APP_SATD_RPC_COOKIE_FILE`,
+which is how they reach Bitcoin Node too.
+
+Earlier builds of the package used 8333, 50002, 3001, 8336 and 8339. A client
+configured against those needs the new port.
+
+Umbrel backups leave out the chain and chainstate, which the node downloads
+again on its own, and keep the CA and the MCP token.
+
+### StartOS
+
+satd is not yet listed in Start9's community registry. Until it is, build the
+package and sideload it as `contrib/packaging/startos/README.md` describes.
+Its **Instructions** tab covers the interfaces, the actions and what the
+package does not do.
+
 ## The reference stack
 
 ```sh
@@ -312,6 +361,9 @@ rather than asserted:
   syncing to the node's tip over Neutrino, and RTL served through the proxy.
 - `contrib/appliance/tests/boot-test.sh` — the built image booted under
   QEMU, checked through the guest agent and through forwarded ports.
+- `contrib/stack/tests/compose-test.sh` — static invariants of the compose
+  files, including that the Umbrel package's ports are its own and mapped
+  1:1, and that its backup exclusions match the StartOS package's.
 - `contrib/packaging/startos/test/` — the StartOS package's type check and
   unit tests, run by the **app-store packages** CI job. Two of them exist
   because a typecheck cannot see the defects they guard: a store read that

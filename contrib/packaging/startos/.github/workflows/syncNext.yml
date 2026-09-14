@@ -1,0 +1,17 @@
+# See build.yml for where this file runs.
+name: Sync next
+
+# Carries every change on `main` onto the `next` iteration branch Start9's
+# tooling works from. Creates `next` on first run.
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: github.repository_owner == 'Start9-Community'
+    uses: Start9Labs/start-technologies/.github/workflows/syncNext.yml@master
+    permissions:
+      contents: write
+      pull-requests: write

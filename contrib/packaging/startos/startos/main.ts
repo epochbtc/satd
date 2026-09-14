@@ -200,9 +200,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
               message: i18n('satd is fully synced'),
             }
 
-          // At genesis nothing sits above the tip yet and
-          // verificationprogress is still 0 — the header chain is the only
-          // thing moving, so reporting a percentage there reads as stuck.
+          // At genesis the header chain is the only thing moving, so a block
+          // count there reads as stuck.
           if (info.blocks === 0)
             return {
               result: 'loading' as const,
@@ -213,10 +212,18 @@ export const main = sdk.setupMain(async ({ effects }) => {
                 : i18n('Syncing block headers…'),
             }
 
+          // Heights, not `verificationprogress`. satd 0.5.2 computes that
+          // field as the tip's timestamp over the current time, both in
+          // seconds since 1970, so a node at genesis reads about 69% and the
+          // figure barely moves for a year of blocks. A height pair is not a
+          // share of the work either — recent blocks cost far more than early
+          // ones — but it is true, and it says so rather than implying a
+          // percentage.
           return {
             result: 'loading' as const,
-            message: i18n('Syncing blocks: ${percentage}%', {
-              percentage: (info.verificationprogress * 100).toFixed(2),
+            message: i18n('Syncing blocks: ${blocks} of ${headers}', {
+              blocks: info.blocks,
+              headers: info.headers,
             }),
           }
         },

@@ -47,9 +47,15 @@ check — `umbrel lint` passes clean both before and after each of them:
 
 What is checked statically:
 
-- `umbrel/` — `umbrel lint` (from `npm i -g umbrel-cli`) validates the store
-  manifest, each app manifest, the compose file and `exports.sh`. It is what
-  caught the missing image digest pin, which the Umbrel app store requires.
+- `umbrel/` — two linters, and neither replaces the other.
+  `umbrel lint` (from `npm i -g umbrel-cli`) validates the store manifest,
+  each app manifest, the compose file and `exports.sh`; it is what caught the
+  missing image digest pin. The store's own linter, in a clone of
+  `getumbrel/umbrel-apps`, is the one that knows every other app: copy
+  `epochbtc-satd/` into the clone and run
+  `npm run lint:apps -- epochbtc-satd --check-images`. It is what checks host
+  ports against the whole store. `umbrel lint` passed while this package took
+  three ports other apps own.
 - `startos/` — typechecks against the SDK, tests its network table against
   `satd-init`, guards the two defects the install found, and packs to a
   `.s9pk`. See `startos/README.md` for what running it on a server showed.
@@ -57,21 +63,75 @@ What is checked statically:
 Neither validator understands satd's own flags, so the checks that cover
 those live in `contrib/stack/tests/compose-test.sh`.
 
+## Host ports
+
+Umbrel has one host port space for every app on the device: an app's manifest
+`port` and every port any app publishes share it. This package used to take
+3001, 8333 and 50002, which belong to Ride The Lightning, Bitcoin Node and
+Fulcrum, so it could not be installed beside the three apps a satd user is
+most likely to run. It now has its own block, clear of every app in the store:
+
+| Port | Surface | Was |
+|---|---|---|
+| 8430 | app page, via `app_proxy` | 3001 |
+| 8433 | Bitcoin P2P | 8333 |
+| 8436 | JSON-RPC, TLS | 8336 |
+| 50012 | Electrum, TLS | 50002 |
+| 8439 | MCP, TLS | 8339 |
+
+Each is mapped 1:1, and satd listens on the same number. P2P cannot be
+remapped any other way: satd advertises the port it listens on, so
+`8433:8333` would send every peer that learned this node's address to Bitcoin
+Node instead. The listener flags on the server's command line override the
+ports satd-init renders, which keeps satd-init shared with the stack.
+`contrib/stack/tests/compose-test.sh` checks the mappings, the flags and the
+known collisions.
+
+## Backups
+
+`backupIgnore` leaves out the chain, the chainstate (with the indices inside
+it), the AssumeUTXO background chainstate, `mempool.dat` and the cookie, at the
+datadir root for mainnet and in each network's subdirectory. The certificate
+authority, the MCP token, `authfile.toml` and `bitcoin.conf` stay in. The set
+matches the StartOS package's exclusions, and `compose-test.sh` checks that it
+still does.
+
 ## Publishing the Umbrel app
 
 Umbrel installs community stores from a git repository whose root holds
-`umbrel-app-store.yml` and one directory per app:
+`umbrel-app-store.yml` and one directory per app, named for the app id:
 
 ```
 epochbtc/umbrel-apps/
+  README.md               # from STORE_README.md
   umbrel-app-store.yml
-  satd/
+  epochbtc-satd/
     umbrel-app.yml
     docker-compose.yml
     exports.sh
+    data/.gitkeep
 ```
 
-Copy `umbrel/` to that repository's root.
+The app id carries the store id as a prefix, and both are permanent once
+anyone installs: Umbrel names the app's data directory and containers after
+them. The store's display name is `satd`.
+
+For each release:
+
+1. Bump the image tag and digest in `docker-compose.yml`, `version` and
+   `releaseNotes` in `umbrel-app.yml`, and the `icon` URL's tag.
+2. Run both linters, above.
+3. Copy it into a clean clone of `epochbtc/umbrel-apps`:
+
+   ```sh
+   contrib/packaging/sync-store.sh umbrel ../umbrel-apps
+   ```
+
+   It refuses an image that is not a release, or whose tag does not match
+   `version`, and it never commits or pushes. Review the diff there, then
+   commit and push.
+
+## `implements: bitcoin`
 
 Both questions this section used to leave open have been checked against the
 current store.

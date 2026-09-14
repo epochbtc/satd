@@ -1,7 +1,7 @@
 import { deepStrictEqual } from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { networks, p2pPorts } from '../startos/networks.ts'
+import { upstream } from './upstream.ts'
 
 /**
  * satd-init owns both of these facts: which network names it accepts (it
@@ -14,10 +14,12 @@ import { networks, p2pPorts } from '../startos/networks.ts'
  * So read satd-init and compare, rather than trusting two lists to stay
  * equal by inspection.
  */
-const initScript = readFileSync(
-  new URL('../../../stack/satd/satd-init', import.meta.url),
-  'utf8',
-)
+const found = upstream('contrib/stack/satd/satd-init')
+if (found === null)
+  throw new Error(
+    'satd-init is neither in the satd tree nor vendored in test/upstream/',
+  )
+const initScript = found
 
 /** The `case "$NETWORK" in` arm that assigns P2P_PORT, as satd-init writes it. */
 const parsePorts = (src: string): Record<string, number> => {
