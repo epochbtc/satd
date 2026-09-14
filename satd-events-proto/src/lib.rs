@@ -21,3 +21,8 @@ pub mod satd {
 }
 
 pub use self::satd::events::v1 as v1;
+
+/// The `NodeEvent.schema_version` this crate's types describe. Mirrors
+/// `node::events::SCHEMA_VERSION` in the satd node; the two are bumped together.
+/// A node advertises its value in the `satd-events-schema` response header.
+pub const SCHEMA_VERSION: u32 = 1;

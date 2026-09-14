@@ -108,10 +108,27 @@ cargo run -p satd-events-client --example firehose_tail -- http://127.0.0.1:5005
 
 ## Stability & versioning
 
-The SDK tracks the **additive `satd.events.v1` wire schema**, not the node's
-release cadence, and follows [semver](https://semver.org/) independently of the
-satd node version — a node and SDK do **not** need matching versions. MSRV is
-**1.93** (an MSRV bump is a minor-version change).
+The crate version **is** the satd version it shipped with, and it follows
+[semver](https://semver.org/). Use an SDK whose minor version is at or below
+your node's; newer nodes only add fields and event kinds within the same schema.
+
+Each time a stream opens, the SDK compares the node's advertised version
+(`satd-version` response header) with its own:
+
+- same or newer node: silent;
+- one minor version behind: a `tracing` warning (target
+  `satd_events_client::compat`) once per node version, which means *upgrade
+  the node*;
+- two or more minor versions, or a major version, behind:
+  `StreamError::NodeTooOld`, unless the client was built with
+  `allow_old_node()`, which turns it into the warning;
+- a different event schema: `StreamError::SchemaMismatch`, always.
+
+A node older than 0.6.0 sends no header and counts as 0.5.
+`StreamClient::node_version()` reports what the node advertised. The rule is
+written down in
+[`STABILITY_POLICY.md`](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md#streaming-api--sdk-compatibility).
+MSRV is **1.93** (an MSRV bump is a minor-version change).
 
 ## More
 

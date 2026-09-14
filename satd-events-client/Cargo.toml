@@ -59,9 +59,16 @@ bitcoin = { workspace = true, optional = true }
 # it must not linger in freed heap once a target is dropped/removed). Tiny,
 # no_std-capable, so it does not compromise the lean-dependency goal.
 zeroize = { workspace = true }
+# The node-version warning (`StreamClient::subscribe` / `watch` against a node
+# one minor version behind) is logged through `tracing`. Not optional: behind a
+# feature, "warn loudly" would silently become a no-op in a minimal build. Two
+# small crates, and the ecosystem default for tokio/tonic consumers.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Captures the node-version warning in the client tests.
+tracing-subscriber = { workspace = true }
 
 # The prefix-privacy example uses `PrefixWatcher`, so it only builds with the
 # `bitcoin` feature (on by default). Gating it here keeps a
