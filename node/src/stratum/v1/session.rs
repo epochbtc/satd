@@ -454,7 +454,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         let height = job.template.work.height;
         let chain = self.shared.chain.clone();
         let mempool = self.shared.mempool.clone();
-        let outcome = tokio::task::spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
+        let outcome = self.shared.core.spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
         let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
         match outcome {
             Ok(Ok(true)) => tracing::info!(

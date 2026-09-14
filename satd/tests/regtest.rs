@@ -17556,12 +17556,43 @@ fn stratum_v1_mined_share_connects_block() {
             format!("{ntime:08x}"),
             format!("{nonce:08x}"),
         ]);
-        let reply = client.call("mining.submit", submit.clone()).await;
-        assert_eq!(reply["result"], true, "{reply}");
-        // The same solution again is a duplicate.
-        let again = client.call("mining.submit", submit).await;
-        assert_eq!(again["error"][0], 22, "{again}");
-        notify_height(&params)
+        // The solution, and the same solution again in the same write: the
+        // session reads the second line before it handles the new tip the
+        // first one creates, so the second is judged a duplicate rather than
+        // stale.
+        {
+            use tokio::io::AsyncWriteExt;
+            let line = |id: u64| json!({"id": id, "method": "mining.submit", "params": submit}).to_string() + "\n";
+            let both = line(100) + &line(101);
+            client.writer.write_all(both.as_bytes()).await.unwrap();
+        }
+        let mut replies = std::collections::HashMap::new();
+        while replies.len() < 2 {
+            let msg = client.read_message(Duration::from_secs(10)).await.expect("submit replies");
+            match msg["id"].as_u64() {
+                Some(id @ (100 | 101)) => {
+                    replies.insert(id, msg);
+                }
+                _ => client.pending.push_back(msg),
+            }
+        }
+        assert_eq!(replies[&100]["result"], true, "{:?}", replies[&100]);
+        assert_eq!(replies[&101]["error"][0], 22, "{:?}", replies[&101]);
+        // The block's own connect event reaches the server, which moves every
+        // miner to the new tip at once rather than at the next 30 s refresh.
+        // A submission that failed part way — the block stored but its chain
+        // event never emitted — leaves this waiting.
+        let height = notify_height(&params);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = client.notification("mining.notify", left).await;
+            if notify_height(&n["params"]) == height + 1 {
+                assert_eq!(n["params"][8], true, "{n}");
+                break;
+            }
+        }
+        height
     });
 
     poll_until(

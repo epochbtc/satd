@@ -43,6 +43,10 @@ pub(crate) struct Shared {
     pub mempool: Arc<Mempool>,
     /// The latest work, or `None` while none should be issued.
     pub work: watch::Sender<Option<Arc<Work>>>,
+    /// The node's core runtime. Found blocks are connected there: block
+    /// connection must never originate on the API runtime the listeners run
+    /// on (see `ChainState::emit_chain_event`).
+    pub(crate) core: tokio::runtime::Handle,
     next_extranonce1: AtomicU32,
 }
 
@@ -74,11 +78,17 @@ impl StratumServer {
     /// to relay a found block to. Relay itself needs nothing from this
     /// module: every block that connects is announced by the node's
     /// block-announcement task.
+    ///
+    /// `core` is the runtime found blocks are submitted on. The server itself
+    /// may run elsewhere — the node runs it on the API runtime — but block
+    /// connection has to happen on the core runtime, exactly as `submitblock`
+    /// does.
     pub async fn bind(
         config: StratumConfig,
         chain: Arc<ChainState>,
         mempool: Arc<Mempool>,
         peers: Option<Arc<PeerManager>>,
+        core: tokio::runtime::Handle,
     ) -> Result<Self, StratumServerError> {
         let listener = TcpListener::bind(config.bind)
             .await
@@ -107,6 +117,7 @@ impl StratumServer {
             chain,
             mempool,
             work,
+            core,
             next_extranonce1: AtomicU32::new(rand::random()),
         });
         Ok(Self { listener, tls, allow, semaphore, shared, peers })

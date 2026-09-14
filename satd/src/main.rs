@@ -3403,6 +3403,8 @@ async fn main() {
             chain_state.clone(),
             mempool.clone(),
             Some(peer_manager.clone()),
+            // `main` runs on the core runtime.
+            tokio::runtime::Handle::current(),
         )
         .await
         {
