@@ -807,12 +807,12 @@ mod tests {
         let declared = check_declaration(&declaration(&work, &payout(1), wtxids(&txs)), payout(1), &work, SUBSIDY, &mempool).unwrap();
         let prev = work.prev_hash.to_byte_array();
         let solve = |nonce| solution_block(&declared, &[3; 8], &prev, work.cur_time, nonce, 0x207fffff, 0x2000_0000);
-        let nonce = (0..).find(|n| solve(*n).is_some()).unwrap();
+        let nonce = (0..1_000).find(|n| solve(*n).is_some()).unwrap();
         let block = solve(nonce).unwrap();
         assert!(block.check_merkle_root());
         assert!(block.check_witness_commitment());
         assert!(block.header.validate_pow(block.header.target()).is_ok());
-        assert!((0..).any(|n| solve(n).is_none()), "a header short of its target assembles nothing");
+        assert!((0..1_000).any(|n| solve(n).is_none()), "a header short of its target assembles nothing");
         assert!(solution_block(&declared, &[3; 4], &prev, work.cur_time, nonce, 0x207fffff, 0x2000_0000).is_none());
         assert!(solution_block(&declared, &[3; 8], &[0; 32], work.cur_time, nonce, 0x207fffff, 0x2000_0000).is_none());
         // An easier nbits than the job's is not the job's block.
