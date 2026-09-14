@@ -917,7 +917,7 @@ mod tests {
         let late = tx(OutPoint { txid: Txid::from_byte_array([5; 32]), vout: 0 }, 5);
         mempool.insert_entry_for_test(late.compute_txid(), late.clone(), FEE);
         index.inner.lock().refreshed = None;
-        let view = MempoolView::for_declaration(&mempool, &index, &wtxids(&[late.clone()]));
+        let view = MempoolView::for_declaration(&mempool, &index, &wtxids(std::slice::from_ref(&late)));
         assert!(view.by_wtxid.contains_key(&late.compute_wtxid()));
         assert_eq!(index.inner.lock().by_txid.len(), 4);
     }
