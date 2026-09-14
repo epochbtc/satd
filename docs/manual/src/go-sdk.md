@@ -357,13 +357,41 @@ transactions.
 
 ## Stability & versioning
 
-The SDK tracks the additive `satd.events.v1` wire schema, not the node's release
-cadence, and **a node and SDK do not need matching versions**. An event kind
-this build predates decodes to `*UnknownEvent`; an unknown enum value is
-preserved with `Known() == false`, so a `Status` from a newer node still routes
-correctly on `Severity` and `Message`.
+The SDK is versioned **with** the node: `clients/go/vX.Y.Z` is cut at the node's
+`vX.Y.Z`, even when no Go code changed, and `satdevents.Version` names it. A
+unit test pins `Version` to the workspace version, so the two cannot drift. Pick
+an SDK whose minor version is at or below your node's. Newer nodes only add:
+an event kind this build predates decodes to `*UnknownEvent`, and an unknown
+enum value is preserved with `Known() == false`, so a `Status` from a newer
+node still routes correctly on `Severity` and `Message`.
 
-Releases are tagged `clients/go/vX.Y.Z`, independently of the node. Because
+Each time `Subscribe` or `Watch` opens a stream, the SDK reads the version the
+node advertises in its `satd-version` response header and compares it with its
+own:
+
+| Node | Result |
+|---|---|
+| Same or newer | Opens silently. |
+| One minor version behind | Opens and logs a warning through `log/slog` (`WithLogger`, default `slog.Default()`), once per client per node version, with attributes `node_version` and `sdk_version`. |
+| Two or more minor versions, or a major version, behind | Refused with `ErrNodeTooOld`. |
+| Different event schema | Refused with `ErrSchemaMismatch`. |
+
+A node older than 0.6.0 sends no header and counts as 0.5. The warning means
+"upgrade the node": features added after the node's release are unavailable,
+and request fields it does not recognise are ignored. For a rolling upgrade
+where clients go first, `WithAllowOldNode()` turns `ErrNodeTooOld` into the same
+warning. Nothing bypasses a schema mismatch. Both errors are non-retryable, so
+the resilient layers return them from `Next` instead of reconnecting.
+`Client.NodeVersion()` returns what the node last advertised. The full rule is
+in
+[`STABILITY_POLICY.md`](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md#streaming-api--sdk-compatibility).
+
+`Watch` waits for the node's response headers before returning, as `Subscribe`
+already did. satd sends them as soon as the stream is set up, so a quiet
+watch-set does not hold it up.
+
+The first tag under this scheme is `clients/go/v0.6.0`; the previous tag was
+`clients/go/v0.1.0`, shipped with node 0.5.0. Because
 there is no `go.mod` at the repository root, the node's own `vX.Y.Z` tags do not
 collide, and the module proxy serves consumers a zip of the module subtree only
 — importing this SDK does not pull the Rust tree.

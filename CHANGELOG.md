@@ -29,6 +29,7 @@ item below is (or will be) written up in full in the in-development
 - A status page on the metrics listener, `statuspage=1`: a single-page, self-refreshing `sat-tui` for a browser, with connection strings from `statusadvertise`. Off by default (#749).
 - Streaming API: `Subscribe`/`Watch` responses carry `satd-version` and `satd-events-schema` gRPC headers; `STABILITY_POLICY.md` now states the SDK ↔ node compatibility rule.
 - Rust SDK: warns when the node is one minor version behind, refuses two or more (`StreamError::NodeTooOld`, override `allow_old_node()`) and any schema mismatch (`StreamError::SchemaMismatch`); `StreamClient::node_version()`.
+- Go SDK: the same check (`ErrNodeTooOld`, `WithAllowOldNode`, `ErrSchemaMismatch`, `WithLogger`, `Client.NodeVersion`); `Watch` now waits for response headers; the module is versioned with the node (`satdevents.Version`), next tag `clients/go/v0.6.0`.
 - The Umbrel and StartOS packages open onto the status page, and the appliance turns it on; Umbrel publishes Esplora over TLS on 8431; the reference stack and the appliance serve metrics and the status page over native TLS on 9336 (#750).
 
 ### Fixed

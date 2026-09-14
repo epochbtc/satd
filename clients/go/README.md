@@ -147,14 +147,30 @@ graph of an application that imports the SDK.
 
 ## Compatibility
 
-The SDK tracks the additive `satd.events.v1` wire schema, not the node's release
-cadence: **a node and SDK do not need matching versions.** New event kinds and
-optional fields are added without breaking existing consumers — an event this
-build predates decodes to `UnknownEvent` rather than an error, and unknown enum
-values are preserved with `Known() == false` so `Severity` and `Message` stay
-usable.
+The SDK is versioned **with** the node: `clients/go/vX.Y.Z` is cut at the node's
+`vX.Y.Z`, even when no Go code changed, and `satdevents.Version` names it. Use
+an SDK whose minor version is at or below your node's. Newer nodes only add
+event kinds and optional fields: an event this build predates decodes to
+`UnknownEvent` rather than an error, and unknown enum values are preserved with
+`Known() == false` so `Severity` and `Message` stay usable.
 
-Releases are tagged `clients/go/vX.Y.Z`, independently of the node's `vX.Y.Z`.
+Each time `Subscribe` or `Watch` opens a stream, the SDK compares the node's
+advertised version (`satd-version` response header) with its own:
+
+- same or newer node: silent;
+- one minor version behind: a warning through `log/slog` (`WithLogger`,
+  default `slog.Default()`), once per node version, which means *upgrade the
+  node*;
+- two or more minor versions, or a major version, behind: `ErrNodeTooOld`,
+  unless dialled with `WithAllowOldNode()`, which turns it into the warning;
+- a different event schema: `ErrSchemaMismatch`, always.
+
+A node older than 0.6.0 sends no header and counts as 0.5. `Client.NodeVersion()`
+reports what the node advertised. The rule is written down in
+[`STABILITY_POLICY.md`](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md#streaming-api--sdk-compatibility).
+
+The first tag under this scheme is `clients/go/v0.6.0`; the one before it was
+`clients/go/v0.1.0`, shipped with node 0.5.0.
 The module stays within v0/v1: Go's semantic import versioning makes `v2+` a
 breaking import-path change, so the bar for v1 is "we can live with this API".
 

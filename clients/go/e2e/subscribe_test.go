@@ -41,6 +41,34 @@ func TestSubscribeDeliversBlockConnected(t *testing.T) {
 	}
 }
 
+// TestStreamsLearnTheNodeVersion: a live node advertises its version on both
+// streams and the SDK accepts it without a warning or refusal - the node under
+// test is built from the same tree, so the versions are equal. The Watch opens
+// with no registrations, so it also proves Watch does not wait for an event
+// before returning.
+func TestStreamsLearnTheNodeVersion(t *testing.T) {
+	n := startNode(t)
+
+	client := n.dial(t)
+	if got := client.NodeVersion(); got != "" {
+		t.Fatalf("NodeVersion() = %q before any stream", got)
+	}
+	if _, err := client.Subscribe(ctxWithTimeout(t, 30), satdevents.SubscribeOptions{}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if got := client.NodeVersion(); got != satdevents.Version {
+		t.Errorf("after Subscribe, NodeVersion() = %q, want %q", got, satdevents.Version)
+	}
+
+	quiet := n.dial(t)
+	if _, _, err := quiet.Watch(ctxWithTimeout(t, 30)); err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	if got := quiet.NodeVersion(); got != satdevents.Version {
+		t.Errorf("after Watch, NodeVersion() = %q, want %q", got, satdevents.Version)
+	}
+}
+
 // TestSubscribeDeliversMempoolLifecycle proves the mempool category end to end:
 // a broadcast produces MempoolEnter with real fee/vsize, and mining it produces
 // MempoolLeaveConfirmed at the confirming height.

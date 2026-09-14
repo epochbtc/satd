@@ -81,12 +81,27 @@ type WatchHandle struct {
 // Adding watches requires the stream:watch capability when the server enforces
 // auth. Cancelling ctx terminates the stream.
 func (c *Client) Watch(ctx context.Context) (*WatchHandle, *Stream, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	sc, err := c.rpc.Watch(c.authed(ctx))
 	if err != nil {
+		cancel()
 		return nil, nil, fromStatus(err)
 	}
+	// Wait for the response headers, which carry the node version. satd sends
+	// them as soon as it has set the stream up, before any control message or
+	// event, so a quiet watch-set does not hold this up; the Rust SDK has always
+	// waited for exactly these headers on watch(). The wait is bounded by ctx.
+	md, err := sc.Header()
+	if err != nil {
+		cancel()
+		return nil, nil, fromStatus(err)
+	}
+	if err := c.checkCompat(md); err != nil {
+		cancel()
+		return nil, nil, err
+	}
 	h := &WatchHandle{stream: sc, sendLock: make(chan struct{}, 1)}
-	return h, &Stream{recv: sc.Recv}, nil
+	return h, &Stream{recv: sc.Recv, cancel: cancel}, nil
 }
 
 // Close stops sending on the watch stream. The server tears the stream (and its

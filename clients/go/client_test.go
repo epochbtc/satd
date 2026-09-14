@@ -276,7 +276,8 @@ func TestTransportCredentialsRejectGarbagePEM(t *testing.T) {
 func TestStreamCapturesTheDurableCursor(t *testing.T) {
 	msgs := []*eventspb.NodeEvent{
 		{
-			Cursor: &eventspb.Cursor{Height: 5, TxIndex: 2},
+			SchemaVersion: schemaVersion,
+			Cursor:        &eventspb.Cursor{Height: 5, TxIndex: 2},
 			Body: &eventspb.NodeEvent_Chain{Chain: &eventspb.ChainEvent{
 				Body: &eventspb.ChainEvent_BlockConnected{BlockConnected: &eventspb.BlockConnected{Height: 5}},
 			}},

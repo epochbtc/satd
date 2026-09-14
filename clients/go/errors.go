@@ -74,6 +74,16 @@ const (
 	// credential on the wire in the clear; use TLS, or [WithInsecureBearerToken]
 	// to accept the risk explicitly.
 	KindInsecureCredential
+	// KindNodeTooOld is a node two or more minor versions (or a major version)
+	// older than this SDK. Features the SDK was built against may be missing and
+	// request fields the node does not recognise would be silently ignored, so
+	// the stream is refused. Upgrade the node, or pass [WithAllowOldNode] to log
+	// a warning instead. Not retryable.
+	KindNodeTooOld
+	// KindSchemaMismatch is a node speaking a different event schema version
+	// than this SDK. Always refused; [WithAllowOldNode] does not apply. Not
+	// retryable.
+	KindSchemaMismatch
 )
 
 // Sentinels for [errors.Is]. `errors.Is(err, ErrUnauthenticated)` is true for
@@ -94,6 +104,8 @@ var (
 	ErrControlClosed        = errors.New("satdevents: control channel closed")
 	ErrWatchSetLoaderFailed = errors.New("satdevents: watch-set loader failed")
 	ErrInsecureCredential   = errors.New("satdevents: insecure credential")
+	ErrNodeTooOld           = errors.New("satdevents: node too old")
+	ErrSchemaMismatch       = errors.New("satdevents: schema mismatch")
 )
 
 // sentinelsByKind maps each class to its sentinel, for Error's Is and Error
@@ -114,6 +126,8 @@ var sentinelsByKind = map[ErrorKind]error{
 	KindControlClosed:        ErrControlClosed,
 	KindWatchSetLoader:       ErrWatchSetLoaderFailed,
 	KindInsecureCredential:   ErrInsecureCredential,
+	KindNodeTooOld:           ErrNodeTooOld,
+	KindSchemaMismatch:       ErrSchemaMismatch,
 }
 
 // Error is the SDK's error type. Match its class with [errors.Is] against a
@@ -138,6 +152,12 @@ type Error struct {
 	// Bits, MinBits, and MaxBits carry the rejected prefix width and the
 	// server's accepted range. Only meaningful for KindPrefixBitsOutOfRange.
 	Bits, MinBits, MaxBits uint32
+	// NodeVersion is the version the node advertised ("" when it sent none).
+	// Only meaningful for KindNodeTooOld.
+	NodeVersion string
+	// NodeSchema is the event schema version the node advertised (0 when it
+	// sent something unparseable). Only meaningful for KindSchemaMismatch.
+	NodeSchema uint32
 
 	err error
 }
@@ -165,6 +185,8 @@ func (e *Error) Is(target error) bool { return target == sentinelFor(e.Kind) }
 // conditions - bad endpoint or token, PERMISSION_DENIED, client-side argument
 // errors. Unauthenticated is reported non-retryable on purpose: a blind retry
 // with the same token will not help; re-auth and reconnect deliberately.
+// NodeTooOld and SchemaMismatch are non-retryable: reconnecting to the same node
+// gives the same answer.
 func (e *Error) Retryable() bool {
 	switch e.Kind {
 	case KindConnect, KindRateLimited, KindQuotaExhausted:
