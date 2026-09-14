@@ -459,6 +459,12 @@ the taxonomy and the details each event carries.
 |---|---|---|---|---|
 | `metricsport` | none | restart | satd | Enable Prometheus `/metrics` + `/healthz` + `/readyz` on this port (unauthenticated). |
 | `metricsbind` | `127.0.0.1` | restart | satd | Metrics/health HTTP bind address. |
+| `metricstlsbind` | none | restart | satd | Also serve the metrics/health endpoints over TLS on this `addr:port` (requires `metricsport`, cert and key). |
+| `metricstlscert` | none | restart | satd | PEM certificate for the metrics TLS listener. |
+| `metricstlskey` | none | restart | satd | PEM private key for the metrics TLS listener. |
+| `metricsmtls` | false | restart | satd | Require a client certificate on the metrics TLS listener (requires `metricsmtlsclientca`). |
+| `metricsmtlsclientca` | none | restart | satd | PEM CA bundle client certs must chain to when `metricsmtls=1`. |
+| `metricsmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values on the metrics TLS listener. |
 
 ---
 

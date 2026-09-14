@@ -15,6 +15,10 @@ Bound for **0.6.0**, a minor release on the 0.x line. This is an index: every
 item below is (or will be) written up in full in the in-development
 [`docs/release-notes/0.6.0-pre.md`](docs/release-notes/0.6.0-pre.md).
 
+### Added
+
+- The metrics and health endpoints can be served over TLS on a second port (`-metricstlsbind`), with optional client certificates (`-metricsmtls`), so Prometheus can scrape a node across a network without a reverse proxy.
+
 ### Fixed
 
 - `verificationprogress` in `getblockchaininfo` and `getchainstates` is Bitcoin Core's transaction-count estimate, equal to Core's; it was the tip's timestamp over the current time and read 0.69 at genesis (#744).

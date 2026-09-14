@@ -10,6 +10,9 @@
 //! The listener is intentionally unauthenticated: these are operator-only
 //! signals, and adding auth would break the Prometheus scrape and k8s probe
 //! ecosystems. Bind to loopback or a trusted network; firewall externally.
+//! For a network-facing scrape, `--metricstlsbind` serves the same endpoints
+//! over TLS on a second listener ([`serve_metrics_https`]), where a client
+//! certificate (`--metricsmtls`) is the access control Prometheus supports.
 //!
 //! Metric schema: `satd_*` prefix, Prometheus conventions (`_bytes` /
 //! `_seconds` / `_total` / `_ratio`). The schema is a stability commitment —
