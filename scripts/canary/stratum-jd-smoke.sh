@@ -66,8 +66,11 @@ echo "Stratum V2 with Job Declaration on $V2"
 # ── Bitcoin Core: peered with satd, serving templates over IPC ──
 mkdir -p "$WORK/core"
 chmod 777 "$WORK/core"
+# `bitcoin -m node` is the multiprocess node, which serves IPC; the image's
+# entrypoint would start plain bitcoind. By name, not path: the image's
+# install directory carries the version, and moves with every pin bump.
 docker run -d --name "$CORE_CONTAINER" --network=host -v "$WORK/core:/data" \
-    --entrypoint /opt/bitcoin-31.1/bin/bitcoin "$STRATUM_CORE_IMAGE" \
+    --entrypoint bitcoin "$STRATUM_CORE_IMAGE" \
     -m node -regtest -datadir=/data -server -ipcbind=unix \
     -connect="127.0.0.1:$SATD_P2P_PORT" -listen=0 -rpcport="$CORE_RPC_PORT" \
     -fallbackfee=0.0001 >/dev/null
