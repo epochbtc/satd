@@ -50,6 +50,7 @@ pub fn get_metrics_snapshot(ctx: &McpContext) -> String {
         filter_enabled: ctx.filter_enabled,
         health: ctx.health.clone(),
         webhooks: ctx.webhooks.clone(),
+        status: None,
     };
     let body = metrics_ctx.render_prometheus();
     let result = json!({
@@ -88,6 +89,7 @@ pub fn get_readiness(ctx: &McpContext) -> String {
         // consulted, so there is nothing to thread through here.
         health: None,
         webhooks: None,
+        status: None,
     };
     let (ready, reason) = match metrics_ctx.is_ready() {
         Ok(()) => (true, None),

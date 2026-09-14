@@ -193,6 +193,42 @@ impl IbdEtaEstimator {
     }
 }
 
+/// How much of the work between heights `from` and `target` is done once the
+/// chain reaches `current`, weighted by the same cost table as the ETA.
+///
+/// A height ratio overstates progress for most of a mainnet sync: early blocks
+/// are nearly empty, so `current / target` passes one half with a small
+/// fraction of the work behind it. Heights are block counts here, so the
+/// block at `current` is counted as done. Test networks use flat weights, and
+/// there this is the height ratio.
+pub fn weighted_progress(from: u32, current: u32, target: u32, mainnet: bool) -> f64 {
+    if target <= from {
+        return 1.0;
+    }
+    let current = current.clamp(from, target);
+    let total = weight_between(from, target, mainnet);
+    if total <= 0.0 {
+        return 1.0;
+    }
+    (weight_between(from, current, mainnet) / total).clamp(0.0, 1.0)
+}
+
+/// Summed per-block weight over heights `[a, b)`, prorating the intervals at
+/// either end.
+fn weight_between(a: u32, b: u32, mainnet: bool) -> f64 {
+    if b <= a {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in (a / INTERVAL)..=((b - 1) / INTERVAL) {
+        let lo = (i * INTERVAL).max(a);
+        let hi = ((i + 1) * INTERVAL).min(b);
+        let w = if mainnet { f64::from(mainnet_weight(i as usize)) } else { 1.0 };
+        sum += w * f64::from(hi - lo) / f64::from(INTERVAL);
+    }
+    sum
+}
+
 /// Format an ETA in seconds to a human-readable string.
 pub fn format_eta(secs: u64) -> String {
     if secs < 60 {
@@ -302,6 +338,32 @@ mod tests {
         let eta = est.estimate_eta(10_000, 100_000).unwrap();
         // Flat weights: 90 remaining intervals * 1.0s each = 90s
         assert!((85..=95).contains(&eta), "eta={eta}s, expected ~90");
+    }
+
+    #[test]
+    fn weighted_progress_trails_the_height_ratio_on_mainnet() {
+        // Half the heights of a 900k chain is a small share of its work.
+        let p = weighted_progress(0, 450_000, 900_000, true);
+        assert!(p < 0.25, "p={p}");
+        // Flat weights on a test network: the height ratio.
+        let flat = weighted_progress(0, 450_000, 900_000, false);
+        assert!((flat - 0.5).abs() < 1e-9, "flat={flat}");
+    }
+
+    #[test]
+    fn weighted_progress_bounds() {
+        assert_eq!(weighted_progress(0, 0, 900_000, true), 0.0);
+        assert_eq!(weighted_progress(0, 900_000, 900_000, true), 1.0);
+        assert_eq!(weighted_progress(0, 950_000, 900_000, true), 1.0);
+        assert_eq!(weighted_progress(10, 5, 900_000, true), 0.0);
+        assert_eq!(weighted_progress(900_000, 900_000, 900_000, true), 1.0);
+        // Monotone in `current`, across interval boundaries.
+        let mut last = 0.0;
+        for h in (0..900_000).step_by(777) {
+            let p = weighted_progress(0, h, 900_000, true);
+            assert!(p >= last, "not monotone at {h}: {p} < {last}");
+            last = p;
+        }
     }
 
     #[test]

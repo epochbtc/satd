@@ -239,6 +239,15 @@ impl ServerListenerStatus {
     fn snapshot(&self) -> ServerListenerStatusInner {
         self.inner.read().clone()
     }
+    /// Whether Esplora is bound and serving.
+    pub fn esplora_serving(&self) -> bool {
+        self.inner.read().esplora.is_some()
+    }
+    /// Whether the Electrum server is bound, on its plain or TLS listener.
+    pub fn electrum_serving(&self) -> bool {
+        let inner = self.inner.read();
+        inner.electrum.is_some() || inner.electrum_tls.is_some()
+    }
 }
 
 /// TLS settings for the JSON-RPC server.
