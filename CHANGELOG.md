@@ -33,7 +33,7 @@ item below is (or will be) written up in full in the in-development
 - The Umbrel and StartOS packages open onto the status page, and the appliance turns it on; Umbrel publishes Esplora over TLS on 8431; the reference stack and the appliance serve metrics and the status page over native TLS on 9336 (#750).
 - **Stratum V1 solo-mining server** (`--stratum=1`): miners connect to the node directly; the username is the payout address. Loopback by default, TLS/mTLS listener, refused on signet (#746).
 - **Stratum V2** on the same server (`--stratumv2bind`): Noise NX transport, standard and extended channels, and an authority key persisted at `<datadir>/stratum_v2.key` so miners that pin it survive a restart (#748).
-- **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC.
+- **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC (#751).
 
 ### Fixed
 
