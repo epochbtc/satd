@@ -47,17 +47,14 @@ website: https://github.com/epochbtc/satd
 dependencies: []
 repo: https://github.com/epochbtc/satd
 support: https://github.com/epochbtc/satd/issues
-# satd 0.5.2 has no web UI. The Esplora REST API is what a browser can
-# usefully open, and the app's description points at `sat-tui` for an actual
-# dashboard. The status page satd gains in 0.6.0 replaces this.
-#
-# The host port app_proxy binds. 8430, not the 3001 this used to be: Ride The
-# Lightning owns 3001, and a manifest port shares one host port space with
-# every port any app publishes. 8430–8439 is otherwise unused in the store;
-# the published ports in exports.sh sit in the same block.
+# The host port app_proxy binds, in front of satd's status page. 8430, not
+# the 3001 this used to be: Ride The Lightning owns 3001, and a manifest port
+# shares one host port space with every port any app publishes. 8430–8439 is
+# otherwise unused in the store; the published ports in exports.sh sit in the
+# same block.
 port: 8430
 gallery: []
-path: "/api/blocks/tip/height"
+path: "/status"
 # A community store may host its own icon; the official store hosts its own
 # and wants this unset. Pinned to the release tag so a later change on master
 # cannot alter an already-published listing.

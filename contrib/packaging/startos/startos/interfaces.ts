@@ -13,12 +13,15 @@ import {
   mcpHostId,
   mcpInterfaceId,
   mcpPort,
+  metricsPort,
   p2pPorts,
   peerHostId,
   peerInterfaceId,
   rpcHostId,
   rpcInterfaceId,
   rpcPort,
+  statusHostId,
+  statusInterfaceId,
 } from './utils'
 
 /**
@@ -187,7 +190,36 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
     query: {},
   })
 
+  // --- Status page --------------------------------------------------------
+  // satd's status page, on its metrics listener, as this service's UI: what
+  // "Launch UI" opens. Plain HTTP inward, TLS from the OS outward, like RPC
+  // and Esplora. satd-init turns the page on (main.ts) with no
+  // statusadvertise: StartOS shows every interface's addresses itself, and
+  // remaps ports, so satd could only guess wrong.
+  //
+  // The same listener serves /metrics, /healthz and /readyz, which become
+  // reachable through this address too. None carries anything secret.
+  const statusOrigin = await sdk.MultiHost.of(effects, statusHostId).bindPort(
+    metricsPort,
+    {
+      protocol: 'http',
+      preferredExternalPort: metricsPort,
+    },
+  )
+  const status = sdk.createInterface(effects, {
+    name: i18n('Status'),
+    id: statusInterfaceId,
+    description: i18n('Sync progress, indexes, wallet readiness, mempool and peers'),
+    type: 'ui',
+    masked: false,
+    schemeOverride: null,
+    username: null,
+    path: '/status',
+    query: {},
+  })
+
   return [
+    await statusOrigin.export([status]),
     await rpcOrigin.export([rpc]),
     await electrumOrigin.export([electrum]),
     await esploraOrigin.export([esplora]),

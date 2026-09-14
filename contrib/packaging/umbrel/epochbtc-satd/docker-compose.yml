@@ -18,32 +18,27 @@ version: "3.7"
 #
 # The tag is bare. The registry has never published a `v`-prefixed tag.
 #
-# 0.5.2 is the first release whose image carries satd-init; before it this
-# pinned a per-commit `sha-` tag. Bumping both halves is a step in the release
-# checklist, and `contrib/packaging/sync-store.sh` refuses a pin whose tag does
-# not match the manifest's `version`.
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.5.2@sha256:70d73fd51eded5be17272d1065b5409d6b296661c6bcee2e38b517ed505a595a
+# Between releases this pins a master commit's `sha-` image, which docker.yml
+# publishes unsigned for exactly this: the status page this package opens
+# onto first ships in 0.6.0. `contrib/packaging/sync-store.sh` refuses a
+# `sha-` pin, so it cannot reach the store; when 0.6.0 is released, pin that
+# tag and bump `version` with it (a step in the release checklist).
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-e7665f3@sha256:177d037aedde5c87e858398cf0358bc17ad675dafe438d8c52ddec126f39b3e9
 
 services:
   app_proxy:
     environment:
       APP_HOST: epochbtc-satd_server_1
-      # 3000, Esplora's plaintext listener — not 3001, its TLS one. Umbrel's
-      # app_proxy always dials its upstream as `http://`, with no option to do
-      # otherwise, so pointing it at a TLS port gets a ServerHello where node's
-      # HTTP parser wants a status line: every request 502s with
-      # `Parse Error: Expected HTTP/ [HPE_INVALID_CONSTANT]`.
+      # satd's status page, on the metrics listener. Plain HTTP on purpose:
+      # Umbrel's app_proxy always dials its upstream as `http://`, with no
+      # option to do otherwise, so a TLS port 502s every request. The hop is
+      # container-to-container on the app network, and the proxy terminates
+      # TLS for the browser.
       #
-      # Plaintext is correct here rather than merely tolerable. This hop is
-      # container-to-container on the app network, which is the same place
-      # satd.conf.tmpl already puts the other plain listeners, and the proxy is
-      # what terminates TLS for the browser. Esplora's TLS listener is not
-      # published; LAN clients that want TLS use Electrum or RPC below.
-      APP_PORT: 3000
-      # Esplora serves public chain data and is unauthenticated by design, like
-      # every public Esplora deployment — putting Umbrel's login in front of it
-      # would break API clients rather than protect anything.
-      PROXY_AUTH_ADD: "false"
+      # Umbrel's login stays in front of it (no PROXY_AUTH_ADD), which also
+      # covers /metrics on the same listener. The page is built to be safe with
+      # nothing in front of it, so this is belt and braces, not a secret.
+      APP_PORT: 9332
 
   init:
     image: *satd-image
@@ -81,6 +76,15 @@ services:
       # over mDNS, and the certificate has to carry that name or every LAN
       # client sees a mismatch.
       SATD_TLS_HOSTNAME: ${DEVICE_HOSTNAME:-umbrel}
+      # The status page, and the connection strings it shows. Umbrel publishes
+      # every port 1:1, so the device's name and satd's own ports are exactly
+      # what a wallet on the LAN dials.
+      SATD_STATUSPAGE: "1"
+      SATD_STATUS_ADVERTISE: >-
+        electrum=ssl://${DEVICE_DOMAIN_NAME:-umbrel.local}:${APP_SATD_ELECTRUM_TLS_PORT}
+        esplora=https://${DEVICE_DOMAIN_NAME:-umbrel.local}:${APP_SATD_ESPLORA_TLS_PORT}/api
+        rpc=https://${DEVICE_DOMAIN_NAME:-umbrel.local}:${APP_SATD_RPC_TLS_PORT}
+        mcp=https://${DEVICE_DOMAIN_NAME:-umbrel.local}:${APP_SATD_MCP_PORT}/
       # No SATD_P2P_PORT. satd-init only accepts the chain's standard port
       # there, and this package listens on its own (see `ports:` below); the
       # server's --port overrides the rendered config instead.
@@ -106,6 +110,7 @@ services:
       - --port=${APP_SATD_P2P_PORT}
       - --rpctlsbind=0.0.0.0:${APP_SATD_RPC_TLS_PORT}
       - --electrumtlsbind=0.0.0.0:${APP_SATD_ELECTRUM_TLS_PORT}
+      - --esploratlsbind=0.0.0.0:${APP_SATD_ESPLORA_TLS_PORT}
       - --mcpport=${APP_SATD_MCP_PORT}
     # No SATD_HEALTH_URL, so the image's own HEALTHCHECK probes JSON-RPC
     # liveness rather than readiness. /readyz is 503 until the tip is within
@@ -115,12 +120,9 @@ services:
     # state to the user, so the whole initial sync would look like a fault.
     volumes:
       - ${APP_DATA_DIR}/data:/var/lib/satd
-    # Esplora's TLS listener is deliberately NOT here. app_proxy is how a
-    # browser reaches Esplora, over the app network, which is exactly what
-    # APP_HOST/APP_PORT above already say.
-    #
-    # The rest are published on purpose: they are the LAN-facing surfaces,
-    # each TLS-terminated by satd itself, and app_proxy fronts only one port.
+    # These are the LAN-facing surfaces, each TLS-terminated by satd itself.
+    # app_proxy fronts only the status page, so Esplora is published here
+    # rather than through it.
     #
     # Every one is mapped 1:1 onto a port no other app in the Umbrel store
     # uses, and satd listens on that same number. The standard ports belong to
@@ -134,6 +136,7 @@ services:
       - "${APP_SATD_P2P_PORT}:${APP_SATD_P2P_PORT}"
       - "${APP_SATD_RPC_TLS_PORT}:${APP_SATD_RPC_TLS_PORT}"
       - "${APP_SATD_ELECTRUM_TLS_PORT}:${APP_SATD_ELECTRUM_TLS_PORT}"
+      - "${APP_SATD_ESPLORA_TLS_PORT}:${APP_SATD_ESPLORA_TLS_PORT}"
       - "${APP_SATD_MCP_PORT}:${APP_SATD_MCP_PORT}"
     stop_grace_period: 10m
     restart: on-failure

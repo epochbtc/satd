@@ -183,6 +183,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          # compose-test.sh reads the commit a package's `sha-` image pin
+          # names, to check that satd has the status page.
+          fetch-depth: 0
       - name: mkca.sh
         run: contrib/stack/tests/mkca-test.sh
       - name: satd-healthcheck

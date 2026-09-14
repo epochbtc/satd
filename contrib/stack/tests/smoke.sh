@@ -87,6 +87,7 @@ export PROXY_METRICS_PORT=$((PORT_BASE + 5))
 export LND_P2P_PORT=$((PORT_BASE + 6))
 export LND_REST_PORT=$((PORT_BASE + 7))
 export PROXY_BTCPAY_PORT=$((PORT_BASE + 8))
+export SATD_METRICS_TLS_PORT=$((PORT_BASE + 9))
 # Required by compose.lightning.yml, and asserted on below: RTL falls back to
 # the literal password "password" if this does not reach it.
 export RTL_PASSWORD="smoke-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -219,6 +220,22 @@ if grep -q "Verification: OK" <<< "$out"; then
     fail "an untrusted client is rejected" "handshake succeeded without the CA"
 else
     pass "an untrusted client is rejected"
+fi
+
+# --- metrics over TLS -------------------------------------------------------
+# satd-init writes the listener only for a satd that has it, so an image that
+# predates it is a skip, not a failure.
+if compose exec -T satd satd --help 2>/dev/null | grep -q -- '--metricstlsbind'; then
+    code="$(curl -sS --cacert "$CA" --resolve "localhost:$SATD_METRICS_TLS_PORT:127.0.0.1" \
+        -o "$WORK/healthz" -w '%{http_code}' \
+        "https://localhost:$SATD_METRICS_TLS_PORT/healthz" 2>&1 || true)"
+    if [[ "$code" == "200" ]]; then
+        pass "metrics answer over TLS, verified against the CA"
+    else
+        fail "metrics answer over TLS, verified against the CA" "http $code: $(cat "$WORK/healthz" 2>/dev/null)"
+    fi
+else
+    echo "  skip  metrics over TLS (this satd predates it)"
 fi
 
 # --- RPC over TLS, end to end ----------------------------------------------

@@ -80,6 +80,10 @@ services:
       - "${SATD_RPC_TLS_PORT:-8336}:8336"
       - "${SATD_ELECTRUM_TLS_PORT:-50002}:50002"
       - "${SATD_ESPLORA_TLS_PORT:-3001}:3001"
+      # Metrics, health and the status page over TLS. satd-init configures
+      # it only for a satd that has it (0.6.0 on); with an older image this
+      # port is published but nothing answers.
+      - "${SATD_METRICS_TLS_PORT:-9336}:9336"
     networks:
       satd:
         aliases:

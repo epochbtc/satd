@@ -111,6 +111,7 @@ RPC_TLS=$((PORT_BASE + 0))
 ELECTRUM_TLS=$((PORT_BASE + 1))
 ESPLORA_TLS=$((PORT_BASE + 2))
 MCP_TLS=$((PORT_BASE + 3))
+METRICS_TLS=$((PORT_BASE + 4))
 
 cleanup() {
     if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
@@ -244,7 +245,7 @@ fi
     "${MACHINE_ARGS[@]}" \
     -m "$MEMORY" -smp "$CPUS" \
     -drive "file=$WORK/overlay.qcow2,if=virtio,format=qcow2" \
-    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$RPC_TLS-:8336,hostfwd=tcp:127.0.0.1:$ELECTRUM_TLS-:50002,hostfwd=tcp:127.0.0.1:$ESPLORA_TLS-:3001,hostfwd=tcp:127.0.0.1:$MCP_TLS-:8339" \
+    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$RPC_TLS-:8336,hostfwd=tcp:127.0.0.1:$ELECTRUM_TLS-:50002,hostfwd=tcp:127.0.0.1:$ESPLORA_TLS-:3001,hostfwd=tcp:127.0.0.1:$MCP_TLS-:8339,hostfwd=tcp:127.0.0.1:$METRICS_TLS-:9336" \
     -device virtio-net-pci,netdev=n0 \
     -chardev "socket,path=$QGA_SOCK,server=on,wait=off,id=qga0" \
     -device virtio-serial \
@@ -357,6 +358,21 @@ else
     fail "the node mines and reports height 5" "height is '$HEIGHT'"
 fi
 
+# --- the status page --------------------------------------------------------
+# configure-network turns it on, and satd-init writes it only for a satd that
+# has it: an image built from a release that predates the page must still
+# boot, so that case is a skip, not a failure.
+if guest 'satd --help 2>/dev/null | grep -q -- --statuspage' > /dev/null 2>&1; then
+    page="$(guest 'curl -s http://127.0.0.1:9332/status.json' 2>/dev/null || true)"
+    if grep -q '"blocks":5' <<< "$page"; then
+        pass "the status page reports height 5"
+    else
+        fail "the status page reports height 5" "${page:0:400}"
+    fi
+else
+    echo "skip — the status page (this satd predates it)"
+fi
+
 # --- TLS, from outside the guest -------------------------------------------
 CA="$WORK/ca.crt"
 guest 'cat /var/lib/satd/tls/ca.crt' > "$CA" 2>/dev/null || true
@@ -381,6 +397,22 @@ probe_tls "JSON-RPC" "$RPC_TLS"
 probe_tls "Electrum" "$ELECTRUM_TLS"
 probe_tls "Esplora" "$ESPLORA_TLS"
 probe_tls "MCP" "$MCP_TLS"
+
+# The status page from another machine: satd's metrics TLS listener, through
+# the firewall, verified against the CA. Skipped for a satd without it, as the
+# in-guest status page check above is.
+if guest 'satd --help 2>/dev/null | grep -q -- --metricstlsbind' > /dev/null 2>&1; then
+    probe_tls "metrics" "$METRICS_TLS"
+    page="$(curl -sS --cacert "$CA" --resolve "satd:$METRICS_TLS:127.0.0.1" \
+        "https://satd:$METRICS_TLS/status.json" 2>&1 || true)"
+    if grep -q '"blocks":5' <<< "$page"; then
+        pass "the status page is reachable over TLS from outside the guest"
+    else
+        fail "the status page is reachable over TLS from outside the guest" "${page:0:400}"
+    fi
+else
+    echo "skip — metrics over TLS (this satd predates it)"
+fi
 
 # Negative control: without the CA the same handshake must fail. Otherwise
 # the four checks above prove only that something is listening on the port.

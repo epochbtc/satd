@@ -8,6 +8,7 @@ REST API from the same process.
 
 | Interface | What it is for |
 |---|---|
+| **Status** | This service's UI: whether the node is syncing or ready, sync progress, each index and whether a wallet can connect yet, the latest block, the mempool and peers. It refreshes itself. |
 | **RPC** | Bitcoin Core-compatible JSON-RPC, with cookie authentication. Other services on this server reach it over the container bridge; you reach it from your LAN over TLS. |
 | **Electrum** | For Sparrow, Electrum, BlueWallet and Zeus. Point the wallet at the Electrum address on the Interfaces tab. |
 | **Esplora** | Blockstream-compatible REST API under `/api`. |

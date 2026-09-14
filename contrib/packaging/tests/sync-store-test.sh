@@ -28,6 +28,16 @@ mkdir -p "$satd/contrib/stack/satd"
 cp -r "$ROOT/contrib/packaging" "$satd/contrib/"
 cp "$ROOT/contrib/stack/satd/satd-init" "$satd/contrib/stack/satd/"
 rm -rf "$satd/contrib/packaging/startos/node_modules" "$satd/contrib/packaging/startos/javascript"
+# The real tree may pin a master `sha-` image between releases, which
+# sync-store.sh rightly refuses. The fixture pins the release its package
+# versions name, so the syncs that must succeed can, whatever is checked in.
+umbrel_version="$(sed -n 's/^version: "\(.*\)"$/\1/p' "$satd/contrib/packaging/umbrel/epochbtc-satd/umbrel-app.yml")"
+startos_version="$(sed -n "s/^ *version: '\([0-9.]*\):[0-9]*',$/\1/p" "$satd/contrib/packaging/startos/startos/versions/current.ts")"
+[[ -n "$umbrel_version" && -n "$startos_version" ]] || { echo "sync-store-test.sh: cannot read the package versions" >&2; exit 1; }
+sed -i "s|ghcr.io/epochbtc/satd:[^@]*@|ghcr.io/epochbtc/satd:$umbrel_version@|" \
+    "$satd/contrib/packaging/umbrel/epochbtc-satd/docker-compose.yml"
+sed -i "s|ghcr.io/epochbtc/satd:[^@]*@|ghcr.io/epochbtc/satd:$startos_version@|" \
+    "$satd/contrib/packaging/startos/startos/manifest/index.ts"
 git_q -C "$satd" init -q
 git_q -C "$satd" add -A
 git_q -C "$satd" commit -qm base

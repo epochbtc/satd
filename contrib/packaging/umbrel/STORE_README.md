@@ -15,7 +15,8 @@ its own host ports:
 
 | Port | Surface |
 |---|---|
-| 8430 | The app page, through Umbrel's proxy |
+| 8430 | The status page, through Umbrel's proxy |
+| 8431 | Esplora, TLS |
 | 8433 | Bitcoin P2P |
 | 50012 | Electrum, TLS |
 | 8436 | JSON-RPC, TLS |
