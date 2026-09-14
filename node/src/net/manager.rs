@@ -2414,7 +2414,11 @@ impl PeerManager {
     /// header height received from peers, or when no headers have been received.
     fn is_ibd(&self) -> bool {
         let tip = self.chain_state.tip_height();
-        let htip = self.headers_tip.load(Ordering::Relaxed) as u32;
+        // The best header is at least our own tip. `headers_tip` only moves
+        // when a peer sends headers, so a node that mined its own chain still
+        // reads 0 there; taken alone, that node would count itself in IBD
+        // forever and ignore every transaction a peer announces.
+        let htip = (self.headers_tip.load(Ordering::Relaxed) as u32).max(tip);
         htip == 0 || tip + 24 < htip
     }
 
