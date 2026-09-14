@@ -79,8 +79,9 @@ echo "== a package that turns on the status page pins a satd that has it =="
 # page first ships in 0.6.0.
 #
 # Between releases a package pins a master commit's `sha-` image. That commit
-# must be in this checkout's history (so, merged) and its satd must have the
-# flag; the CI job checks out full history for this.
+# must be in this checkout's history (so, merged), its satd must have the
+# flag, and its satd-init the SATD_STATUSPAGE switch, since the packages run
+# the image's satd-init. The CI job checks out full history for this.
 if python3 - "$UMBREL/docker-compose.yml" "$ROOT/contrib/packaging/startos/startos/main.ts" \
     "$ROOT/contrib/packaging/startos/startos/manifest/index.ts" "$ROOT" <<'PY'
 import re, subprocess, sys
@@ -104,6 +105,12 @@ def dev_pin_problem(short):
     config = git("show", f"{full}:satd/src/config.rs").stdout
     if "pub statuspage:" not in config:
         return f"sha-{short}, which predates the status page"
+    # The packages run the satd-init baked into the image, not this tree's,
+    # so the image has to carry the switch that turns the page on. Without
+    # it satd starts, serves /metrics, and answers 404 on /status.
+    init = git("show", f"{full}:contrib/stack/satd/satd-init").stdout
+    if "SATD_STATUSPAGE" not in init:
+        return f"sha-{short}, whose satd-init cannot turn the status page on"
     return None
 for name, enabled, pinned in [
     ("Umbrel", re.search(r'SATD_STATUSPAGE:\s*"1"', umbrel), tag_of(umbrel)),
