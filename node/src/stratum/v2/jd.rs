@@ -394,14 +394,16 @@ pub fn check_custom_job(
     if msg.merkle_path != job.merkle_branch {
         return Err(refuse("invalid-job-param-value-merkle_path", "the merkle path is not the declared job's"));
     }
+    // The prefix is the start of the coinbase scriptSig, and the extranonce
+    // follows it. The message's field description says "up to 8 bytes", but
+    // the reference Job Declaration client sends the height, a tag and the
+    // extranonce's push opcode there, and the reference server takes it; the
+    // bound that matters is the scriptSig's own 100 bytes.
     let script_len = msg.coinbase_prefix.len() + hole_len;
-    if msg.coinbase_prefix.len() > 8
-        || !(2..=100).contains(&script_len)
-        || script_height(&msg.coinbase_prefix) != Some(work.height)
-    {
+    if !(2..=100).contains(&script_len) || script_height(&msg.coinbase_prefix) != Some(work.height) {
         return Err(refuse(
             "invalid-job-param-value-coinbase_prefix",
-            "the coinbase prefix must be at most 8 bytes and start with the block height",
+            "the coinbase prefix must start with the block height and leave the scriptSig at most 100 bytes",
         ));
     }
     let outputs: Vec<TxOut> = bitcoin::consensus::deserialize(&msg.coinbase_tx_outputs)
@@ -766,6 +768,34 @@ mod tests {
             coinbase_tx_locktime: 0,
             merkle_path: declared.merkle_branch.clone(),
         }
+    }
+
+    /// The prefix the reference Job Declaration client sends: the height, a
+    /// pushed tag, then the push opcode for the extranonce that follows.
+    #[test]
+    fn a_custom_job_takes_a_prefix_longer_than_eight_bytes() {
+        let txs = three_txs();
+        let (work, mempool) = setup(txs.clone());
+        let declared = check_declaration(&declaration(&work, &payout(1), wtxids(&txs)), payout(1), &work, SUBSIDY, &mempool).unwrap();
+        let hole = 12;
+        let mut msg = custom_job_msg(&work, &declared, declared.max_coinbase_value, true);
+        let tag = b"satd-canary";
+        msg.coinbase_prefix.push(tag.len() as u8);
+        msg.coinbase_prefix.extend_from_slice(tag);
+        msg.coinbase_prefix.push(hole as u8);
+        assert!(msg.coinbase_prefix.len() > 8);
+        let custom = check_custom_job(&msg, &declared, &work, hole).expect("a tagged prefix");
+        let job = ActiveTemplate::from_parts(custom.work.clone(), 5, declared.payout.script.clone(), custom.coinbase_prefix, custom.coinbase_suffix, hole);
+        let block = job.reconstruct_block(&[7; 12], work.cur_time, 0, 0x2000_0000);
+        assert!(block.check_merkle_root());
+        assert!(block.check_witness_commitment());
+        assert_eq!(block.bip34_block_height().unwrap(), 321);
+        assert!(block.txdata[0].input[0].script_sig.as_bytes().windows(tag.len()).any(|w| w == tag));
+
+        // A prefix that leaves no room in the scriptSig's 100 bytes is refused.
+        msg.coinbase_prefix.resize(100 - hole + 1, 0);
+        let err = check_custom_job(&msg, &declared, &work, hole).err().unwrap();
+        assert_eq!(err.code, "invalid-job-param-value-coinbase_prefix");
     }
 
     #[test]
