@@ -17081,8 +17081,10 @@ fn test_metrics_tls_bind_failure_aborts_startup() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken_port = taken.local_addr().unwrap().port();
     let datadir = fresh_test_datadir("satd-test-metricstls-bind");
+    let log_path = tmp.path().join("satd.log");
+    let log = std::fs::File::create(&log_path).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_satd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
         .arg("--regtest")
         .arg(format!("--datadir={}", datadir.display()))
         .arg(format!("--rpcport={}", find_available_port()))
@@ -17091,16 +17093,33 @@ fn test_metrics_tls_bind_failure_aborts_startup() {
         .arg(format!("--metricstlsbind=127.0.0.1:{taken_port}"))
         .arg(format!("--metricstlscert={}", cert_path.display()))
         .arg(format!("--metricstlskey={}", key_path.display()))
-        .output()
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
         .expect("spawn satd");
+
+    // satd must exit by itself. One still running at the deadline came up
+    // without the listener it was told to serve; kill it and fail, rather
+    // than let the kill's non-zero status pass for the refusal.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "satd kept running without its metrics TLS listener: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     drop(taken);
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success(), "satd started without its metrics TLS listener: {combined}");
+    let combined = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!status.success(), "satd exited cleanly without its metrics TLS listener: {combined}");
     assert!(
         combined.contains("metrics TLS listener could not bind"),
         "error should name the metrics TLS listener; got: {combined}"
