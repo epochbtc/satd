@@ -47,9 +47,11 @@ pub fn share_target(difficulty: u64) -> [u8; 32] {
 /// The target a share is actually checked against: the easier of the
 /// session's share target and the block target.
 ///
-/// A share target harder than the block target would reject a header that
-/// is a valid block. On regtest, whose block target is far easier than
-/// difficulty 1, that is every block a miner finds; on mainnet it is a
+/// A share target harder than the block target would make a valid block a
+/// "low difficulty" share. [`validate_share`] tests the block target first,
+/// so a block is recognised either way; the clamp keeps the two targets
+/// ordered so every block is also an accepted share. It matters on regtest,
+/// whose block target is far easier than difficulty 1, and on mainnet for a
 /// session whose difficulty drifted above the network's.
 pub fn effective_share_target(difficulty: u64, block_target: &[u8; 32]) -> [u8; 32] {
     let share = share_target(difficulty);
@@ -114,6 +116,8 @@ pub fn validate_share(
         return Ok(ShareResult::Stale);
     }
     let header = job.header(extranonce, ntime, nonce, version);
+    // The block target first: a header that makes a block is a block, whatever
+    // share target the session has.
     let hash = header.block_hash();
     if hash_meets_target(&hash, &work.block_target) {
         return Ok(ShareResult::Block(Box::new(job.reconstruct_block(

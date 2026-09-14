@@ -319,6 +319,18 @@ startup error.
 | `electrumfeehistogramttl` | 10 | restart | satd | TTL (seconds) for the `mempool.get_fee_histogram` cache. |
 | `electrumbanner` | `powered by satd <ver>` | restart | satd | Override for `server.banner`. |
 | `electrumservername` | `satd-electrs-compatible/<ver>` | restart | satd | Name reported by `server.version` and `server.features.server_version`. The default carries an `electrs` compatibility token because Electrum clients feature-detect by matching on this string (Cake Wallet probes silent-payment tweaks only when it contains `electrs`). Affects the Electrum surface only — the P2P user agent stays `/satd:<ver>/`. |
+| `stratum` | off | restart | satd | Run the Stratum V1 solo-mining server. Refused on signet. See [Stratum Mining Server](stratum.md). |
+| `stratumbind` | `127.0.0.1:3333` | restart | satd | Bind the plaintext Stratum listener. A non-loopback address needs `stratumtlsbind` or `stratumallowplaintextremote=1`. |
+| `stratumtlsbind` | none (conventional port 4333) | restart | satd | Bind the Stratum TLS listener (requires cert+key). |
+| `stratumtlscert` | none | restart | satd | PEM TLS certificate (or full chain) for the Stratum server. |
+| `stratumtlskey` | none | restart | satd | PEM TLS private key for the Stratum server. |
+| `stratummtls` | false | restart | satd | Require mutual TLS on the Stratum TLS listener. |
+| `stratummtlsclientca` | none | restart | satd | PEM CA bundle to verify client certs when `stratummtls=1`. |
+| `stratummtlsclientallow` | any CA-signed | restart | satd | Allowlist of accepted client-cert CN/DNS-SAN values. |
+| `stratumaddress` | none | restart | satd | Payout address for a miner whose username is not a valid address for this network. |
+| `stratumdifficulty` | 10000 mainnet, 1000 testnet, 1 regtest | restart | satd | Initial Stratum share difficulty. |
+| `stratummaxconns` | 64 | restart | satd | Hard cap on simultaneous Stratum connections across both listeners. |
+| `stratumallowplaintextremote` | false | restart | satd | Accept a non-loopback `stratumbind` with no TLS listener. |
 
 ## Storage / pruning / reindex
 

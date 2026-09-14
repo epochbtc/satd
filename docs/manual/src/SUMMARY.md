@@ -18,6 +18,7 @@
 
 - [Esplora REST API](esplora.md)
 - [Electrum Protocol Server](electrum.md)
+- [Stratum Mining Server](stratum.md)
 - [Getting Started: Consuming Events](streaming-tutorial.md)
 - [Streaming Consumption API](streaming.md)
 - [Silent Payments (BIP 352)](silent-payments.md)

@@ -147,9 +147,10 @@ Authoritative wire spec: [`docs/api/streaming.md`](docs/api/streaming.md).
 **Possible follow-up (uncertain):** standardizing the wire protocol as an open,
 transport-agnostic spec with a second (bitcoind-sidecar) implementation — a
 governance lift deferred until a real downstream consumer's feedback justifies
-it. Mining ops (`getblocktemplate` / `submitblock` — Stratum is the venue),
-wallet key management, and any consensus / block-production knobs remain
-explicitly out of scope.
+it. Mining is served by the native Stratum server, which ships in 0.6.0, not by
+this API; pool operation and the Stratum V2 Template Distribution Protocol stay
+out of scope. Wallet key management and any consensus / block-production knobs
+remain explicitly out of scope.
 
 ## Ecosystem & Mobile Integration
 

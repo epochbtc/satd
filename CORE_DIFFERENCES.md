@@ -166,6 +166,18 @@ coordinators in one move. Bitcoin Core operators typically deploy
 `electrs` or `Fulcrum` as a separate process that re-indexes the chain;
 satd makes that a runtime flag.
 
+### Stratum solo-mining server (`node::stratum`)
+
+A Stratum V1 server inside the node (`--stratum=1`), so a miner connects to
+satd directly instead of to `getblocktemplate` through pool software such as
+ckpool. Solo only: the `mining.authorize` username is the payout address.
+Plaintext listener on loopback by default, with an optional TLS/mTLS listener;
+a non-loopback plaintext bind without TLS is refused unless explicitly
+allowed. No work is issued during initial block download (regtest exempt), and
+the server is refused on signet. See `docs/manual/src/stratum.md`.
+
+Bitcoin Core has no Stratum server; operators run a pool daemon beside it.
+
 ### Address-history index (`node-index`)
 
 Per-scripthash funding + spending history over the shared RocksDB.
@@ -694,6 +706,7 @@ default behavior set the corresponding flag.
 | Address index | not present | on (`--addressindex=1`) | Required by Esplora and Electrum. Opt out with `--addressindex=0` on storage-constrained nodes. |
 | `/metrics` HTTP server | not present | off | Off by default; enable with `--metricsbind=<addr:port>`. |
 | Electrum server | not present | off | Off by default; enable with `--electrum=1`. |
+| Stratum server | not present | off | Off by default; enable with `--stratum=1`. |
 | Block-filter index | off | off | Matches Core; enable with `--blockfilterindex=basic`. |
 | `--peerblockfilters` | off | off | Matches Core; opt in to advertise `NODE_COMPACT_FILTERS`. |
 | `--mempoolfullrbf` | on (Core v28+) | on | Matches Core post-v28. |

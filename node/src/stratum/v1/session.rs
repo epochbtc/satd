@@ -106,7 +106,7 @@ pub(crate) async fn run<S>(
                 };
                 buf.clear();
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
-                session.handle_line(&line, &work_rx).await
+                session.handle_line(&line, &mut work_rx).await
             }
             changed = work_rx.changed(), if authorized => {
                 if changed.is_err() {
@@ -184,7 +184,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     async fn handle_line(
         &mut self,
         line: &str,
-        work_rx: &watch::Receiver<Option<Arc<Work>>>,
+        work_rx: &mut watch::Receiver<Option<Arc<Work>>>,
     ) -> Result<(), Close> {
         if line.trim().is_empty() {
             return Ok(());
@@ -242,7 +242,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     async fn authorize(
         &mut self,
         req: &Request,
-        work_rx: &watch::Receiver<Option<Arc<Work>>>,
+        work_rx: &mut watch::Receiver<Option<Arc<Work>>>,
     ) -> Result<(), Close> {
         let username = req.params.first().and_then(Value::as_str).unwrap_or("");
         let config = &self.shared.config;
@@ -275,7 +275,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         if first {
             self.write(notification("mining.set_difficulty", json!([self.vardiff.difficulty()])))
                 .await?;
-            let work = work_rx.borrow().clone();
+            // Mark it seen, so the select loop does not issue the same work
+            // again as a change.
+            let work = work_rx.borrow_and_update().clone();
             if let Some(work) = work {
                 self.issue_job(work).await?;
             }

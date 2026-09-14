@@ -87,6 +87,8 @@ ALERTS
             --events-grpc-bind=127.0.0.1:0
             --streamws=127.0.0.1:0
             --alertfile="$alertfile"
+            --stratum=1
+            --stratumbind=127.0.0.1:0
         )
         echo "boot_satd: 0.5.0 feature profile ON: ${feature_args[*]}"
     fi
