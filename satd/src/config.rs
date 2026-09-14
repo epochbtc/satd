@@ -1047,6 +1047,24 @@ pub struct Config {
     // Metrics / health HTTP server (unauthenticated — bind to loopback or firewall)
     pub metricsport: Option<u16>,
     pub metricsbind: String,
+    /// Optional TLS listener for the metrics / health / status endpoints,
+    /// alongside the plain one. Requires `metricsport` (the plain listener
+    /// stays: container healthchecks and local scrapers speak plain HTTP)
+    /// and both `metrics_tls_cert` and `metrics_tls_key`. TLS encrypts the
+    /// scrape; it does not authenticate it — `metrics_mtls` does that.
+    pub metrics_tls_bind: Option<String>,
+    /// PEM certificate for the metrics TLS listener.
+    pub metrics_tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for the metrics TLS listener.
+    pub metrics_tls_key: Option<std::path::PathBuf>,
+    /// Require a client certificate signed by `metrics_mtls_client_ca` on
+    /// the metrics TLS listener. The only authentication this surface has.
+    pub metrics_mtls: bool,
+    /// PEM CA bundle for client certificates. Required when `metrics_mtls`.
+    pub metrics_mtls_client_ca: Option<std::path::PathBuf>,
+    /// Accepted client-cert CN / DNS-SAN values; empty accepts any cert the
+    /// CA signed.
+    pub metrics_mtls_client_allow: Vec<String>,
     /// Emit structured `data` payloads (category, suggestion, debug) on
     /// RPC errors. Default off to preserve Bitcoin-Core wire format.
     pub rpc_extended_errors: bool,
@@ -3197,6 +3215,68 @@ impl Config {
             );
         }
 
+        // ── Metrics TLS ──────────────────────────────────────────
+        // Same shape and the same partial-config refusals as the Esplora
+        // TLS surface above.
+        let metrics_tls_bind = cli.metricstlsbind.or_else(|| file_get("metricstlsbind"));
+        let metrics_tls_cert = cli
+            .metricstlscert
+            .or_else(|| file_get("metricstlscert").map(std::path::PathBuf::from));
+        let metrics_tls_key = cli
+            .metricstlskey
+            .or_else(|| file_get("metricstlskey").map(std::path::PathBuf::from));
+        let metrics_mtls = cli
+            .metricsmtls
+            .or_else(|| file_get("metricsmtls").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
+        let metrics_mtls_client_ca = cli
+            .metricsmtlsclientca
+            .or_else(|| file_get("metricsmtlsclientca").map(std::path::PathBuf::from));
+        let metrics_mtls_client_allow: Vec<String> = {
+            let mut values: Vec<String> = cli.metricsmtlsclientallow.clone();
+            if values.is_empty() {
+                values = file_get_all("metricsmtlsclientallow");
+            }
+            values
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let metrics_port_set = cli.metricsport.is_some()
+            || file_get("metricsport").and_then(|v| v.parse::<u16>().ok()).is_some();
+        if metrics_tls_bind.is_some() && !metrics_port_set {
+            // The TLS listener is an addition to the plain one, never a
+            // replacement: without the plain listener the image's
+            // healthcheck and any local scraper would lose the endpoint.
+            return Err("--metricstlsbind requires --metricsport".to_string());
+        }
+        if metrics_mtls && metrics_tls_bind.is_none() {
+            return Err("--metricsmtls=1 requires --metricstlsbind".to_string());
+        }
+        if metrics_mtls && metrics_mtls_client_ca.is_none() {
+            return Err("--metricsmtls=1 requires --metricsmtlsclientca".to_string());
+        }
+        if !metrics_mtls && !metrics_mtls_client_allow.is_empty() {
+            return Err("--metricsmtlsclientallow requires --metricsmtls=1".to_string());
+        }
+        if metrics_tls_bind.is_some()
+            && (metrics_tls_cert.is_none() || metrics_tls_key.is_none())
+        {
+            return Err(
+                "--metricstlsbind requires --metricstlscert AND --metricstlskey".to_string(),
+            );
+        }
+        if let Some(bind) = &metrics_tls_bind
+            && let Err(e) = bind.parse::<std::net::SocketAddr>()
+        {
+            return Err(format!("invalid --metricstlsbind {bind:?}: {e}"));
+        }
+
         // ── Electrum ─────────────────────────────────────────────
         let electrum = cli
             .electrum
@@ -3968,6 +4048,12 @@ impl Config {
                 .metricsbind
                 .or_else(|| file_get("metricsbind"))
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            metrics_tls_bind,
+            metrics_tls_cert,
+            metrics_tls_key,
+            metrics_mtls,
+            metrics_mtls_client_ca,
+            metrics_mtls_client_allow,
             rpc_extended_errors: cli.rpcextendederrors.unwrap_or_else(|| {
                 file_get("rpcextendederrors").and_then(|v| parse_bool(&v)).unwrap_or(false)
             }),
@@ -4240,6 +4326,9 @@ impl Config {
             "metrics": {
                 "port": self.metricsport,
                 "bind": self.metricsbind,
+                "tls_bind": self.metrics_tls_bind,
+                "mtls": self.metrics_mtls,
+                "mtls_client_allow_count": self.metrics_mtls_client_allow.len(),
             },
             "log_format": match self.log_format {
                 LogFormat::Text => "text",
@@ -5840,6 +5929,51 @@ pub struct CliArgs {
     )]
     pub metricsbind: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "ADDR:PORT",
+        help = "Also serve the metrics/health endpoints over TLS on this address (requires --metricsport, --metricstlscert and --metricstlskey)"
+    )]
+    pub metricstlsbind: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS certificate for the metrics TLS listener"
+    )]
+    pub metricstlscert: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM-encoded TLS private key for the metrics TLS listener"
+    )]
+    pub metricstlskey: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Require mutual TLS on the metrics TLS listener (default: false). Requires --metricstlsbind and --metricsmtlsclientca."
+    )]
+    pub metricsmtls: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to PEM CA bundle used to verify client certificates when --metricsmtls=1"
+    )]
+    pub metricsmtlsclientca: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Allowlist of accepted client-cert CN / DNS-SAN values on the metrics TLS listener (repeatable, comma-separated). Empty = any cert validly signed by the CA."
+    )]
+    pub metricsmtlsclientallow: Vec<String>,
+
     // No-op compatibility flags (accepted silently, not wired)
     #[arg(
         long,
@@ -6529,6 +6663,12 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "mcpallowedhost",
         "metricsport",
         "metricsbind",
+        "metricstlsbind",
+        "metricstlscert",
+        "metricstlskey",
+        "metricsmtls",
+        "metricsmtlsclientca",
+        "metricsmtlsclientallow",
         "server",
         "daemon",
         "dbcache",
@@ -7318,6 +7458,12 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     // Metrics / health
     "metricsport",
     "metricsbind",
+    "metricstlsbind",
+    "metricstlscert",
+    "metricstlskey",
+    "metricsmtls",
+    "metricsmtlsclientca",
+    "metricsmtlsclientallow",
 ];
 
 // Disposition of a Bitcoin Core config key that satd does not honor.
@@ -9633,6 +9779,12 @@ testactivationheight=bip34@2
             mcpallowedhost: Vec::new(),
             metricsport: None,
             metricsbind: None,
+            metricstlsbind: None,
+            metricstlscert: None,
+            metricstlskey: None,
+            metricsmtls: None,
+            metricsmtlsclientca: None,
+            metricsmtlsclientallow: vec![],
             maxahead: None,
             maxopenfiles: None,
             storageprofile: None,
@@ -9930,6 +10082,12 @@ testactivationheight=bip34@2
             mcpallowedhost: Vec::new(),
             metricsport: None,
             metricsbind: None,
+            metricstlsbind: None,
+            metricstlscert: None,
+            metricstlskey: None,
+            metricsmtls: None,
+            metricsmtlsclientca: None,
+            metricsmtlsclientallow: vec![],
             maxahead: None,
             maxopenfiles: None,
             storageprofile: None,
@@ -10168,6 +10326,60 @@ testactivationheight=bip34@2
             config.esplora_tls_bind.as_deref(),
             Some("127.0.0.1:3001")
         );
+    }
+
+    /// The metrics TLS listener refuses every partial configuration, and a
+    /// complete one loads with the plain listener still configured.
+    #[test]
+    fn test_metrics_tls_partial_config_is_rejected() {
+        let load = |extra: &[&str]| {
+            let mut args = vec!["satd", "--regtest", "--datadir=/tmp/satd-test"];
+            args.extend_from_slice(extra);
+            Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+        };
+        let full = [
+            "--metricsport=9332",
+            "--metricstlsbind=127.0.0.1:9336",
+            "--metricstlscert=/tmp/cert.pem",
+            "--metricstlskey=/tmp/key.pem",
+        ];
+        let without = |flag: &str| -> Vec<&str> {
+            full.iter().copied().filter(|a| !a.starts_with(flag)).collect()
+        };
+
+        let err = load(&without("--metricsport=")).unwrap_err();
+        assert!(err.contains("requires --metricsport"), "got: {err}");
+        let err = load(&without("--metricstlscert=")).unwrap_err();
+        assert!(err.contains("--metricstlscert AND --metricstlskey"), "got: {err}");
+        let err = load(&without("--metricstlskey=")).unwrap_err();
+        assert!(err.contains("--metricstlscert AND --metricstlskey"), "got: {err}");
+
+        let mut bad = without("--metricstlsbind=");
+        bad.push("--metricstlsbind=localhost");
+        let err = load(&bad).unwrap_err();
+        assert!(err.contains("invalid --metricstlsbind"), "got: {err}");
+
+        let err = load(&["--metricsport=9332", "--metricsmtls=1"]).unwrap_err();
+        assert!(err.contains("--metricsmtls=1 requires --metricstlsbind"), "got: {err}");
+        let mut mtls = full.to_vec();
+        mtls.push("--metricsmtls=1");
+        let err = load(&mtls).unwrap_err();
+        assert!(err.contains("requires --metricsmtlsclientca"), "got: {err}");
+        let mut allow = full.to_vec();
+        allow.push("--metricsmtlsclientallow=prometheus");
+        let err = load(&allow).unwrap_err();
+        assert!(err.contains("requires --metricsmtls=1"), "got: {err}");
+
+        let config = load(&full).expect("a complete --metricstls* set loads");
+        assert_eq!(config.metricsport, Some(9332));
+        assert_eq!(config.metrics_tls_bind.as_deref(), Some("127.0.0.1:9336"));
+        assert!(!config.metrics_mtls);
+
+        mtls.push("--metricsmtlsclientca=/tmp/ca.pem");
+        mtls.push("--metricsmtlsclientallow=prometheus,grafana");
+        let config = load(&mtls).expect("a complete mTLS set loads");
+        assert!(config.metrics_mtls);
+        assert_eq!(config.metrics_mtls_client_allow, vec!["prometheus", "grafana"]);
     }
 
     /// `--rpctlsbind` without the matching cert/key flags must be

@@ -23,6 +23,50 @@ The metrics and health server starts only when a port is set. Use
 address alone (default `127.0.0.1`) and does not enable the server on its own.
 The listener binds `<metricsbind>:<metricsport>`.
 
+### Over TLS
+
+The metrics listener speaks plain HTTP and has no authentication, which is
+right for loopback and wrong for a LAN. To scrape from another machine, add a
+TLS listener beside it on its own port:
+
+```sh
+satd --metricsport=9332 \
+     --metricstlsbind=0.0.0.0:9336 \
+     --metricstlscert=/path/fullchain.pem --metricstlskey=/path/server.key
+```
+
+It serves the same endpoints as the plain listener. The plain listener keeps
+running, so container healthchecks and local tools are unaffected, and
+`--metricstlsbind` refuses to start without `--metricsport`. Leave
+`--metricsbind` at `127.0.0.1` so the only way in from the network is the TLS
+port. A bad certificate path or a port that cannot be bound stops satd at
+startup. The certificate reloads on `SIGUSR1`, like satd's other TLS
+listeners.
+
+TLS encrypts the scrape but does not decide who may scrape. For that, require
+a client certificate with `--metricsmtls=1` and
+`--metricsmtlsclientca=<ca.pem>`, and optionally narrow it to named clients
+with `--metricsmtlsclientallow=<cn>[,<cn>...]`.
+
+Prometheus supports both directly:
+
+```yaml
+scrape_configs:
+  - job_name: satd
+    scheme: https
+    tls_config:
+      ca_file: satd-ca.crt
+      server_name: satd.local
+      # With --metricsmtls=1:
+      # cert_file: prometheus.crt
+      # key_file: prometheus.key
+    static_configs:
+      - targets: ['satd.local:9336']
+```
+
+The TLS listener serves at most 64 connections at once, gives a client 10
+seconds to finish the handshake and 30 seconds to send its request headers.
+
 The `GET /metrics` endpoint serves native Prometheus metrics covering P2P
 traffic, block validation times, mempool depth, and RocksDB performance. P2P
 wire volume is exported as the `satd_net_bytes_sent_total` and

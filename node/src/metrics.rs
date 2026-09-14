@@ -10,6 +10,9 @@
 //! The listener is intentionally unauthenticated: these are operator-only
 //! signals, and adding auth would break the Prometheus scrape and k8s probe
 //! ecosystems. Bind to loopback or a trusted network; firewall externally.
+//! For a network-facing scrape, `--metricstlsbind` serves the same endpoints
+//! over TLS on a second listener ([`serve_metrics_https`]), where a client
+//! certificate (`--metricsmtls`) is the access control Prometheus supports.
 //!
 //! Metric schema: `satd_*` prefix, Prometheus conventions (`_bytes` /
 //! `_seconds` / `_total` / `_ratio`). The schema is a stability commitment —
@@ -1059,6 +1062,144 @@ pub async fn serve_metrics_http(
             }
             _ = shutdown_rx.wait_for(|v| *v) => {
                 tracing::info!("Metrics HTTP server shutting down");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Most TLS connections the metrics TLS listener serves at once. A scraper
+/// holds one; a status page in a browser holds a few. The cap exists because
+/// this listener is meant to face a LAN, where a handshake flood must not be
+/// able to spawn unbounded tasks on the runtime it shares.
+pub const METRICS_TLS_MAX_CONNECTIONS: usize = 64;
+
+/// How long a client gets to finish the TLS handshake.
+const METRICS_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a client gets to send its request headers once the handshake is
+/// done. Without it a client dribbling header bytes pins a connection slot.
+const METRICS_TLS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Native TLS for the metrics listener (`--metricstlsbind`).
+pub struct MetricsTls {
+    acceptor: tls_config::TlsAcceptor,
+    allow: tls_config::ClientAllowList,
+    mtls_enabled: bool,
+}
+
+impl MetricsTls {
+    /// Load the certificate and key, and the client CA when `mtls_client_ca`
+    /// is set, so a bad path is a startup error rather than a failure on the
+    /// first handshake. The certificate reloads on SIGUSR1 like every other
+    /// TLS surface.
+    pub fn new(
+        cert: &std::path::Path,
+        key: &std::path::Path,
+        mtls_client_ca: Option<&std::path::Path>,
+        mtls_client_allow: impl IntoIterator<Item = String>,
+    ) -> Result<Self, tls_config::TlsConfigError> {
+        let policy = match mtls_client_ca {
+            Some(ca) => tls_config::ClientAuthPolicy::Required {
+                ca_path: ca.to_path_buf(),
+            },
+            None => tls_config::ClientAuthPolicy::Disabled,
+        };
+        Ok(Self {
+            acceptor: tls_config::build_acceptor(cert, key, &policy)?,
+            allow: tls_config::ClientAllowList::new(mtls_client_allow),
+            mtls_enabled: mtls_client_ca.is_some(),
+        })
+    }
+}
+
+/// Serve the same endpoints as [`serve_metrics_http`] over TLS, on a listener
+/// the caller has already bound (so a bind failure is the caller's startup
+/// error). Unlike the plain listener, which is meant for loopback, this one
+/// bounds concurrent connections, the handshake and the header read.
+pub async fn serve_metrics_https(
+    ctx: MetricsContext,
+    listener: tokio::net::TcpListener,
+    tls: MetricsTls,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bind_addr = listener.local_addr()?;
+    tracing::info!(%bind_addr, mtls = tls.mtls_enabled, "Metrics/health HTTPS server listening");
+    let tls = Arc::new(tls);
+    let conn_cap = Arc::new(tokio::sync::Semaphore::new(METRICS_TLS_MAX_CONNECTIONS));
+
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                let (stream, peer) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Back off so a persistent error (fd exhaustion)
+                        // does not busy-loop a runtime worker.
+                        tracing::warn!(error = %e, "Metrics HTTPS accept error");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = conn_cap.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        %peer,
+                        "Metrics HTTPS at-capacity rejection ({METRICS_TLS_MAX_CONNECTIONS} max)",
+                    );
+                    continue;
+                };
+                let ctx = ctx.clone();
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let tls_stream = match tokio::time::timeout(
+                        METRICS_TLS_HANDSHAKE_TIMEOUT,
+                        tls.acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            tracing::debug!(%peer, error = %e, "Metrics TLS handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer, "Metrics TLS handshake timed out");
+                            return;
+                        }
+                    };
+                    if tls.mtls_enabled {
+                        let (_, server_conn) = tls_stream.get_ref();
+                        if let Err(rej) = tls_config::check_peer_allowed(server_conn, &tls.allow) {
+                            tracing::warn!(
+                                %peer,
+                                subject = %rej.subject_label,
+                                "Metrics mTLS client rejected by allowlist",
+                            );
+                            return;
+                        }
+                    }
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let svc = hyper::service::service_fn(move |req| {
+                        let ctx = ctx.clone();
+                        async move { Ok::<_, std::convert::Infallible>(handle_request(&ctx, req).await) }
+                    });
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(METRICS_TLS_HEADER_READ_TIMEOUT)
+                        .serve_connection(io, svc)
+                        .await
+                    {
+                        tracing::debug!("Metrics HTTPS connection error: {}", e);
+                    }
+                });
+            }
+            // Wrapped so the non-Send `watch::Ref` is dropped before the arm
+            // body, keeping this future `Send` (the caller spawns it).
+            _ = async { let _ = shutdown_rx.wait_for(|v| *v).await; } => {
+                tracing::info!("Metrics HTTPS server shutting down");
                 break;
             }
         }
