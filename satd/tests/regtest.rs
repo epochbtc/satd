@@ -17556,10 +17556,10 @@ fn stratum_v1_mined_share_connects_block() {
             format!("{ntime:08x}"),
             format!("{nonce:08x}"),
         ]);
-        // The solution, and the same solution again in the same write: the
-        // session reads the second line before it handles the new tip the
-        // first one creates, so the second is judged a duplicate rather than
-        // stale.
+        // The solution, and the same solution again in the same write. The
+        // second is refused either way: as a duplicate if the session reads
+        // it before the job for the new tip, or as a share for a job that no
+        // longer exists if after. It must never be accepted twice.
         {
             use tokio::io::AsyncWriteExt;
             let line = |id: u64| json!({"id": id, "method": "mining.submit", "params": submit}).to_string() + "\n";
@@ -17577,7 +17577,9 @@ fn stratum_v1_mined_share_connects_block() {
             }
         }
         assert_eq!(replies[&100]["result"], true, "{:?}", replies[&100]);
-        assert_eq!(replies[&101]["error"][0], 22, "{:?}", replies[&101]);
+        assert_eq!(replies[&101]["result"], serde_json::Value::Null, "{:?}", replies[&101]);
+        let code = &replies[&101]["error"][0];
+        assert!(*code == 22 || *code == 21, "a repeated solution is a duplicate or stale: {:?}", replies[&101]);
         // The block's own connect event reaches the server, which moves every
         // miner to the new tip at once rather than at the next 30 s refresh.
         // A submission that failed part way — the block stored but its chain
@@ -17639,6 +17641,73 @@ fn stratum_v1_new_block_pushes_clean_job() {
                 break;
             }
         }
+    });
+}
+
+/// A miner that never stops submitting still gets the job for a new tip. On
+/// regtest every share a CPU miner finds is a block, so it submits without
+/// pause; a session that served the miner's lines ahead of new work never
+/// sent the job for the block the miner had just found.
+#[test]
+fn stratum_v1_new_work_reaches_a_miner_that_never_stops_submitting() {
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (_, first) = client.handshake(&addr).await;
+        let StratumClient { mut reader, mut writer, .. } = client;
+
+        // Submits for a job the server never issued, as fast as the socket
+        // takes them: each is refused, and there is always another queued.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood = {
+            let stop = stop.clone();
+            let addr = addr.clone();
+            tokio::spawn(async move {
+                let mut batch = String::new();
+                for i in 0..1_000u32 {
+                    batch += &json!({"id": 1_000_000 + i, "method": "mining.submit",
+                        "params": [addr, "ffffffff", "00000000", "00000000", "00000000"]})
+                    .to_string();
+                    batch.push('\n');
+                }
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if writer.write_all(batch.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        // Let the flood fill the socket buffers both ways before the tip
+        // moves, reading nothing: from here on the server always has another
+        // submit waiting.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut line = String::new();
+
+        let hashes = tokio::task::block_in_place(|| node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]));
+        let new_tip = hashes[0].as_str().unwrap().to_string();
+        assert_ne!(notify_prevhash(&first), new_tip);
+        let found = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    return false;
+                }
+                let msg: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if msg["method"] == "mining.notify" && notify_prevhash(&msg["params"]) == new_tip {
+                    return true;
+                }
+            }
+        })
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flood.abort();
+        assert_eq!(found, Ok(true), "no job for the new tip while the miner was submitting");
     });
 }
 

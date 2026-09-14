@@ -93,9 +93,24 @@ pub(crate) async fn run<S>(
 
     loop {
         let authorized = session.payout.is_some();
+        // New work and the vardiff tick come before the miner's own lines.
+        // They are rare, so they cannot starve the reader; the other way
+        // round, a miner that submits without pause (on regtest every share
+        // is a block) would never be sent the next job or a higher difficulty.
         let result = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            changed = work_rx.changed(), if authorized => {
+                if changed.is_err() {
+                    break;
+                }
+                let work = work_rx.borrow_and_update().clone();
+                match work {
+                    Some(work) => session.issue_job(work).await,
+                    None => Ok(()),
+                }
+            }
+            _ = vardiff_tick.tick(), if authorized => session.check_vardiff().await,
             line = read_line_bounded(&mut reader, &mut buf) => {
                 let line = match line {
                     Ok(line) => line,
@@ -108,17 +123,6 @@ pub(crate) async fn run<S>(
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                 session.handle_line(&line, &mut work_rx).await
             }
-            changed = work_rx.changed(), if authorized => {
-                if changed.is_err() {
-                    break;
-                }
-                let work = work_rx.borrow_and_update().clone();
-                match work {
-                    Some(work) => session.issue_job(work).await,
-                    None => Ok(()),
-                }
-            }
-            _ = vardiff_tick.tick(), if authorized => session.check_vardiff().await,
             _ = &mut idle => {
                 tracing::debug!(target: "node::stratum", %peer, "Stratum connection idle; closing");
                 break;
