@@ -378,13 +378,36 @@ func (c *Client) NodeVersion() string {
 // response's headers (STABILITY_POLICY.md, "Streaming API & SDK
 // compatibility").
 func (c *Client) checkCompat(md metadata.MD) error {
+	shown, warn, err := c.recordCompat(md)
+	if err != nil || !warn {
+		return err
+	}
+	// Logged after recordCompat released compatMu: the handler behind
+	// WithLogger is user code, and one that calls NodeVersion (or blocks) must
+	// not deadlock or stall every other stream open on this client.
+	logger := c.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn(fmt.Sprintf("satd node %s is older than this SDK (%s); features added after "+
+		"the node's release are unavailable and request fields it does not recognise are "+
+		"ignored. Upgrade the node - connections are refused once it is two minor versions "+
+		"behind.", shown, Version),
+		"node_version", shown, "sdk_version", Version)
+	return nil
+}
+
+// recordCompat records the advertised version and decides, under compatMu,
+// whether the stream is refused or the old-node warning is due. It returns the
+// node version as shown in the warning.
+func (c *Client) recordCompat(md metadata.MD) (shown string, warn bool, err error) {
 	raw, node := nodeVersionFromMD(md)
 	c.compatMu.Lock()
 	defer c.compatMu.Unlock()
 	c.nodeVersion = raw
 
 	if schema := schemaFromMD(md); schema != schemaVersion {
-		return schemaMismatch(schema)
+		return "", false, schemaMismatch(schema)
 	}
 
 	sdk, ok := parseVersion(Version)
@@ -393,10 +416,10 @@ func (c *Client) checkCompat(md metadata.MD) error {
 	}
 	switch classify(sdk, node) {
 	case compatOK:
-		return nil
+		return "", false, nil
 	case compatTooOld:
 		if !c.allowOldNode {
-			return &Error{
+			return "", false, &Error{
 				Kind: KindNodeTooOld,
 				Message: fmt.Sprintf("satd node %s is too old for this SDK (%s): two or more "+
 					"minor versions behind. Upgrade the node, or opt in with WithAllowOldNode()",
@@ -408,20 +431,10 @@ func (c *Client) checkCompat(md metadata.MD) error {
 	// Once per observed version: a reconnect loop against the same node stays
 	// quiet, a node upgraded (or downgraded) in between warns again.
 	if c.warned && c.warnedFor == raw {
-		return nil
+		return "", false, nil
 	}
 	c.warned, c.warnedFor = true, raw
-	logger := c.logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	shown := displayNodeVersion(raw)
-	logger.Warn(fmt.Sprintf("satd node %s is older than this SDK (%s); features added after "+
-		"the node's release are unavailable and request fields it does not recognise are "+
-		"ignored. Upgrade the node - connections are refused once it is two minor versions "+
-		"behind.", shown, Version),
-		"node_version", shown, "sdk_version", Version)
-	return nil
+	return displayNodeVersion(raw), true, nil
 }
 
 func schemaMismatch(node uint32) error {

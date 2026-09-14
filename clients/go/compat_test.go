@@ -393,6 +393,59 @@ func TestOneBehindWarnsOncePerNodeVersion(t *testing.T) {
 	}
 }
 
+// lockProbe is a slog.Handler that records, for each record, whether the
+// client's compat lock was free.
+type lockProbe struct {
+	client **Client
+	mu     sync.Mutex
+	free   []bool
+}
+
+func (h *lockProbe) Enabled(context.Context, slog.Level) bool { return true }
+func (h *lockProbe) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *lockProbe) WithGroup(string) slog.Handler            { return h }
+func (h *lockProbe) Handle(context.Context, slog.Record) error {
+	c := *h.client
+	free := c.compatMu.TryLock()
+	if free {
+		c.compatMu.Unlock()
+	}
+	h.mu.Lock()
+	h.free = append(h.free, free)
+	h.mu.Unlock()
+	return nil
+}
+
+// TestWarningIsLoggedWithoutHoldingTheCompatLock: the handler behind WithLogger
+// is user code. One that calls NodeVersion from inside Handle would deadlock if
+// the warning were logged under the lock, and a slow one would stall every
+// stream open.
+func TestWarningIsLoggedWithoutHoldingTheCompatLock(t *testing.T) {
+	behind, ok := minorsBehind(t, 1)
+	opts := []Option{}
+	if !ok {
+		behind = tooOld(t)
+		opts = append(opts, WithAllowOldNode())
+	}
+	var client *Client
+	probe := &lockProbe{client: &client}
+	client = startVersionFake(t, newVersionFake(nodeHeaders{version: behind, schema: "1"}),
+		append(opts, WithLogger(slog.New(probe)))...)
+	if _, err := client.Subscribe(testCtx(t), SubscribeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	if len(probe.free) == 0 {
+		t.Fatal("the warning was not logged")
+	}
+	for _, free := range probe.free {
+		if !free {
+			t.Fatalf("a record was logged under the compat lock: %v", probe.free)
+		}
+	}
+}
+
 func TestNodeVersionIsRecordedOnceAStreamOpens(t *testing.T) {
 	client := startVersionFake(t, newVersionFake(sameVersionNode()))
 	if got := client.NodeVersion(); got != "" {
