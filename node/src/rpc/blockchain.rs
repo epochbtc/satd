@@ -125,9 +125,6 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     // IBD heuristic: if tip is more than 24 hours behind wall clock, we're
     // in IBD. Shares one definition with the per-block flush gate in
     // `ChainState` (see `tip_time_is_ibd` / issue #262).
-    // Node clock, for the same reason as `tip_time_is_ibd`, which this is
-    // reported alongside.
-    let now = crate::time::now_secs();
     let is_ibd = ChainState::tip_time_is_ibd(time as u32);
 
     let mut out = json!({
@@ -138,7 +135,7 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
         "difficulty": difficulty,
         "time": time,
         "mediantime": mediantime,
-        "verificationprogress": if is_ibd { time as f64 / now as f64 } else { 1.0 },
+        "verificationprogress": chain_state.verification_progress(&tip_hash),
         "initialblockdownload": is_ibd,
         "chainwork": format!("{:0>64}", chainwork),
         // Core's is `blk*.dat` + `rev*.dat`; satd keeps undo data in
@@ -401,21 +398,14 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
     // alongside the hash of a different block.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
 
-    let (difficulty, time) = chain_state
+    let difficulty = chain_state
         .get_block_index(&tip_hash)
-        .map(|entry| (target_to_difficulty(entry.header.bits), entry.header.time as u64))
-        .unwrap_or((0.0, 0));
+        .map(|entry| target_to_difficulty(entry.header.bits))
+        .unwrap_or(0.0);
 
-    // Node clock, matching `ChainState::tip_time_is_ibd`: both sides of this
-    // comparison have to be on the same clock or a mocked chain reports itself
-    // as syncing forever.
-    let now = crate::time::now_secs();
-    let is_ibd = time + 86400 < now;
-    let verificationprogress = if is_ibd && now > 0 {
-        time as f64 / now as f64
-    } else {
-        1.0
-    };
+    // Core's `GuessVerificationProgress`, per chainstate tip, as Core's own
+    // `getchainstates` computes it.
+    let verificationprogress = chain_state.verification_progress(&tip_hash);
 
     // Core's `coins_db_cache_bytes` is the UTXO database's cache size; satd's
     // equivalent is the RocksDB block cache, which the store reports. Both
@@ -465,11 +455,7 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
                 .get_block_index(&bg.tip_hash())
                 .map(|e| target_to_difficulty(e.header.bits))
                 .unwrap_or(0.0);
-            let bg_progress = if bg.snapshot_height() > 0 {
-                (bg_height as f64 / bg.snapshot_height() as f64).min(1.0)
-            } else {
-                1.0
-            };
+            let bg_progress = chain_state.verification_progress(&bg.tip_hash());
             chainstates.push(with_tip_cache(json!({
                 "blocks": bg_height,
                 "bestblockhash": bg.tip_hash().to_string(),

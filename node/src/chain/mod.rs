@@ -13,3 +13,4 @@ pub mod replay_plan;
 pub mod repair;
 pub mod state;
 pub mod tip_ancestry;
+pub mod verification_progress;

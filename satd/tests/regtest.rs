@@ -16879,3 +16879,67 @@ fn rpcservertimeout_cuts_an_incomplete_head() {
     );
     node.stop();
 }
+
+/// `verificationprogress` is Bitcoin Core's `GuessVerificationProgress`: the
+/// share of all transactions ever confirmed that the chain holds, and exactly
+/// 1 for a tip within two hours of the clock with no header above it.
+///
+/// satd used to report the tip's timestamp over the current time, both in
+/// seconds since 1970, so a node at genesis read about 0.69.
+///
+/// The expected values were read from Bitcoin Core v31.1 on the same shape of
+/// chain — 150 coinbase-only blocks on regtest — with its clock mocked to the
+/// same offsets from the tip. The estimate depends only on the transaction
+/// count, the offset and the header height, not on the block timestamps, so
+/// they carry over. Core prints 16 significant digits, hence the tolerance.
+#[test]
+fn verificationprogress_matches_bitcoin_core() {
+    use serde_json::json;
+    const ADDR: &str = "bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka";
+    let node = TestNode::start(&[]);
+    node.rpc_ok("setmocktime", vec![json!(1_700_000_000u64)]);
+    node.rpc_ok("generatetoaddress", vec![json!(150), json!(ADDR)]);
+    let info = node.rpc_ok("getblockchaininfo", vec![]);
+    let tip_time = info["time"].as_u64().unwrap();
+
+    let check = |offset: u64, core: f64, what: &str| {
+        node.rpc_ok("setmocktime", vec![json!(tip_time + offset)]);
+        let a = node.rpc_ok("getblockchaininfo", vec![])["verificationprogress"]
+            .as_f64()
+            .unwrap();
+        let b = node.rpc_ok("getchainstates", vec![])["chainstates"][0]["verificationprogress"]
+            .as_f64()
+            .unwrap();
+        for (rpc, got) in [("getblockchaininfo", a), ("getchainstates", b)] {
+            assert!(
+                (got - core).abs() <= 1e-15 * core,
+                "{what}, tip+{offset}s, {rpc}: satd {got}, Core {core}"
+            );
+        }
+    };
+
+    for (offset, core) in [
+        (0, 1.0),
+        (1, 1.0),
+        (3600, 1.0),
+        (7199, 1.0),
+        (7200, 1.0),
+        (7201, 0.9544819564983786),
+        (86400, 0.6360572872788542),
+        (86401, 0.6360546080260824),
+        (31_536_000, 0.004765361189131189),
+        (315_360_000, 0.000478588702137168),
+    ] {
+        check(offset, core, "150 blocks");
+    }
+
+    // A header above the tip: the tip is no longer the best known block, so it
+    // is placed one block spacing into the past.
+    node.rpc_ok("setmocktime", vec![json!(tip_time + 60)]);
+    let block = node.rpc_ok("generateblock", vec![json!(ADDR), json!([]), json!(false)]);
+    let header = &block["hex"].as_str().unwrap()[..160];
+    node.rpc_ok("submitheader", vec![json!(header)]);
+    for (offset, core) in [(60, 0.996042216358839), (7200, 0.996042216358839), (7201, 0.9544819564983786)] {
+        check(offset, core, "a header above the tip");
+    }
+}
