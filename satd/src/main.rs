@@ -2810,6 +2810,7 @@ async fn main() {
             filter_enabled: config.blockfilterindex,
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
+            status: None,
         };
         // The TLS listener is set up before the plain one is spawned, and
         // every failure in it is fatal: an operator who asked for a

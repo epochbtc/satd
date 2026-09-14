@@ -286,6 +286,16 @@ impl Drop for OwnedTypedDialGuard {
     }
 }
 
+/// See [`PeerManager::peer_summary`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PeerSummary {
+    pub inbound: usize,
+    pub outbound: usize,
+    /// Connected peers per user agent (BIP 14 subversion), as the peer sent
+    /// it. Unescaped: it is peer-controlled text.
+    pub clients: std::collections::BTreeMap<String, usize>,
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -2091,6 +2101,40 @@ impl PeerManager {
     /// Process-global P2P byte totals (for `getnettotals` and metrics).
     pub fn net_totals(&self) -> &Arc<NetTotals> {
         &self.net_totals
+    }
+
+    /// Connected peers by direction, and how many run each client version,
+    /// for the status page. One read of the peer table. Deliberately no
+    /// addresses: the page may be served with no authentication in front of
+    /// it, and who a node talks to is not something to publish.
+    pub fn peer_summary(&self) -> PeerSummary {
+        let peers = self.peers.read();
+        let mut summary = PeerSummary::default();
+        for h in peers.values() {
+            if h.info.state != PeerState::Connected {
+                continue;
+            }
+            match h.info.direction {
+                Direction::Inbound => summary.inbound += 1,
+                Direction::Outbound => summary.outbound += 1,
+            }
+            *summary.clients.entry(h.info.user_agent.clone()).or_default() += 1;
+        }
+        summary
+    }
+
+    /// The initial-block-download ETA, in seconds, while the download
+    /// scheduler is running and has an estimate. The same figure
+    /// `getibdprogress` reports as `eta_secs`, without building that call's
+    /// block bitmap.
+    pub fn ibd_eta_secs(&self) -> Option<u64> {
+        if self.ibd.read().is_none() {
+            return None;
+        }
+        match self.ibd_eta_secs.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        }
     }
 
     /// Get connection count.

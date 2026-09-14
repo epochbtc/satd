@@ -1675,7 +1675,11 @@ impl ChainState {
         // every freshly mined block look a day stale and silently disable the
         // per-block coin-cache flush at the call site below, i.e. the #262
         // mitigation, in the tests most likely to reorg.
-        let now = crate::time::now_secs();
+        Self::time_is_ibd_at(tip_time, crate::time::now_secs())
+    }
+
+    /// [`Self::tip_time_is_ibd`] against a given clock reading.
+    pub(crate) fn time_is_ibd_at(tip_time: u32, now: u64) -> bool {
         (tip_time as u64) + 86_400 < now
     }
 
@@ -2447,6 +2451,12 @@ impl ChainState {
         }
 
         (accepted, None)
+    }
+
+    /// Hold the accept lock, for tests that prove a read path never takes it.
+    #[cfg(test)]
+    pub(crate) fn hold_accept_lock_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.accept_lock.lock()
     }
 
     /// Get the highest header height stored (may be ahead of block tip during IBD).

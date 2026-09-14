@@ -8,6 +8,7 @@ pub mod index;
 pub mod memstat;
 pub mod mempool;
 pub mod metrics;
+pub mod status;
 pub mod mining;
 pub mod net;
 pub mod perf;

@@ -71,6 +71,9 @@ pub struct MetricsContext {
     /// Per-hook webhook delivery counters. `None` (or empty) when no alertfile
     /// is configured, in which case the block renders nothing at all.
     pub webhooks: Option<Arc<WebhookMetrics>>,
+    /// Inputs for the status snapshot beyond the ones above. `None` wherever
+    /// no status page is served.
+    pub status: Option<Arc<crate::status::StatusSources>>,
 }
 
 impl MetricsContext {
@@ -558,16 +561,40 @@ impl MetricsContext {
             self.chain_state.tip_height(),
             self.chain_state.headers_tip_height(),
         )
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// Why `/readyz` is 503.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    /// The block connector has given up.
+    Stalled,
+    /// The tip trails the best header by more than [`READY_LAG_BLOCKS`].
+    Lag { lag: u32 },
+}
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotReady::Stalled => f.write_str("the block connector cannot make progress"),
+            NotReady::Lag { lag } => write!(
+                f,
+                "chain lag {} blocks exceeds ready threshold {}",
+                lag, READY_LAG_BLOCKS
+            ),
+        }
     }
 }
 
 /// The `/readyz` decision, separated from the state it reads so it can be
-/// tested without standing up a live node.
-fn readiness(
+/// tested without standing up a live node. The status page's top line starts
+/// from this same function.
+pub fn readiness(
     warnings: &crate::warnings::NodeWarnings,
     tip: u32,
     headers_tip: u32,
-) -> Result<(), String> {
+) -> Result<(), NotReady> {
     // A connector that has given up cannot extend the chain, and lag alone
     // does not always catch that — a node wedged at its own tip has no lag to
     // show, and one wedged mid-IBD stops advancing the headers tip too once
@@ -579,15 +606,12 @@ fn readiness(
         .iter()
         .any(|w| w.id == crate::warnings::CONNECT_PERSISTENT_FAILURE)
     {
-        return Err("the block connector cannot make progress".to_string());
+        return Err(NotReady::Stalled);
     }
     let headers_tip = headers_tip.max(tip);
     let lag = headers_tip.saturating_sub(tip);
     if lag > READY_LAG_BLOCKS {
-        Err(format!(
-            "chain lag {} blocks exceeds ready threshold {}",
-            lag, READY_LAG_BLOCKS
-        ))
+        Err(NotReady::Lag { lag })
     } else {
         Ok(())
     }
@@ -1271,7 +1295,9 @@ mod tests {
             "cannot connect block 101".to_string(),
             serde_json::Value::Null,
         );
-        let reason = readiness(&warnings, 100, 100).expect_err("not ready while wedged");
+        let reason = readiness(&warnings, 100, 100)
+            .expect_err("not ready while wedged")
+            .to_string();
         assert!(reason.contains("connector"), "reason was: {reason}");
 
         // And recovers when the connector does.
