@@ -34,6 +34,8 @@ pub const MAX_EXTRANONCE_LEN: usize = 32;
 
 /// One assembled block template, ready to be turned into per-miner jobs.
 pub struct Work {
+    /// Sequence number of this work within the server, for reporting.
+    pub id: u64,
     pub height: u32,
     pub prev_hash: BlockHash,
     pub version: i32,
@@ -78,6 +80,7 @@ impl Work {
                 .is_multiple_of(crate::validation::pow::RETARGET_INTERVAL))
         .then(|| prev_time.saturating_add(20 * 60));
         Self {
+            id: 0,
             height: template.height,
             prev_hash: template.prev_hash,
             version: template.version,
@@ -226,6 +229,20 @@ impl ActiveTemplate {
             work,
             extranonce_len,
         })
+    }
+
+    /// A job whose coinbase was built elsewhere — a custom job a miner
+    /// declared. `coinbase_prefix ++ extranonce ++ coinbase_suffix` must be the
+    /// coinbase's non-witness serialization.
+    pub fn from_parts(
+        work: Arc<Work>,
+        job_id: u32,
+        payout_script: ScriptBuf,
+        coinbase_prefix: Vec<u8>,
+        coinbase_suffix: Vec<u8>,
+        extranonce_len: usize,
+    ) -> Self {
+        Self { job_id, work, payout_script, coinbase_prefix, coinbase_suffix, extranonce_len }
     }
 
     /// The coinbase txid for a given extranonce.

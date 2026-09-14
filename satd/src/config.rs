@@ -862,6 +862,8 @@ pub struct Config {
     pub stratum_v2_key: Option<std::path::PathBuf>,
     /// Channels one Stratum V2 connection may open.
     pub stratum_v2_max_channels: usize,
+    /// Serve Stratum V2 Job Declaration on the V2 listener.
+    pub stratum_v2_jd: bool,
     /// BIP 158 compact-block-filter index (see
     /// `docs/manual/src/native-protocol-surfaces.md`). Off by default; enable via
     /// `--blockfilterindex=basic` (Bitcoin-Core-compatible spelling)
@@ -3433,6 +3435,7 @@ impl Config {
             stratum_v2_bind,
             stratum_v2_key,
             stratum_v2_max_channels,
+            stratum_v2_jd,
         } = resolve_stratum(
             cli.stratum_args,
             network,
@@ -3887,6 +3890,7 @@ impl Config {
             stratum_v2_bind,
             stratum_v2_key,
             stratum_v2_max_channels,
+            stratum_v2_jd,
             blockfilterindex,
             coinstatsindex,
             txospenderindex,
@@ -4397,6 +4401,7 @@ impl Config {
                 None
             },
             "v2_max_channels": if self.stratum { Some(self.stratum_v2_max_channels) } else { None },
+            "v2_jd": if self.stratum { Some(self.stratum_v2_jd) } else { None },
         });
         serde_json::json!({
             "network": self.network.to_string(),
@@ -6701,6 +6706,7 @@ pub struct StratumArgs {
     pub stratumv2bind: Option<String>,
     pub stratumv2key: Option<std::path::PathBuf>,
     pub stratumv2maxchannels: Option<usize>,
+    pub stratumv2jd: Option<bool>,
 }
 
 /// How a Stratum flag's value is parsed.
@@ -6731,6 +6737,7 @@ const STRATUM_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
     ("stratumv2bind", "ADDR:PORT", StratumArgKind::Text, "Bind the Stratum V2 listener (Noise-encrypted; requires --stratum=1)"),
     ("stratumv2key", "PATH", StratumArgKind::Path, "Stratum V2 authority key file (default: <datadir>/stratum_v2.key; created if absent)"),
     ("stratumv2maxchannels", "N", StratumArgKind::Usize, "Channels one Stratum V2 connection may open (default: 16)"),
+    ("stratumv2jd", "BOOL", StratumArgKind::Bool, "Serve Stratum V2 Job Declaration on the V2 listener (default: false). Requires --stratumv2bind."),
 ];
 
 #[inline(never)]
@@ -6794,6 +6801,7 @@ impl clap::FromArgMatches for StratumArgs {
             stratumv2bind: m.remove_one("stratumv2bind"),
             stratumv2key: m.remove_one("stratumv2key"),
             stratumv2maxchannels: m.remove_one("stratumv2maxchannels"),
+            stratumv2jd: m.remove_one("stratumv2jd"),
         })
     }
 
@@ -6824,6 +6832,7 @@ struct StratumFields {
     stratum_v2_bind: Option<String>,
     stratum_v2_key: Option<std::path::PathBuf>,
     stratum_v2_max_channels: usize,
+    stratum_v2_jd: bool,
 }
 
 /// Resolve the Stratum keys from CLI then config file, and validate them.
@@ -6899,6 +6908,13 @@ fn resolve_stratum(
         .stratumv2maxchannels
         .or_else(|| file_get("stratumv2maxchannels").and_then(|v| v.parse().ok()))
         .unwrap_or(16);
+    let stratum_v2_jd = cli
+        .stratumv2jd
+        .or_else(|| file_get("stratumv2jd").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false);
+    if stratum_v2_jd && stratum_v2_bind.is_none() {
+        return Err("--stratumv2jd=1 requires --stratumv2bind".to_string());
+    }
     validate_stratum(&StratumSettings {
         network,
         enabled: stratum,
@@ -6931,6 +6947,7 @@ fn resolve_stratum(
         stratum_v2_bind,
         stratum_v2_key,
         stratum_v2_max_channels,
+        stratum_v2_jd,
     })
 }
 
@@ -7157,6 +7174,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "stratumv2bind",
         "stratumv2key",
         "stratumv2maxchannels",
+        "stratumv2jd",
         "prune",
         "reindex",
         "reindex-chainstate",
@@ -7933,6 +7951,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stratumv2bind",
     "stratumv2key",
     "stratumv2maxchannels",
+    "stratumv2jd",
     // Storage / pruning / reindex
     "prune",
     "reindex",
@@ -11508,6 +11527,18 @@ testactivationheight=bip34@2
         .unwrap();
         assert_eq!(config.stratum_v2_key, Some(std::path::PathBuf::from("/tmp/k.key")));
         assert_eq!(config.stratum_v2_max_channels, 2);
+        assert!(!config.stratum_v2_jd, "Job Declaration is off by default");
+
+        let err = stratum_config(&["--regtest", "--stratum=1", "--stratumv2jd=1"]).unwrap_err();
+        assert!(err.contains("--stratumv2jd=1 requires --stratumv2bind"), "got: {err}");
+        let config = stratum_config(&[
+            "--regtest",
+            "--stratum=1",
+            "--stratumv2bind=127.0.0.1:3336",
+            "--stratumv2jd",
+        ])
+        .unwrap();
+        assert!(config.stratum_v2_jd);
     }
 
     #[test]

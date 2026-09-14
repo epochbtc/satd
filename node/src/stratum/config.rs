@@ -44,6 +44,8 @@ pub struct V2Config {
     pub key_path: PathBuf,
     /// Channels one connection may open.
     pub max_channels: usize,
+    /// Serve Stratum V2 Job Declaration.
+    pub job_declaration: bool,
 }
 
 /// The initial share difficulty when none is configured.

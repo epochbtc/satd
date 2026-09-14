@@ -118,6 +118,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("getmininginfo", "Mining"),
     ("getnetworkhashps", "Mining"),
     ("getprioritisedtransactions", "Mining"),
+    ("getstratuminfo", "Mining"),
     ("prioritisetransaction", "Mining"),
     ("submitblock", "Mining"),
     ("submitheader", "Mining"),
@@ -202,6 +203,8 @@ const TX_VERSION_MAX: u32 = 3;
 #[derive(Default)]
 pub struct ServerListenerStatus {
     inner: RwLock<ServerListenerStatusInner>,
+    /// The Stratum server, once bound; `getstratuminfo` reads it.
+    stratum: RwLock<Option<crate::stratum::StratumHandle>>,
 }
 
 #[derive(Default, Clone)]
@@ -235,6 +238,9 @@ impl ServerListenerStatus {
     }
     pub fn set_stratum_tls(&self, bind: String) {
         self.inner.write().stratum_tls = Some(bind);
+    }
+    pub fn set_stratum_handle(&self, handle: crate::stratum::StratumHandle) {
+        *self.stratum.write() = Some(handle);
     }
     pub fn set_stratum_v2(&self, bind: String) {
         self.inner.write().stratum_v2 = Some(bind);
@@ -3380,6 +3386,17 @@ pub async fn start(
             );
         }
         Ok::<_, ErrorObjectOwned>(serde_json::Value::Object(resp))
+    })?;
+
+    // satd extension: the Stratum server's listeners, counters and current
+    // job. Answers with `enabled: false` and zeroed counters when the server
+    // is off, so a monitor can poll it unconditionally.
+    module.register_method("getstratuminfo", |_params, ctx, _extensions| {
+        let handle = ctx.listener_status.stratum.read().clone();
+        Ok::<_, ErrorObjectOwned>(match handle {
+            Some(h) => h.info(),
+            None => crate::stratum::StratumHandle::disabled_info(),
+        })
     })?;
 
     module.register_method("getwarnings", |_params, ctx, _extensions| {

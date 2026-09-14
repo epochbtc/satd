@@ -25,4 +25,4 @@ pub mod v2;
 pub mod vardiff;
 
 pub use config::{StratumConfig, V2Config, default_initial_difficulty, resolve_payout, should_issue_work};
-pub use server::{StratumServer, StratumServerError};
+pub use server::{StratumHandle, StratumServer, StratumServerError, StratumStats};
