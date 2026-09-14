@@ -27,6 +27,7 @@ item below is (or will be) written up in full in the in-development
   Liana publish no arm64 build; its welcome page names what is installed
   (#742).
 - A status page on the metrics listener, `statuspage=1`: a single-page, self-refreshing `sat-tui` for a browser, with connection strings from `statusadvertise`. Off by default (#749).
+- Streaming API: `Subscribe`/`Watch` responses carry `satd-version` and `satd-events-schema` gRPC headers; `STABILITY_POLICY.md` now states the SDK ↔ node compatibility rule.
 
 ### Fixed
 

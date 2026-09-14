@@ -35,12 +35,13 @@ Minimum 1 major-release deprecation cycle. Removal requires canary CI pass.
 - `/metrics` label schema.
 - Log line content (structure stays Tier 1; wording may change).
 - Internal index file formats whose contents are externally readable.
+- Streaming events gRPC API (`satd.events.v1`) and the Rust / Go SDKs (`satd-events-client`, `satdevents`) — see [Streaming API & SDK compatibility](#streaming-api--sdk-compatibility).
 
 ### Tier 3 — no stability guarantee
 
 Must be clearly documented as unstable in the surface itself (`--help`, endpoint response, etc.).
 
-- IPC / gRPC experimental surfaces.
+- Experimental IPC surfaces (anything documented as unstable in its own `--help` or response).
 - MCP tool schemas (the `rmcp` crate is version-gated; downstream MCP clients pin versions).
 - Debug RPCs (`debug_*`, `test_*`).
 - The status page's `/status.json`. It exists for the page's own refresh; build on `/metrics` or RPC instead.
@@ -49,6 +50,29 @@ Must be clearly documented as unstable in the surface itself (`--help`, endpoint
 ### Explicitly out of scope
 
 satd does not implement Bitcoin Core's legacy wallet. Core's v30 removal of `addmultisigaddress`, `dumpprivkey`, `dumpwallet`, the `import*` family, `sethdseed`, `upgradewallet`, `include_watchonly`, `iswatchonly`, and the BDB wallet format is a surface we never exposed, so the corresponding downstream break is not one we can reproduce directly. PSBT construction, descriptor parsing, and external-signer coordination are in scope and subject to this policy.
+
+---
+
+## Streaming API & SDK compatibility
+
+**Streaming API & SDKs (`satd.events.v1` over gRPC; `satd-events-client`, `satdevents`).**
+
+- An SDK works with any node that speaks the same `schema_version` and is **at or above the SDK's own version**. New event kinds, categories and request fields are additive within a schema version; a node newer than its SDK simply carries features the SDK cannot ask for.
+- An SDK **newer than its node** logs a warning when the node is **one minor version behind**, and **refuses to connect** when it is **two or more minor versions behind** (or a major version behind). Operators mid-upgrade can downgrade the refusal to a warning with an explicit opt-in.
+- A `schema_version` mismatch is always a hard error, in either direction.
+- **Request fields must degrade to a superset.** A new `SubscribeRequest` / `SubscribeControl` field, when ignored by an older node that predates it, must yield the same events or *more* — never fewer or different ones. A field that cannot satisfy this needs a schema bump. (Reviewers check this on every proto addition; it is what makes "warn" safe instead of "wrong data".)
+- Both SDKs carry the node's version number. The Rust crate inherits the workspace version; the Go module is tagged `clients/go/vX.Y.Z` with the node's `X.Y.Z` at the same release commit.
+
+The SDKs do not track which node version introduced which feature. The whole mechanism is two numbers and one comparison, made each time a stream opens.
+
+**How a node advertises itself.** Every `Subscribe` and `Watch` response carries two gRPC response headers, sent when the stream opens and before any event:
+
+| Header | Value |
+|---|---|
+| `satd-version` | The node's version, e.g. `0.6.0` or `0.6.0-pre`. |
+| `satd-events-schema` | `NodeEvent.schema_version` as a decimal string, e.g. `1`. |
+
+Nodes before 0.6.0 send neither header. An SDK treats a missing (or unparseable) `satd-version` as `0.5` and a missing `satd-events-schema` as `1`. Only major and minor versions are compared; the patch number and any `-pre` suffix are ignored.
 
 ---
 

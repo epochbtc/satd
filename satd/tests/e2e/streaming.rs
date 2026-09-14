@@ -123,6 +123,30 @@ async fn grpc_subscribe_block_connected() {
     }
 }
 
+/// A live node advertises its version and schema on both stream RPCs, through
+/// the real server stack. The test binary and the node share the workspace
+/// version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_streams_advertise_node_version() {
+    let sn = start_streaming_async(vec![]).await;
+    let mut client = GrpcStreamClient::connect(sn.grpc_port()).await;
+    for (rpc, md) in [
+        ("subscribe", client.subscribe_metadata().await),
+        ("watch", client.watch_metadata().await),
+    ] {
+        assert_eq!(
+            md.get("satd-version").and_then(|v| v.to_str().ok()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "{rpc}: satd-version header",
+        );
+        assert_eq!(
+            md.get("satd-events-schema").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "{rpc}: satd-events-schema header",
+        );
+    }
+}
+
 /// WS `/ws` firehose delivers a JSON chain `block_connected` event on a new
 /// block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -15,6 +15,12 @@
 //!   ("monotonic per `EventPublisher` instance") are frozen.
 //!
 //! Bump only when forced. The envelope is the user-visible API surface.
+//!
+//! The gRPC carrier also advertises this value, together with the node
+//! version, as the `satd-events-schema` / `satd-version` response headers on
+//! every stream. The SDKs refuse a schema they were not built for and compare
+//! node and SDK versions. See `STABILITY_POLICY.md` → "Streaming API & SDK
+//! compatibility".
 
 /// Current schema version. See module docs for the evolution policy.
 pub const SCHEMA_VERSION: u32 = 1;
