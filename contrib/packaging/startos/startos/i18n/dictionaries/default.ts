@@ -47,7 +47,7 @@ const dict = {
   'satd is fully synced': 32,
   'Syncing block headers: ${count}': 33,
   'Syncing block headers…': 34,
-  'Syncing blocks: ${percentage}%': 35,
+  'Syncing blocks: ${blocks} of ${headers}': 42,
 } as const
 
 export type LangDict = typeof dict

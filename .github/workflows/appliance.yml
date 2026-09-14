@@ -160,16 +160,19 @@ jobs:
           echo "appliance=$(match "^(contrib/appliance/|contrib/stack/|contrib/systemd/)|$self")" >> "$GITHUB_OUTPUT"
           # Widened past tls/tests: compose-test.sh asserts invariants over the
           # compose files, the appliance CLI and the Umbrel package, so it has
-          # to run when any of those change.
-          echo "scripts=$(match "^contrib/(stack/|docker/|appliance/bin/|packaging/umbrel/)|$self")" >> "$GITHUB_OUTPUT"
+          # to run when any of those change. It also covers the StartOS
+          # package, whose backup exclusions the Umbrel package must mirror,
+          # and sync-store.sh, whose test copies both packages.
+          echo "scripts=$(match "^contrib/(stack/|docker/|appliance/bin/|packaging/)|$self")" >> "$GITHUB_OUTPUT"
           # satd-init as well as the package: test/networks.test.ts reads
           # contrib/stack/satd/satd-init and compares its network list and
           # P2P ports against the package's own. That guard exists because
           # the two drifting is silent — a stale port publishes the wrong
           # P2P port, a stale name fails at first start — and gating only on
           # contrib/packaging/startos/ would skip it on exactly the change
-          # it is there to catch.
-          echo "packages=$(match "^(contrib/packaging/startos/|contrib/stack/satd/satd-init$)|$self")" >> "$GITHUB_OUTPUT"
+          # it is there to catch. test/backups.test.ts reads the storage code
+          # for the same reason: the directory names it excludes are there.
+          echo "packages=$(match "^(contrib/packaging/startos/|contrib/stack/satd/satd-init$|node/src/storage/rocksdb_store\.rs$)|$self")" >> "$GITHUB_OUTPUT"
 
   # Cheap and always worth running when touched: no docker, no network.
   scripts:
@@ -186,6 +189,8 @@ jobs:
         run: contrib/docker/tests/healthcheck-test.sh
       - name: compose + appliance invariants
         run: contrib/stack/tests/compose-test.sh
+      - name: sync-store.sh
+        run: contrib/packaging/tests/sync-store-test.sh
       - name: shellcheck
         run: |
           sudo apt-get update -qq
@@ -201,7 +206,9 @@ jobs:
             contrib/appliance/firstboot/satd-appliance-firstboot \
             contrib/appliance/provision/*.sh \
             contrib/stack/tests/compose-test.sh \
-            contrib/stack/tests/smoke.sh
+            contrib/stack/tests/smoke.sh \
+            contrib/packaging/sync-store.sh \
+            contrib/packaging/tests/sync-store-test.sh
 
   # The StartOS package is TypeScript, and until now nothing compiled or ran
   # it here: `make` needs a StartOS server to sideload to, so the packaging

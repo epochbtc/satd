@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: epochbtc-satd
 category: bitcoin
 name: satd
-version: "0.5.1"
+version: "0.5.2"
 tagline: A Bitcoin full node in Rust, with Electrum and Esplora built in
 description: >-
   satd is a Bitcoin Core-compatible full node written in Rust. It speaks
@@ -47,11 +47,49 @@ website: https://github.com/epochbtc/satd
 dependencies: []
 repo: https://github.com/epochbtc/satd
 support: https://github.com/epochbtc/satd/issues
-# satd has no web UI. The Esplora REST API is what a browser can usefully
-# open — its root returns JSON — and the app's description points at
-# `sat-tui` for an actual dashboard.
-port: 3001
+# satd 0.5.2 has no web UI. The Esplora REST API is what a browser can
+# usefully open, and the app's description points at `sat-tui` for an actual
+# dashboard. The status page satd gains in 0.6.0 replaces this.
+#
+# The host port app_proxy binds. 8430, not the 3001 this used to be: Ride The
+# Lightning owns 3001, and a manifest port shares one host port space with
+# every port any app publishes. 8430–8439 is otherwise unused in the store;
+# the published ports in exports.sh sit in the same block.
+port: 8430
 gallery: []
 path: "/api/blocks/tip/height"
+# A community store may host its own icon; the official store hosts its own
+# and wants this unset. Pinned to the release tag so a later change on master
+# cannot alter an already-published listing.
+icon: https://raw.githubusercontent.com/epochbtc/satd/v0.5.2/contrib/packaging/startos/icon.png
+releaseNotes: >-
+  Moves this app off the host ports other Bitcoin apps use, so it installs
+  alongside Bitcoin Node, Fulcrum and Ride The Lightning. P2P is now 8433,
+  Electrum TLS 50012, JSON-RPC TLS 8436 and MCP 8439; reconfigure any client
+  that used the old ports.
+
+
+  Backups leave out the chain and chainstate, which the node downloads again
+  on its own.
+
+
+  Updates satd to 0.5.2. See
+  https://github.com/epochbtc/satd/blob/v0.5.2/docs/release-notes/0.5.2.md
+# Regenerable, and hundreds of gigabytes. What stays in the backup is what
+# cannot be re-derived: tls/ (the CA clients have imported), secrets/ (the MCP
+# token), authfile.toml and bitcoin.conf. `data/` is the directory mounted at
+# /var/lib/satd. Mainnet lives at its root; every other network is a
+# subdirectory with the same layout, which the `*` entries cover.
+backupIgnore:
+  - data/blocks
+  - data/chainstate
+  - data/chainstate_background
+  - data/mempool.dat
+  - data/.cookie
+  - data/*/blocks
+  - data/*/chainstate
+  - data/*/chainstate_background
+  - data/*/mempool.dat
+  - data/*/.cookie
 submitter: 20 Gauge Software
 submission: https://github.com/epochbtc/satd

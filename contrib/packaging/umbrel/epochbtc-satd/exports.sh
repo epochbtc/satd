@@ -20,10 +20,18 @@
 export APP_SATD_HOST="epochbtc-satd_server_1"
 export APP_SATD_IP="epochbtc-satd_server_1"
 export APP_SATD_RPC_PORT="8332"
-export APP_SATD_P2P_PORT="${APP_SATD_P2P_PORT:-8333}"
 export APP_SATD_ELECTRUM_PORT="50001"
-export APP_SATD_ELECTRUM_TLS_PORT="50002"
 export APP_SATD_ESPLORA_PORT="3000"
+
+# The ports published to the host, each mapped 1:1 with satd listening on the
+# same number (docker-compose.yml explains why). None of the standard ports:
+# Bitcoin Node owns 8333, Fulcrum 50002, and every number here is otherwise
+# unused in the Umbrel app store. The plain ports above are on the app network
+# only and keep satd's defaults.
+export APP_SATD_P2P_PORT="8433"
+export APP_SATD_RPC_TLS_PORT="8436"
+export APP_SATD_ELECTRUM_TLS_PORT="50012"
+export APP_SATD_MCP_PORT="8439"
 export APP_SATD_NETWORK="${APP_SATD_NETWORK:-mainnet}"
 
 # Cookie authentication. satd writes the cookie under the network's

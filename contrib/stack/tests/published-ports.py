@@ -30,14 +30,33 @@ ALLOWED = {
     "38333": "Bitcoin P2P (signet)",
     "48333": "Bitcoin P2P (testnet4)",
     "8339": "satd MCP, native TLS plus a bearer token",
+    # The Umbrel package's own block, clear of the ports other store apps use.
+    "8433": "Bitcoin P2P (Umbrel package)",
+    "8436": "satd JSON-RPC, native TLS (Umbrel package)",
+    "50012": "satd Electrum, native TLS (Umbrel package)",
+    "8439": "satd MCP, native TLS plus a bearer token (Umbrel package)",
 }
 
 # "${VAR:-default}" -> "default"; "${VAR}" -> "" (unknown at rest)
 VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
-def resolve(text):
-    return VAR.sub(lambda m: m.group(2) or "", text)
+EXPORT = re.compile(r'^export ([A-Za-z_][A-Za-z0-9_]*)="([0-9]+)"\s*$', re.M)
+
+
+def exports_beside(path):
+    """Numeric values from an Umbrel `exports.sh` next to the compose file.
+
+    Umbrel puts every app's exports into the compose environment, so a port
+    named `${APP_SATD_P2P_PORT}` there is whatever exports.sh says it is.
+    """
+    ex = os.path.join(os.path.dirname(path), "exports.sh")
+    return dict(EXPORT.findall(open(ex).read())) if os.path.exists(ex) else {}
+
+
+def resolve(text, env=None):
+    env = env or {}
+    return VAR.sub(lambda m: env.get(m.group(1)) or m.group(2) or "", text)
 
 
 def published(path):
@@ -88,11 +107,18 @@ def main(*roots):
     failed = False
     for path in sorted(paths):
         name = os.path.basename(path)
+        env = exports_beside(path)
         for spec in published(path):
-            parts = resolve(spec).split(":")
+            parts = resolve(spec, env).split(":")
             # ADDR:HOST:CONTAINER, or HOST:CONTAINER
             addr = parts[0] if len(parts) == 3 else None
             host = parts[-2] if len(parts) >= 2 else parts[0]
+            if not host:
+                # An unset variable resolves to nothing, and "" is in no
+                # allow-list: say which, rather than a bare FAIL on ":".
+                print(f"  FAIL  {name} publishes {spec}, whose host port resolves to nothing")
+                failed = True
+                continue
             if addr and addr not in ("0.0.0.0", "::"):
                 print(f"  ok    {name} publishes {spec} on {addr}")
             elif host in ALLOWED:

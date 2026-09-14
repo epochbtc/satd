@@ -79,3 +79,13 @@ test('the package never disables the MCP Host check', () => {
   const src = read('../startos/main.ts')
   doesNotMatch(src, /mcpallowanyhost|disable_allowed_hosts|mcptrustedproxy/i)
 })
+
+/**
+ * satd 0.5.2's `verificationprogress` is the tip's timestamp divided by the
+ * current time, so a node at genesis reports about 69%. The Blockchain Sync
+ * check used to print it as a percentage, which told a user starting a
+ * multi-day sync that it was two-thirds done.
+ */
+test('Blockchain Sync does not report verificationprogress', () => {
+  doesNotMatch(read('../startos/main.ts'), /verificationprogress/)
+})

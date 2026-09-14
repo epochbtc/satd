@@ -19,19 +19,17 @@ export const manifest = setupManifest({
         // the reference stack and the appliance perform and cannot drift from
         // them.
         //
-        // A per-commit tag, not a release tag: no release contains satd-init,
-        // which this branch adds, so `0.5.1` — what this line used to say —
-        // could not have started. `docker.yml` publishes `sha-<short>` on
-        // every build, the short sha names a real commit on the branch, and
-        // the digest pins the manifest list, which resolves per architecture
-        // so one pin covers amd64 and arm64.
+        // 0.5.2 is the first release whose image carries satd-init; before it
+        // this pinned a per-commit `sha-` tag. The digest pins the OCI index,
+        // which resolves per architecture, so one pin covers amd64 and arm64.
         //
         // The `.s9pk` that was installed on a StartOS server was packed from
         // this digest — `pack` resolves the tag and embeds the layers, so the
         // server itself never contacts a registry.
         //
-        // Bumping it to the release tag is a step in the release checklist.
-        dockerTag: 'ghcr.io/epochbtc/satd:sha-8246eb9@sha256:88b7489a76a11aebf57b805f6fa97b002141fa712b530083bfa081a7dc4ec4b6',
+        // Bumping it, with versions/current.ts, is a step in the release
+        // checklist.
+        dockerTag: 'ghcr.io/epochbtc/satd:0.5.2@sha256:70d73fd51eded5be17272d1065b5409d6b296661c6bcee2e38b517ed505a595a',
       },
       // The image publishes linux/amd64 and linux/arm64 and nothing else, so
       // there is no riscv64 here and nothing to emulate it from.

@@ -62,6 +62,49 @@ if ! python3 "$HERE/published-ports.py" "$STACK" "$APPLIANCE/files" "$UMBREL"; t
     fail=1
 fi
 
+echo "== Umbrel host ports =="
+# One host port space for the whole Umbrel store. The package used to take
+# 8333, 50002 and 3001, which Bitcoin Node, Fulcrum and Ride The Lightning
+# own, so it could not be installed beside any of them. Each port must be
+# mapped 1:1 with satd listening on it: satd advertises its listen port, so a
+# remapped P2P port sends peers to whichever node owns the standard one.
+if ! python3 "$HERE/umbrel-ports.py" "$UMBREL"; then
+    fail=1
+fi
+
+echo "== Umbrel backups leave the chain out, as StartOS's do =="
+# Umbrel backs up the whole app data directory unless told otherwise, and the
+# package used to say nothing, so a user with backups on backed up the chain.
+# The two packages exclude the same set; StartOS's is guarded by its own tests
+# against the directory names satd opens.
+if python3 - "$UMBREL/umbrel-app.yml" "$ROOT/contrib/packaging/startos/startos/backups.ts" <<'PY'
+import re, sys
+umbrel = open(sys.argv[1]).read()
+block = re.search(r"^backupIgnore:\n((?:  - .*\n)+)", umbrel, re.M)
+u = set()
+for line in (block.group(1).splitlines() if block else []):
+    path = line.strip()[2:].strip()
+    if not path.startswith("data/"):
+        print(f"  FAIL  backupIgnore {path} is outside data/, the directory mounted at /var/lib/satd")
+        sys.exit(1)
+    u.add(path[len("data/"):].rstrip("/"))
+ts = re.sub(r"//.*", "", open(sys.argv[2]).read())
+excl = re.search(r"exclude: \[(.*?)\]", ts, re.S)
+s = {e.rstrip("/") for e in re.findall(r"'([^']+)'", excl.group(1))} - {"rpc-cookie"}
+if not u:
+    print("  FAIL  umbrel-app.yml has no backupIgnore")
+    sys.exit(1)
+if u != s:
+    print(f"  FAIL  Umbrel and StartOS exclude different sets: only Umbrel {sorted(u - s)}, only StartOS {sorted(s - u)}")
+    sys.exit(1)
+for d in ("blocks", "chainstate", "chainstate_background"):
+    if d not in u or "*/" + d not in u:
+        print(f"  FAIL  {d} is not excluded at the root and per network")
+        sys.exit(1)
+print(f"  ok    both packages exclude the same {len(u)} paths, the chain among them")
+PY
+then :; else fail=1; fi
+
 check "the proxy serves BTCPay over TLS" \
     "grep -q 'btcpay:49392' '$STACK/caddy/Caddyfile'"
 check "the proxy publishes the BTCPay TLS port" \

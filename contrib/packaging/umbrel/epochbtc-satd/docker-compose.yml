@@ -16,21 +16,13 @@ version: "3.7"
 # users different software from the same manifest. The digest is the OCI index
 # (linux/amd64 + linux/arm64), so it still resolves per-architecture.
 #
-# The tag is bare. The registry has never published a `v`-prefixed tag, so the
-# `v0.5.2` this used to name resolved to nothing on every architecture.
+# The tag is bare. The registry has never published a `v`-prefixed tag.
 #
-# It is also a per-commit tag rather than a release: no release contains
-# satd-init, which this branch adds, so the `0.5.1` this used to name could
-# not have started. `docker.yml` publishes `sha-<short>` on every build and
-# the short sha names a real commit on the branch.
-#
-# The umbrelOS install was run against a locally built copy of this image
-# served from a registry on the host, not against ghcr itself — the VM's
-# outbound path is QEMU's NAT and the package is not public yet. Same
-# Dockerfile, same tree; the registry hop is what is untested.
-#
-# Bumping both halves is a step in the release checklist.
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-8246eb9@sha256:88b7489a76a11aebf57b805f6fa97b002141fa712b530083bfa081a7dc4ec4b6
+# 0.5.2 is the first release whose image carries satd-init; before it this
+# pinned a per-commit `sha-` tag. Bumping both halves is a step in the release
+# checklist, and `contrib/packaging/sync-store.sh` refuses a pin whose tag does
+# not match the manifest's `version`.
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:0.5.2@sha256:70d73fd51eded5be17272d1065b5409d6b296661c6bcee2e38b517ed505a595a
 
 services:
   app_proxy:
@@ -45,8 +37,8 @@ services:
       # Plaintext is correct here rather than merely tolerable. This hop is
       # container-to-container on the app network, which is the same place
       # satd.conf.tmpl already puts the other plain listeners, and the proxy is
-      # what terminates TLS for the browser. The TLS listener on 3001 is for
-      # LAN clients reaching satd directly, and it stays exactly as it was.
+      # what terminates TLS for the browser. Esplora's TLS listener is not
+      # published; LAN clients that want TLS use Electrum or RPC below.
       APP_PORT: 3000
       # Esplora serves public chain data and is unauthenticated by design, like
       # every public Esplora deployment — putting Umbrel's login in front of it
@@ -89,7 +81,9 @@ services:
       # over mDNS, and the certificate has to carry that name or every LAN
       # client sees a mismatch.
       SATD_TLS_HOSTNAME: ${DEVICE_HOSTNAME:-umbrel}
-      SATD_P2P_PORT: ${APP_SATD_P2P_PORT:-8333}
+      # No SATD_P2P_PORT. satd-init only accepts the chain's standard port
+      # there, and this package listens on its own (see `ports:` below); the
+      # server's --port overrides the rendered config instead.
     volumes:
       - ${APP_DATA_DIR}/data:/var/lib/satd
 
@@ -102,9 +96,17 @@ services:
     # `signet=1` in a file and then ignores it, which silently starts a
     # mainnet node. `--chain=` because there is no bare `--mainnet` flag,
     # and mainnet is this package's default.
+    #
+    # The listener flags move satd onto this package's own host ports (see
+    # `ports:`). A command-line value overrides the same key in the rendered
+    # bitcoin.conf, so satd-init stays unmodified.
     command:
       - --datadir=/var/lib/satd
       - --chain=${APP_SATD_NETWORK:-mainnet}
+      - --port=${APP_SATD_P2P_PORT}
+      - --rpctlsbind=0.0.0.0:${APP_SATD_RPC_TLS_PORT}
+      - --electrumtlsbind=0.0.0.0:${APP_SATD_ELECTRUM_TLS_PORT}
+      - --mcpport=${APP_SATD_MCP_PORT}
     # No SATD_HEALTH_URL, so the image's own HEALTHCHECK probes JSON-RPC
     # liveness rather than readiness. /readyz is 503 until the tip is within
     # six blocks of the headers tip; on this install the container read
@@ -113,20 +115,26 @@ services:
     # state to the user, so the whole initial sync would look like a fault.
     volumes:
       - ${APP_DATA_DIR}/data:/var/lib/satd
-    # Esplora's 3001 is deliberately NOT here. `umbrel-app.yml` sets
-    # `port: 3001`, which is the host port app_proxy binds, and app_proxy
-    # starts first — so publishing 3001 from this service too is a guaranteed
-    # "port is already allocated" on every install, not a race. The proxy
-    # reaches Esplora over the app network as epochbtc-satd_server_1:3001,
-    # which is exactly what APP_HOST/APP_PORT above already say.
+    # Esplora's TLS listener is deliberately NOT here. app_proxy is how a
+    # browser reaches Esplora, over the app network, which is exactly what
+    # APP_HOST/APP_PORT above already say.
     #
     # The rest are published on purpose: they are the LAN-facing surfaces,
     # each TLS-terminated by satd itself, and app_proxy fronts only one port.
+    #
+    # Every one is mapped 1:1 onto a port no other app in the Umbrel store
+    # uses, and satd listens on that same number. The standard ports belong to
+    # apps satd users run beside it: 8333 to Bitcoin Node, 50002 to Fulcrum,
+    # and 3001 (this package's old manifest port) to Ride The Lightning. P2P
+    # cannot be remapped instead: satd advertises the port it listens on, so
+    # `8433:8333` would send every peer that learned this address to Bitcoin
+    # Node. The numbers live in exports.sh, and compose-test.sh checks that
+    # each mapping is 1:1 and matches the flag above.
     ports:
-      - "${APP_SATD_P2P_PORT:-8333}:${APP_SATD_P2P_PORT:-8333}"
-      - "8336:8336"
-      - "50002:50002"
-      - "8339:8339"
+      - "${APP_SATD_P2P_PORT}:${APP_SATD_P2P_PORT}"
+      - "${APP_SATD_RPC_TLS_PORT}:${APP_SATD_RPC_TLS_PORT}"
+      - "${APP_SATD_ELECTRUM_TLS_PORT}:${APP_SATD_ELECTRUM_TLS_PORT}"
+      - "${APP_SATD_MCP_PORT}:${APP_SATD_MCP_PORT}"
     stop_grace_period: 10m
     restart: on-failure
     healthcheck:
