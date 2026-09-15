@@ -3252,6 +3252,12 @@ impl Mempool {
     /// The acting txids and the mempool sequence number, read under one
     /// lock so the number describes exactly that set (Core's
     /// `MempoolToJSON` with `mempool_sequence`).
+    /// The mempool sequence alone: Core's `GetTransactionsUpdated`, which a
+    /// `getblocktemplate` long poll compares.
+    pub fn mempool_sequence(&self) -> u64 {
+        self.inner.read().sequence
+    }
+
     pub fn acting_txids_with_sequence(&self) -> (Vec<Txid>, u64) {
         let inner = self.inner.read();
         let txids = inner
