@@ -111,40 +111,52 @@ by version order.
 
 Every reason came from running the test, not from reading it.
 
-**`addconnection` landed, and the nine rows behind it were re-measured.** Two
-passed outright (`p2p_add_connections`, `p2p_addrfetch`); the other seven each
-carry the blocker that was actually observed once the RPC existed, and none of
-them is about `addconnection` any more.
+**Re-measured 2026-09-15.** Every eligible skip row -- 134 rows, 146
+executions, leaving out the buckets that can never run (`no-wallet`, `no-tool`,
+`prev-release`, `no-usdt`, `core-internal`, `no-ipc`, `no-core-zmq`) -- was run
+as `--candidate` in one batch. Two executions passed: `feature_fastprune`,
+which went into the run-set, and `rpc_bind --nonloopback`, one of that row's
+three variants. Many rows still named a blocker that had since shipped (the
+keepalive ping, `getpeerinfo.inflight` during IBD, `getmininginfo.bits`,
+`getdeploymentinfo`, `getprioritisedtransactions`); every row now carries the
+line it actually stopped on, and the blocker known to sit behind it where one
+is.
+
+The first blocker per failing execution, grouped. This is a map of what the
+framework hits first, not a priority order: a row almost always stops again
+behind its first blocker.
+
+| Execs | First blocker |
+|---:|---|
+| 21 | **A log line satd never writes.** `assert_debug_log` greps for an event satd handles silently: a tx or block reject reason, a redundant `verack`, an inbound accept with its peer id, a disconnect's node-state cleanup, the RPC method being served. Where satd logs the event in other words, `debuglog_map.toml` can carry it; where it logs nothing, satd needs the line first. The rest of this group (addrman, assumevalid, anti-DoS headers, reindex ordering) has no event to log. |
+| 19 | **Core's P2P policy.** `feefilter` send rules, `-blocksonly` and `-peerbloomfilters=0` violation disconnects, ping timing on the mock clock, the stale-block serving cutoff, single-peer initial headers sync, the stale-tip outbound eviction probe, header announcement state, `NODE_NETWORK_LIMITED`, address relay, inbound eviction, Erlay. |
+| 15 | **A missing RPC.** `createmultisig` (three rows), `signmessagewithprivkey`, `getorphantxs` (two), `sendmsgtopeer` (two variants), `addpeeraddress` (two), `mockscheduler`, `getdescriptoractivity`, and per-method `help` text (three executions). |
+| 13 | **A missing or differently shaped RPC field.** `getmininginfo.bits`, `getblockchaininfo.signet_challenge`, `getprioritisedtransactions.modified_fee`, `getmempoolentry.wtxid`, `getrawmempool(mempool_sequence=true)`, `NODE_P2P_V2` in `localservices`, per-message byte counts under v2, `decodescript` asm, `muhash`, `uploadtarget`, coinstatsindex fields, `hash_serialized_3`. |
+| 11 | **Core v31 options or out-of-scope surfaces.** Cluster mempool limits, `-txospenderindex`, `-privatebroadcast`, I2P, RPC whitelists. |
+| 10 | **Core's on-disk layout.** `rev*.dat`, `blocks/index`, `anchors.dat`, `-debuglogfile`, datadir permissions, `getrpcinfo.logpath`, REST. |
+| 9 | **Chain behaviour.** `preciousblock` is a no-op, the filter index is keyed by height, the unknown-versionbits and large-work-invalid-chain warnings, `stop` during a long call, txindex over a cached datadir, block reject wording, the prune target across a reorg. |
+| 9 | **Mempool policy.** The rolling minimum fee, `-bytespersigop` rounding, the `-26` reject message prefix, `-maxtipage`, TRUC, package RBF, fee estimation, key-based descriptors in `scantxoutset`. |
+| 8 | **`-prune=1` refused at startup.** satd prunes automatically under `-prune=<MiB>` but has no manual mode, and seven rows start a node with `-prune=1`. |
+| 8 | **Message ordering behind `ping`.** satd answers `ping` on the peer's socket task, while blocks and transactions go through the block processor, so `send_and_ping` does not guarantee the block or tx was processed when the pong arrives. |
+| 8 | **Startup text.** `-rpcauth` validation, `-rpcbind` port errors, `-nolisten=0`, a missing `-blocksdir`, `-pid` path resolution, `uacomment` from an included config. |
+| 4 | **Sync wedges.** The IBD scheduler stuck at `0 in-flight, N pending`, and `invalidateblock` leaving the headers tip on the invalidated branch. |
+| 4 | **wtxid relay** (#714). |
+| 3 | **In-flight blocks outside IBD.** `getpeerinfo.inflight` is filled only by the IBD scheduler. |
+| 2 | **High-bandwidth compact blocks.** |
+
+Nine rows are outside the compatibility target: six use Core v31 options
+(cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
+target; the rest need Core-only binaries or internals.
 
 **Re-measured 2026-09-05.** Fifty-seven skip rows still named a since-shipped
 blocker (`setmocktime`, named parameters, `syncwithvalidationinterfacequeue`,
 `scantxoutset`); all 66 rows that had a stale or unattributed note were re-run
 as `--candidate` in one batch. **73 executions, 73 failures** -- a stale note
 is never a near-pass, removing the stated blocker only exposes the next one.
-Every one of those rows now carries the blocker that was actually observed, so
-the table below and the inventory agree with the machine.
 
-Ranked by executions blocked, except the catch-all row, which is last whatever
-its size. This is a map of the framework's demands, not a priority order.
-
-The rows do not sum to the 73 executions above: five rows credited to
-`addconnection` were not re-run in that batch, and the counts here are per
-blocker rather than per re-measured row.
-
-| Execs | Blocker |
-|---:|---|
-| 15 | **debug.log phrasing.** `assert_debug_log` greps for a line satd either words differently or does not log: `bad-txns-vout-empty`, `bad-txns-duplicate`, `Added connection peer=0`, `Misbehaving`, `DNS seeding disabled`, `LoadExternalBlockFile: Out of order block`, the assumevalid and addrman lines. Where satd logs the event, a `debuglog_map.toml` rule can carry it; where it does not, the row is `core-log`. |
-| 3 | **Per-peer in-flight blocks.** `getpeerinfo.inflight` is a hardcoded empty list. `p2p_ibd_stalling` (x2) waits on the total across peers; `p2p_mutated_blocks` asserts the exact list. Core populates it from `mapBlocksInFlight`, so it covers every block request, not only the IBD scheduler's. |
-| 4 | **Startup-abort text.** Four tests assert Core's exact fatal message on stderr for a condition satd does not detect at all: a missing `-blocksdir`, a pre-segwit chainstate, a block-database timestamp from the future. |
-| 3 | **Missing RPC methods.** `createmultisig` (`feature_nulldummy`), `signmessagewithprivkey`, `getdescriptoractivity`. All three are pure secp256k1/script over code satd already has -- no wallet. |
-| 3 | **UTXO-set hashing.** `hash_serialized_3` is not Core's serialization and there is no `muhash`, which blocks `feature_utxo_set_hash`, `rpc_dumptxoutset` and (with Core's own tool on top) `tool_utxo_to_sqlite`. |
-| 2 | **Unrequested-block connection.** A block pushed over P2P with `send_and_ping` does not connect, so `feature_cltv` and `feature_dersig` stall one block short. Same root as `p2p_unrequested_blocks`. |
-| 2 | **Missing RPC fields.** `getnettotals.uploadtarget` (only the doorway -- the test then drives real `-maxuploadtarget` behaviour), `getmininginfo.bits`. |
-| 32 | **Real policy and behaviour gaps**, each named in its inventory row: TRUC, package relay, high-bandwidth compact blocks, fee estimation, min-relay-fee divergence, reindex logging, assumeutxo rollback, addrman and address relay, the P2P keepalive ping, `-debuglogfile`, `-capturemessages`, datadir permissions, `decodescript` asm rendering, preciousblock and invalidateblock branch selection, key-based descriptors in `scantxoutset`. |
-
-Nine rows are outside the compatibility target: six use Core v31 options
-(cluster mempool, `-txospenderindex`, `-privatebroadcast`) against a stated v30
-target; the rest need Core-only binaries or internals.
+**`addconnection` landed, and the nine rows behind it were re-measured.** Two
+passed outright (`p2p_add_connections`, `p2p_addrfetch`); the other seven each
+carry the blocker that was actually observed once the RPC existed.
 
 ## Fixed
 
