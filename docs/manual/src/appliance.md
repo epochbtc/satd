@@ -37,59 +37,11 @@ still qualifies that one. The `arm64` half of the container image is exercised
 by the reference stack's own test suite on an arm64 host, but umbrelOS ships
 `aarch64` only as a Raspberry Pi image, with no supported path to a VM.
 
-## Installing from an app store
+## Installing
 
-### Umbrel
-
-satd is in a community app store rather than Umbrel's own:
-
-1. In umbrelOS, open the **App Store**, then **⋯ → Community App Stores**.
-2. Add `https://github.com/epochbtc/umbrel-apps`.
-3. Open the **satd** store and install **satd**.
-
-The app takes its own host ports, clear of every other app in the Umbrel store,
-so it installs alongside Bitcoin Node, Fulcrum and Ride The Lightning:
-
-| Port | Surface |
-|---|---|
-| 8430 | the status page, through Umbrel's proxy and login |
-| 8431 | Esplora, TLS |
-| 8433 | Bitcoin P2P |
-| 50012 | Electrum, TLS |
-| 8436 | JSON-RPC, TLS |
-| 8439 | MCP, TLS and a bearer token |
-
-Opening the app shows satd's [status page](observability.md#status-page):
-sync progress, whether a wallet can connect yet, and the connection strings
-to use.
-
-Point a wallet at `umbrel.local:50012` over SSL. Sparrow and Electrum pin the
-certificate on first use; a client that verifies against a CA needs the
-install's, and the MCP token lives beside it. The status page never shows
-either, since it carries nothing secret, so reading them takes SSH:
-
-```sh
-sudo cat ~/umbrel/app-data/epochbtc-satd/data/tls/ca.crt
-sudo cat ~/umbrel/app-data/epochbtc-satd/data/secrets/mcp-token
-```
-
-See [Trusting it](#trusting-it) for importing the CA. Other
-apps on the device reach JSON-RPC in plain text on the app network, as
-`epochbtc-satd_server_1:8332` with the cookie at `APP_SATD_RPC_COOKIE_FILE`,
-which is how they reach Bitcoin Node too.
-
-Earlier builds of the package used 8333, 50002, 3001, 8336 and 8339. A client
-configured against those needs the new port.
-
-Umbrel backups leave out the chain and chainstate, which the node downloads
-again on its own, and keep the CA and the MCP token.
-
-### StartOS
-
-satd is not yet listed in Start9's community registry. Until it is, build the
-package and sideload it as `contrib/packaging/startos/README.md` describes.
-Its **Instructions** tab covers the interfaces, the actions and what the
-package does not do.
+[Installing satd](installing.md) has the steps for each: adding the Umbrel
+community store, sideloading the StartOS package, and downloading, verifying
+and booting an appliance image. This chapter covers how they fit together and how they are built.
 
 ## The reference stack
 
@@ -247,33 +199,10 @@ anything that does not verify.
 
 ### Downloading a built image
 
-Images are attached to the [GitHub release](https://github.com/epochbtc/satd/releases)
-for each version, alongside the tarballs, and are signed with the same
-minisign key:
-
-Both architectures are published. Pick `arm64` on Apple Silicon and on an
-arm64 server; `amd64` on an Intel or AMD host. Running an image under
-emulation works but is slow enough to be unpleasant for a syncing node.
-
-```sh
-# core is headless and ~600 MB; desktop is ~1.4 GB.
-ver=0.5.2
-arch=arm64   # or amd64
-base="https://github.com/epochbtc/satd/releases/download/v$ver"
-curl -fLO "$base/satd-appliance-$ver-core-$arch.qcow2"
-curl -fLO "$base/satd-appliance-$ver-core-$arch.qcow2.minisig"
-
-minisign -Vm "satd-appliance-$ver-core-$arch.qcow2" \
-  -P RWQeP6MczCgPh6tU03GEMm4HsnGbXte3VT2Bc52TBSR7Q+X7WnL5vfQ3
-```
-
-An arm64 guest is UEFI-only — there is no BIOS to fall back on — so give it
-a UEFI firmware. UTM on macOS does this for you; with plain QEMU, pass
-`-machine virt` and an `AAVMF_CODE.fd` in pflash.
-
-The `.qcow2` boots under QEMU/libvirt as it is — `qemu-img` already
-compressed it, so there is nothing to unpack. The `.ova` that accompanies
-the desktop flavour imports into VirtualBox or VMware.
+Released images, from 0.6.0 on, are attached to the
+[GitHub release](https://github.com/epochbtc/satd/releases) and signed with
+the release minisign key. [Installing satd](installing.md#appliance-image)
+has the download, verification and first-boot steps.
 
 The satd inside a released image is the same signed tarball published on
 that release, verified against the key above during the build — not a
