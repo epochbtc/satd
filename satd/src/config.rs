@@ -30,6 +30,17 @@ pub(crate) const CONNECT_NEGATED: &str = "\u{0}noconnect";
 /// negation rides as a value no path can name.
 pub(crate) const INCLUDECONF_NEGATED: &str = "\u{0}noincludeconf";
 
+/// Sentinel for `-norpcauth`, which discards every `-rpcauth` before it,
+/// including the config file's (`SettingsSpan`, as for `-noconnect`).
+pub(crate) const RPCAUTH_NEGATED: &str = "\u{0}norpcauth";
+
+/// Sentinel for `-norpccookiefile`: generate no cookie file at all.
+pub(crate) const RPCCOOKIEFILE_NEGATED: &str = "\u{0}norpccookiefile";
+
+/// Core's startup error for any `-rpcauth` it cannot use (`InitRPCAuthentication`
+/// fails and `StartHTTPServer` reports it this way). The detail goes to the log.
+const RPCAUTH_INIT_ERROR: &str = "Unable to start HTTP server. See debug log for details.";
+
 /// DB cache sizing mode. `Fixed(n)` is the Core-compatible static N-MB budget;
 /// `Auto { max_mb }` lets the adaptive controller grow/shrink the cache based
 /// on system memory pressure, capped at max_mb.
@@ -422,6 +433,9 @@ pub struct Config {
     /// value is supplied, defaults to `127.0.0.1:rpcport` only — same
     /// posture as Core when no `-rpcallowip` is configured.
     pub rpcbind: Vec<SocketAddr>,
+    /// `rpcbind` holds the defaults (no `-rpcbind` given): 127.0.0.1 and ::1.
+    /// A default that cannot be bound is skipped rather than fatal.
+    pub rpcbind_is_default: bool,
     /// Per-request source-IP allowlist for the JSON-RPC HTTP listener.
     /// Mirrors Bitcoin Core's `-rpcallowip=<ip|cidr>` — repeatable.
     /// Empty list means loopback only (Core's default). If any
@@ -524,6 +538,8 @@ pub struct Config {
     /// `$DATADIR/.cookie` behaviour. Absolute paths only — relative
     /// paths would be ambiguous against the network-suffixed datadir.
     pub rpc_cookie_file: Option<PathBuf>,
+    /// `-norpccookiefile`: write no cookie file.
+    pub rpc_cookie_disabled: bool,
     /// Filesystem permissions applied to the cookie file when it's
     /// written, matching Core's `-rpccookieperms=<owner|group|all>`.
     /// `Owner` (0600, default) restricts to the satd UID; `Group`
@@ -647,6 +663,9 @@ pub struct Config {
     /// `MAX_CLUSTER_COUNT_LIMIT`), so the option can only lower it.
     pub limitclustercount: usize,
     pub mempoolexpiry: u64,
+    /// Core's `-maxtipage`, seconds: a tip older than this keeps the node in
+    /// initial block download. Default 24 hours.
+    pub maxtipage: i64,
     /// Bitcoin Core's `-persistmempool`: save the mempool to
     /// `<datadir>/<chain>/mempool.dat` on clean shutdown and re-admit
     /// it (re-validated) on startup. Default true, matching Core.
@@ -1406,12 +1425,14 @@ impl Config {
     /// config file is re-read from disk.
     pub fn load_with_cli() -> Result<(Self, CliArgs), String> {
         let raw_args: Vec<String> = std::env::args().collect();
+        let double_negatives = double_negative_warnings(&raw_args);
         let normalized = normalize_args(raw_args);
         // Recognized-but-unsupported Core options are skipped with a warning,
         // exactly as the same key in bitcoin.conf would be (drop-in
         // compatibility). Unrecognized options stay in place so clap still
         // rejects typos.
-        let (normalized, cli_warnings) = filter_unsupported_core_cli_args(normalized)?;
+        let (normalized, mut cli_warnings) = filter_unsupported_core_cli_args(normalized)?;
+        cli_warnings.extend(double_negatives);
         // Pre-flight: any single-dashed *multi-character* arg that survived
         // normalize_args (which converts known satd flags to `--long`) and
         // filter_unsupported_core_cli_args (which drops/errors on
@@ -1773,16 +1794,20 @@ impl Config {
             file_get_all("rpcbind")
         };
         let mut rpcbind: Vec<SocketAddr> = Vec::new();
-        if rpcbind_raw.is_empty() {
-            // Core's posture when no -rpcbind is set: 127.0.0.1 (and
-            // ::1 when IPv6 is available). We default to 127.0.0.1
-            // only — adding ::1 by default risks an unexpected open
-            // listener on dual-stack boxes where IPv6 firewall rules
-            // haven't been written. Operators who want ::1 can pass
-            // `--rpcbind=[::1]` explicitly.
+        let rpcbind_is_default = rpcbind_raw.is_empty();
+        if rpcbind_is_default {
+            // Core's default with no -rpcbind: both loopbacks, 127.0.0.1 and
+            // ::1 (`HTTPBindAddresses`). Both are loopback-only, so neither
+            // opens the server to the network. A host without IPv6 cannot
+            // bind ::1; `main` drops it there, as Core carries on when one of
+            // its defaults fails to bind.
             rpcbind.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), rpcport));
+            rpcbind.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), rpcport));
         } else {
             for entry in &rpcbind_raw {
+                if rpcbind_port_is_invalid(entry) {
+                    return Err(format!("Invalid port specified in -rpcbind: '{entry}'"));
+                }
                 let parsed = parse_rpcbind_entry(entry, rpcport).map_err(|e| {
                     format!("invalid --rpcbind value {entry:?}: {e}")
                 })?;
@@ -1800,8 +1825,25 @@ impl Config {
             file_get_all("rpcallowip")
         };
         let mut rpcallowip: Vec<IpAllowEntry> = Vec::new();
+        // satd has no CJDNS transport, so `-cjdnsreachable` does one thing
+        // here, the thing Core does to the RPC allowlist: with it set, an
+        // address in fc00::/8 is a CJDNS address rather than RFC4193, and
+        // Core refuses an RFC4193 subnet (L bit clear) in `-rpcallowip`.
+        let cjdnsreachable = cli
+            .cjdnsreachable
+            .or_else(|| file_get("cjdnsreachable").and_then(|v| parse_bool(&v)))
+            .unwrap_or(false);
         for entry in &rpcallowip_raw {
-            rpcallowip.push(IpAllowEntry::parse(entry)?);
+            let parsed = IpAllowEntry::parse(entry)?;
+            if cjdnsreachable && parsed.is_cjdns_range() {
+                return Err(format!(
+                    "Invalid -rpcallowip subnet specification: {entry}. Valid values are a single IP \
+                     (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0), a network/CIDR \
+                     (e.g. 1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0). RFC4193 is allowed \
+                     only if -cjdnsreachable=0."
+                ));
+            }
+            rpcallowip.push(parsed);
         }
 
         // Core's gate against accidental exposure: if any rpcbind is
@@ -1822,20 +1864,39 @@ impl Config {
             ));
         }
 
-        // --rpcauth resolution: CLI list wins; else config (multi).
-        let rpcauth_raw: Vec<String> = if !cli.rpcauth.is_empty() {
+        // --rpcauth resolution: CLI list wins; else config (multi). A
+        // `-norpcauth` discards the entries before it and the config file's.
+        let mut rpcauth_raw: Vec<String> = if !cli.rpcauth.is_empty() {
             cli.rpcauth.clone()
         } else {
             file_get_all("rpcauth")
         };
+        if let Some(last_negation) = rpcauth_raw.iter().rposition(|v| v == RPCAUTH_NEGATED) {
+            rpcauth_raw.drain(..=last_negation);
+        }
         let mut rpcauth: Vec<RpcAuthEntry> = Vec::new();
         for entry in &rpcauth_raw {
-            rpcauth.push(RpcAuthEntry::parse(entry)?);
+            // Core refuses to start on an empty or malformed `-rpcauth`, with
+            // a generic message and the reason in the log.
+            match RpcAuthEntry::parse(entry) {
+                Ok(parsed) => rpcauth.push(parsed),
+                Err(detail) => {
+                    println!("Invalid -rpcauth argument. {detail}");
+                    return Err(RPCAUTH_INIT_ERROR.to_string());
+                }
+            }
         }
 
-        let rpc_cookie_file = cli
+        let mut rpc_cookie_file = cli
             .rpccookiefile
             .or_else(|| file_get("rpccookiefile").map(PathBuf::from));
+        // `-norpccookiefile`: no cookie; the node authenticates with
+        // `-rpcauth`/`-rpcuser` alone.
+        let rpc_cookie_disabled =
+            rpc_cookie_file.as_deref() == Some(std::path::Path::new(RPCCOOKIEFILE_NEGATED));
+        if rpc_cookie_disabled {
+            rpc_cookie_file = None;
+        }
         if let Some(p) = &rpc_cookie_file
             && p.is_relative()
         {
@@ -2852,6 +2913,17 @@ impl Config {
             .or_else(|| file_get("mempoolexpiry").and_then(|v| v.parse().ok()))
             .unwrap_or(336); // hours
 
+        let maxtipage = match cli.maxtipage {
+            Some(v) => v,
+            None => match file_get("maxtipage") {
+                Some(v) => v
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid maxtipage {v:?}: expected seconds"))?,
+                None => node::chain::state::DEFAULT_MAX_TIP_AGE_SECS,
+            },
+        };
+
         let permitbaremultisig = cli
             .permitbaremultisig
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
@@ -3790,6 +3862,7 @@ impl Config {
             signet_challenge,
             rpcport,
             rpcbind,
+            rpcbind_is_default,
             rpcallowip,
             rpcuser,
             rpcpassword,
@@ -3812,6 +3885,7 @@ impl Config {
             authfile,
             rpc_auth_bearer,
             rpc_cookie_file,
+            rpc_cookie_disabled,
             rpc_cookie_perms,
             rpc_tls_bind,
             rpc_mtls,
@@ -3853,6 +3927,7 @@ impl Config {
             limitdescendantcount,
             limitclustercount,
             mempoolexpiry,
+            maxtipage,
             persistmempool: cli
                 .persistmempool
                 .or_else(|| file_get("persistmempool").and_then(|v| parse_bool(&v)))
@@ -5256,6 +5331,24 @@ pub struct CliArgs {
         help = "Mempool expiry in hours (default: 336)"
     )]
     pub mempoolexpiry: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        allow_hyphen_values = true,
+        help = "Maximum tip age in seconds to consider the node out of initial block download (default: 86400)"
+    )]
+    pub maxtipage: Option<i64>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Core's -cjdnsreachable. satd has no CJDNS transport; the only effect is Core's refusal of an fc00::/8 (L bit clear) -rpcallowip"
+    )]
+    pub cjdnsreachable: Option<bool>,
 
     #[arg(
         long,
@@ -7164,6 +7257,80 @@ fn validate_stratum(s: &StratumSettings<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Boolean options Core negates with a `-no` prefix, which [`normalize_args`]
+/// rewrites to an explicit value.
+const NEGATABLE_BOOL_FLAGS: &[&str] = &[
+    "regtest",
+    "testnet",
+    "testnet4",
+    "signet",
+    "listen",
+    "blocksonly",
+    "cmpctblockprefill",
+    "blocksxor",
+    "v2transport",
+    "v2only",
+    "dns",
+    "dnsseed",
+    "forcednsseed",
+    "fixedseeds",
+    "listenonion",
+    "proxyrandomize",
+    "txindex",
+    "addressindex",
+    "silentpaymentindex",
+    "peerblockfilters",
+    "coinstatsindex",
+    "txospenderindex",
+    "mempoolfullrbf",
+    "datacarrier",
+    "permitbaremultisig",
+    "persistmempool",
+    "acceptnonstdtxn",
+    "allowdangerousfilters",
+    "networkactive",
+    "esplora",
+    "esploramtls",
+    "esploraauthbearer",
+    "electrum",
+    "electrummtls",
+    "rpcmtls",
+    "rpcdisableauth",
+    "rpcauthbearer",
+    "rpcextendederrors",
+    "logtimestamps",
+    "logthreadnames",
+    "logsourcelocations",
+    "checkpoints",
+    "allowignoredconf",
+    "whitelistrelay",
+    "whitelistforcerelay",
+    "reindex",
+    "reindex-chainstate",
+    "checkblockindex",
+    "mcp",
+    "mcpmtls",
+    "mcpauth",
+    "mcpallowremote",
+    "server",
+    "daemon",
+    "events-grpc-allow-remote",
+    "events-grpc-mtls",
+    "events-grpc-tls-cert",
+    "events-grpc-tls-key",
+    "events-grpc-mtls-client-ca",
+    "events-grpc-mtls-client-allow",
+    "events-grpc-tls-handshake-timeout",
+    "streamws-allow-remote",
+    "streamws-auth",
+    "events-zmq-hashtx",
+    "events-zmq-hashblock",
+    "events-zmq-mpevict",
+    "events-zmq-mpreplace",
+    "events-zmq-mpconfirm",
+    "events-zmq-nodeevent",
+];
+
 /// Convert Bitcoin Core-style single-dash long flags to clap-compatible double-dash.
 /// e.g. `-regtest` → `--regtest`, `-datadir=/path` → `--datadir=/path`
 pub fn normalize_args(args: Vec<String>) -> Vec<String> {
@@ -7236,6 +7403,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitdescendantcount",
         "limitclustercount",
         "mempoolexpiry",
+        "maxtipage",
+        "cjdnsreachable",
         "persistmempool",
         "permitbaremultisig",
         "acceptnonstdtxn",
@@ -7394,77 +7563,6 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
     // `--<flag>=0` is a flag clap recognises. `blockfilterindex` is
     // intentionally absent: it is not a plain bool (accepts `basic`), so
     // its `-no` form is handled via translate_index_aliases instead.
-    const NEGATABLE_BOOL_FLAGS: &[&str] = &[
-        "regtest",
-        "testnet",
-        "testnet4",
-        "signet",
-        "listen",
-        "blocksonly",
-        "cmpctblockprefill",
-        "blocksxor",
-        "v2transport",
-        "v2only",
-        "dns",
-        "dnsseed",
-        "forcednsseed",
-        "fixedseeds",
-        "listenonion",
-        "proxyrandomize",
-        "txindex",
-        "addressindex",
-        "silentpaymentindex",
-        "peerblockfilters",
-        "coinstatsindex",
-        "txospenderindex",
-        "mempoolfullrbf",
-        "datacarrier",
-        "permitbaremultisig",
-        "persistmempool",
-        "acceptnonstdtxn",
-        "allowdangerousfilters",
-        "networkactive",
-        "esplora",
-        "esploramtls",
-        "esploraauthbearer",
-        "electrum",
-        "electrummtls",
-        "rpcmtls",
-        "rpcdisableauth",
-        "rpcauthbearer",
-        "rpcextendederrors",
-        "logtimestamps",
-        "logthreadnames",
-        "logsourcelocations",
-        "checkpoints",
-        "allowignoredconf",
-        "whitelistrelay",
-        "whitelistforcerelay",
-        "reindex",
-        "reindex-chainstate",
-        "checkblockindex",
-        "mcp",
-        "mcpmtls",
-        "mcpauth",
-        "mcpallowremote",
-        "server",
-        "daemon",
-        "events-grpc-allow-remote",
-        "events-grpc-mtls",
-        "events-grpc-tls-cert",
-        "events-grpc-tls-key",
-        "events-grpc-mtls-client-ca",
-        "events-grpc-mtls-client-allow",
-        "events-grpc-tls-handshake-timeout",
-        "streamws-allow-remote",
-        "streamws-auth",
-        "events-zmq-hashtx",
-        "events-zmq-hashblock",
-        "events-zmq-mpevict",
-        "events-zmq-mpreplace",
-        "events-zmq-mpconfirm",
-        "events-zmq-nodeevent",
-    ];
 
     args.into_iter()
         .map(|arg| {
@@ -7476,6 +7574,12 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                 {
                     return format!("--{flag}=0");
                 }
+            }
+            // `-no<flag>=<value>`: Core's `InterpretValue` negates the value,
+            // so `-nolisten=0` is `-listen=1` (with the warning
+            // [`double_negative_warnings`] reports).
+            if let Some((flag, value)) = negated_bool_with_value(&arg) {
+                return format!("--{flag}={}", u8::from(!core_interpret_bool(value)));
             }
 
             // `-noconnect`: Core's `IsArgNegated("-connect")`, which
@@ -7494,6 +7598,18 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                 let stripped = arg.trim_start_matches('-');
                 if stripped == "noconnect" || stripped == "noconnect=1" {
                     return format!("--connect={CONNECT_NEGATED}");
+                }
+                // `-rpcauth` with no value is an empty entry, which Core
+                // refuses at startup; clap would refuse it earlier, in its
+                // own words. `-norpcauth` rides as a sentinel entry.
+                if stripped == "rpcauth" {
+                    return "--rpcauth=".to_string();
+                }
+                if stripped == "norpcauth" || stripped == "norpcauth=1" {
+                    return format!("--rpcauth={RPCAUTH_NEGATED}");
+                }
+                if stripped == "norpccookiefile" || stripped == "norpccookiefile=1" {
+                    return format!("--rpccookiefile={RPCCOOKIEFILE_NEGATED}");
                 }
             }
 
@@ -7539,6 +7655,39 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
                 arg
             }
         })
+        .collect()
+}
+
+/// `-no<flag>=<value>` for a negatable boolean: `(flag, value)`.
+fn negated_bool_with_value(arg: &str) -> Option<(&str, &str)> {
+    if !arg.starts_with('-') {
+        return None;
+    }
+    let (key, value) = arg.trim_start_matches('-').split_once('=')?;
+    let flag = key.strip_prefix("no")?;
+    NEGATABLE_BOOL_FLAGS.contains(&flag).then_some((flag, value))
+}
+
+/// Core's `InterpretBool`: empty is true, otherwise the leading integer is
+/// nonzero (`LocaleIndependentAtoi`, so `abc` is 0 and `2x` is 2).
+fn core_interpret_bool(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let s = value.trim_start();
+    let digits = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    digits[..end].bytes().any(|b| b != b'0')
+}
+
+/// Core's warning for each double negative on the command line
+/// (`-nolisten=0`), logged at startup.
+pub fn double_negative_warnings(args: &[String]) -> Vec<String> {
+    args.iter()
+        .skip(1)
+        .filter_map(|arg| negated_bool_with_value(arg))
+        .filter(|(_, value)| !core_interpret_bool(value))
+        .map(|(flag, value)| format!("Parsed potentially confusing double-negative -{flag}={value}"))
         .collect()
 }
 
@@ -8019,6 +8168,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "limitdescendantcount",
     "limitclustercount",
     "mempoolexpiry",
+    "maxtipage",
+    "cjdnsreachable",
     "persistmempool",
     "permitbaremultisig",
     "acceptnonstdtxn",
@@ -8533,6 +8684,26 @@ fn default_p2p_port(network: Network) -> u16 {
 /// (could be the IPv6 address `::1:18443` or the address `::1` with
 /// port `18443`). Matches Core's behaviour: square brackets are
 /// mandatory for IPv6 with port.
+/// Whether `entry` names a host with a port that is not 1-65535: Core's
+/// `SplitHostPort` failure, which it reports as
+/// `Invalid port specified in -rpcbind: '<entry>'`. `127.0.0.1:notaport`, `[::1]:0`, `127.0.0.1:65536`.
+fn rpcbind_port_is_invalid(entry: &str) -> bool {
+    let entry = entry.trim();
+    let port = if let Some(rest) = entry.strip_prefix('[') {
+        match rest.split_once("]:") {
+            Some((_, port)) => port,
+            None => return false,
+        }
+    } else {
+        match entry.rsplit_once(':') {
+            // A bare IPv6 literal has several colons and no port.
+            Some((host, port)) if !host.contains(':') => port,
+            _ => return false,
+        }
+    };
+    !matches!(port.parse::<u16>(), Ok(p) if p != 0)
+}
+
 fn parse_rpcbind_entry(s: &str, default_port: u16) -> Result<SocketAddr, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -9069,6 +9240,24 @@ blockmintxfee=0.00001
     /// settings.cpp). satd used to reject the duplicate outright, which breaks
     /// any wrapper that appends an override onto a base command line; Core's
     /// own tests pass `-v2transport` twice for exactly that reason.
+    /// Core's double negative: `-nolisten=0` is `-listen=1`, with a warning;
+    /// `-nolisten=1` is `-listen=0`, without one.
+    #[test]
+    fn a_negated_boolean_with_a_value_negates_the_value() {
+        let norm = |a: &str| normalize_args(vec!["satd".into(), a.into()])[1].clone();
+        assert_eq!(norm("-nolisten=0"), "--listen=1");
+        assert_eq!(norm("-nolisten=1"), "--listen=0");
+        assert_eq!(norm("-nolisten=abc"), "--listen=1");
+        assert_eq!(norm("-nolisten="), "--listen=0");
+        let cli = CliArgs::try_parse_from(normalize_args(vec!["satd".into(), "-nolisten=0".into()]))
+            .expect("Core accepts -nolisten=0");
+        assert_eq!(cli.listen, Some(true));
+        assert_eq!(
+            double_negative_warnings(&["satd".into(), "-nolisten=0".into(), "-nolisten=1".into()]),
+            vec!["Parsed potentially confusing double-negative -listen=0".to_string()]
+        );
+    }
+
     #[test]
     fn a_repeated_scalar_option_takes_the_last_value() {
         let args = normalize_args(
@@ -10326,6 +10515,8 @@ testactivationheight=bip34@2
             blocksdir: None,
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
+            maxtipage: None,
+            cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -10634,6 +10825,8 @@ testactivationheight=bip34@2
             blocksdir: None,
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
+            maxtipage: None,
+            cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -10883,6 +11076,10 @@ testactivationheight=bip34@2
         assert!(Config::from_cli(cli).is_err());
     }
 
+    fn fast_start_config(args: &[&str]) -> Result<Config, String> {
+        Config::from_cli(CliArgs::try_parse_from(args).unwrap())
+    }
+
     /// `--esploratlsbind` without the matching cert/key flags must be
     /// rejected at config-load time. Catching it here surfaces a
     /// friendlier message than the server-side check; the server still
@@ -10892,96 +11089,91 @@ testactivationheight=bip34@2
     /// uniformly.
     #[test]
     fn test_fast_start_validation() {
+        // Each parse runs in its own frame: `CliArgs` and `Config` are large
+        // enough in a debug build that several of them live at once in one
+        // test frame overflow the 2 MiB test-thread stack.
         // Plain http:// is refused (must be https).
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=http://example.com/utxo-840000.dat",
-        ])
-        .unwrap();
-        let err = Config::from_cli(cli).unwrap_err();
+        ];
+        let err = fast_start_config(&args).unwrap_err();
         assert!(err.contains("https://"), "expected https-required error, got: {err}");
 
         // https:// is accepted and preserved.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=https://example.com/utxo-840000.dat",
-        ])
-        .unwrap();
-        let config = Config::from_cli(cli).expect("https fast-start should load");
+        ];
+        let config = fast_start_config(&args).expect("https fast-start should load");
         assert_eq!(
             config.fast_start.as_deref(),
             Some("https://example.com/utxo-840000.dat")
         );
 
         // A bare local path is accepted (operator's own disk).
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=/opt/utxo-840000.dat",
-        ])
-        .unwrap();
-        let config = Config::from_cli(cli).expect("local-path fast-start should load");
+        ];
+        let config = fast_start_config(&args).expect("local-path fast-start should load");
         assert_eq!(config.fast_start.as_deref(), Some("/opt/utxo-840000.dat"));
 
         // fast-start is incompatible with pruning.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=https://example.com/utxo-840000.dat",
             "--prune=550",
-        ])
-        .unwrap();
-        let err = Config::from_cli(cli).unwrap_err();
+        ];
+        let err = fast_start_config(&args).unwrap_err();
         assert!(err.contains("prune"), "expected prune-conflict error, got: {err}");
 
         // An unsupported scheme is rejected.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=ftp://example.com/utxo-840000.dat",
-        ])
-        .unwrap();
-        assert!(Config::from_cli(cli).is_err());
+        ];
+        assert!(fast_start_config(&args).is_err());
 
         // --fast-start-sha256 requires --fast-start.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start-sha256=b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-        ])
-        .unwrap();
-        let err = Config::from_cli(cli).unwrap_err();
+        ];
+        let err = fast_start_config(&args).unwrap_err();
         assert!(err.contains("--fast-start"), "got: {err}");
 
         // A malformed (short) digest is rejected.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=https://example.com/utxo-840000.dat",
             "--fast-start-sha256=deadbeef",
-        ])
-        .unwrap();
-        assert!(Config::from_cli(cli).is_err());
+        ];
+        assert!(fast_start_config(&args).is_err());
 
         // A valid digest is accepted and normalized to lowercase.
-        let cli = CliArgs::try_parse_from([
+        let args = [
             "satd",
             "--regtest",
             "--datadir=/tmp/satd-test",
             "--fast-start=https://example.com/utxo-840000.dat",
             "--fast-start-sha256=B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9",
-        ])
-        .unwrap();
-        let config = Config::from_cli(cli).expect("valid digest should load");
+        ];
+        let config = fast_start_config(&args).expect("valid digest should load");
         assert_eq!(
             config.fast_start_sha256.as_deref(),
             Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
@@ -11881,7 +12073,7 @@ testactivationheight=bip34@2
     }
 
     #[test]
-    fn default_rpcbind_is_single_loopback() {
+    fn default_rpcbind_is_both_loopbacks() {
         let cli = CliArgs::try_parse_from([
             "satd",
             "--regtest",
@@ -11889,9 +12081,43 @@ testactivationheight=bip34@2
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
-        assert_eq!(cfg.rpcbind.len(), 1);
-        assert!(cfg.rpcbind[0].ip().is_loopback());
-        assert_eq!(cfg.rpcbind[0].port(), cfg.rpcport);
+        // Core's `HTTPBindAddresses` default: 127.0.0.1 first, then ::1.
+        assert!(cfg.rpcbind_is_default);
+        assert_eq!(
+            cfg.rpcbind,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cfg.rpcport),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), cfg.rpcport),
+            ]
+        );
+    }
+
+    #[test]
+    fn rpcbind_invalid_port_uses_core_wording() {
+        for entry in [
+            "127.0.0.1:notaport",
+            "127.0.0.1:-18443",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "[::1]:notaport",
+            "[::1]:-18443",
+            "[::1]:0",
+            "[::1]:65536",
+        ] {
+            let cli = CliArgs::try_parse_from([
+                "satd",
+                "--regtest",
+                "--datadir=/tmp/satd-rpc-compat-test5",
+                &format!("--rpcbind={entry}"),
+            ])
+            .unwrap();
+            let err = Config::from_cli(cli).unwrap_err();
+            assert_eq!(err, format!("Invalid port specified in -rpcbind: '{entry}'"));
+        }
+        // A valid port, and forms with no port at all, are not port errors.
+        for entry in ["127.0.0.1:8332", "[::1]:8332", "127.0.0.1", "[::1]", "::1"] {
+            assert!(!rpcbind_port_is_invalid(entry), "{entry}");
+        }
     }
 
     #[test]
