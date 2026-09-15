@@ -7,8 +7,8 @@
 #   - it resolves exactly like a real downstream project would: its own
 #     lockfile, its own published-crate versions.
 #
-# Pins mirror the BDK 2.x release train (bdk_wallet 2.x + bdk_electrum
-# 0.23 + bdk_esplora 0.22 share the same bdk_core, so the FullScan
+# Pins mirror the BDK 3.x release train (bdk_wallet 3.x + bdk_electrum
+# 0.24 + bdk_esplora 0.22 share the same bdk_core, so the FullScan
 # update types unify across both backends). Bumping a pin is a
 # deliberate maintenance step in a follow-up PR after re-verifying the
 # canary still passes — the same policy as the container canaries.
@@ -28,9 +28,9 @@ path = "src/main.rs"
 # The dominant descriptor-wallet toolkit; the canonical real-world
 # consumer of both the Electrum and Esplora surfaces (Bitkey, Bull
 # Bitcoin, and many others build on it).
-bdk_wallet = "2.1"
-bdk_electrum = "0.23"
-bdk_esplora = { version = "0.22", features = ["blocking"] }
+bdk_wallet = "3.1"
+bdk_electrum = "0.24"
+bdk_esplora = { version = "0.22.2", features = ["blocking"] }
 # Used ONLY to advance the regtest chain (generatetoaddress). On
 # mainnet this is what miners do; here it is the test driver's
 # chain-advancement affordance. Every *wallet* operation (scan,
