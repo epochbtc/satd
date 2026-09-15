@@ -40,6 +40,7 @@ item below is (or will be) written up in full in the in-development
 
 - An expired mempool transaction now takes its descendants with it, and `-mempoolexpiry` is applied whenever a transaction is accepted, as in Core, rather than on a 30-second timer; a child of an expired parent used to stay in the pool.
 - `generatetoaddress`, `generatetodescriptor` and `generateblock` work on every chain, as in Core, instead of only regtest.
+- Blocks mined by the node's RPCs always carry the witness commitment, as Core's do; an empty block on a custom signet was rejected `bad-signet-blksig` for lack of it.
 - A signet block with an invalid solution is rejected as `bad-signet-blksig` (Core's reason) rather than `bad-signet-solution`; `-signetchallenge` given twice is refused, and a non-hex value is reported in Core's words.
 - A node that mined its own chain, and so had never been sent a header by a peer, counted itself as still in initial block download and ignored every transaction its peers announced. It now takes them (#759).
 - `verificationprogress` in `getblockchaininfo` and `getchainstates` is Bitcoin Core's transaction-count estimate, equal to Core's; it was the tip's timestamp over the current time and read 0.69 at genesis (#744).
