@@ -129,8 +129,9 @@ startup error.
 | Key | Default | Reload | Compat | Description |
 |---|---|---|---|---|
 | `rpcport` | 8332 (network-dependent) | restart | core | RPC server port. Defaults: main 8332, test 18332, testnet4 48332, signet 38332, regtest 18443. |
-| `rpcbind` | `127.0.0.1:<rpcport>` | restart | core | Bind plain-HTTP JSON-RPC to address (repeatable). Non-loopback requires `rpcallowip`. |
-| `rpcallowip` | loopback only | restart | core | Per-request source-IP allowlist for JSON-RPC (repeatable). |
+| `rpcbind` | `127.0.0.1:<rpcport>` and `[::1]:<rpcport>` | restart | core | Bind plain-HTTP JSON-RPC to address (repeatable). Non-loopback requires `rpcallowip`. With no `rpcbind`, a default that cannot be bound (no IPv6) is skipped. |
+| `rpcallowip` | loopback only | restart | core | Per-request source-IP allowlist for JSON-RPC (repeatable). IPv6 may be bracketed (`[::1]`). |
+| `cjdnsreachable` | false | restart | core | satd has no CJDNS transport; as in Core, an `rpcallowip` in fc00::/8 is refused while it is set. |
 | `rpcuser` | none | hot | core | RPC username. |
 | `rpcpassword` | none | hot | core | RPC password. |
 | `rpcthreads` | 16 | restart | core | Max concurrent in-flight RPC method calls. |
@@ -148,10 +149,10 @@ startup error.
 | `rpcreadonlymtls` | false | restart | satd | Require a client cert (mTLS) on the read-only TLS surface. |
 | `rpcreadonlymtlsclientca` | none | restart | satd | CA bundle client certs must chain to on the read-only TLS surface. |
 | `rpcreadonlymtlsclientallow` | any CA-signed | restart | satd | Allowlist of client-cert subjects on the read-only TLS surface. |
-| `rpcauth` | none | hot | core | HMAC-SHA256 RPC credential `user:salt$hash` (Core `rpcauth` format; repeatable). |
+| `rpcauth` | none | hot | core | HMAC-SHA256 RPC credential `user:salt$hash` (Core `rpcauth` format; repeatable). An empty or malformed entry stops startup; `-norpcauth` discards the entries before it and the config file's. |
 | `authfile` | none | restart | satd | Path to unified-auth bearer-token file (TOML); enables the opt-in bearer-auth layer. Token contents reload live. |
 | `rpcauthbearer` | false | restart | satd | Honor `Authorization: Bearer` tokens on the JSON-RPC listeners (requires `authfile`). |
-| `rpccookiefile` | `$DATADIR/.cookie` | restart | core | Override the auto-generated cookie file path. |
+| `rpccookiefile` | `$DATADIR/.cookie` | restart | core | Override the auto-generated cookie file path. `-norpccookiefile` writes no cookie. |
 | `rpccookieperms` | owner (0600) | restart | core | Cookie file permissions: `owner`(0600)\|`group`(0640)\|`all`(0644). |
 | `rpcdefaultunits` | btc | hot | satd | Default units for RPC amount fields: `btc` (Core-compatible) or `sats`. |
 | `rpcdisableauth` | false | restart | satd | Disable HTTP Basic auth on the JSON-RPC TLS surface; only valid with `rpcmtls=1`. |
@@ -267,6 +268,7 @@ startup error.
 | `limitancestorcount` | 25 | hot | core | Maximum unconfirmed ancestor count. Deprecated in Bitcoin Core v31 and superseded by `limitclustercount`; accepted for config compatibility but no longer gates admission. |
 | `limitdescendantcount` | 25 | hot | core | Maximum unconfirmed descendant count. Deprecated alongside `limitancestorcount`, and likewise no longer gates admission. |
 | `mempoolexpiry` | 336 h | hot | core | Mempool entry expiry in hours. |
+| `maxtipage` | 86400 s | restart | core | A tip older than this keeps the node in initial block download. |
 | `persistmempool` | on | hot | core | Persist the mempool to `mempool.dat` across restarts. |
 | `rebroadcastinterval` | 0 (auto) | hot | satd | Seconds between rebroadcasts of unconfirmed *local* transactions (those submitted here via `sendrawtransaction`, the MCP tool, Esplora `POST /tx`, or Electrum `transaction.broadcast`). `0` = auto: a randomized 10–15 min interval per pass, matching Bitcoin Core. A locally-submitted tx is re-announced until enough peers take it (see `broadcastconfirmpeers`) or it leaves the mempool, so it still propagates if no peer was connected at submit time; the pending set is persisted in `mempool.dat` so it also survives restarts. A SIGHUP interval change applies after the in-flight sleep completes. |
 | `broadcastconfirmpeers` | 1 | hot | satd | Distinct peer IPs that must take a locally-broadcast tx before it counts as propagated and rebroadcast stops. A peer takes a tx by fetching it via `getdata` (the primary signal) or announcing it back via `inv`. Counted per IP, not per connection, so a reconnecting host is one witness. Raising it demands wider observed propagation before retries stop. |

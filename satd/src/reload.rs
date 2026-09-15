@@ -435,6 +435,8 @@ struct FieldSpec {
 /// builds compile out the test that reads it.
 #[allow(dead_code)]
 const LOAD_ONLY_KEYS: &[&str] = &[
+    // Read at load only to validate `rpcallowip` (Core refuses fc00::/8 under it).
+    "cjdnsreachable",
     "conf",
     "includeconf",
     "allowignoredconf",
@@ -772,6 +774,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("onlynet", onlynet),
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),
+        restart!("maxtipage", maxtipage),
         // ---- Proxy / Tor ----
         restart!("proxy", proxy),
         restart!("proxyrandomize", proxyrandomize),

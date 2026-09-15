@@ -38,6 +38,8 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
+- `-maxtipage` is honoured: a tip older than it keeps the node in initial block download. It was parsed and ignored.
+- With no `-rpcbind`, the RPC server listens on `::1` as well as `127.0.0.1`, as Core does; a malformed `-rpcbind` port, an empty or malformed `-rpcauth`, and a cookie file that cannot be written stop startup with Core's messages; `-norpcauth`, `-norpccookiefile`, bracketed IPv6 in `-rpcallowip`, `-cjdnsreachable`'s allowlist rule and Core's `-noX=0` double negative are accepted.
 - An expired mempool transaction now takes its descendants with it, and `-mempoolexpiry` is applied whenever a transaction is accepted, as in Core, rather than on a 30-second timer; a child of an expired parent used to stay in the pool.
 - `generatetoaddress`, `generatetodescriptor` and `generateblock` work on every chain, as in Core, instead of only regtest.
 - Blocks mined by the node's RPCs always carry the witness commitment, as Core's do; an empty block on a custom signet was rejected `bad-signet-blksig` for lack of it.
