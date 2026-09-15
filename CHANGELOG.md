@@ -34,6 +34,7 @@ item below is (or will be) written up in full in the in-development
 - **Stratum V1 solo-mining server** (`--stratum=1`): miners connect to the node directly; the username is the payout address. Loopback by default, TLS/mTLS listener, refused on signet (#746).
 - **Stratum V2** on the same server (`--stratumv2bind`): Noise NX transport, standard and extended channels, and an authority key persisted at `<datadir>/stratum_v2.key` so miners that pin it survive a restart (#748).
 - Compact block reconstruction is observable: one `compact block reconstructed` log line per block (transactions prefilled, from the mempool, from the extra pool, requested; whether a round trip was needed) and `satd_net_compact_block_*` metrics. `-blockreconstructionextratxn` now works: replaced and policy-refused transactions are kept (default 100) so blocks containing them reconstruct without a round trip (#765).
+- BIP 152 high-bandwidth compact block relay: satd selects up to three high-bandwidth peers, announces new blocks — including blocks found through the Stratum server — as `cmpctblock` before connecting them, and serves `MSG_CMPCT_BLOCK` and `getblocktxn` from a tip cache. Core's `p2p_compactblocks_hb.py` joins the functional run-set (#770).
 - **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC (#751).
 
 ### Fixed
