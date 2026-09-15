@@ -38,9 +38,15 @@ impl IpAllowEntry {
         if raw.is_empty() {
             return Err("empty allowlist entry".to_string());
         }
-        let net: IpNet = if let Ok(n) = raw.parse::<IpNet>() {
+        // Core's `LookupHost` accepts an IPv6 literal in brackets, `[::1]`
+        // or `[fd00::]/8`, the spelling `-rpcbind` requires.
+        let unbracketed = match raw.split_once('/') {
+            Some((host, prefix)) => format!("{}/{prefix}", strip_brackets(host)),
+            None => strip_brackets(&raw).to_string(),
+        };
+        let net: IpNet = if let Ok(n) = unbracketed.parse::<IpNet>() {
             n
-        } else if let Ok(ip) = raw.parse::<IpAddr>() {
+        } else if let Ok(ip) = unbracketed.parse::<IpAddr>() {
             match ip {
                 IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
                 IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
@@ -54,9 +60,19 @@ impl IpAllowEntry {
         Ok(Self { raw, net })
     }
 
+    /// Whether the entry's network is Core's CJDNS range under
+    /// `-cjdnsreachable`: fc00::/8, the half of RFC4193 with the L bit clear.
+    pub fn is_cjdns_range(&self) -> bool {
+        matches!(self.net, IpNet::V6(n) if n.network().octets()[0] == 0xfc)
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.net.contains(&ip)
     }
+}
+
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
 }
 
 /// Does `ip` satisfy the allowlist? Loopback is always allowed (matches
@@ -106,6 +122,15 @@ mod tests {
         let e = IpAllowEntry::parse("fd00::/8").unwrap();
         assert!(e.contains("fd00:1234::5".parse().unwrap()));
         assert!(!e.contains("fe00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_bracketed_ipv6() {
+        let e = IpAllowEntry::parse("[::1]").unwrap();
+        assert!(e.contains("::1".parse().unwrap()));
+        let e = IpAllowEntry::parse("[fd00::]/8").unwrap();
+        assert!(e.contains("fd00:1234::5".parse().unwrap()));
+        assert!(IpAllowEntry::parse("[::1").is_err());
     }
 
     #[test]

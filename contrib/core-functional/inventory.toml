@@ -112,7 +112,7 @@ reason = "prev-release"
 file = "feature_config_args.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L233 startup refuses '-nolisten=0' ('Invalid parameter'), Core's double-negative form. Behind it ~25 exact init/warning strings. Follow-up: -noX=0 parsing, then init-message parity"
+note = "measured 2026-09-15: -nolisten=0 is accepted and warns in Core's words (the line needs a debuglog_map.toml rule, left for the flip). The test then stops at L255: satd refuses -rpcauth=alice:<salt>$<short hash>, which Core accepts because it checks only the user:salt$hash shape; satd requires a 32-byte hex HMAC. Behind that, Core's 'Command-line arg: ...' startup logging and ~25 init strings. Follow-up: args logging and init-message parity"
 
 [[test]]
 file = "feature_csv_activation.py"
@@ -205,9 +205,7 @@ note = "measured 2026-09-15: L28 -debuglogfile=foo.log writes no foo.log; satd l
 
 [[test]]
 file = "feature_maxtipage.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L39 initialblockdownload False where True is expected: -maxtipage is parsed but not consulted by the IBD predicate. Follow-up: -maxtipage"
+status = "run"
 
 [[test]]
 file = "feature_maxuploadtarget.py"
@@ -861,9 +859,7 @@ note = "measured 2026-09-15: L39 localservices lacks NODE_P2P_V2 (2048) with -v2
 
 [[test]]
 file = "rpc_bind.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: --nonloopback passes. --ipv6 L46: of two -rpcbind entries only 127.0.0.1 is bound, not ::1. --ipv4 L60: init error wording differs from 'Error: Invalid port specified in -rpcbind: '<addr>''. Follow-up: bind every -rpcbind entry and Core's error text"
+status = "run"
 
 [[test]]
 file = "rpc_blockchain.py"
@@ -1046,9 +1042,7 @@ status = "run"
 
 [[test]]
 file = "rpc_users.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L160 a bare -rpcauth must start and fail with 'Error: Unable to start HTTP server. See debug log for details.'; satd refuses it at argument parsing. Follow-up: Core's -rpcauth validation"
+status = "run"
 
 [[test]]
 file = "rpc_validateaddress.py"
