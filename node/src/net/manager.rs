@@ -6474,6 +6474,21 @@ impl PeerManager {
             return;
         }
 
+        // 5b. The parent's block data must be here. Core stores a block whose
+        // parent is only a header and connects it later; satd connects a block
+        // as it arrives, so reconstructing this one would start a reorg that
+        // cannot finish. Take it as a header announcement and fetch the chain
+        // in order.
+        if self
+            .chain_state
+            .get_block_index(&compact.header.prev_blockhash)
+            .is_none_or(|parent| parent.status == BlockStatus::HeaderOnly)
+        {
+            tracing::debug!(id, %block_hash, "cmpctblock parent has no block data yet; fetching in order");
+            self.request_missing_blocks(id);
+            return;
+        }
+
         // 6. Only a high-bandwidth peer may push a block at us. Anyone else's
         // `cmpctblock` counts as a header announcement: the header is in, so
         // fetch the block the ordinary way. Core: `fRevertToHeaderProcessing`,

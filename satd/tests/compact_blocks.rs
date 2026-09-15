@@ -436,6 +436,34 @@ fn partial_block(node: &TestNode, n: u32, salt: u32) -> (Block, HeaderAndShortId
     (b, compact)
 }
 
+/// A `cmpctblock` whose parent is known only as a header is not
+/// reconstructed: satd connects a block as it arrives, and this one would
+/// start a reorg that cannot finish. A fresh node following a peer that
+/// mines quickly sees exactly this. The chain is fetched in order instead,
+/// and the block still connects.
+#[test]
+fn cmpctblock_on_a_header_only_parent_is_fetched_in_order() {
+    let (node, _) = started_node(1);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b2 = build_block(&tip, 2, vec![], true, 21);
+    let b3 = build_block(&b2, 3, vec![unknown_tx(3_000)], true, 22);
+    peer.send(NetworkMessage::Headers(vec![b2.header]));
+    std::thread::sleep(Duration::from_millis(500));
+    let compact = HeaderAndShortIds::from_block(&b3, 7, 2, &[]).unwrap();
+    peer.send(cmpct(compact));
+
+    let asked = peer.recv_until(is_getblocktxn_for(b3.block_hash()), Duration::from_secs(5));
+    assert!(asked.is_none(), "a block on a header-only parent must not be reconstructed: {asked:?}");
+    assert_eq!(banned_count(&node), 0);
+
+    peer.send(NetworkMessage::Block(b2.clone()));
+    poll_until(|| best_hash(&node) == b2.block_hash(), test_timeout(20), "the parent must connect");
+    assert!(!peer.is_closed());
+}
+
 /// A `blocktxn` completes only the reconstruction the *sending* peer has
 /// open. Core ignores one "for block we weren't expecting"; satd used to
 /// complete any peer's pending block with any peer's reply.
