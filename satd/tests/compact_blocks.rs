@@ -500,10 +500,13 @@ fn cmpctblock_on_a_header_only_parent_is_fetched_in_order() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
     poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    // Only a high-bandwidth peer's push reaches reconstruction at all.
+    promote(&node, &mut peer);
 
     let tip = block_at(&node, &best_hash(&node));
-    let b2 = build_block(&tip, 2, vec![], true, 21);
-    let b3 = build_block(&b2, 3, vec![unknown_tx(3_000)], true, 22);
+    let h = height(&node);
+    let b2 = build_block(&tip, h + 1, vec![], true, 21);
+    let b3 = build_block(&b2, h + 2, vec![unknown_tx(3_000)], true, 22);
     peer.send(NetworkMessage::Headers(vec![b2.header]));
     std::thread::sleep(Duration::from_millis(500));
     let compact = HeaderAndShortIds::from_block(&b3, 7, 2, &[]).unwrap();
@@ -885,12 +888,31 @@ fn a_peer_that_delivers_our_tip_is_promoted_to_high_bandwidth() {
     let (node, _) = started_node(1);
     let mut peer = RawPeer::connect(node.p2p_port.unwrap());
     poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
-    promote(&node, &mut peer);
+    // Delivered by hand rather than through `promote`, which discards what
+    // arrives before the `sendcmpct` -- where an echo would be.
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, height(&node) + 1, vec![], true, 4_242);
+    let delivered = b.block_hash();
+    peer.send(NetworkMessage::Headers(vec![b.header]));
+    peer.send(NetworkMessage::Block(b));
     poll_until(
         || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_to"] == json!(true),
         test_timeout(20),
         "getpeerinfo must report the selection",
     );
+    let seen = peer.collect_for(Duration::from_secs(2));
+    assert!(
+        seen.iter().any(|m| sendcmpct_hb(m) == Some(true)),
+        "a peer that delivers the tip must be promoted to high-bandwidth: {seen:?}"
+    );
+    // The block the peer delivered is not announced back to it.
+    let echoed = seen.into_iter().find(|m| match m {
+        NetworkMessage::Inv(inv) => inv.iter().any(|i| matches!(i, Inventory::Block(h) if *h == delivered)),
+        NetworkMessage::Headers(hs) => hs.iter().any(|h| h.block_hash() == delivered),
+        NetworkMessage::CmpctBlock(c) => c.compact_block.header.block_hash() == delivered,
+        _ => false,
+    });
+    assert!(echoed.is_none(), "the node announced a block back to its source: {echoed:?}");
 }
 
 /// BIP 152: at most three high-bandwidth peers. A fourth promotion demotes
@@ -1004,6 +1026,16 @@ fn a_high_bandwidth_peer_receives_new_blocks_as_cmpctblock() {
         panic!("the high-bandwidth peer must receive a cmpctblock");
     };
     assert_eq!(c.compact_block, expected_compact(&block, c.compact_block.nonce));
+    let again = hb.collect_for(Duration::from_secs(2));
+    let repeat = again.iter().find(|m| match m {
+        NetworkMessage::Inv(inv) => inv.iter().any(|i| matches!(i, Inventory::Block(h) if *h == hash)),
+        NetworkMessage::Headers(hs) => hs.iter().any(|h| h.block_hash() == hash),
+        m => is_cmpctblock_for(hash)(m),
+    });
+    assert!(
+        repeat.is_none(),
+        "the block is announced once — before connecting it, not again after: {repeat:?}"
+    );
 
     let lb_msgs = lb.collect_for(Duration::from_secs(2));
     assert!(
@@ -1117,4 +1149,27 @@ fn a_block_is_announced_to_high_bandwidth_peers_before_it_is_connected() {
     let got = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20));
     assert!(got.is_some(), "the block must be announced before connection is attempted");
     assert_eq!(best_hash(&node), tip_before, "and it must not have connected");
+}
+
+/// A peer we did not select for high-bandwidth relay, pushing a `cmpctblock`
+/// for a block we never asked it for, gets it treated as a header
+/// announcement: the header is taken and the block fetched the ordinary
+/// way, with no reconstruction (Core `fRevertToHeaderProcessing`; #32606).
+#[test]
+fn unsolicited_cmpctblock_from_a_low_bandwidth_peer_is_a_header_announcement() {
+    let (node, _) = started_node(1);
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+
+    let (b, compact) = partial_block(&node, 2, 9);
+    let hash = b.block_hash();
+    peer.send(cmpct(compact));
+    let msgs = peer.collect_for(Duration::from_secs(3));
+    assert!(
+        !msgs.iter().any(is_getblocktxn_for(hash)),
+        "an unsolicited push from a low-bandwidth peer must not be reconstructed"
+    );
+    assert!(msgs.iter().any(is_getdata_for(hash)), "the block is fetched in full instead: {msgs:?}");
+    let header = node.rpc_call_with_params("getblockheader", vec![json!(hash.to_string())]).unwrap();
+    assert!(header["error"].is_null(), "the header must have been accepted: {header}");
 }
