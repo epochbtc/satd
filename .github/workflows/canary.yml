@@ -886,13 +886,16 @@ jobs:
           SRI_COMMIT: ${{ steps.pin.outputs.commit }}
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$SRI_TAG" https://github.com/stratum-mining/sv2-apps sri
-          [ "$(git -C sri rev-parse HEAD)" = "$SRI_COMMIT" ] \
+          # Outside the checkout: under it, cargo takes satd's Cargo.toml for
+          # the workspace root and refuses to build.
+          sri="$RUNNER_TEMP/sv2-apps"
+          git clone --depth 1 --branch "$SRI_TAG" https://github.com/stratum-mining/sv2-apps "$sri"
+          [ "$(git -C "$sri" rev-parse HEAD)" = "$SRI_COMMIT" ] \
             || { echo "sv2-apps $SRI_TAG is not the pinned commit $SRI_COMMIT" >&2; exit 1; }
           # sv2-apps pins its own toolchain in rust-toolchain.toml.
-          (cd sri/integration-tests && cargo build --release --locked --bin mining_device)
+          (cd "$sri/integration-tests" && cargo build --release --locked --bin mining_device)
           mkdir -p sri-bin
-          cp sri/integration-tests/target/release/mining_device sri-bin/
+          cp "$sri/integration-tests/target/release/mining_device" sri-bin/
 
       - name: Upload mining_device
         uses: actions/upload-artifact@v7
