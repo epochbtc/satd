@@ -24,7 +24,8 @@
 #     detects it via scripthash subscription, pulls history, verifies the
 #     merkle proof, and reports a confirmed balance.
 #
-# Pin: electrum 4.5.8 (download.electrum.org AppImage). Pin bumps are
+# Pin: ELECTRUM_VERSION in scripts/canary/PINS (download.electrum.org AppImage,
+# checked against ELECTRUM_APPIMAGE_SHA256). Pin bumps are
 # deliberate follow-up-PR maintenance.
 
 set -euo pipefail
@@ -32,9 +33,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-ELECTRUM_VERSION="4.5.8"
-ELECTRUM_IMAGE="debian:bookworm-slim"
+ELECTRUM_IMAGE="$ELECTRUM_BASE_IMAGE"
 ELECTRUM_CONTAINER="satd-canary-electrum-wallet-$$"
 APPRUN="/opt/electrum/squashfs-root/AppRun"
 
@@ -76,6 +78,7 @@ docker exec "$ELECTRUM_CONTAINER" sh -c '
     apt-get install -y -qq curl ca-certificates >/dev/null 2>&1
     mkdir -p /opt/electrum && cd /opt/electrum
     curl -fsSL -o e.AppImage "https://download.electrum.org/'"$ELECTRUM_VERSION"'/electrum-'"$ELECTRUM_VERSION"'-x86_64.AppImage"
+    echo "'"$ELECTRUM_APPIMAGE_SHA256"'  e.AppImage" | sha256sum -c -
     chmod +x e.AppImage
     ./e.AppImage --appimage-extract >/dev/null 2>&1
 ' || { echo "electrum: AppImage install failed" >&2; exit 1; }

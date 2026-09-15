@@ -22,7 +22,7 @@
 #     credits its wallet. Proves the filter-match → targeted-block-
 #     download → wallet-credit path, not just header sync.
 #
-# Pin: lightninglabs/lnd:v0.18.5-beta. Pin bumps are deliberate
+# Pin: LND_IMAGE in scripts/canary/PINS. Pin bumps are deliberate
 # follow-up-PR maintenance after re-verifying interop holds.
 
 set -euo pipefail
@@ -30,8 +30,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-LND_IMAGE="lightninglabs/lnd:v0.18.5-beta"
 LND_CONTAINER="satd-canary-lnd-$$"
 LND_RPC_PORT=18610
 LND_P2P_PORT=18612

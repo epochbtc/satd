@@ -18,7 +18,7 @@
 # directly with no shim. Core runs on the host network namespace (like
 # the other container canaries) so satd reaches it at 127.0.0.1.
 #
-# Pin: lncm/bitcoind:v27.0. Bumping the pin is a deliberate maintenance
+# Pin: CORE_IMAGE in scripts/canary/PINS. Bumping the pin is a deliberate maintenance
 # step in a follow-up PR after re-verifying interop holds — especially
 # across a Core major (consensus/relay/transport changes land there).
 
@@ -27,8 +27,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=boot-satd.sh
 source "$SCRIPT_DIR/boot-satd.sh"
+# shellcheck source=PINS
+source "$SCRIPT_DIR/PINS"
 
-CORE_IMAGE="lncm/bitcoind:v27.0"
 CORE_CONTAINER="satd-canary-core-$$"
 CORE_RPC_PORT=18510
 CORE_P2P_PORT=18511

@@ -11,7 +11,7 @@
 //
 // Provisioning mirrors the existing Bitcoin Core interop canary
 // (`scripts/canary/core-interop-smoke.sh`): the same pinned image
-// (`lncm/bitcoind:v27.0`) run on the host network namespace so the test's
+// (`CORE_IMAGE` in `scripts/canary/PINS`) run on the host network namespace so the test's
 // `bitcoincore-rpc` client reaches it at 127.0.0.1. Unlike the canary we do
 // NOT peer Core with satd over P2P — the harness submits identical bytes to
 // each node independently and compares verdicts, so any P2P relay between
@@ -28,10 +28,15 @@ use std::time::{Duration, Instant};
 
 use super::{find_available_port, test_timeout};
 
-/// Pinned Core image — kept identical to the interop canary's pin so the two
-/// jobs provision the same reference node. Bumping it is a deliberate
-/// maintenance step (a Core major moves consensus/relay behaviour).
-pub const CORE_IMAGE: &str = "lncm/bitcoind:v27.0";
+/// Pinned Core image, read from the canary pin manifest so this harness and
+/// the interop canary provision the same reference node. Bumping it is a
+/// deliberate maintenance step (a Core major moves consensus/relay behaviour).
+pub static CORE_IMAGE: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+    include_str!("../../../scripts/canary/PINS")
+        .lines()
+        .find_map(|line| line.strip_prefix("CORE_IMAGE="))
+        .expect("scripts/canary/PINS has a CORE_IMAGE line")
+});
 
 /// satd / Core accept-or-reject verdict for one submission. `Reject` carries
 /// the reject-reason string each node emits (the `bad-*` labels both keep
@@ -89,7 +94,7 @@ impl CoreNode {
                 "--name",
                 &container,
                 "--network=host",
-                CORE_IMAGE,
+                *CORE_IMAGE,
                 "-regtest",
                 "-server",
                 "-listen=0",
@@ -224,7 +229,7 @@ impl Drop for CoreNode {
 pub fn pull_core_image() {
     for attempt in 1..=3 {
         let ok = Command::new("docker")
-            .args(["pull", CORE_IMAGE])
+            .args(["pull", *CORE_IMAGE])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()

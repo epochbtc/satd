@@ -5,7 +5,7 @@
 #   MAX_TOTAL_TIME=300 scripts/fuzz/run-block-differential.sh
 #
 # The fuzz target (fuzz/fuzz_targets/block_differential.rs) spawns a resident
-# regtest bitcoind (lncm/bitcoind:v27.0) named `satd-fuzz-core`; this script
+# regtest bitcoind (CORE_IMAGE in scripts/canary/PINS) named `satd-fuzz-core`; this script
 # tears it down on exit. A discovered divergence is written to
 # fuzz/artifacts/block_differential/ AND its block hex is printed to stderr,
 # so the run log alone is enough to reproduce.
