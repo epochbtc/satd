@@ -435,7 +435,7 @@ status = "run"
 file = "mempool_ephemeral_dust.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L104 the -26 message lacks Core's 'min relay fee not met' reason prefix. Behind it: 1P1C package relay for zero-fee parents. Follow-up: reject message parity, then package relay"
+note = "measured 2026-09-15: the -26 message carries Core's reason prefix; L118 then times out syncing a zero-fee dusty parent and its sweep to the second node, which needs 1P1C package relay. Follow-up: package relay"
 
 [[test]]
 file = "mempool_expiry.py"
@@ -445,7 +445,7 @@ status = "run"
 file = "mempool_limit.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L208 fill_mempool: getmempoolinfo.mempoolminfee never rises above minrelaytxfee; satd has no rolling mempool minimum feerate. Follow-up: dynamic mempool minimum fee"
+note = "measured 2026-09-15: the rolling mempool minimum landed and fill_mempool passes; L229 then submits a package whose child bumps a parent below that minimum, and satd's package path admits a below-floor parent only as ephemeral dust. Follow-up: package CPFP of a below-minimum parent"
 
 [[test]]
 file = "mempool_package_limits.py"
@@ -484,7 +484,7 @@ status = "run"
 file = "mempool_sigoplimit.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L117 sigop-equivalent vsize 344 != 345: satd's -bytespersigop rounding differs. Follow-up: Core's sigop-adjusted vsize"
+note = "measured 2026-09-15: L117 vsize 344 != 345: satd has no sigop-adjusted vsize and ignores -bytespersigop (Core: max(weight, sigops x bytespersigop) / 4 for feerates and ancestor/descendant sizes). Behind it: the package cluster limit on that vsize and the 2500 legacy-sigop standardness rule. Follow-up: sigop-adjusted vsize"
 
 [[test]]
 file = "mempool_spend_coinbase.py"
@@ -715,7 +715,7 @@ note = "measured 2026-09-15: L150 no wtxidrelay during the handshake; satd has n
 file = "p2p_leak_tx.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L46 getrawmempool(mempool_sequence=true) returns a list, not {txids, mempool_sequence}. Follow-up: mempool sequence counter"
+note = "measured 2026-09-15: getrawmempool mempool_sequence landed; L47 then reads getpeerinfo.last_inv_sequence, Core's announce-gated relay bookkeeping. Follow-up: announce-gated getdata (#714 / W19)"
 
 [[test]]
 file = "p2p_message_capture.py"
