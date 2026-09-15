@@ -124,6 +124,13 @@ const BLOCK_REFETCH_TTL: Duration = Duration::from_secs(600);
 /// refreshes the stamp; an entry this old belongs to a request nobody is
 /// making any more.
 const BLOCK_IN_FLIGHT_TTL: Duration = Duration::from_secs(120);
+/// How long a compact block being reconstructed suppresses an ordinary fetch
+/// of the same block. Core marks a block it is reconstructing as in flight
+/// and does not download it twice; satd's tip-following sweep would otherwise
+/// fetch in full a block already arriving compactly, spending the bandwidth
+/// compact relay saves. Short on purpose: the sweep is the safety net for a
+/// reconstruction that never finishes, so it must not be held off for long.
+const COMPACT_RECONSTRUCT_SUPPRESSION: Duration = Duration::from_secs(5);
 /// Most tip-following block requests recorded per peer. The records exist to
 /// answer "did we ask this peer for this block?", and a peer can make us
 /// record one per hash it announces: an `inv` may carry
@@ -336,6 +343,16 @@ pub struct PeerManager {
     /// [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`], which bounds the whole table by the
     /// connection limit no matter what peers announce.
     in_flight_blocks: RwLock<HashMap<PeerId, HashMap<bitcoin::BlockHash, Instant>>>,
+    /// Blocks a `cmpctblock` is being turned into right now: hash → when the
+    /// reconstruction started. Dropped when the block arrives by any route,
+    /// when its reconstruction is abandoned, and after
+    /// [`COMPACT_RECONSTRUCT_SUPPRESSION`]. While an entry is here the
+    /// tip-following sweep leaves the block alone rather than fetching it in
+    /// full — Core's `mapBlocksInFlight`, which covers a block being
+    /// reconstructed as much as one being downloaded. (An `inv` for it needs
+    /// no such guard: its header is accepted before reconstruction starts,
+    /// and `handle_inv` only fetches blocks it has no index entry for.)
+    compact_in_progress: RwLock<HashMap<bitcoin::BlockHash, Instant>>,
     /// Blocks explicitly requested by `getblockfrompeer`: hash → (the peer we
     /// asked, when we asked). A block arriving from *that* peer is routed to
     /// `ChainState::repair_block_data` instead of the normal accept path —
@@ -656,6 +673,7 @@ impl PeerManager {
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
             in_flight_blocks: RwLock::new(HashMap::new()),
+            compact_in_progress: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
@@ -6549,11 +6567,18 @@ impl PeerManager {
             return;
         }
 
+        // From here the block is on its way in compactly, so the
+        // tip-following sweep leaves it alone; every path that gives up below
+        // clears the mark, as does the block arriving or the sweep in
+        // `expire_compact_state`.
+        self.compact_in_progress.write().insert(block_hash, Instant::now());
+
         // 9. Reconstruct from the mempool.
         let reconstruction = match compact::try_reconstruct(&compact, &self.mempool) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(id, %block_hash, reason = %e, "invalid cmpctblock");
+                self.compact_in_progress.write().remove(&block_hash);
                 self.add_ban_score(id, 100, "invalid-cmpctblock");
                 return;
             }
@@ -6572,6 +6597,7 @@ impl PeerManager {
                         id, %block_hash,
                         "compact block failed merkle check, possible short-ID collision; requesting full block"
                     );
+                    self.compact_in_progress.write().remove(&block_hash);
                     self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
                     self.note_blocks_requested(id, &[block_hash]);
                     self.pending_compact.write().insert(
@@ -6738,7 +6764,11 @@ impl PeerManager {
         // below our active tip — a plain forward-by-height walk skips them,
         // and without them a reorg onto a longer competing chain announced by
         // a peer can never reconnect.
-        let to_request = self.chain_state.missing_blocks_for_best_header_chain(128);
+        let mut to_request = self.chain_state.missing_blocks_for_best_header_chain(128);
+        // A block already arriving as a `cmpctblock` is not fetched in full:
+        // the sweep runs on a timer, and without this it downloads the very
+        // block a reconstruction is a round trip away from finishing.
+        to_request.retain(|hash| !self.compact_reconstruction_in_flight(hash));
 
         if !to_request.is_empty() {
             tracing::debug!(count = to_request.len(), "Requesting blocks for best header chain");
@@ -6778,6 +6808,15 @@ impl PeerManager {
             .is_some_and(|at| at.elapsed() < BLOCK_IN_FLIGHT_TTL)
     }
 
+    /// Whether a compact reconstruction of `hash` started recently enough to
+    /// still be worth waiting for instead of fetching the block in full.
+    fn compact_reconstruction_in_flight(&self, hash: &bitcoin::BlockHash) -> bool {
+        self.compact_in_progress
+            .read()
+            .get(hash)
+            .is_some_and(|at| at.elapsed() < COMPACT_RECONSTRUCT_SUPPRESSION)
+    }
+
     /// A block arrived, by whatever route: nothing is in flight for it any
     /// more, and no partial compact reconstruction of it needs finishing.
     fn note_block_arrived(&self, hash: &bitcoin::BlockHash) {
@@ -6791,6 +6830,9 @@ impl PeerManager {
         }
         if self.pending_compact.read().values().any(|p| p.hash == *hash) {
             self.pending_compact.write().retain(|_, p| p.hash != *hash);
+        }
+        if self.compact_in_progress.read().contains_key(hash) {
+            self.compact_in_progress.write().remove(hash);
         }
     }
 
@@ -6826,6 +6868,9 @@ impl PeerManager {
             asked.retain(|_, at| at.elapsed() < BLOCK_IN_FLIGHT_TTL);
             !asked.is_empty()
         });
+        self.compact_in_progress
+            .write()
+            .retain(|_, at| at.elapsed() < COMPACT_RECONSTRUCT_SUPPRESSION);
     }
 
     /// Queue a message to a peer. Returns whether the message was actually
@@ -9846,6 +9891,91 @@ mod tests {
             asked.len() <= MAX_IN_FLIGHT_BLOCKS_PER_PEER,
             "{} records retained for one peer, cap is {MAX_IN_FLIGHT_BLOCKS_PER_PEER}",
             asked.len()
+        );
+    }
+
+    /// A block already on its way in as a `cmpctblock` must not also be
+    /// fetched in full: the tip-following sweep runs on a timer, and the
+    /// reconstruction is typically a round trip from done — downloading the
+    /// block spends exactly the bandwidth the compact form saved. The
+    /// suppression is bounded, so a reconstruction that never finishes still
+    /// gets the block fetched.
+    #[test]
+    fn a_block_being_reconstructed_is_not_also_fetched_in_full() {
+        use crate::chain::state::tests::{build_test_block, make_chain_state};
+
+        let (cs, _dir) = make_chain_state();
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let b1 = build_test_block(genesis, 1, 1_707_000_000);
+        let h1 = cs.accept_block(&b1).expect("connect block 1").hash();
+        let pm = peer_manager_over(Arc::new(cs));
+
+        let mut block = build_test_block(h1, 2, 1_707_000_001);
+        // A transaction the mempool has never seen: the reconstruction stops
+        // at a `getblocktxn` and the block stays unfinished.
+        block.txdata.push(bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(b1.txdata[0].compute_txid(), 0),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block.header.nonce = 0;
+        while block.header.validate_pow(block.header.target()).is_err() {
+            block.header.nonce += 1;
+        }
+        let hash = block.block_hash();
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h);
+        // We asked this peer for high-bandwidth relay, so its push is taken.
+        pm.peers.write().get_mut(&1).unwrap().info.hb_to = true;
+
+        let compact = bitcoin::bip152::HeaderAndShortIds::from_block(&block, 42, 2, &[])
+            .expect("compact form");
+        pm.handle_compact_block(1, compact);
+        assert!(
+            matches!(rx.try_recv(), Ok(NetworkMessage::GetBlockTxn(_))),
+            "the missing transaction must be requested"
+        );
+
+        let fetched_in_full = |rx: &mut mpsc::Receiver<NetworkMessage>| {
+            let mut seen = false;
+            while let Ok(msg) = rx.try_recv() {
+                if let NetworkMessage::GetData(inv) = msg {
+                    seen |= inv.iter().any(|i| {
+                        matches!(i, Inventory::Block(h) | Inventory::WitnessBlock(h) if *h == hash)
+                    });
+                }
+            }
+            seen
+        };
+
+        pm.request_missing_blocks(1);
+        assert!(
+            !fetched_in_full(&mut rx),
+            "the block must not be fetched in full while it is being reconstructed"
+        );
+
+        // Bounded: once the reconstruction has had its window, the ordinary
+        // fetch is back.
+        let stale = Instant::now()
+            .checked_sub(COMPACT_RECONSTRUCT_SUPPRESSION + Duration::from_secs(1))
+            .expect("a monotonic clock that far along");
+        pm.compact_in_progress.write().insert(hash, stale);
+        pm.request_missing_blocks(1);
+        assert!(
+            fetched_in_full(&mut rx),
+            "a reconstruction that never finishes must not hold the block hostage"
         );
     }
 
