@@ -193,7 +193,8 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
         "curtime": template.cur_time,
         "bits": format!("{:08x}", template.bits.to_consensus()),
         "height": template.height,
-        "longpollid": format!("{}{:x}", template.prev_hash, template.cur_time),
+        // Core's `<tip hash><transactions updated>`, what a long poll waits on.
+        "longpollid": format!("{}{}", template.prev_hash, mempool.mempool_sequence()),
         "expires": 120,
     });
     if !pre_segwit {

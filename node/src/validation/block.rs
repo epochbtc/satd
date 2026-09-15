@@ -392,9 +392,11 @@ pub fn is_block_mutated(block: &Block, check_witness_root: bool) -> bool {
         .compute_merkle_root()
         .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
     if computed != block.header.merkle_root {
+        tracing::debug!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
         return true;
     }
     if merkle_tree_mutated(block) {
+        tracing::debug!("Block mutated: bad-txns-duplicate, duplicate transaction");
         return true;
     }
 
@@ -404,7 +406,13 @@ pub fn is_block_mutated(block: &Block, check_witness_root: bool) -> bool {
     }
 
     // 3. `CheckWitnessMalleation`.
-    check_witness_rules(block, check_witness_root).is_err()
+    match check_witness_rules(block, check_witness_root) {
+        Ok(()) => false,
+        Err(e) => {
+            tracing::debug!("Block mutated: {e}");
+            true
+        }
+    }
 }
 
 fn compute_merkle_root_from_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {

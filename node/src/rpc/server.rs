@@ -1603,7 +1603,7 @@ pub async fn start(
         }
     })?;
 
-    module.register_method("getblocktemplate", |params, ctx, _extensions| {
+    module.register_async_method("getblocktemplate", |params, ctx, _extensions| async move {
         // The optional first positional argument is the template_request
         // object. When it contains `"mode": "proposal"` and `"data"`, run
         // proposal-mode validation instead of returning a new template.
@@ -1643,6 +1643,9 @@ pub async fn start(
         }
         if mode != "template" {
             return Err(ErrorObjectOwned::owned(-8, "Invalid mode", None::<()>));
+        }
+        if let Some(lpval) = request.as_ref().and_then(|r| r.get("longpollid")) {
+            wait_for_longpoll(&ctx, lpval).await?;
         }
         Ok::<_, ErrorObjectOwned>(mining::get_block_template(&ctx.chain_state, &ctx.mempool))
     })?;
@@ -4744,6 +4747,42 @@ where
             conn.as_mut().graceful_shutdown();
             conn.await
         }
+    }
+}
+
+/// Core's `getblocktemplate` long poll: hold the call until the tip moves
+/// from the one in `longpollid`, or, from a minute in and then every ten
+/// seconds, until the mempool has changed since it. A `longpollid` that is not
+/// a `<tip hash><counter>` string watches the current tip and counter, as
+/// Core's does for testing.
+async fn wait_for_longpoll(ctx: &RpcContext, lpval: &serde_json::Value) -> Result<(), ErrorObjectOwned> {
+    let (watched, seq) = match lpval.as_str() {
+        Some(s) => {
+            let hash = s.get(..64).unwrap_or(s);
+            let watched: bitcoin::BlockHash = hash.parse().map_err(|_| {
+                ErrorObjectOwned::owned(
+                    -8,
+                    format!("longpollid must be of length 64 (not {}, for '{hash}')", hash.len()),
+                    None::<()>,
+                )
+            })?;
+            (watched, s.get(64..).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0))
+        }
+        None => (ctx.chain_state.tip_hash(), ctx.mempool.mempool_sequence()),
+    };
+    let started = std::time::Instant::now();
+    let mut check_txs_at = std::time::Duration::from_secs(60);
+    loop {
+        if ctx.chain_state.tip_hash() != watched {
+            return Ok(());
+        }
+        if started.elapsed() >= check_txs_at {
+            if ctx.mempool.mempool_sequence() != seq {
+                return Ok(());
+            }
+            check_txs_at += std::time::Duration::from_secs(10);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
