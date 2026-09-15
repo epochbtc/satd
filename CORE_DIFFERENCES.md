@@ -710,6 +710,8 @@ default behavior set the corresponding flag.
 | Block-filter index | off | off | Matches Core; enable with `--blockfilterindex=basic`. |
 | `--peerblockfilters` | off | off | Matches Core; opt in to advertise `NODE_COMPACT_FILTERS`. |
 | `--mempoolfullrbf` | on (Core v28+) | on | Matches Core post-v28. |
+| Invalid header in a `cmpctblock` | penalised for most classes of header invalidity (`MaybePunishNodeForBlock` with `via_compact_block`) | ignored, never penalised | A compact block is pushed, not requested, and a header that fails validation leaves no state behind; the block is simply not reconstructed. A `headers` message is still penalised as in Core. |
+| Compact block reconstructions per block | at most three, unless we requested the block from the sender | at most three, always | satd's tip-following fetch asks every peer for a missing block, so Core's "requested from this peer" exemption would cover nearly every peer. The full block that request asked for still arrives. |
 | `--listenonion` | on (no-op without Tor) | off (on if `-torcontrol` set) | Core defaults it on, but it's a silent no-op unless a Tor control port is reachable; satd defaults it off to avoid dialing the control port on every boot. When on, satd creates a v3 hidden service via `-torcontrol` (default `127.0.0.1:9051`). An explicit `-torcontrol` implies `-listenonion=1`; `-listenonion=0` forces it off. |
 
 ---

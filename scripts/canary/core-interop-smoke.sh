@@ -13,6 +13,9 @@
 #   - block download Core <- satd (Core syncs satd-mined blocks)
 #   - tx relay satd <- Core (Core-originated tx reaches satd mempool)
 #   - tx relay Core <- satd (satd-broadcast tx reaches Core mempool)
+#   - BIP 152 high-bandwidth compact blocks in both directions: each side
+#     selects the other after taking a block from it, and the next block
+#     crosses as a `cmpctblock`
 #
 # satd uses Bitcoin Core's regtest network magic, so the two peer
 # directly with no shim. Core runs on the host network namespace (like
@@ -177,6 +180,44 @@ echo "verifying Core syncs satd-mined blocks..."
 sat_cli generatetoaddress 3 "$SATD_MINE_ADDR" >/dev/null
 wait_core_height 109
 assert_same_tip "block sync Core<-satd"
+
+# ── 3b. BIP 152 high-bandwidth compact blocks, both directions ──
+# Poll a jq expression over getpeerinfo until it holds.
+wait_peerinfo() {
+    local who="$1" expr="$2" label="$3" deadline=$(($(date +%s) + 60))
+    while [[ $(date +%s) -lt $deadline ]]; do
+        if "$who" getpeerinfo 2>/dev/null | jq -e "$expr" >/dev/null 2>&1; then
+            echo "ok: $label"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$label: timed out; getpeerinfo on $who:" >&2
+    "$who" getpeerinfo >&2 || true
+    return 1
+}
+
+echo "verifying compact block relay Core<-satd..."
+# Core selects satd for high-bandwidth relay once satd has delivered its tip
+# (step 3), so the next satd block reaches Core as a cmpctblock.
+wait_peerinfo core_cli 'any(.[]; .bip152_hb_to == true)' "Core selected satd for high-bandwidth compact relay"
+wait_peerinfo sat_cli 'any(.[]; .bip152_hb_from == true)' "satd sees Core's high-bandwidth request"
+sat_cli generatetoaddress 1 "$SATD_MINE_ADDR" >/dev/null
+wait_core_height 110
+assert_same_tip "compact block relay Core<-satd"
+wait_peerinfo core_cli 'any(.[]; (.bytesrecv_per_msg.cmpctblock // 0) > 0)' "Core received a cmpctblock from satd"
+
+echo "verifying compact block relay satd<-Core..."
+# The reverse: a block from Core that becomes satd's tip earns Core satd's
+# high-bandwidth selection, and Core's next block arrives as a cmpctblock,
+# which satd must reconstruct.
+core_cli generatetoaddress 1 "$CORE_ADDR" >/dev/null
+wait_satd_height 111
+wait_peerinfo sat_cli 'any(.[]; .bip152_hb_to == true)' "satd selected Core for high-bandwidth compact relay"
+core_cli generatetoaddress 1 "$CORE_ADDR" >/dev/null
+wait_satd_height 112
+assert_same_tip "compact block relay satd<-Core"
+wait_peerinfo sat_cli 'any(.[]; (.bytesrecv_per_msg.cmpctblock // 0) > 0)' "satd received a cmpctblock from Core"
 
 # ── 4. Tx relay satd <- Core ──
 echo "verifying tx relay satd<-Core..."
