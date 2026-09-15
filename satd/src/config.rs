@@ -904,6 +904,10 @@ pub struct Config {
     /// Maximum simultaneous inbound peers from the same source IP
     /// (Core-style flood guard; default 3).
     pub maxinboundperip: usize,
+    /// Bitcoin Core's `-blockreconstructionextratxn`: how many recently seen
+    /// transactions that are not in the mempool (replaced, or refused by
+    /// policy) are kept for compact block reconstruction. 0 keeps none.
+    pub blockreconstructionextratxn: usize,
     /// Bitcoin Core's `-maxuploadtarget`: soft cap in bytes on historical
     /// block upload per rolling 24h. 0 = unlimited.
     pub max_upload_target: u64,
@@ -3915,6 +3919,16 @@ impl Config {
                 .maxinboundperip
                 .or_else(|| file_get("maxinboundperip").and_then(|v| v.parse().ok()))
                 .unwrap_or(3),
+            blockreconstructionextratxn: match cli
+                .blockreconstructionextratxn
+                .map(|n| n.to_string())
+                .or_else(|| file_get("blockreconstructionextratxn"))
+            {
+                None => node::net::compact::DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN,
+                Some(v) => v.trim().parse::<i64>().map(|n| n.max(0) as usize).map_err(|_| {
+                    format!("blockreconstructionextratxn: invalid number {v:?}")
+                })?,
+            },
             max_upload_target: {
                 let raw = cli
                     .maxuploadtarget
@@ -4441,6 +4455,7 @@ impl Config {
                 "port": self.port,
                 "max_connections": self.maxconnections,
                 "max_inbound_per_ip": self.maxinboundperip,
+                "block_reconstruction_extra_txn": self.blockreconstructionextratxn,
                 "bind": self.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "dns": self.dns,
                 "dnsseed": self.dnsseed,
@@ -5663,6 +5678,13 @@ pub struct CliArgs {
         help = "Maximum simultaneous inbound peers from the same source IP (default: 3)"
     )]
     pub maxinboundperip: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Extra transactions kept in memory for compact block reconstruction (default: 100)"
+    )]
+    pub blockreconstructionextratxn: Option<i64>,
 
     /// Bitcoin Core's `-maxuploadtarget`: cap historical block upload per
     /// 24h. Plain number = MiB; suffix `B/K/M/G/T` (or `KiB`/`MiB`/…)
@@ -7181,6 +7203,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "checkblockindex",
         "maxconnections",
         "maxinboundperip",
+        "blockreconstructionextratxn",
         "maxuploadtarget",
         "bind",
         "timeout",
@@ -7848,6 +7871,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "seednode",
     "maxconnections",
     "maxinboundperip",
+    "blockreconstructionextratxn",
     "maxuploadtarget",
     "dns",
     "dnsseed",
@@ -10320,6 +10344,7 @@ testactivationheight=bip34@2
             checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
+            blockreconstructionextratxn: None,
             maxuploadtarget: None,
             bind: Vec::new(),
             timeout: None,
@@ -10626,6 +10651,7 @@ testactivationheight=bip34@2
             checkblockindex: None,
             maxconnections: None,
             maxinboundperip: None,
+            blockreconstructionextratxn: None,
             maxuploadtarget: None,
             bind: Vec::new(),
             timeout: None,
@@ -13276,6 +13302,21 @@ mcpallowedhost=node.local
         );
         let cli = CliArgs::try_parse_from(argv).unwrap();
         assert!(!Config::from_cli(cli).unwrap().blocksonly);
+    }
+
+    // ---- blockreconstructionextratxn ----
+
+    #[test]
+    fn blockreconstructionextratxn_defaults_to_cores_100_and_clamps_negative_to_zero() {
+        let parse = |argv: &[&str]| {
+            let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
+            Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap().blockreconstructionextratxn
+        };
+        assert_eq!(parse(&["satd", "--regtest"]), 100);
+        assert_eq!(parse(&["satd", "--regtest", "-blockreconstructionextratxn=7"]), 7);
+        assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=0"]), 0);
+        // Core: `std::max(GetIntArg(...), 0)`.
+        assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=-5"]), 0);
     }
 
     // ---- logging format knobs ----

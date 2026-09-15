@@ -51,12 +51,16 @@ pub struct PendingCompact {
     /// requested instead. The entry is kept so that a second `cmpctblock`
     /// for the same block from the same peer is ignored, as Core does.
     pub failed: bool,
+    /// The block's height, for the reconstruction log line.
+    pub height: u32,
+    /// What the mempool pass supplied, completed when the `blocktxn` arrives.
+    pub stats: ReconstructStats,
 }
 
 impl PendingCompact {
     /// A placeholder for a block whose reconstruction failed and was
     /// re-requested in full from the same peer.
-    pub fn failed(hash: BlockHash, header: bitcoin::block::Header) -> Self {
+    pub fn failed(hash: BlockHash, header: bitcoin::block::Header, height: u32) -> Self {
         Self {
             hash,
             header,
@@ -65,6 +69,8 @@ impl PendingCompact {
             since: Instant::now(),
             requested: true,
             failed: true,
+            height,
+            stats: ReconstructStats::default(),
         }
     }
 }
@@ -125,24 +131,129 @@ pub fn check_shape(compact: &HeaderAndShortIds) -> Result<(), ShapeError> {
     Ok(())
 }
 
+/// Bitcoin Core's `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN`.
+pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
+
+/// A transaction larger than this is not kept in the [`ExtraTxnCache`]. Core
+/// bounds each entry by its in-memory size (`RecursiveDynamicUsage < 100000`);
+/// satd bounds the serialized size, which is smaller and so keeps no more.
+pub const MAX_EXTRA_TXN_BYTES: usize = 100_000;
+
+/// Bitcoin Core's `vExtraTxnForCompact`: a fixed ring of recently seen
+/// transactions that are not in the mempool — replaced by RBF, or refused by
+/// policy but well-formed — kept so a compact block that includes one still
+/// reconstructs locally. Sized by `-blockreconstructionextratxn` (default 100;
+/// 0 disables). The oldest entry is overwritten first.
+pub struct ExtraTxnCache {
+    ring: Vec<Option<(bitcoin::Wtxid, Transaction)>>,
+    next: usize,
+}
+
+impl ExtraTxnCache {
+    pub fn new(capacity: usize) -> Self {
+        Self { ring: vec![None; capacity], next: 0 }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Keep `tx`, displacing the oldest entry once the ring is full. A no-op
+    /// at capacity 0, and for a transaction over [`MAX_EXTRA_TXN_BYTES`].
+    pub fn insert(&mut self, tx: Transaction) {
+        if self.ring.is_empty() || tx.total_size() > MAX_EXTRA_TXN_BYTES {
+            return;
+        }
+        let wtxid = tx.compute_wtxid();
+        self.ring[self.next] = Some((wtxid, tx));
+        self.next = (self.next + 1) % self.ring.len();
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(bitcoin::Wtxid, Transaction)> {
+        self.ring.iter().flatten()
+    }
+
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Where the transactions of a reconstruction came from, counted while the
+/// block was being filled — never by checking the mempool again afterwards,
+/// when a transaction may have come or gone. Field names follow Bitcoin Core
+/// #35724's reconstruction log line so the two can be compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconstructStats {
+    pub prefilled: u64,
+    pub prefilled_bytes: u64,
+    pub mempool: u64,
+    pub mempool_bytes: u64,
+    /// Filled from the [`ExtraTxnCache`], not the mempool.
+    pub extra: u64,
+    pub extra_bytes: u64,
+    /// Requested with `getblocktxn`.
+    pub requested: u64,
+    pub requested_bytes: u64,
+    /// Prefilled transactions we already had, in the mempool or the extra
+    /// cache: bytes the sender need not have spent.
+    pub redundant_prefilled: u64,
+}
+
 /// The result of matching a well-formed compact block against the mempool.
 pub enum Reconstruction {
     /// Every slot was filled; the block still has to pass its merkle check.
-    Complete(Block),
+    Complete(Block, ReconstructStats),
     /// Some slots must be requested with `getblocktxn`.
     Partial {
         txs: Vec<Option<Transaction>>,
         missing_indices: Vec<u64>,
+        stats: ReconstructStats,
     },
 }
 
-/// Attempt to reconstruct a full block from a compact block using the mempool.
+/// Where a candidate for a slot came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Mempool,
+    Extra,
+}
+
+type Candidates = HashMap<ShortId, Option<(bitcoin::Wtxid, Transaction, Source)>>;
+
+/// Offer `tx` as the transaction behind `short_id`. The first offer fills
+/// the entry; the same transaction offered again (it can be in both the
+/// mempool and the extra cache) changes nothing; a *different* transaction
+/// on a short ID already claimed makes it ambiguous (`None`), and the slot
+/// will be requested rather than guessed. Core's `InitData` does the same.
+fn offer(
+    matched: &mut Candidates,
+    short_id: ShortId,
+    wtxid: bitcoin::Wtxid,
+    tx: &Transaction,
+    source: Source,
+) {
+    match matched.get_mut(&short_id) {
+        None => {
+            matched.insert(short_id, Some((wtxid, tx.clone(), source)));
+        }
+        Some(Some((have, _, _))) if *have == wtxid => {}
+        Some(slot) => *slot = None,
+    }
+}
+
+/// Attempt to reconstruct a full block from a compact block using the mempool
+/// and the extra-transaction cache.
 ///
 /// Returns [`ShapeError`] for a message no valid block could produce; call
 /// [`check_shape`] first if the distinction matters before the mempool pass.
 pub fn try_reconstruct(
     compact: &HeaderAndShortIds,
     mempool: &Mempool,
+    extra: &ExtraTxnCache,
 ) -> Result<Reconstruction, ShapeError> {
     check_shape(compact)?;
     let siphash_keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
@@ -157,6 +268,12 @@ pub fn try_reconstruct(
     for short_id in &compact.short_ids {
         *short_id_counts.entry(*short_id).or_insert(0) += 1;
     }
+    let prefilled_wtxids: std::collections::HashSet<bitcoin::Wtxid> =
+        compact.prefilled_txs.iter().map(|p| p.tx.compute_wtxid()).collect();
+    let mut stats = ReconstructStats::default();
+    // Prefilled transactions we already held. A set, because a transaction
+    // can be in the mempool and the extra cache at once.
+    let mut redundant: std::collections::HashSet<bitcoin::Wtxid> = std::collections::HashSet::new();
 
     // Match the mempool against the announced short IDs: short_id -> the one
     // mempool tx carrying it, or `None` when more than one does.
@@ -181,21 +298,33 @@ pub fn try_reconstruct(
     //
     // The mempool is walked under its read lock without copying it: only a
     // transaction whose short ID the peer actually announced is cloned.
-    let mempool_by_short_id: HashMap<ShortId, Option<Transaction>> = mempool.with_entries(|entries| {
-        let mut matched: HashMap<ShortId, Option<Transaction>> = HashMap::new();
+    let mut by_short_id: Candidates = mempool.with_entries(|entries| {
+        let mut matched = Candidates::new();
         for entry in entries.values() {
             let wtxid = entry.tx.compute_wtxid();
-            let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
-            if !short_id_counts.contains_key(&short_id) {
-                continue;
+            if prefilled_wtxids.contains(&wtxid) {
+                redundant.insert(wtxid);
             }
-            matched
-                .entry(short_id)
-                .and_modify(|slot| *slot = None) // second match on this short ID: ambiguous
-                .or_insert_with(|| Some(entry.tx.clone()));
+            let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
+            if short_id_counts.contains_key(&short_id) {
+                offer(&mut matched, short_id, wtxid, &entry.tx, Source::Mempool);
+            }
         }
         matched
     });
+
+    // Then the extra-transaction cache, under the same collision rule.
+    for (wtxid, tx) in extra.iter() {
+        if prefilled_wtxids.contains(wtxid) {
+            redundant.insert(*wtxid);
+        }
+        let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
+        if short_id_counts.contains_key(&short_id) {
+            offer(&mut by_short_id, short_id, *wtxid, tx, Source::Extra);
+        }
+    }
+
+    stats.redundant_prefilled = redundant.len() as u64;
 
     // Total number of transactions in the block
     let total_txs = compact.prefilled_txs.len() + compact.short_ids.len();
@@ -206,6 +335,8 @@ pub fn try_reconstruct(
     let mut idx = 0usize;
     for prefilled in &compact.prefilled_txs {
         idx += prefilled.idx as usize;
+        stats.prefilled += 1;
+        stats.prefilled_bytes += prefilled.tx.total_size() as u64;
         txs[idx] = Some(prefilled.tx.clone());
         idx += 1;
     }
@@ -222,8 +353,21 @@ pub fn try_reconstruct(
             // txs, is not safe to fill locally — request it so we get the real
             // transaction for this slot instead of duplicating one.
             let ambiguous = short_id_counts.get(short_id).is_some_and(|&n| n > 1);
-            match mempool_by_short_id.get(short_id) {
-                Some(Some(tx)) if !ambiguous => *slot = Some(tx.clone()),
+            match by_short_id.get(short_id) {
+                Some(Some((_, tx, source))) if !ambiguous => {
+                    let bytes = tx.total_size() as u64;
+                    match source {
+                        Source::Mempool => {
+                            stats.mempool += 1;
+                            stats.mempool_bytes += bytes;
+                        }
+                        Source::Extra => {
+                            stats.extra += 1;
+                            stats.extra_bytes += bytes;
+                        }
+                    }
+                    *slot = Some(tx.clone());
+                }
                 _ => missing_indices.push(i as u64),
             }
         }
@@ -232,14 +376,18 @@ pub fn try_reconstruct(
     if missing_indices.is_empty() {
         // All transactions found — reconstruct the block
         let txdata: Vec<Transaction> = txs.into_iter().map(|t| t.unwrap()).collect();
-        Ok(Reconstruction::Complete(Block {
-            header: compact.header,
-            txdata,
-        }))
+        Ok(Reconstruction::Complete(
+            Block {
+                header: compact.header,
+                txdata,
+            },
+            stats,
+        ))
     } else {
         Ok(Reconstruction::Partial {
             txs,
             missing_indices,
+            stats,
         })
     }
 }
@@ -264,7 +412,8 @@ pub fn complete_pending(
     pending: PendingCompact,
     block_txns: &BlockTransactions,
     segwit_active: bool,
-) -> Result<Block, CompleteError> {
+) -> Result<(Block, ReconstructStats), CompleteError> {
+    let mut stats = pending.stats;
     if pending.failed || pending.missing_indices.is_empty() {
         return Err(CompleteError::Invalid);
     }
@@ -280,6 +429,8 @@ pub fn complete_pending(
             return Err(CompleteError::Invalid);
         }
         txs[i] = Some(tx.clone());
+        stats.requested += 1;
+        stats.requested_bytes += tx.total_size() as u64;
     }
 
     // Check all slots are filled
@@ -295,7 +446,7 @@ pub fn complete_pending(
     if crate::validation::block::is_block_mutated(&block, segwit_active) {
         return Err(CompleteError::Mutated);
     }
-    Ok(block)
+    Ok((block, stats))
 }
 
 /// Create a GetBlockTxn request for missing transactions.
@@ -355,6 +506,8 @@ mod tests {
             since: Instant::now(),
             requested: false,
             failed: false,
+            height: 1,
+            stats: ReconstructStats::default(),
         }
     }
 
@@ -423,8 +576,9 @@ mod tests {
             block_hash: header.block_hash(),
             transactions: vec![tx1.clone(), tx2.clone()],
         };
-        let block = complete_pending(pending, &block_txns, false)
+        let (block, stats) = complete_pending(pending, &block_txns, false)
             .unwrap_or_else(|e| panic!("expected a completed block, got {e:?}"));
+        assert_eq!(stats.requested, 2, "the two blocktxn transactions are counted as requested");
         assert_eq!(block.header, header);
         assert_eq!(block.txdata.len(), 3);
         assert_eq!(block.txdata[0], tx0);
@@ -459,8 +613,8 @@ mod tests {
         let compact = make_compact_block(&block).unwrap();
 
         let mempool = Mempool::new(300_000_000, 1_000);
-        match try_reconstruct(&compact, &mempool) {
-            Ok(Reconstruction::Complete(reconstructed)) => {
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Complete(reconstructed, _)) => {
                 assert_eq!(reconstructed.header, block.header);
                 assert_eq!(reconstructed.txdata.len(), block.txdata.len());
             }
@@ -480,7 +634,7 @@ mod tests {
 
         let compact = make_compact_block(&block).unwrap();
         let mempool = Mempool::new(300_000_000, 1_000);
-        match try_reconstruct(&compact, &mempool) {
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
             Ok(Reconstruction::Partial { missing_indices, .. }) => {
                 assert_eq!(missing_indices, vec![1]);
             }
@@ -507,8 +661,8 @@ mod tests {
         // relay nor template).
         mempool.insert_tx_scoped_for_test(extra_tx, full_quarantine);
 
-        match try_reconstruct(&compact, &mempool) {
-            Ok(Reconstruction::Complete(reconstructed)) => {
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Complete(reconstructed, _)) => {
                 assert_eq!(reconstructed.header, block.header);
                 assert_eq!(reconstructed.txdata.len(), block.txdata.len());
             }
@@ -553,8 +707,8 @@ mod tests {
             crate::mempool::pool::QuarantineScope::acting(),
         );
 
-        match try_reconstruct(&compact, &mempool) {
-            Ok(Reconstruction::Partial { txs, missing_indices }) => {
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Partial { txs, missing_indices, .. }) => {
                 assert_eq!(
                     missing_indices,
                     vec![1, 2],
@@ -564,7 +718,7 @@ mod tests {
                 assert!(txs[1].is_none());
                 assert!(txs[2].is_none());
             }
-            Ok(Reconstruction::Complete(block)) => panic!(
+            Ok(Reconstruction::Complete(block, _)) => panic!(
                 "must not reconstruct a block with a duplicated tx (txdata len {})",
                 block.txdata.len()
             ),
@@ -638,7 +792,7 @@ mod tests {
         for (name, compact, want) in cases {
             assert_eq!(check_shape(&compact), Err(want), "{name}");
             assert!(
-                matches!(try_reconstruct(&compact, &mempool), Err(e) if e == want),
+                matches!(try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)), Err(e) if e == want),
                 "{name}: try_reconstruct must refuse the shape"
             );
         }
@@ -682,7 +836,7 @@ mod tests {
     #[test]
     fn blocktxn_against_a_failed_entry_is_invalid() {
         let header = regtest_genesis().header;
-        let pending = PendingCompact::failed(header.block_hash(), header);
+        let pending = PendingCompact::failed(header.block_hash(), header, 1);
         let block_txns = BlockTransactions {
             block_hash: header.block_hash(),
             transactions: vec![],
@@ -736,9 +890,102 @@ mod tests {
             wanted.clone(),
             crate::mempool::pool::QuarantineScope::acting(),
         );
-        match try_reconstruct(&compact, &mempool) {
-            Ok(Reconstruction::Complete(b)) => assert_eq!(b.txdata[1], wanted),
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Complete(b, _)) => assert_eq!(b.txdata[1], wanted),
             _ => panic!("the announced tx must be found among unrelated entries"),
         }
+    }
+
+    // ---- extra-transaction cache ----
+
+    #[test]
+    fn extra_txn_cache_wraps_at_capacity_overwriting_the_oldest() {
+        let mut cache = ExtraTxnCache::new(3);
+        for v in 1..=4u64 {
+            cache.insert(make_test_tx(v));
+        }
+        let kept: Vec<u64> = cache.iter().map(|(_, tx)| tx.output[0].value.to_sat()).collect();
+        assert_eq!(cache.len(), 3);
+        assert!(!kept.contains(&1), "the oldest entry is overwritten: {kept:?}");
+        for v in 2..=4 {
+            assert!(kept.contains(&v), "{v} is kept: {kept:?}");
+        }
+    }
+
+    #[test]
+    fn extra_txn_cache_of_zero_keeps_nothing() {
+        let mut cache = ExtraTxnCache::new(0);
+        cache.insert(make_test_tx(1));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn extra_txn_cache_refuses_an_oversized_transaction() {
+        let mut big = make_test_tx(1);
+        big.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; MAX_EXTRA_TXN_BYTES]);
+        let mut cache = ExtraTxnCache::new(4);
+        cache.insert(big);
+        assert!(cache.is_empty());
+    }
+
+    /// A transaction that left the mempool (replaced) but sits in the extra
+    /// cache still fills its slot, and is counted as `extra`, not `mempool`.
+    #[test]
+    fn a_replaced_tx_in_the_extra_cache_is_found_by_the_next_reconstruction() {
+        let mut block = regtest_genesis();
+        let replaced = make_test_tx(31_337);
+        let in_pool = make_test_tx(42);
+        block.txdata.push(replaced.clone());
+        block.txdata.push(in_pool.clone());
+        let compact = make_compact_block(&block).unwrap();
+
+        let mempool = Mempool::new(300_000_000, 1_000);
+        mempool.insert_tx_scoped_for_test(in_pool, crate::mempool::pool::QuarantineScope::acting());
+        let mut extra = ExtraTxnCache::new(10);
+        extra.insert(replaced.clone());
+
+        match try_reconstruct(&compact, &mempool, &extra) {
+            Ok(Reconstruction::Complete(b, stats)) => {
+                assert_eq!(b.txdata[1], replaced);
+                assert_eq!((stats.prefilled, stats.mempool, stats.extra), (1, 1, 1), "{stats:?}");
+                assert_eq!(stats.extra_bytes, replaced.total_size() as u64);
+            }
+            _ => panic!("the cached tx must fill its slot"),
+        }
+        // Without the cache the same block needs a round trip.
+        match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Partial { missing_indices, .. }) => assert_eq!(missing_indices, vec![1]),
+            _ => panic!("without the cache the slot must be requested"),
+        }
+    }
+
+    /// Two different transactions on one short ID — one in the mempool, one
+    /// in the extra cache — make the slot ambiguous: it is requested, never
+    /// guessed. The same transaction offered from both places is one match.
+    /// A 48-bit collision cannot be ground in a test, so the matcher is fed
+    /// the colliding short ID directly.
+    #[test]
+    fn a_short_id_matching_mempool_and_extra_cache_is_ambiguous() {
+        let sid = ShortId::from([1, 2, 3, 4, 5, 6]);
+        let a = make_test_tx(1_001);
+        let b = make_test_tx(1_002);
+
+        let mut same = Candidates::new();
+        offer(&mut same, sid, a.compute_wtxid(), &a, Source::Mempool);
+        offer(&mut same, sid, a.compute_wtxid(), &a, Source::Extra);
+        assert!(
+            matches!(same.get(&sid), Some(Some((_, tx, Source::Mempool))) if *tx == a),
+            "the same transaction from both sources is one match"
+        );
+
+        let mut collision = Candidates::new();
+        offer(&mut collision, sid, a.compute_wtxid(), &a, Source::Mempool);
+        offer(&mut collision, sid, b.compute_wtxid(), &b, Source::Extra);
+        assert!(matches!(collision.get(&sid), Some(None)), "a mempool/cache collision is ambiguous");
+
+        let mut two_cached = Candidates::new();
+        offer(&mut two_cached, sid, a.compute_wtxid(), &a, Source::Extra);
+        offer(&mut two_cached, sid, b.compute_wtxid(), &b, Source::Extra);
+        assert!(matches!(two_cached.get(&sid), Some(None)), "two cached txs on one short ID are ambiguous");
     }
 }
