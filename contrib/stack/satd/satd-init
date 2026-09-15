@@ -33,6 +33,13 @@ MCP_ENABLED="${SATD_MCP:-0}"
 # derived below cover the install's own hostname; this is for a reverse proxy
 # or a DNS alias in front of it, which satd-init cannot know about.
 MCP_EXTRA_HOSTS="${SATD_MCP_ALLOWED_HOSTS:-}"
+# The status page on the metrics listener. Off in the plain stack, on in the
+# appliance and the app-store packages. SATD_STATUS_ADVERTISE is the
+# connection strings it shows, whitespace-separated `surface=url` values; see
+# satd's `statusadvertise`.
+STATUS_PAGE="${SATD_STATUSPAGE:-0}"
+STATUS_ADVERTISE="${SATD_STATUS_ADVERTISE:-}"
+SATD_BIN="${SATD_BIN:-satd}"
 
 # Fixed inside the stack, on every network. Publishing and client
 # configuration therefore do not change when the network does; only the P2P
@@ -45,6 +52,7 @@ ELECTRUM_TLS_PORT=50002
 ESPLORA_PORT=3000
 ESPLORA_TLS_PORT=3001
 METRICS_PORT=9332
+METRICS_TLS_PORT=9336
 ZMQ_PORT=28332
 MCP_PORT=8339
 
@@ -187,6 +195,44 @@ MCPCONF
     for h in "${mcp_hosts[@]}"; do
         printf 'mcpallowedhost=%s\n' "$h" >> "$CONF.new"
     done
+fi
+
+# The status page. Only for a satd that has it: satd refuses a config key it
+# does not know, so writing `statuspage=1` for an older binary would stop the
+# node from starting, and satd-init can run beside a satd that is not the one
+# it shipped with (the appliance installs a released binary next to this
+# script). An older satd gets no page, and says so here.
+if [[ "$STATUS_PAGE" == "1" ]]; then
+    if "$SATD_BIN" --help 2>/dev/null | grep -q -- '--statuspage'; then
+        {
+            printf '\n# --- status page ------------------------------------------------------------\n'
+            printf '# /status on the metrics listener above. Unauthenticated, like /metrics, and\n'
+            printf '# built to carry nothing secret.\n'
+            printf 'statuspage=1\n'
+            # An array, not an unquoted expansion: a URL may carry `?` or
+            # `*`, which the shell would glob.
+            read -r -a advertise <<< "$STATUS_ADVERTISE"
+            for a in ${advertise[@]+"${advertise[@]}"}; do
+                printf 'statusadvertise=%s\n' "$a"
+            done
+        } >> "$CONF.new"
+    else
+        echo "satd-init: SATD_STATUSPAGE=1, but $SATD_BIN has no status page; leaving it off" >&2
+    fi
+fi
+
+# The metrics listener over TLS, for the same reason and with the same guard
+# as the status page: the keys are new in 0.6.0 and an older satd refuses
+# them. On for every satd that has them, like the other TLS listeners in the
+# template — this is what makes the status page and /metrics reachable from
+# another machine without a proxy in front.
+if "$SATD_BIN" --help 2>/dev/null | grep -q -- '--metricstlsbind'; then
+    {
+        printf '\n# --- metrics over TLS --------------------------------------------------------\n'
+        printf 'metricstlsbind=0.0.0.0:%s\n' "$METRICS_TLS_PORT"
+        printf 'metricstlscert=%s/fullchain.crt\n' "$TLS_DIR"
+        printf 'metricstlskey=%s/leaf.key\n' "$TLS_DIR"
+    } >> "$CONF.new"
 fi
 
 # Operator additions, appended last so they win where satd takes the last

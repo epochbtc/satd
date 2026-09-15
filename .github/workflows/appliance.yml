@@ -189,6 +189,8 @@ jobs:
         run: contrib/docker/tests/healthcheck-test.sh
       - name: compose + appliance invariants
         run: contrib/stack/tests/compose-test.sh
+      - name: satd-init
+        run: contrib/stack/tests/satd-init-test.sh
       - name: sync-store.sh
         run: contrib/packaging/tests/sync-store-test.sh
       - name: shellcheck
@@ -207,6 +209,7 @@ jobs:
             contrib/appliance/provision/*.sh \
             contrib/stack/tests/compose-test.sh \
             contrib/stack/tests/smoke.sh \
+            contrib/stack/tests/satd-init-test.sh \
             contrib/packaging/sync-store.sh \
             contrib/packaging/tests/sync-store-test.sh
 
