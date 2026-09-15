@@ -1863,6 +1863,8 @@ async fn main() {
     peer_manager.set_blocksonly(config.blocksonly);
     // -blockreconstructionextratxn: the compact block extra-transaction ring.
     peer_manager.set_block_reconstruction_extra_txn(config.blockreconstructionextratxn);
+    // -cmpctblockprefill / -cmpctblockprefillbytes: opt-in outbound prefill.
+    peer_manager.set_compact_block_prefill(config.cmpctblockprefill, config.cmpctblockprefillbytes);
 
     // -v2transport / -v2only: BIP 324 encrypted transport. -v2only implies
     // the transport is enabled (it just additionally refuses v1 peers).

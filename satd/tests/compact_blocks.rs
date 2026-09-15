@@ -1173,3 +1173,153 @@ fn unsolicited_cmpctblock_from_a_low_bandwidth_peer_is_a_header_announcement() {
     let header = node.rpc_call_with_params("getblockheader", vec![json!(hash.to_string())]).unwrap();
     assert!(header["error"].is_null(), "the header must have been accepted: {header}");
 }
+
+// ---------------------------------------------------------------------------
+// Outbound prefill (-cmpctblockprefill)
+// ---------------------------------------------------------------------------
+
+fn metric_or_zero(port: u16, series: &str) -> u64 {
+    metric(&metrics_body(port), series).unwrap_or(0)
+}
+
+/// Core #35558: a block announced with the transactions the sender lacked
+/// prefilled reconstructs on a peer that lacks them too, without a
+/// `getblocktxn` round trip. Node A takes a block carrying X straight from a
+/// raw peer, so X was never in A's mempool, and announces it to node B, which
+/// has never seen X either. With prefill on, B rebuilds it directly; with it
+/// off, B has to ask. Both halves run here so the difference is the flag.
+#[test]
+fn prefilled_cmpctblock_reconstructs_without_a_round_trip() {
+    for (prefill, expect_round_trip) in [(true, false), (false, true)] {
+        let p2p_port_a = common::find_available_port();
+        let mut args_a = vec![format!("--port={p2p_port_a}")];
+        if prefill {
+            args_a.push("--cmpctblockprefill=1".to_string());
+        }
+        let args_a: Vec<&str> = args_a.iter().map(String::as_str).collect();
+        let node_a = TestNode::start(&args_a);
+        let wallet = DeterministicWallet::from_secret([0x64; 32]);
+        node_a.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+
+        let metrics_b = common::find_available_port();
+        let node_b = TestNode::start(&[
+            &format!("--connect=127.0.0.1:{p2p_port_a}"),
+            &format!("--metricsport={metrics_b}"),
+        ]);
+        poll_until(|| height(&node_b) == 101, test_timeout(60), "B must sync A's chain");
+        // One block delivered by A makes B select A for high-bandwidth relay.
+        node_a.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+        poll_until(|| best_hash(&node_b) == best_hash(&node_a), test_timeout(20), "B must follow A");
+        poll_until(
+            || node_a.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
+            test_timeout(20),
+            "B must select A for high-bandwidth relay",
+        );
+
+        let dest = DeterministicWallet::from_secret([0x65; 32]);
+        let (x_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+            &node_a, &wallet, dest.address.script_pubkey(), 1_000,
+        );
+        let x: Transaction = deserialize(&hex::decode(&x_hex).unwrap()).unwrap();
+
+        let direct = "satd_net_compact_block_reconstructions_total{outcome=\"direct\"}";
+        let round_trip = "satd_net_compact_block_reconstructions_total{outcome=\"round_trip\"}";
+        let prefilled = "satd_net_compact_block_txs_total{source=\"prefilled\"}";
+        let before = [direct, round_trip, prefilled].map(|s| metric_or_zero(metrics_b, s));
+
+        let p = RawPeer::connect(node_a.p2p_port.unwrap());
+        poll_until(|| peer_count(&node_a) == 2, test_timeout(20), "the raw peer must connect to A");
+        let tip = block_at(&node_a, &best_hash(&node_a));
+        let block = build_block(&tip, height(&node_a) + 1, vec![x], true, 64);
+        let hash = block.block_hash();
+        p.send(NetworkMessage::Headers(vec![block.header]));
+        p.send(NetworkMessage::Block(block));
+        poll_until(|| best_hash(&node_a) == hash, test_timeout(20), "A must connect the block");
+        poll_until(|| best_hash(&node_b) == hash, test_timeout(20), "B must follow A");
+
+        let after = [direct, round_trip, prefilled].map(|s| metric_or_zero(metrics_b, s));
+        let delta: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        if expect_round_trip {
+            assert_eq!(delta, vec![0, 1, 1], "prefill off: coinbase only, and B must ask for X");
+        } else {
+            assert_eq!(delta, vec![1, 0, 2], "prefill on: X arrives prefilled and B needs nothing");
+        }
+    }
+}
+
+/// A transaction nobody has, about `bytes` long.
+fn bulky_unknown_tx(seed: u32, bytes: usize) -> Transaction {
+    let mut tx = unknown_tx(seed);
+    tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
+    tx
+}
+
+/// The prefill stays inside `-cmpctblockprefillbytes`: of five transactions
+/// the node lacks, only as many as fit go prefilled, and the rest as short
+/// IDs.
+#[test]
+fn prefill_never_exceeds_its_budget() {
+    use bitcoin::p2p::message_compact_blocks::SendCmpct;
+    let budget = 4_000usize;
+    let node = TestNode::start(&["--cmpctblockprefill=1", &format!("--cmpctblockprefillbytes={budget}")]);
+    let wallet = DeterministicWallet::from_secret([0x66; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(5), json!(wallet.address.to_string())]);
+    let mut hb = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    hb.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    poll_until(
+        || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
+        test_timeout(20),
+        "the node must record the high-bandwidth request",
+    );
+
+    let tip = block_at(&node, &best_hash(&node));
+    let txs: Vec<Transaction> = (0..5).map(|i| bulky_unknown_tx(700 + i, 1_500)).collect();
+    let block = build_block(&tip, height(&node) + 1, txs, true, 66);
+    let hash = block.block_hash();
+    // It spends coins that do not exist, so it never connects; it is still
+    // announced, which is all this test needs.
+    let hex = hex::encode(bitcoin::consensus::serialize(&block));
+    let _ = node.rpc_call_with_params("submitblock", vec![json!(hex)]).unwrap();
+
+    let Some(NetworkMessage::CmpctBlock(c)) = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20)) else {
+        panic!("the block must be announced");
+    };
+    let prefilled = &c.compact_block.prefilled_txs;
+    let used: usize = prefilled.iter().skip(1).map(|p| p.tx.total_size()).sum();
+    assert!(used <= budget, "{used} bytes prefilled against a {budget}-byte budget");
+    assert_eq!(prefilled.len(), 1 + budget / 1_500, "as many as fit, beyond the coinbase");
+    assert_eq!(prefilled.len() + c.compact_block.short_ids.len(), 6, "the rest go as short IDs");
+}
+
+/// Which transactions a node lacked can only be read off the mempool before
+/// the block connects; afterwards the mempool no longer holds any of them.
+/// A `cmpctblock` first built after connection -- here, a `MSG_CMPCT_BLOCK`
+/// getdata for a block the tip cache has moved past -- goes out with the
+/// coinbase only, not with every transaction the node in fact had.
+#[test]
+fn a_cmpctblock_built_after_connection_is_not_prefilled() {
+    let node = TestNode::start(&["--cmpctblockprefill=1"]);
+    let wallet = DeterministicWallet::from_secret([0x67; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(wallet.address.to_string())]);
+    let dest = DeterministicWallet::from_secret([0x68; 32]);
+    let (tx_hex, _) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node, &wallet, dest.address.script_pubkey(), 1_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(tx_hex)]);
+    let mined = node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+    let hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+    assert_eq!(block_at(&node, &hash).txdata.len(), 2, "the block must carry the mempool transaction");
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(wallet.address.to_string())]);
+
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    peer.send(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)]));
+    match peer.recv_until(|m| matches!(m, NetworkMessage::CmpctBlock(_) | NetworkMessage::Block(_)), test_timeout(20)) {
+        Some(NetworkMessage::CmpctBlock(c)) => {
+            assert_eq!(c.compact_block.prefilled_txs.len(), 1, "coinbase only");
+            assert_eq!(c.compact_block.short_ids.len(), 1);
+        }
+        other => panic!("expected a cmpctblock, got {other:?}"),
+    }
+}
