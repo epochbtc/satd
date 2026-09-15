@@ -2923,8 +2923,12 @@ impl PeerManager {
 
             ticks += 1;
 
-            // Every 4 ticks (2 seconds), bring stale fee filters up to date.
-            if ticks.is_multiple_of(4) {
+            // Bring stale fee filters up to date every 4 ticks (2 seconds),
+            // and on the tick the tip moves: that is when the node leaves
+            // IBD, and a peer still holding the IBD maximum filters out every
+            // transaction it would announce to us. Core sends that update at
+            // once (`m_next_send_feefilter = 0` after `MAX_FILTER`).
+            if tip_advanced || ticks.is_multiple_of(4) {
                 self.maybe_send_fee_filters();
             }
 
