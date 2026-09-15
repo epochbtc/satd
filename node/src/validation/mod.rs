@@ -81,7 +81,8 @@ pub enum ValidationError {
     /// Core's `unexpected-witness`.
     #[error("unexpected-witness")]
     UnexpectedWitness,
-    #[error("bad-signet-solution")]
+    /// Core's `CheckBlock` reject reason, which `submitblock` returns.
+    #[error("bad-signet-blksig")]
     BadSignetSolution,
     #[error("time-timewarp-attack")]
     TimewarpAttack,

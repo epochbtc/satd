@@ -2784,11 +2784,26 @@ fn test_preciousblock() {
 fn test_getmininginfo() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getmininginfo").unwrap();
-    let result = &response["result"];
+    let result = response["result"].clone();
     assert_eq!(result["chain"], "regtest");
     assert!(result["blocks"].is_number());
     assert!(result["difficulty"].is_number());
+    // Core v29+: the tip's `bits`/`target`, and the next block's.
+    let regtest_target = "7fffff0000000000000000000000000000000000000000000000000000000000";
+    assert_eq!(result["bits"], "207fffff");
+    assert_eq!(result["target"], regtest_target);
+    assert_eq!(result["next"]["height"], 1);
+    assert_eq!(result["next"]["bits"], "207fffff");
+    assert_eq!(result["next"]["target"], regtest_target);
+    assert!(result.get("signet_challenge").is_none());
+    let tip = result_hash(&mut node);
+    let header = node.rpc_call_with_params("getblockheader", vec![tip]).unwrap();
+    assert_eq!(header["result"]["target"], regtest_target);
     node.stop();
+}
+
+fn result_hash(node: &mut TestNode) -> serde_json::Value {
+    node.rpc_call("getbestblockhash").unwrap()["result"].clone()
 }
 
 #[test]

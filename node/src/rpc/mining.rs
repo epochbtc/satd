@@ -63,7 +63,12 @@ pub fn submit_block(chain_state: &ChainState, mempool: &Mempool, hex_block: &str
     }
 }
 
-/// Handle the `generatetoaddress` RPC call (regtest only).
+/// Handle the `generatetoaddress` RPC call.
+///
+/// Available on every chain, as in Core: the miner grinds real proof of work
+/// against the chain's target, so off regtest it spends its nonce budget and
+/// almost always returns no blocks. Core's functional tests mine on signet
+/// with an `OP_TRUE` challenge this way.
 pub fn generate_to_address(
     chain_state: &ChainState,
     mempool: &Mempool,
@@ -71,10 +76,6 @@ pub fn generate_to_address(
     address: &str,
     max_tries: u64,
 ) -> Result<Value, (i32, String)> {
-    if chain_state.network != bitcoin::Network::Regtest {
-        return Err((-1, "generatetoaddress is only available in regtest mode".to_string()));
-    }
-
     let hashes = crate::mining::miner::mine_blocks(chain_state, mempool, address, nblocks, max_tries)
         .map_err(|e| match &e {
             crate::mining::miner::MineError::BadAddress(_) => (-5, format!("Invalid address: {e}")),
@@ -84,7 +85,7 @@ pub fn generate_to_address(
     Ok(json!(hashes))
 }
 
-/// Handle the `generatetodescriptor` RPC call (regtest only).
+/// Handle the `generatetodescriptor` RPC call. Every chain, as `generatetoaddress`.
 pub fn generate_to_descriptor(
     chain_state: &ChainState,
     mempool: &Mempool,
@@ -92,10 +93,6 @@ pub fn generate_to_descriptor(
     descriptor: &str,
     max_tries: u64,
 ) -> Result<Value, (i32, String)> {
-    if chain_state.network != bitcoin::Network::Regtest {
-        return Err((-1, "generatetodescriptor is only available in regtest mode".to_string()));
-    }
-
     // `descriptor_to_coinbase_script` is the full key-based parser
     // `generateblock` already uses, and it answers `-5` as Core's
     // `RPC_INVALID_ADDRESS_OR_KEY` does. `parse_descriptor` is
@@ -115,17 +112,13 @@ pub fn generate_to_descriptor(
     Ok(json!(hashes))
 }
 
-/// Handle the `generateblock` RPC call (regtest only).
+/// Handle the `generateblock` RPC call. Every chain, as `generatetoaddress`.
 pub fn generate_block(
     chain_state: &ChainState,
     mempool: &Mempool,
     address: &str,
     submit: bool,
 ) -> Result<Value, (i32, String)> {
-    if chain_state.network != bitcoin::Network::Regtest {
-        return Err((-1, "generateblock is only available in regtest mode".to_string()));
-    }
-
     if submit {
         let block = crate::mining::miner::mine_block(chain_state, mempool, address)
             .map_err(|e| (-1, e.to_string()))?;
@@ -215,15 +208,37 @@ pub fn get_block_template(chain_state: &ChainState, mempool: &Mempool) -> Value 
     result
 }
 
+/// `getmininginfo.next`: the block after `tip` as Core's
+/// `NextEmptyBlockIndex` builds it — timestamped `max(MTP + 1, now)` on the
+/// node clock, with the `nBits` that timestamp requires.
+fn next_block_info(chain_state: &ChainState, tip: &crate::storage::blockindex::BlockIndexEntry) -> Value {
+    let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
+    let time = now.max(crate::rpc::blockchain::block_median_time(chain_state, tip) + 1);
+    let bits = crate::validation::pow::next_bits(
+        chain_state.network,
+        tip,
+        time,
+        |h| chain_state.get_block_index(&chain_state.get_block_hash_by_height(h)?),
+        |hash| chain_state.get_block_index(hash),
+    )
+    .unwrap_or(tip.header.bits);
+    json!({
+        "height": tip.height + 1,
+        "bits": crate::rpc::blockchain::bits_hex(bits),
+        "difficulty": target_to_difficulty(bits),
+        "target": crate::rpc::blockchain::target_hex(bits),
+    })
+}
+
 /// `getmininginfo` — return mining-related info.
 pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     // One read -- see `ChainState::tip_snapshot`.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
-    let difficulty = if let Some(entry) = chain_state.get_block_index(&tip_hash) {
-        target_to_difficulty(entry.header.bits)
-    } else {
-        0.0
-    };
+    let tip_entry = chain_state.get_block_index(&tip_hash);
+    let difficulty = tip_entry
+        .as_ref()
+        .map(|entry| target_to_difficulty(entry.header.bits))
+        .unwrap_or(0.0);
     let hashps = get_network_hash_ps(chain_state, 120, -1).unwrap_or(0.0);
 
     let chain = match chain_state.network {
@@ -241,6 +256,11 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
         "difficulty": difficulty,
         "networkhashps": hashps,
         "pooledtx": pooledtx,
+        // Core's `blockmintxfee`, BTC/kvB.
+        "blockmintxfee": crate::rpc::amounts::format_feerate_sat_per_kvb(
+            crate::mining::template::block_min_tx_fee(),
+            crate::rpc::amounts::AmountUnit::Btc,
+        ),
         "chain": chain,
         // The node's real warnings, the same ones `getblockchaininfo`
         // reports. This was `""` while the plumbing sat one call away —
@@ -260,6 +280,15 @@ pub fn get_mining_info(chain_state: &ChainState, mempool: &Mempool) -> Value {
     // assemble a template to answer `getmininginfo`, and neither should we:
     // this is a hot `Read` RPC that monitoring polls, and assembling walks
     // the whole mempool.
+    if let Some(entry) = &tip_entry {
+        out["bits"] = json!(crate::rpc::blockchain::bits_hex(entry.header.bits));
+        out["target"] = json!(crate::rpc::blockchain::target_hex(entry.header.bits));
+        out["next"] = next_block_info(chain_state, entry);
+    }
+    if let Some(challenge) = chain_state.signet_challenge() {
+        out["signet_challenge"] = json!(hex::encode(challenge));
+    }
+
     if let Some((num_txs, weight)) = crate::mining::template::last_block_stats() {
         out["currentblocktx"] = json!(num_txs);
         out["currentblockweight"] = json!(weight);

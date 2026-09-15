@@ -28,6 +28,28 @@ use crate::validation::ValidationError;
 
 /// The 4-byte tag that marks the signet solution pushdata inside the
 /// coinbase witness-commitment output (BIP 325).
+/// The default signet's challenge, a 1-of-2 multisig (Core's
+/// `CChainParams::SigNet` with no `-signetchallenge`).
+pub const DEFAULT_SIGNET_CHALLENGE: [u8; 71] = hex_literal_challenge();
+
+const fn hex_literal_challenge() -> [u8; 71] {
+    const HEX: &[u8] = b"512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+    const fn nib(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("bad hex"),
+        }
+    }
+    let mut out = [0u8; 71];
+    let mut i = 0;
+    while i < 71 {
+        out[i] = (nib(HEX[2 * i]) << 4) | nib(HEX[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
 const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
 
 /// BIP 141 witness-commitment header: `OP_RETURN OP_PUSHBYTES_36 <aa21a9ed…>`.
