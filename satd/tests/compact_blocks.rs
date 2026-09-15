@@ -1087,3 +1087,34 @@ fn two_satd_nodes_relay_a_block_as_cmpctblock() {
         "no full block may be needed"
     );
 }
+
+/// Core's `NewPoWValidBlock`: a block that extends the tip is announced to
+/// high-bandwidth peers once it has passed proof of work and `check_block`,
+/// before its transactions are validated against the UTXO set. The proof is
+/// a block that never connects — it spends a coin that does not exist — and
+/// still reaches the peer. A post-connect announcement could not send it.
+#[test]
+fn a_block_is_announced_to_high_bandwidth_peers_before_it_is_connected() {
+    use bitcoin::p2p::message_compact_blocks::SendCmpct;
+    let (node, _) = started_node(5);
+    let mut hb = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    hb.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    poll_until(
+        || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"] == json!(true),
+        test_timeout(20),
+        "the node must record the high-bandwidth request",
+    );
+
+    let tip_before = best_hash(&node);
+    let tip = block_at(&node, &tip_before);
+    let bad = build_block(&tip, height(&node) + 1, vec![unknown_tx(1)], true, 8);
+    let hash = bad.block_hash();
+    let hex = hex::encode(bitcoin::consensus::serialize(&bad));
+    let submitted = node.rpc_call_with_params("submitblock", vec![json!(hex)]).unwrap();
+    assert!(!submitted["result"].is_null(), "submitblock must reject the block: {submitted}");
+
+    let got = hb.recv_until(is_cmpctblock_for(hash), test_timeout(20));
+    assert!(got.is_some(), "the block must be announced before connection is attempted");
+    assert_eq!(best_hash(&node), tip_before, "and it must not have connected");
+}
