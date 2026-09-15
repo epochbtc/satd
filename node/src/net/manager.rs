@@ -218,6 +218,9 @@ struct PeerHandle {
     /// of queued `inv` allocations, so even a *permissioned* peer must not
     /// be able to spam it in a tight loop. `None` until the first serve.
     last_mempool_served: Option<Instant>,
+    /// The BIP 133 `feefilter` value last sent to this peer, sat/kvB. `None`
+    /// until one is sent; some peers are never sent one.
+    fee_filter_sent: Option<u64>,
     /// Signals the peer's write loop to end, shared with that task.
     ///
     /// Dropping this handle closes `msg_rx`, which the write loop already
@@ -231,6 +234,62 @@ struct PeerHandle {
     /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
     /// [`NetTotals`].
     stats: Arc<PeerStats>,
+}
+
+/// Core's `ProcessMessage` line, written as the message comes off the wire
+/// so it lands in the order the peer sent. The payload size needs a
+/// re-encode, so it is only paid for when the line will be written.
+fn log_received(id: PeerId, msg: &NetworkMessage) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let cmd = match msg {
+        NetworkMessage::Unknown { command, .. } => command.to_string(),
+        m => m.cmd().to_string(),
+    };
+    let raw = bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone());
+    let payload = bitcoin::consensus::serialize(&raw).len().saturating_sub(24);
+    tracing::debug!("received: {cmd} ({payload} bytes) peer={id}");
+}
+
+/// Core's `CInv::ToString`: the inventory type's name and the hash.
+fn inv_to_string(inv: &Inventory) -> String {
+    match inv {
+        Inventory::Transaction(txid) => format!("tx {txid}"),
+        Inventory::WitnessTransaction(txid) => format!("witness-tx {txid}"),
+        Inventory::WTx(wtxid) => format!("wtx {wtxid}"),
+        Inventory::Block(hash) => format!("block {hash}"),
+        Inventory::WitnessBlock(hash) => format!("witness-block {hash}"),
+        Inventory::CompactBlock(hash) => format!("cmpctblock {hash}"),
+        Inventory::Error => "error".to_string(),
+        Inventory::Unknown { inv_type, hash } => format!("type={inv_type} {}", hex::encode(hash)),
+    }
+}
+
+/// Core's `MAX_MONEY`, the `feefilter` a node in initial block download sends
+/// before rounding.
+const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
+
+/// Core's `FeeFilterRounder::round`: the buckets are 0 and
+/// `max(1, incremental / 2) * 1.1^n` up to 10,000,000 sat/kvB; `fee` goes to
+/// the first bucket at or above it, stepped one bucket down two times in
+/// three (or always, past the last bucket), so the filter a peer sees carries
+/// less information about the mempool.
+fn fee_filter_round(fee: u64, incremental_relay_fee: u64, random: u32) -> u64 {
+    const MAX_FILTER_FEERATE: f64 = 10_000_000.0;
+    const FEE_FILTER_SPACING: f64 = 1.1;
+    let mut buckets = vec![0.0f64];
+    let mut boundary = ((incremental_relay_fee / 2).max(1)) as f64;
+    while boundary <= MAX_FILTER_FEERATE {
+        buckets.push(boundary);
+        boundary *= FEE_FILTER_SPACING;
+    }
+    let fee = fee as f64;
+    let mut i = buckets.partition_point(|b| *b < fee);
+    if i == buckets.len() || (i != 0 && !random.is_multiple_of(3)) {
+        i -= 1;
+    }
+    buckets[i] as u64
 }
 
 /// How a peer task receives its transport.
@@ -1669,7 +1728,7 @@ impl PeerManager {
         // can re-dial for v1. Peers that already failed v2 this session are
         // connected straight as v1 to avoid a wasted round trip.
         let conn = self
-            .establish_outbound(stream, OutboundDial::Direct(addr), use_v2)
+            .establish_outbound(id, stream, OutboundDial::Direct(addr), use_v2)
             .await?;
 
         // Re-check after the dial + handshake awaits: `setnetworkactive false`
@@ -1746,7 +1805,7 @@ impl PeerManager {
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
         let conn = self
-            .establish_outbound(stream, OutboundDial::Onion(host.to_string(), port), None)
+            .establish_outbound(id, stream, OutboundDial::Onion(host.to_string(), port), None)
             .await?;
 
         // Re-check after the dial + handshake awaits (see connect_outbound):
@@ -1769,12 +1828,22 @@ impl PeerManager {
 
     /// Connect to a PeerAddr (either socket or .onion).
     pub async fn connect_peer_addr(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+        self.connect_peer_addr_with(addr, None).await
+    }
+
+    /// [`Self::connect_peer_addr`] with `addnode`'s `v2transport` choice for
+    /// this dial; `None` follows `-v2transport`.
+    pub async fn connect_peer_addr_with(
+        self: &Arc<Self>,
+        addr: &PeerAddr,
+        use_v2: Option<bool>,
+    ) -> Result<(), String> {
         // Connections from addnode RPC (including onetry) are manual.
         // Mark the address so spawn_peer tags the peer correctly.
         match addr {
             PeerAddr::Socket(sa) => {
                 self.manual_addrs.write().insert(*sa);
-                let result = self.connect_outbound(*sa).await;
+                let result = self.connect_outbound_as(*sa, None, use_v2).await;
                 // onetry: remove the manual marker after connect.
                 // Persistent addnode entries remain in connect_addrs.
                 if !self.connect_addrs.read().contains(sa) {
@@ -1899,6 +1968,10 @@ impl PeerManager {
             // reached us on. Distinct from `-bind` config, since a node may
             // listen on several addresses.
             info.bind_addr = stream.local_addr().ok();
+            // `detecting` until the first bytes show v1 or v2.
+            if self.v2_transport_enabled() {
+                info.transport = crate::net::peer::TransportProtocol::Detecting;
+            }
             peers.insert(
                 id,
                 PeerHandle {
@@ -1907,6 +1980,7 @@ impl PeerManager {
                     disconnect: Arc::new(tokio::sync::Notify::new()),
                     last_getheaders_sent: None,
                     last_mempool_served: None,
+                    fee_filter_sent: None,
                     stats: PeerStats::new(self.net_totals.clone()),
                 },
             );
@@ -2341,6 +2415,112 @@ impl PeerManager {
         }
     }
 
+    /// Queue a message of any type to one fully connected peer: Core's hidden
+    /// `sendmsgtopeer`. The caller has already bounded `msg_type` to the
+    /// 12-byte header field. Returns false if the peer is not connected or its
+    /// send queue is full.
+    pub fn send_raw_message(&self, id: PeerId, msg_type: &str, payload: Vec<u8>) -> bool {
+        let Ok(command) = bitcoin::p2p::message::CommandString::try_from(msg_type.to_string()) else {
+            return false;
+        };
+        let peers = self.peers.read();
+        match peers.get(&id) {
+            Some(handle) if handle.info.state == PeerState::Connected => handle
+                .msg_tx
+                .try_send(NetworkMessage::Unknown { command, payload })
+                .is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Core's `RejectIncomingTxs`: whether a transaction or transaction inv
+    /// from `id` is a protocol violation. A block-relay-only link never
+    /// carries them; on a `-blocksonly` node only a peer with `relay`
+    /// permission may send them.
+    fn rejects_incoming_txs(&self, id: PeerId) -> bool {
+        let (conn_type, permissions) = {
+            let peers = self.peers.read();
+            match peers.get(&id) {
+                Some(h) => (h.info.conn_type, h.info.permissions),
+                None => return false,
+            }
+        };
+        if conn_type == ConnType::BlockRelay {
+            return true;
+        }
+        if permissions.relays_txes() {
+            return false;
+        }
+        self.blocksonly()
+    }
+
+    /// The `feefilter` to send `id` now, Core's `MaybeSendFeefilter`: none to
+    /// a peer we take no transactions from (`-blocksonly`, a block-relay-only
+    /// or feeler link) or one with `forcerelay`; while in initial block
+    /// download the largest filter, so no peer sends transactions we would
+    /// not validate; otherwise the relay floor, rounded to a coarse bucket so
+    /// the value does not fingerprint the mempool.
+    fn fee_filter_for(&self, id: PeerId) -> Option<u64> {
+        if self.blocksonly() {
+            return None;
+        }
+        let (conn_type, permissions) = {
+            let peers = self.peers.read();
+            let h = peers.get(&id)?;
+            (h.info.conn_type, h.info.permissions)
+        };
+        if !conn_type.wants_tx_relay() || permissions.force_relay {
+            return None;
+        }
+        let min_relay = self.mempool.min_fee_rate();
+        let current = if self.chain_state.is_initial_block_download() {
+            MAX_MONEY_SATS
+        } else {
+            min_relay
+        };
+        let rounded = fee_filter_round(
+            current,
+            self.mempool.policy().incremental_relay_fee,
+            rand::random::<u32>(),
+        );
+        Some(rounded.max(min_relay))
+    }
+
+    /// Re-send `feefilter` where the value a peer holds is out of date: at
+    /// once when the node leaves or re-enters initial block download, and
+    /// when the floor has moved outside Core's 3/4..4/3 band.
+    fn maybe_send_fee_filters(&self) {
+        let ids: Vec<(PeerId, Option<u64>)> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Connected && h.fee_filter_sent.is_some())
+            .map(|(id, h)| (*id, h.fee_filter_sent))
+            .collect();
+        let ibd = self.chain_state.is_initial_block_download();
+        let max_filter = fee_filter_round(MAX_MONEY_SATS, self.mempool.policy().incremental_relay_fee, 0);
+        for (id, sent) in ids {
+            let Some(sent) = sent else { continue };
+            let stale = if ibd {
+                sent != max_filter
+            } else if sent == max_filter {
+                true
+            } else {
+                let current = self.mempool.min_fee_rate();
+                current * 4 < sent * 3 || current * 3 > sent * 4
+            };
+            if !stale {
+                continue;
+            }
+            if let Some(rate) = self.fee_filter_for(id)
+                && self.send_to_peer(id, NetworkMessage::FeeFilter(rate as i64))
+                && let Some(h) = self.peers.write().get_mut(&id)
+            {
+                h.fee_filter_sent = Some(rate);
+            }
+        }
+    }
+
     /// Send a ping to all connected peers.
     ///
     /// Registered with the peer's counters exactly as a keepalive ping is, so
@@ -2743,6 +2923,11 @@ impl PeerManager {
 
             ticks += 1;
 
+            // Every 4 ticks (2 seconds), bring stale fee filters up to date.
+            if ticks.is_multiple_of(4) {
+                self.maybe_send_fee_filters();
+            }
+
             // Every 60 ticks (30 seconds), expire old mempool transactions
             // and sweep expired orphans.
             if ticks.is_multiple_of(60) {
@@ -3033,6 +3218,18 @@ impl PeerManager {
             NetworkMessage::MemPool => {
                 self.handle_mempool_request(id);
             }
+            // BIP 111: satd never offers NODE_BLOOM, so a peer sending a BIP
+            // 37 filter message is violating the protocol, and Core
+            // disconnects it (`ProcessMessage`, "filterload received despite
+            // not offering bloom services").
+            NetworkMessage::FilterLoad(_) | NetworkMessage::FilterAdd(_) | NetworkMessage::FilterClear => {
+                tracing::debug!(
+                    id,
+                    "{} received despite not offering bloom services, disconnecting peer={id}",
+                    msg.cmd()
+                );
+                self.disconnect_by_id(id);
+            }
             NetworkMessage::Addr(addrs) => {
                 tracing::debug!(id, count = addrs.len(), "Received addr");
                 // Address relay is off in *both* directions on a
@@ -3318,8 +3515,17 @@ impl PeerManager {
     /// scan and up to multi-MB of queued invs, and the permission grant is
     /// not a license to request in a loop.
     fn handle_mempool_request(&self, id: PeerId) {
-        if !self.peer_permissions(id).mempool {
-            tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
+        let permissions = self.peer_permissions(id);
+        if !permissions.mempool {
+            // Without NODE_BLOOM, which satd never offers, Core serves BIP 35
+            // only to a peer with `mempool` permission and disconnects any
+            // other that is not `noban`.
+            if permissions.noban {
+                tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
+            } else {
+                tracing::debug!(id, "mempool request with bloom filters disabled, disconnecting peer={id}");
+                self.disconnect_by_id(id);
+            }
             return;
         }
         // Snapshot the peer's fee filter; confirm it's still connected,
@@ -3368,8 +3574,25 @@ impl PeerManager {
     fn handle_inv(&self, id: PeerId, inventory: Vec<Inventory>) {
         let mut blocks_to_get = Vec::new();
         let mut txs_to_get = Vec::new();
+        let reject_tx_invs = self.rejects_incoming_txs(id);
 
         for inv in inventory {
+            if reject_tx_invs {
+                let tx_hash = match &inv {
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                        Some(txid.to_string())
+                    }
+                    Inventory::WTx(wtxid) => Some(wtxid.to_string()),
+                    _ => None,
+                };
+                if let Some(hash) = tx_hash {
+                    tracing::debug!(
+                        "transaction ({hash}) inv sent in violation of protocol, disconnecting peer={id}"
+                    );
+                    self.disconnect_by_id(id);
+                    return;
+                }
+            }
             match inv {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     if self.chain_state.get_block_index(&hash).is_none() {
@@ -3450,6 +3673,14 @@ impl PeerManager {
         // Whatever the batch did to the rows above the tip, the scheduler
         // must hear about it before its next assignment.
         self.apply_header_row_changes();
+        // Core's `UpdateBlockAvailability`: the peer has at least the last
+        // header it sent, already known or not.
+        if let Some(last) = headers.last()
+            && let Some(entry) = self.chain_state.get_block_index(&last.block_hash())
+            && let Some(h) = self.peers.write().get_mut(&id)
+        {
+            h.info.best_known_height = Some(h.info.best_known_height.map_or(entry.height, |b| b.max(entry.height)));
+        }
         if let Some(e) = err {
             match e {
                 crate::chain::state::ChainError::Duplicate => {}
@@ -3629,17 +3860,26 @@ impl PeerManager {
             if !handle.info.serves_blocks() {
                 return;
             }
-            handle.info.best_height
+            // What the peer claimed at connect, or has announced since.
+            (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from))
         };
         // i32::saturating_sub avoids underflow for early-IBD targets.
-        if (peer_height as i64) < (target_height as i64).saturating_sub(1000) {
+        if peer_height < (target_height as i64).saturating_sub(1000) {
             // Peer is not synced enough to be a useful IBD source. Skip.
             return;
         }
+        // A peer that has neither claimed nor announced a block we still
+        // need can serve none of them. Core only downloads from a peer up to
+        // its `pindexBestKnownBlock`; asking the rest parks the heights on
+        // them until the stall timeout.
+        let Ok(max_height) = u32::try_from(peer_height) else { return };
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
             scheduler.register_peer(peer_id);
-            let hashes = scheduler.assign_blocks(peer_id);
+            if max_height <= scheduler.connect_cursor() {
+                return;
+            }
+            let hashes = scheduler.assign_blocks_up_to(peer_id, max_height);
             if !hashes.is_empty() {
                 drop(ibd);
                 for chunk in hashes.chunks(128) {
@@ -5461,14 +5701,17 @@ impl PeerManager {
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
+        // A peer told not to send transactions -- a block-relay-only link, or
+        // any peer of a `-blocksonly` node unless it holds `relay` -- is
+        // violating the protocol by sending one, and Core disconnects it.
+        if self.rejects_incoming_txs(id) {
+            tracing::debug!("transaction sent in violation of protocol, disconnecting peer={id}");
+            self.disconnect_by_id(id);
+            return;
+        }
         // During IBD, ignore relayed transactions — our UTXO set is incomplete
         // so validation would produce false MissingInputs rejections.
         if self.is_ibd() {
-            return;
-        }
-        // -blocksonly: ignore peer-relayed transactions, unless the peer
-        // holds the `relay`/`forcerelay` permission (-whitelist).
-        if self.blocksonly() && !self.peer_permissions(id).relays_txes() {
             return;
         }
 
@@ -6277,6 +6520,11 @@ impl PeerManager {
     }
 
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
+        // Core's `ProcessMessage` line for every getdata.
+        match inventory.as_slice() {
+            [inv] => tracing::debug!("received getdata for: {} peer={id}", inv_to_string(inv)),
+            invs => tracing::debug!("received getdata ({} invsz) peer={id}", invs.len()),
+        }
         let mut not_found = Vec::new();
         for inv in inventory {
             match inv {
@@ -6560,12 +6808,22 @@ impl PeerManager {
             IncomingTransport::Raw(_) => None,
             IncomingTransport::Established(c) => c.session_id(),
         };
+        // An inbound socket is `detecting` until its first bytes arrive, when
+        // v2 is on; otherwise it can only be v1.
+        info.transport = match &transport {
+            IncomingTransport::Raw(_) if self.v2_transport_enabled() => {
+                crate::net::peer::TransportProtocol::Detecting
+            }
+            IncomingTransport::Raw(_) => crate::net::peer::TransportProtocol::V1,
+            IncomingTransport::Established(c) => c.transport_protocol(),
+        };
         let handle = PeerHandle {
             info,
             msg_tx,
             disconnect: Arc::new(tokio::sync::Notify::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+                    fee_filter_sent: None,
             stats: PeerStats::new(self.net_totals.clone()),
         };
         {
@@ -6607,41 +6865,89 @@ impl PeerManager {
 
     /// Negotiate the transport for an inbound connection.
     ///
-    /// BIP 324 leaves v1/v2 detection to the responder: read the first
-    /// bytes and, if they are the network magic, the peer is speaking
-    /// plaintext v1 (a `version` message starts with the magic); otherwise
-    /// treat the bytes as the front of the peer's ElligatorSwift key and
-    /// run the v2 handshake. The detection bytes are consumed off the
-    /// socket and replayed into whichever transport is built.
-    async fn accept_transport(self: &Arc<Self>, mut stream: TcpStream) -> Result<Connection, String> {
+    /// BIP 324 leaves v1/v2 detection to the responder. Core's
+    /// `ProcessReceivedMaybeV1Bytes`: the peer speaks v1 only if its first 16
+    /// bytes are the network magic followed by the `version` command, and v2
+    /// as soon as any byte departs from that prefix. The detection bytes are
+    /// consumed off the socket and replayed into whichever transport is built.
+    async fn accept_transport(self: &Arc<Self>, id: PeerId, mut stream: TcpStream) -> Result<Connection, String> {
+        const V1_PREFIX_LEN: usize = 16;
         let magic = self.chain_state.p2p_magic();
-        let expected = magic.to_bytes();
         let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let counters = self.peers.read().get(&id).map(|h| h.stats.clone());
 
-        let mut first = [0u8; 4];
-        tokio::time::timeout(timeout, stream.read_exact(&mut first))
-            .await
-            .map_err(|_| "v2 detection timeout".to_string())?
-            .map_err(|e| format!("v2 detection read: {}", e))?;
+        let mut v1_prefix = [0u8; V1_PREFIX_LEN];
+        v1_prefix[..4].copy_from_slice(&magic.to_bytes());
+        v1_prefix[4..11].copy_from_slice(b"version");
 
-        if first == expected {
+        // Read until a byte departs from the prefix or all 16 match.
+        let mut first: Vec<u8> = Vec::with_capacity(V1_PREFIX_LEN);
+        while first.len() < V1_PREFIX_LEN && first[..] == v1_prefix[..first.len()] {
+            let mut tmp = [0u8; V1_PREFIX_LEN];
+            let want = V1_PREFIX_LEN - first.len();
+            let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp[..want]))
+                .await
+                .map_err(|_| "v2 detection timeout".to_string())?
+                .map_err(|e| format!("v2 detection read: {}", e))?;
+            if n == 0 {
+                return Err("v2 detection read: early eof".to_string());
+            }
+            first.extend_from_slice(&tmp[..n]);
+        }
+
+        if first[..] == v1_prefix[..] {
             if self.v2_only() {
                 return Err("v2only: rejecting inbound v1 peer".to_string());
             }
-            Ok(Connection::v1_with_leading(stream, magic, first.to_vec()))
-        } else {
-            let network = self.chain_state.network;
-            let (cipher, leftover) = tokio::time::timeout(
-                timeout,
-                crate::net::v2transport::responder_handshake(&mut stream, network, &first),
-            )
-            .await
-            .map_err(|_| "v2 handshake timeout".to_string())?
-            .map_err(|e| format!("v2 responder handshake: {}", e))?;
-            Ok(Connection::v2(crate::net::v2transport::V2Connection::new(
-                stream, cipher, leftover,
-            )))
+            return Ok(Connection::v1_with_leading(stream, magic, first));
         }
+
+        // A v2 key. Its bytes count as they arrive, as Core's do.
+        if let Some(c) = &counters {
+            c.record_recv(first.len());
+        }
+        while first.len() < V1_PREFIX_LEN {
+            let mut tmp = [0u8; V1_PREFIX_LEN];
+            let want = V1_PREFIX_LEN - first.len();
+            let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp[..want]))
+                .await
+                .map_err(|_| "v2 handshake timeout".to_string())?
+                .map_err(|e| format!("v2 responder handshake: {}", e))?;
+            if n == 0 {
+                return Err("v2 responder handshake: early eof".to_string());
+            }
+            if let Some(c) = &counters {
+                c.record_recv(n);
+            }
+            first.extend_from_slice(&tmp[..n]);
+        }
+        // A v1 `version` message under another network's magic.
+        if first[4..] == v1_prefix[4..] {
+            tracing::debug!(
+                "V2 transport error: V1 peer with wrong MessageStart {}, peer={id}",
+                hex::encode(&first[..4])
+            );
+            return Err("v1 peer with the wrong network magic".to_string());
+        }
+
+        let network = self.chain_state.network;
+        let (cipher, leftover) = tokio::time::timeout_at(
+            deadline,
+            crate::net::v2transport::responder_handshake(
+                &mut stream,
+                network,
+                &first,
+                id,
+                counters.as_ref(),
+            ),
+        )
+        .await
+        .map_err(|_| "v2 handshake timeout".to_string())?
+        .map_err(|e| format!("v2 responder handshake: {}", e))?;
+        Ok(Connection::v2(crate::net::v2transport::V2Connection::new(
+            stream, cipher, leftover,
+        )))
     }
 
     /// Dial a direct outbound peer (through the SOCKS5 proxy when one is
@@ -6748,6 +7054,7 @@ impl PeerManager {
     /// could reach it.
     async fn establish_outbound(
         self: &Arc<Self>,
+        id: PeerId,
         mut stream: TcpStream,
         target: OutboundDial,
         use_v2: Option<bool>,
@@ -6766,7 +7073,7 @@ impl PeerManager {
         let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
         let v2 = tokio::time::timeout(
             timeout,
-            crate::net::v2transport::initiator_handshake(&mut stream, network),
+            crate::net::v2transport::initiator_handshake(&mut stream, network, id, None),
         )
         .await;
         match v2 {
@@ -6782,7 +7089,7 @@ impl PeerManager {
                 if let OutboundDial::Direct(addr) = &target {
                     self.v2_downgraded.write().insert(*addr);
                 }
-                tracing::debug!("v2 outbound handshake failed; re-dialing for v1");
+                tracing::debug!("retrying with v1 transport protocol for peer={id}");
                 let stream = self.redial(&target).await?;
                 Ok(Connection::with_magic(stream, magic))
             }
@@ -6806,7 +7113,7 @@ impl PeerManager {
             IncomingTransport::Established(conn) => *conn,
             IncomingTransport::Raw(stream) => {
                 if self.v2_transport_enabled() {
-                    self.accept_transport(stream).await?
+                    self.accept_transport(id, stream).await?
                 } else {
                     Connection::with_magic(stream, self.chain_state.p2p_magic())
                 }
@@ -6822,6 +7129,12 @@ impl PeerManager {
         if let Some(handle) = self.peers.write().get_mut(&id) {
             handle.info.transport = transport_protocol;
             handle.info.session_id = session_id;
+        }
+
+        // Count the version handshake too: Core attributes `version` and
+        // `verack` in `bytessent_per_msg` / `bytesrecv_per_msg`.
+        if let Some(stats) = self.peers.read().get(&id).map(|h| h.stats.clone()) {
+            conn.set_counters(stats);
         }
 
         // Perform handshake with timeout
@@ -6908,9 +7221,15 @@ impl PeerManager {
         .map_err(|e| format!("send sendcmpct: {}", e))?;
 
         // Send our fee filter (BIP 133) so peer doesn't relay low-fee txs to us
-        writer.send(NetworkMessage::FeeFilter(self.mempool.min_fee_rate() as i64))
-            .await
-            .map_err(|e| format!("send feefilter: {}", e))?;
+        if let Some(rate) = self.fee_filter_for(id) {
+            writer
+                .send(NetworkMessage::FeeFilter(rate as i64))
+                .await
+                .map_err(|e| format!("send feefilter: {}", e))?;
+            if let Some(h) = self.peers.write().get_mut(&id) {
+                h.fee_filter_sent = Some(rate);
+            }
+        }
 
         // Core enables address relay on an outbound link as the handshake
         // completes — that is when it sends its one-shot `getaddr` — and
@@ -6965,6 +7284,7 @@ impl PeerManager {
                 .await
                 {
                     Ok(Ok(msg)) => {
+                        log_received(id, &msg);
                         if read_tx.send(msg).await.is_err() {
                             break; // receiver dropped, peer_task ended
                         }
@@ -7025,7 +7345,10 @@ impl PeerManager {
         // The first tick of a tokio interval fires immediately, which is also
         // what Core does: a peer whose last ping time is still zero is pinged
         // as soon as it is set up, not two minutes later.
-        let mut ping_timer = tokio::time::interval(PING_INTERVAL);
+        // Polled rather than scheduled: the interval and the timeout are
+        // judged on the node clock, which `setmocktime` moves (Core's
+        // `MaybeSendPing` runs on every send pass).
+        let mut ping_timer = tokio::time::interval(Duration::from_secs(1));
         // After a stall, catch up by resuming the cadence rather than firing
         // the missed ticks back to back. The `ping_outstanding()` guard below
         // already swallows a burst, but not relying on that keeps the
@@ -7074,6 +7397,10 @@ impl PeerManager {
                         && stats.ping_timed_out(PING_TIMEOUT)
                     {
                         stats.note_ping_timeout();
+                        tracing::debug!(
+                            "ping timeout: {:.6}s, disconnecting peer={id}",
+                            stats.ping_wait_secs().unwrap_or_default()
+                        );
                         tracing::warn!(
                             id,
                             timeout_secs = PING_TIMEOUT.as_secs(),
@@ -7090,7 +7417,7 @@ impl PeerManager {
                     // minutes, so `pingwait` keeps measuring from the ping
                     // that actually went unanswered.
                     if let Some(stats) = &stats
-                        && !stats.ping_outstanding()
+                        && stats.ping_due(PING_INTERVAL)
                     {
                         // Nonce 0 is the "nothing outstanding" sentinel, so
                         // it must never go on the wire.
@@ -7125,7 +7452,36 @@ impl PeerManager {
                         // peer can only ever be dropped for its own silence.
                         Some(NetworkMessage::Pong(nonce)) => {
                             if let Some(stats) = &stats {
+                                let expected = stats.ping_nonce();
+                                let problem = if expected == 0 {
+                                    Some("Unsolicited pong without ping")
+                                } else if nonce == expected {
+                                    None
+                                } else if nonce == 0 {
+                                    Some("Nonce zero")
+                                } else {
+                                    Some("Nonce mismatch")
+                                };
                                 stats.pong_received(nonce);
+                                if let Some(problem) = problem {
+                                    tracing::debug!(
+                                        "pong peer={id}: {problem}, {expected:x} expected, {nonce:x} received, 8 bytes"
+                                    );
+                                }
+                            }
+                        }
+                        // A pong too short to hold a nonce: Core cancels the
+                        // outstanding ping ("Short payload").
+                        Some(NetworkMessage::Unknown { command, payload })
+                            if command.as_ref() == "pong" && payload.len() < 8 =>
+                        {
+                            if let Some(stats) = &stats {
+                                let expected = stats.ping_nonce();
+                                stats.cancel_ping();
+                                tracing::debug!(
+                                    "pong peer={id}: Short payload, {expected:x} expected, 0 received, {} bytes",
+                                    payload.len()
+                                );
                             }
                         }
                         // Answered here for the same reason the pong is
@@ -7392,8 +7748,11 @@ impl PeerManager {
     /// directions at once.
     pub fn local_services(&self) -> ServiceFlags {
         // Only the cfg-gated COMPACT_FILTERS bit below mutates this.
-        #[cfg_attr(not(feature = "block-filter-index"), allow(unused_mut))]
         let mut services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        // BIP 324 NODE_P2P_V2 (bit 11), which Core sets with -v2transport.
+        if self.v2_transport_enabled() {
+            services |= ServiceFlags::P2P_V2;
+        }
         // BIP 157 NODE_COMPACT_FILTERS (bit 6) — advertised at version
         // time when the runtime predicate is true. Re-evaluated per
         // outgoing handshake so a node that finishes a backfill or
@@ -7725,6 +8084,19 @@ mod tests {
         assert!(!historical_block_storable(800_000, 800_000, Some(bh(7)), bh(8)));
     }
 
+    /// Core's rounder: a node in IBD sends 0.09936506 BTC/kvB, the top bucket
+    /// (`p2p_ibd_txrelay.py`'s `MAX_FEE_FILTER`), and a floor below the first
+    /// bucket rounds to zero, which the caller lifts back to the floor.
+    #[test]
+    fn fee_filter_rounds_into_cores_buckets() {
+        for random in [0, 1, 2] {
+            assert_eq!(fee_filter_round(MAX_MONEY_SATS, 100, random), 9_936_506);
+        }
+        assert_eq!(fee_filter_round(10, 100, 1), 0);
+        assert_eq!(fee_filter_round(10, 100, 0), 50);
+        assert_eq!(fee_filter_round(50, 100, 0), 50);
+    }
+
     fn mk_handle(id: PeerId, addr: SocketAddr, dir: Direction, state: PeerState) -> PeerHandle {
         let mut info = PeerInfo::new(id, addr, dir);
         info.state = state;
@@ -7736,6 +8108,7 @@ mod tests {
             disconnect: Arc::new(tokio::sync::Notify::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
+                    fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         }
     }
@@ -7936,6 +8309,7 @@ mod tests {
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
+                    fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
             rx,
@@ -9206,6 +9580,7 @@ mod tests {
                 disconnect: Arc::new(tokio::sync::Notify::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
+                    fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
         );

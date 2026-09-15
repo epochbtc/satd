@@ -20,7 +20,11 @@
 //! and headers are stamped from this clock, so leaving it on the system clock
 //! would put the two sides of the comparison on different clocks.
 //!
-//! Peer timeouts, reconnect backoff, ban expiry, fee-estimator decay, and the
+//! The keepalive ping is the exception on the peer side: Core schedules it,
+//! times its round trip and judges its timeout on this clock (`MaybeSendPing`),
+//! and so does satd ([`now_micros`]).
+//!
+//! Other peer timeouts, reconnect backoff, ban expiry, fee-estimator decay, and the
 //! orphanage all read `Instant::now()` and are deliberately **not** mockable:
 //! a monotonic clock that can jump backwards underflows or waits forever.
 //! Core's tests that need those mock its scheduler instead, which satd does
@@ -61,6 +65,19 @@ pub fn now_secs() -> u64 {
     match MOCK_TIME.load(Ordering::Relaxed) {
         0 => system_now_secs(),
         mocked => mocked,
+    }
+}
+
+/// The node's current time in microseconds since the epoch: the mock (whole
+/// seconds) if one is installed, otherwise the system clock. Core times its
+/// ping round trips and schedules its keepalive on this clock.
+pub fn now_micros() -> u64 {
+    match MOCK_TIME.load(Ordering::Relaxed) {
+        0 => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0),
+        mocked => mocked.saturating_mul(1_000_000),
     }
 }
 
