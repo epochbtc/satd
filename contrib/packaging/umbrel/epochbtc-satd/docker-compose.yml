@@ -23,7 +23,7 @@ version: "3.7"
 # onto first ships in 0.6.0. `contrib/packaging/sync-store.sh` refuses a
 # `sha-` pin, so it cannot reach the store; when 0.6.0 is released, pin that
 # tag and bump `version` with it (a step in the release checklist).
-x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-77d834b@sha256:78a134649c259c1c9cf0c4489b0b12b7a83b48e2d13fcc40f6250f3e5e339dee
+x-satd-image: &satd-image ghcr.io/epochbtc/satd:sha-7d15a9c@sha256:ffd413c0ab277f69015de4f119a40343e051fc7d9fe3c75dc3d7b68722018285
 
 services:
   app_proxy:
