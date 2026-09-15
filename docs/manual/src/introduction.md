@@ -33,6 +33,9 @@ the scale-out trade-off.
 
 ## How this manual is organized
 
+- **Getting Started**: [installing satd](installing.md) from the Umbrel
+  community store, the StartOS package, an appliance image, the container
+  image or a release tarball.
 - **Operating**: the day-to-day surfaces. [Observability and
   metrics](observability.md); [configuration, tuning, and live
   reload](configuration.md); [initial block download and AssumeUTXO fast
