@@ -34,6 +34,7 @@ export const rpcHostId = 'rpc'
 export const electrumHostId = 'electrum'
 export const esploraHostId = 'esplora'
 export const mcpHostId = 'mcp'
+export const statusHostId = 'status'
 export const peerHostId = 'peer'
 
 export const rpcInterfaceId = 'rpc'
@@ -41,6 +42,7 @@ export const electrumInterfaceId = 'electrum'
 export const esploraInterfaceId = 'esplora'
 export const mcpInterfaceId = 'mcp'
 export const peerInterfaceId = 'peer'
+export const statusInterfaceId = 'status'
 
 /**
  * StartOS puts every service container on one bridge, `lxcbr0`, with the OS

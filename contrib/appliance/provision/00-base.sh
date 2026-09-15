@@ -124,8 +124,9 @@ table inet filter {
 		# contrib/appliance/files/compose.appliance.yml.
 		ip saddr 10.77.0.0/24 tcp dport { 8332, 50001, 3000, 9332, 28332 } accept
 
-		# satd's TLS surfaces: JSON-RPC, Electrum, Esplora, MCP.
-		tcp dport { 8336, 50002, 3001, 8339 } accept
+		# satd's TLS surfaces: JSON-RPC, Electrum, Esplora, MCP, and
+		# metrics / health / the status page.
+		tcp dport { 8336, 50002, 3001, 8339, 9336 } accept
 
 		# Reverse proxy: web UIs and metrics, TLS with the same cert.
 		# 49393 is BTCPay; its own HTTP port binds loopback in

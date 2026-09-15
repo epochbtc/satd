@@ -24,6 +24,7 @@ ALLOWED = {
     "8336": "satd JSON-RPC, native TLS",
     "50002": "satd Electrum, native TLS",
     "3001": "satd Esplora, native TLS",
+    "9336": "satd metrics / health / status page, native TLS",
     "8333": "Bitcoin P2P (mainnet)",
     "18333": "Bitcoin P2P (testnet3)",
     "18444": "Bitcoin P2P (regtest)",
@@ -34,6 +35,7 @@ ALLOWED = {
     "8433": "Bitcoin P2P (Umbrel package)",
     "8436": "satd JSON-RPC, native TLS (Umbrel package)",
     "50012": "satd Electrum, native TLS (Umbrel package)",
+    "8431": "satd Esplora, native TLS (Umbrel package)",
     "8439": "satd MCP, native TLS plus a bearer token (Umbrel package)",
 }
 

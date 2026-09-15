@@ -73,11 +73,17 @@ most likely to run. It now has its own block, clear of every app in the store:
 
 | Port | Surface | Was |
 |---|---|---|
-| 8430 | app page, via `app_proxy` | 3001 |
+| 8430 | the status page, via `app_proxy` | 3001 |
+| 8431 | Esplora, TLS | — |
 | 8433 | Bitcoin P2P | 8333 |
 | 8436 | JSON-RPC, TLS | 8336 |
 | 50012 | Electrum, TLS | 50002 |
 | 8439 | MCP, TLS | 8339 |
+
+The app opens onto satd's status page, which `app_proxy` fronts behind
+Umbrel's login. Esplora is published on its own port instead, since
+`app_proxy` fronts one upstream. The page's connection strings come from
+`SATD_STATUS_ADVERTISE`, built from the device's name and these ports.
 
 Each is mapped 1:1, and satd listens on the same number. P2P cannot be
 remapped any other way: satd advertises the port it listens on, so

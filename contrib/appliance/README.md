@@ -194,6 +194,17 @@ satd`, `sat-tui` — while the overlays run as containers from
 data volume bound to the real `/var/lib/satd`, and a network whose gateway
 is how the containers reach the host's node.
 
+## Status page
+
+satd's status page is on: sync progress, each index and whether a wallet can
+connect yet, the latest block, the mempool and peers, refreshing itself. It is
+served on the metrics listener: `http://127.0.0.1:9332/status` on the
+appliance itself, and `https://satd.local:9336/status` from another machine,
+over satd's own TLS with the same certificate as every other surface. Import
+the CA first (below) or the browser will refuse the certificate. Port 9336
+also serves `/metrics`, `/healthz` and `/readyz`, so Prometheus can scrape the
+appliance directly with `scheme: https` and the CA as its `ca_file`.
+
 ## TLS
 
 One CA per install, one certificate presented by every surface. Export the

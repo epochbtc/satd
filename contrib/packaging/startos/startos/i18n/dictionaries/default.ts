@@ -38,6 +38,8 @@ const dict = {
   'Model Context Protocol server, so an AI assistant can query this node': 24,
   'Peer': 25,
   'Listens for connections from other Bitcoin nodes': 26,
+  'Status': 43,
+  'Sync progress, indexes, wallet readiness, mempool and peers': 44,
   // startos/main.ts
   'satd is starting…': 27,
   'Could not read ${cmd} from satd: ${error}': 28,

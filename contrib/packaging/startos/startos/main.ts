@@ -135,6 +135,10 @@ export const main = sdk.setupMain(async ({ effects }) => {
            */
           SATD_MCP_ALLOWED_HOSTS: mcpHostnames,
           SATD_P2P_PORT: String(p2pPorts[network]),
+          // The status page, which interfaces.ts exports as this service's
+          // UI. No SATD_STATUS_ADVERTISE: StartOS lists every interface's
+          // addresses on the service page, with the ports it actually chose.
+          SATD_STATUSPAGE: '1',
           SATD_CA_EXPORT_HINT:
             'the CA certificate is shown by this service’s "CA Certificate" action',
         },

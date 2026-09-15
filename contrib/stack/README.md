@@ -38,7 +38,7 @@ components yourself.
 | Esplora REST | `https://<host>:3001/api` | native, stack certificate |
 | MCP (opt-in) | `https://<host>:8339` | native, plus a bearer token |
 | P2P | `<host>:38333` on signet | n/a — Bitcoin P2P, BIP 324 v2 is on |
-| metrics / `readyz` | compose network, or `https://<host>:9443` with the proxy overlay | reverse proxy |
+| metrics / `readyz` / status page | `https://<host>:9336` (satd 0.6.0 on), or `https://<host>:9443` with the proxy overlay | native, stack certificate |
 
 Plain listeners exist for RPC, Electrum, Esplora and metrics, but they bind
 the compose network only and are never published. They are how the overlay

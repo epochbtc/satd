@@ -52,16 +52,21 @@ so it installs alongside Bitcoin Node, Fulcrum and Ride The Lightning:
 
 | Port | Surface |
 |---|---|
-| 8430 | the app page, through Umbrel's proxy and login |
+| 8430 | the status page, through Umbrel's proxy and login |
+| 8431 | Esplora, TLS |
 | 8433 | Bitcoin P2P |
 | 50012 | Electrum, TLS |
 | 8436 | JSON-RPC, TLS |
 | 8439 | MCP, TLS and a bearer token |
 
+Opening the app shows satd's [status page](observability.md#status-page):
+sync progress, whether a wallet can connect yet, and the connection strings
+to use.
+
 Point a wallet at `umbrel.local:50012` over SSL. Sparrow and Electrum pin the
 certificate on first use; a client that verifies against a CA needs the
-install's, and the MCP token lives beside it. In this release reading either
-takes SSH, since the app has no page of its own yet:
+install's, and the MCP token lives beside it. The status page never shows
+either, since it carries nothing secret, so reading them takes SSH:
 
 ```sh
 sudo cat ~/umbrel/app-data/epochbtc-satd/data/tls/ca.crt
@@ -141,6 +146,7 @@ be taught to trust a private CA. What leaves the host is TLS only:
 | 8336 | JSON-RPC over TLS |
 | 50002 | Electrum over TLS |
 | 3001 | Esplora over TLS |
+| 9336 | metrics, health and the status page over TLS (satd 0.6.0 on) |
 | 8339 | MCP over TLS, when `SATD_MCP=1` |
 | 38333 (signet) | Bitcoin P2P |
 | 443 / 8443 / 49393 / 9443 | RTL, Cashu mint, BTCPay and metrics, with `compose.proxy.yml` |
@@ -225,9 +231,10 @@ cookie-authenticated. The local CA authenticates the appliance to clients,
 not clients to the appliance — every surface supports mTLS if you turn it
 on, but none requires it by default.
 
-The metrics endpoint and the streaming WebSocket have no native TLS. They
-stay on loopback or the container network, and `compose.proxy.yml` fronts
-them.
+The metrics endpoint has native TLS from satd 0.6.0 on, on 9336 beside the
+plain listener; see [Observability](observability.md#over-tls). The streaming
+WebSocket has none. It stays on loopback or the container network, and
+`compose.proxy.yml` fronts it.
 
 ## The appliance image
 
@@ -301,6 +308,10 @@ satd-appliance logs satd
 
 satd runs natively under systemd; the overlays run as containers from
 `/opt/satd/stack`, which is `contrib/stack`'s overlay files unmodified.
+
+The status page is at `https://satd.local:9336/status` from another machine,
+once the CA is imported, and `http://127.0.0.1:9332/status` on the appliance
+itself.
 
 The firewall is default-deny inbound, and `sshd` is off until
 `satd-appliance ssh enable`.

@@ -72,6 +72,68 @@ if ! python3 "$HERE/umbrel-ports.py" "$UMBREL"; then
     fail=1
 fi
 
+echo "== a package that turns on the status page pins a satd that has it =="
+# satd-init writes the page's keys only for a satd that lists --statuspage,
+# so an older image would not crash-loop, but the app would open onto a 404:
+# Umbrel's app_proxy and StartOS's UI interface both point at /status. The
+# page first ships in 0.6.0.
+#
+# Between releases a package pins a master commit's `sha-` image. That commit
+# must be in this checkout's history (so, merged), its satd must have the
+# flag, and its satd-init the SATD_STATUSPAGE switch, since the packages run
+# the image's satd-init. The CI job checks out full history for this.
+if python3 - "$UMBREL/docker-compose.yml" "$ROOT/contrib/packaging/startos/startos/main.ts" \
+    "$ROOT/contrib/packaging/startos/startos/manifest/index.ts" "$ROOT" <<'PY'
+import re, subprocess, sys
+umbrel, main_ts, manifest = (open(p).read() for p in sys.argv[1:4])
+root = sys.argv[4]
+failed = False
+def git(*args):
+    return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
+def tag_of(text):
+    m = re.search(r"ghcr\.io/epochbtc/satd:sha-([0-9a-f]{7,40})@sha256:[0-9a-f]{64}", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"ghcr\.io/epochbtc/satd:([0-9]+)\.([0-9]+)\.([0-9]+)@", text)
+    return tuple(int(x) for x in m.groups()) if m else None
+def dev_pin_problem(short):
+    full = git("rev-parse", "--verify", "--quiet", f"{short}^{{commit}}").stdout.strip()
+    if not full:
+        return f"sha-{short}, which names no commit in this checkout (a shallow clone, or not merged)"
+    if git("merge-base", "--is-ancestor", full, "HEAD").returncode != 0:
+        return f"sha-{short}, which is not in this branch's history"
+    config = git("show", f"{full}:satd/src/config.rs").stdout
+    if "pub statuspage:" not in config:
+        return f"sha-{short}, which predates the status page"
+    # The packages run the satd-init baked into the image, not this tree's,
+    # so the image has to carry the switch that turns the page on. Without
+    # it satd starts, serves /metrics, and answers 404 on /status.
+    init = git("show", f"{full}:contrib/stack/satd/satd-init").stdout
+    if "SATD_STATUSPAGE" not in init:
+        return f"sha-{short}, whose satd-init cannot turn the status page on"
+    return None
+for name, enabled, pinned in [
+    ("Umbrel", re.search(r'SATD_STATUSPAGE:\s*"1"', umbrel), tag_of(umbrel)),
+    ("StartOS", re.search(r"SATD_STATUSPAGE:\s*'1'", main_ts), tag_of(manifest)),
+]:
+    if not enabled:
+        print(f"  ok    {name} does not turn on the status page")
+    elif isinstance(pinned, str):
+        problem = dev_pin_problem(pinned)
+        if problem:
+            print(f"  FAIL  {name} turns on the status page but pins {problem}")
+            failed = True
+        else:
+            print(f"  ok    {name} pins master sha-{pinned}, which has the status page")
+    elif pinned is None or pinned < (0, 6, 0):
+        print(f"  FAIL  {name} turns on the status page but pins satd {pinned}, which predates it (0.6.0)")
+        failed = True
+    else:
+        print(f"  ok    {name} pins satd {'.'.join(map(str, pinned))} for its status page")
+sys.exit(1 if failed else 0)
+PY
+then :; else fail=1; fi
+
 echo "== Umbrel backups leave the chain out, as StartOS's do =="
 # Umbrel backs up the whole app data directory unless told otherwise, and the
 # package used to say nothing, so a user with backups on backed up the chain.

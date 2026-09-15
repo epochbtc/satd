@@ -40,6 +40,7 @@ SATD_CONF_TEMPLATE="$LIB/satd.conf.tmpl" \
 SATD_MKCA="$LIB/mkca.sh" \
 NETWORK="$NETWORK" \
 SATD_MCP=1 \
+SATD_STATUSPAGE=1 \
 SATD_STACK_SUBNET="${SATD_STACK_SUBNET:-10.77.0.0/24}" \
 SATD_TLS_HOSTNAME="${SATD_TLS_HOSTNAME:-$(hostname)}" \
 SATD_CA_EXPORT_HINT="satd-appliance tls export-ca" \
