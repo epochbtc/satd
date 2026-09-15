@@ -261,6 +261,9 @@ pub struct UtxoSetInfo {
     pub height_hist: Vec<u64>,
 }
 
+/// See `ChainState::set_pow_valid_block_hook`.
+pub type PowValidBlockHook = Box<dyn Fn(&Block, u32) + Send + Sync>;
+
 /// Central chain state manager.
 pub struct ChainState {
     store: std::sync::Arc<CoinCache>,
@@ -479,6 +482,13 @@ pub struct ChainState {
     /// the AssumeUTXO background catch-up mutates a *separate* `ChainState`
     /// and neither needs nor touches this lock.
     accept_lock: std::sync::Arc<Mutex<()>>,
+    /// Called from `accept_block` once a block that extends the tip has
+    /// passed every check short of connecting it: proof of work, header
+    /// context, `check_block`. Core's `NewPoWValidBlock` signal, which the
+    /// P2P layer uses to announce the block before spending the time to
+    /// validate its scripts. Runs under `accept_lock`, so it must be quick
+    /// and must not call back into chain mutation.
+    pow_valid_block_hook: RwLock<Option<PowValidBlockHook>>,
     /// True while [`Self::load_utxo_snapshot`] is streaming coins in.
     ///
     /// The snapshot load runs for minutes on an RPC thread, so it cannot
@@ -744,6 +754,7 @@ impl ChainState {
                     background: RwLock::new(None),
                     signet_challenge: None,
                     accept_lock: std::sync::Arc::new(Mutex::new(())),
+                    pow_valid_block_hook: RwLock::new(None),
                     snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
                 };
                 // Self-heal a tip left durably `Invalid` by a crash mid-
@@ -856,8 +867,16 @@ impl ChainState {
             background: RwLock::new(None),
             signet_challenge: None,
             accept_lock: std::sync::Arc::new(Mutex::new(())),
+            pow_valid_block_hook: RwLock::new(None),
             snapshot_load_active: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Install the hook `accept_block` calls for a block that extends the tip
+    /// and has passed everything but connection (see `pow_valid_block_hook`).
+    /// Replaces any earlier hook.
+    pub fn set_pow_valid_block_hook(&self, hook: PowValidBlockHook) {
+        *self.pow_valid_block_hook.write() = Some(hook);
     }
 
     /// Set the custom signet challenge (BIP 325). Call once, before the
@@ -6202,6 +6221,14 @@ impl ChainState {
                 "Block rejected: checkpoint mismatch"
             );
             return Err(ChainError::CheckpointMismatch(new_height));
+        }
+
+        // Everything short of connecting has passed. A block that extends the
+        // tip may be announced now (Core's `NewPoWValidBlock`).
+        if prev_hash == self.tip_hash()
+            && let Some(hook) = self.pow_valid_block_hook.read().as_ref()
+        {
+            hook(block, new_height);
         }
 
         // ---- Connect-time validation passed. Write the block data. ----

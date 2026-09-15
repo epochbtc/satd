@@ -596,19 +596,17 @@ note = "`getnetworkinfo.localrelay` is always true; Core reports false under `-b
 file = "p2p_compactblocks.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: addconnection works now; make_utxos pushes a block with send_and_ping and getbestblockhash stays at genesis -- an unrequested block is not connected. Same root as p2p_unrequested_blocks"
+note = "re-measured with high-bandwidth compact relay in place: still stops in make_utxos, before any compact-block subtest -- a block pushed with send_and_ping is not connected (getbestblockhash stays at genesis). The residual is only the unrequested-block rule, same root as p2p_unrequested_blocks"
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
 status = "skip"
 reason = "feature-missing"
-note = "block hash mismatch after compact-block relay in -blocksonly mode; compact-block handling diverges"
+note = "re-measured with high-bandwidth compact relay in place: fails at its first assertion, before any compact-block behaviour is checked -- a block pushed with send_and_ping to the -blocksonly node does not become the tip"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured: high-bandwidth peer selection never happens -- assert_equal([False]*4, [False,True,False,False]). satd does not promote peers to HB compact-block mode. Follow-up: BIP 152 high-bandwidth mode"
+status = "run"
 
 [[test]]
 file = "p2p_disconnect_ban.py"
