@@ -469,6 +469,83 @@ pub fn make_compact_block(block: &Block) -> Result<HeaderAndShortIds, bitcoin::b
     HeaderAndShortIds::from_block(block, nonce, 2, &[])
 }
 
+/// `-cmpctblockprefillbytes` default: the transaction bytes, beyond the
+/// coinbase, a prefilled `cmpctblock` may carry. Under the median TCP
+/// congestion window measured for Core #35558 (14 480 bytes), so the larger
+/// message still leaves in one flight.
+pub const DEFAULT_CMPCTBLOCK_PREFILL_BYTES: usize = 8192;
+
+/// The transactions of a block worth prefilling: the ones this node did not
+/// have when the block arrived, so its peers most likely lack them too (Core
+/// #35558). Indexes into `block.txdata`, in block order, never the coinbase.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PrefillCandidates {
+    /// In neither the mempool nor the extra-transaction cache.
+    pub needed: Vec<usize>,
+    /// Not in the mempool, but in the extra-transaction cache: a replaced or
+    /// policy-refused transaction a peer is less likely to be missing than
+    /// one nobody relayed to us at all.
+    pub extra: Vec<usize>,
+}
+
+/// Classify `block`'s transactions against the mempool and the extra cache.
+///
+/// Call it before the block is connected: connecting removes its
+/// transactions from the mempool, after which every one looks missing.
+/// `None` when the mempool is write-locked -- the caller is about to announce
+/// the block, and a prefill is not worth delaying the announcement for.
+pub fn prefill_candidates(block: &Block, mempool: &Mempool, extra: &ExtraTxnCache) -> Option<PrefillCandidates> {
+    let absent: Vec<usize> = mempool.try_with_entries(|entries| {
+        block
+            .txdata
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, tx)| entries.get(&tx.compute_txid()).is_none_or(|e| e.tx != **tx))
+            .map(|(i, _)| i)
+            .collect()
+    })?;
+    let cached: std::collections::HashSet<bitcoin::Wtxid> = extra.iter().map(|(w, _)| *w).collect();
+    let (extra, needed) = absent
+        .into_iter()
+        .partition(|&i| cached.contains(&block.txdata[i].compute_wtxid()));
+    Some(PrefillCandidates { needed, extra })
+}
+
+/// Which candidates to prefill within `budget` transaction bytes (witness
+/// serialization; the coinbase, always prefilled, is not counted). Needed
+/// transactions first, then extra-cache ones, so a tight budget still carries
+/// the transactions nobody relayed; each group in block order, greedily, so
+/// one that does not fit is skipped and a smaller later one still goes.
+/// Returns sorted indexes for [`HeaderAndShortIds::from_block`].
+pub fn prefill_indexes(block: &Block, candidates: &PrefillCandidates, budget: usize) -> Vec<usize> {
+    let mut used = 0usize;
+    let mut chosen: Vec<usize> = Vec::new();
+    for &i in candidates.needed.iter().chain(&candidates.extra) {
+        let Some(tx) = block.txdata.get(i) else { continue };
+        if i == 0 || chosen.contains(&i) {
+            continue;
+        }
+        let size = tx.total_size();
+        if used + size <= budget {
+            used += size;
+            chosen.push(i);
+        }
+    }
+    chosen.sort_unstable();
+    chosen
+}
+
+/// [`make_compact_block`] with `prefill` (sorted, no coinbase) prefilled as
+/// well, under a caller-chosen nonce.
+pub fn make_prefilled_compact_block(
+    block: &Block,
+    nonce: u64,
+    prefill: &[usize],
+) -> Result<HeaderAndShortIds, bitcoin::bip152::Error> {
+    HeaderAndShortIds::from_block(block, nonce, 2, prefill)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,5 +1069,107 @@ mod tests {
         offer(&mut two_cached, sid, a.compute_wtxid(), &a, Source::Extra);
         offer(&mut two_cached, sid, b.compute_wtxid(), &b, Source::Extra);
         assert!(matches!(two_cached.get(&sid), Some(None)), "two cached txs on one short ID are ambiguous");
+    }
+
+    /// A test transaction whose serialization is about `bytes` long.
+    fn sized_tx(value: u64, bytes: usize) -> Transaction {
+        let mut tx = make_test_tx(value);
+        tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
+        tx
+    }
+
+    fn block_of(txs: Vec<Transaction>) -> Block {
+        let mut block = regtest_genesis();
+        block.txdata.extend(txs);
+        block
+    }
+
+    #[test]
+    fn prefill_packs_needed_before_extra_each_in_block_order() {
+        let block = block_of((1..=4).map(|v| sized_tx(v, 200)).collect());
+        let candidates = PrefillCandidates { needed: vec![2, 4], extra: vec![1] };
+        // Room for two: both needed ones, not the extra-cache one before them.
+        let budget = block.txdata[2].total_size() + block.txdata[4].total_size();
+        assert_eq!(prefill_indexes(&block, &candidates, budget), vec![2, 4]);
+        // Room for all three, returned sorted for `from_block`.
+        assert_eq!(prefill_indexes(&block, &candidates, 10_000), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn prefill_respects_its_budget_and_keeps_a_later_small_candidate() {
+        let block = block_of(vec![sized_tx(1, 300), sized_tx(2, 5_000), sized_tx(3, 300)]);
+        let candidates = PrefillCandidates { needed: vec![1, 2, 3], extra: vec![] };
+        let budget = 1_000;
+        let chosen = prefill_indexes(&block, &candidates, budget);
+        assert_eq!(chosen, vec![1, 3], "the oversize middle one is skipped, the small last one kept");
+        let used: usize = chosen.iter().map(|&i| block.txdata[i].total_size()).sum();
+        assert!(used <= budget);
+        assert!(prefill_indexes(&block, &candidates, 0).is_empty(), "a zero budget prefills nothing beyond the coinbase");
+    }
+
+    #[test]
+    fn prefill_never_names_the_coinbase_or_an_index_past_the_block() {
+        let block = block_of(vec![sized_tx(1, 100)]);
+        let candidates = PrefillCandidates { needed: vec![0, 1, 7], extra: vec![1] };
+        assert_eq!(prefill_indexes(&block, &candidates, 10_000), vec![1]);
+    }
+
+    #[test]
+    fn a_block_whose_transactions_were_all_in_the_mempool_prefills_the_coinbase_only() {
+        let a = make_test_tx(111);
+        let b = make_test_tx(222);
+        let block = block_of(vec![a.clone(), b.clone()]);
+        let mempool = Mempool::new(300_000_000, 1_000);
+        for tx in [a, b] {
+            mempool.insert_tx_scoped_for_test(tx, crate::mempool::pool::QuarantineScope::acting());
+        }
+        let candidates = prefill_candidates(&block, &mempool, &ExtraTxnCache::new(10)).unwrap();
+        assert_eq!(candidates, PrefillCandidates::default());
+        let prefill = prefill_indexes(&block, &candidates, DEFAULT_CMPCTBLOCK_PREFILL_BYTES);
+        let compact = make_prefilled_compact_block(&block, 1, &prefill).unwrap();
+        assert_eq!(compact.prefilled_txs.len(), 1, "coinbase only");
+    }
+
+    #[test]
+    fn prefill_candidates_split_missing_transactions_by_the_extra_cache() {
+        let in_pool = make_test_tx(1);
+        let replaced = make_test_tx(2);
+        let unseen = make_test_tx(3);
+        let block = block_of(vec![in_pool.clone(), replaced.clone(), unseen]);
+        let mempool = Mempool::new(300_000_000, 1_000);
+        mempool.insert_tx_scoped_for_test(in_pool, crate::mempool::pool::QuarantineScope::acting());
+        let mut extra = ExtraTxnCache::new(10);
+        extra.insert(replaced);
+        let candidates = prefill_candidates(&block, &mempool, &extra).unwrap();
+        assert_eq!(candidates, PrefillCandidates { needed: vec![3], extra: vec![2] });
+    }
+
+    #[test]
+    fn a_prefilled_compact_block_shares_the_plain_ones_short_ids_and_reconstructs() {
+        let unseen = make_test_tx(9);
+        let block = block_of(vec![make_test_tx(8), unseen.clone()]);
+        let plain = make_prefilled_compact_block(&block, 42, &[]).unwrap();
+        let prefilled = make_prefilled_compact_block(&block, 42, &[2]).unwrap();
+        assert_eq!(prefilled.short_ids, plain.short_ids[..1], "same nonce, same IDs for what is not prefilled");
+        let mempool = Mempool::new(300_000_000, 1_000);
+        mempool.insert_tx_scoped_for_test(block.txdata[1].clone(), crate::mempool::pool::QuarantineScope::acting());
+        match try_reconstruct(&prefilled, &mempool, &ExtraTxnCache::new(0)) {
+            Ok(Reconstruction::Complete(b, stats)) => {
+                assert_eq!(b.txdata[2], unseen);
+                assert_eq!(stats.requested, 0);
+                assert_eq!(stats.prefilled, 2);
+            }
+            _ => panic!("a block prefilled with what the receiver lacks needs no round trip"),
+        }
+    }
+
+    #[test]
+    fn prefill_candidates_skip_rather_than_wait_on_a_write_locked_mempool() {
+        let src = include_str!("compact.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let start = body.find("pub fn prefill_candidates(").expect("prefill_candidates");
+        let f = &body[start..];
+        let f = &f[..f.find("\n}\n").expect("end of prefill_candidates")];
+        assert!(f.contains("mempool.try_with_entries("), "must not block the announcement on the mempool lock");
     }
 }

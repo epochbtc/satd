@@ -908,6 +908,12 @@ pub struct Config {
     /// transactions that are not in the mempool (replaced, or refused by
     /// policy) are kept for compact block reconstruction. 0 keeps none.
     pub blockreconstructionextratxn: usize,
+    /// `-cmpctblockprefill`: prefill the transactions this node lacked when
+    /// announcing a block as a `cmpctblock` (Core #35558). Off by default.
+    pub cmpctblockprefill: bool,
+    /// `-cmpctblockprefillbytes`: the transaction bytes a prefill may carry
+    /// beyond the coinbase.
+    pub cmpctblockprefillbytes: usize,
     /// Bitcoin Core's `-maxuploadtarget`: soft cap in bytes on historical
     /// block upload per rolling 24h. 0 = unlimited.
     pub max_upload_target: u64,
@@ -3420,6 +3426,11 @@ impl Config {
                 }
             });
 
+        // Resolved in a helper, like the Stratum keys below, to keep this
+        // function's debug-build stack frame from growing.
+        let (cmpctblockprefill, cmpctblockprefillbytes) =
+            resolve_cmpctblock_prefill(cli.compact_prefill_args, &file_get)?;
+
         // ── Stratum ──────────────────────────────────────────────
         // Resolved in a helper, to keep `from_cli`'s debug-build stack frame from
         // growing further.
@@ -3929,6 +3940,8 @@ impl Config {
                     format!("blockreconstructionextratxn: invalid number {v:?}")
                 })?,
             },
+            cmpctblockprefill,
+            cmpctblockprefillbytes,
             max_upload_target: {
                 let raw = cli
                     .maxuploadtarget
@@ -4456,6 +4469,8 @@ impl Config {
                 "max_connections": self.maxconnections,
                 "max_inbound_per_ip": self.maxinboundperip,
                 "block_reconstruction_extra_txn": self.blockreconstructionextratxn,
+                "cmpct_block_prefill": self.cmpctblockprefill,
+                "cmpct_block_prefill_bytes": self.cmpctblockprefillbytes,
                 "bind": self.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
                 "dns": self.dns,
                 "dnsseed": self.dnsseed,
@@ -5572,6 +5587,11 @@ pub struct CliArgs {
     /// a separate, hand-built group.
     #[command(flatten)]
     pub stratum_args: StratumArgs,
+
+    /// `-cmpctblockprefill` and `-cmpctblockprefillbytes`, hand-built for the
+    /// same stack-frame reason as [`StratumArgs`].
+    #[command(flatten)]
+    pub compact_prefill_args: CompactPrefillArgs,
 
     #[arg(
         long,
@@ -6837,6 +6857,53 @@ impl clap::FromArgMatches for StratumArgs {
     }
 }
 
+/// The compact block prefill flags (see [`CliArgs::compact_prefill_args`]).
+#[derive(Debug, Clone, Default)]
+pub struct CompactPrefillArgs {
+    pub cmpctblockprefill: Option<bool>,
+    pub cmpctblockprefillbytes: Option<usize>,
+}
+
+const COMPACT_PREFILL_ARG_SPECS: &[(&str, &str, StratumArgKind, &str)] = &[
+    ("cmpctblockprefill", "BOOL", StratumArgKind::Bool, "Prefill the transactions this node lacked when announcing a block as a cmpctblock (default: false)"),
+    ("cmpctblockprefillbytes", "BYTES", StratumArgKind::Usize, "Transaction bytes a cmpctblock prefill may carry beyond the coinbase (default: 8192)"),
+];
+
+impl clap::Args for CompactPrefillArgs {
+    fn augment_args(mut cmd: clap::Command) -> clap::Command {
+        for spec in COMPACT_PREFILL_ARG_SPECS {
+            cmd = cmd.arg(stratum_arg(spec));
+        }
+        cmd
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_args(cmd)
+    }
+}
+
+impl clap::FromArgMatches for CompactPrefillArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            cmpctblockprefill: m.remove_one("cmpctblockprefill"),
+            cmpctblockprefillbytes: m.remove_one("cmpctblockprefillbytes"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches_mut(m)?;
+        Ok(())
+    }
+}
+
 /// The resolved Stratum [`Config`] fields.
 struct StratumFields {
     stratum: bool,
@@ -6855,6 +6922,27 @@ struct StratumFields {
     stratum_v2_key: Option<std::path::PathBuf>,
     stratum_v2_max_channels: usize,
     stratum_v2_jd: bool,
+}
+
+/// Resolve `-cmpctblockprefill` and `-cmpctblockprefillbytes` from CLI then
+/// config file.
+#[inline(never)]
+fn resolve_cmpctblock_prefill(
+    cli: CompactPrefillArgs,
+    file_get: &dyn Fn(&str) -> Option<String>,
+) -> Result<(bool, usize), String> {
+    let prefill = cli
+        .cmpctblockprefill
+        .or_else(|| file_get("cmpctblockprefill").and_then(|v| parse_bool(&v)))
+        .unwrap_or(false);
+    let bytes = match cli.cmpctblockprefillbytes.map(|n| n.to_string()).or_else(|| file_get("cmpctblockprefillbytes")) {
+        None => node::net::compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES,
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("cmpctblockprefillbytes: invalid number {v:?}"))?,
+    };
+    Ok((prefill, bytes))
 }
 
 /// Resolve the Stratum keys from CLI then config file, and validate them.
@@ -7204,6 +7292,8 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "maxconnections",
         "maxinboundperip",
         "blockreconstructionextratxn",
+        "cmpctblockprefill",
+        "cmpctblockprefillbytes",
         "maxuploadtarget",
         "bind",
         "timeout",
@@ -7303,6 +7393,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "signet",
         "listen",
         "blocksonly",
+        "cmpctblockprefill",
         "blocksxor",
         "v2transport",
         "v2only",
@@ -7872,6 +7963,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "maxconnections",
     "maxinboundperip",
     "blockreconstructionextratxn",
+    "cmpctblockprefill",
+    "cmpctblockprefillbytes",
     "maxuploadtarget",
     "dns",
     "dnsseed",
@@ -10345,6 +10438,7 @@ testactivationheight=bip34@2
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,
+            compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
             bind: Vec::new(),
             timeout: None,
@@ -10652,6 +10746,7 @@ testactivationheight=bip34@2
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,
+            compact_prefill_args: CompactPrefillArgs::default(),
             maxuploadtarget: None,
             bind: Vec::new(),
             timeout: None,
@@ -13317,6 +13412,21 @@ mcpallowedhost=node.local
         assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=0"]), 0);
         // Core: `std::max(GetIntArg(...), 0)`.
         assert_eq!(parse(&["satd", "--regtest", "--blockreconstructionextratxn=-5"]), 0);
+    }
+
+    // ---- cmpctblockprefill ----
+
+    #[test]
+    fn cmpctblockprefill_is_off_with_an_8192_byte_budget_by_default() {
+        let parse = |argv: &[&str]| {
+            let argv = normalize_args(argv.iter().map(|s| s.to_string()).collect());
+            let c = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+            (c.cmpctblockprefill, c.cmpctblockprefillbytes)
+        };
+        assert_eq!(parse(&["satd", "--regtest"]), (false, 8192));
+        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill"]), (true, 8192));
+        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill=1", "-cmpctblockprefillbytes=4096"]), (true, 4096));
+        assert_eq!(parse(&["satd", "--regtest", "-cmpctblockprefill", "-nocmpctblockprefill"]), (false, 8192));
     }
 
     // ---- logging format knobs ----
