@@ -37,6 +37,19 @@ BTCPAY_IMAGE=btcpayserver/btcpayserver:2.4.4@sha256:c264aa08cd32a469bd30d41978b7
 ELECTRUM_VERSION=4.8.2
 ELECTRUM_APPIMAGE_SHA256=6310ebd0b7965196ecc3eb7e1bfead260cdc9033a8847204561b9762e62a87c0
 
+# The Stratum canaries.
+#   cpuminer: the Stratum V1 CPU miner the Stratum V2 Reference
+#   Implementation's integration tests drive; the prebuilt release of
+#   github.com/stratum-mining/cpuminer, and its SHA-256.
+CPUMINER_VERSION=2.5.1
+CPUMINER_SHA256=5fc7219fbb72dad32d64f11cd579383e53d8872f95309594fad2a07554a541f7
+#   The Stratum V2 Reference Implementation (github.com/stratum-mining/sv2-apps):
+#   the tag and commit the canary workflow builds mining_device from, and the
+#   Job Declaration client image. The JD canary's template source is CORE_IMAGE.
+SRI_TAG=v0.7.0
+SRI_COMMIT=d7d556d1a3c7e1c26dfccd076b491a38c038a5e0
+SRI_JD_CLIENT_IMAGE=stratumv2/jd_client_sv2:v0.7.0@sha256:485853aa8e58bc75c2cef2fb45f537880b047e3b3c4eac352ca8576d07415f2b
+
 # Sidecars. Their major versions are chosen, not tracked: the weekly check
 # does not report them, and a bump refreshes the digest.
 POSTGRES_IMAGE=postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685

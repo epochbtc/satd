@@ -25,6 +25,9 @@
 # peers satd with a real bitcoind and checks bidirectional P2P interop
 # (handshake, BIP324 v2 transport, block sync + tx relay both ways) —
 # the only canary that tests satd against the reference node directly.
+# The Stratum canaries mine against satd's Stratum V1 and V2 servers with
+# real third-party miners (cpuminer; the Stratum V2 Reference
+# Implementation's mining_device and Job Declaration client).
 #
 # Triggers:
 #   - pull_request → PR-gating (required status check)
@@ -829,6 +832,230 @@ jobs:
         with:
           name: cln-canary-logs
           path: /tmp/satd-canary-cln.*/satd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # SRI's Stratum V2 CPU miner (`mining_device`, from the Stratum V2
+  # Reference Implementation's sv2-apps repository) has no published image or
+  # release binary, so it is built here once per run from the tag and commit
+  # pinned in scripts/canary/PINS, and shared with the two
+  # Stratum V2 canaries. It builds against Bitcoin Core's IPC schema, hence
+  # Cap'n Proto.
+  sri-mining-device:
+    name: build SRI mining_device
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          . scripts/canary/PINS
+          echo "tag=$SRI_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$SRI_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the build
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: sri-bin/mining_device
+          key: ${{ runner.os }}-sri-mining-device-${{ steps.pin.outputs.commit }}
+
+      - name: Install Cap'n Proto
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # See the note on the build job: third-party apt sources on the
+          # runner image can fail `apt-get update`.
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev
+
+      - name: Build mining_device
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          SRI_TAG: ${{ steps.pin.outputs.tag }}
+          SRI_COMMIT: ${{ steps.pin.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # Outside the checkout: under it, cargo takes satd's Cargo.toml for
+          # the workspace root and refuses to build.
+          sri="$RUNNER_TEMP/sv2-apps"
+          git clone --depth 1 --branch "$SRI_TAG" https://github.com/stratum-mining/sv2-apps "$sri"
+          [ "$(git -C "$sri" rev-parse HEAD)" = "$SRI_COMMIT" ] \
+            || { echo "sv2-apps $SRI_TAG is not the pinned commit $SRI_COMMIT" >&2; exit 1; }
+          # sv2-apps pins its own toolchain in rust-toolchain.toml.
+          (cd "$sri/integration-tests" && cargo build --release --locked --bin mining_device)
+          mkdir -p sri-bin
+          cp "$sri/integration-tests/target/release/mining_device" sri-bin/
+
+      - name: Upload mining_device
+        uses: actions/upload-artifact@v7
+        with:
+          name: sri-mining-device
+          path: sri-bin/mining_device
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stratum V1 canary: cpuminer, the V1 CPU miner SRI's own integration tests
+  # drive, mines against satd's Stratum V1 server on regtest until it finds a
+  # block that connects and pays it, then is sent the job for a tip it did not
+  # mine. The miner's difficulty is at least 1, so a block takes about a
+  # minute of hashing.
+  canary-stratum-v1:
+    name: canary / Stratum V1
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli
+
+      - name: Run Stratum V1 canary
+        run: bash scripts/canary/stratum-v1-smoke.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stratum-v1-canary-logs
+          path: |
+            /tmp/satd-canary-stratum-v1.*/satd.log
+            /tmp/satd-canary-stratum-v1.*/minerd.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Stratum V2 canary: SRI's mining_device over the Noise handshake with the
+  # server's authority key pinned (and refused with any other key), a
+  # standard channel, and block after block across new tips.
+  canary-stratum-v2:
+    name: canary / Stratum V2
+    needs: [build, sri-mining-device]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Download mining_device
+        uses: actions/download-artifact@v8
+        with:
+          name: sri-mining-device
+          path: sri-bin/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli sri-bin/mining_device
+
+      - name: Run Stratum V2 canary
+        env:
+          SRI_MINING_DEVICE: ${{ github.workspace }}/sri-bin/mining_device
+        run: bash scripts/canary/stratum-v2-smoke.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stratum-v2-canary-logs
+          path: |
+            /tmp/satd-canary-stratum-v2.*/satd.log
+            /tmp/satd-canary-stratum-v2.*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Stratum V2 Job Declaration canary: SRI's Job Declaration client, with
+  # Bitcoin Core (peered with satd over P2P) as its template source over IPC,
+  # declares a job carrying a real mempool transaction; satd checks it, sets
+  # the custom job, and mining_device mines it into a block that connects.
+  canary-stratum-jd:
+    name: canary / Stratum V2 Job Declaration
+    needs: [build, sri-mining-device]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/*google* \
+                     /etc/apt/sources.list.d/*microsoft* \
+                     /etc/apt/sources.list.d/*chrome* 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Download satd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: satd-canary-binaries
+          path: target/release/
+
+      - name: Download mining_device
+        uses: actions/download-artifact@v8
+        with:
+          name: sri-mining-device
+          path: sri-bin/
+
+      - name: Mark binaries executable
+        run: chmod +x target/release/satd target/release/sat-cli sri-bin/mining_device
+
+      - name: Run Stratum V2 Job Declaration canary
+        env:
+          SRI_MINING_DEVICE: ${{ github.workspace }}/sri-bin/mining_device
+        run: bash scripts/canary/stratum-jd-smoke.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stratum-jd-canary-logs
+          path: |
+            /tmp/satd-canary-stratum-jd.*/satd/satd.log
+            /tmp/satd-canary-stratum-jd.*/*.log
           if-no-files-found: ignore
           retention-days: 7
 
