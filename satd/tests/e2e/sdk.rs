@@ -165,6 +165,21 @@ async fn sdk_subscribe_delivers_block_connected() {
     assert_eq!(stream.cursor().map(|c| c.height), Some(1));
 }
 
+/// The SDK reads the version a live node advertises and opens both streams
+/// without a warning or refusal: the node and the SDK share the workspace
+/// version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_learns_the_node_version() {
+    let sn = start_async(vec![]).await;
+    let mut client = connect(&sn).await;
+    assert_eq!(client.node_version(), None, "nothing is known before a stream opens");
+    let _stream = client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+    assert_eq!(client.node_version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    let mut fresh = connect(&sn).await;
+    let _watch = fresh.watch().await.expect("watch");
+    assert_eq!(fresh.node_version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+}
+
 /// `watch` + `add_outpoints` delivers `OutpointSpent` in the mempool, then again
 /// once confirmed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

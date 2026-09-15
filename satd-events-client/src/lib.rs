@@ -107,11 +107,16 @@
 //!
 //! ## Stability & versioning
 //!
-//! The SDK tracks the **additive `satd.events.v1` wire schema**, not the node's
-//! release cadence: new optional fields and event / watch kinds are added
-//! without breaking existing consumers, and the crate follows [semver]
-//! independently of the satd node version — a node and SDK do **not** need
-//! matching versions. The generated wire types are re-exported under [`proto`]
+//! The crate version is the satd version it shipped with, and follows
+//! [semver]. An SDK works with any node on the same event schema whose version is
+//! at or above its own; newer nodes only add fields and event kinds. When a
+//! stream opens, the SDK compares the node's advertised version with its own:
+//! one minor version behind logs a `tracing` warning, two or more (or a major
+//! version) behind is refused with [`StreamError::NodeTooOld`] unless the client
+//! was built with [`allow_old_node`](StreamClientBuilder::allow_old_node), and a
+//! different schema is always refused with [`StreamError::SchemaMismatch`]. A
+//! node older than 0.6.0 advertises nothing and counts as 0.5. See
+//! [`StreamClient::node_version`]. The generated wire types are re-exported under [`proto`]
 //! so you can pin to the schema directly when a typed helper does not yet cover
 //! your case. Minimum supported Rust version (**MSRV**) is **1.93**; an MSRV
 //! bump is treated as a minor-version change.
@@ -128,6 +133,7 @@
 #![warn(missing_docs)]
 
 mod client;
+mod compat;
 mod error;
 mod event;
 #[cfg(feature = "bitcoin")]

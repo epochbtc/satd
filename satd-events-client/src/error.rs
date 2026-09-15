@@ -115,6 +115,34 @@ pub enum StreamError {
     /// integrator's source-of-truth does not crash the consumer.
     #[error("watch-set loader failed: {0}")]
     WatchSetLoader(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The node is two or more minor versions (or a major version) older than
+    /// this SDK. Features the SDK was built against may be missing and request
+    /// fields the node does not recognise would be silently ignored, so the
+    /// stream is refused. Upgrade the node, or accept the risk with
+    /// [`allow_old_node`](crate::StreamClientBuilder::allow_old_node), which turns
+    /// this into a logged warning. Not retryable.
+    #[error(
+        "satd node {node} is too old for this SDK ({sdk}): two or more minor versions \
+         behind. Upgrade the node, or opt in with allow_old_node()"
+    )]
+    NodeTooOld {
+        /// The node's advertised version, or a note that it sent none.
+        node: String,
+        /// This SDK's version.
+        sdk: &'static str,
+    },
+
+    /// The node speaks a different event schema version than this SDK. Always
+    /// refused, whatever the versions; `allow_old_node` does not apply. Not
+    /// retryable.
+    #[error("satd node event schema {node} does not match this SDK's schema {sdk}")]
+    SchemaMismatch {
+        /// The node's schema version (`0` if it sent an unparseable value).
+        node: u32,
+        /// The schema version this SDK was built for.
+        sdk: u32,
+    },
 }
 
 impl StreamError {
@@ -138,7 +166,9 @@ impl StreamError {
     /// `RateLimited`. `false` for permanent conditions — bad endpoint/token,
     /// `PERMISSION_DENIED`, client-side argument errors. `Unauthenticated` is
     /// reported non-retryable: a blind retry with the same token will not help;
-    /// the caller should re-auth and reconnect deliberately.
+    /// the caller should re-auth and reconnect deliberately. `NodeTooOld` and
+    /// `SchemaMismatch` are non-retryable: reconnecting to the same node gives
+    /// the same answer.
     pub fn is_retryable(&self) -> bool {
         use tonic::Code;
         match self {

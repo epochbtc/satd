@@ -3,15 +3,17 @@
 //! and cursor-capturing event stream that the reconnect/replay resilience layer
 //! (the `resilience` module) builds on.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use satd_events_proto::v1 as pb;
 use satd_events_proto::v1::node_event_stream_client::NodeEventStreamClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::metadata::{Ascii, MetadataValue};
+use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
+use crate::compat::{self, Compat};
 use crate::error::StreamError;
 use crate::event::{Cursor, Event};
 
@@ -250,6 +252,8 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub struct EventStream {
     inner: tonic::Streaming<pb::NodeEvent>,
     last_cursor: Option<Cursor>,
+    /// Set once the first event's `schema_version` has been checked.
+    schema_checked: bool,
 }
 
 impl EventStream {
@@ -258,6 +262,18 @@ impl EventStream {
     pub async fn message(&mut self) -> Result<Option<Event>, StreamError> {
         match self.inner.message().await {
             Ok(Some(ev)) => {
+                // The response header already carried the schema on a node
+                // that sends one. This covers a node that predates the header.
+                // One event is enough: a node does not change schema mid-stream.
+                if !self.schema_checked {
+                    self.schema_checked = true;
+                    if ev.schema_version != satd_events_proto::SCHEMA_VERSION {
+                        return Err(StreamError::SchemaMismatch {
+                            node: ev.schema_version,
+                            sdk: satd_events_proto::SCHEMA_VERSION,
+                        });
+                    }
+                }
                 if let Some(c) = ev.cursor {
                     self.last_cursor = Some(c);
                 }
@@ -272,6 +288,10 @@ impl EventStream {
     /// to resume after a disconnect.
     pub fn cursor(&self) -> Option<&Cursor> {
         self.last_cursor.as_ref()
+    }
+
+    fn new(inner: tonic::Streaming<pb::NodeEvent>) -> Self {
+        EventStream { inner, last_cursor: None, schema_checked: false }
     }
 }
 
@@ -813,6 +833,7 @@ pub struct StreamClientBuilder {
     /// has explicitly accepted sending the token over an unencrypted endpoint.
     allow_insecure_token: bool,
     keepalive: Option<(Duration, Duration)>,
+    allow_old_node: bool,
     #[cfg(feature = "tls")]
     tls: Option<TlsSettings>,
 }
@@ -825,7 +846,8 @@ impl std::fmt::Debug for StreamClientBuilder {
             // Not the token, but worth seeing in a bug report: it says whether
             // the plaintext waiver is in force.
             .field("allow_insecure_token", &self.allow_insecure_token)
-            .field("keepalive", &self.keepalive);
+            .field("keepalive", &self.keepalive)
+            .field("allow_old_node", &self.allow_old_node);
         #[cfg(feature = "tls")]
         d.field("tls", &self.tls.is_some());
         d.finish()
@@ -881,6 +903,22 @@ impl StreamClientBuilder {
     /// Use the server-matching keepalive defaults (30s interval / 20s timeout).
     pub fn keepalive_default(self) -> Self {
         self.keepalive(30, 20)
+    }
+
+    /// Accept a node two or more minor versions older than this SDK.
+    ///
+    /// By default [`subscribe`](StreamClient::subscribe) and
+    /// [`watch`](StreamClient::watch) refuse such a node with
+    /// [`StreamError::NodeTooOld`]. With this set they log the same warning as
+    /// for a node one minor version behind and carry on. Meant for a rolling
+    /// upgrade where the SDK side went first. Features added after the node's
+    /// release are still unavailable, and request fields it does not recognise
+    /// are still ignored.
+    ///
+    /// This does not bypass [`StreamError::SchemaMismatch`].
+    pub fn allow_old_node(mut self) -> Self {
+        self.allow_old_node = true;
+        self
     }
 
     /// Enable TLS for the connection, trusting the bundled Mozilla root CAs
@@ -1016,7 +1054,12 @@ impl StreamClientBuilder {
         }
 
         let channel = endpoint.connect().await?;
-        Ok(StreamClient { inner: NodeEventStreamClient::new(channel), auth })
+        Ok(StreamClient {
+            inner: NodeEventStreamClient::new(channel),
+            auth,
+            allow_old_node: self.allow_old_node,
+            compat: Arc::default(),
+        })
     }
 }
 
@@ -1042,6 +1085,21 @@ fn ensure_crypto_provider() {
 pub struct StreamClient {
     inner: NodeEventStreamClient<Channel>,
     auth: Option<MetadataValue<Ascii>>,
+    allow_old_node: bool,
+    /// Shared by clones, so the resilient layers (which hold a clone) update
+    /// [`node_version`](Self::node_version) and warn at most once per node
+    /// version for the whole client.
+    compat: Arc<Mutex<CompatState>>,
+}
+
+/// What the client last learned from a node's response headers.
+#[derive(Debug, Default)]
+struct CompatState {
+    /// The raw `satd-version` header from the most recent stream.
+    node_version: Option<String>,
+    /// The node version string the old-node warning was last logged for
+    /// (`Some(None)` for a node that sent no header).
+    warned_for: Option<Option<String>>,
 }
 
 impl std::fmt::Debug for StreamClient {
@@ -1061,9 +1119,76 @@ impl StreamClient {
             token: None,
             allow_insecure_token: false,
             keepalive: None,
+            allow_old_node: false,
             #[cfg(feature = "tls")]
             tls: None,
         }
+    }
+
+    /// The version the node advertised on the most recently opened stream, e.g.
+    /// `"0.6.0"`.
+    ///
+    /// `None` until a stream has been opened, and when the node predates the
+    /// `satd-version` header (0.5.x and older).
+    pub fn node_version(&self) -> Option<String> {
+        self.compat.lock().unwrap_or_else(|e| e.into_inner()).node_version.clone()
+    }
+
+    /// Apply the SDK ↔ node compatibility rule to a stream-opening response's
+    /// headers (`STABILITY_POLICY.md` → "Streaming API & SDK compatibility").
+    fn check_compat(&self, md: &MetadataMap) -> Result<(), StreamError> {
+        let (raw, node) = compat::node_version_from(md);
+        let schema = compat::schema_from(md);
+        let sdk = compat::parse(compat::SDK_VERSION).expect("the crate version parses");
+
+        // Decide under the lock, log after releasing it: a `tracing` subscriber
+        // is user code, and one that calls `node_version()` (or blocks) must not
+        // deadlock or stall every other stream open on this client.
+        let warn_for = {
+            let mut state = self.compat.lock().unwrap_or_else(|e| e.into_inner());
+            state.node_version = raw.clone();
+
+            if schema != satd_events_proto::SCHEMA_VERSION {
+                return Err(StreamError::SchemaMismatch {
+                    node: schema,
+                    sdk: satd_events_proto::SCHEMA_VERSION,
+                });
+            }
+
+            let warn = match compat::classify(sdk, node) {
+                Compat::Ok => false,
+                Compat::OneBehind => true,
+                Compat::TooOld if self.allow_old_node => true,
+                Compat::TooOld => {
+                    return Err(StreamError::NodeTooOld {
+                        node: compat::display_node_version(raw.as_deref()),
+                        sdk: compat::SDK_VERSION,
+                    });
+                }
+            };
+            // Once per observed version: a reconnect loop against the same node
+            // stays quiet, a node upgraded (or downgraded) in between warns again.
+            if warn && state.warned_for.as_ref() != Some(&raw) {
+                state.warned_for = Some(raw.clone());
+                Some(compat::display_node_version(raw.as_deref()))
+            } else {
+                None
+            }
+        };
+
+        if let Some(shown) = warn_for {
+            tracing::warn!(
+                target: "satd_events_client::compat",
+                node_version = %shown,
+                sdk_version = compat::SDK_VERSION,
+                "satd node {} is older than this SDK ({}); features added after the node's \
+                 release are unavailable and request fields it does not recognise are ignored. \
+                 Upgrade the node — connections are refused once it is two minor versions behind.",
+                shown,
+                compat::SDK_VERSION,
+            );
+        }
+        Ok(())
     }
 
     /// Wrap a message in a request carrying the configured auth metadata.
@@ -1082,8 +1207,9 @@ impl StreamClient {
         opts: SubscribeOptions,
     ) -> Result<EventStream, StreamError> {
         let req = self.authed(opts.into_request());
-        let inner = self.inner.subscribe(req).await?.into_inner();
-        Ok(EventStream { inner, last_cursor: None })
+        let resp = self.inner.subscribe(req).await?;
+        self.check_compat(resp.metadata())?;
+        Ok(EventStream::new(resp.into_inner()))
     }
 
     /// Open a reconnect-and-replay-aware firehose. Unlike [`subscribe`](Self::subscribe),
@@ -1114,8 +1240,9 @@ impl StreamClient {
     pub async fn watch(&mut self) -> Result<(WatchHandle, EventStream), StreamError> {
         let (tx, rx) = mpsc::channel::<pb::SubscribeControl>(CONTROL_BUFFER);
         let req = self.authed(ReceiverStream::new(rx));
-        let inner = self.inner.watch(req).await?.into_inner();
-        Ok((WatchHandle { tx }, EventStream { inner, last_cursor: None }))
+        let resp = self.inner.watch(req).await?;
+        self.check_compat(resp.metadata())?;
+        Ok((WatchHandle { tx }, EventStream::new(resp.into_inner())))
     }
 }
 
@@ -1139,7 +1266,12 @@ impl StreamClient {
     /// no server is required; it must be called from within a Tokio runtime.
     pub(crate) fn for_test() -> Self {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        StreamClient { inner: NodeEventStreamClient::new(channel), auth: None }
+        StreamClient {
+            inner: NodeEventStreamClient::new(channel),
+            auth: None,
+            allow_old_node: false,
+            compat: Arc::default(),
+        }
     }
 }
 
@@ -1497,5 +1629,381 @@ mod tests {
                 other => panic!("expected InvalidEndpoint for {ep}, got {other:?}"),
             }
         }
+    }
+}
+
+/// The node-version check against an in-process tonic server that sends
+/// whatever version headers a test asks for.
+#[cfg(test)]
+mod version_check_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use satd_events_proto::v1::node_event_stream_server::{
+        NodeEventStream, NodeEventStreamServer,
+    };
+    use tokio_stream::Stream;
+
+    use crate::compat::{Version, SDK_VERSION};
+    use crate::{ResilientConfig, ResilientWatchConfig};
+
+    type EventResult = Result<pb::NodeEvent, tonic::Status>;
+    type BoxStream = std::pin::Pin<Box<dyn Stream<Item = EventResult> + Send>>;
+
+    /// A node stand-in. `version` can be changed between calls to model a node
+    /// upgraded underneath a client.
+    #[derive(Clone)]
+    struct FakeNode {
+        version: Arc<Mutex<Option<String>>>,
+        schema: Option<&'static str>,
+        /// When set, every stream delivers one heartbeat with this schema.
+        event_schema: Option<u32>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl FakeNode {
+        fn new(version: Option<&str>) -> Self {
+            FakeNode {
+                version: Arc::new(Mutex::new(version.map(str::to_owned))),
+                schema: Some("1"),
+                event_schema: None,
+                opens: Arc::default(),
+            }
+        }
+
+        fn respond(&self) -> tonic::Response<BoxStream> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<EventResult> = self
+                .event_schema
+                .map(|schema_version| {
+                    Ok(pb::NodeEvent {
+                        schema_version,
+                        body: Some(pb::node_event::Body::Heartbeat(pb::Heartbeat {
+                            uptime_ns: 1,
+                        })),
+                        ..Default::default()
+                    })
+                })
+                .into_iter()
+                .collect();
+            let stream = tokio_stream::StreamExt::chain(
+                tokio_stream::iter(events),
+                tokio_stream::pending(),
+            );
+            let mut resp = tonic::Response::new(Box::pin(stream) as BoxStream);
+            let md = resp.metadata_mut();
+            if let Some(v) = self.version.lock().unwrap().as_deref() {
+                md.insert(compat::VERSION_HEADER, v.parse().unwrap());
+            }
+            if let Some(s) = self.schema {
+                md.insert(compat::SCHEMA_HEADER, s.parse().unwrap());
+            }
+            resp
+        }
+    }
+
+    #[tonic::async_trait]
+    impl NodeEventStream for FakeNode {
+        type SubscribeStream = BoxStream;
+        type WatchStream = BoxStream;
+
+        async fn subscribe(
+            &self,
+            _: tonic::Request<pb::SubscribeRequest>,
+        ) -> Result<tonic::Response<BoxStream>, tonic::Status> {
+            Ok(self.respond())
+        }
+
+        async fn watch(
+            &self,
+            _: tonic::Request<tonic::Streaming<pb::SubscribeControl>>,
+        ) -> Result<tonic::Response<BoxStream>, tonic::Status> {
+            Ok(self.respond())
+        }
+    }
+
+    async fn serve(fake: FakeNode) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeEventStreamServer::new(fake))
+                .serve_with_incoming(incoming),
+        );
+        format!("http://{addr}")
+    }
+
+    async fn client_for(fake: &FakeNode) -> StreamClient {
+        StreamClient::builder(serve(fake.clone()).await).connect().await.expect("connect")
+    }
+
+    fn sdk() -> Version {
+        compat::parse(SDK_VERSION).unwrap()
+    }
+
+    /// A node version `n` minor versions behind this build's SDK, derived so the
+    /// tests keep meaning the same thing after every version bump. `None` when
+    /// the SDK's minor is too small for that.
+    fn minors_behind(n: u32) -> Option<String> {
+        let sdk = sdk();
+        (sdk.minor >= n).then(|| format!("{}.{}.0", sdk.major, sdk.minor - n))
+    }
+
+    /// A node version the SDK refuses: two minors behind, or failing that a
+    /// major behind.
+    fn too_old() -> String {
+        minors_behind(2).unwrap_or_else(|| format!("{}.9.0", sdk().major - 1))
+    }
+
+    /// Captures `tracing` output for the duration of a test.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains("WARN"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn same_version_node_opens_silently() {
+        let (logs, _guard) = Logs::capture();
+        let fake = FakeNode::new(Some(SDK_VERSION));
+        let mut client = client_for(&fake).await;
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client.watch().await.expect("watch");
+        assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+    }
+
+    #[tokio::test]
+    async fn newer_node_opens_silently() {
+        let (logs, _guard) = Logs::capture();
+        let sdk = sdk();
+        let fake = FakeNode::new(Some(&format!("{}.{}.0", sdk.major, sdk.minor + 3)));
+        let mut client = client_for(&fake).await;
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+    }
+
+    /// A node that sends no headers is taken to be 0.5; what that means depends
+    /// on this build's version, so the expectation is derived from the rule.
+    #[tokio::test]
+    async fn headerless_node_is_treated_as_0_5() {
+        let mut fake = FakeNode::new(None);
+        fake.schema = None;
+        let mut client = client_for(&fake).await;
+        let res = client.subscribe(SubscribeOptions::default()).await;
+        match compat::classify(sdk(), compat::HEADERLESS_NODE) {
+            Compat::TooOld => assert!(matches!(res, Err(StreamError::NodeTooOld { .. }))),
+            _ => assert!(res.is_ok(), "{:?}", res.err()),
+        }
+        assert_eq!(client.node_version(), None);
+    }
+
+    #[tokio::test]
+    async fn two_minors_behind_is_refused() {
+        let fake = FakeNode::new(Some(&too_old()));
+        let mut client = client_for(&fake).await;
+        let err = client.subscribe(SubscribeOptions::default()).await.err().expect("refused");
+        match &err {
+            StreamError::NodeTooOld { node, sdk } => {
+                assert_eq!(node, &too_old());
+                assert_eq!(*sdk, SDK_VERSION);
+            }
+            other => panic!("expected NodeTooOld, got {other:?}"),
+        }
+        assert!(!err.is_retryable());
+        let err = client.watch().await.err().expect("watch refused too");
+        assert!(matches!(err, StreamError::NodeTooOld { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn allow_old_node_downgrades_the_refusal_to_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = FakeNode::new(Some(&too_old()));
+        let mut client = StreamClient::builder(serve(fake.clone()).await)
+            .allow_old_node()
+            .connect()
+            .await
+            .unwrap();
+        client.subscribe(SubscribeOptions::default()).await.expect("allowed");
+        assert_eq!(logs.warnings().len(), 1, "{:?}", logs.warnings());
+    }
+
+    #[tokio::test]
+    async fn schema_header_mismatch_is_refused_even_with_allow_old_node() {
+        let mut fake = FakeNode::new(Some(SDK_VERSION));
+        fake.schema = Some("2");
+        let mut client = StreamClient::builder(serve(fake.clone()).await)
+            .allow_old_node()
+            .connect()
+            .await
+            .unwrap();
+        let err = client.subscribe(SubscribeOptions::default()).await.err().expect("refused");
+        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+        assert!(!err.is_retryable());
+        let err = client.watch().await.err().expect("watch refused too");
+        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+    }
+
+    /// A node that predates the headers still stamps `schema_version` on every
+    /// event; the first one is checked.
+    #[tokio::test]
+    async fn first_event_schema_mismatch_is_refused() {
+        let mut fake = FakeNode::new(Some(SDK_VERSION));
+        fake.event_schema = Some(2);
+        let mut client = client_for(&fake).await;
+        let mut stream = client.subscribe(SubscribeOptions::default()).await.expect("opens");
+        let err = stream.message().await.expect_err("refused");
+        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+
+        // The matching schema passes through as an ordinary event.
+        let mut fake = FakeNode::new(Some(SDK_VERSION));
+        fake.event_schema = Some(1);
+        let mut client = client_for(&fake).await;
+        let (_handle, mut stream) = client.watch().await.expect("opens");
+        let ev = stream.message().await.expect("event").expect("not closed");
+        assert!(matches!(ev, Event::Heartbeat { .. }), "{ev:?}");
+    }
+
+    #[tokio::test]
+    async fn one_behind_warns_once_per_node_version() {
+        let (logs, _guard) = Logs::capture();
+        // At a `.0` minor there is no one-behind in the same major; the
+        // downgraded refusal logs the same warning.
+        let (behind, allow) = match minors_behind(1) {
+            Some(v) => (v, false),
+            None => (too_old(), true),
+        };
+        let fake = FakeNode::new(Some(&behind));
+        let mut builder = StreamClient::builder(serve(fake.clone()).await);
+        if allow {
+            builder = builder.allow_old_node();
+        }
+        let mut client = builder.connect().await.unwrap();
+
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe again");
+        // A clone (as the resilient layers hold) shares the state.
+        client.clone().watch().await.expect("watch");
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&format!("node_version={behind}")), "{warnings:?}");
+        assert!(warnings[0].contains(&format!("sdk_version=\"{SDK_VERSION}\"")), "{warnings:?}");
+        assert!(warnings[0].contains("is older than this SDK"), "{warnings:?}");
+
+        // The node changes version (a rolling downgrade, say): warn again.
+        *fake.version.lock().unwrap() = Some(format!("{behind}-other"));
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        assert_eq!(logs.warnings().len(), 2, "{:?}", logs.warnings());
+    }
+
+    /// The warning is logged with the compat lock released. A subscriber is user
+    /// code: one that reads `node_version()` from inside the event would
+    /// otherwise deadlock, and a slow one would stall every stream open.
+    #[tokio::test]
+    async fn warning_is_logged_without_holding_the_compat_lock() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Records, for each event, whether the client's compat lock was free.
+        struct ProbeLock {
+            compat: Arc<Mutex<CompatState>>,
+            free: Arc<Mutex<Vec<bool>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLock {
+            fn on_event(
+                &self,
+                _: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let free = self.compat.try_lock().is_ok();
+                self.free.lock().unwrap().push(free);
+            }
+        }
+
+        let (behind, allow) = match minors_behind(1) {
+            Some(v) => (v, false),
+            None => (too_old(), true),
+        };
+        let fake = FakeNode::new(Some(&behind));
+        let mut builder = StreamClient::builder(serve(fake.clone()).await);
+        if allow {
+            builder = builder.allow_old_node();
+        }
+        let mut client = builder.connect().await.unwrap();
+
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(ProbeLock { compat: client.compat.clone(), free: free.clone() });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        let seen = free.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the warning was not logged");
+        assert!(seen.iter().all(|f| *f), "an event was logged under the compat lock: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn node_version_is_recorded_once_a_stream_opens() {
+        let fake = FakeNode::new(Some(SDK_VERSION));
+        let client = client_for(&fake).await;
+        assert_eq!(client.node_version(), None);
+        client.clone().subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        assert_eq!(client.node_version().as_deref(), Some(SDK_VERSION));
+    }
+
+    #[tokio::test]
+    async fn resilient_subscribe_surfaces_node_too_old_without_retrying() {
+        let fake = FakeNode::new(Some(&too_old()));
+        let client = client_for(&fake).await;
+        let mut sub =
+            client.resilient_subscribe(SubscribeOptions::default(), ResilientConfig::default());
+        let err = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("no backoff loop")
+            .expect_err("refused");
+        assert!(matches!(err, StreamError::NodeTooOld { .. }), "{err:?}");
+        assert_eq!(fake.opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resilient_watch_surfaces_node_too_old_without_retrying() {
+        let fake = FakeNode::new(Some(&too_old()));
+        let client = client_for(&fake).await;
+        let mut watch = client.resilient_watch(ResilientWatchConfig::default());
+        let err = tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .expect("no backoff loop")
+            .expect_err("refused");
+        assert!(matches!(err, StreamError::NodeTooOld { .. }), "{err:?}");
+        assert_eq!(fake.opens.load(Ordering::SeqCst), 1);
     }
 }

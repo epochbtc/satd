@@ -4182,6 +4182,8 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

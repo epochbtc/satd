@@ -25,11 +25,11 @@ The wire types are generated once in `satd-events-proto`, a thin tonic/prost
 crate shared by the node's server and this client. The SDK therefore pulls in
 no server glue: no `node` crate, no RocksDB. On top of the proto crate,
 `satd-events-client` depends on `tonic`, `prost`, `tokio`, `tokio-stream`,
-`thiserror`, and an optional `bitcoin`.
+`thiserror`, `tracing`, and an optional `bitcoin`.
 
 ```toml
 [dependencies]
-satd-events-client = "0.4"
+satd-events-client = "0.6"
 ```
 
 > **Note.** The crate is not yet on crates.io. Until the published release
@@ -48,7 +48,7 @@ prefix-watch re-filter and the scripthash helpers. For a minimal dependency
 tree that hands you raw bytes to filter yourself:
 
 ```toml
-satd-events-client = { version = "0.4", default-features = false }
+satd-events-client = { version = "0.6", default-features = false }
 ```
 
 Note that this also drops the default-on `tls` feature, which is not merely a
@@ -56,7 +56,7 @@ smaller dependency tree — it is a plaintext-only client. Keep `tls` unless the
 node is genuinely reachable over loopback only:
 
 ```toml
-satd-events-client = { version = "0.4", default-features = false, features = ["tls"] }
+satd-events-client = { version = "0.6", default-features = false, features = ["tls"] }
 ```
 
 ## Connecting
@@ -472,11 +472,34 @@ boxed status message before retrying a watch-add forever.
 
 ## Stability & versioning
 
-The SDK tracks the additive `satd.events.v1` wire schema, not the node's
-release cadence. New optional fields and event or watch kinds are added
-without breaking existing consumers. The crate follows
-[semver](https://semver.org/) independently of the satd node version; a node
-and an SDK do not need matching versions. The generated wire types are
+The crate's version is the satd version it was released with (it inherits the
+workspace version), and it follows [semver](https://semver.org/). Pick an SDK
+whose minor version is at or below your node's: `satd-events-client` 0.6 is
+built for satd 0.6 and works unchanged against 0.7, 0.8 and later nodes, which
+only add fields and event kinds within `schema_version` 1.
+
+Each time `subscribe` or `watch` opens a stream, the SDK reads the version
+the node advertises in its `satd-version` response header and compares it with
+its own:
+
+| Node | Result |
+|---|---|
+| Same or newer | Opens silently. |
+| One minor version behind | Opens and logs a `tracing` warning (target `satd_events_client::compat`), once per client per node version. |
+| Two or more minor versions, or a major version, behind | Refused with `StreamError::NodeTooOld`. |
+| Different event schema | Refused with `StreamError::SchemaMismatch`. |
+
+A node older than 0.6.0 sends no header and counts as 0.5. The warning means
+"upgrade the node": features added after the node's release are unavailable,
+and request fields it does not recognise are ignored. For a rolling upgrade
+where clients go first, `StreamClient::builder(..).allow_old_node()` turns
+`NodeTooOld` into the same warning. Nothing bypasses a schema mismatch. Both
+errors are non-retryable, so the resilient layers surface them instead of
+reconnecting. `StreamClient::node_version()` returns what the node last
+advertised. The full rule is in
+[`STABILITY_POLICY.md`](https://github.com/epochbtc/satd/blob/master/STABILITY_POLICY.md#streaming-api--sdk-compatibility).
+
+The generated wire types are
 re-exported under `proto`, so you can pin to the schema directly when a typed
 helper does not yet cover your case. The minimum supported Rust version
 (**MSRV**) is 1.93; an MSRV bump is treated as a minor-version change. The
