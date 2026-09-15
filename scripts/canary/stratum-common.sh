@@ -1,11 +1,10 @@
 #!/bin/bash
 # Shared helpers for the Stratum canaries. Source after boot-satd.sh.
 
-# Pins for the miners the Stratum canaries run.
-#   cpuminer: the Stratum V1 CPU miner SRI's own integration tests drive, as
-#   the prebuilt release of github.com/stratum-mining/cpuminer.
-CPUMINER_VERSION=2.5.1
-CPUMINER_SHA256=5fc7219fbb72dad32d64f11cd579383e53d8872f95309594fad2a07554a541f7
+# The miners the Stratum canaries run (cpuminer, SRI's JD client and the
+# sv2-apps tag mining_device is built from) are pinned in PINS.
+# shellcheck source=PINS
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/PINS"
 
 # A valid regtest P2WPKH the miners are paid to (secret [0x11; 32]); shared
 # with the other canaries.
@@ -60,16 +59,6 @@ assert_last_block_pays_payout() {
     fi
     echo "ok: block $hash pays $STRATUM_PAYOUT_ADDR"
 }
-
-# Stratum V2 Reference Implementation (SRI), github.com/stratum-mining/sv2-apps.
-#   mining_device: SRI's Stratum V2 CPU miner, built from source at this tag
-#   by the workflow (it has no published image) and passed in as
-#   SRI_MINING_DEVICE.
-SRI_TAG=v0.7.0
-SRI_COMMIT=d7d556d1a3c7e1c26dfccd076b491a38c038a5e0
-SRI_JD_CLIENT_IMAGE=stratumv2/jd_client_sv2:v0.7.0@sha256:485853aa8e58bc75c2cef2fb45f537880b047e3b3c4eac352ca8576d07415f2b
-# Bitcoin Core, the JD client's template source over IPC.
-STRATUM_CORE_IMAGE=bitcoin/bitcoin:31.1@sha256:da25cedc66b1daefff9f412ee196c901a899c3fa68a33b20849c3e08b5c40d63
 
 pull_with_retries() {
     local image="$1"

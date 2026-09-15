@@ -838,7 +838,7 @@ jobs:
   # SRI's Stratum V2 CPU miner (`mining_device`, from the Stratum V2
   # Reference Implementation's sv2-apps repository) has no published image or
   # release binary, so it is built here once per run from the tag and commit
-  # pinned in scripts/canary/stratum-common.sh, and shared with the two
+  # pinned in scripts/canary/PINS, and shared with the two
   # Stratum V2 canaries. It builds against Bitcoin Core's IPC schema, hence
   # Cap'n Proto.
   sri-mining-device:
@@ -856,7 +856,7 @@ jobs:
         id: pin
         run: |
           set -euo pipefail
-          . scripts/canary/stratum-common.sh
+          . scripts/canary/PINS
           echo "tag=$SRI_TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$SRI_COMMIT" >> "$GITHUB_OUTPUT"
 

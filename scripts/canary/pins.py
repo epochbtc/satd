@@ -40,12 +40,15 @@ GITHUB_SOURCES = {
     "NBXPLORER_IMAGE": ("dgarage/NBXplorer", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "BTCPAY_IMAGE": ("btcpayserver/btcpayserver", r"^v(\d+)\.(\d+)\.(\d+)$"),
     "ELECTRUM_VERSION": ("spesmilo/electrum", r"^(\d+)\.(\d+)\.(\d+)$"),
+    "CPUMINER_VERSION": ("stratum-mining/cpuminer", r"^v(\d+)\.(\d+)\.(\d+)$"),
+    "SRI_TAG": ("stratum-mining/sv2-apps", r"^v(\d+)\.(\d+)\.(\d+)$"),
+    "SRI_JD_CLIENT_IMAGE": ("stratum-mining/sv2-apps", r"^v(\d+)\.(\d+)\.(\d+)$"),
 }
 # Crate pins, named the way PINS names its entries so a hold can refer to
 # them: HOLD_BDK_WALLET=<issue>.
 CRATE_SOURCES = {"BDK_WALLET": ("bdk_wallet", BDK_LOCK)}
 # Pinned for reproducibility, not tracked against upstream.
-SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256"}
+SIDECARS = {"POSTGRES_IMAGE", "ELECTRUM_BASE_IMAGE", "ELECTRUM_APPIMAGE_SHA256", "CPUMINER_SHA256", "SRI_COMMIT"}
 
 # Images CI builds itself rather than pulls.
 LOCAL_IMAGES = {"satd"}
