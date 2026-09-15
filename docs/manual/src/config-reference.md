@@ -331,6 +331,9 @@ startup error.
 | `stratumdifficulty` | 10000 mainnet, 1000 testnet, 1 regtest | restart | satd | Initial Stratum share difficulty. |
 | `stratummaxconns` | 64 | restart | satd | Hard cap on simultaneous Stratum connections across both listeners. |
 | `stratumallowplaintextremote` | false | restart | satd | Accept a non-loopback `stratumbind` with no TLS listener. |
+| `stratumv2bind` | none | restart | satd | Bind the Stratum V2 listener (Noise-encrypted; requires `stratum=1`). |
+| `stratumv2key` | `<datadir>/stratum_v2.key` | restart | satd | Stratum V2 authority key file, created if absent. Back it up with the datadir: miners pin the key. |
+| `stratumv2maxchannels` | 16 | restart | satd | Channels one Stratum V2 connection may open. |
 
 ## Storage / pruning / reindex
 

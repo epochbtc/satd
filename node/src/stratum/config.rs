@@ -31,6 +31,19 @@ pub struct StratumConfig {
     /// Connection cap across every listener.
     pub max_conns: usize,
     pub vardiff: VardiffConfig,
+    /// The Stratum V2 listener, when configured. Needs the `stratum-v2`
+    /// feature; without it, binding fails.
+    pub v2: Option<V2Config>,
+}
+
+/// The Stratum V2 listener's settings.
+#[derive(Debug, Clone)]
+pub struct V2Config {
+    pub bind: SocketAddr,
+    /// The authority key file; created if absent.
+    pub key_path: PathBuf,
+    /// Channels one connection may open.
+    pub max_channels: usize,
 }
 
 /// The initial share difficulty when none is configured.

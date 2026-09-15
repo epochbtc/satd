@@ -211,6 +211,7 @@ struct ServerListenerStatusInner {
     electrum_tls: Option<String>,
     stratum: Option<String>,
     stratum_tls: Option<String>,
+    stratum_v2: Option<String>,
     rpc_tls: Option<String>,
     events_grpc: Option<String>,
     streamws: Option<String>,
@@ -234,6 +235,9 @@ impl ServerListenerStatus {
     }
     pub fn set_stratum_tls(&self, bind: String) {
         self.inner.write().stratum_tls = Some(bind);
+    }
+    pub fn set_stratum_v2(&self, bind: String) {
+        self.inner.write().stratum_v2 = Some(bind);
     }
     pub fn set_rpc_tls(&self, bind: String) {
         self.inner.write().rpc_tls = Some(bind);
@@ -3350,6 +3354,7 @@ pub async fn start(
         resp.insert("electrum_tls".into(), listener(snap.electrum_tls));
         resp.insert("stratum".into(), listener(snap.stratum));
         resp.insert("stratum_tls".into(), listener(snap.stratum_tls));
+        resp.insert("stratum_v2".into(), listener(snap.stratum_v2));
         resp.insert("rpc_tls".into(), listener(snap.rpc_tls));
         // Streaming Consumption API listeners — same `null | {"bind": ...}`
         // shape as the wallet servers above. Reports the runtime-bound

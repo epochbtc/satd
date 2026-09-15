@@ -3363,6 +3363,14 @@ async fn main() {
             .stratum_tls_bind
             .as_deref()
             .map(|raw| parse_bind("stratumtlsbind", raw));
+        let stratum_v2 = config.stratum_v2_bind.as_deref().map(|raw| node::stratum::V2Config {
+            bind: parse_bind("stratumv2bind", raw),
+            key_path: config
+                .stratum_v2_key
+                .clone()
+                .unwrap_or_else(|| config.network_datadir().join("stratum_v2.key")),
+            max_channels: config.stratum_v2_max_channels,
+        });
         // Validated against the network when the config loaded.
         let fallback_address = config.stratum_address.as_deref().map(|a| {
             a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
@@ -3397,6 +3405,7 @@ async fn main() {
                 .unwrap_or_else(|| node::stratum::default_initial_difficulty(config.network)),
             max_conns: config.stratum_max_conns,
             vardiff: Default::default(),
+            v2: stratum_v2,
         };
         let server = match node::stratum::StratumServer::bind(
             stratum_cfg,
@@ -3424,15 +3433,23 @@ async fn main() {
             (Some(Err(_)), Some(cfg)) => Some(cfg.to_string()),
             (None, _) | (Some(Err(_)), None) => None,
         };
+        let reported_v2_bind = server.local_v2_addr().map(|a| match a {
+            Ok(a) => a.to_string(),
+            Err(_) => config.stratum_v2_bind.clone().unwrap_or_default(),
+        });
         tracing::info!(
             target: "node::stratum",
             bind = %reported_bind,
             tls_bind = ?reported_tls_bind,
+            v2_bind = ?reported_v2_bind,
             "Stratum server listening"
         );
         listener_status.set_stratum(reported_bind);
         if let Some(tls_bind) = reported_tls_bind {
             listener_status.set_stratum_tls(tls_bind);
+        }
+        if let Some(v2_bind) = reported_v2_bind {
+            listener_status.set_stratum_v2(v2_bind);
         }
         let stratum_shutdown = shutdown_rx.clone();
         api_handle.spawn(async move {

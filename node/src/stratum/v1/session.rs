@@ -24,7 +24,7 @@ use super::{
 };
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::server::{Shared, submit_block};
+use crate::stratum::server::{Shared, submit_found_block};
 use crate::stratum::share::{ShareResult, effective_share_target, network_difficulty, validate_share};
 use crate::stratum::template::{ActiveTemplate, Work};
 use crate::stratum::vardiff::Vardiff;
@@ -406,7 +406,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         match result {
             ShareResult::Block(block) => {
                 self.accepted(key);
-                self.submit_block(*block, &job, &payout).await;
+                submit_found_block(&self.shared, *block, job.template.work.height, &payout, self.peer).await;
                 Ok(())
             }
             ShareResult::Share => {
@@ -449,41 +449,5 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 
     fn reject(&self, job_id: u32, reason: &str) {
         tracing::warn!(target: "node::stratum", peer = %self.peer, job_id, reason, "Stratum share rejected");
-    }
-
-    /// Hand a found block to the chain. The miner is told `true` whatever
-    /// happens here: it did its part.
-    async fn submit_block(&self, block: bitcoin::Block, job: &Job, payout: &Payout) {
-        let hash = block.block_hash();
-        let height = job.template.work.height;
-        let chain = self.shared.chain.clone();
-        let mempool = self.shared.mempool.clone();
-        let outcome = self.shared.core.spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
-        let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
-        match outcome {
-            Ok(Ok(true)) => tracing::info!(
-                target: "node::stratum",
-                peer = %self.peer,
-                height,
-                %hash,
-                address,
-                worker = payout.worker.as_deref().unwrap_or(""),
-                "Stratum miner found a block"
-            ),
-            Ok(Ok(false)) => tracing::warn!(
-                target: "node::stratum",
-                height,
-                %hash,
-                "Stratum block was valid but did not join the active chain"
-            ),
-            Ok(Err(e)) => tracing::warn!(
-                target: "node::stratum",
-                height,
-                %hash,
-                error = %e,
-                "Stratum block was not accepted"
-            ),
-            Err(e) => tracing::error!(target: "node::stratum", %hash, error = %e, "Stratum block submission panicked"),
-        }
     }
 }
