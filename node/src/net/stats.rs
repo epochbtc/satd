@@ -364,6 +364,8 @@ mod tests {
 
     #[test]
     fn a_matching_pong_records_a_round_trip() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         assert_eq!(s.ping_time_secs(), None, "nothing measured yet");
         assert_eq!(s.min_ping_secs(), None);
@@ -372,8 +374,8 @@ mod tests {
         s.ping_sent(42);
         assert!(s.ping_outstanding());
         // Core omits `pingwait` until the wait is measurably non-zero, so the
-        // field only appears once time has actually passed.
-        assert_eq!(s.ping_wait_secs(), None, "no measurable wait yet");
+        // field appears once time has actually passed. Whether a microsecond
+        // has already gone by at this line is up to the scheduler.
         std::thread::sleep(std::time::Duration::from_micros(1500));
         assert!(s.ping_wait_secs().is_some_and(|w| w > 0.0));
 
@@ -388,6 +390,8 @@ mod tests {
 
     #[test]
     fn a_wrong_or_repeated_nonce_cannot_write_a_ping_time() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         // Unsolicited pong, before any ping went out.
         assert!(!s.pong_received(7));
@@ -408,6 +412,8 @@ mod tests {
 
     #[test]
     fn a_pong_carrying_nonce_zero_finishes_the_ping_without_timing_it() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::time::Duration;
         let s = PeerStats::new(NetTotals::new());
 
@@ -430,6 +436,8 @@ mod tests {
 
     #[test]
     fn only_an_unanswered_ping_can_time_out() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::time::Duration;
         let s = PeerStats::new(NetTotals::new());
 
@@ -461,6 +469,8 @@ mod tests {
 
     #[test]
     fn minping_keeps_the_best_round_trip_not_the_last() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         s.ping_sent(1);
         assert!(s.pong_received(1));
@@ -542,6 +552,8 @@ mod tests {
 
     #[test]
     fn records_stamp_last_activity() {
+        // Timed on the node clock, which another test may mock meanwhile.
+        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let a = PeerStats::new(NetTotals::new());
         assert_eq!(a.last_send(), 0);
         assert_eq!(a.last_recv(), 0);

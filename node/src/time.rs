@@ -112,6 +112,11 @@ pub fn mock_time() -> Option<u64> {
     }
 }
 
+/// Held by a unit test that installs the mock clock, and by the ones that
+/// measure elapsed node time, so the two never overlap on parallel threads.
+#[cfg(test)]
+pub static CLOCK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +133,7 @@ mod tests {
     /// forward here.
     #[test]
     fn mock_replaces_the_system_clock_and_can_be_cleared() {
+        let _clock = CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(mock_time().is_none(), "no mock installed by default");
         let real = now_secs();
         assert!(real > 1_600_000_000, "system clock looks wrong: {real}");
