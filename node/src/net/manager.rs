@@ -319,6 +319,67 @@ pub struct PeerSummary {
     pub clients: std::collections::BTreeMap<String, usize>,
 }
 
+/// BIP 152 compact block counters, exported as `satd_net_compact_block_*`.
+#[derive(Debug, Default)]
+pub struct CompactBlockStats {
+    /// Reconstructed from the `cmpctblock` alone.
+    pub direct: AtomicU64,
+    /// Reconstructed after a `getblocktxn` round trip.
+    pub round_trip: AtomicU64,
+    /// Abandoned for a full block: merkle mismatch or timeout.
+    pub fallback: AtomicU64,
+    /// Refused as malformed: a bad `cmpctblock` shape or a `blocktxn` that
+    /// does not answer the request.
+    pub invalid: AtomicU64,
+    /// Transaction bytes received in `blocktxn` messages that completed a block.
+    pub fetched_bytes: AtomicU64,
+    pub txs_prefilled: AtomicU64,
+    pub txs_mempool: AtomicU64,
+    pub txs_extra: AtomicU64,
+    pub txs_requested: AtomicU64,
+    /// `cmpctblock` messages sent as announcements.
+    pub sent_announce: AtomicU64,
+    /// `cmpctblock` messages sent in answer to a `MSG_CMPCT_BLOCK` getdata.
+    pub sent_getdata: AtomicU64,
+}
+
+impl CompactBlockStats {
+    fn record(&self, stats: &compact::ReconstructStats, round_trip: bool) {
+        let o = Ordering::Relaxed;
+        if round_trip {
+            self.round_trip.fetch_add(1, o);
+        } else {
+            self.direct.fetch_add(1, o);
+        }
+        self.fetched_bytes.fetch_add(stats.requested_bytes, o);
+        self.txs_prefilled.fetch_add(stats.prefilled, o);
+        self.txs_mempool.fetch_add(stats.mempool, o);
+        self.txs_extra.fetch_add(stats.extra, o);
+        self.txs_requested.fetch_add(stats.requested, o);
+    }
+}
+
+/// Why a compact block reconstruction was given up, for its log line.
+#[derive(Debug, Clone, Copy)]
+enum CompactAbandon {
+    /// The filled block failed its merkle check; the full block was requested.
+    Merkle,
+    /// No `blocktxn` came within [`compact::COMPACT_PENDING_TIMEOUT`].
+    Timeout,
+    /// The message was malformed.
+    Invalid,
+}
+
+impl CompactAbandon {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Merkle => "merkle",
+            Self::Timeout => "timeout",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
 /// Manages all peer connections and routes messages.
 pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
@@ -414,6 +475,12 @@ pub struct PeerManager {
     /// [`compact::COMPACT_PENDING_TIMEOUT`], dropped when the peer disconnects
     /// or the block arrives by any route.
     pending_compact: RwLock<HashMap<PeerId, compact::PendingCompact>>,
+    /// Recently seen transactions that are not in the mempool, for compact
+    /// block reconstruction (Core's `vExtraTxnForCompact`). Shared with the
+    /// mempool's replacement hook, which feeds it RBF-replaced transactions.
+    extra_txns: Arc<parking_lot::Mutex<compact::ExtraTxnCache>>,
+    /// Compact block relay counters, rendered by the metrics endpoint.
+    compact_stats: CompactBlockStats,
     /// Per-address reconnect backoff state.
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
     /// Exponential backoff for `.onion` reconnect candidates, keyed by host
@@ -688,6 +755,10 @@ impl PeerManager {
             addrman: RwLock::new(crate::net::addrman::AddrMan::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
+            extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
+                compact::DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN,
+            ))),
+            compact_stats: CompactBlockStats::default(),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
@@ -732,6 +803,19 @@ impl PeerManager {
             net_totals: NetTotals::new(),
             network_active: std::sync::atomic::AtomicBool::new(true),
         });
+
+        // Transactions an RBF replacement pushes out of the mempool are the
+        // ones most likely to turn up in a block mined by someone who never
+        // saw the replacement; keep them for reconstruction.
+        {
+            let extra = mgr.extra_txns.clone();
+            mgr.mempool.set_replaced_tx_sink(Box::new(move |replaced| {
+                let mut cache = extra.lock();
+                for tx in replaced {
+                    cache.insert(tx);
+                }
+            }));
+        }
 
         // Spawn block processing thread
         let cs = chain_state;
@@ -5563,8 +5647,11 @@ impl PeerManager {
                 // Don't ban — peer may just be ahead of us. Defer to
                 // orphanage and ask the same peer for the parents.
                 let missing = self.collect_missing_parents(&tx);
-                match self.orphanage.add(tx, id, missing.clone()) {
+                match self.orphanage.add(tx.clone(), id, missing.clone()) {
                     Ok(AddOutcome::Added) => {
+                        // Core keeps a first-time orphan for reconstruction:
+                        // its parents may well confirm alongside it.
+                        self.keep_for_reconstruction(tx);
                         let want: Vec<bitcoin::Txid> = missing.into_iter().collect();
                         self.send_to_peer(id, sync::make_getdata_txs(&want));
                         tracing::debug!(%txid, peer = id, "Tx deferred to orphanage");
@@ -5604,6 +5691,12 @@ impl PeerManager {
                 let score = Self::tx_rejection_ban_score(&e);
                 if score > 0 {
                     self.add_ban_score(id, score, &format!("Tx rejected: {}", e));
+                } else if !matches!(e, MempoolError::AlreadyExists) {
+                    // Refused by policy but well-formed: a miner with other
+                    // policy may still include it. Core's first-time-reject
+                    // insertion. A consensus-invalid transaction is not kept,
+                    // and one we already hold is not a rejection.
+                    self.keep_for_reconstruction(tx);
                 }
             }
         }
@@ -6458,12 +6551,70 @@ impl PeerManager {
         })
     }
 
+    /// Compact block relay counters, for the metrics endpoint.
+    pub fn compact_block_stats(&self) -> &CompactBlockStats {
+        &self.compact_stats
+    }
+
+    /// Size the extra-transaction ring (`-blockreconstructionextratxn`).
+    /// Call once at startup: resizing discards what the ring holds.
+    pub fn set_block_reconstruction_extra_txn(&self, capacity: usize) {
+        *self.extra_txns.lock() = compact::ExtraTxnCache::new(capacity);
+    }
+
+    /// Keep a transaction the mempool refused, for reconstruction. Core's
+    /// `AddToCompactExtraTransactions` on a first-time rejection.
+    fn keep_for_reconstruction(&self, tx: bitcoin::Transaction) {
+        self.extra_txns.lock().insert(tx);
+    }
+
+    /// One line per finished reconstruction. The counts are the ones taken
+    /// while the block was filled.
+    fn log_reconstructed(
+        &self,
+        id: PeerId,
+        hash: &bitcoin::BlockHash,
+        height: u32,
+        stats: &compact::ReconstructStats,
+        round_trip: bool,
+        since: Instant,
+    ) {
+        self.compact_stats.record(stats, round_trip);
+        tracing::info!(
+            hash = %hash,
+            height,
+            peer = id,
+            prefilled = stats.prefilled,
+            prefilled_bytes = stats.prefilled_bytes,
+            mempool = stats.mempool,
+            mempool_bytes = stats.mempool_bytes,
+            extra = stats.extra,
+            extra_bytes = stats.extra_bytes,
+            requested = stats.requested,
+            fetched_bytes = stats.requested_bytes,
+            redundant_prefilled = stats.redundant_prefilled,
+            round_trip,
+            elapsed_ms = since.elapsed().as_millis() as u64,
+            "compact block reconstructed"
+        );
+    }
+
+    fn log_abandoned(&self, id: PeerId, hash: &bitcoin::BlockHash, reason: CompactAbandon) {
+        let counter = match reason {
+            CompactAbandon::Merkle | CompactAbandon::Timeout => &self.compact_stats.fallback,
+            CompactAbandon::Invalid => &self.compact_stats.invalid,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(hash = %hash, peer = id, reason = reason.as_str(), "compact block abandoned");
+    }
+
     /// BIP 152 `cmpctblock`. The gate order follows Bitcoin Core's
     /// `CMPCTBLOCK` handler: nothing about the message is trusted, and no
     /// mempool work is done or state kept, until its header has been
     /// accepted and found to extend our tip.
     fn handle_compact_block(&self, id: PeerId, compact: bitcoin::bip152::HeaderAndShortIds) {
         use crate::storage::blockindex::BlockStatus;
+        let started = Instant::now();
         let block_hash = compact.header.block_hash();
 
         // 1. Still syncing: take the header, leave the block to the download
@@ -6563,6 +6714,7 @@ impl PeerManager {
         // `READ_STATUS_INVALID` from `InitData`).
         if let Err(e) = compact::check_shape(&compact) {
             tracing::debug!(id, %block_hash, reason = %e, "invalid cmpctblock");
+            self.log_abandoned(id, &block_hash, CompactAbandon::Invalid);
             self.add_ban_score(id, 100, "invalid-cmpctblock");
             return;
         }
@@ -6573,18 +6725,23 @@ impl PeerManager {
         // `expire_compact_state`.
         self.compact_in_progress.write().insert(block_hash, Instant::now());
 
-        // 9. Reconstruct from the mempool.
-        let reconstruction = match compact::try_reconstruct(&compact, &self.mempool) {
+        // 9. Reconstruct from the mempool and the extra-transaction cache.
+        let reconstruction = {
+            let extra = self.extra_txns.lock();
+            compact::try_reconstruct(&compact, &self.mempool, &extra)
+        };
+        let reconstruction = match reconstruction {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(id, %block_hash, reason = %e, "invalid cmpctblock");
                 self.compact_in_progress.write().remove(&block_hash);
+                self.log_abandoned(id, &block_hash, CompactAbandon::Invalid);
                 self.add_ban_score(id, 100, "invalid-cmpctblock");
                 return;
             }
         };
         match reconstruction {
-            compact::Reconstruction::Complete(block) => {
+            compact::Reconstruction::Complete(block, stats) => {
                 // 10. A block that fails its merkle check after a full
                 // reconstruction may be an honest block whose short IDs
                 // collided with something in our mempool. Core returns
@@ -6598,18 +6755,19 @@ impl PeerManager {
                         "compact block failed merkle check, possible short-ID collision; requesting full block"
                     );
                     self.compact_in_progress.write().remove(&block_hash);
+                    self.log_abandoned(id, &block_hash, CompactAbandon::Merkle);
                     self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
                     self.note_blocks_requested(id, &[block_hash]);
                     self.pending_compact.write().insert(
                         id,
-                        compact::PendingCompact::failed(block_hash, compact.header),
+                        compact::PendingCompact::failed(block_hash, compact.header, entry.height),
                     );
                     return;
                 }
-                tracing::debug!(%block_hash, "Compact block fully reconstructed from mempool");
+                self.log_reconstructed(id, &block_hash, entry.height, &stats, false, started);
                 let _ = self.block_tx.send((self.peer_stats(id), block));
             }
-            compact::Reconstruction::Partial { txs, missing_indices } => {
+            compact::Reconstruction::Partial { txs, missing_indices, stats } => {
                 // 11. Ask the peer for what the mempool could not supply.
                 tracing::debug!(
                     %block_hash,
@@ -6624,9 +6782,11 @@ impl PeerManager {
                         header: compact.header,
                         txs,
                         missing_indices,
-                        since: Instant::now(),
+                        since: started,
                         requested,
                         failed: false,
+                        height: entry.height,
+                        stats,
                     },
                 );
                 self.send_to_peer(
@@ -6708,14 +6868,16 @@ impl PeerManager {
             return;
         }
         let header = pending.header;
+        let (height, since) = (pending.height, pending.since);
         let segwit_active = self.segwit_active_after(&header.prev_blockhash).unwrap_or(true);
         match compact::complete_pending(pending, &txns, segwit_active) {
-            Ok(block) => {
-                tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
+            Ok((block, stats)) => {
+                self.log_reconstructed(id, &block_hash, height, &stats, true, since);
                 let _ = self.block_tx.send((self.peer_stats(id), block));
             }
             Err(compact::CompleteError::Invalid) => {
                 tracing::debug!(id, %block_hash, "blocktxn does not match the compact block");
+                self.log_abandoned(id, &block_hash, CompactAbandon::Invalid);
                 self.add_ban_score(id, 100, "invalid-blocktxn");
             }
             Err(compact::CompleteError::Mutated) => {
@@ -6724,11 +6886,12 @@ impl PeerManager {
                     id, %block_hash,
                     "compact block failed merkle check, possible short-ID collision; requesting full block"
                 );
+                self.log_abandoned(id, &block_hash, CompactAbandon::Merkle);
                 self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
                 self.note_blocks_requested(id, &[block_hash]);
                 self.pending_compact
                     .write()
-                    .insert(id, compact::PendingCompact::failed(block_hash, header));
+                    .insert(id, compact::PendingCompact::failed(block_hash, header, height));
             }
         }
     }
@@ -6842,7 +7005,7 @@ impl PeerManager {
     /// re-requested as a full block, so a requested block is never left
     /// unfetched because a `blocktxn` never came.
     fn expire_compact_state(&self) {
-        let expired: Vec<(PeerId, bitcoin::BlockHash, bool)> = {
+        let expired: Vec<(PeerId, bitcoin::BlockHash, bool, bool)> = {
             let mut pending = self.pending_compact.write();
             let stale: Vec<PeerId> = pending
                 .iter()
@@ -6851,10 +7014,14 @@ impl PeerManager {
                 .collect();
             stale
                 .into_iter()
-                .filter_map(|id| pending.remove(&id).map(|p| (id, p.hash, p.requested)))
+                .filter_map(|id| pending.remove(&id).map(|p| (id, p.hash, p.requested, p.failed)))
                 .collect()
         };
-        for (id, hash, requested) in expired {
+        for (id, hash, requested, failed) in expired {
+            // A failed entry was already counted when its merkle check failed.
+            if !failed {
+                self.log_abandoned(id, &hash, CompactAbandon::Timeout);
+            }
             let have_data = self
                 .chain_state
                 .get_block_index(&hash)
@@ -9785,6 +9952,8 @@ mod tests {
                 .expect("monotonic clock far enough from its origin"),
             requested,
             failed: false,
+            height: 1,
+            stats: compact::ReconstructStats::default(),
         }
     }
 

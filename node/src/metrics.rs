@@ -228,6 +228,70 @@ impl MetricsContext {
             &[],
             net_bytes_recv,
         );
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let cb = self.peer_manager.compact_block_stats();
+            metric_header(
+                &mut out,
+                "satd_net_compact_block_reconstructions_total",
+                "BIP 152 compact blocks received, by outcome: direct (no round trip), round_trip (after getblocktxn), fallback (full block fetched after a merkle mismatch or timeout), invalid (malformed).",
+                "counter",
+            );
+            for (outcome, v) in [
+                ("direct", &cb.direct),
+                ("round_trip", &cb.round_trip),
+                ("fallback", &cb.fallback),
+                ("invalid", &cb.invalid),
+            ] {
+                metric_sample(
+                    &mut out,
+                    "satd_net_compact_block_reconstructions_total",
+                    &[("outcome", outcome)],
+                    v.load(Relaxed),
+                );
+            }
+            metric(
+                &mut out,
+                "satd_net_compact_block_fetched_bytes_total",
+                "Transaction bytes received in blocktxn messages that completed a compact block.",
+                "counter",
+                &[],
+                cb.fetched_bytes.load(Relaxed),
+            );
+            metric_header(
+                &mut out,
+                "satd_net_compact_block_txs_total",
+                "Transactions of reconstructed compact blocks, by where they came from.",
+                "counter",
+            );
+            for (source, v) in [
+                ("prefilled", &cb.txs_prefilled),
+                ("mempool", &cb.txs_mempool),
+                ("extra", &cb.txs_extra),
+                ("requested", &cb.txs_requested),
+            ] {
+                metric_sample(
+                    &mut out,
+                    "satd_net_compact_block_txs_total",
+                    &[("source", source)],
+                    v.load(Relaxed),
+                );
+            }
+            metric_header(
+                &mut out,
+                "satd_net_compact_block_sent_total",
+                "BIP 152 cmpctblock messages sent, by kind: announce (a new block pushed to a high-bandwidth peer) or getdata (an answer to MSG_CMPCT_BLOCK).",
+                "counter",
+            );
+            for (kind, v) in [("announce", &cb.sent_announce), ("getdata", &cb.sent_getdata)] {
+                metric_sample(
+                    &mut out,
+                    "satd_net_compact_block_sent_total",
+                    &[("kind", kind)],
+                    v.load(Relaxed),
+                );
+            }
+        }
         metric(
             &mut out,
             "satd_peer_ping_timeouts_total",

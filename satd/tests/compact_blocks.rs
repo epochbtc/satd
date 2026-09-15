@@ -607,3 +607,160 @@ fn a_second_compact_peer_for_the_same_hash_is_capped_at_three() {
         .count();
     assert_eq!(asked, 3, "exactly three peers may reconstruct one block at once");
 }
+
+// ---------------------------------------------------------------------------
+// Reconstruction statistics and the extra-transaction cache
+// ---------------------------------------------------------------------------
+
+fn metrics_body(port: u16) -> String {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/metrics");
+    let deadline = std::time::Instant::now() + test_timeout(20);
+    loop {
+        if let Ok(r) = client.get(&url).send()
+            && let Ok(body) = r.text()
+        {
+            return body;
+        }
+        assert!(std::time::Instant::now() < deadline, "metrics endpoint never answered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The value of one sample, e.g. `metric(&body, "satd_x_total{a=\"b\"}")`.
+fn metric(body: &str, series: &str) -> Option<u64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(series).and_then(|rest| rest.trim().parse().ok()))
+}
+
+/// A node with a metrics port and `blocks` mined.
+fn node_with_metrics(blocks: u64, extra_args: &[&str]) -> (TestNode, DeterministicWallet, u16) {
+    let metrics_port = common::find_available_port();
+    let mut args = vec![format!("--metricsport={metrics_port}")];
+    args.extend(extra_args.iter().map(|a| a.to_string()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let node = TestNode::start(&args);
+    let wallet = DeterministicWallet::from_secret([0x5c; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(blocks), json!(wallet.address.to_string())]);
+    (node, wallet, metrics_port)
+}
+
+/// Send `block` as a coinbase-only `cmpctblock` and report whether the node
+/// had to ask for anything before the block connected.
+fn relay_compact(node: &TestNode, peer: &mut RawPeer, block: &Block) -> bool {
+    let hash = block.block_hash();
+    peer.send(cmpct(HeaderAndShortIds::from_block(block, 0xfeed, 2, &[]).unwrap()));
+    let mut asked = false;
+    let deadline = std::time::Instant::now() + test_timeout(20);
+    while best_hash(node) != hash {
+        assert!(std::time::Instant::now() < deadline, "block {hash} never connected");
+        for m in peer.collect_for(Duration::from_millis(200)) {
+            if let NetworkMessage::GetBlockTxn(g) = m
+                && g.txs_request.block_hash == hash
+            {
+                asked = true;
+                let txs = g
+                    .txs_request
+                    .indexes
+                    .iter()
+                    .map(|i| block.txdata[*i as usize].clone())
+                    .collect();
+                peer.send(NetworkMessage::BlockTxn(BlockTxn {
+                    transactions: BlockTransactions { block_hash: hash, transactions: txs },
+                }));
+            }
+        }
+    }
+    asked
+}
+
+/// A transaction an RBF replacement pushed out of the mempool is kept, so a
+/// block from a miner who never saw the replacement still reconstructs
+/// without a round trip — and with the cache sized to zero, it does not.
+#[test]
+fn compact_block_reconstructs_from_the_extra_pool_after_rbf() {
+    for (extra_args, expect_round_trip) in [(&[][..], false), (&["--blockreconstructionextratxn=0"][..], true)] {
+        let (node, wallet, metrics_port) = node_with_metrics(101, extra_args);
+        let dest = DeterministicWallet::from_secret([0x60; 32]);
+        let (t1_hex, _) = common::build_signed_p2wpkh_spend_seq(
+            &node, &wallet, dest.address.script_pubkey(), 1_000, 0xffff_fffd,
+        );
+        let (t2_hex, _) = common::build_signed_p2wpkh_spend_seq(
+            &node, &wallet, dest.address.script_pubkey(), 5_000, 0xffff_fffd,
+        );
+        node.rpc_ok("sendrawtransaction", vec![json!(t1_hex)]);
+        node.rpc_ok("sendrawtransaction", vec![json!(t2_hex)]);
+        let t1: Transaction = deserialize(&hex::decode(&t1_hex).unwrap()).unwrap();
+
+        let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+        poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+        let tip = block_at(&node, &best_hash(&node));
+        let b = build_block(&tip, 102, vec![t1], true, 6);
+
+        let asked = relay_compact(&node, &mut peer, &b);
+        assert_eq!(asked, expect_round_trip, "extra args {extra_args:?}");
+
+        let body = metrics_body(metrics_port);
+        let extra = metric(&body, "satd_net_compact_block_txs_total{source=\"extra\"}");
+        let direct = metric(&body, "satd_net_compact_block_reconstructions_total{outcome=\"direct\"}");
+        let round_trip = metric(&body, "satd_net_compact_block_reconstructions_total{outcome=\"round_trip\"}");
+        if expect_round_trip {
+            assert_eq!((extra, direct, round_trip), (Some(0), Some(0), Some(1)), "{extra_args:?}");
+            assert_eq!(
+                metric(&body, "satd_net_compact_block_txs_total{source=\"requested\"}"),
+                Some(1)
+            );
+            assert!(metric(&body, "satd_net_compact_block_fetched_bytes_total").unwrap() > 0);
+        } else {
+            assert_eq!((extra, direct, round_trip), (Some(1), Some(1), Some(0)), "{extra_args:?}");
+        }
+    }
+}
+
+/// A relayed transaction the mempool refuses on policy — here, no fee — is
+/// kept for reconstruction too (Core's first-time-reject insertion).
+#[test]
+fn a_policy_refused_relayed_tx_is_kept_for_reconstruction() {
+    let (node, wallet, metrics_port) = node_with_metrics(101, &[]);
+    let dest = DeterministicWallet::from_secret([0x61; 32]);
+    let (free_hex, free_txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node, &wallet, dest.address.script_pubkey(), 0,
+    );
+    let free: Transaction = deserialize(&hex::decode(&free_hex).unwrap()).unwrap();
+
+    let mut peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    peer.send(NetworkMessage::Tx(free.clone()));
+    std::thread::sleep(Duration::from_secs(2));
+    let in_pool = node.rpc_ok("getrawmempool", vec![]);
+    assert!(
+        !in_pool.as_array().unwrap().iter().any(|t| t == &json!(free_txid)),
+        "the zero-fee transaction must be refused"
+    );
+    assert!(!peer.is_closed(), "a policy refusal is not misbehaviour");
+
+    let tip = block_at(&node, &best_hash(&node));
+    let b = build_block(&tip, 102, vec![free], true, 7);
+    assert!(!relay_compact(&node, &mut peer, &b), "the refused tx must fill its slot");
+    let body = metrics_body(metrics_port);
+    assert_eq!(metric(&body, "satd_net_compact_block_txs_total{source=\"extra\"}"), Some(1));
+}
+
+/// `getpeerinfo` reports the peer's high-bandwidth request. It was hardcoded
+/// `false`.
+#[test]
+fn getpeerinfo_reports_bip152_high_bandwidth_state() {
+    use bitcoin::p2p::message_compact_blocks::SendCmpct;
+    let (node, _) = started_node(1);
+    let peer = RawPeer::connect(node.p2p_port.unwrap());
+    poll_until(|| peer_count(&node) == 1, test_timeout(20), "peer must connect");
+    let hb_from = || node.rpc_ok("getpeerinfo", vec![])[0]["bip152_hb_from"].clone();
+    assert_eq!(hb_from(), json!(false));
+    peer.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    poll_until(|| hb_from() == json!(true), test_timeout(20), "bip152_hb_from must turn true");
+    peer.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+    poll_until(|| hb_from() == json!(false), test_timeout(20), "and back to false");
+}
