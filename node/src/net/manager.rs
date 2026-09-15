@@ -505,6 +505,10 @@ pub struct PeerManager {
     /// uses the same nonce, and `getblocktxn` for it needs no disk read.
     /// Core's `m_most_recent_block` / `m_most_recent_compact_block`.
     most_recent_block: RwLock<Option<RecentBlock>>,
+    /// The highest block announced before connecting it. Core's
+    /// `m_highest_fast_announce`: a block at or below it is not announced
+    /// early again.
+    highest_fast_announce: std::sync::atomic::AtomicU32,
     /// Per-address reconnect backoff state.
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
     /// Exponential backoff for `.onion` reconnect candidates, keyed by host
@@ -785,6 +789,7 @@ impl PeerManager {
             compact_stats: CompactBlockStats::default(),
             hb_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             most_recent_block: RwLock::new(None),
+            highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
@@ -839,6 +844,18 @@ impl PeerManager {
                 let mut cache = extra.lock();
                 for tx in replaced {
                     cache.insert(tx);
+                }
+            }));
+        }
+
+        // Announce a block to high-bandwidth peers as soon as it has passed
+        // everything short of connection, from whichever path it arrives on:
+        // P2P, `submitblock`, or a miner on the Stratum server.
+        {
+            let pm = Arc::downgrade(&mgr);
+            mgr.chain_state.set_pow_valid_block_hook(Box::new(move |block, height| {
+                if let Some(pm) = pm.upgrade() {
+                    pm.fast_announce(block, height);
                 }
             }));
         }
@@ -6681,6 +6698,66 @@ impl PeerManager {
             return;
         }
         self.maybe_set_peer_as_hb(from);
+    }
+
+    /// Bitcoin Core's `NewPoWValidBlock`: announce a block that extends our
+    /// tip to high-bandwidth peers before connecting it. It has passed proof
+    /// of work, header context and `check_block`; script validation and the
+    /// UTXO update come after. BIP 152 allows relaying a block this early,
+    /// and a connect failure does not take the announcement back: every
+    /// receiver validates the block itself, and whoever produced an invalid
+    /// block paid for its proof of work.
+    ///
+    /// Called under the chain's accept lock, so it only reads chain state.
+    pub fn fast_announce(&self, block: &bitcoin::Block, height: u32) {
+        if self.ibd.read().is_some() || self.is_ibd() {
+            return;
+        }
+        // One early announcement per height, and never for a lower one.
+        if self
+            .highest_fast_announce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| (height > h).then_some(height))
+            .is_err()
+        {
+            return;
+        }
+        if !crate::validation::block::segwit_active_at(self.chain_state.network, height) {
+            return;
+        }
+        let hash = block.block_hash();
+        let Some(compact) = self.compact_for(block, height) else {
+            return;
+        };
+        let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
+            compact_block: (*compact).clone(),
+        });
+        let mut announced = Vec::new();
+        {
+            let peers = self.peers.read();
+            for (id, handle) in peers.iter() {
+                if handle.info.state == PeerState::Connected
+                    && handle.info.hb_from
+                    && handle.info.compact_blocks
+                    && handle.info.known_block != Some(hash)
+                    && handle.msg_tx.try_send(msg.clone()).is_ok()
+                {
+                    announced.push(*id);
+                }
+            }
+        }
+        if announced.is_empty() {
+            return;
+        }
+        tracing::debug!(%hash, height, peers = announced.len(), "announcing block before connecting it");
+        self.compact_stats
+            .sent_announce
+            .fetch_add(announced.len() as u64, Ordering::Relaxed);
+        let mut peers = self.peers.write();
+        for id in announced {
+            if let Some(h) = peers.get_mut(&id) {
+                h.info.known_block = Some(hash);
+            }
+        }
     }
 
     /// The `cmpctblock` form of `block`, from the tip cache or built now. A
