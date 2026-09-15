@@ -10497,8 +10497,9 @@ fn test_esplora_outspends_array_matches_output_count() {
 
     let r = esplora_get(esplora_port, &format!("/tx/{}/outspends", cb));
     let arr: Vec<serde_json::Value> = r.json().unwrap();
-    // Coinbase to a single P2WPKH/P2WSH address: one output.
-    assert_eq!(arr.len(), 1);
+    // Coinbase to a single address, plus the witness commitment every
+    // post-segwit block carries (Core's `GenerateCoinbaseCommitment`).
+    assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["spent"], false);
     node.stop();
 }
@@ -10689,8 +10690,8 @@ fn test_esplora_outspend_out_of_range_vout_returns_404() {
     let body: serde_json::Value = r.json().unwrap();
     assert_eq!(body["spent"], false);
 
-    // vout 1 (past coinbase output count) → 404.
-    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/1", cb));
+    // vout 2 (past the payout and the witness commitment) → 404.
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/2", cb));
     assert_eq!(r.status(), 404);
 
     // vout 999 (way out of range) → 404.
