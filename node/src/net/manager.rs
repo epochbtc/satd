@@ -124,6 +124,16 @@ const BLOCK_REFETCH_TTL: Duration = Duration::from_secs(600);
 /// refreshes the stamp; an entry this old belongs to a request nobody is
 /// making any more.
 const BLOCK_IN_FLIGHT_TTL: Duration = Duration::from_secs(120);
+/// Most tip-following block requests recorded per peer. The records exist to
+/// answer "did we ask this peer for this block?", and a peer can make us
+/// record one per hash it announces: an `inv` may carry
+/// [`MAX_INV_PER_MSG`] hashes, none of which has to be a block anyone mined.
+/// Capping per peer bounds the table by the connection limit rather than by
+/// what peers say. Comfortably above the 128 blocks
+/// [`PeerManager::request_missing_blocks`] asks for in one round; past it a
+/// request simply goes unrecorded, and a block that arrives for it is treated
+/// as unsolicited.
+const MAX_IN_FLIGHT_BLOCKS_PER_PEER: usize = 256;
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -313,14 +323,19 @@ pub struct PeerManager {
     /// Track the highest header height we've stored.
     headers_tip: AtomicU64,
     /// Blocks we asked a peer for outside the IBD scheduler (a `getdata`
-    /// sent while following the tip): hash → the peers asked, and when.
+    /// sent while following the tip): peer → the hashes asked of it, and when.
     /// Core's `mapBlocksInFlight`, as far as the compact block path needs it:
     /// "did we request this block from this peer?" decides whether an
     /// out-of-range `cmpctblock` still earns a full `getdata`, and whether a
     /// peer that is not high-bandwidth may send one at all. Cleared when the
     /// block arrives, when the peer disconnects, and after
     /// [`BLOCK_IN_FLIGHT_TTL`].
-    in_flight_blocks: RwLock<HashMap<bitcoin::BlockHash, HashMap<PeerId, Instant>>>,
+    ///
+    /// Keyed by peer first so the peer that fills it is the peer it is
+    /// charged to: each map is capped at
+    /// [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`], which bounds the whole table by the
+    /// connection limit no matter what peers announce.
+    in_flight_blocks: RwLock<HashMap<PeerId, HashMap<bitcoin::BlockHash, Instant>>>,
     /// Blocks explicitly requested by `getblockfrompeer`: hash → (the peer we
     /// asked, when we asked). A block arriving from *that* peer is routed to
     /// `ChainState::repair_block_data` instead of the normal accept path —
@@ -2987,10 +3002,7 @@ impl PeerManager {
         // A departed peer's partial compact block can never be completed,
         // and its requests will never be answered.
         self.pending_compact.write().remove(&id);
-        self.in_flight_blocks.write().retain(|_, asked| {
-            asked.remove(&id);
-            !asked.is_empty()
-        });
+        self.in_flight_blocks.write().remove(&id);
     }
 
     fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
@@ -6737,11 +6749,23 @@ impl PeerManager {
     }
 
     /// Record that `id` was asked for `hashes` (see `in_flight_blocks`).
+    /// Records past [`MAX_IN_FLIGHT_BLOCKS_PER_PEER`] are dropped, expired
+    /// ones first: the `getdata` still goes out, we just stop remembering
+    /// having sent it once a peer has more outstanding than any honest peer
+    /// needs.
     fn note_blocks_requested(&self, id: PeerId, hashes: &[bitcoin::BlockHash]) {
         let now = Instant::now();
         let mut in_flight = self.in_flight_blocks.write();
+        let asked = in_flight.entry(id).or_default();
         for hash in hashes {
-            in_flight.entry(*hash).or_default().insert(id, now);
+            if asked.len() >= MAX_IN_FLIGHT_BLOCKS_PER_PEER && !asked.contains_key(hash) {
+                asked.retain(|_, at| at.elapsed() < BLOCK_IN_FLIGHT_TTL);
+                if asked.len() >= MAX_IN_FLIGHT_BLOCKS_PER_PEER {
+                    tracing::debug!(id, "peer has too many blocks in flight to track; not recording");
+                    break;
+                }
+            }
+            asked.insert(*hash, now);
         }
     }
 
@@ -6749,8 +6773,8 @@ impl PeerManager {
     fn block_requested_from(&self, id: PeerId, hash: &bitcoin::BlockHash) -> bool {
         self.in_flight_blocks
             .read()
-            .get(hash)
-            .and_then(|asked| asked.get(&id))
+            .get(&id)
+            .and_then(|asked| asked.get(hash))
             .is_some_and(|at| at.elapsed() < BLOCK_IN_FLIGHT_TTL)
     }
 
@@ -6759,8 +6783,11 @@ impl PeerManager {
     fn note_block_arrived(&self, hash: &bitcoin::BlockHash) {
         // Read-only fast path: this runs for every block, IBD included, and
         // both tables are empty for all but the blocks at the tip.
-        if self.in_flight_blocks.read().contains_key(hash) {
-            self.in_flight_blocks.write().remove(hash);
+        if self.in_flight_blocks.read().values().any(|asked| asked.contains_key(hash)) {
+            self.in_flight_blocks.write().retain(|_, asked| {
+                asked.remove(hash);
+                !asked.is_empty()
+            });
         }
         if self.pending_compact.read().values().any(|p| p.hash == *hash) {
             self.pending_compact.write().retain(|_, p| p.hash != *hash);
@@ -9780,6 +9807,46 @@ mod tests {
         assert!(!pm.pending_compact.read().contains_key(&1));
         assert!(pm.pending_compact.read().contains_key(&2), "other peers are untouched");
         assert!(!pm.block_requested_from(1, &hash), "the peer's requests are forgotten too");
+    }
+
+    /// The in-flight table is charged to the peer that fills it. An `inv` is
+    /// peer-controlled input and every announced block we lack earns a
+    /// `getdata`, so recording those requests must not let a peer that keeps
+    /// announcing fresh hashes — none of which has to be a block anyone mined
+    /// — grow the table for as long as the records live.
+    #[test]
+    fn announced_blocks_cannot_grow_the_in_flight_table_without_bound() {
+        use bitcoin::hashes::Hash;
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+
+        let mut nth: u32 = 0;
+        for _ in 0..20 {
+            let inv: Vec<Inventory> = (0..200)
+                .map(|_| {
+                    nth += 1;
+                    let mut bytes = [0u8; 32];
+                    bytes[..4].copy_from_slice(&nth.to_le_bytes());
+                    Inventory::Block(bitcoin::BlockHash::from_byte_array(bytes))
+                })
+                .collect();
+            pm.handle_inv(1, inv);
+            // Drained, as a peer keeping its queue empty would: a full channel
+            // must not be what bounds this.
+            while rx1.try_recv().is_ok() {}
+        }
+        assert_eq!(nth as usize, 4000, "the peer announced more than the cap");
+
+        let in_flight = pm.in_flight_blocks.read();
+        assert_eq!(in_flight.len(), 1, "one entry per peer, not one per announced hash");
+        let asked = in_flight.get(&1).expect("the peer's records");
+        assert!(
+            asked.len() <= MAX_IN_FLIGHT_BLOCKS_PER_PEER,
+            "{} records retained for one peer, cap is {MAX_IN_FLIGHT_BLOCKS_PER_PEER}",
+            asked.len()
+        );
     }
 
     /// However a block arrives, every partial reconstruction of it is moot.

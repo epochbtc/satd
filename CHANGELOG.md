@@ -37,7 +37,7 @@ item below is (or will be) written up in full in the in-development
 
 ### Fixed
 
-- Compact block receive path hardened: a `cmpctblock`'s header is validated before the block is reconstructed, pending reconstructions are bounded per peer and expire, and a merkle mismatch after reconstruction falls back to fetching the full block instead of penalising the peer (Core parity; #763).
+- Compact block receive path hardened: a `cmpctblock`'s header is validated before the block is reconstructed, pending reconstructions and the record of which blocks were asked of a peer are bounded per peer and expire, and a merkle mismatch after reconstruction falls back to fetching the full block instead of penalising the peer (Core parity; #763).
 - Stratum work follows a tip the node reached through block download. Those blocks connect without a chain event, so work stayed on the old tip for up to 30 seconds after a node caught up — long enough for a Job Declaration client to be refused (#763).
 - A node that mined its own chain, and so had never been sent a header by a peer, counted itself as still in initial block download and ignored every transaction its peers announced. It now takes them (#759).
 - `verificationprogress` in `getblockchaininfo` and `getchainstates` is Bitcoin Core's transaction-count estimate, equal to Core's; it was the tip's timestamp over the current time and read 0.69 at genesis (#744).
