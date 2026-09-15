@@ -2354,6 +2354,53 @@ fn test_rpc_submitted_tx_relays_to_peer() {
     node_a.stop();
 }
 
+/// A node that mined its own chain still takes transactions from its peers.
+/// Node A mines every block locally and so never hears a header from a peer;
+/// it used to count itself as in initial block download for as long as that
+/// lasted, and ignored every transaction a peer announced. The reverse of
+/// `test_rpc_submitted_tx_relays_to_peer`, where the relaying node is the one
+/// that synced.
+#[test]
+fn test_node_that_mined_its_own_chain_accepts_relayed_tx() {
+    let p2p_port_a = find_available_port();
+    let mut node_a = TestNode::start(&[&format!("--port={}", p2p_port_a)]);
+    let wallet = DeterministicWallet::from_secret([0x74u8; 32]);
+    node_a
+        .rpc_call_with_params(
+            "generatetoaddress",
+            vec![serde_json::json!(101), serde_json::json!(wallet.address.to_string())],
+        )
+        .unwrap();
+
+    let mut node_b = TestNode::start(&[&format!("--connect=127.0.0.1:{}", p2p_port_a)]);
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 101,
+        Duration::from_secs(30),
+        "node B did not sync to height 101",
+    );
+
+    let dest = wallet.address.script_pubkey();
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(&node_b, &wallet, dest, 1_000);
+    node_b
+        .rpc_call_with_params("sendrawtransaction", vec![serde_json::json!(raw_hex)])
+        .unwrap();
+
+    poll_until(
+        || {
+            node_a
+                .rpc_call("getrawmempool")
+                .ok()
+                .and_then(|v| v["result"].as_array().cloned())
+                .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(txid.as_str())))
+        },
+        Duration::from_secs(30),
+        "a transaction node B relayed never reached node A, which mined its own chain",
+    );
+
+    node_b.stop();
+    node_a.stop();
+}
+
 #[test]
 fn test_parallel_ibd() {
     let p2p_port_a = find_available_port();
