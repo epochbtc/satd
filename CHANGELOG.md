@@ -26,6 +26,7 @@ item below is (or will be) written up in full in the in-development
   arm64 servers. The arm64 desktop carries Sparrow only, since Electrum and
   Liana publish no arm64 build; its welcome page names what is installed
   (#742).
+- Operator Manual: a new **Installing satd** chapter covering the Umbrel community store (`epochbtc/umbrel-apps`), the StartOS package (`epochbtc/satd-startos`), the appliance images, the container image and the tarballs; the README's quick start points at it.
 - A status page on the metrics listener, `statuspage=1`: a single-page, self-refreshing `sat-tui` for a browser, with connection strings from `statusadvertise`. Off by default (#749).
 - Streaming API: `Subscribe`/`Watch` responses carry `satd-version` and `satd-events-schema` gRPC headers; `STABILITY_POLICY.md` now states the SDK ↔ node compatibility rule.
 - Rust SDK: warns when the node is one minor version behind, refuses two or more (`StreamError::NodeTooOld`, override `allow_old_node()`) and any schema mismatch (`StreamError::SchemaMismatch`); `StreamClient::node_version()`.

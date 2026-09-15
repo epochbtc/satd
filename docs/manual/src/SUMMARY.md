@@ -2,6 +2,10 @@
 
 [Introduction](introduction.md)
 
+# Getting Started
+
+- [Installing satd](installing.md)
+
 # Operating
 
 - [Observability & Metrics](observability.md)
