@@ -118,6 +118,12 @@ const MAX_LOCATOR_SZ: usize = 101;
 /// normal paths were already handling. Generous relative to a single-block
 /// round trip, short enough that the map self-drains.
 const BLOCK_REFETCH_TTL: Duration = Duration::from_secs(600);
+
+/// How long a tip-following block request counts as in flight. A request is
+/// re-sent every few seconds while the block is still missing, which
+/// refreshes the stamp; an entry this old belongs to a request nobody is
+/// making any more.
+const BLOCK_IN_FLIGHT_TTL: Duration = Duration::from_secs(120);
 /// Token-bucket cap for the promotion-INV drain (§8): at most this many
 /// reloaded-and-promoted transactions are announced per drain tick, so a
 /// worst-case mass promotion spreads over minutes instead of bursting peers.
@@ -306,9 +312,15 @@ pub struct PeerManager {
     event_rx: tokio::sync::Mutex<mpsc::Receiver<NetEvent>>,
     /// Track the highest header height we've stored.
     headers_tip: AtomicU64,
-    /// Track blocks currently in-flight (requested but not yet received).
-    #[allow(dead_code)]
-    in_flight_blocks: RwLock<std::collections::HashSet<bitcoin::BlockHash>>,
+    /// Blocks we asked a peer for outside the IBD scheduler (a `getdata`
+    /// sent while following the tip): hash → the peers asked, and when.
+    /// Core's `mapBlocksInFlight`, as far as the compact block path needs it:
+    /// "did we request this block from this peer?" decides whether an
+    /// out-of-range `cmpctblock` still earns a full `getdata`, and whether a
+    /// peer that is not high-bandwidth may send one at all. Cleared when the
+    /// block arrives, when the peer disconnects, and after
+    /// [`BLOCK_IN_FLIGHT_TTL`].
+    in_flight_blocks: RwLock<HashMap<bitcoin::BlockHash, HashMap<PeerId, Instant>>>,
     /// Blocks explicitly requested by `getblockfrompeer`: hash → (the peer we
     /// asked, when we asked). A block arriving from *that* peer is routed to
     /// `ChainState::repair_block_data` instead of the normal accept path —
@@ -365,8 +377,11 @@ pub struct PeerManager {
     addrman: RwLock<crate::net::addrman::AddrMan>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<(Option<Arc<PeerStats>>, bitcoin::Block)>,
-    /// Pending compact blocks awaiting missing transactions.
-    pending_compact: RwLock<HashMap<bitcoin::BlockHash, compact::PendingCompact>>,
+    /// Compact block reconstructions awaiting a `blocktxn`, at most one per
+    /// peer. Bounded by the peer count, expired after
+    /// [`compact::COMPACT_PENDING_TIMEOUT`], dropped when the peer disconnects
+    /// or the block arrives by any route.
+    pending_compact: RwLock<HashMap<PeerId, compact::PendingCompact>>,
     /// Per-address reconnect backoff state.
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
     /// Exponential backoff for `.onion` reconnect candidates, keyed by host
@@ -625,7 +640,7 @@ impl PeerManager {
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
             headers_tip: AtomicU64::new(headers_tip_height as u64),
-            in_flight_blocks: RwLock::new(std::collections::HashSet::new()),
+            in_flight_blocks: RwLock::new(HashMap::new()),
             block_refetch: RwLock::new(HashMap::new()),
             connect_addrs: RwLock::new(Vec::new()),
             automatic_outbound: std::sync::atomic::AtomicBool::new(true),
@@ -2903,6 +2918,7 @@ impl PeerManager {
             // `setmocktime` moves the deadline the way it does in Core.
             if ticks.is_multiple_of(2) {
                 self.expire_addr_fetch_peers();
+                self.expire_compact_state();
             }
 
             // Yield to tokio runtime
@@ -2968,6 +2984,13 @@ impl PeerManager {
         // Return the peer's background-range requests to the pool so they
         // re-request promptly rather than waiting out the stale timeout.
         self.bg_downloader.write().note_peer_gone(id);
+        // A departed peer's partial compact block can never be completed,
+        // and its requests will never be answered.
+        self.pending_compact.write().remove(&id);
+        self.in_flight_blocks.write().retain(|_, asked| {
+            asked.remove(&id);
+            !asked.is_empty()
+        });
     }
 
     fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
@@ -3004,10 +3027,19 @@ impl PeerManager {
                 self.handle_getdata(id, inv);
             }
             NetworkMessage::SendCmpct(msg) => {
+                // Only version 2 (witness) compact blocks are spoken; Core
+                // ignores any other version outright. `send_compact` is the
+                // high-bandwidth flag, not "supports compact blocks": a peer
+                // sends `sendcmpct(0, 2)` to say it speaks v2 but wants
+                // announcements as headers.
+                if msg.version != 2 {
+                    return;
+                }
                 let mut peers = self.peers.write();
                 if let Some(handle) = peers.get_mut(&id) {
-                    handle.info.compact_blocks = msg.send_compact;
-                    tracing::debug!(id, version = msg.version, "Peer supports compact blocks");
+                    handle.info.compact_blocks = true;
+                    handle.info.hb_from = msg.send_compact;
+                    tracing::debug!(id, high_bandwidth = msg.send_compact, "Peer supports compact blocks");
                 }
             }
             NetworkMessage::CmpctBlock(msg) => {
@@ -3396,7 +3428,9 @@ impl PeerManager {
 
         if !blocks_to_get.is_empty() {
             // Direct fetch (fast path when the block extends our tip)…
-            self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get));
+            if self.send_to_peer(id, sync::make_getdata_blocks(&blocks_to_get)) {
+                self.note_blocks_requested(id, &blocks_to_get);
+            }
             // …plus rate-limited headers-first discovery: if the announced
             // block builds on a competing chain we don't have, the direct block
             // arrives with an unknown parent and stalls in the buffer; asking
@@ -3848,6 +3882,7 @@ impl PeerManager {
         if self.reject_if_mutated(id, &block) {
             return;
         }
+        self.note_block_arrived(&block.block_hash());
 
         // Operator-requested single-block re-fetch. Must come before every
         // other route: the normal paths reject a block we already have an
@@ -6346,33 +6381,201 @@ impl PeerManager {
         }
     }
 
+    /// Accept the header a `cmpctblock` carries, the way a `headers` message
+    /// would be, and return its index entry.
+    ///
+    /// `None` means stop: the parent is unknown (a rate-limited `getheaders`
+    /// has gone out), or the header is invalid. An invalid header here earns
+    /// no ban score. BIP 152 lets a high-bandwidth peer relay a block after
+    /// checking only its header, so Core's `MaybePunishNodeForBlock` goes
+    /// easy on header invalidity that arrives `via_compact_block`; satd goes
+    /// further and never penalises it, because the message was pushed to us,
+    /// not requested, and nothing is stored for a header that fails.
+    fn accept_compact_header(
+        &self,
+        id: PeerId,
+        header: &bitcoin::block::Header,
+    ) -> Option<crate::storage::blockindex::BlockIndexEntry> {
+        let hash = header.block_hash();
+        if self.chain_state.get_block_index(&header.prev_blockhash).is_none() {
+            self.maybe_send_getheaders(id);
+            return None;
+        }
+        match self.chain_state.accept_header(header) {
+            Ok(_) => {
+                self.apply_header_row_changes();
+                let htip = self.chain_state.headers_tip_height() as u64;
+                self.headers_tip.store(htip, Ordering::Relaxed);
+            }
+            Err(crate::chain::state::ChainError::Duplicate) => {}
+            Err(crate::chain::state::ChainError::PrevBlockNotFound) => {
+                self.maybe_send_getheaders(id);
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(id, %hash, error = %e, "ignoring cmpctblock with an invalid header");
+                return None;
+            }
+        }
+        self.chain_state.get_block_index(&hash)
+    }
+
+    /// Whether segwit is active for a block building on `prev`, for the
+    /// mutation check. `None` when the parent is unknown.
+    fn segwit_active_after(&self, prev: &bitcoin::BlockHash) -> Option<bool> {
+        self.chain_state.get_block_index(prev).map(|parent| {
+            crate::validation::block::segwit_active_at(self.chain_state.network, parent.height + 1)
+        })
+    }
+
+    /// BIP 152 `cmpctblock`. The gate order follows Bitcoin Core's
+    /// `CMPCTBLOCK` handler: nothing about the message is trusted, and no
+    /// mempool work is done or state kept, until its header has been
+    /// accepted and found to extend our tip.
     fn handle_compact_block(&self, id: PeerId, compact: bitcoin::bip152::HeaderAndShortIds) {
+        use crate::storage::blockindex::BlockStatus;
         let block_hash = compact.header.block_hash();
 
-        // Skip if we already have this block
-        if let Some(entry) = self.chain_state.get_block_index(&block_hash)
-            && entry.status != crate::storage::blockindex::BlockStatus::HeaderOnly {
+        // 1. Still syncing: take the header, leave the block to the download
+        // scheduler. Core: `if (!already_in_flight && !CanDirectFetch()) return`.
+        if self.ibd.read().is_some() || self.is_ibd() {
+            let _ = self.accept_compact_header(id, &compact.header);
+            return;
+        }
+
+        // 2 + 3. Parent known, header valid (proof of work, difficulty).
+        let Some(entry) = self.accept_compact_header(id, &compact.header) else {
+            return;
+        };
+
+        // 4. Already have the block.
+        if entry.status != BlockStatus::HeaderOnly {
+            self.note_block_arrived(&block_hash);
+            return;
+        }
+
+        let requested = self.block_requested_from(id, &block_hash);
+
+        // 5. Must beat our tip, and by no more than two blocks — Core keeps
+        // compact reconstruction to blocks right at the tip "to be extra
+        // careful about DoS possibilities". The index stores chain work, so
+        // the comparison is Core's own rather than a height proxy. A block we
+        // asked this peer for is still fetched, in full.
+        let tip_hash = self.chain_state.tip_hash();
+        let Some(tip) = self.chain_state.get_block_index(&tip_hash) else {
+            return;
+        };
+        if entry.height > tip.height + 2
+            || crate::chain::state::compare_u256(&entry.chainwork, &tip.chainwork) <= 0
+        {
+            if requested {
+                self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
+            }
+            return;
+        }
+
+        // 6. Only a high-bandwidth peer may push a block at us. Anyone else's
+        // `cmpctblock` counts as a header announcement: the header is in, so
+        // fetch the block the ordinary way. Core: `fRevertToHeaderProcessing`,
+        // and #32606's rule for unsolicited compact blocks.
+        let hb_to = self.peers.read().get(&id).is_some_and(|h| h.info.hb_to);
+        if !requested && !hb_to {
+            self.request_missing_blocks(id);
+            return;
+        }
+
+        // 7. One reconstruction per peer, at most three per block.
+        let superseded = {
+            let mut pending = self.pending_compact.write();
+            if pending.get(&id).is_some_and(|p| p.hash == block_hash) {
+                // Core keeps a failed partial block for exactly this: a peer
+                // may not restart a reconstruction of the same block.
+                tracing::debug!(id, %block_hash, "peer sent a compact block we are already reconstructing");
                 return;
             }
+            // Unlike Core, a block we asked this peer for does not get past
+            // the cap: satd's tip-following fetch asks every peer for a
+            // missing block, so "requested" would exempt nearly everyone. The
+            // full block that request asked for still comes.
+            let others = pending.values().filter(|p| p.hash == block_hash).count();
+            if others >= compact::MAX_CMPCT_INFLIGHT_PER_BLOCK {
+                tracing::debug!(id, %block_hash, others, "compact block already in flight from enough peers");
+                return;
+            }
+            pending.remove(&id)
+        };
+        if let Some(old) = superseded
+            && old.requested
+            && self
+                .chain_state
+                .get_block_index(&old.hash)
+                .is_some_and(|e| e.status == BlockStatus::HeaderOnly)
+        {
+            self.send_to_peer(id, sync::make_getdata_blocks(&[old.hash]));
+        }
 
-        match compact::try_reconstruct(&compact, &self.mempool) {
-            Ok(block) => {
-                if self.reject_if_mutated(id, &block) {
+        // 8. A shape no valid block has is misbehaviour (Core:
+        // `READ_STATUS_INVALID` from `InitData`).
+        if let Err(e) = compact::check_shape(&compact) {
+            tracing::debug!(id, %block_hash, reason = %e, "invalid cmpctblock");
+            self.add_ban_score(id, 100, "invalid-cmpctblock");
+            return;
+        }
+
+        // 9. Reconstruct from the mempool.
+        let reconstruction = match compact::try_reconstruct(&compact, &self.mempool) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(id, %block_hash, reason = %e, "invalid cmpctblock");
+                self.add_ban_score(id, 100, "invalid-cmpctblock");
+                return;
+            }
+        };
+        match reconstruction {
+            compact::Reconstruction::Complete(block) => {
+                // 10. A block that fails its merkle check after a full
+                // reconstruction may be an honest block whose short IDs
+                // collided with something in our mempool. Core returns
+                // `READ_STATUS_FAILED` and fetches the full block without
+                // penalty; the full block then goes through `handle_block`'s
+                // mutation check, which does penalise, since we asked for it.
+                let segwit_active = self.segwit_active_after(&block.header.prev_blockhash).unwrap_or(true);
+                if crate::validation::block::is_block_mutated(&block, segwit_active) {
+                    tracing::debug!(
+                        id, %block_hash,
+                        "compact block failed merkle check, possible short-ID collision; requesting full block"
+                    );
+                    self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
+                    self.note_blocks_requested(id, &[block_hash]);
+                    self.pending_compact.write().insert(
+                        id,
+                        compact::PendingCompact::failed(block_hash, compact.header),
+                    );
                     return;
                 }
                 tracing::debug!(%block_hash, "Compact block fully reconstructed from mempool");
                 let _ = self.block_tx.send((self.peer_stats(id), block));
             }
-            Err(pending) => {
-                if pending.missing_indices.is_empty() {
-                    return; // Malformed
-                }
+            compact::Reconstruction::Partial { txs, missing_indices } => {
+                // 11. Ask the peer for what the mempool could not supply.
                 tracing::debug!(
                     %block_hash,
-                    missing = pending.missing_indices.len(),
+                    missing = missing_indices.len(),
                     "Compact block incomplete, requesting missing txs"
                 );
-                let request = compact::make_get_block_txn(block_hash, &pending.missing_indices);
+                let request = compact::make_get_block_txn(block_hash, &missing_indices);
+                self.pending_compact.write().insert(
+                    id,
+                    compact::PendingCompact {
+                        hash: block_hash,
+                        header: compact.header,
+                        txs,
+                        missing_indices,
+                        since: Instant::now(),
+                        requested,
+                        failed: false,
+                    },
+                );
                 self.send_to_peer(
                     id,
                     NetworkMessage::GetBlockTxn(
@@ -6381,47 +6584,98 @@ impl PeerManager {
                         },
                     ),
                 );
-                self.pending_compact.write().insert(block_hash, pending);
             }
         }
     }
 
+    /// BIP 152 `getblocktxn`. Bitcoin Core's rules: a block we do not hold is
+    /// ignored; one more than [`compact::MAX_BLOCKTXN_DEPTH`] below the tip is
+    /// sent in full, so a peer cannot turn cheap requests into disk reads for
+    /// a few bytes of reply; an index past the end of the block is
+    /// misbehaviour.
     fn handle_get_block_txn(
         &self,
         id: PeerId,
         request: bitcoin::bip152::BlockTransactionsRequest,
     ) {
-        if let Some(block) = self.chain_state.get_block(&request.block_hash) {
-            match bitcoin::bip152::BlockTransactions::from_request(&request, &block) {
-                Ok(txns) => {
-                    self.send_to_peer(
-                        id,
-                        NetworkMessage::BlockTxn(
-                            bitcoin::p2p::message_compact_blocks::BlockTxn {
-                                transactions: txns,
-                            },
-                        ),
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(id, "GetBlockTxn request out of range: {}", e);
-                }
+        let Some(entry) = self.chain_state.get_block_index(&request.block_hash) else {
+            tracing::debug!(id, hash = %request.block_hash, "getblocktxn for a block we don't have");
+            return;
+        };
+        if entry.height.saturating_add(compact::MAX_BLOCKTXN_DEPTH) < self.chain_state.tip_height() {
+            tracing::debug!(
+                id, hash = %request.block_hash,
+                "getblocktxn for a block more than {} deep; sending the full block",
+                compact::MAX_BLOCKTXN_DEPTH
+            );
+            self.handle_getdata(id, vec![Inventory::WitnessBlock(request.block_hash)]);
+            return;
+        }
+        let Some(block) = self.chain_state.get_block(&request.block_hash) else {
+            tracing::debug!(id, hash = %request.block_hash, "getblocktxn for a block we don't have");
+            return;
+        };
+        match bitcoin::bip152::BlockTransactions::from_request(&request, &block) {
+            Ok(txns) => {
+                self.send_to_peer(
+                    id,
+                    NetworkMessage::BlockTxn(
+                        bitcoin::p2p::message_compact_blocks::BlockTxn {
+                            transactions: txns,
+                        },
+                    ),
+                );
+            }
+            Err(e) => {
+                tracing::debug!(id, "getblocktxn with out-of-bounds tx indices: {}", e);
+                self.add_ban_score(id, 100, "getblocktxn-out-of-range");
             }
         }
     }
 
+    /// BIP 152 `blocktxn`: the answer to a `getblocktxn` we sent this peer.
     fn handle_block_txn(&self, id: PeerId, txns: bitcoin::bip152::BlockTransactions) {
         let block_hash = txns.block_hash;
-        let pending = self.pending_compact.write().remove(&block_hash);
-        if let Some(pending) = pending {
-            if let Some(block) = compact::complete_pending(pending, &txns) {
-                if self.reject_if_mutated(id, &block) {
-                    return;
-                }
+        // Only the reconstruction this peer has open, for this block. Core
+        // ignores a `blocktxn` "for block we weren't expecting".
+        let pending = {
+            let mut pending = self.pending_compact.write();
+            match pending.get(&id) {
+                Some(p) if p.hash == block_hash => pending.remove(&id),
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else {
+            tracing::debug!(id, %block_hash, "blocktxn for a block we did not request from this peer");
+            return;
+        };
+        if pending.failed {
+            // Core: "previous compact block reconstruction attempt failed".
+            self.add_ban_score(id, 100, "blocktxn-after-failed-reconstruction");
+            return;
+        }
+        let header = pending.header;
+        let segwit_active = self.segwit_active_after(&header.prev_blockhash).unwrap_or(true);
+        match compact::complete_pending(pending, &txns, segwit_active) {
+            Ok(block) => {
                 tracing::debug!(%block_hash, "Compact block completed with BlockTxn");
                 let _ = self.block_tx.send((self.peer_stats(id), block));
-            } else {
-                tracing::debug!(%block_hash, "Failed to complete compact block");
+            }
+            Err(compact::CompleteError::Invalid) => {
+                tracing::debug!(id, %block_hash, "blocktxn does not match the compact block");
+                self.add_ban_score(id, 100, "invalid-blocktxn");
+            }
+            Err(compact::CompleteError::Mutated) => {
+                // Core: "Might have collided, fall back to getdata now".
+                tracing::debug!(
+                    id, %block_hash,
+                    "compact block failed merkle check, possible short-ID collision; requesting full block"
+                );
+                self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
+                self.note_blocks_requested(id, &[block_hash]);
+                self.pending_compact
+                    .write()
+                    .insert(id, compact::PendingCompact::failed(block_hash, header));
             }
         }
     }
@@ -6461,8 +6715,75 @@ impl PeerManager {
 
         if !to_request.is_empty() {
             tracing::debug!(count = to_request.len(), "Requesting blocks for best header chain");
-            self.send_to_peer(id, sync::make_getdata_blocks(&to_request));
+            if self.send_to_peer(id, sync::make_getdata_blocks(&to_request)) {
+                self.note_blocks_requested(id, &to_request);
+            }
         }
+    }
+
+    /// Record that `id` was asked for `hashes` (see `in_flight_blocks`).
+    fn note_blocks_requested(&self, id: PeerId, hashes: &[bitcoin::BlockHash]) {
+        let now = Instant::now();
+        let mut in_flight = self.in_flight_blocks.write();
+        for hash in hashes {
+            in_flight.entry(*hash).or_default().insert(id, now);
+        }
+    }
+
+    /// Whether we asked `id` for `hash` recently enough to still expect it.
+    fn block_requested_from(&self, id: PeerId, hash: &bitcoin::BlockHash) -> bool {
+        self.in_flight_blocks
+            .read()
+            .get(hash)
+            .and_then(|asked| asked.get(&id))
+            .is_some_and(|at| at.elapsed() < BLOCK_IN_FLIGHT_TTL)
+    }
+
+    /// A block arrived, by whatever route: nothing is in flight for it any
+    /// more, and no partial compact reconstruction of it needs finishing.
+    fn note_block_arrived(&self, hash: &bitcoin::BlockHash) {
+        // Read-only fast path: this runs for every block, IBD included, and
+        // both tables are empty for all but the blocks at the tip.
+        if self.in_flight_blocks.read().contains_key(hash) {
+            self.in_flight_blocks.write().remove(hash);
+        }
+        if self.pending_compact.read().values().any(|p| p.hash == *hash) {
+            self.pending_compact.write().retain(|_, p| p.hash != *hash);
+        }
+    }
+
+    /// Drop compact reconstructions that have waited longer than
+    /// [`compact::COMPACT_PENDING_TIMEOUT`] and stale in-flight records. A
+    /// dropped reconstruction of a block we had asked that peer for is
+    /// re-requested as a full block, so a requested block is never left
+    /// unfetched because a `blocktxn` never came.
+    fn expire_compact_state(&self) {
+        let expired: Vec<(PeerId, bitcoin::BlockHash, bool)> = {
+            let mut pending = self.pending_compact.write();
+            let stale: Vec<PeerId> = pending
+                .iter()
+                .filter(|(_, p)| p.since.elapsed() >= compact::COMPACT_PENDING_TIMEOUT)
+                .map(|(id, _)| *id)
+                .collect();
+            stale
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|p| (id, p.hash, p.requested)))
+                .collect()
+        };
+        for (id, hash, requested) in expired {
+            let have_data = self
+                .chain_state
+                .get_block_index(&hash)
+                .is_some_and(|e| e.status != crate::storage::blockindex::BlockStatus::HeaderOnly);
+            tracing::debug!(id, %hash, requested, have_data, "compact block reconstruction timed out");
+            if requested && !have_data {
+                self.send_to_peer(id, sync::make_getdata_blocks(&[hash]));
+            }
+        }
+        self.in_flight_blocks.write().retain(|_, asked| {
+            asked.retain(|_, at| at.elapsed() < BLOCK_IN_FLIGHT_TTL);
+            !asked.is_empty()
+        });
     }
 
     /// Queue a message to a peer. Returns whether the message was actually
@@ -6897,7 +7218,13 @@ impl PeerManager {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Negotiate compact block support (BIP 152, version 2 = with witness)
+        // Negotiate compact block support (BIP 152, version 2 = with witness).
+        // This is `hb=1`, so the peer may push us `cmpctblock`s from here on.
+        // The flag is set before the message goes out: the peer's first
+        // `cmpctblock` can be processed before this task resumes.
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.hb_to = true;
+        }
         writer.send(NetworkMessage::SendCmpct(
             bitcoin::p2p::message_compact_blocks::SendCmpct {
                 send_compact: true,
@@ -9312,5 +9639,181 @@ mod tests {
             second.is_err(),
             "binding an already-bound address must return Err, not panic or succeed"
         );
+    }
+
+    // ---- BIP 152 compact block receive state ----
+
+    /// A regtest block on top of the manager's genesis tip, ground to a valid
+    /// proof of work. `salt` varies the coinbase so sibling blocks differ.
+    fn regtest_child_of_genesis(pm: &PeerManager, salt: u8) -> bitcoin::Block {
+        use bitcoin::hashes::Hash;
+        let genesis = pm.chain_state.tip_hash();
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::script::Builder::new()
+                    .push_int(1)
+                    .push_int(i64::from(salt))
+                    .into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50 * 100_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::from_consensus(0x2000_0000),
+                prev_blockhash: genesis,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_296_688_602 + 600,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while block.header.validate_pow(block.header.target()).is_err() {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    fn stale_pending(
+        hash: bitcoin::BlockHash,
+        header: bitcoin::block::Header,
+        requested: bool,
+    ) -> compact::PendingCompact {
+        compact::PendingCompact {
+            hash,
+            header,
+            txs: vec![None],
+            missing_indices: vec![0],
+            since: Instant::now()
+                .checked_sub(compact::COMPACT_PENDING_TIMEOUT + Duration::from_secs(1))
+                .expect("monotonic clock far enough from its origin"),
+            requested,
+            failed: false,
+        }
+    }
+
+    /// A reconstruction whose `blocktxn` never comes is dropped after
+    /// `COMPACT_PENDING_TIMEOUT`. If we had asked that peer for the block, the
+    /// full block is requested from it, so the block is not left unfetched;
+    /// an unrequested push is simply forgotten.
+    #[test]
+    fn pending_entry_expires_and_requested_block_falls_back_to_getdata() {
+        use bitcoin::hashes::Hash;
+        let pm = empty_peer_manager();
+        let block = regtest_child_of_genesis(&pm, 1);
+        let hash = block.block_hash();
+        pm.chain_state.accept_header(&block.header).expect("header accepted");
+
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        let (h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h1);
+        pm.peers.write().insert(2, h2);
+
+        {
+            let mut pending = pm.pending_compact.write();
+            pending.insert(1, stale_pending(hash, block.header, true));
+            pending.insert(2, stale_pending(hash, block.header, false));
+            // A fresh entry must survive the sweep.
+            let other = bitcoin::BlockHash::all_zeros();
+            let mut fresh = stale_pending(other, block.header, true);
+            fresh.since = Instant::now();
+            pending.insert(3, fresh);
+        }
+
+        pm.expire_compact_state();
+
+        let pending = pm.pending_compact.read();
+        assert!(!pending.contains_key(&1) && !pending.contains_key(&2), "stale entries dropped");
+        assert!(pending.contains_key(&3), "a fresh entry is kept");
+        drop(pending);
+
+        match rx1.try_recv() {
+            Ok(NetworkMessage::GetData(inv)) => {
+                assert_eq!(inv, vec![Inventory::WitnessBlock(hash)]);
+            }
+            other => panic!("the requested block must be fetched in full, got {other:?}"),
+        }
+        assert!(rx2.try_recv().is_err(), "an unrequested push earns no getdata");
+    }
+
+    /// A departed peer's reconstruction can never complete; it must not keep
+    /// its memory.
+    #[test]
+    fn disconnect_drops_the_peers_pending_entry() {
+        let pm = empty_peer_manager();
+        let block = regtest_child_of_genesis(&pm, 2);
+        let hash = block.block_hash();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        pm.peers.write().insert(1, mk_handle(1, addr, Direction::Inbound, PeerState::Connected));
+        pm.peers.write().insert(2, mk_handle(2, addr, Direction::Inbound, PeerState::Connected));
+        pm.pending_compact.write().insert(1, stale_pending(hash, block.header, false));
+        pm.pending_compact.write().insert(2, stale_pending(hash, block.header, false));
+        pm.note_blocks_requested(1, &[hash]);
+
+        pm.handle_peer_disconnected(1);
+
+        assert!(!pm.pending_compact.read().contains_key(&1));
+        assert!(pm.pending_compact.read().contains_key(&2), "other peers are untouched");
+        assert!(!pm.block_requested_from(1, &hash), "the peer's requests are forgotten too");
+    }
+
+    /// However a block arrives, every partial reconstruction of it is moot.
+    #[test]
+    fn full_block_arrival_drops_every_pending_entry_for_that_hash() {
+        let pm = empty_peer_manager();
+        let block = regtest_child_of_genesis(&pm, 3);
+        let other = regtest_child_of_genesis(&pm, 4);
+        let hash = block.block_hash();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        for id in 1..=3 {
+            pm.peers.write().insert(id, mk_handle(id, addr, Direction::Inbound, PeerState::Connected));
+        }
+        pm.pending_compact.write().insert(1, stale_pending(hash, block.header, false));
+        pm.pending_compact.write().insert(2, stale_pending(hash, block.header, false));
+        pm.pending_compact
+            .write()
+            .insert(3, stale_pending(other.block_hash(), other.header, false));
+        pm.note_blocks_requested(1, &[hash]);
+
+        pm.handle_block(3, block);
+
+        let pending = pm.pending_compact.read();
+        assert!(!pending.contains_key(&1) && !pending.contains_key(&2));
+        assert!(pending.contains_key(&3), "a reconstruction of another block survives");
+        assert!(!pm.block_requested_from(1, &hash));
+    }
+
+    /// `sendcmpct`'s boolean is the high-bandwidth flag, and only version 2 is
+    /// spoken. satd used to store the flag as "supports compact blocks".
+    #[test]
+    fn sendcmpct_records_version_two_support_and_the_high_bandwidth_flag() {
+        use bitcoin::p2p::message_compact_blocks::SendCmpct;
+        let pm = empty_peer_manager();
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        pm.peers.write().insert(1, mk_handle(1, addr, Direction::Inbound, PeerState::Connected));
+        let info = |pm: &PeerManager| {
+            let peers = pm.peers.read();
+            let h = &peers[&1].info;
+            (h.compact_blocks, h.hb_from)
+        };
+
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 1 }));
+        assert_eq!(info(&pm), (false, false), "version 1 is ignored");
+
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        assert_eq!(info(&pm), (true, false), "low-bandwidth v2");
+
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+        assert_eq!(info(&pm), (true, true), "high-bandwidth v2");
     }
 }

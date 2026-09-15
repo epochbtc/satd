@@ -6,59 +6,146 @@
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::{Block, BlockHash, Transaction};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::mempool::pool::Mempool;
 
+/// How long a partial reconstruction waits for its `blocktxn` before it is
+/// dropped. Bitcoin Core ties the partial block to the peer's in-flight
+/// request and lets the block download timeout reap it; satd keeps the
+/// partial block in its own table, so it needs its own clock.
+pub const COMPACT_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bitcoin Core's `MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK`: at most this many
+/// peers may have a partial reconstruction of one block in progress at once.
+pub const MAX_CMPCT_INFLIGHT_PER_BLOCK: usize = 3;
+
+/// Bitcoin Core's `MAX_BLOCKTXN_DEPTH`: a `getblocktxn` for a block deeper
+/// than this below the tip is answered with the full block instead. It is
+/// below `MIN_BLOCKS_TO_KEEP` (288), so a pruned node can always serve it.
+pub const MAX_BLOCKTXN_DEPTH: u32 = 10;
+
+/// The most transactions a compact block may claim. Bitcoin Core's bound in
+/// `PartiallyDownloadedBlock::InitData`: `MAX_BLOCK_WEIGHT /
+/// MIN_SERIALIZABLE_TRANSACTION_WEIGHT`, i.e. 4,000,000 / (4 * 10) — no
+/// block can hold more transactions than that, whatever a peer claims.
+pub const MAX_COMPACT_BLOCK_TXS: usize = 4_000_000 / (4 * 10);
+
 /// A partially-reconstructed compact block awaiting missing transactions.
+///
+/// One per peer: the manager keys these by the peer that sent the
+/// `cmpctblock`, so the memory they hold is bounded by the peer count rather
+/// than by how fast peers can send messages.
 pub struct PendingCompact {
+    pub hash: BlockHash,
     pub header: bitcoin::block::Header,
     /// Ordered transaction slots: Some = have it, None = need it.
     pub txs: Vec<Option<Transaction>>,
     /// Indices of transactions we requested via GetBlockTxn.
     pub missing_indices: Vec<u64>,
+    /// When the entry was created, for [`COMPACT_PENDING_TIMEOUT`].
+    pub since: Instant,
+    /// We had asked this peer for the block before its `cmpctblock` arrived.
+    pub requested: bool,
+    /// Reconstruction failed its merkle check and the full block was
+    /// requested instead. The entry is kept so that a second `cmpctblock`
+    /// for the same block from the same peer is ignored, as Core does.
+    pub failed: bool,
+}
+
+impl PendingCompact {
+    /// A placeholder for a block whose reconstruction failed and was
+    /// re-requested in full from the same peer.
+    pub fn failed(hash: BlockHash, header: bitcoin::block::Header) -> Self {
+        Self {
+            hash,
+            header,
+            txs: Vec::new(),
+            missing_indices: Vec::new(),
+            since: Instant::now(),
+            requested: true,
+            failed: true,
+        }
+    }
+}
+
+/// A `cmpctblock` that no valid block could produce. Bitcoin Core's
+/// `READ_STATUS_INVALID` from `PartiallyDownloadedBlock::InitData`: the peer
+/// is misbehaving, whatever the header says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeError {
+    /// Neither short IDs nor prefilled transactions.
+    Empty,
+    /// More transactions than [`MAX_COMPACT_BLOCK_TXS`].
+    TooManyTxs,
+    /// A prefilled transaction with no inputs and no outputs.
+    NullPrefilledTx,
+    /// A prefilled index past `u16::MAX`, or past the end of the block.
+    PrefilledIndexOutOfRange,
+}
+
+impl std::fmt::Display for ShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "empty compact block",
+            Self::TooManyTxs => "compact block claims too many transactions",
+            Self::NullPrefilledTx => "null prefilled transaction",
+            Self::PrefilledIndexOutOfRange => "prefilled transaction index out of range",
+        })
+    }
+}
+
+/// Check the shape Core checks before it touches the mempool
+/// (`blockencodings.cpp`, `InitData`). Every failure here is
+/// `READ_STATUS_INVALID`.
+pub fn check_shape(compact: &HeaderAndShortIds) -> Result<(), ShapeError> {
+    if compact.short_ids.is_empty() && compact.prefilled_txs.is_empty() {
+        return Err(ShapeError::Empty);
+    }
+    if compact.short_ids.len() + compact.prefilled_txs.len() > MAX_COMPACT_BLOCK_TXS {
+        return Err(ShapeError::TooManyTxs);
+    }
+    // Indexes are differentially encoded: each is the gap after the previous
+    // prefilled slot. Core's arithmetic, including starting at -1.
+    let mut last: i64 = -1;
+    for (i, prefilled) in compact.prefilled_txs.iter().enumerate() {
+        if prefilled.tx.input.is_empty() && prefilled.tx.output.is_empty() {
+            return Err(ShapeError::NullPrefilledTx);
+        }
+        last += i64::from(prefilled.idx) + 1;
+        if last > i64::from(u16::MAX) {
+            return Err(ShapeError::PrefilledIndexOutOfRange);
+        }
+        // A slot past every short ID plus every prefilled tx placed so far
+        // has neither a transaction nor a short ID.
+        if last as usize > compact.short_ids.len() + i {
+            return Err(ShapeError::PrefilledIndexOutOfRange);
+        }
+    }
+    Ok(())
+}
+
+/// The result of matching a well-formed compact block against the mempool.
+pub enum Reconstruction {
+    /// Every slot was filled; the block still has to pass its merkle check.
+    Complete(Block),
+    /// Some slots must be requested with `getblocktxn`.
+    Partial {
+        txs: Vec<Option<Transaction>>,
+        missing_indices: Vec<u64>,
+    },
 }
 
 /// Attempt to reconstruct a full block from a compact block using the mempool.
 ///
-/// Returns Ok(Block) if all transactions were found, or Err(PendingCompact)
-/// with the missing indices if some transactions are not in the mempool.
-#[allow(clippy::result_large_err)]
+/// Returns [`ShapeError`] for a message no valid block could produce; call
+/// [`check_shape`] first if the distinction matters before the mempool pass.
 pub fn try_reconstruct(
     compact: &HeaderAndShortIds,
     mempool: &Mempool,
-) -> Result<Block, PendingCompact> {
+) -> Result<Reconstruction, ShapeError> {
+    check_shape(compact)?;
     let siphash_keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
-
-    // Build a lookup table: short_id -> Transaction from mempool.
-    //
-    // This is the one assist-adjacent consumer that deliberately reads the
-    // FULL union (`get_all_entries`), NOT a scope-filtered view: a peer's
-    // compact block may contain transactions our policy quarantines, and a
-    // quarantined tx we already hold lets us reconstruct the block locally
-    // instead of paying a `getblocktxn` round trip (design §2.4). Filtering by
-    // scope here would silently reintroduce those round trips. Validating /
-    // reconstructing someone else's block is consensus-only and never
-    // consults policy (I1 corollary, design §3) — so do NOT filter here.
-    //
-    // A short ID is only 6 bytes, so two distinct mempool transactions can
-    // hash to the same short ID (crafted, or ~1-in-2^48 by chance). Using
-    // either one to fill a slot would be a guess: if it is the wrong tx the
-    // reconstructed block fails its merkle check and the honest relayer is
-    // banned, with no `getblocktxn` fallback. So a short ID that matches more
-    // than one mempool tx is marked ambiguous (`None`) and treated as
-    // unavailable — the slot is requested instead. This mirrors Bitcoin Core's
-    // `PartiallyDownloadedBlock::InitData`, which resets a slot when a second
-    // mempool tx collides on its short ID.
-    let all_entries = mempool.get_all_entries();
-    let mut mempool_by_short_id: HashMap<ShortId, Option<Transaction>> = HashMap::new();
-    for (_txid, entry) in &all_entries {
-        let wtxid = entry.tx.compute_wtxid();
-        let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
-        mempool_by_short_id
-            .entry(short_id)
-            .and_modify(|slot| *slot = None) // second match on this short ID: ambiguous
-            .or_insert_with(|| Some(entry.tx.clone()));
-    }
 
     // Short IDs that the peer announced more than once. Two block slots sharing
     // one short ID must never both be filled from the same mempool tx (that
@@ -66,27 +153,59 @@ pub fn try_reconstruct(
     // via `getblocktxn` so the peer supplies the real, distinct transactions.
     // Core hard-fails reconstruction on this collision and re-requests; routing
     // the individual slots is the same outcome with less bandwidth.
-    let mut short_id_counts: HashMap<ShortId, u32> = HashMap::new();
+    let mut short_id_counts: HashMap<ShortId, u32> = HashMap::with_capacity(compact.short_ids.len());
     for short_id in &compact.short_ids {
         *short_id_counts.entry(*short_id).or_insert(0) += 1;
     }
+
+    // Match the mempool against the announced short IDs: short_id -> the one
+    // mempool tx carrying it, or `None` when more than one does.
+    //
+    // This is the one assist-adjacent consumer that deliberately reads the
+    // FULL union, NOT a scope-filtered view: a peer's compact block may
+    // contain transactions our policy quarantines, and a quarantined tx we
+    // already hold lets us reconstruct the block locally instead of paying a
+    // `getblocktxn` round trip (design §2.4). Filtering by scope here would
+    // silently reintroduce those round trips. Validating / reconstructing
+    // someone else's block is consensus-only and never consults policy (I1
+    // corollary, design §3) — so do NOT filter here.
+    //
+    // A short ID is only 6 bytes, so two distinct mempool transactions can
+    // hash to the same short ID (crafted, or ~1-in-2^48 by chance). Using
+    // either one to fill a slot would be a guess: if it is the wrong tx the
+    // reconstructed block fails its merkle check. So a short ID that matches
+    // more than one mempool tx is marked ambiguous (`None`) and treated as
+    // unavailable — the slot is requested instead. This mirrors Bitcoin Core's
+    // `PartiallyDownloadedBlock::InitData`, which resets a slot when a second
+    // mempool tx collides on its short ID.
+    //
+    // The mempool is walked under its read lock without copying it: only a
+    // transaction whose short ID the peer actually announced is cloned.
+    let mempool_by_short_id: HashMap<ShortId, Option<Transaction>> = mempool.with_entries(|entries| {
+        let mut matched: HashMap<ShortId, Option<Transaction>> = HashMap::new();
+        for entry in entries.values() {
+            let wtxid = entry.tx.compute_wtxid();
+            let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), siphash_keys);
+            if !short_id_counts.contains_key(&short_id) {
+                continue;
+            }
+            matched
+                .entry(short_id)
+                .and_modify(|slot| *slot = None) // second match on this short ID: ambiguous
+                .or_insert_with(|| Some(entry.tx.clone()));
+        }
+        matched
+    });
 
     // Total number of transactions in the block
     let total_txs = compact.prefilled_txs.len() + compact.short_ids.len();
     let mut txs: Vec<Option<Transaction>> = vec![None; total_txs];
 
-    // Place prefilled transactions (differentially encoded indices)
+    // Place prefilled transactions (differentially encoded indices). The
+    // shape check has already proved every index lands inside the block.
     let mut idx = 0usize;
     for prefilled in &compact.prefilled_txs {
         idx += prefilled.idx as usize;
-        if idx >= total_txs {
-            // Malformed compact block
-            return Err(PendingCompact {
-                header: compact.header,
-                txs: vec![],
-                missing_indices: vec![],
-            });
-        }
         txs[idx] = Some(prefilled.tx.clone());
         idx += 1;
     }
@@ -113,48 +232,70 @@ pub fn try_reconstruct(
     if missing_indices.is_empty() {
         // All transactions found — reconstruct the block
         let txdata: Vec<Transaction> = txs.into_iter().map(|t| t.unwrap()).collect();
-        Ok(Block {
+        Ok(Reconstruction::Complete(Block {
             header: compact.header,
             txdata,
-        })
+        }))
     } else {
-        Err(PendingCompact {
-            header: compact.header,
+        Ok(Reconstruction::Partial {
             txs,
             missing_indices,
         })
     }
 }
 
-/// Complete a pending compact block with the missing transactions from a BlockTxn response.
+/// Why a `blocktxn` did not complete a pending reconstruction. The split is
+/// Bitcoin Core's `READ_STATUS_INVALID` versus `READ_STATUS_FAILED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteError {
+    /// The reply does not answer the request: wrong transaction count, or
+    /// the entry has nothing outstanding. The peer is misbehaving.
+    Invalid,
+    /// The filled block fails its merkle or witness commitment check. A
+    /// short-ID collision produces this on an honest relay, so the right
+    /// response is to fetch the full block, not to penalise the peer.
+    Mutated,
+}
+
+/// Complete a pending compact block with the missing transactions from a
+/// `blocktxn` response, then apply the mutation check Core runs at the end of
+/// `FillBlock`.
 pub fn complete_pending(
     pending: PendingCompact,
     block_txns: &BlockTransactions,
-) -> Option<Block> {
+    segwit_active: bool,
+) -> Result<Block, CompleteError> {
+    if pending.failed || pending.missing_indices.is_empty() {
+        return Err(CompleteError::Invalid);
+    }
     let mut txs = pending.txs;
 
     if block_txns.transactions.len() != pending.missing_indices.len() {
-        return None;
+        return Err(CompleteError::Invalid);
     }
 
     for (tx, &idx) in block_txns.transactions.iter().zip(pending.missing_indices.iter()) {
         let i = idx as usize;
         if i >= txs.len() {
-            return None;
+            return Err(CompleteError::Invalid);
         }
         txs[i] = Some(tx.clone());
     }
 
     // Check all slots are filled
     if txs.iter().any(|t| t.is_none()) {
-        return None;
+        return Err(CompleteError::Invalid);
     }
 
     let txdata: Vec<Transaction> = txs.into_iter().map(|t| t.unwrap()).collect();
-    Some(Block {
+    let block = Block {
         header: pending.header,
         txdata,
-    })
+    };
+    if crate::validation::block::is_block_mutated(&block, segwit_active) {
+        return Err(CompleteError::Mutated);
+    }
+    Ok(block)
 }
 
 /// Create a GetBlockTxn request for missing transactions.
@@ -201,6 +342,22 @@ mod tests {
         }
     }
 
+    fn pending_for(
+        header: bitcoin::block::Header,
+        txs: Vec<Option<Transaction>>,
+        missing_indices: Vec<u64>,
+    ) -> PendingCompact {
+        PendingCompact {
+            hash: header.block_hash(),
+            header,
+            txs,
+            missing_indices,
+            since: Instant::now(),
+            requested: false,
+            failed: false,
+        }
+    }
+
     #[test]
     fn test_make_compact_block() {
         let block = regtest_genesis();
@@ -236,38 +393,38 @@ mod tests {
     fn test_complete_pending_wrong_count() {
         let header = regtest_genesis().header;
         let tx = make_test_tx(5000);
-        let pending = PendingCompact {
-            header,
-            txs: vec![Some(tx.clone()), None, None],
-            missing_indices: vec![1, 2],
-        };
+        let pending = pending_for(header, vec![Some(tx.clone()), None, None], vec![1, 2]);
         // Provide only 1 transaction but 2 are missing
         let block_txns = BlockTransactions {
             block_hash: header.block_hash(),
             transactions: vec![make_test_tx(100)],
         };
-        assert!(complete_pending(pending, &block_txns).is_none());
+        assert_eq!(
+            complete_pending(pending, &block_txns, false).unwrap_err(),
+            CompleteError::Invalid
+        );
     }
 
     #[test]
     fn test_complete_pending_success() {
-        let header = regtest_genesis().header;
         let tx0 = make_test_tx(5000);
         let tx1 = make_test_tx(1000);
         let tx2 = make_test_tx(2000);
-
-        let pending = PendingCompact {
+        let mut header = regtest_genesis().header;
+        header.merkle_root = Block {
             header,
-            txs: vec![Some(tx0.clone()), None, None],
-            missing_indices: vec![1, 2],
-        };
+            txdata: vec![tx0.clone(), tx1.clone(), tx2.clone()],
+        }
+        .compute_merkle_root()
+        .unwrap();
+
+        let pending = pending_for(header, vec![Some(tx0.clone()), None, None], vec![1, 2]);
         let block_txns = BlockTransactions {
             block_hash: header.block_hash(),
             transactions: vec![tx1.clone(), tx2.clone()],
         };
-        let result = complete_pending(pending, &block_txns);
-        assert!(result.is_some());
-        let block = result.unwrap();
+        let block = complete_pending(pending, &block_txns, false)
+            .unwrap_or_else(|e| panic!("expected a completed block, got {e:?}"));
         assert_eq!(block.header, header);
         assert_eq!(block.txdata.len(), 3);
         assert_eq!(block.txdata[0], tx0);
@@ -280,17 +437,16 @@ mod tests {
         let header = regtest_genesis().header;
         let tx0 = make_test_tx(5000);
 
-        let pending = PendingCompact {
-            header,
-            txs: vec![Some(tx0)],
-            // Index 5 is out of bounds (only 1 slot)
-            missing_indices: vec![5],
-        };
+        // Index 5 is out of bounds (only 1 slot)
+        let pending = pending_for(header, vec![Some(tx0)], vec![5]);
         let block_txns = BlockTransactions {
             block_hash: header.block_hash(),
             transactions: vec![make_test_tx(100)],
         };
-        assert!(complete_pending(pending, &block_txns).is_none());
+        assert_eq!(
+            complete_pending(pending, &block_txns, false).unwrap_err(),
+            CompleteError::Invalid
+        );
     }
 
     #[test]
@@ -303,13 +459,12 @@ mod tests {
         let compact = make_compact_block(&block).unwrap();
 
         let mempool = Mempool::new(300_000_000, 1_000);
-        let result = try_reconstruct(&compact, &mempool);
-        match result {
-            Ok(reconstructed) => {
+        match try_reconstruct(&compact, &mempool) {
+            Ok(Reconstruction::Complete(reconstructed)) => {
                 assert_eq!(reconstructed.header, block.header);
                 assert_eq!(reconstructed.txdata.len(), block.txdata.len());
             }
-            Err(_) => panic!("expected successful reconstruction of coinbase-only block"),
+            _ => panic!("expected successful reconstruction of coinbase-only block"),
         }
     }
 
@@ -325,14 +480,11 @@ mod tests {
 
         let compact = make_compact_block(&block).unwrap();
         let mempool = Mempool::new(300_000_000, 1_000);
-        let result = try_reconstruct(&compact, &mempool);
-        match result {
-            Ok(_) => panic!("expected Err(PendingCompact) with missing transactions"),
-            Err(pending) => {
-                assert_eq!(pending.header, block.header);
-                // At least one index should be missing
-                assert!(!pending.missing_indices.is_empty());
+        match try_reconstruct(&compact, &mempool) {
+            Ok(Reconstruction::Partial { missing_indices, .. }) => {
+                assert_eq!(missing_indices, vec![1]);
             }
+            _ => panic!("expected a partial reconstruction with missing transactions"),
         }
     }
 
@@ -356,11 +508,11 @@ mod tests {
         mempool.insert_tx_scoped_for_test(extra_tx, full_quarantine);
 
         match try_reconstruct(&compact, &mempool) {
-            Ok(reconstructed) => {
+            Ok(Reconstruction::Complete(reconstructed)) => {
                 assert_eq!(reconstructed.header, block.header);
                 assert_eq!(reconstructed.txdata.len(), block.txdata.len());
             }
-            Err(_) => panic!("quarantined tx must still be available for reconstruction"),
+            _ => panic!("quarantined tx must still be available for reconstruction"),
         }
     }
 
@@ -402,20 +554,191 @@ mod tests {
         );
 
         match try_reconstruct(&compact, &mempool) {
-            Ok(block) => panic!(
-                "must not reconstruct a block with a duplicated tx (txdata len {})",
-                block.txdata.len()
-            ),
-            Err(pending) => {
+            Ok(Reconstruction::Partial { txs, missing_indices }) => {
                 assert_eq!(
-                    pending.missing_indices,
+                    missing_indices,
                     vec![1, 2],
                     "both colliding slots must be requested via getblocktxn"
                 );
-                assert_eq!(pending.txs[0].as_ref(), Some(&coinbase));
-                assert!(pending.txs[1].is_none());
-                assert!(pending.txs[2].is_none());
+                assert_eq!(txs[0].as_ref(), Some(&coinbase));
+                assert!(txs[1].is_none());
+                assert!(txs[2].is_none());
             }
+            Ok(Reconstruction::Complete(block)) => panic!(
+                "must not reconstruct a block with a duplicated tx (txdata len {})",
+                block.txdata.len()
+            ),
+            Err(e) => panic!("well-formed compact block reported as {e}"),
+        }
+    }
+
+    fn compact_with(
+        short_ids: usize,
+        prefilled: Vec<(u16, Transaction)>,
+    ) -> HeaderAndShortIds {
+        use bitcoin::bip152::PrefilledTransaction;
+        HeaderAndShortIds {
+            header: regtest_genesis().header,
+            nonce: 7,
+            short_ids: (0..short_ids)
+                .map(|i| ShortId::from([i as u8, (i >> 8) as u8, (i >> 16) as u8, 1, 2, 3]))
+                .collect(),
+            prefilled_txs: prefilled
+                .into_iter()
+                .map(|(idx, tx)| PrefilledTransaction { idx, tx })
+                .collect(),
+        }
+    }
+
+    /// Every shape Core's `InitData` calls `READ_STATUS_INVALID` is reported as
+    /// such before the mempool is consulted, and none of them yields a
+    /// reconstruction the manager could park as pending state.
+    #[test]
+    fn malformed_cmpctblock_shapes_are_invalid_not_pending() {
+        let null_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let cases: Vec<(&str, HeaderAndShortIds, ShapeError)> = vec![
+            ("empty", compact_with(0, vec![]), ShapeError::Empty),
+            (
+                "too many transactions",
+                compact_with(MAX_COMPACT_BLOCK_TXS, vec![(0, make_test_tx(1))]),
+                ShapeError::TooManyTxs,
+            ),
+            (
+                "null prefilled tx",
+                compact_with(2, vec![(0, null_tx)]),
+                ShapeError::NullPrefilledTx,
+            ),
+            (
+                "prefilled index past the end",
+                // Two slots in total (one short ID + one prefilled): index 2
+                // is outside the block.
+                compact_with(1, vec![(2, make_test_tx(1))]),
+                ShapeError::PrefilledIndexOutOfRange,
+            ),
+            (
+                "second prefilled index past the end",
+                compact_with(1, vec![(0, make_test_tx(1)), (2, make_test_tx(2))]),
+                ShapeError::PrefilledIndexOutOfRange,
+            ),
+            (
+                "differential index overflowing u16",
+                compact_with(
+                    70_000,
+                    vec![(u16::MAX, make_test_tx(1)), (u16::MAX, make_test_tx(2))],
+                ),
+                ShapeError::PrefilledIndexOutOfRange,
+            ),
+        ];
+        let mempool = Mempool::new(300_000_000, 1_000);
+        for (name, compact, want) in cases {
+            assert_eq!(check_shape(&compact), Err(want), "{name}");
+            assert!(
+                matches!(try_reconstruct(&compact, &mempool), Err(e) if e == want),
+                "{name}: try_reconstruct must refuse the shape"
+            );
+        }
+
+        // The boundaries themselves are well-formed.
+        assert_eq!(check_shape(&compact_with(1, vec![(1, make_test_tx(1))])), Ok(()));
+        assert_eq!(
+            check_shape(&compact_with(MAX_COMPACT_BLOCK_TXS - 1, vec![(0, make_test_tx(1))])),
+            Ok(())
+        );
+    }
+
+    /// The core of the bound Core's constant encodes, restated so a typo in
+    /// the derivation cannot slip through: 4,000,000 weight units, at least
+    /// 40 per serializable transaction.
+    #[test]
+    fn max_compact_block_txs_is_cores_bound() {
+        assert_eq!(MAX_COMPACT_BLOCK_TXS, 100_000);
+    }
+
+    /// A `blocktxn` that fills every slot but produces a block whose merkle
+    /// root does not match the header is a possible short-ID collision, not
+    /// misbehaviour: Core's `FillBlock` returns `READ_STATUS_FAILED` and the
+    /// caller fetches the full block without penalising the peer.
+    #[test]
+    fn completed_block_failing_merkle_is_mutated_not_invalid() {
+        let header = regtest_genesis().header; // merkle root commits to genesis only
+        let pending = pending_for(header, vec![Some(make_test_tx(5000)), None], vec![1]);
+        let block_txns = BlockTransactions {
+            block_hash: header.block_hash(),
+            transactions: vec![make_test_tx(1)],
+        };
+        assert_eq!(
+            complete_pending(pending, &block_txns, false).unwrap_err(),
+            CompleteError::Mutated
+        );
+    }
+
+    /// A pending entry kept only to remember a failed reconstruction has
+    /// nothing outstanding; a `blocktxn` against it is not an answer.
+    #[test]
+    fn blocktxn_against_a_failed_entry_is_invalid() {
+        let header = regtest_genesis().header;
+        let pending = PendingCompact::failed(header.block_hash(), header);
+        let block_txns = BlockTransactions {
+            block_hash: header.block_hash(),
+            transactions: vec![],
+        };
+        assert_eq!(
+            complete_pending(pending, &block_txns, false).unwrap_err(),
+            CompleteError::Invalid
+        );
+    }
+
+    /// Reconstruction runs on every `cmpctblock` a peer sends, so it must not
+    /// copy the mempool to build its short-ID table. `Mempool::get_all_entries`
+    /// clones every entry; the reconstruction path walks the pool under its
+    /// read lock with `with_entries` and clones only the transactions a short
+    /// ID matched. Not observable through the API, so pinned on the source.
+    #[test]
+    fn reconstruct_reads_the_mempool_without_cloning_it() {
+        let src = include_str!("compact.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let fn_start = body.find("pub fn try_reconstruct(").expect("try_reconstruct");
+        let fn_body = &body[fn_start..];
+        let fn_body = &fn_body[..fn_body.find("\n}\n").expect("end of try_reconstruct")];
+        assert!(
+            !fn_body.contains("get_all_entries"),
+            "try_reconstruct must not clone the mempool"
+        );
+        assert!(
+            fn_body.contains("mempool.with_entries("),
+            "try_reconstruct must read the mempool under its lock"
+        );
+    }
+
+    /// Only an announced short ID pulls a transaction out of the mempool:
+    /// unrelated entries are neither cloned into the result nor able to
+    /// disturb the match for the one that is announced.
+    #[test]
+    fn reconstruct_takes_only_announced_transactions_from_a_large_mempool() {
+        let mut block = regtest_genesis();
+        let wanted = make_test_tx(777_777);
+        block.txdata.push(wanted.clone());
+        let compact = make_compact_block(&block).unwrap();
+
+        let mempool = Mempool::new(300_000_000, 1_000);
+        for v in 0..500u64 {
+            mempool.insert_tx_scoped_for_test(
+                make_test_tx(10_000 + v),
+                crate::mempool::pool::QuarantineScope::acting(),
+            );
+        }
+        mempool.insert_tx_scoped_for_test(
+            wanted.clone(),
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
+        match try_reconstruct(&compact, &mempool) {
+            Ok(Reconstruction::Complete(b)) => assert_eq!(b.txdata[1], wanted),
+            _ => panic!("the announced tx must be found among unrelated entries"),
         }
     }
 }
