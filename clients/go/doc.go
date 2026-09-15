@@ -17,10 +17,21 @@
 //
 // # Stability
 //
-// The SDK tracks the additive satd.events.v1 wire schema, not the node's
-// release cadence: new optional fields and event kinds are added without
-// breaking existing consumers, and this module is versioned independently of
-// the satd node - a node and SDK do not need matching versions. The generated
-// wire types are exported from the eventspb subpackage for the cases a typed
-// helper does not yet cover.
+// The module is versioned with the node: clients/go/vX.Y.Z is cut at the node's
+// vX.Y.Z, and [Version] names it. An SDK works with any node on the same event
+// schema whose version is at or above its own; newer nodes only add fields and
+// event kinds, which an older build decodes as [UnknownEvent].
+//
+// When a stream opens, the SDK compares the version the node advertises with
+// its own. A node one minor version behind gets a warning, logged once per node
+// version through [WithLogger] (default slog.Default()). A node two or more
+// minor versions, or a major version, behind is refused with [ErrNodeTooOld];
+// [WithAllowOldNode] turns that into the warning. A different event schema is
+// always refused with [ErrSchemaMismatch]. A node older than 0.6.0 advertises
+// nothing and counts as 0.5. [Client.NodeVersion] reports what the node
+// advertised. The rule is in STABILITY_POLICY.md, "Streaming API & SDK
+// compatibility".
+//
+// The generated wire types are exported from the eventspb subpackage for the
+// cases a typed helper does not yet cover.
 package satdevents

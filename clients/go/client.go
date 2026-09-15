@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -76,6 +79,19 @@ type Client struct {
 	// token was configured. Held rather than logged - never put it in a String
 	// or error message.
 	auth string
+
+	allowOldNode bool
+	// logger receives the old-node warning; nil means slog.Default().
+	logger *slog.Logger
+
+	// compatMu guards what the client last learned from a node's headers.
+	compatMu sync.Mutex
+	// nodeVersion is the raw satd-version header from the most recent stream.
+	nodeVersion string
+	// warned and warnedFor record the node version the old-node warning was
+	// last logged for, so it is logged once per observed version.
+	warned    bool
+	warnedFor string
 }
 
 type dialConfig struct {
@@ -95,6 +111,9 @@ type dialConfig struct {
 	keepaliveTimeout time.Duration
 
 	extra []grpc.DialOption
+
+	allowOldNode bool
+	logger       *slog.Logger
 }
 
 // Option configures [Dial].
@@ -194,6 +213,26 @@ func WithKeepalive(interval, timeout time.Duration) Option {
 // the transport's own timeouts fire.
 func WithoutKeepalive() Option {
 	return func(c *dialConfig) { c.keepalive = false }
+}
+
+// WithAllowOldNode accepts a node two or more minor versions older than this
+// SDK.
+//
+// By default [Client.Subscribe] and [Client.Watch] refuse such a node with
+// [ErrNodeTooOld]. With this option they log the same warning as for a node one
+// minor version behind and carry on. Meant for a rolling upgrade where the SDK
+// side went first. Features added after the node's release are still
+// unavailable, and request fields it does not recognise are still ignored.
+//
+// It does not bypass [ErrSchemaMismatch].
+func WithAllowOldNode() Option {
+	return func(c *dialConfig) { c.allowOldNode = true }
+}
+
+// WithLogger sets where the client logs. Today that is only the warning for a
+// node older than this SDK. The default is [slog.Default].
+func WithLogger(logger *slog.Logger) Option {
+	return func(c *dialConfig) { c.logger = logger }
 }
 
 // WithGRPCDialOption passes raw grpc-go dial options through - the escape hatch
@@ -297,7 +336,12 @@ func Dial(ctx context.Context, target string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, wrapError(KindConnect, err, "%s", err)
 	}
-	c := &Client{conn: conn, rpc: eventspb.NewNodeEventStreamClient(conn)}
+	c := &Client{
+		conn:         conn,
+		rpc:          eventspb.NewNodeEventStreamClient(conn),
+		allowOldNode: cfg.allowOldNode,
+		logger:       cfg.logger,
+	}
 	if cfg.token != "" {
 		if !validHeaderValue(cfg.token) {
 			_ = conn.Close()
@@ -320,6 +364,87 @@ func (c *Client) Close() error {
 // Conn exposes the underlying gRPC connection, for callers that need to inspect
 // its state or share it. The Client owns it: do not close it directly.
 func (c *Client) Conn() *grpc.ClientConn { return c.conn }
+
+// NodeVersion returns the version the node advertised on the most recently
+// opened stream, e.g. "0.6.0". It is "" until a stream has been opened, and
+// when the node predates the satd-version header (0.5.x and older).
+func (c *Client) NodeVersion() string {
+	c.compatMu.Lock()
+	defer c.compatMu.Unlock()
+	return c.nodeVersion
+}
+
+// checkCompat applies the SDK <-> node compatibility rule to a stream-opening
+// response's headers (STABILITY_POLICY.md, "Streaming API & SDK
+// compatibility").
+func (c *Client) checkCompat(md metadata.MD) error {
+	shown, warn, err := c.recordCompat(md)
+	if err != nil || !warn {
+		return err
+	}
+	// Logged after recordCompat released compatMu: the handler behind
+	// WithLogger is user code, and one that calls NodeVersion (or blocks) must
+	// not deadlock or stall every other stream open on this client.
+	logger := c.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn(fmt.Sprintf("satd node %s is older than this SDK (%s); features added after "+
+		"the node's release are unavailable and request fields it does not recognise are "+
+		"ignored. Upgrade the node - connections are refused once it is two minor versions "+
+		"behind.", shown, Version),
+		"node_version", shown, "sdk_version", Version)
+	return nil
+}
+
+// recordCompat records the advertised version and decides, under compatMu,
+// whether the stream is refused or the old-node warning is due. It returns the
+// node version as shown in the warning.
+func (c *Client) recordCompat(md metadata.MD) (shown string, warn bool, err error) {
+	raw, node := nodeVersionFromMD(md)
+	c.compatMu.Lock()
+	defer c.compatMu.Unlock()
+	c.nodeVersion = raw
+
+	if schema := schemaFromMD(md); schema != schemaVersion {
+		return "", false, schemaMismatch(schema)
+	}
+
+	sdk, ok := parseVersion(Version)
+	if !ok {
+		panic("satdevents: Version does not parse: " + Version)
+	}
+	switch classify(sdk, node) {
+	case compatOK:
+		return "", false, nil
+	case compatTooOld:
+		if !c.allowOldNode {
+			return "", false, &Error{
+				Kind: KindNodeTooOld,
+				Message: fmt.Sprintf("satd node %s is too old for this SDK (%s): two or more "+
+					"minor versions behind. Upgrade the node, or opt in with WithAllowOldNode()",
+					displayNodeVersion(raw), Version),
+				NodeVersion: raw,
+			}
+		}
+	}
+	// Once per observed version: a reconnect loop against the same node stays
+	// quiet, a node upgraded (or downgraded) in between warns again.
+	if c.warned && c.warnedFor == raw {
+		return "", false, nil
+	}
+	c.warned, c.warnedFor = true, raw
+	return displayNodeVersion(raw), true, nil
+}
+
+func schemaMismatch(node uint32) error {
+	return &Error{
+		Kind: KindSchemaMismatch,
+		Message: fmt.Sprintf("satd node event schema %d does not match this SDK's schema %d",
+			node, schemaVersion),
+		NodeSchema: node,
+	}
+}
 
 // authed attaches the configured bearer credential to an outgoing context.
 func (c *Client) authed(ctx context.Context) context.Context {
@@ -431,6 +556,10 @@ func (o SubscribeOptions) toProto() *eventspb.SubscribeRequest {
 type Stream struct {
 	recv       func() (*eventspb.NodeEvent, error)
 	lastCursor *Cursor
+	// cancel releases the stream's context once Recv has seen the end.
+	cancel context.CancelFunc
+	// schemaChecked is set once the first event's schema_version was checked.
+	schemaChecked bool
 }
 
 // Recv returns the next event. It returns [io.EOF] when the server closes the
@@ -438,10 +567,25 @@ type Stream struct {
 func (s *Stream) Recv() (Event, error) {
 	msg, err := s.recv()
 	if err != nil {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		if err == io.EOF {
 			return nil, io.EOF
 		}
 		return nil, fromStatus(err)
+	}
+	// The response header already carried the schema on a node that sends one.
+	// This covers a node that predates the header. One event is enough: a node
+	// does not change schema mid-stream.
+	if !s.schemaChecked {
+		s.schemaChecked = true
+		if msg.GetSchemaVersion() != schemaVersion {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			return nil, schemaMismatch(msg.GetSchemaVersion())
+		}
 	}
 	if c := cursorFromProto(msg.GetCursor()); c != nil {
 		s.lastCursor = c
@@ -487,8 +631,12 @@ func (c *Client) String() string {
 func (c *Client) GoString() string { return c.String() }
 
 func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream, error) {
+	// A derived context, so a stream refused by the version check below is
+	// torn down instead of lingering until the caller's ctx ends.
+	ctx, cancel := context.WithCancel(ctx)
 	sc, err := c.rpc.Subscribe(c.authed(ctx), opts.toProto())
 	if err != nil {
+		cancel()
 		return nil, fromStatus(err)
 	}
 	// Wait for the server's response headers before handing the stream back.
@@ -503,15 +651,17 @@ func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (*Stream,
 	// This also matches the Rust SDK, where awaiting the tonic response waits
 	// for headers as a matter of course. The wait is bounded by ctx, and the
 	// node flushes headers when it accepts the stream, so it costs one round
-	// trip.
-	//
-	// Deliberately NOT done for the bidirectional Watch stream: there a server
-	// is free to withhold headers until it has something to send, so waiting can
-	// block until the first event - or forever on a quiet watch-set.
-	if _, err := sc.Header(); err != nil {
+	// trip. The headers also carry the node version, checked here.
+	md, err := sc.Header()
+	if err != nil {
+		cancel()
 		return nil, fromStatus(err)
 	}
-	return &Stream{recv: sc.Recv}, nil
+	if err := c.checkCompat(md); err != nil {
+		cancel()
+		return nil, err
+	}
+	return &Stream{recv: sc.Recv, cancel: cancel}, nil
 }
 
 // splitScheme accepts a bare gRPC target or one carrying an http:// or https://

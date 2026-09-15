@@ -1,6 +1,7 @@
-// The satd streaming-events Go SDK. An independently versioned module inside
-// the satd repo (released as `clients/go/vX.Y.Z` tags), so proto changes and
-// both SDKs land atomically and the Go E2E suite gates every satd PR.
+// The satd streaming-events Go SDK. A module inside the satd repo, released as
+// `clients/go/vX.Y.Z` tags at the node's `vX.Y.Z` (see version.go), so proto
+// changes and both SDKs land atomically and the Go E2E suite gates every satd
+// PR.
 //
 // The `go` directive tracks (latest stable - 1) to cover Go's two-release
 // support window; `toolchain` names the version CI builds with. Bump both

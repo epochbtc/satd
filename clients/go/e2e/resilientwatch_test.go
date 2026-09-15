@@ -116,7 +116,11 @@ func primeRW(t *testing.T, src *coinbaseSource, w *satdevents.ResilientWatch, ta
 			if err != nil {
 				break // deadline for this round; register and pay again
 			}
-			if m, ok := ev.(*satdevents.ScriptMatched); ok && matchesWallet(m, target) {
+			// Wait for the CONFIRMED match: it carries the durable cursor that a
+			// reconnect re-anchors from. Returning on the mempool match left the
+			// watch with no resume cursor whenever the registration beat the
+			// payment, so a following cut reconnected without a SetCursor.
+			if m, ok := ev.(*satdevents.ScriptMatched); ok && matchesWallet(m, target) && m.Confirmed {
 				cancel()
 				return
 			}

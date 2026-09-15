@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/epochbtc/satd/clients/go/eventspb"
@@ -62,11 +63,60 @@ func startFake(t *testing.T) (*Client, *fakeServer) {
 	return startServer(t, fake), fake
 }
 
-// startServer wires a Client to impl over bufconn.
+// startServer wires a Client to impl over bufconn, behaving like a satd node of
+// this SDK's own version.
 func startServer(t *testing.T, impl eventspb.NodeEventStreamServer) *Client {
 	t.Helper()
+	return startServerAs(t, impl, sameVersionNode)
+}
+
+// nodeHeaders is what a fake node advertises. A zero value advertises nothing,
+// like a node that predates the version headers.
+type nodeHeaders struct {
+	version string
+	schema  string
+}
+
+func sameVersionNode() nodeHeaders {
+	return nodeHeaders{version: Version, schema: "1"}
+}
+
+// asNode makes a fake server behave like satd towards the SDK's version check:
+// it sends the version headers as soon as a stream opens (satd sends its
+// response headers before any event), and stamps schema_version on every event
+// the fake left at zero, as every real node does.
+func asNode(headers func() nodeHeaders) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		h := headers()
+		md := metadata.MD{}
+		if h.version != "" {
+			md.Set(versionHeader, h.version)
+		}
+		if h.schema != "" {
+			md.Set(schemaHeader, h.schema)
+		}
+		if err := ss.SendHeader(md); err != nil {
+			return err
+		}
+		return handler(srv, schemaStampingStream{ss})
+	}
+}
+
+type schemaStampingStream struct{ grpc.ServerStream }
+
+func (s schemaStampingStream) SendMsg(m any) error {
+	if ev, ok := m.(*eventspb.NodeEvent); ok && ev.SchemaVersion == 0 {
+		ev.SchemaVersion = schemaVersion
+	}
+	return s.ServerStream.SendMsg(m)
+}
+
+// startServerAs is startServer with the node's advertised headers chosen by the
+// test, read afresh on every stream so a test can change them between calls.
+func startServerAs(t *testing.T, impl eventspb.NodeEventStreamServer, headers func() nodeHeaders, opts ...Option) *Client {
+	t.Helper()
 	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.StreamInterceptor(asNode(headers)))
 	eventspb.RegisterNodeEventStreamServer(srv, impl)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
@@ -81,7 +131,16 @@ func startServer(t *testing.T, impl eventspb.NodeEventStreamServer) *Client {
 		t.Fatalf("dialing the fake: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return &Client{conn: conn, rpc: eventspb.NewNodeEventStreamClient(conn)}
+	var cfg dialConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return &Client{
+		conn:         conn,
+		rpc:          eventspb.NewNodeEventStreamClient(conn),
+		allowOldNode: cfg.allowOldNode,
+		logger:       cfg.logger,
+	}
 }
 
 // waitForControls blocks until the fake has seen n control messages, so an
