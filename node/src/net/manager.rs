@@ -5683,6 +5683,7 @@ impl PeerManager {
             | MempoolError::MissingInputs
             | MempoolError::InsufficientFee(..)
             | MempoolError::MempoolFull
+            | MempoolError::MempoolMinFeeNotMet(..)
             | MempoolError::Validation(_)
             | MempoolError::PrematureCoinbaseSpend
             | MempoolError::DecodeFailed
