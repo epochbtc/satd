@@ -2521,6 +2521,18 @@ impl PeerManager {
         }
     }
 
+    /// Record a peer's BIP 133 `feefilter`.
+    ///
+    /// The message carries an `i64`; a negative value clamps to 0 (pass
+    /// everything, Core's signed comparison) rather than wrapping through
+    /// `as u64` into a filter that drops every announcement.
+    fn set_peer_fee_filter(&self, id: PeerId, rate: i64) {
+        if let Some(handle) = self.peers.write().get_mut(&id) {
+            handle.info.fee_filter = rate.max(0) as u64;
+            tracing::debug!(id, rate, "Peer set fee filter");
+        }
+    }
+
     /// Send a ping to all connected peers.
     ///
     /// Registered with the peer's counters exactly as a keepalive ping is, so
@@ -3208,17 +3220,8 @@ impl PeerManager {
             NetworkMessage::BlockTxn(msg) => {
                 self.handle_block_txn(id, msg.transactions);
             }
-            NetworkMessage::FeeFilter(rate) => {
-                let mut peers = self.peers.write();
-                if let Some(handle) = peers.get_mut(&id) {
-                    // BIP 133 carries an i64; clamp negatives to 0
-                    // (pass-everything, Core's signed-comparison behavior)
-                    // instead of letting `as u64` wrap to ~u64::MAX, which
-                    // would silently filter ALL tx announcements to the peer.
-                    handle.info.fee_filter = rate.max(0) as u64;
-                    tracing::debug!(id, rate, "Peer set fee filter");
-                }
-            }
+            // Applied in the peer's read task, the moment it arrives.
+            NetworkMessage::FeeFilter(_) => {}
             NetworkMessage::MemPool => {
                 self.handle_mempool_request(id);
             }
@@ -7279,6 +7282,7 @@ impl PeerManager {
         // Spawn a dedicated read task that forwards messages via a channel.
         // This task is never cancelled, so read_exact always completes.
         let (read_tx, mut read_rx) = mpsc::channel::<NetworkMessage>(64);
+        let read_manager = Arc::clone(self);
         let read_task = tokio::spawn(async move {
             loop {
                 match tokio::time::timeout(
@@ -7289,6 +7293,15 @@ impl PeerManager {
                 {
                     Ok(Ok(msg)) => {
                         log_received(id, &msg);
+                        // Core applies a peer's fee filter on the message
+                        // thread. Through the manager's drain it could be up
+                        // to a tick late, and a transaction announced in that
+                        // window is judged against the filter the peer has
+                        // already replaced -- which, coming out of initial
+                        // block download, is the one that drops everything.
+                        if let NetworkMessage::FeeFilter(rate) = msg {
+                            read_manager.set_peer_fee_filter(id, rate);
+                        }
                         if read_tx.send(msg).await.is_err() {
                             break; // receiver dropped, peer_task ended
                         }
