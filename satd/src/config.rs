@@ -2072,11 +2072,19 @@ impl Config {
         // there and silently ignoring it would be the accept-and-ignore
         // hazard the strict parser exists to prevent).
         let signet_challenge: Option<Vec<u8>> = {
-            let raw = cli
-                .signetchallenge
-                .clone()
-                .or_else(|| file_get("signetchallenge"));
-            match raw {
+            // Core reads every value and refuses more than one
+            // (`ReadSigNetArgs`), where other scalar options take the last:
+            // two challenges name two different signets, and picking one
+            // would join the node to a network the operator may not mean.
+            let raw = if cli.signetchallenge.is_empty() {
+                file_get_all("signetchallenge")
+            } else {
+                cli.signetchallenge.clone()
+            };
+            if raw.len() > 1 {
+                return Err("-signetchallenge cannot be multiple values.".to_string());
+            }
+            match raw.into_iter().next() {
                 Some(hex) => {
                     if network != Network::Signet {
                         return Err(format!(
@@ -2085,7 +2093,7 @@ impl Config {
                         ));
                     }
                     let bytes = <Vec<u8> as bitcoin::hashes::hex::FromHex>::from_hex(hex.trim())
-                        .map_err(|e| format!("signetchallenge is not valid hex: {e}"))?;
+                        .map_err(|_| format!("-signetchallenge must be hex, not '{hex}'."))?;
                     if bytes.is_empty() {
                         return Err("signetchallenge must not be empty".to_string());
                     }
@@ -4751,7 +4759,7 @@ pub struct CliArgs {
         value_name = "HEX",
         help = "Custom signet challenge script, hex (BIP 325). Signet only."
     )]
-    pub signetchallenge: Option<String>,
+    pub signetchallenge: Vec<String>,
 
     #[arg(long, value_name = "PORT", help = "RPC server port")]
     pub rpcport: Option<u16>,
@@ -10317,7 +10325,7 @@ testactivationheight=bip34@2
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
-            signetchallenge: None,
+            signetchallenge: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -10625,7 +10633,7 @@ testactivationheight=bip34@2
             chain: None,
             blocksdir: None,
             signetseednode: Vec::new(),
-            signetchallenge: None,
+            signetchallenge: Vec::new(),
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
             includeconf: Vec::new(),
@@ -13850,7 +13858,18 @@ mcpallowedhost=node.local
         let cli =
             CliArgs::try_parse_from(["satd", "--signet", "--signetchallenge", "zzzz"]).unwrap();
         let err = Config::from_cli(cli).unwrap_err();
-        assert!(err.contains("not valid hex"), "got: {err}");
+        // Core's `ReadSigNetArgs` wording; feature_signet.py matches it.
+        assert_eq!(err, "-signetchallenge must be hex, not 'zzzz'.");
+    }
+
+    #[test]
+    fn signetchallenge_refuses_multiple_values() {
+        let cli = CliArgs::try_parse_from([
+            "satd", "--signet", "--signetchallenge", "51", "--signetchallenge", "51",
+        ])
+        .unwrap();
+        let err = Config::from_cli(cli).unwrap_err();
+        assert_eq!(err, "-signetchallenge cannot be multiple values.");
     }
 
     #[test]

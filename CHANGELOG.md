@@ -36,12 +36,16 @@ item below is (or will be) written up in full in the in-development
 - Compact block reconstruction is observable: one `compact block reconstructed` log line per block (transactions prefilled, from the mempool, from the extra pool, requested; whether a round trip was needed) and `satd_net_compact_block_*` metrics. `-blockreconstructionextratxn` now works: replaced and policy-refused transactions are kept (default 100) so blocks containing them reconstruct without a round trip (#765).
 - BIP 152 high-bandwidth compact block relay: satd selects up to three high-bandwidth peers, announces new blocks — including blocks found through the Stratum server — as `cmpctblock` before connecting them, and serves `MSG_CMPCT_BLOCK` and `getblocktxn` from a tip cache. Core's `p2p_compactblocks_hb.py` joins the functional run-set (#770).
 - Opt-in `cmpctblock` prefill (`-cmpctblockprefill`, `-cmpctblockprefillbytes`, default off / 8192 bytes): new blocks are announced with the transactions this node lacked prefilled, following Core's proposal #35558 (#772).
+- `getmininginfo` reports `bits`, `target`, `blockmintxfee` and the next block's `height`/`bits`/`difficulty`/`target`; `getblock`, `getblockheader`, `getblockchaininfo` and `getchainstates` report `target`; on signet `getblockchaininfo` and `getmininginfo` report `signet_challenge`; `getprioritisedtransactions` reports `modified_fee`; `getmempoolentry` reports `wtxid`.
 - **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC (#751).
 
 ### Fixed
 
 - Compact block receive path hardened: a `cmpctblock`'s header is validated before the block is reconstructed, pending reconstructions and the record of which blocks were asked of a peer are bounded per peer and expire, a block being reconstructed is not also downloaded in full, and a merkle mismatch after reconstruction falls back to fetching the full block instead of penalising the peer (Core parity; #763).
 - Stratum work follows a tip the node reached through block download. Those blocks connect without a chain event, so work stayed on the old tip for up to 30 seconds after a node caught up — long enough for a Job Declaration client to be refused (#763).
+- An expired mempool transaction now takes its descendants with it, and `-mempoolexpiry` is applied whenever a transaction is accepted, as in Core, rather than on a 30-second timer; a child of an expired parent used to stay in the pool.
+- `generatetoaddress`, `generatetodescriptor` and `generateblock` work on every chain, as in Core, instead of only regtest.
+- A signet block with an invalid solution is rejected as `bad-signet-blksig` (Core's reason) rather than `bad-signet-solution`; `-signetchallenge` given twice is refused, and a non-hex value is reported in Core's words.
 - A node that mined its own chain, and so had never been sent a header by a peer, counted itself as still in initial block download and ignored every transaction its peers announced. It now takes them (#759).
 - `verificationprogress` in `getblockchaininfo` and `getchainstates` is Bitcoin Core's transaction-count estimate, equal to Core's; it was the tip's timestamp over the current time and read 0.69 at genesis (#744).
 - An appliance image can be built around a published release. The

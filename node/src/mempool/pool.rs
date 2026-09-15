@@ -2122,6 +2122,23 @@ impl Mempool {
         source: TxSource,
         allow_quarantined: bool,
     ) -> Result<Txid, MempoolError> {
+        let accepted =
+            self.accept_transaction_unexpired(tx, chain_state, script_verifier, source, allow_quarantined)?;
+        // Core expires the pool after every acceptance (`LimitMempoolSize` in
+        // `MemPoolAccept::Finalize`), so `-mempoolexpiry` is enforced at the
+        // moment the pool changes, not up to a timer tick later.
+        self.remove_expired();
+        Ok(accepted)
+    }
+
+    fn accept_transaction_unexpired(
+        &self,
+        tx: Transaction,
+        chain_state: &ChainState,
+        script_verifier: &dyn ScriptVerifier,
+        source: TxSource,
+        allow_quarantined: bool,
+    ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
         // Snapshot the live policy once so the entire acceptance is judged
@@ -3084,13 +3101,18 @@ impl Mempool {
     /// nonzero fee_delta and pending (not-yet-seen) priority deltas.
     ///
     /// Core's `getprioritisedtransactions` format: `{ txid: { fee_delta, in_mempool } }`.
-    pub fn get_prioritised_transactions(&self) -> HashMap<Txid, (i64, bool)> {
+    /// Every recorded `prioritisetransaction` delta: `(delta, in_mempool,
+    /// modified_fee)`. `modified_fee` is the base fee plus the delta, in
+    /// satoshis, and is present only for a transaction in the mempool, as in
+    /// Core.
+    pub fn get_prioritised_transactions(&self) -> HashMap<Txid, (i64, bool, Option<i64>)> {
         let inner = self.inner.read();
         let mut result = HashMap::new();
         // In-mempool entries with a nonzero delta
         for (txid, entry) in &inner.entries {
             if entry.fee_delta != 0 {
-                result.insert(*txid, (entry.fee_delta, true));
+                let modified = (entry.fee as i64).saturating_add(entry.fee_delta);
+                result.insert(*txid, (entry.fee_delta, true, Some(modified)));
             }
         }
         // Pending deltas for transactions that are *not* in the mempool.
@@ -3100,7 +3122,7 @@ impl Mempool {
         // the opposite of what the field means.
         for (txid, delta) in &inner.fee_deltas {
             if !inner.entries.contains_key(txid) {
-                result.insert(*txid, (*delta, false));
+                result.insert(*txid, (*delta, false, None));
             }
         }
         result
@@ -3269,12 +3291,30 @@ impl Mempool {
         let mut expired_txids: Vec<Txid> = Vec::new();
         {
             let mut inner = self.inner.write();
-            let expired: Vec<Txid> = inner
+            let mut expired: Vec<Txid> = inner
                 .entries
                 .iter()
                 .filter(|(_, entry)| now.saturating_sub(entry.time) > expiry_secs)
                 .map(|(txid, _)| *txid)
                 .collect();
+            // An expired transaction takes its descendants with it, as Core's
+            // `CTxMemPool::Expire` does: a child left behind spends an output
+            // the pool no longer has, and a block template would include it.
+            let mut seen: HashSet<Txid> = expired.iter().copied().collect();
+            let mut i = 0;
+            while i < expired.len() {
+                if let Some(entry) = inner.entries.get(&expired[i]) {
+                    let parent = expired[i];
+                    for vout in 0..entry.tx.output.len() as u32 {
+                        if let Some(child) = inner.spends.get(&OutPoint { txid: parent, vout })
+                            && seen.insert(*child)
+                        {
+                            expired.push(*child);
+                        }
+                    }
+                }
+                i += 1;
+            }
 
             for txid in &expired {
                 if let Some(entry) = inner.entries.remove(txid) {
@@ -4004,6 +4044,7 @@ impl Mempool {
         let entry_fee_delta = entry.fee_delta;
         let entry_weight = entry.weight;
         let entry_time = entry.time;
+        let entry_wtxid = entry.tx.compute_wtxid();
         let entry_tx_inputs: Vec<_> = entry.tx.input.clone();
         let is_unbroadcast = inner.unbroadcast.contains_key(txid);
         drop(inner);
@@ -4093,6 +4134,8 @@ impl Mempool {
             "spentby": children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "bip125-replaceable": bip125_replaceable,
             "unbroadcast": is_unbroadcast,
+            // Core's `entryToJSON` carries the witness hash beside the txid.
+            "wtxid": entry_wtxid.to_string(),
         });
         crate::rpc::amounts::annotate_units(&mut out, unit);
         Some(out)
@@ -6933,8 +6976,36 @@ mod tests {
         mp.prioritise_transaction(&absent, 7_000).expect("delta");
 
         let listed = mp.get_prioritised_transactions();
-        assert_eq!(listed.get(&txid), Some(&(5_000, true)), "{listed:?}");
-        assert_eq!(listed.get(&absent), Some(&(7_000, false)), "{listed:?}");
+        // 100_000 in, 90_000 out: a 10_000 base fee, lifted by the delta.
+        assert_eq!(listed.get(&txid), Some(&(5_000, true, Some(15_000))), "{listed:?}");
+        assert_eq!(listed.get(&absent), Some(&(7_000, false, None)), "{listed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An expired transaction takes its in-mempool descendants with it (Core's
+    /// `CTxMemPool::Expire`). `remove_expired` removed only the aged entries,
+    /// leaving a child spending an output the pool no longer had.
+    #[test]
+    fn expiry_removes_the_descendants_of_an_expired_transaction() {
+        let op = outpoint(0xED);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let parent = tx_from(&[op], &[(90_000, 0xC2)]);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent admitted");
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(80_000, 0xC3)]);
+        let child_txid = mp
+            .accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("child admitted");
+
+        // Age only the parent past the expiry.
+        mp.inner.write().entries.get_mut(&parent_txid).unwrap().time = 0;
+
+        assert_eq!(mp.remove_expired(), 2);
+        assert!(mp.get_entry_verbose(&parent_txid).is_none());
+        assert!(mp.get_entry_verbose(&child_txid).is_none(), "the child must not outlive its parent");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7443,7 +7514,7 @@ mod tests {
                     fee: 0,
                     weight: 400,
                     fee_rate: 0,
-                    time: 0,
+                    time: crate::time::now_secs(), // unexpired: acceptance runs expiry
                     fee_delta: 0,
                     sigop_cost: 0,
                     prev_scripthashes: Vec::new(),
@@ -7548,7 +7619,7 @@ mod tests {
                         fee: 0,
                         weight: 400,
                         fee_rate: 0,
-                        time: 0,
+                        time: crate::time::now_secs(), // unexpired: acceptance runs expiry
                         fee_delta: 0,
                         sigop_cost: 0,
                         prev_scripthashes: Vec::new(),
@@ -7684,7 +7755,7 @@ mod tests {
                         fee: 0,
                         weight: 400,
                         fee_rate: 0,
-                        time: 0,
+                        time: crate::time::now_secs(), // unexpired: acceptance runs expiry
                         fee_delta: 0,
                         sigop_cost: 0,
                         prev_scripthashes: Vec::new(),
