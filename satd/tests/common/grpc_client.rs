@@ -200,6 +200,32 @@ impl GrpcStreamClient {
             .into_inner();
         (tx, stream)
     }
+
+    /// Open a `Subscribe` and return only the response headers, for the
+    /// version-advertisement tests.
+    pub async fn subscribe_metadata(&mut self) -> tonic::metadata::MetadataMap {
+        self.inner
+            .subscribe(SubscribeRequest::default())
+            .await
+            .expect("subscribe")
+            .metadata()
+            .clone()
+    }
+
+    /// Open a `Watch` with no control messages and return only the response
+    /// headers. No event is needed for them to arrive.
+    pub async fn watch_metadata(&mut self) -> tonic::metadata::MetadataMap {
+        let (_tx, rx) = mpsc::channel::<SubscribeControl>(1);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.inner.watch(Request::new(ReceiverStream::new(rx))),
+        )
+        .await
+        .expect("watch headers must arrive without an event")
+        .expect("watch")
+        .metadata()
+        .clone()
+    }
 }
 
 // --- SubscribeControl builders (gRPC wire-correct) -------------------------

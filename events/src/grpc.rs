@@ -824,6 +824,30 @@ impl Connected for EventsConn {
     }
 }
 
+/// Response metadata key carrying the node's version (`CARGO_PKG_VERSION`, e.g.
+/// `0.6.0`). Every `Subscribe` and `Watch` response carries it, so an SDK can
+/// apply the compatibility rule in `STABILITY_POLICY.md` before the first
+/// event — a quiet `Watch` may never deliver one. A node that predates this
+/// header (0.5.x and earlier) sends neither key.
+pub const VERSION_METADATA_KEY: &str = "satd-version";
+/// Response metadata key carrying [`node::events::SCHEMA_VERSION`] as a decimal
+/// string. Same contract as [`VERSION_METADATA_KEY`].
+pub const SCHEMA_METADATA_KEY: &str = "satd-events-schema";
+
+/// Stamp the version headers onto a stream-opening response.
+fn stamp_version<T>(mut resp: Response<T>) -> Response<T> {
+    let md = resp.metadata_mut();
+    md.insert(
+        VERSION_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    md.insert(
+        SCHEMA_METADATA_KEY,
+        tonic::metadata::MetadataValue::from(node::events::SCHEMA_VERSION),
+    );
+    resp
+}
+
 #[async_trait]
 impl NodeEventStream for NodeEventStreamSvc {
     type SubscribeStream =
@@ -1249,7 +1273,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             None => Box::pin(live),
         };
 
-        Ok(Response::new(stream))
+        Ok(stamp_version(Response::new(stream)))
     }
 
     async fn watch(
@@ -2016,7 +2040,7 @@ impl NodeEventStream for NodeEventStreamSvc {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx_out))))
+        Ok(stamp_version(Response::new(Box::pin(ReceiverStream::new(rx_out)))))
     }
 }
 
@@ -3902,6 +3926,82 @@ mod tests {
         let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
         assert!(!cut);
         assert!(entries_of(&refined)[0].taproot_outputs.is_empty());
+    }
+
+    /// Both headers, with the values an SDK compares against.
+    fn assert_version_metadata(md: &tonic::metadata::MetadataMap) {
+        assert_eq!(
+            md.get(VERSION_METADATA_KEY).and_then(|v| v.to_str().ok()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "stream response must carry the node version",
+        );
+        assert_eq!(
+            md.get(SCHEMA_METADATA_KEY).and_then(|v| v.to_str().ok()),
+            Some(node::events::SCHEMA_VERSION.to_string().as_str()),
+            "stream response must carry the schema version",
+        );
+    }
+
+    /// Bind a real sink (so the headers cross the tonic transport, not just a
+    /// handler return value) and connect a raw client to it.
+    async fn version_metadata_fixture() -> (
+        pb::node_event_stream_client::NodeEventStreamClient<tonic::transport::Channel>,
+        watch::Sender<bool>,
+    ) {
+        let publisher = EventPublisher::new(edge(), 16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Arc::new(node::events::WatchRegistry::new());
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            Some(registry),
+            None,
+            None,
+        )
+        .await
+        .expect("bind");
+        let actual = sink.local_addr().unwrap();
+        publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
+        (client, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn subscribe_response_carries_version_metadata() {
+        let (mut client, shutdown_tx) = version_metadata_fixture().await;
+        let resp = client
+            .subscribe(pb::SubscribeRequest::default())
+            .await
+            .expect("subscribe");
+        assert_version_metadata(resp.metadata());
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn watch_response_carries_version_metadata() {
+        let (mut client, shutdown_tx) = version_metadata_fixture().await;
+        // No control message and no event: the headers must arrive on their
+        // own, since a quiet watch-set may never produce an event.
+        let (_ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(1);
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.watch(ReceiverStream::new(ctrl_rx)),
+        )
+        .await
+        .expect("watch headers must not wait for an event")
+        .expect("watch");
+        assert_version_metadata(resp.metadata());
+        let _ = shutdown_tx.send(true);
     }
 
     #[tokio::test]

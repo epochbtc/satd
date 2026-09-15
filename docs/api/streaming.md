@@ -106,6 +106,24 @@ Unknown `oneof` arms and fields MUST be ignored by older readers (forward-compat
 for rolling upgrades), exactly as the existing `categories` bitfield already
 tolerates unknown bits.
 
+Every `Subscribe` and `Watch` response carries two gRPC **response headers**,
+sent as soon as the stream is set up (before any event, so a quiet `Watch`
+still delivers them):
+
+| Header | Value |
+|---|---|
+| `satd-version` | The node's version string, e.g. `0.6.0` or `0.6.0-pre`. |
+| `satd-events-schema` | `schema_version` as a decimal string (`1`). |
+
+Nodes before 0.6.0 send neither header. The first-party SDKs compare the node's
+major/minor version against their own and warn when the node is one minor version
+behind, or refuse when it is two or more behind. A missing header counts as `0.5`.
+A schema mismatch is always refused. The full rule, including the obligation that
+new request fields degrade to a superset when an older node ignores them, is in
+[`STABILITY_POLICY.md` → Streaming API & SDK compatibility](../../STABILITY_POLICY.md#streaming-api--sdk-compatibility).
+The WebSocket/SSE carrier does not send these headers; its JSON envelope carries
+`schema_version` on every event.
+
 ## 5. Event envelope
 
 ```proto
