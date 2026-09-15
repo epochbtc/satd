@@ -2784,11 +2784,26 @@ fn test_preciousblock() {
 fn test_getmininginfo() {
     let mut node = TestNode::start(&[]);
     let response = node.rpc_call("getmininginfo").unwrap();
-    let result = &response["result"];
+    let result = response["result"].clone();
     assert_eq!(result["chain"], "regtest");
     assert!(result["blocks"].is_number());
     assert!(result["difficulty"].is_number());
+    // Core v29+: the tip's `bits`/`target`, and the next block's.
+    let regtest_target = "7fffff0000000000000000000000000000000000000000000000000000000000";
+    assert_eq!(result["bits"], "207fffff");
+    assert_eq!(result["target"], regtest_target);
+    assert_eq!(result["next"]["height"], 1);
+    assert_eq!(result["next"]["bits"], "207fffff");
+    assert_eq!(result["next"]["target"], regtest_target);
+    assert!(result.get("signet_challenge").is_none());
+    let tip = result_hash(&mut node);
+    let header = node.rpc_call_with_params("getblockheader", vec![tip]).unwrap();
+    assert_eq!(header["result"]["target"], regtest_target);
     node.stop();
+}
+
+fn result_hash(node: &mut TestNode) -> serde_json::Value {
+    node.rpc_call("getbestblockhash").unwrap()["result"].clone()
 }
 
 #[test]
@@ -10482,8 +10497,9 @@ fn test_esplora_outspends_array_matches_output_count() {
 
     let r = esplora_get(esplora_port, &format!("/tx/{}/outspends", cb));
     let arr: Vec<serde_json::Value> = r.json().unwrap();
-    // Coinbase to a single P2WPKH/P2WSH address: one output.
-    assert_eq!(arr.len(), 1);
+    // Coinbase to a single address, plus the witness commitment every
+    // post-segwit block carries (Core's `GenerateCoinbaseCommitment`).
+    assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["spent"], false);
     node.stop();
 }
@@ -10674,8 +10690,8 @@ fn test_esplora_outspend_out_of_range_vout_returns_404() {
     let body: serde_json::Value = r.json().unwrap();
     assert_eq!(body["spent"], false);
 
-    // vout 1 (past coinbase output count) → 404.
-    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/1", cb));
+    // vout 2 (past the payout and the witness commitment) → 404.
+    let r = esplora_get(esplora_port, &format!("/tx/{}/outspend/2", cb));
     assert_eq!(r.status(), 404);
 
     // vout 999 (way out of range) → 404.

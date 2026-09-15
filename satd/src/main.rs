@@ -784,6 +784,12 @@ async fn main() {
             // Custom signet (BIP 325): enables block-solution validation
             // and custom P2P magic. Set before sharing the ChainState.
             cs.set_signet_challenge(config.signet_challenge.clone());
+            if cs.network == bitcoin::Network::Signet {
+                tracing::info!(
+                    "Signet derived magic (message start): {}",
+                    hex::encode(cs.p2p_magic().to_bytes())
+                );
+            }
             // -checkpoints=0 disables built-in checkpoint validation.
             cs.set_enforce_checkpoints(config.enforce_checkpoints);
             if !config.enforce_checkpoints {

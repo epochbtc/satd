@@ -310,9 +310,7 @@ note = "measured 2026-09-15: L12 RemoteDisconnected: stop closes the RPC listene
 
 [[test]]
 file = "feature_signet.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L71 KeyError 'signet_challenge' on getblockchaininfo. Behind it: getmininginfo.signet_challenge, bad-signet-blksig and the -signetchallenge init errors. Follow-up: signet_challenge"
+status = "run"
 
 [[test]]
 file = "feature_startupnotify.py"
@@ -414,7 +412,7 @@ note = "measured 2026-09-15: L287 getrawtransaction of a confirmed coinbase with
 file = "mempool_accept_wtxid.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L54 KeyError 'wtxid' on getmempoolentry. Behind it: BIP 339 wtxid relay (#714). Follow-up: getmempoolentry.wtxid, then #714"
+note = "measured 2026-09-15: getmempoolentry.wtxid landed; the test then waits at L55 for a MSG_WTX announcement of the submitted transaction, and satd announces by txid. Follow-up: BIP 339 wtxid relay (#714)"
 
 [[test]]
 file = "mempool_cluster.py"
@@ -443,9 +441,7 @@ note = "measured 2026-09-15: L104 the -26 message lacks Core's 'min relay fee no
 
 [[test]]
 file = "mempool_expiry.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L46 getprioritisedtransactions lacks modified_fee. Follow-up: modified_fee"
+status = "run"
 
 [[test]]
 file = "mempool_limit.py"
@@ -528,9 +524,7 @@ note = "measured 2026-09-15: L44 assert_debug_log 'ThreadRPCServer method=getblo
 
 [[test]]
 file = "mining_mainnet.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: L100 KeyError 'bits' on getmininginfo. Follow-up: getmininginfo bits/target/next and getblock/getblockheader target"
+status = "run"
 
 [[test]]
 file = "mining_prioritisetransaction.py"

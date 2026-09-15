@@ -875,6 +875,21 @@ impl ChainState {
         self.enforce_checkpoints = enforce;
     }
 
+    /// The signet challenge this node validates against: the configured
+    /// `-signetchallenge`, else the default signet's. `None` off signet.
+    /// Core reports it as `signet_challenge` in `getblockchaininfo` and
+    /// `getmininginfo`.
+    pub fn signet_challenge(&self) -> Option<&[u8]> {
+        if self.network != Network::Signet {
+            return None;
+        }
+        Some(
+            self.signet_challenge
+                .as_deref()
+                .unwrap_or(&crate::validation::signet::DEFAULT_SIGNET_CHALLENGE),
+        )
+    }
+
     /// Effective P2P network magic. Custom-signet challenges derive their
     /// own magic (BIP 325); everything else uses the `bitcoin` crate's
     /// per-network value.
