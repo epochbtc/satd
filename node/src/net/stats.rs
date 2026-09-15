@@ -44,14 +44,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Monotonic microseconds for round-trip timing.
-///
-/// Deliberately not wall-clock: `setmocktime` and NTP steps both move
-/// `SystemTime`, and either would otherwise show up as a nonsense ping time
-/// (or a negative one, clamped to zero).
+/// Microseconds on the node clock, for ping round trips and the keepalive
+/// schedule. Core uses its mockable clock for both, and its functional tests
+/// step `setmocktime` to produce exact `pingtime`/`pingwait` values and to
+/// trigger the 20-minute timeout. A clock step backwards clamps a round trip
+/// to the 1 us floor rather than going negative.
 fn now_micros() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    crate::time::now_micros()
 }
 
 /// Process-global byte totals across all peers, past and present. Like
@@ -160,6 +159,14 @@ impl PeerStats {
         self.bytes_recv.fetch_add(n, Ordering::Relaxed);
         self.last_recv.store(now_secs(), Ordering::Relaxed);
         self.totals.bytes_recv.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Take back `n` received bytes that a later framing will count again.
+    pub fn discount_recv(&self, n: usize) {
+        let n = n as u64;
+        let sub = |v: u64| Some(v.saturating_sub(n));
+        let _ = self.bytes_recv.fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
+        let _ = self.totals.bytes_recv.fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -280,6 +287,26 @@ impl PeerStats {
         self.ping_time_us.store(rtt, Ordering::Relaxed);
         self.min_ping_us.fetch_min(rtt, Ordering::Relaxed);
         true
+    }
+
+    /// The outstanding ping's nonce, 0 if none.
+    pub fn ping_nonce(&self) -> u64 {
+        self.ping_nonce.load(Ordering::Relaxed)
+    }
+
+    /// Cancel the outstanding ping without timing it: Core's "Short payload"
+    /// case, a pong too short to carry a nonce.
+    pub fn cancel_ping(&self) {
+        self.ping_nonce.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether a keepalive ping is due: none is outstanding and the last one
+    /// went out more than `interval` ago on the node clock (Core's
+    /// `MaybeSendPing`). A peer never pinged is due at once.
+    pub fn ping_due(&self, interval: std::time::Duration) -> bool {
+        !self.ping_outstanding()
+            && now_micros()
+                > self.ping_sent_us.load(Ordering::Relaxed).saturating_add(interval.as_micros() as u64)
     }
 
     /// Whether a ping is still awaiting its pong.
