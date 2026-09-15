@@ -14,38 +14,38 @@ reason = "no-wallet"
 [[test]]
 file = "feature_abortnode.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured: unlinks blocks/rev00000.dat to force a write failure and expects the node to abort. satd writes no rev*.dat undo files -- undo data lives in RocksDB -- so the file the test corrupts does not exist. Follow-up: an abort-on-write-failure path the test can reach, or a permanent core-internal reclassification"
+reason = "core-internal"
+note = "measured 2026-09-15: L28 unlinks blocks/rev00000.dat to force a write failure. satd keeps undo data in RocksDB and writes no rev*.dat, so the file the test corrupts does not exist"
 
 [[test]]
 file = "feature_addrman.py"
 status = "skip"
 reason = "feature-missing"
-note = "test writes/reads Core's peers.dat addrman format and checks corruption handling; satd has no addrman or peers.dat"
+note = "measured 2026-09-15: L65 assert_debug_log 'Loaded 0 addresses from peers.dat'; satd has no addrman and no peers.dat. Follow-up: addrman (not planned for 0.6.0)"
 
 [[test]]
 file = "feature_anchors.py"
 status = "skip"
 reason = "core-net-policy"
-note = "measured: addconnection works now; the test then reads node0/regtest/anchors.dat, which satd never writes. Core persists its block-relay-only peers there on shutdown and re-dials them at startup. Follow-up: anchors.dat"
+note = "measured 2026-09-15: L66 opens node0/regtest/anchors.dat, which satd never writes. Core persists its block-relay-only peers there on shutdown and re-dials them at startup. Follow-up: anchors.dat"
 
 [[test]]
 file = "feature_asmap.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'Using /16 prefix for IP bucketing'; satd has no addrman and no IP bucketing, so there is no event to reword"
+note = "measured 2026-09-15: L41 assert_debug_log 'Using /16 prefix for IP bucketing'; satd has no addrman and no IP bucketing, so there is no event to reword"
 
 [[test]]
 file = "feature_assumeutxo.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: dumptxoutset now answers `latest`; the test needs \"rollback\" snapshots and the background-validation states satd does not expose. Follow-up: rollback snapshots"
+note = "measured 2026-09-15: L80 node1 is started with -prune=1, which satd refuses (no manual pruning mode). Behind that: rollback snapshots and the background-validation states. Follow-up: -prune=1, then rollback snapshots"
 
 [[test]]
 file = "feature_assumevalid.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'Enabling script verification at block #N (<hash>): assumevalid=0 (always verify).'; satd does not log the assumevalid decision"
+note = "measured 2026-09-15: L146 assert_debug_log 'Enabling script verification at block #1 (<hash>): assumevalid=0 (always verify).'; satd does not log the assumevalid decision"
 
 [[test]]
 file = "feature_bind_extra.py"
@@ -55,13 +55,13 @@ status = "run"
 file = "feature_bind_port_discover.py"
 status = "skip"
 reason = "harness"
-note = "the framework skipped it; re-triage when the run-set grows"
+note = "measured 2026-09-15: the framework skips it -- it needs 1.1.1.1 and 2.2.2.2 configured on a host interface. Follow-up: none; a harness property"
 
 [[test]]
 file = "feature_bind_port_externalip.py"
 status = "skip"
 reason = "harness"
-note = "the framework skipped it; re-triage when the run-set grows"
+note = "measured 2026-09-15: the framework skips it -- it needs 1.1.1.1 and 2.2.2.2 configured on a host interface. Follow-up: none; a harness property"
 
 [[test]]
 file = "feature_bip68_sequence.py"
@@ -71,37 +71,37 @@ status = "run"
 file = "feature_block.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: assert_raises_rpc_error on a submitblock/sendrawtransaction rejection string that satd words differently. Follow-up: reject-reason parity for the block-level rules this test walks (#671)"
+note = "measured 2026-09-15: L157 generateblock expects -25 'TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction <txid>'; satd words it differently. Behind it ~50 more reject strings and the disconnect on an invalid block. Follow-up: block reject-reason parity (#671)"
 
 [[test]]
 file = "feature_blocksdir.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: expects the node to exit with Core's exact text, 'Specified blocks directory \"...\" does not exist.'; satd accepts -blocksdir pointing at a missing directory. Follow-up: validate -blocksdir at startup with Core's message"
+note = "measured 2026-09-15: L27 expects init error 'Error: Specified blocks directory \"...\" does not exist.'; satd accepts a missing -blocksdir. Behind it the test asserts Core's blocks/index directory. Follow-up: validate -blocksdir at startup"
 
 [[test]]
 file = "feature_blocksxor.py"
 status = "skip"
-reason = "feature-missing"
-note = "satd rejects MiniWallet's padding output -- `OP_RETURN` followed by ~20000 `OP_1`s -- as a nonstandard `scriptpubkey`. Core v31's `-datacarriersize` defaults to MAX_STANDARD_TX_WEIGHT/4 (100000 vbytes), so the same output is standard there"
+reason = "core-internal"
+note = "measured 2026-09-15: L38 compares blk*.dat and rev*.dat file counts (1 != 0). satd writes Core's block-file XOR format but keeps undo data in RocksDB, so there are no rev*.dat files to count"
 
 [[test]]
 file = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: times out in wait_until on a tie-break between equal-work tips. satd keeps the first tip seen where Core applies its received-order/hash tie-break. Follow-up: Core's tie-break rule for equal-work tips"
+note = "measured 2026-09-15: L75 send_blocks_and_test predicate times out: a block pushed with send_and_ping is not yet connected when the pong arrives (satd answers ping on the socket task, blocks go through the block processor). Behind it: Core's nSequenceId tie-break between equal-work tips. Follow-up: message ordering behind ping, then nSequenceId"
 
 [[test]]
 file = "feature_cltv.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: with getdeploymentinfo fixed (#666) the test reaches its next blocker -- a block pushed over P2P with `send_and_ping` is not connected, so `active` stays false where the test expects true. Same blocker as p2p_unrequested_blocks; behind it are exact CLTV reject-reason strings in debug.log and testmempoolaccept `reject-details`"
+note = "measured 2026-09-15: L95 bip65 still inactive at height 111: the block pushed with send_and_ping is not connected when the pong arrives. Behind it: the CLTV reject strings. Follow-up: message ordering behind ping"
 
 [[test]]
 file = "feature_coinstatsindex.py"
 status = "skip"
-reason = "rpc-missing"
-note = "gettxoutsetinfo missing `disk_size` and `transactions` fields"
+reason = "feature-missing"
+note = "measured 2026-09-15: L82 KeyError 'disk_size' on gettxoutsetinfo; the test then drives -coinstatsindex. Follow-up: coinstatsindex"
 
 [[test]]
 file = "feature_coinstatsindex_compatibility.py"
@@ -112,13 +112,13 @@ reason = "prev-release"
 file = "feature_config_args.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: startup fails on '-nolisten=0' -- satd rejects the negated-with-value form Core accepts ('Invalid parameter -nolisten=0'). Follow-up: Core's -noX=0 handling"
+note = "measured 2026-09-15: L233 startup refuses '-nolisten=0' ('Invalid parameter'), Core's double-negative form. Behind it ~25 exact init/warning strings. Follow-up: -noX=0 parsing, then init-message parity"
 
 [[test]]
 file = "feature_csv_activation.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: sendrawtransaction rejects the test's transactions with -26 'scriptpubkey'. The test spends bare CSV scripts that satd's standardness rules refuse. Follow-up: standardness parity for the script forms this test uses"
+note = "measured 2026-09-15: L181 send_blocks_and_test predicate times out: a block pushed with send_and_ping is not connected when the pong arrives. An earlier measurement hit -26 'scriptpubkey' on bare CSV scripts behind it. Follow-up: message ordering behind ping, then standardness"
 
 [[test]]
 file = "feature_dbcrash.py"
@@ -129,7 +129,7 @@ reason = "core-internal"
 file = "feature_dersig.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: with getdeploymentinfo fixed (#666) the test reaches its next blocker -- getblockcount stays at DERSIG_HEIGHT-2 after a block pushed over P2P with `send_and_ping`, i.e. the block is not connected. Same blocker as p2p_unrequested_blocks"
+note = "measured 2026-09-15: L93 getblockcount 100 != 101: the block pushed with send_and_ping is not connected when the pong arrives. Behind it: the DERSIG reject strings. Follow-up: message ordering behind ping"
 
 [[test]]
 file = "feature_dirsymlinks.py"
@@ -140,15 +140,13 @@ status = "run"
 
 [[test]]
 file = "feature_fastprune.py"
-status = "skip"
-reason = "rpc-missing"
-note = "`generateblock` takes an address only; Core's `output` argument is an address *or* a descriptor, and MiniWallet passes `raw(<script>)`"
+status = "run"
 
 [[test]]
 file = "feature_fee_estimation.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(1, 2) on estimatesmartfee's returned confirmation target. satd's estimator does not track per-target buckets the way Core's does. Follow-up: real fee estimation (already on the M18/release-gate list)"
+note = "measured 2026-09-15: L117 estimatesmartfee returns blocks=1 where 2 is expected; satd's estimator does not track per-target buckets as Core's does. Follow-up: fee estimator parity"
 
 [[test]]
 file = "feature_filelock.py"
@@ -178,92 +176,92 @@ status = "run"
 [[test]]
 file = "feature_includeconf.py"
 status = "skip"
-reason = "harness"
-note = "measured: subversion does not end with 'main; relative)/' -- the test's -includeconf chain sets uacomment from an included file. Behind that, tracing writes all log output to stderr and the test's stop_node(expected_stderr=...) exact-matches a single line"
+reason = "feature-missing"
+note = "measured 2026-09-15: L39 subversion does not end with 'main; relative)/': uacomment from an -includeconf file is not composed into the user agent. Behind it an exact stderr match. Follow-up: uacomment from included config"
 
 [[test]]
 file = "feature_index_prune.py"
 status = "skip"
 reason = "feature-missing"
-note = "-blockfilterindex=1 accepted but not activated; getindexinfo never reports synced:true"
+note = "measured 2026-09-15: L42 node0 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: prune-locked indexes and coinstatsindex. Follow-up: -prune=1, then prune locks"
 
 [[test]]
 file = "feature_init.py"
 status = "skip"
 reason = "feature-missing"
-note = "-pid with a datadir-relative path does not produce the pid file where Core does. Follow-up: -pid path resolution"
+note = "measured 2026-09-15: L256 -pid with a datadir-relative path does not create the pid file where Core does. Follow-up: -pid path resolution"
 
 [[test]]
 file = "feature_loadblock.py"
 status = "skip"
-reason = "needs-triage"
-note = "Core's contrib/linearize scripts exit non-zero against satd; not yet attributed"
+reason = "core-internal"
+note = "measured 2026-09-15: L65 Core's contrib/linearize/linearize-hashes.py exits non-zero; linearize-data.py then reads blk*.dat files by Core's layout, which satd's block store does not share"
 
 [[test]]
 file = "feature_logging.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: -debuglogfile=foo.log writes no foo.log; satd has no -debuglogfile. Follow-up: -debuglogfile, including the relative-path and unopenable-path error text the test asserts"
+note = "measured 2026-09-15: L28 -debuglogfile=foo.log writes no foo.log; satd logs to stdout and has no -debuglogfile. Follow-up: -debuglogfile, including the relative-path and unopenable-path errors"
 
 [[test]]
 file = "feature_maxtipage.py"
 status = "skip"
 reason = "feature-missing"
-note = "-maxtipage is not honored, so the node does not leave IBD when the test expects. Follow-up: -maxtipage"
+note = "measured 2026-09-15: L39 initialblockdownload False where True is expected: -maxtipage is parsed but not consulted by the IBD predicate. Follow-up: -maxtipage"
 
 [[test]]
 file = "feature_maxuploadtarget.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: KeyError 'uploadtarget' on getnettotals. The field is only the first assertion -- the test then drives real -maxuploadtarget behaviour (historical-block refusal, cycle reset, per-peer accounting), which satd does not implement. Follow-up: -maxuploadtarget"
+note = "measured 2026-09-15: L57 KeyError 'uploadtarget' on getnettotals. The field is the first assertion; the test then drives real -maxuploadtarget behaviour. Follow-up: -maxuploadtarget"
 
 [[test]]
 file = "feature_minchainwork.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd does not reject a malformed -minimumchainwork at startup the way Core does. Follow-up: -minimumchainwork validation"
+note = "measured 2026-09-15: L72 node2 accepts headers below -minimumchainwork (getchaintips has more than one tip). Follow-up: Core's low-work headers gating"
 
 [[test]]
 file = "feature_notifications.py"
 status = "skip"
-reason = "needs-triage"
-note = "an RPC fails with -1 'Header decode failed'; not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L194 no -alertnotify file after the large-work-invalid-chain condition (submitheader x7, then submitblock in reverse). Follow-up: the large-work-invalid-chain warning and its alertnotify"
 
 [[test]]
 file = "feature_nulldummy.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: createmultisig is Method not found. Follow-up: createmultisig (pure secp256k1/script, no wallet)"
+note = "measured 2026-09-15: L72 createmultisig is Method not found. Behind it: the '(Dummy CHECKMULTISIG argument must be zero)' reject detail. Follow-up: createmultisig"
 
 [[test]]
 file = "feature_port.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_debug_log expects 'Bound to 127.0.0.1:<port+1>'. satd already logs 'Bound to <addr>' with Core's wording; what is missing is Core's automatic onion bind at port+1, which four of the six assertions need. Not adopted -- an extra listening socket on every default node is a design decision, not an oversight"
+note = "measured 2026-09-15: L32 assert_debug_log 'Bound to 127.0.0.1:<port+1>'. satd logs 'Bound to <addr>' in Core's wording; what is missing is Core's automatic onion bind at port+1, which satd leaves off by decision. Follow-up: none planned"
 
 [[test]]
 file = "feature_posix_fs_permissions.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: the datadir is not 0700. The test also checks a wallets/ directory satd never creates. Follow-up: create the datadir and debug.log with Core's 0700/0600 modes"
+note = "measured 2026-09-15: L25 the datadir is not 0700. The test also checks a wallets/ directory satd never creates. Follow-up: create the datadir 0700"
 
 [[test]]
 file = "feature_presegwit_node_upgrade.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured: expects the node to exit with 'Witness data for blocks after height N requires validation. Please restart with -reindex.'; satd has no pre-segwit-chainstate detection. Follow-up: the upgrade check, or a permanent core-internal reclassification"
+reason = "core-internal"
+note = "measured 2026-09-15: L39 expects init error 'Witness data for blocks after height 5 requires validation. Please restart with -reindex.' for a pre-segwit chainstate, which satd has never written"
 
 [[test]]
 file = "feature_proxy.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured 2026-09-09: the earlier proxy-dial failure is gone; the test now cannot start at all -- setup_nodes passes -i2psam, which satd refuses by name (I2P is out of scope; Tor is satd's anonymity network). The test also exercises -cjdnsreachable and unix-socket proxies."
+note = "measured 2026-09-15: L139 setup_nodes passes -i2psam, which satd refuses by name (I2P out of scope). Follow-up: none planned while I2P is out of scope"
 
 [[test]]
 file = "feature_pruning.py"
 status = "skip"
 reason = "feature-missing"
-note = "needs block-file pruning, which satd does not implement. Follow-up: pruning"
+note = "measured 2026-09-15: L223 disk usage 1083 MB > 550 in reorg_test: automatic pruning ran this far, but the prune target is not held across the test's large reorg. Follow-up: prune-target enforcement across reorgs (#540)"
 
 [[test]]
 file = "feature_rbf.py"
@@ -273,13 +271,13 @@ status = "run"
 file = "feature_reindex.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'LoadExternalBlockFile: Out of order block' / 'Processing out of order child'; satd's reindex does not log per-block ordering events"
+note = "measured 2026-09-15: L71 assert_debug_log 'LoadExternalBlockFile: Out of order block' / 'Processing out of order child'; satd's reindex does not read block files out of order and logs no such event"
 
 [[test]]
 file = "feature_reindex_init.py"
 status = "skip"
-reason = "feature-missing"
-note = "test looks for Core-specific datadir files (blocks/blk*.dat layout) that satd does not produce"
+reason = "core-internal"
+note = "measured 2026-09-15: L22 removes blocks/index, Core's LevelDB block index; satd keeps its block index in RocksDB and has no such directory"
 
 [[test]]
 file = "feature_reindex_readonly.py"
@@ -291,7 +289,7 @@ note = "measured: asserts blocks/blk00001.dat exists after mining, then makes it
 file = "feature_remove_pruned_files_on_startup.py"
 status = "skip"
 reason = "feature-missing"
-note = "test looks for Core-specific datadir files that satd does not produce"
+note = "measured 2026-09-15: startup refuses -prune=1 (no manual pruning mode). Behind it the test counts Core's blk*.dat/rev*.dat files. Follow-up: -prune=1, then a core-internal reclassification"
 
 [[test]]
 file = "feature_segwit.py"
@@ -308,13 +306,13 @@ note = "measured: reads and writes Core's regtest/settings.json, which satd does
 file = "feature_shutdown.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: the RPC connection is closed mid-call during shutdown (RemoteDisconnected) where Core answers the in-flight long call first. Follow-up: drain in-flight RPCs before closing listeners on stop"
+note = "measured 2026-09-15: L12 RemoteDisconnected: stop closes the RPC listener while waitfornewblock is in flight, where Core answers the long call first. Follow-up: drain in-flight long calls on stop"
 
 [[test]]
 file = "feature_signet.py"
 status = "skip"
 reason = "rpc-missing"
-note = "getblockchaininfo omits signet_challenge. Follow-up: signet_challenge in getblockchaininfo"
+note = "measured 2026-09-15: L71 KeyError 'signet_challenge' on getblockchaininfo. Behind it: getmininginfo.signet_challenge, bad-signet-blksig and the -signetchallenge init errors. Follow-up: signet_challenge"
 
 [[test]]
 file = "feature_startupnotify.py"
@@ -337,13 +335,13 @@ reason = "prev-release"
 file = "feature_utxo_set_hash.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: KeyError 'muhash' -- gettxoutsetinfo ignores hash_type and never returns a muhash. Follow-up: gettxoutsetinfo(hash_type='muhash')"
+note = "measured 2026-09-15: L65 KeyError 'muhash': gettxoutsetinfo ignores hash_type. Follow-up: gettxoutsetinfo(hash_type='muhash')"
 
 [[test]]
 file = "feature_versionbits_warning.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: expects getmininginfo().warnings to carry Core's unknown-rules-active warning. satd has no versionbits deployments and no unknown-rule detection. Follow-up: unknown-versionbits warning"
+note = "measured 2026-09-15: L97 getmininginfo.warnings lacks Core's unknown-new-rules-activated warning; satd has no unknown-versionbits detection. Follow-up: unknown versionbits warning"
 
 [[test]]
 file = "interface_bitcoin_cli.py"
@@ -368,13 +366,13 @@ reason = "no-ipc"
 file = "interface_rest.py"
 status = "skip"
 reason = "feature-missing"
-note = "REST endpoint returns 401 Unauthorized; Core's REST is unauthenticated by design, satd requires auth"
+note = "measured 2026-09-15: L87 /rest/ returns 404; satd serves Esplora instead of Core's REST interface, by design. Follow-up: none planned"
 
 [[test]]
 file = "interface_rpc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "re-measured 2026-09-09 after #702: `active_commands` now passes — the test reaches `assert_equal(info['logpath'], <chain_path>/debug.log)` and fails there. satd has no `debug.log` by design (it logs to stdout; `-debuglogfile` / `-shrinkdebugfile` / `-printtoconsole` are recognised and refused with that message), so `logpath` is deliberately empty rather than naming a file that does not exist. This row cannot flip without satd growing a log file."
+note = "measured 2026-09-15: L106 getrpcinfo.logpath is empty where Core reports <datadir>/debug.log; satd logs to stdout and has no debug.log of its own. Follow-up: none planned while there is no -debuglogfile"
 
 [[test]]
 file = "interface_usdt_coinselection.py"
@@ -410,19 +408,19 @@ reason = "no-core-zmq"
 file = "mempool_accept.py"
 status = "skip"
 reason = "rpc-missing"
-note = "re-measured after the #665 shape work, which carried it from line 113 to line 287: four divergences fixed on the way (missing `wtxid`, the lenient `maxfeerate` parser, `txn-already-known` decided from the txindex, and `bad-txns-vout-negative`). The remaining blocker is unrelated: with `-txindex` the test's `getrawtransaction` of a coinbase answers `-5 Use -txindex` after `getindexinfo` reports the index synced. Follow-up: txindex completeness over a cached datadir"
+note = "measured 2026-09-15: L287 getrawtransaction of a confirmed coinbase with -txindex answers -5 'No such mempool transaction' after getindexinfo reports the index synced, on a datadir first built from the framework's cache. Follow-up: txindex over a cached datadir"
 
 [[test]]
 file = "mempool_accept_wtxid.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured after `wtxid` was added to every `testmempoolaccept` result: the blocker is now BIP 339 wtxid relay, which satd does not implement at all — it announces txids under MSG_WITNESS_TX, so `wait_for_broadcast([wtxid])` never matches. Follow-up: BIP 339 wtxid relay"
+note = "measured 2026-09-15: L54 KeyError 'wtxid' on getmempoolentry. Behind it: BIP 339 wtxid relay (#714). Follow-up: getmempoolentry.wtxid, then #714"
 
 [[test]]
 file = "mempool_cluster.py"
 status = "skip"
 reason = "feature-missing"
-note = "getmempoolentry missing `optimal` cluster-linearization field (Core v31+)"
+note = "measured 2026-09-15: L319 KeyError 'optimal' on getmempoolinfo (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "mempool_compatibility.py"
@@ -441,37 +439,37 @@ status = "run"
 file = "mempool_ephemeral_dust.py"
 status = "skip"
 reason = "feature-missing"
-note = "submitpackage + ephemeral dust policy partially implemented; mempool sync fails (no 1P1C P2P relay for zero-fee parents)"
+note = "measured 2026-09-15: L104 the -26 message lacks Core's 'min relay fee not met' reason prefix. Behind it: 1P1C package relay for zero-fee parents. Follow-up: reject message parity, then package relay"
 
 [[test]]
 file = "mempool_expiry.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `getprioritisedtransactions`"
+note = "measured 2026-09-15: L46 getprioritisedtransactions lacks modified_fee. Follow-up: modified_fee"
 
 [[test]]
 file = "mempool_limit.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured after the RBF/eviction fixes: satd has no dynamic mempool minimum feerate. Core raises `getmempoolinfo.mempoolminfee` above `minrelaytxfee` once the pool has evicted, and decays it; satd reports the static relay floor. Follow-up: dynamic mempool min feerate"
+note = "measured 2026-09-15: L208 fill_mempool: getmempoolinfo.mempoolminfee never rises above minrelaytxfee; satd has no rolling mempool minimum feerate. Follow-up: dynamic mempool minimum fee"
 
 [[test]]
 file = "mempool_package_limits.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: L29 KeyError 'package-error' where 'too-large-cluster' is expected; the test uses Core v31 cluster limits and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "mempool_package_rbf.py"
 status = "skip"
 reason = "feature-missing"
-note = "needs `submitpackage` RPC and package-RBF policy"
+note = "measured 2026-09-15: L110 reject-reason 'insufficient fee' where 'bip125-replacement-disallowed' is expected; satd has no package RBF. Follow-up: package RBF"
 
 [[test]]
 file = "mempool_packages.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses -limitclustercount (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: L62 wait_for_broadcast times out; the test uses Core v31 cluster limits and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "mempool_persist.py"
@@ -482,7 +480,7 @@ reason = "no-wallet"
 file = "mempool_reorg.py"
 status = "skip"
 reason = "feature-missing"
-note = "error-code -26 fixed; fails later: disconnected-block txs not reclaimed into mempool after reorg (invalidateblock path)"
+note = "measured 2026-09-15: L54 node1 block sync times out after invalidateblock: its headers tip stays on the invalidated branch. Behind it: Core's Poisson tx-announcement trickle. Follow-up: invalidateblock resets the best header"
 
 [[test]]
 file = "mempool_resurrect.py"
@@ -492,7 +490,7 @@ status = "run"
 file = "mempool_sigoplimit.py"
 status = "skip"
 reason = "feature-missing"
-note = "sigop-equivalent vsize differs by one (satd 344, Core 345) for the same transaction"
+note = "measured 2026-09-15: L117 sigop-equivalent vsize 344 != 345: satd's -bytespersigop rounding differs. Follow-up: Core's sigop-adjusted vsize"
 
 [[test]]
 file = "mempool_spend_coinbase.py"
@@ -502,43 +500,43 @@ status = "run"
 file = "mempool_truc.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_raises_rpc_error saw no exception -- satd has no TRUC (v3) topology policy. Follow-up: TRUC"
+note = "measured 2026-09-15: L69 no exception raised: satd has no TRUC (v3) topology policy. Follow-up: TRUC"
 
 [[test]]
 file = "mempool_unbroadcast.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `mockscheduler` RPC and `unbroadcast` field in getmempoolentry"
+note = "measured 2026-09-15: L69 mockscheduler is Method not found; the test then checks getmempoolentry.unbroadcast. Follow-up: mockscheduler and unbroadcast tracking"
 
 [[test]]
 file = "mempool_updatefromblock.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses Core v31 cluster-mempool option; satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: startup refuses -limitclustersize (Core v31 cluster mempool); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "mining_basic.py"
 status = "skip"
 reason = "feature-missing"
-note = "getmininginfo fixed; fails on -blockversion=1337 (satd ignores -blockversion CLI arg in getblocktemplate)"
+note = "measured 2026-09-15: node2 is started with -prune=1, which satd refuses (no manual pruning mode). Follow-up: -prune=1, then re-measure"
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'ThreadRPCServer method=getblocktemplate'; satd does not log per-method RPC calls"
+note = "measured 2026-09-15: L44 assert_debug_log 'ThreadRPCServer method=getblocktemplate'. Behind it: the longpoll must block until the tip or mempool changes. Follow-up: a debuglog_map.toml rule over satd's RPC trace line"
 
 [[test]]
 file = "mining_mainnet.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: KeyError 'bits' on getmininginfo. Follow-up: the `bits` field (Core's compact-target string) on getmininginfo/getblockheader/getblock"
+note = "measured 2026-09-15: L100 KeyError 'bits' on getmininginfo. Follow-up: getmininginfo bits/target/next and getblock/getblockheader target"
 
 [[test]]
 file = "mining_prioritisetransaction.py"
 status = "skip"
 reason = "rpc-missing"
-note = "re-measured after the prioritisetransaction fixes: the remaining failure is a missing *required* argument, where Core throws the method's help text (which contains the method name) and satd answers `Missing required argument txid`. Follow-up: required-argument errors carry the help text (#671)"
+note = "measured 2026-09-15: L206 a missing required argument must fail with -1 and the method's help text; satd's arity error does not name the method. Behind it: getmempoolcluster (Core v31). Follow-up: per-method help"
 
 [[test]]
 file = "mining_template_verification.py"
@@ -547,8 +545,8 @@ status = "run"
 [[test]]
 file = "p2p_1p1c_network.py"
 status = "skip"
-reason = "rpc-missing"
-note = "needs `getorphantxs` RPC"
+reason = "feature-missing"
+note = "measured 2026-09-15: L105 node2 block sync times out, its IBD scheduler stuck at '32/130 stored, 0 in-flight, 10 pending'. Behind it: getorphantxs and 1P1C relay. Follow-up: IBD scheduler wedge"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -558,13 +556,13 @@ status = "run"
 file = "p2p_addr_relay.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: addconnection works now; oversized_addr_test sends an addr of 1010 entries and satd neither logs it nor disconnects. Follow-up: enforce MAX_ADDR_TO_SEND on inbound addr"
+note = "measured 2026-09-15: L149 an addr of 1010 entries is neither logged nor disconnected. Behind it: address relay. Follow-up: addrman and address relay"
 
 [[test]]
 file = "p2p_addr_selfannouncement.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `addpeeraddress` RPC"
+note = "measured 2026-09-15: L74 addpeeraddress is Method not found. Follow-up: addrman and addpeeraddress"
 
 [[test]]
 file = "p2p_addrfetch.py"
@@ -574,7 +572,7 @@ status = "run"
 file = "p2p_addrv2_relay.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: times out in wait_until waiting for an addrv2 relay satd never sends; satd has no addrman and does not relay addresses. Follow-up: address relay"
+note = "measured 2026-09-15: L83 an oversized addrv2 is not disconnected; satd has no address relay. Follow-up: addrman and address relay"
 
 [[test]]
 file = "p2p_block_sync.py"
@@ -583,32 +581,32 @@ status = "run"
 [[test]]
 file = "p2p_blockfilters.py"
 status = "skip"
-reason = "needs-triage"
-note = "block sync between two nodes times out after 60s; not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L60 node1 block sync times out in a 999-block IBD with 'Connector stuck waiting for block data'. Behind it: hash-keyed block filters. Follow-up: IBD scheduler wedge"
 
 [[test]]
 file = "p2p_blocksonly.py"
 status = "skip"
-reason = "rpc-missing"
-note = "`getnetworkinfo.localrelay` is always true; Core reports false under `-blocksonly`"
+reason = "feature-missing"
+note = "measured 2026-09-15: L120 under -blocksonly a tx from a peer without relay permission does not disconnect it. Follow-up: Core's -blocksonly violation disconnects"
 
 [[test]]
 file = "p2p_compactblocks.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: addconnection works now; make_utxos pushes a block with send_and_ping and getbestblockhash stays at genesis -- an unrequested block is not connected. Same root as p2p_unrequested_blocks"
+note = "measured 2026-09-15: L162 a block pushed with send_and_ping is not connected when the pong arrives. Behind it: BIP 152 compact block sending. Follow-up: message ordering behind ping"
 
 [[test]]
 file = "p2p_compactblocks_blocksonly.py"
 status = "skip"
 reason = "feature-missing"
-note = "block hash mismatch after compact-block relay in -blocksonly mode; compact-block handling diverges"
+note = "measured 2026-09-15: L75 a block pushed with send_and_ping is not connected when the pong arrives. Behind it: BIP 152 compact block sending. Follow-up: message ordering behind ping"
 
 [[test]]
 file = "p2p_compactblocks_hb.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: high-bandwidth peer selection never happens -- assert_equal([False]*4, [False,True,False,False]). satd does not promote peers to HB compact-block mode. Follow-up: BIP 152 high-bandwidth mode"
+note = "measured 2026-09-15: L69 no high-bandwidth peer promotion ([False]*4 where [False, True, False, False] is expected). Follow-up: BIP 152 high-bandwidth mode"
 
 [[test]]
 file = "p2p_disconnect_ban.py"
@@ -618,37 +616,37 @@ status = "run"
 file = "p2p_dns_seeds.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'DNS seeding disabled'; satd does not log the DNS-seed decision. Follow-up: a debuglog_map.toml rule once satd logs it"
+note = "measured 2026-09-15: L32 assert_debug_log 'DNS seeding disabled' is not in the node log. Behind it: addrman. Follow-up: addrman"
 
 [[test]]
 file = "p2p_eviction.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd sends no periodic P2P ping, so the test's peers never see one. Same gap that blocks connect_nodes() for 22 other tests"
+note = "measured 2026-09-15: L119 no inbound peer is evicted (0 != 1); satd has no inbound eviction. Follow-up: inbound eviction"
 
 [[test]]
 file = "p2p_feefilter.py"
 status = "skip"
 reason = "feature-missing"
-note = "fee filter relay assertion fails; satd's feefilter relay timing or threshold differs from Core"
+note = "measured 2026-09-15: L24 a feefilter is sent to a forcerelay-permissioned peer, which Core never does. Follow-up: Core's feefilter send rules"
 
 [[test]]
 file = "p2p_filter.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'Misbehaving'; satd has no misbehaviour scoring to log"
+note = "measured 2026-09-15: L109 assert_debug_log 'Misbehaving'; satd has neither BIP 37 filtering nor misbehaviour scoring to log"
 
 [[test]]
 file = "p2p_fingerprint.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(10, 13) -- satd serves stale blocks the anti-fingerprinting rule says to withhold. Follow-up: Core's stale-block serving cutoff"
+note = "measured 2026-09-15: L87 getblockcount 10 != 13: satd serves stale blocks older than 30 days that Core withholds. Follow-up: Core's stale-block serving cutoff"
 
 [[test]]
 file = "p2p_getaddr_caching.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `addpeeraddress` RPC"
+note = "measured 2026-09-15: L60 addpeeraddress is Method not found. Follow-up: addrman and addpeeraddress"
 
 [[test]]
 file = "p2p_getdata.py"
@@ -657,49 +655,49 @@ status = "run"
 file = "p2p_handshake.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'ignoring redundant verack message'; satd does not log this"
+note = "measured 2026-09-15: L79 assert_debug_log 'ignoring redundant verack message'; satd does not log the event. Behind it three more handshake lines. Follow-up: handshake log lines"
 
 [[test]]
 file = "p2p_headers_sync_with_minchainwork.py"
 status = "skip"
-reason = "needs-triage"
-note = "a wait_until predicate on headers sync times out; not yet attributed"
+reason = "core-log"
+note = "measured 2026-09-15: L59 assert_debug_log 'Synchronizing blockheaders, height: 14'; satd has no anti-DoS headers presync to log"
 
 [[test]]
 file = "p2p_i2p_ports.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd hard-errors on -i2psam config key; I2P is out of scope"
+note = "measured 2026-09-15: startup refuses -i2psam; I2P is out of scope. Follow-up: none planned"
 
 [[test]]
 file = "p2p_i2p_sessions.py"
 status = "skip"
 reason = "feature-missing"
-note = "`-i2psam` is unimplemented; satd refuses the option at startup"
+note = "measured 2026-09-15: startup refuses -i2psam; I2P is out of scope. Follow-up: none planned"
 
 [[test]]
 file = "p2p_ibd_stalling.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured: addconnection works now; the test waits on sum(len(peer[inflight])) and getpeerinfo.inflight is a hardcoded empty list. Follow-up: per-peer in-flight block tracking in getpeerinfo"
+reason = "feature-missing"
+note = "measured 2026-09-15: L86 sum(inflight) never equals the stalled block count. Behind it: Core's stalling window, timeout doubling and reassignment. Follow-up: per-peer in-flight ledger and Core's stalling logic"
 
 [[test]]
 file = "p2p_ibd_txrelay.py"
 status = "skip"
-reason = "needs-triage"
-note = "a wait_until predicate times out during IBD tx relay; not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L49 peers' minfeefilter is not MAX_FEE_FILTER while the node is in IBD. Follow-up: Core's IBD feefilter"
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: satd sends getheaders to a second peer during initial headers sync where Core sends to exactly one. Follow-up: Core's single-peer initial-headers-sync rule"
+note = "measured 2026-09-15: L94 getheaders goes to a second peer during initial headers sync where Core sends to exactly one. Follow-up: Core's single-peer initial headers sync"
 
 [[test]]
 file = "p2p_invalid_block.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects the reject reason 'bad-txns-duplicate' in debug.log; satd rejects the block but words the log line differently. Follow-up: a debuglog_map.toml rule for block reject reasons"
+note = "measured 2026-09-15: L89 assert_debug_log 'bad-txns-duplicate'; satd rejects the block but logs no reject reason. Behind it: mutated-twin re-acceptance. Follow-up: block reject log line"
 
 [[test]]
 file = "p2p_invalid_locator.py"
@@ -709,187 +707,187 @@ status = "run"
 file = "p2p_invalid_messages.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: times out in wait_until on a malformed-message disconnect satd does not perform. Follow-up: Core's message-level sanity checks and disconnects"
+note = "measured 2026-09-15: L96 getnettotals.totalbytesrecv not advanced by a partial message header. Behind it: Core's message error taxonomy. Follow-up: message-level accounting and disconnects"
 
 [[test]]
 file = "p2p_invalid_tx.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects the reject reason 'bad-txns-vout-empty' in debug.log; satd rejects the transaction but words the log line differently. Follow-up: a debuglog_map.toml rule for tx reject reasons"
+note = "measured 2026-09-15: L74 assert_debug_log 'bad-txns-vout-empty'; satd rejects the transaction but logs no reject reason. Behind it: getorphantxs and orphan log lines. Follow-up: tx reject log line"
 
 [[test]]
 file = "p2p_leak.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd does not send a wtxidrelay message during handshake; test asserts got_wtxidrelay"
+note = "measured 2026-09-15: L150 no wtxidrelay during the handshake; satd has no BIP 339 wtxid relay. Follow-up: #714"
 
 [[test]]
 file = "p2p_leak_tx.py"
 status = "skip"
 reason = "feature-missing"
-note = "getrawmempool(verbose=false, mempool_sequence=true) returns a list instead of {txids, mempool_sequence}; satd has no mempool sequence counter"
+note = "measured 2026-09-15: L46 getrawmempool(mempool_sequence=true) returns a list, not {txids, mempool_sequence}. Follow-up: mempool sequence counter"
 
 [[test]]
 file = "p2p_message_capture.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: no msgs_recv.dat written -- satd has no -capturemessages. Follow-up: -capturemessages"
+note = "measured 2026-09-15: L65 no msgs_recv.dat; satd has no -capturemessages. Follow-up: -capturemessages"
 
 [[test]]
 file = "p2p_mutated_blocks.py"
 status = "skip"
-reason = "rpc-missing"
-note = "measured: addconnection works and the peer-id assertion passes; assert_equal([101], peer[inflight]) then fails on the hardcoded empty getpeerinfo.inflight. Follow-up: per-peer in-flight block tracking"
+reason = "feature-missing"
+note = "measured 2026-09-15: L78 getpeerinfo.inflight is [] where [101] is expected: in-flight blocks are only tracked by the IBD scheduler, not for a steady-state request. Follow-up: per-peer in-flight ledger"
 
 [[test]]
 file = "p2p_net_deadlock.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs the hidden Core RPC sendmsgtopeer to push an unknown message type. Follow-up: sendmsgtopeer"
+note = "measured 2026-09-15: sendmsgtopeer is Method not found. Follow-up: sendmsgtopeer"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: times out in wait_until on the disconnect satd does not perform when a peer sends filter messages with -peerbloomfilters=0. Follow-up: BIP 37 filter-message rejection"
+note = "measured 2026-09-15: L30 mempool/filterload/filteradd/filterclear with -peerbloomfilters=0 do not disconnect the peer. Follow-up: Core's no-bloom-filter disconnects"
 
 [[test]]
 file = "p2p_node_network_limited.py"
 status = "skip"
 reason = "feature-missing"
-note = "observed: a -prune=550 node advertises NODE_NETWORK|NODE_WITNESS (9) where Core signals NODE_NETWORK_LIMITED|NODE_WITNESS (1032). Follow-up: signal NODE_NETWORK_LIMITED, and drop NODE_NETWORK, when pruning"
+note = "measured 2026-09-15: L126 nServices 9 where 1032 (v2: 3080) is expected: a pruned node does not signal NODE_NETWORK_LIMITED. Follow-up: NODE_NETWORK_LIMITED"
 
 [[test]]
 file = "p2p_opportunistic_1p1c.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(0.00000100, 0.00001) on the min-relay feerate the test sets up against; behind it, satd has no 1p1c package relay. Follow-up: package relay"
+note = "measured 2026-09-15: L620 fill_mempool: mempoolminfee never rises above minrelaytxfee. Behind it: 1P1C package relay. Follow-up: dynamic mempool minimum fee, then package relay"
 
 [[test]]
 file = "p2p_orphan_handling.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `getorphantxs` RPC"
+note = "measured 2026-09-15: L60 getorphantxs is Method not found. Behind it: Core's txrequest scheduling. Follow-up: getorphantxs"
 
 [[test]]
 file = "p2p_outbound_eviction.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: addconnection works now; the test waits for the getheaders satd never sends when an outbound peer stalls. Follow-up: outbound peer eviction (stale-tip getheaders + protection rules)"
+note = "measured 2026-09-15: L52 no getheaders probe to a stale outbound peer. Follow-up: Core's CHAIN_SYNC_TIMEOUT outbound eviction"
 
 [[test]]
 file = "p2p_permissions.py"
 status = "skip"
 reason = "feature-missing"
-note = "tx not relayed to a -whitelist peer with relay permission; satd's permission-based relay logic differs"
+note = "measured 2026-09-15: L117 a tx pushed by a forcerelay peer is not in the mempool when send_txs_and_test checks. Behind it: forcerelay re-relay and its log line. Follow-up: message ordering behind ping"
 
 [[test]]
 file = "p2p_ping.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(0.099043, 3) on getpeerinfo().pingtime -- satd sends no periodic ping, so no round-trip is ever measured. Follow-up: the P2P keepalive ping (also blocks ~27 other tests)"
+note = "measured 2026-09-15: L43 pingwait 0.099 != 3: ping timing reads the wall clock, not the mock clock. Behind it: Core's pong log lines. Follow-up: ping timing on the node clock"
 
 [[test]]
 file = "p2p_private_broadcast.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: startup refuses -i2psam; the test uses -privatebroadcast (Core v31) and satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "p2p_private_broadcast_retry_v1.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses -privatebroadcast (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: startup refuses -privatebroadcast (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "p2p_seednode.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'Empty addrman, adding seednode (<ip>) to addrfetch'; satd has no addrman, so there is no event to reword"
+note = "measured 2026-09-15: L33 assert_debug_log 'Empty addrman, adding seednode (<ip>) to addrfetch'; satd has no addrman, so there is no event to reword"
 
 [[test]]
 file = "p2p_segwit.py"
 status = "skip"
-reason = "rpc-missing"
-note = "calls getdeploymentinfo, which satd does not implement. Follow-up: getdeploymentinfo"
+reason = "feature-missing"
+note = "measured 2026-09-15: L321 a tx pushed with send_and_ping is not in the mempool when the pong arrives. Behind it: witness-aware getdata and wtxid relay. Follow-up: message ordering behind ping, then #714"
 
 [[test]]
 file = "p2p_sendheaders.py"
 status = "skip"
-reason = "needs-triage"
-note = "satd announces a different set of headers than the test expects; not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L334 an unexpected getheaders after a block inv. Behind it: inv->getheaders-not-getdata, per-peer announcement state and direct fetch. Follow-up: Core's header announcement state machine"
 
 [[test]]
 file = "p2p_sendtxrcncl.py"
 status = "skip"
 reason = "feature-missing"
-note = "erlay/tx reconciliation (BIP 330) not implemented; satd does not send sendtxrcncl during handshake"
+note = "measured 2026-09-15: L79 no sendtxrcncl during the handshake; satd has no BIP 330 Erlay. Follow-up: none planned"
 
 [[test]]
 file = "p2p_timeouts.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'Added connection peer=0'; satd words its inbound-accept log differently. Follow-up: a debuglog_map.toml rule once the satd line is stable"
+note = "measured 2026-09-15: L52 assert_debug_log 'Added connection peer=0'; satd logs no inbound accept with the peer id. Behind it: the handshake-timeout lines. Follow-up: connection and timeout log lines"
 
 [[test]]
 file = "p2p_tx_download.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd does not send GETDATA after receiving a WTX INV; tx download scheduling for wtxid-relay not implemented"
+note = "measured 2026-09-15: L171 no getdata after a MSG_WTX inv; satd has no wtxid relay or Core's tx download scheduling. Follow-up: #714"
 
 [[test]]
 file = "p2p_tx_privacy.py"
 status = "skip"
-reason = "needs-triage"
-note = "after 60s the spy peer has not seen the expected wtxid inv: `AssertionError: Predicate ... not true after 60 seconds` on wait_for_inv_match(CInv(MSG_WTX, tx2.wtxid_int))"
+reason = "feature-missing"
+note = "measured 2026-09-15: L48 the spy peer never sees a MSG_WTX inv; satd announces by txid. Follow-up: #714"
 
 [[test]]
 file = "p2p_unrequested_blocks.py"
 status = "skip"
 reason = "core-log"
-note = "measured: assert_debug_log expects 'AcceptBlockHeader: not adding new block header <hash>, missing anti-dos proof-of-work validation'; satd has no anti-DoS header-acceptance gate to log"
+note = "measured 2026-09-15: L100 assert_debug_log 'AcceptBlockHeader: not adding new block header <hash>, missing anti-dos proof-of-work validation'; satd has no anti-DoS header gate to log"
 
 [[test]]
 file = "p2p_v2_encrypted.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: addconnection works now; the v1 re-dial after a failed outbound v2 handshake ends in early eof, so the advertised-v2/actually-v1 downgrade never completes. Follow-up: v2 downgrade re-dial"
+note = "measured 2026-09-15: L85 KeyError 'version' in bytessent_per_msg under v2 transport: v2 connections do not account bytes per message type. Behind it: the advertised-v2/actually-v1 downgrade re-dial. Follow-up: per-message byte accounting on v2"
 
 [[test]]
 file = "p2p_v2_misbehaving.py"
 status = "skip"
 reason = "feature-missing"
-note = "v2 transport peer_id counter semantics differ after a detection timeout"
+note = "measured 2026-09-15: L152 the peer is absent from getpeerinfo during v2 detection. Behind it: Core's v2 error log taxonomy. Follow-up: v2 detection peer accounting"
 
 [[test]]
 file = "p2p_v2_transport.py"
 status = "skip"
-reason = "needs-triage"
-note = "a v2 transport assertion fails (0 == 2048); not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L39 localservices lacks NODE_P2P_V2 (2048) with -v2transport=1. Behind it: the v2 detection/error log lines. Follow-up: NODE_P2P_V2 in localservices"
 
 [[test]]
 file = "rpc_bind.py"
 status = "skip"
 reason = "feature-missing"
-note = "observed: with two -rpcbind addresses satd binds only 127.0.0.1, not ::1, and rejects a bad -rpcbind port with different wording than `Error: Invalid port specified in -rpcbind`. Follow-up: bind every -rpcbind entry, and match Core's invalid-port error"
+note = "measured 2026-09-15: --nonloopback passes. --ipv6 L46: of two -rpcbind entries only 127.0.0.1 is bound, not ::1. --ipv4 L60: init error wording differs from 'Error: Invalid port specified in -rpcbind: '<addr>''. Follow-up: bind every -rpcbind entry and Core's error text"
 
 [[test]]
 file = "rpc_blockchain.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: expects the node to exit with 'The block database contains a block which appears to be from the future...'; satd has no future-timestamp check on the block database at startup. Follow-up: the startup check, plus getnetworkhashps argument-type parity earlier in the file"
+note = "measured 2026-09-15: L118 restart with -prune=1, which satd refuses (no manual pruning mode). Follow-up: -prune=1, then re-measure the remaining sub-tests"
 
 [[test]]
 file = "rpc_createmultisig.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `createmultisig` RPC (not a wallet-only method in Core)"
+note = "measured 2026-09-15: L100 createmultisig is Method not found. Follow-up: createmultisig (pure secp256k1/script, no wallet)"
 
 [[test]]
 file = "rpc_decodescript.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: decodescript's `asm` omits opcode names -- satd emits the raw push payload where Core emits 'OP_PUSHBYTES_72 <hex>'. Follow-up: Core's ScriptToAsmStr rendering"
+note = "measured 2026-09-15: L36 asm renders 'OP_PUSHBYTES_72 <hex>' where Core's ScriptToAsmStr renders the bare push. Behind it: the segwit sub-object and miniscript descriptors. Follow-up: Core's asm rendering"
 
 [[test]]
 file = "rpc_deprecated.py"
@@ -903,7 +901,7 @@ status = "run"
 file = "rpc_dumptxoutset.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: after the `type` argument and datadir-relative path landed, txoutset_hash disagrees with Core -- satd's hash_serialized_3 is not Core's serialization. Follow-up: hash_serialized_3 parity (also blocks feature_utxo_set_hash), then \"rollback\" snapshots"
+note = "measured 2026-09-15: L50 txoutset_hash disagrees with Core: satd's hash_serialized_3 is not Core's serialization. Follow-up: hash_serialized_3 parity"
 
 [[test]]
 file = "rpc_estimatefee.py"
@@ -916,14 +914,14 @@ status = "run"
 [[test]]
 file = "rpc_getblockfilter.py"
 status = "skip"
-reason = "needs-triage"
-note = "getblockfilter returns -5 'filter not found for non-active block'; not yet attributed"
+reason = "feature-missing"
+note = "measured 2026-09-15: L46 getblockfilter answers -5 'filter not found for non-active block': the filter index is keyed by height, not hash. Follow-up: hash-keyed block filters"
 
 [[test]]
 file = "rpc_getblockfrompeer.py"
 status = "skip"
 reason = "feature-missing"
-note = "blocked by getchaintips not reporting fork tips; test filters getchaintips() for a non-active hash"
+note = "measured 2026-09-15: L35 node2 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: getchaintips fork tips and prune heights. Follow-up: -prune=1"
 
 [[test]]
 file = "rpc_getblockstats.py"
@@ -938,7 +936,7 @@ status = "run"
 file = "rpc_getdescriptoractivity.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: getdescriptoractivity is Method not found. Follow-up: getdescriptoractivity"
+note = "measured 2026-09-15: L39 getdescriptoractivity is Method not found. Follow-up: getdescriptoractivity"
 
 [[test]]
 file = "rpc_getdescriptorinfo.py"
@@ -948,7 +946,7 @@ status = "run"
 file = "rpc_gettxspendingprevout.py"
 status = "skip"
 reason = "feature-missing"
-note = "uses -txospenderindex (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
+note = "measured 2026-09-15: L89 the test uses -txospenderindex (Core v31); satd targets Core v30 compatibility, see CORE_DIFFERENCES.md"
 
 [[test]]
 file = "rpc_help.py"
@@ -962,13 +960,13 @@ status = "run"
 file = "rpc_invalidateblock.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: assert_equal(7, 4) on the tip height after invalidateblock across a fork; satd reconnects a different branch than Core does. Follow-up: invalidateblock branch selection"
+note = "measured 2026-09-15: L58 headers 7 != blocks 4 after invalidateblock: the headers tip stays on the invalidated branch. Behind it: branch selection at L54. Follow-up: invalidateblock resets the best header"
 
 [[test]]
 file = "rpc_misc.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs echo with named args, echoipc, coinstatsindex and txospenderindex, none of which satd has; the getmemoryinfo assertions (used/free/total/chunks_* > 0) also cannot pass now that satd reports the secure-allocator pool honestly as empty (#667), since it has no such allocator. Not reachable by fixing `logging` alone -- re-measure and re-bucket rather than tracking it as an RPC gap"
+note = "measured 2026-09-15: L56 getmemoryinfo.used is 0: satd has no locked-memory pool and reports that honestly (#667). The test also needs echoipc, coinstatsindex and txospenderindex. Follow-up: none planned"
 
 [[test]]
 file = "rpc_named_arguments.py"
@@ -978,25 +976,25 @@ status = "run"
 file = "rpc_net.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured 2026-09-09: the proxy blocker is gone (the nodes connect and getpeerinfo is reached). It now fails on `assert \"(ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)\" in help(\"getpeerinfo\")` -- satd's `help <command>` returns the method name, not Core's per-method help text."
+note = "measured 2026-09-15: L131 help('getpeerinfo') lacks the network list. Behind it: addpeeraddress, getnodeaddresses and getrawaddrman. Follow-up: per-method help, then addrman"
 
 [[test]]
 file = "rpc_orphans.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `getorphantxs`"
+note = "measured 2026-09-15: L52 getorphantxs is Method not found. Follow-up: getorphantxs"
 
 [[test]]
 file = "rpc_packages.py"
 status = "skip"
 reason = "feature-missing"
-note = "re-measured after #665: the package shape, limits, topology and arity all pass now, and the test runs to `test_submitpackage_with_ancestors`, where it waits for the node to announce four *wtxids*. satd has no BIP 339 wtxid relay. Follow-up: BIP 339 wtxid relay"
+note = "measured 2026-09-15: L546 waits for four wtxid announcements; satd announces by txid. Follow-up: #714"
 
 [[test]]
 file = "rpc_preciousblock.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured: the tip after preciousblock is the wrong branch -- satd's preciousblock does not re-order equal-work tips. Follow-up: Core's preciousblock semantics"
+note = "measured 2026-09-15: L67 the tip after preciousblock is the wrong branch: preciousblock is a no-op and equal-work tips are not ordered by Core's nSequenceId. Follow-up: preciousblock"
 
 [[test]]
 file = "rpc_psbt.py"
@@ -1007,25 +1005,25 @@ reason = "no-wallet"
 file = "rpc_rawtransaction.py"
 status = "skip"
 reason = "feature-missing"
-note = "getindexinfo does not include a txindex entry; test needs --txindex and waits for sync via getindexinfo"
+note = "measured 2026-09-15: L81 node2 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: txindex over a cached datadir. Follow-up: -prune=1"
 
 [[test]]
 file = "rpc_scanblocks.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs scanblocks RPC and -blockfilterindex activation from config"
+note = "measured 2026-09-15: L46 getindexinfo never reports synced with -blockfilterindex=1. Behind it: the scanblocks RPC. Follow-up: block filter index activation, then scanblocks"
 
 [[test]]
 file = "rpc_scantxoutset.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: scantxoutset rejects pkh() with -5. satd implements the key-free descriptors (raw(), addr()); this test needs pkh(), combo(), sh(multi()), tr() and ranged xpub derivation. Follow-up: key-based descriptors (#633)"
+note = "measured 2026-09-15: L70 scantxoutset refuses pkh() with -5. satd implements the key-free descriptors raw() and addr(). Follow-up: key-based descriptors (#633)"
 
 [[test]]
 file = "rpc_setban.py"
 status = "skip"
-reason = "rpc-missing"
-note = "the getpeerinfo.permissions blocker is closed (#667): the field reports the real flags now. Unmeasured since — the test also wants assert_debug_log('dropped (banned)') and addnode onetry. Re-measure with --candidate before flipping"
+reason = "feature-missing"
+note = "measured 2026-09-15: L48 assert_debug_log 'Cleared nodestate for peer=2'; satd logs 'Peer disconnected id=2'. The --v2transport variant also wants 'retrying with v1 transport protocol for peer=2'. Follow-up: debuglog_map.toml rules"
 
 [[test]]
 file = "rpc_signer.py"
@@ -1036,13 +1034,13 @@ reason = "no-tool"
 file = "rpc_signmessagewithprivkey.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured: signmessagewithprivkey is Method not found. Follow-up: signmessagewithprivkey (pure secp256k1, no wallet)"
+note = "measured 2026-09-15: L34 signmessagewithprivkey is Method not found. Follow-up: signmessagewithprivkey and verifymessage"
 
 [[test]]
 file = "rpc_signrawtransactionwithkey.py"
 status = "skip"
 reason = "rpc-missing"
-note = "needs `createmultisig`"
+note = "measured 2026-09-15: L79 createmultisig is Method not found. Follow-up: createmultisig and multisig signing"
 
 [[test]]
 file = "rpc_txoutproof.py"
@@ -1056,7 +1054,7 @@ status = "run"
 file = "rpc_users.py"
 status = "skip"
 reason = "feature-missing"
-note = "`connect_nodes()` waits for a `pong` in both directions and satd sends no periodic ping"
+note = "measured 2026-09-15: L160 a bare -rpcauth must start and fail with 'Error: Unable to start HTTP server. See debug log for details.'; satd refuses it at argument parsing. Follow-up: Core's -rpcauth validation"
 
 [[test]]
 file = "rpc_validateaddress.py"
@@ -1066,7 +1064,7 @@ status = "run"
 file = "rpc_whitelist.py"
 status = "skip"
 reason = "feature-missing"
-note = "satd hard-errors on rpcwhitelistdefault config key; by design, satd uses bearer-token auth instead of Core's RPC whitelists"
+note = "measured 2026-09-15: L74 satd refuses the rpcwhitelistdefault config key; by design satd uses bearer-token auth instead of Core's RPC whitelists. Follow-up: none planned"
 
 [[test]]
 file = "tool_bench_sanity_check.py"
