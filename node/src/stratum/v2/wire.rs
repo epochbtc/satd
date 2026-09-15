@@ -31,9 +31,22 @@ pub const SUBMIT_SHARES_ERROR: u8 = 0x1d;
 pub const NEW_EXTENDED_MINING_JOB: u8 = 0x1f;
 pub const SET_NEW_PREV_HASH: u8 = 0x20;
 pub const SET_TARGET: u8 = 0x21;
+pub const SET_CUSTOM_MINING_JOB: u8 = 0x22;
+pub const SET_CUSTOM_MINING_JOB_SUCCESS: u8 = 0x23;
+pub const SET_CUSTOM_MINING_JOB_ERROR: u8 = 0x24;
+
+/// Message types, Job Declaration Protocol.
+pub const ALLOCATE_MINING_JOB_TOKEN: u8 = 0x50;
+pub const ALLOCATE_MINING_JOB_TOKEN_SUCCESS: u8 = 0x51;
+pub const DECLARE_MINING_JOB: u8 = 0x57;
+pub const DECLARE_MINING_JOB_SUCCESS: u8 = 0x58;
+pub const DECLARE_MINING_JOB_ERROR: u8 = 0x59;
+pub const PUSH_SOLUTION: u8 = 0x60;
 
 /// `SetupConnection.protocol` for the Mining Protocol.
 pub const PROTOCOL_MINING: u8 = 0;
+/// `SetupConnection.protocol` for the Job Declaration Protocol.
+pub const PROTOCOL_JOB_DECLARATION: u8 = 1;
 /// The only Stratum V2 protocol version.
 pub const PROTOCOL_VERSION: u16 = 2;
 /// `SetupConnection.flags` (Mining Protocol): the client wants to select its
@@ -108,6 +121,28 @@ impl<'a> Reader<'a> {
     fn str0255(&mut self) -> Result<String, DecodeError> {
         let n = self.u8()? as usize;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+    }
+
+    fn b0255(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let n = self.u8()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+
+    fn b064k(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let n = self.u16()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+
+    /// `Seq064K<U256>`: a 2-byte count, then 32 bytes each.
+    fn seq064k_u256(&mut self) -> Result<Vec<[u8; 32]>, DecodeError> {
+        let n = self.u16()? as usize;
+        (0..n).map(|_| self.u256()).collect()
+    }
+
+    /// `Seq0255<U256>`: a 1-byte count, then 32 bytes each.
+    fn seq0255_u256(&mut self) -> Result<Vec<[u8; 32]>, DecodeError> {
+        let n = self.u8()? as usize;
+        (0..n).map(|_| self.u256()).collect()
     }
 
     fn b032(&mut self) -> Result<Vec<u8>, DecodeError> {
@@ -440,6 +475,171 @@ pub fn submit_shares_error(channel_id: u32, sequence_number: u32, error_code: &s
     out
 }
 
+fn push_b0255(out: &mut Vec<u8>, bytes: &[u8]) {
+    assert!(bytes.len() <= 255, "B0255 holds at most 255 bytes");
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
+fn push_b064k(out: &mut Vec<u8>, bytes: &[u8]) {
+    assert!(bytes.len() <= u16::MAX as usize, "B064K holds at most 65535 bytes");
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// `SetCustomMiningJob` (0x22), Mining Protocol: a job built on a transaction
+/// set the miner declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCustomMiningJob {
+    pub channel_id: u32,
+    pub request_id: u32,
+    pub token: Vec<u8>,
+    pub version: u32,
+    /// The header's byte order.
+    pub prev_hash: [u8; 32],
+    pub min_ntime: u32,
+    pub nbits: u32,
+    pub coinbase_tx_version: u32,
+    /// At most 8 bytes, placed at the start of the coinbase scriptSig ahead of
+    /// the extranonce.
+    pub coinbase_prefix: Vec<u8>,
+    pub coinbase_tx_input_n_sequence: u32,
+    /// The coinbase outputs, consensus-serialized with their count.
+    pub coinbase_tx_outputs: Vec<u8>,
+    pub coinbase_tx_locktime: u32,
+    pub merkle_path: Vec<[u8; 32]>,
+}
+
+pub fn decode_set_custom_mining_job(payload: &[u8]) -> Result<SetCustomMiningJob, DecodeError> {
+    let mut r = Reader::new(payload);
+    Ok(SetCustomMiningJob {
+        channel_id: r.u32()?,
+        request_id: r.u32()?,
+        token: r.b0255()?,
+        version: r.u32()?,
+        prev_hash: r.u256()?,
+        min_ntime: r.u32()?,
+        nbits: r.u32()?,
+        coinbase_tx_version: r.u32()?,
+        coinbase_prefix: r.b0255()?,
+        coinbase_tx_input_n_sequence: r.u32()?,
+        coinbase_tx_outputs: r.b064k()?,
+        coinbase_tx_locktime: r.u32()?,
+        merkle_path: r.seq0255_u256()?,
+    })
+}
+
+/// `SetCustomMiningJobSuccess` (0x23): `channel_id`, `request_id`, `job_id`.
+pub fn set_custom_mining_job_success(channel_id: u32, request_id: u32, job_id: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&channel_id.to_le_bytes());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    out.extend_from_slice(&job_id.to_le_bytes());
+    out
+}
+
+/// `SetCustomMiningJobError` (0x24): `channel_id`, `request_id`, `error_code:
+/// Str0255`.
+pub fn set_custom_mining_job_error(channel_id: u32, request_id: u32, error_code: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + error_code.len());
+    out.extend_from_slice(&channel_id.to_le_bytes());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    push_str0255(&mut out, error_code);
+    out
+}
+
+/// `AllocateMiningJobToken` (0x50).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocateMiningJobToken {
+    pub user_identifier: String,
+    pub request_id: u32,
+}
+
+pub fn decode_allocate_mining_job_token(payload: &[u8]) -> Result<AllocateMiningJobToken, DecodeError> {
+    let mut r = Reader::new(payload);
+    Ok(AllocateMiningJobToken { user_identifier: r.str0255()?, request_id: r.u32()? })
+}
+
+/// `AllocateMiningJobTokenSuccess` (0x51): `request_id`, `mining_job_token:
+/// B0255`, `coinbase_outputs: B064K`.
+pub fn allocate_mining_job_token_success(request_id: u32, token: &[u8], coinbase_outputs: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7 + token.len() + coinbase_outputs.len());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    push_b0255(&mut out, token);
+    push_b064k(&mut out, coinbase_outputs);
+    out
+}
+
+/// `DeclareMiningJob` (0x57).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclareMiningJob {
+    pub request_id: u32,
+    pub mining_job_token: Vec<u8>,
+    pub version: u32,
+    pub coinbase_tx_prefix: Vec<u8>,
+    pub coinbase_tx_suffix: Vec<u8>,
+    /// The template's transactions by wtxid, in block order, without the
+    /// coinbase.
+    pub wtxid_list: Vec<[u8; 32]>,
+    pub excess_data: Vec<u8>,
+}
+
+pub fn decode_declare_mining_job(payload: &[u8]) -> Result<DeclareMiningJob, DecodeError> {
+    let mut r = Reader::new(payload);
+    Ok(DeclareMiningJob {
+        request_id: r.u32()?,
+        mining_job_token: r.b0255()?,
+        version: r.u32()?,
+        coinbase_tx_prefix: r.b064k()?,
+        coinbase_tx_suffix: r.b064k()?,
+        wtxid_list: r.seq064k_u256()?,
+        excess_data: r.b064k()?,
+    })
+}
+
+/// `DeclareMiningJobSuccess` (0x58): `request_id`, `new_mining_job_token`.
+pub fn declare_mining_job_success(request_id: u32, new_token: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + new_token.len());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    push_b0255(&mut out, new_token);
+    out
+}
+
+/// `DeclareMiningJobError` (0x59): `request_id`, `error_code: Str0255`,
+/// `error_details: B064K`.
+pub fn declare_mining_job_error(request_id: u32, error_code: &str, details: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7 + error_code.len() + details.len());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    push_str0255(&mut out, error_code);
+    push_b064k(&mut out, details.as_bytes());
+    out
+}
+
+/// `PushSolution` (0x60).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushSolution {
+    /// The full extranonce: everything between the declared coinbase prefix
+    /// and suffix.
+    pub extranonce: Vec<u8>,
+    pub prev_hash: [u8; 32],
+    pub ntime: u32,
+    pub nonce: u32,
+    pub nbits: u32,
+    pub version: u32,
+}
+
+pub fn decode_push_solution(payload: &[u8]) -> Result<PushSolution, DecodeError> {
+    let mut r = Reader::new(payload);
+    Ok(PushSolution {
+        extranonce: r.b032()?,
+        prev_hash: r.u256()?,
+        ntime: r.u32()?,
+        nonce: r.u32()?,
+        nbits: r.u32()?,
+        version: r.u32()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +807,122 @@ mod tests {
         let decoded: SetTarget = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert_eq!(decoded.channel_id, 11);
         assert_eq!(decoded.maximum_target.inner_as_ref(), &[0x77; 32]);
+    }
+
+    #[test]
+    fn job_declaration_messages_match_the_reference_types() {
+        use stratum_core::binary_sv2::{B0255, B064K, Seq0255, Seq064K};
+        use stratum_core::job_declaration_sv2::{
+            AllocateMiningJobToken as RefAllocate, AllocateMiningJobTokenSuccess,
+            DeclareMiningJob as RefDeclare, DeclareMiningJobError, DeclareMiningJobSuccess,
+            PushSolution as RefPush,
+        };
+        use stratum_core::mining_sv2::{
+            SetCustomMiningJob as RefCustom, SetCustomMiningJobError, SetCustomMiningJobSuccess,
+        };
+        {
+            use stratum_core::job_declaration_sv2 as j;
+            use stratum_core::mining_sv2 as m;
+            assert_eq!(ALLOCATE_MINING_JOB_TOKEN, j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN);
+            assert_eq!(ALLOCATE_MINING_JOB_TOKEN_SUCCESS, j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS);
+            assert_eq!(DECLARE_MINING_JOB, j::MESSAGE_TYPE_DECLARE_MINING_JOB);
+            assert_eq!(DECLARE_MINING_JOB_SUCCESS, j::MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS);
+            assert_eq!(DECLARE_MINING_JOB_ERROR, j::MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR);
+            assert_eq!(PUSH_SOLUTION, j::MESSAGE_TYPE_PUSH_SOLUTION);
+            assert_eq!(SET_CUSTOM_MINING_JOB, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB);
+            assert_eq!(SET_CUSTOM_MINING_JOB_SUCCESS, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS);
+            assert_eq!(SET_CUSTOM_MINING_JOB_ERROR, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR);
+            for (t, bit) in [
+                (SET_CUSTOM_MINING_JOB, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB),
+                (SET_CUSTOM_MINING_JOB_SUCCESS, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_SUCCESS),
+                (SET_CUSTOM_MINING_JOB_ERROR, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_ERROR),
+            ] {
+                assert_eq!(is_channel_message(t), bit, "{t:#04x}");
+            }
+        }
+
+        let bytes = binary_sv2::to_bytes(RefAllocate {
+            user_identifier: Str0255::try_from("bcrt1q.rig".to_string()).unwrap(),
+            request_id: 4,
+        })
+        .unwrap();
+        assert_eq!(
+            decode_allocate_mining_job_token(&bytes).unwrap(),
+            AllocateMiningJobToken { user_identifier: "bcrt1q.rig".into(), request_id: 4 }
+        );
+        let mut bytes = allocate_mining_job_token_success(4, &[9; 16], b"outputs");
+        let decoded: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
+        assert_eq!(decoded.request_id, 4);
+        assert_eq!(decoded.mining_job_token.inner_as_ref(), &[9; 16]);
+        assert_eq!(decoded.coinbase_outputs.inner_as_ref(), b"outputs");
+
+        let wtxids = vec![[1u8; 32], [2u8; 32]];
+        let bytes = binary_sv2::to_bytes(RefDeclare {
+            request_id: 5,
+            mining_job_token: B0255::try_from(vec![7u8; 16]).unwrap(),
+            version: 0x2000_0000,
+            coinbase_tx_prefix: B064K::try_from(b"pre".to_vec()).unwrap(),
+            coinbase_tx_suffix: B064K::try_from(b"suf".to_vec()).unwrap(),
+            wtxid_list: Seq064K::new(wtxids.iter().map(|w| U256::from(*w)).collect()).unwrap(),
+            excess_data: B064K::try_from(Vec::new()).unwrap(),
+        })
+        .unwrap();
+        let got = decode_declare_mining_job(&bytes).unwrap();
+        assert_eq!((got.request_id, got.version), (5, 0x2000_0000));
+        assert_eq!(got.mining_job_token, vec![7u8; 16]);
+        assert_eq!((got.coinbase_tx_prefix.as_slice(), got.coinbase_tx_suffix.as_slice()), (&b"pre"[..], &b"suf"[..]));
+        assert_eq!(got.wtxid_list, wtxids);
+
+        let mut bytes = declare_mining_job_success(5, &[8; 16]);
+        let decoded: DeclareMiningJobSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
+        assert_eq!(decoded.new_mining_job_token.inner_as_ref(), &[8; 16]);
+        let mut bytes = declare_mining_job_error(5, "invalid-mining-job-token", "unknown token");
+        let decoded: DeclareMiningJobError = binary_sv2::from_bytes(&mut bytes).unwrap();
+        assert_eq!(decoded.error_code.inner_as_ref(), b"invalid-mining-job-token");
+        assert_eq!(decoded.error_details.inner_as_ref(), b"unknown token");
+
+        let bytes = binary_sv2::to_bytes(RefPush {
+            extranonce: B032::try_from(vec![3u8; 10]).unwrap(),
+            prev_hash: U256::from([4u8; 32]),
+            ntime: 11,
+            nonce: 12,
+            nbits: 13,
+            version: 14,
+        })
+        .unwrap();
+        let got = decode_push_solution(&bytes).unwrap();
+        assert_eq!(got.extranonce, vec![3u8; 10]);
+        assert_eq!((got.ntime, got.nonce, got.nbits, got.version), (11, 12, 13, 14));
+
+        let bytes = binary_sv2::to_bytes(RefCustom {
+            channel_id: 2,
+            request_id: 3,
+            token: B0255::try_from(vec![5u8; 16]).unwrap(),
+            version: 0x2000_0000,
+            prev_hash: U256::from([6u8; 32]),
+            min_ntime: 100,
+            nbits: 0x207fffff,
+            coinbase_tx_version: 2,
+            coinbase_prefix: B0255::try_from(vec![1, 2, 3]).unwrap(),
+            coinbase_tx_input_n_sequence: 0xffff_ffff,
+            coinbase_tx_outputs: B064K::try_from(b"outs".to_vec()).unwrap(),
+            coinbase_tx_locktime: 0,
+            merkle_path: Seq0255::new(vec![U256::from([7u8; 32])]).unwrap(),
+        })
+        .unwrap();
+        let got = decode_set_custom_mining_job(&bytes).unwrap();
+        assert_eq!((got.channel_id, got.request_id, got.min_ntime), (2, 3, 100));
+        assert_eq!(got.prev_hash, [6u8; 32]);
+        assert_eq!(got.coinbase_prefix, vec![1, 2, 3]);
+        assert_eq!(got.coinbase_tx_outputs, b"outs".to_vec());
+        assert_eq!(got.merkle_path, vec![[7u8; 32]]);
+
+        let mut bytes = set_custom_mining_job_success(2, 3, 99);
+        let decoded: SetCustomMiningJobSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
+        assert_eq!((decoded.channel_id, decoded.request_id, decoded.job_id), (2, 3, 99));
+        let mut bytes = set_custom_mining_job_error(2, 3, "invalid-mining-job-token");
+        let decoded: SetCustomMiningJobError = binary_sv2::from_bytes(&mut bytes).unwrap();
+        assert_eq!(decoded.error_code.inner_as_ref(), b"invalid-mining-job-token");
     }
 
     #[test]

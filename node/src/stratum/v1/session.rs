@@ -24,7 +24,7 @@ use super::{
 };
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::server::{Shared, submit_found_block};
+use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{ShareResult, effective_share_target, network_difficulty, validate_share};
 use crate::stratum::template::{ActiveTemplate, Work};
 use crate::stratum::vardiff::Vardiff;
@@ -57,6 +57,8 @@ struct Session<S> {
     /// one is a clean job: everything before it is stale.
     job_prev_hash: Option<BlockHash>,
     seen: HashSet<SeenKey>,
+    /// Counts this connection as a channel once authorized.
+    channel: Option<CountGuard>,
 }
 
 /// Serve one connection until it closes, idles out, or the node shuts down.
@@ -69,6 +71,7 @@ pub(crate) async fn run<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tracing::debug!(target: "node::stratum", %peer, "Stratum connection opened");
+    let _connection = shared.stats.connection();
     let (read_half, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut buf = Vec::with_capacity(512);
@@ -85,6 +88,7 @@ pub(crate) async fn run<S>(
         jobs: JobManager::new(),
         job_prev_hash: None,
         seen: HashSet::new(),
+        channel: None,
     };
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -275,6 +279,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         );
         let first = self.payout.is_none();
         self.payout = Some(payout);
+        if first {
+            self.channel = Some(CountGuard::new(self.shared.stats.clone(), |s| &s.channels));
+        }
         self.write(response(&req.id, json!(true))).await?;
         if first {
             self.write(notification("mining.set_difficulty", json!([self.vardiff.difficulty()])))
@@ -352,6 +359,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 
     async fn submit(&mut self, req: &Request) -> Result<(), Close> {
         let reply = self.judge_submit(req).await;
+        self.shared.stats.share(match reply {
+            Ok(()) => ShareOutcome::Accepted,
+            Err(StratumError::JobNotFound) => ShareOutcome::Stale,
+            Err(_) => ShareOutcome::Rejected,
+        });
         let line = match reply {
             Ok(()) => response(&req.id, json!(true)),
             Err(err) => error_response(&req.id, err, None),

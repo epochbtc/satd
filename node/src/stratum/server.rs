@@ -3,7 +3,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bitcoin::{Block, Network};
@@ -47,6 +47,81 @@ struct V2Listener {
     ctx: Arc<super::v2::session::V2Context>,
 }
 
+/// Counters the server keeps for `getstratuminfo`.
+#[derive(Default)]
+pub struct StratumStats {
+    /// Open connections, both protocols.
+    pub connections: AtomicU64,
+    /// Authorized Stratum V1 connections plus open Stratum V2 channels.
+    pub channels: AtomicU64,
+    pub shares_accepted: AtomicU64,
+    /// Rejected for any reason other than staleness.
+    pub shares_rejected: AtomicU64,
+    pub shares_stale: AtomicU64,
+    /// Blocks found by miners that joined the active chain.
+    pub blocks_found: AtomicU64,
+    last_block: parking_lot::Mutex<Option<LastBlock>>,
+}
+
+#[derive(Clone, Copy)]
+struct LastBlock {
+    height: u32,
+    hash: bitcoin::BlockHash,
+    time: u64,
+}
+
+impl StratumStats {
+    /// Count a connection until the returned guard drops.
+    pub(crate) fn connection(self: &Arc<Self>) -> CountGuard {
+        CountGuard::new(self.clone(), |s| &s.connections)
+    }
+
+    pub(crate) fn share(&self, outcome: ShareOutcome) {
+        let counter = match outcome {
+            ShareOutcome::Accepted => &self.shares_accepted,
+            ShareOutcome::Stale => &self.shares_stale,
+            ShareOutcome::Rejected => &self.shares_rejected,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// How a share was judged, for the counters.
+#[derive(Clone, Copy)]
+pub(crate) enum ShareOutcome {
+    Accepted,
+    Stale,
+    Rejected,
+}
+
+/// Holds one unit of a gauge in [`StratumStats`], released on drop.
+pub(crate) struct CountGuard {
+    stats: Arc<StratumStats>,
+    gauge: fn(&StratumStats) -> &AtomicU64,
+}
+
+impl CountGuard {
+    pub(crate) fn new(stats: Arc<StratumStats>, gauge: fn(&StratumStats) -> &AtomicU64) -> Self {
+        gauge(&stats).fetch_add(1, Ordering::Relaxed);
+        Self { stats, gauge }
+    }
+}
+
+impl Drop for CountGuard {
+    fn drop(&mut self) {
+        (self.gauge)(&self.stats).fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What was bound, for reporting.
+#[derive(Default, Clone)]
+struct Listeners {
+    v1: Option<SocketAddr>,
+    v1_tls: Option<SocketAddr>,
+    v2: Option<SocketAddr>,
+    authority_pubkey: Option<[u8; 32]>,
+}
+
 /// State every connection shares.
 pub(crate) struct Shared {
     pub config: Arc<StratumConfig>,
@@ -58,7 +133,74 @@ pub(crate) struct Shared {
     /// connection must never originate on the API runtime the listeners run
     /// on (see `ChainState::emit_chain_event`).
     pub(crate) core: tokio::runtime::Handle,
+    pub stats: Arc<StratumStats>,
+    listeners: Listeners,
     next_extranonce1: AtomicU32,
+}
+
+/// A read handle on a running server, for `getstratuminfo`.
+#[derive(Clone)]
+pub struct StratumHandle {
+    shared: Arc<Shared>,
+}
+
+impl StratumHandle {
+    /// The `getstratuminfo` result.
+    pub fn info(&self) -> serde_json::Value {
+        let shared = &self.shared;
+        let stats = &shared.stats;
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let addr = |a: Option<SocketAddr>| a.map(|a| a.to_string());
+        let work = shared.work.borrow().clone();
+        let current_job = work.map(|w| {
+            serde_json::json!({
+                "height": w.height,
+                "job_id": format!("{:x}", w.id),
+                "prev_hash": w.prev_hash.to_string(),
+                "template_txs": w.txdata.len(),
+                "template_fees": w.fees,
+            })
+        });
+        let last_block = stats.last_block.lock().map(|b| {
+            serde_json::json!({ "height": b.height, "hash": b.hash.to_string(), "time": b.time })
+        });
+        serde_json::json!({
+            "enabled": true,
+            "listeners": {
+                "v1": addr(shared.listeners.v1),
+                "v1_tls": addr(shared.listeners.v1_tls),
+                "v2": addr(shared.listeners.v2),
+            },
+            "authority_pubkey": shared.listeners.authority_pubkey.map(hex::encode),
+            "job_declaration": shared.config.v2.as_ref().is_some_and(|v| v.job_declaration),
+            "connections": load(&stats.connections),
+            "channels": load(&stats.channels),
+            "current_job": current_job,
+            "shares": {
+                "accepted": load(&stats.shares_accepted),
+                "rejected": load(&stats.shares_rejected),
+                "stale": load(&stats.shares_stale),
+            },
+            "blocks_found": load(&stats.blocks_found),
+            "last_block": last_block,
+        })
+    }
+
+    /// The `getstratuminfo` result on a node with the server off.
+    pub fn disabled_info() -> serde_json::Value {
+        serde_json::json!({
+            "enabled": false,
+            "listeners": { "v1": null, "v1_tls": null, "v2": null },
+            "authority_pubkey": null,
+            "job_declaration": false,
+            "connections": 0,
+            "channels": 0,
+            "current_job": null,
+            "shares": { "accepted": 0, "rejected": 0, "stale": 0 },
+            "blocks_found": 0,
+            "last_block": null,
+        })
+    }
 }
 
 impl Shared {
@@ -134,12 +276,26 @@ impl StratumServer {
         let allow = ClientAllowList::new(config.mtls_client_allow.iter().cloned());
         let semaphore = Arc::new(Semaphore::new(config.max_conns.max(1)));
         let (work, _) = watch::channel(None);
+        let listeners = Listeners {
+            v1: listener.local_addr().ok(),
+            v1_tls: tls.as_ref().and_then(|(l, _)| l.local_addr().ok()),
+            #[cfg(feature = "stratum-v2")]
+            v2: v2.as_ref().and_then(|v| v.listener.local_addr().ok()),
+            #[cfg(feature = "stratum-v2")]
+            authority_pubkey: v2.as_ref().map(|v| v.ctx.authority_public),
+            #[cfg(not(feature = "stratum-v2"))]
+            v2: None,
+            #[cfg(not(feature = "stratum-v2"))]
+            authority_pubkey: None,
+        };
         let shared = Arc::new(Shared {
             config: Arc::new(config),
             chain,
             mempool,
             work,
             core,
+            stats: Arc::new(StratumStats::default()),
+            listeners,
             next_extranonce1: AtomicU32::new(rand::random()),
         });
         Ok(Self {
@@ -152,6 +308,11 @@ impl StratumServer {
             #[cfg(feature = "stratum-v2")]
             v2,
         })
+    }
+
+    /// A read handle for `getstratuminfo`.
+    pub fn handle(&self) -> StratumHandle {
+        StratumHandle { shared: self.shared.clone() }
     }
 
     /// The plaintext listener's bound address.
@@ -317,6 +478,7 @@ async fn bind_v2(config: &super::config::V2Config) -> Result<V2Listener, Stratum
             authority_public: public,
             authority_private: private,
             max_channels: config.max_channels,
+            jd: config.job_declaration.then(|| Arc::new(super::v2::jd::JobDeclaration::default())),
         }),
     })
 }
@@ -345,6 +507,7 @@ async fn refresh_loop(
     let mut polled_tip = shared.chain.tip_snapshot();
     let mut withheld_warned = false;
     let mut no_peers_warned = false;
+    let mut next_work_id = 1u64;
     let network = shared.config.network;
 
     loop {
@@ -409,7 +572,9 @@ async fn refresh_loop(
                 }
                 shared.work.send_if_modified(|w| w.take().is_some());
             }
-            Some(work) => {
+            Some(mut work) => {
+                work.id = next_work_id;
+                next_work_id += 1;
                 if withheld_warned {
                     tracing::info!(target: "node::stratum", "stratum: initial block download finished; issuing work");
                     withheld_warned = false;
@@ -466,15 +631,20 @@ pub(crate) async fn submit_found_block(
     let outcome = shared.core.spawn_blocking(move || submit_block(&chain, &mempool, &block)).await;
     let address = payout.address.as_deref().unwrap_or("<--stratumaddress>");
     match outcome {
-        Ok(Ok(true)) => tracing::info!(
-            target: "node::stratum",
-            %peer,
-            height,
-            %hash,
-            address,
-            worker = payout.worker.as_deref().unwrap_or(""),
-            "Stratum miner found a block"
-        ),
+        Ok(Ok(true)) => {
+            shared.stats.blocks_found.fetch_add(1, Ordering::Relaxed);
+            *shared.stats.last_block.lock() =
+                Some(LastBlock { height, hash, time: crate::time::now_secs() });
+            tracing::info!(
+                target: "node::stratum",
+                %peer,
+                height,
+                %hash,
+                address,
+                worker = payout.worker.as_deref().unwrap_or(""),
+                "Stratum miner found a block"
+            )
+        }
         Ok(Ok(false)) => tracing::warn!(
             target: "node::stratum",
             height,

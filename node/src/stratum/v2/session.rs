@@ -14,7 +14,7 @@
 //! merkle root. An extended channel gets the split coinbase, the merkle path
 //! and an extranonce range after the prefix.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,11 +28,12 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
+use super::jd::{self, DeclaredJob, JobDeclaration};
 use super::noise::{self, TransportError};
 use super::wire;
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::server::{Shared, submit_found_block};
+use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{ShareResult, effective_share_target, network_difficulty, validate_share};
 use crate::stratum::template::{ActiveTemplate, MAX_EXTRANONCE_LEN, Work};
 use crate::stratum::v1::VERSION_ROLLING_MASK;
@@ -46,6 +47,8 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const VARDIFF_TICK: Duration = Duration::from_secs(10);
 const MAX_SEEN_SHARES: usize = 100_000;
+/// Declared jobs a Job Declaration connection keeps for `PushSolution`.
+const DECLARED_JOB_HISTORY: usize = 8;
 /// Bytes of server-assigned extranonce per channel: the connection's four
 /// bytes, then the channel id. Unique across every channel on the node.
 pub const EXTRANONCE_PREFIX_LEN: usize = 8;
@@ -55,6 +58,8 @@ pub(crate) struct V2Context {
     pub authority_public: [u8; 32],
     pub authority_private: zeroize::Zeroizing<[u8; 32]>,
     pub max_channels: usize,
+    /// Job Declaration state, when Job Declaration is enabled.
+    pub jd: Option<Arc<JobDeclaration>>,
 }
 
 /// The connection must close.
@@ -76,6 +81,7 @@ struct Channel {
     /// The previous-block hash the channel's jobs build on.
     prev_hash: Option<BlockHash>,
     seen: HashSet<SeenKey>,
+    _count: CountGuard,
 }
 
 impl Channel {
@@ -95,9 +101,17 @@ struct Session {
     codec: NoiseCodec,
     extranonce: [u8; 4],
     setup: bool,
+    /// The `SetupConnection.protocol` this connection speaks.
+    protocol: u8,
+    /// A mining connection that set `REQUIRES_WORK_SELECTION`: it may send
+    /// `SetCustomMiningJob`.
+    work_selection: bool,
     channels: HashMap<u32, Channel>,
     next_channel_id: u32,
     max_channels: usize,
+    jd: Option<Arc<JobDeclaration>>,
+    /// Jobs this Job Declaration connection declared, newest last.
+    declared: VecDeque<Arc<DeclaredJob>>,
 }
 
 /// Serve one connection until it closes, idles out, or the node shuts down.
@@ -121,6 +135,7 @@ pub(crate) async fn run(
         }
     };
     tracing::debug!(target: "node::stratum", %peer, "Stratum V2 connection opened");
+    let _connection = shared.stats.connection();
 
     let (mut reader, writer) = stream.into_split();
     // A frame read is several `read_exact`s and cannot be cancelled half way,
@@ -146,9 +161,13 @@ pub(crate) async fn run(
         writer,
         codec,
         setup: false,
+        protocol: wire::PROTOCOL_MINING,
+        work_selection: false,
         channels: HashMap::new(),
         next_channel_id: 1,
         max_channels: ctx.max_channels.max(1),
+        jd: ctx.jd.clone(),
+        declared: VecDeque::new(),
     };
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -228,8 +247,26 @@ impl Session {
             );
             return Err(Close);
         }
+        if msg_type == wire::SETUP_CONNECTION {
+            if self.setup {
+                tracing::debug!(target: "node::stratum", peer = %self.peer, "Stratum V2 second SetupConnection; closing");
+                return Err(Close);
+            }
+            return self.setup_connection(payload).await;
+        }
+        if self.protocol == wire::PROTOCOL_JOB_DECLARATION {
+            return match msg_type {
+                wire::ALLOCATE_MINING_JOB_TOKEN => self.allocate_token(payload).await,
+                wire::DECLARE_MINING_JOB => self.declare_job(payload).await,
+                wire::PUSH_SOLUTION => self.push_solution(payload).await,
+                other => {
+                    tracing::debug!(target: "node::stratum", peer = %self.peer, msg_type = other, "Stratum V2 Job Declaration message ignored");
+                    Ok(())
+                }
+            };
+        }
         match msg_type {
-            wire::SETUP_CONNECTION => self.setup_connection(payload).await,
+            wire::SET_CUSTOM_MINING_JOB => self.set_custom_job(payload).await,
             wire::OPEN_STANDARD_MINING_CHANNEL => {
                 let req = self.decode(wire::decode_open_standard_mining_channel(payload))?;
                 self.open_channel(req.request_id, &req.user_identity, req.max_target, None, work_rx)
@@ -275,11 +312,17 @@ impl Session {
 
     async fn setup_connection(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_setup_connection(payload))?;
-        let refusal = if req.protocol != wire::PROTOCOL_MINING {
+        let jd = self.jd.is_some();
+        let refusal = if !(req.protocol == wire::PROTOCOL_MINING
+            || (req.protocol == wire::PROTOCOL_JOB_DECLARATION && jd))
+        {
             Some((0, "unsupported-protocol"))
         } else if req.min_version > wire::PROTOCOL_VERSION || req.max_version < wire::PROTOCOL_VERSION {
             Some((0, "protocol-version-mismatch"))
-        } else if req.flags & wire::REQUIRES_WORK_SELECTION != 0 {
+        } else if req.protocol == wire::PROTOCOL_MINING
+            && req.flags & wire::REQUIRES_WORK_SELECTION != 0
+            && !jd
+        {
             Some((wire::REQUIRES_WORK_SELECTION, "unsupported-feature-flags"))
         } else {
             None
@@ -305,9 +348,212 @@ impl Session {
             "Stratum V2 SetupConnection"
         );
         self.setup = true;
-        // No REQUIRES_FIXED_VERSION: miners may roll the version bits.
+        self.protocol = req.protocol;
+        self.work_selection =
+            req.protocol == wire::PROTOCOL_MINING && req.flags & wire::REQUIRES_WORK_SELECTION != 0;
+        // No REQUIRES_FIXED_VERSION: miners may roll the version bits. Job
+        // Declaration flags ask nothing of the server that it must refuse.
         self.send(wire::SETUP_CONNECTION_SUCCESS, &wire::setup_connection_success(wire::PROTOCOL_VERSION, 0))
             .await
+    }
+
+    /// This connection, as the owner of the job tokens it is issued.
+    fn owner(&self) -> u32 {
+        u32::from_be_bytes(self.extranonce)
+    }
+
+    /// `AllocateMiningJobToken`: issue a token for the address the user
+    /// identifier names. There is no error reply in the protocol, so a
+    /// request that names no usable address closes the connection.
+    async fn allocate_token(&mut self, payload: &[u8]) -> Result<(), Close> {
+        let req = self.decode(wire::decode_allocate_mining_job_token(payload))?;
+        let Some(jd) = self.jd.clone() else { return Err(Close) };
+        let config = self.shared.config.clone();
+        let payout = match resolve_payout(&req.user_identifier, config.network, config.fallback_address.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    user_identifier = %req.user_identifier,
+                    "Stratum V2 job token refused: {e}; closing"
+                );
+                return Err(Close);
+            }
+        };
+        let outputs = jd::coinbase_outputs(&payout.script);
+        let Some(token) = jd.tokens.allocate(self.owner(), payout) else {
+            tracing::warn!(
+                target: "node::stratum",
+                peer = %self.peer,
+                "Stratum V2 job token refused: the token table is full of other connections' declared jobs; closing"
+            );
+            return Err(Close);
+        };
+        self.send(
+            wire::ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
+            &wire::allocate_mining_job_token_success(req.request_id, &token, &outputs),
+        )
+        .await
+    }
+
+    /// `DeclareMiningJob`: check the declared transaction set against the
+    /// mempool and the current work.
+    async fn declare_job(&mut self, payload: &[u8]) -> Result<(), Close> {
+        let req = self.decode(wire::decode_declare_mining_job(payload))?;
+        let Some(jd) = self.jd.clone() else { return Err(Close) };
+        let request_id = req.request_id;
+        let Some(payout) = jd.tokens.take_allocated(&req.mining_job_token) else {
+            return self
+                .declare_error(request_id, "invalid-mining-job-token", "the token is unknown, expired or already used")
+                .await;
+        };
+        let Some(work) = self.shared.work.borrow().clone() else {
+            return self
+                .declare_error(
+                    request_id,
+                    "invalid-job-param-value-coinbase_tx_prefix",
+                    "the node is not issuing work (initial block download)",
+                )
+                .await;
+        };
+        let mempool = self.shared.mempool.clone();
+        let network = self.shared.config.network;
+        let shared_jd = jd.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            let view = jd::MempoolView::for_declaration(&mempool, &shared_jd.wtxids, &req.wtxid_list);
+            let subsidy = crate::chain::connect::block_subsidy(network, work.height);
+            jd::check_declaration(&req, payout, &work, subsidy, &view)
+        })
+        .await;
+        match checked {
+            Ok(Ok(job)) => {
+                let job = Arc::new(job);
+                let Some(token) = jd.tokens.declare(self.owner(), job.clone()) else {
+                    return self
+                        .declare_error(
+                            request_id,
+                            "invalid-mining-job-token",
+                            "the server holds as many declared jobs as it can; try again later",
+                        )
+                        .await;
+                };
+                tracing::info!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    height = job.height,
+                    txs = job.txdata.len(),
+                    fees = job.fees,
+                    "Stratum V2 mining job declared"
+                );
+                if self.declared.len() == DECLARED_JOB_HISTORY {
+                    self.declared.pop_front();
+                }
+                self.declared.push_back(job);
+                self.send(wire::DECLARE_MINING_JOB_SUCCESS, &wire::declare_mining_job_success(request_id, &token))
+                    .await
+            }
+            Ok(Err(refusal)) => self.declare_error(request_id, refusal.code, &refusal.details).await,
+            Err(e) => {
+                tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 declaration check panicked");
+                Err(Close)
+            }
+        }
+    }
+
+    async fn declare_error(&mut self, request_id: u32, code: &str, details: &str) -> Result<(), Close> {
+        tracing::warn!(target: "node::stratum", peer = %self.peer, code, details, "Stratum V2 mining job declaration refused");
+        self.send(wire::DECLARE_MINING_JOB_ERROR, &wire::declare_mining_job_error(request_id, code, details))
+            .await
+    }
+
+    /// `PushSolution`: a block found on a job this connection declared.
+    async fn push_solution(&mut self, payload: &[u8]) -> Result<(), Close> {
+        let msg = self.decode(wire::decode_push_solution(payload))?;
+        let found = self.declared.iter().rev().find_map(|job| {
+            let block = jd::solution_block(job, &msg.extranonce, &msg.prev_hash, msg.ntime, msg.nonce, msg.nbits, msg.version)?;
+            Some((block, job.height, job.payout.clone()))
+        });
+        match found {
+            Some((block, height, payout)) => submit_found_block(&self.shared, block, height, &payout, self.peer).await,
+            None => tracing::warn!(
+                target: "node::stratum",
+                peer = %self.peer,
+                "Stratum V2 pushed solution matches no declared job on this connection"
+            ),
+        }
+        Ok(())
+    }
+
+    /// `SetCustomMiningJob`: a job on a declared transaction set, for an
+    /// extended channel on a connection that asked for work selection.
+    async fn set_custom_job(&mut self, payload: &[u8]) -> Result<(), Close> {
+        let msg = self.decode(wire::decode_set_custom_mining_job(payload))?;
+        let (channel_id, request_id) = (msg.channel_id, msg.request_id);
+        let outcome = self.check_custom_job(&msg);
+        match outcome {
+            Ok(job_id) => {
+                tracing::info!(target: "node::stratum", peer = %self.peer, channel_id, job_id, "Stratum V2 custom mining job set");
+                self.send(
+                    wire::SET_CUSTOM_MINING_JOB_SUCCESS,
+                    &wire::set_custom_mining_job_success(channel_id, request_id, job_id),
+                )
+                .await
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    target: "node::stratum",
+                    peer = %self.peer,
+                    channel_id,
+                    code = refusal.code,
+                    details = %refusal.details,
+                    "Stratum V2 custom mining job refused"
+                );
+                self.send(
+                    wire::SET_CUSTOM_MINING_JOB_ERROR,
+                    &wire::set_custom_mining_job_error(channel_id, request_id, refusal.code),
+                )
+                .await
+            }
+        }
+    }
+
+    fn check_custom_job(&mut self, msg: &wire::SetCustomMiningJob) -> Result<u32, jd::Refusal> {
+        let refuse = |code: &'static str, details: &str| jd::Refusal { code, details: details.to_string() };
+        let Some(jd) = self.jd.clone().filter(|_| self.work_selection) else {
+            return Err(refuse("invalid-mining-job-token", "this connection did not negotiate work selection"));
+        };
+        let job = jd
+            .tokens
+            .declared(&msg.token)
+            .ok_or_else(|| refuse("invalid-mining-job-token", "the token names no declared job"))?;
+        let work = self
+            .shared
+            .work
+            .borrow()
+            .clone()
+            .ok_or_else(|| refuse("invalid-job-param-value-prev_hash", "the node is not issuing work"))?;
+        let ch = self
+            .channels
+            .get_mut(&msg.channel_id)
+            .filter(|c| c.extended.is_some())
+            .ok_or_else(|| refuse("invalid-channel-id", "no extended channel with that id"))?;
+        let custom = jd::check_custom_job(msg, &job, &work, ch.hole_len())?;
+        let job_id = ch.jobs.next_job_id();
+        let template = ActiveTemplate::from_parts(
+            custom.work,
+            job_id,
+            job.payout.script.clone(),
+            custom.coinbase_prefix,
+            custom.coinbase_suffix,
+            ch.hole_len(),
+        );
+        ch.jobs.push(Job {
+            template: Arc::new(template),
+            difficulty: ch.vardiff.difficulty(),
+            share_target: ch.target(&work.block_target),
+        });
+        Ok(job_id)
     }
 
     async fn open_channel(
@@ -364,6 +610,7 @@ impl Session {
             jobs: JobManager::new(),
             prev_hash: None,
             seen: HashSet::new(),
+            _count: CountGuard::new(self.shared.stats.clone(), |s| &s.channels),
         };
         let work = work_rx.borrow_and_update().clone();
         // Before any work exists (initial block download), advertise the
@@ -497,6 +744,11 @@ impl Session {
         miner_extranonce: Option<Vec<u8>>,
     ) -> Result<(), Close> {
         let outcome = self.judge(channel_id, job_id, nonce, ntime, version, miner_extranonce);
+        self.shared.stats.share(match &outcome {
+            Judged::Accepted { .. } => ShareOutcome::Accepted,
+            Judged::Rejected("stale-share") => ShareOutcome::Stale,
+            Judged::Rejected(_) => ShareOutcome::Rejected,
+        });
         match outcome {
             Judged::Accepted { difficulty, block } => {
                 if let Some((block, height, payout)) = block {

@@ -117,6 +117,47 @@ reaches the node; for the streaming firehose with cursor replay, and the
 integrator guide to every silent-payment consumption mode, see
 [Silent Payments (BIP 352)](silent-payments.md).
 
+## Stratum
+
+`getstratuminfo` reports the [Stratum mining server](stratum.md). It takes no
+arguments, is read-only, and answers on a node with the server off too — with
+`enabled: false`, null listeners and zero counters — so a monitor can poll it
+unconditionally.
+
+```json
+{
+  "enabled": true,
+  "listeners": { "v1": "127.0.0.1:3333", "v1_tls": null, "v2": "0.0.0.0:3336" },
+  "authority_pubkey": "<32-byte x-only key, hex>",
+  "job_declaration": false,
+  "connections": 2,
+  "channels": 3,
+  "current_job": {
+    "height": 912345,
+    "job_id": "1a",
+    "prev_hash": "<hex>",
+    "template_txs": 3210,
+    "template_fees": 12345678
+  },
+  "shares": { "accepted": 412, "rejected": 3, "stale": 1 },
+  "blocks_found": 0,
+  "last_block": null
+}
+```
+
+*   `listeners` are the bound addresses, with the real port when a bind used
+    `:0`. `authority_pubkey` is null without a Stratum V2 listener.
+*   `channels` counts authorized Stratum V1 connections and open Stratum V2
+    channels.
+*   `current_job` is the work being handed out, or null while none is (during
+    initial block download). `job_id` identifies the work within this server;
+    the job ids a miner sees are per connection.
+*   `shares` count since startup. `stale` is a share for a job that is no
+    longer current; `rejected` is every other refusal.
+*   `blocks_found` counts blocks found through the server that joined the
+    active chain; `last_block` is `{ "height", "hash", "time" }` for the most
+    recent, or null.
+
 ## Client-side PSBT signing (no signing RPC)
 
 There is no signing method: satd never handles private keys. Signing is a

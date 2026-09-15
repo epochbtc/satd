@@ -334,6 +334,7 @@ startup error.
 | `stratumv2bind` | none | restart | satd | Bind the Stratum V2 listener (Noise-encrypted; requires `stratum=1`). |
 | `stratumv2key` | `<datadir>/stratum_v2.key` | restart | satd | Stratum V2 authority key file, created if absent. Back it up with the datadir: miners pin the key. |
 | `stratumv2maxchannels` | 16 | restart | satd | Channels one Stratum V2 connection may open. |
+| `stratumv2jd` | false | restart | satd | Serve Stratum V2 Job Declaration on the V2 listener (requires `stratumv2bind`). |
 
 ## Storage / pruning / reindex
 

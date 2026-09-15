@@ -173,9 +173,53 @@ rejections carry the Stratum V2 codes `stale-share`, `difficulty-too-low`,
 `duplicate-share`, `invalid-share`, `invalid-timestamp` and
 `invalid-channel-id`.
 
-A connection must complete the handshake within 10 seconds. Job Declaration
-(`SetupConnection` with `REQUIRES_WORK_SELECTION`) is refused with
-`unsupported-feature-flags`.
+A connection must complete the handshake within 10 seconds.
+
+## Job Declaration
+
+With `--stratumv2jd=1` the Stratum V2 listener also serves the Job
+Declaration Protocol, for a miner that wants to choose the transactions in its
+blocks. The miner runs a Job Declarator Client, which:
+
+1. opens a Job Declaration connection to the same port and sends
+   `AllocateMiningJobToken` with its payout address as the user identifier
+   (the answer names the payout output its coinbase must include);
+2. declares a coinbase and a list of transactions by wtxid
+   (`DeclareMiningJob`);
+3. on a mining connection opened with `REQUIRES_WORK_SELECTION`, sends
+   `SetCustomMiningJob` on an extended channel with the token the declaration
+   returned, and mines the job id it gets back. A block found on it is
+   submitted with ordinary shares, or pushed with `PushSolution`.
+
+This is solo-mining Job Declaration, so the checks are strict and nothing is
+fetched:
+
+- Every declared transaction must already be in this node's mempool and
+  eligible for a block template. A declaration naming anything else is refused
+  with `invalid-job-param-value-wtxid_list`; the server never asks for missing
+  transactions.
+- A transaction that spends an unconfirmed parent must be listed after it, and
+  the set must fit in a block.
+- The coinbase must commit to the next height on the current tip, pay the
+  address the token was issued for, claim no more than the subsidy plus the
+  declared fees, and carry a witness commitment that matches the declared
+  transactions.
+- The custom job must name the current tip and difficulty, a merkle path that
+  matches the declaration, a coinbase prefix of at most eight bytes starting
+  with the height, and outputs that satisfy the same payout and value rules.
+
+Refusals use the Stratum V2 codes `invalid-mining-job-token` and
+`invalid-job-param-value-<field>`, with a human-readable reason in
+`DeclareMiningJobError`'s details. A token is good for one declaration and
+expires after ten minutes. Without `--stratumv2jd`, a Job Declaration
+connection is refused with `unsupported-protocol`, and a mining connection
+asking for work selection with `unsupported-feature-flags`.
+
+## Monitoring
+
+`getstratuminfo` reports the listeners, the authority key, open connections
+and channels, share counters, blocks found and the current job. See
+[JSON-RPC Extensions](json-rpc-extensions.md#stratum).
 
 ## Configuration
 
@@ -198,6 +242,7 @@ Every Stratum key is restart-only.
 | `--stratumv2bind=<addr:port>` | none | Stratum V2 listener. Noise-encrypted; may bind a network address without TLS. Requires `--stratum=1`. |
 | `--stratumv2key=<path>` | `<datadir>/stratum_v2.key` | Authority key file, created if absent. Back it up: miners pin the key. |
 | `--stratumv2maxchannels=<n>` | `16` | Channels one Stratum V2 connection may open. |
+| `--stratumv2jd=<0\|1>` | `0` | Serve Stratum V2 Job Declaration on the V2 listener. Requires `--stratumv2bind`. |
 
 The server runs on satd's [isolated API runtime](api-scaling.md), and block
 submission runs on a blocking thread, so a found block does not stall the
@@ -312,6 +357,5 @@ rejected, is logged at `warn`.
 - Pool operation: multiple payout addresses per share stream, PPLNS or any
   other reward splitting, share accounting.
 - The Stratum V2 Template Distribution Protocol (the `TemplateProvider`
-  role), and group channels.
-- Stratum V2 Job Declaration is not yet available; it is planned for a later
-  0.6.0 change.
+  role), group channels, and fetching declared transactions this node does not
+  already have (`ProvideMissingTransactions`).

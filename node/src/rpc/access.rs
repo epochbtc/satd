@@ -119,6 +119,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getrpcinfo"
         | "getserverstatus"
         | "getsilentpaymentblockdata"
+        | "getstratuminfo"
         | "getsysteminfo"
         | "gettxout"
         // Merkle-proof build/verify over stored blocks; neither mutates state.

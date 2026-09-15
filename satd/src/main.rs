@@ -3370,6 +3370,7 @@ async fn main() {
                 .clone()
                 .unwrap_or_else(|| config.network_datadir().join("stratum_v2.key")),
             max_channels: config.stratum_v2_max_channels,
+            job_declaration: config.stratum_v2_jd,
         });
         // Validated against the network when the config loaded.
         let fallback_address = config.stratum_address.as_deref().map(|a| {
@@ -3444,6 +3445,7 @@ async fn main() {
             v2_bind = ?reported_v2_bind,
             "Stratum server listening"
         );
+        listener_status.set_stratum_handle(server.handle());
         listener_status.set_stratum(reported_bind);
         if let Some(tls_bind) = reported_tls_bind {
             listener_status.set_stratum_tls(tls_bind);

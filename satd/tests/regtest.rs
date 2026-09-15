@@ -17969,13 +17969,17 @@ mod sv2 {
         }
 
         pub async fn setup(&mut self) {
-            use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
+            self.setup_with(stratum_core::common_messages_sv2::Protocol::MiningProtocol, 0b100).await;
+        }
+
+        pub async fn setup_with(&mut self, protocol: stratum_core::common_messages_sv2::Protocol, flags: u32) {
+            use stratum_core::common_messages_sv2::SetupConnection;
             let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
             let msg = SetupConnection {
-                protocol: Protocol::MiningProtocol,
+                protocol,
                 min_version: 2,
                 max_version: 2,
-                flags: 0b100,
+                flags,
                 endpoint_host: s("127.0.0.1"),
                 endpoint_port: 0,
                 vendor: s("test-miner"),
@@ -18411,4 +18415,322 @@ fn stratum_v1_and_v2_share_one_job_stream() {
             }
         }
     });
+}
+
+/// A coinbase for `height` paying `value` to `payout`, committing to the
+/// witnesses of `txs`, split around an extranonce hole of `hole` bytes that
+/// follows the height push. Returns `(prefix, suffix, outputs)`.
+#[cfg(feature = "stratum-v2")]
+fn sv2_declared_coinbase(
+    height: u32,
+    payout: &bitcoin::ScriptBuf,
+    value: u64,
+    txs: &[bitcoin::Transaction],
+    hole: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<bitcoin::TxOut>) {
+    use bitcoin::hashes::{Hash, sha256d};
+    let mut leaves = vec![[0u8; 32]];
+    leaves.extend(txs.iter().map(|t| t.compute_wtxid().to_raw_hash().to_byte_array()));
+    while leaves.len() > 1 {
+        if leaves.len() % 2 == 1 {
+            leaves.push(*leaves.last().unwrap());
+        }
+        leaves = leaves
+            .chunks(2)
+            .map(|p| {
+                let mut b = p[0].to_vec();
+                b.extend_from_slice(&p[1]);
+                sha256d::Hash::hash(&b).to_byte_array()
+            })
+            .collect();
+    }
+    let mut preimage = leaves[0].to_vec();
+    preimage.extend_from_slice(&[0u8; 32]);
+    let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    commitment.extend_from_slice(&sha256d::Hash::hash(&preimage).to_byte_array());
+    let outputs = vec![
+        bitcoin::TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: payout.clone() },
+        bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: bitcoin::ScriptBuf::from_bytes(commitment) },
+    ];
+    let height_push = bitcoin::script::Builder::new().push_int(i64::from(height)).into_script().into_bytes();
+    let mut prefix = 2u32.to_le_bytes().to_vec();
+    prefix.push(1);
+    prefix.extend_from_slice(&[0u8; 32]);
+    prefix.extend_from_slice(&u32::MAX.to_le_bytes());
+    prefix.push((height_push.len() + hole) as u8);
+    prefix.extend_from_slice(&height_push);
+    let mut suffix = u32::MAX.to_le_bytes().to_vec();
+    suffix.extend_from_slice(&bitcoin::consensus::serialize(&outputs));
+    suffix.extend_from_slice(&0u32.to_le_bytes());
+    (prefix, suffix, outputs)
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_jd_declared_job_mines_a_block() {
+    use bitcoin::hashes::{Hash, sha256d};
+    use serde_json::json;
+    use stratum_core::binary_sv2::{self, B0255, B032, B064K, Seq0255, Seq064K, Str0255, U256};
+    use stratum_core::common_messages_sv2::Protocol;
+    use stratum_core::job_declaration_sv2::{
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobSuccess,
+    };
+    use stratum_core::mining_sv2::{
+        SetCustomMiningJob, SetCustomMiningJobSuccess, SubmitSharesExtended, SubmitSharesSuccess,
+    };
+    let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
+    let funder = DeterministicWallet::from_secret([0x7b; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    let dest = DeterministicWallet::from_secret([0x7c; 32]);
+    let (raw_hex, txid) = common::build_signed_p2wpkh_spend_from_block1_coinbase(
+        &node,
+        &funder,
+        dest.address.script_pubkey(),
+        2_000,
+    );
+    node.rpc_ok("sendrawtransaction", vec![json!(raw_hex.clone())]);
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(&raw_hex).unwrap()).unwrap();
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
+    let height = 102u32;
+    let reward = 50 * 100_000_000 + 2_000;
+    let best = get_rpc_str(&node, "getbestblockhash").unwrap();
+    // Blocks generated faster than one a second carry timestamps ahead of the
+    // wall clock, so the median time past can be too; the tip's timestamp is
+    // safely above it.
+    let tip_time = node.rpc_ok("getblockheader", vec![json!(best)])["time"].as_u64().unwrap() as u32;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Job Declaration connection: a token, then the declared job.
+        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
+        jdc.send(
+            0x50,
+            AllocateMiningJobToken {
+                user_identifier: Str0255::try_from(miner.address.to_string()).unwrap(),
+                request_id: 1,
+            },
+        )
+        .await;
+        let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
+        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let token = allocated.mining_job_token.inner_as_ref().to_vec();
+        let required: Vec<bitcoin::TxOut> =
+            bitcoin::consensus::deserialize(allocated.coinbase_outputs.inner_as_ref()).unwrap();
+        assert_eq!(required[0].script_pubkey, miner.address.script_pubkey());
+
+        let (prefix, suffix, outputs) =
+            sv2_declared_coinbase(height, &miner.address.script_pubkey(), reward, std::slice::from_ref(&tx), 8);
+        jdc.send(
+            0x57,
+            DeclareMiningJob {
+                request_id: 2,
+                mining_job_token: B0255::try_from(token).unwrap(),
+                version: 0x2000_0000,
+                coinbase_tx_prefix: B064K::try_from(prefix).unwrap(),
+                coinbase_tx_suffix: B064K::try_from(suffix).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from(tx.compute_wtxid().to_raw_hash().to_byte_array())]).unwrap(),
+                excess_data: B064K::try_from(Vec::new()).unwrap(),
+            },
+        )
+        .await;
+        let mut payload = jdc.expect(0x58, Duration::from_secs(10)).await;
+        let declared: DeclareMiningJobSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let job_token = declared.new_mining_job_token.inner_as_ref().to_vec();
+
+        // Mining connection with work selection: an extended channel and a
+        // custom job on the declared set.
+        let mut miner_conn = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        miner_conn.setup_with(Protocol::MiningProtocol, 0b110).await;
+        let (channel_id, extranonce_prefix, size) = miner_conn.open_extended(&miner.address.to_string(), 4).await;
+        let min_ntime = tip_time + 1;
+        let prev = sv2::internal(&best);
+        let height_push = bitcoin::script::Builder::new().push_int(i64::from(height)).into_script().into_bytes();
+        let outputs_bytes = bitcoin::consensus::serialize(&outputs);
+        let txid_bytes = tx.compute_txid().to_raw_hash().to_byte_array();
+        miner_conn
+            .send(
+                0x22,
+                SetCustomMiningJob {
+                    channel_id,
+                    request_id: 3,
+                    token: B0255::try_from(job_token).unwrap(),
+                    version: 0x2000_0000,
+                    prev_hash: U256::from(prev),
+                    min_ntime,
+                    nbits: 0x207fffff,
+                    coinbase_tx_version: 2,
+                    coinbase_prefix: B0255::try_from(height_push.clone()).unwrap(),
+                    coinbase_tx_input_n_sequence: u32::MAX,
+                    coinbase_tx_outputs: B064K::try_from(outputs_bytes.clone()).unwrap(),
+                    coinbase_tx_locktime: 0,
+                    merkle_path: Seq0255::new(vec![U256::from(txid_bytes)]).unwrap(),
+                },
+            )
+            .await;
+        let mut payload = miner_conn.expect(0x23, Duration::from_secs(10)).await;
+        let set: SetCustomMiningJobSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!((set.channel_id, set.request_id), (channel_id, 3));
+
+        let miner_extranonce = [1u8, 2, 3, 4];
+        assert_eq!(size as usize, miner_extranonce.len());
+        let mut coinbase = 2u32.to_le_bytes().to_vec();
+        coinbase.push(1);
+        coinbase.extend_from_slice(&[0u8; 32]);
+        coinbase.extend_from_slice(&u32::MAX.to_le_bytes());
+        coinbase.push((height_push.len() + extranonce_prefix.len() + miner_extranonce.len()) as u8);
+        coinbase.extend_from_slice(&height_push);
+        coinbase.extend_from_slice(&extranonce_prefix);
+        coinbase.extend_from_slice(&miner_extranonce);
+        coinbase.extend_from_slice(&u32::MAX.to_le_bytes());
+        coinbase.extend_from_slice(&outputs_bytes);
+        coinbase.extend_from_slice(&0u32.to_le_bytes());
+        let cb_txid = sha256d::Hash::hash(&coinbase).to_byte_array();
+        let mut buf = cb_txid.to_vec();
+        buf.extend_from_slice(&txid_bytes);
+        let root = sha256d::Hash::hash(&buf).to_byte_array();
+        let nonce = sv2::grind(0x2000_0000, prev, root, min_ntime, 0x207fffff);
+        miner_conn
+            .send(
+                0x1b,
+                SubmitSharesExtended {
+                    channel_id,
+                    sequence_number: 1,
+                    job_id: set.job_id,
+                    nonce,
+                    ntime: min_ntime,
+                    version: 0x2000_0000,
+                    extranonce: B032::try_from(miner_extranonce.to_vec()).unwrap(),
+                },
+            )
+            .await;
+        let mut payload = miner_conn.expect(0x1c, Duration::from_secs(10)).await;
+        let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!(ok.last_sequence_number, 1);
+    });
+    poll_until(
+        || get_rpc_u64(&node, "getblockcount") == Some(u64::from(height)),
+        test_timeout(10),
+        "the block mined on the declared job connects",
+    );
+    let block = node.rpc_ok("getblock", vec![json!(get_rpc_str(&node, "getbestblockhash").unwrap()), json!(2)]);
+    let txs = block["tx"].as_array().unwrap();
+    assert_eq!(txs.len(), 2, "{block}");
+    assert_eq!(txs[1]["txid"], txid);
+    assert_eq!(txs[0]["vout"][0]["scriptPubKey"]["address"], miner.address.to_string());
+}
+
+#[cfg(feature = "stratum-v2")]
+#[test]
+fn stratum_v2_jd_refuses_a_transaction_not_in_the_mempool() {
+    use serde_json::json;
+    use stratum_core::binary_sv2::{self, B0255, B064K, Seq064K, Str0255, U256};
+    use stratum_core::common_messages_sv2::Protocol;
+    use stratum_core::job_declaration_sv2::{
+        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob, DeclareMiningJobError,
+    };
+    let (node, _, v2_port) = start_stratum_v2_node(&["--stratumv2jd=1"]);
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(miner.address.to_string())]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut jdc = sv2::Client::connect(v2_port, None).await.expect("handshake");
+        jdc.setup_with(Protocol::JobDeclarationProtocol, 0).await;
+        jdc.send(
+            0x50,
+            AllocateMiningJobToken {
+                user_identifier: Str0255::try_from(miner.address.to_string()).unwrap(),
+                request_id: 1,
+            },
+        )
+        .await;
+        let mut payload = jdc.expect(0x51, Duration::from_secs(10)).await;
+        let allocated: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
+        let token = allocated.mining_job_token.inner_as_ref().to_vec();
+        let (prefix, suffix, _) = sv2_declared_coinbase(2, &miner.address.script_pubkey(), 50 * 100_000_000, &[], 8);
+        jdc.send(
+            0x57,
+            DeclareMiningJob {
+                request_id: 2,
+                mining_job_token: B0255::try_from(token).unwrap(),
+                version: 0x2000_0000,
+                coinbase_tx_prefix: B064K::try_from(prefix).unwrap(),
+                coinbase_tx_suffix: B064K::try_from(suffix).unwrap(),
+                wtxid_list: Seq064K::new(vec![U256::from([0x42u8; 32])]).unwrap(),
+                excess_data: B064K::try_from(Vec::new()).unwrap(),
+            },
+        )
+        .await;
+        let mut payload = jdc.expect(0x59, Duration::from_secs(10)).await;
+        let refused: DeclareMiningJobError = binary_sv2::from_bytes(&mut payload).unwrap();
+        assert_eq!(refused.error_code.inner_as_ref(), b"invalid-job-param-value-wtxid_list");
+        assert!(String::from_utf8_lossy(refused.error_details.inner_as_ref()).contains("not in this node's mempool"));
+    });
+
+    // Job Declaration is off unless asked for.
+    let (_plain, _, v2_plain) = start_stratum_v2_node(&[]);
+    rt.block_on(async {
+        use stratum_core::common_messages_sv2::SetupConnection;
+        let mut jdc = sv2::Client::connect(v2_plain, None).await.expect("handshake");
+        let s = |v: &str| Str0255::try_from(v.to_string()).unwrap();
+        jdc.send(
+            0x00,
+            SetupConnection {
+                protocol: Protocol::JobDeclarationProtocol,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                endpoint_host: s(""),
+                endpoint_port: 0,
+                vendor: s(""),
+                hardware_version: s(""),
+                firmware: s(""),
+                device_id: s(""),
+            },
+        )
+        .await;
+        jdc.expect(0x02, Duration::from_secs(10)).await;
+    });
+}
+
+#[test]
+fn getstratuminfo_reports_live_counters() {
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    let before = node.rpc_ok("getstratuminfo", vec![]);
+    assert_eq!(before["enabled"], true, "{before}");
+    assert_eq!(before["listeners"]["v1"], format!("127.0.0.1:{port}"));
+    assert_eq!(before["shares"]["accepted"], 0);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (extranonce1, params) = client.handshake(&addr).await;
+        let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
+        let reply = client
+            .call(
+                "mining.submit",
+                json!([addr, params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+            )
+            .await;
+        assert_eq!(reply["result"], true, "{reply}");
+        let stale = client.call("mining.submit", json!([addr, "ffff", "00000000", "00000000", "00000000"])).await;
+        assert_eq!(stale["error"][0], 21);
+
+        let info = tokio::task::block_in_place(|| node.rpc_ok("getstratuminfo", vec![]));
+        assert_eq!(info["shares"]["accepted"], 1, "{info}");
+        assert_eq!(info["shares"]["stale"], 1, "{info}");
+        assert_eq!(info["blocks_found"], 1, "{info}");
+        assert_eq!(info["last_block"]["height"], 1, "{info}");
+        assert_eq!(info["connections"], 1, "{info}");
+        assert_eq!(info["channels"], 1, "{info}");
+        assert!(info["current_job"]["height"].is_u64(), "{info}");
+    });
+
+    let off = TestNode::start(&[]);
+    let info = off.rpc_ok("getstratuminfo", vec![]);
+    assert_eq!(info["enabled"], false, "{info}");
+    assert!(info["listeners"]["v1"].is_null());
 }

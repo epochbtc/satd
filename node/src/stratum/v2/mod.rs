@@ -6,6 +6,7 @@
 //! protocol-agnostic core the Stratum V1 server uses.
 
 pub mod authority;
+pub mod jd;
 pub mod noise;
 pub mod session;
 pub mod wire;

@@ -926,6 +926,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("stratumv2bind", stratum_v2_bind),
         restart!("stratumv2key", stratum_v2_key),
         restart!("stratumv2maxchannels", stratum_v2_max_channels),
+        restart!("stratumv2jd", stratum_v2_jd),
         // ---- Storage / pruning / reindex ----
         restart!("prune", prune),
         restart!("reindex", reindex),

@@ -277,6 +277,7 @@ SATD_ONLY = {
     # satd-native index view; `getindexinfo` is the Core-compatible surface.
     "getsatdindexinfo": [],
     "getserverstatus": [],
+    "getstratuminfo": [],
     "getsysteminfo": [],
     "getwarnings": [],
     "echo": [["arg0", False], ["arg1", False], ["arg2", False], ["arg3", False], ["arg4", False], ["arg5", False], ["arg6", False], ["arg7", False], ["arg8", False], ["arg9", False]],
