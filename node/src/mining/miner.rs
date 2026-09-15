@@ -129,11 +129,7 @@ pub fn build_block_to_script_within(
 
     let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
 
-    let has_witness = other_txs.iter().any(|tx| {
-        tx.input.iter().any(|i| !i.witness.is_empty())
-    });
-
-    if has_witness {
+    if needs_witness_commitment(chain_state, template.height, &other_txs) {
         let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
         let witness_nonce = [0u8; 32];
         let mut commitment_preimage = [0u8; 64];
@@ -235,11 +231,7 @@ pub fn mine_block_only(
 
     let other_txs: Vec<Transaction> =
         template.transactions.iter().map(|t| t.tx.clone()).collect();
-    let has_witness = other_txs
-        .iter()
-        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
-
-    if has_witness {
+    if needs_witness_commitment(chain_state, template.height, &other_txs) {
         let witness_root = compute_witness_root(&coinbase_tx, &other_txs);
         let witness_nonce = [0u8; 32];
         let mut commitment_preimage = [0u8; 64];
@@ -342,11 +334,7 @@ pub fn build_solved_block(
 
     let mut coinbase_tx = build_coinbase(template.height, coinbase_value, &coinbase_script);
 
-    let has_witness = explicit_txs.iter().any(|tx| {
-        tx.input.iter().any(|i| !i.witness.is_empty())
-    });
-
-    if has_witness {
+    if needs_witness_commitment(chain_state, template.height, &explicit_txs) {
         let witness_root = compute_witness_root(&coinbase_tx, &explicit_txs);
         let witness_nonce = [0u8; 32];
         let mut commitment_preimage = [0u8; 64];
@@ -454,6 +442,15 @@ fn resolve_output_descriptor(
 }
 
 /// Build a coinbase transaction for the given height and value.
+/// Whether a mined block carries a BIP 141 witness commitment. Core's
+/// `GenerateCoinbaseCommitment` adds one to every block once segwit is
+/// active, witness transactions or not; a signet solution (BIP 325) lives in
+/// that output, so an empty block without it can never satisfy a challenge.
+fn needs_witness_commitment(chain_state: &ChainState, height: u32, txs: &[Transaction]) -> bool {
+    crate::validation::block::segwit_active_at(chain_state.network, height)
+        || txs.iter().any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+}
+
 fn build_coinbase(height: u32, value: u64, output_script: &ScriptBuf) -> Transaction {
     // BIP 34: height in coinbase scriptSig
     let height_script = Builder::new()
@@ -677,6 +674,18 @@ mod tests {
         let block = mine_block(&cs, &mp, addr).unwrap();
         assert_eq!(cs.tip_height(), 1);
         assert_eq!(cs.tip_hash(), block.block_hash());
+
+        // Core commits to the witness root even in an empty block, and a
+        // signet solution needs that output: without it an OP_TRUE
+        // challenge rejects the block.
+        assert_eq!(block.txdata[0].output.len(), 2, "coinbase carries the commitment");
+        assert!(block.check_witness_commitment());
+        crate::validation::signet::check_signet_block_solution(
+            &block,
+            &[0x51],
+            bitcoin::constants::genesis_block(Network::Signet).block_hash(),
+        )
+        .expect("an empty block satisfies an OP_TRUE signet challenge");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
