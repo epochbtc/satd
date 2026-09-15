@@ -744,6 +744,9 @@ fn field_specs() -> Vec<FieldSpec> {
         live!("maxinboundperip", maxinboundperip, |c, h| {
             h.peer_manager.set_max_inbound_per_ip(c.maxinboundperip)
         }),
+        // Sizes a ring the peer manager allocates once; a resize would have to
+        // decide which of the kept transactions to drop.
+        restart!("blockreconstructionextratxn", blockreconstructionextratxn),
         live!("maxuploadtarget", max_upload_target, |c, h| {
             h.peer_manager.set_max_upload_target(c.max_upload_target)
         }),
