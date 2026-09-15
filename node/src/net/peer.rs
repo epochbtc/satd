@@ -172,6 +172,9 @@ pub enum PeerState {
 /// The wire transport carrying a peer connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportProtocol {
+    /// An inbound connection whose first bytes have not yet shown whether it
+    /// speaks v1 or v2.
+    Detecting,
     /// Legacy plaintext v1.
     V1,
     /// BIP 324 v2 encrypted transport.
@@ -182,6 +185,7 @@ impl TransportProtocol {
     /// Bitcoin Core's `getpeerinfo.transport_protocol_type` string.
     pub fn as_str(self) -> &'static str {
         match self {
+            TransportProtocol::Detecting => "detecting",
             TransportProtocol::V1 => "v1",
             TransportProtocol::V2 => "v2",
         }
@@ -213,6 +217,10 @@ pub struct PeerInfo {
     pub version: Option<VersionMessage>,
     pub services: ServiceFlags,
     pub best_height: i32,
+    /// Height of the highest header this peer has announced that we have
+    /// indexed: Core's `pindexBestKnownBlock`, the bound on what the peer
+    /// can be asked to serve.
+    pub best_known_height: Option<u32>,
     pub user_agent: String,
     pub ban_score: u32,
     pub compact_blocks: bool,
@@ -280,6 +288,7 @@ impl PeerInfo {
             version: None,
             services: ServiceFlags::NONE,
             best_height: -1,
+            best_known_height: None,
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
