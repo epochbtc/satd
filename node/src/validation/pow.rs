@@ -11,6 +11,10 @@ const MAINNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
 const REGTEST_POWLIMIT_BITS: u32 = 0x207fffff;
 /// Testnet minimum difficulty target (same as mainnet).
 const TESTNET_POWLIMIT_BITS: u32 = 0x1d00ffff;
+/// Signet minimum difficulty target (Core's signet `powLimit`,
+/// `00000377ae…`). Only the retarget clamp in [`next_bits`] reads it: signet
+/// validation does not check `nBits` (the block signature is the gate).
+const SIGNET_POWLIMIT_BITS: u32 = 0x1e0377ae;
 /// Number of blocks between difficulty retargets.
 /// Bitcoin's difficulty adjustment interval, in blocks (Core's
 /// `Consensus::Params::DifficultyAdjustmentInterval()`). The same on every
@@ -25,7 +29,7 @@ const TESTNET_ALLOW_MIN_DIFF_AFTER: u32 = 20 * 60;
 const MAX_TIMEWARP: u32 = 600;
 /// Bitcoin Core's `MAX_FUTURE_BLOCK_TIME` (2 hours): a block whose timestamp
 /// is more than this far ahead of the node's current time is rejected.
-const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
 /// Check that the block header hash meets the proof-of-work target.
 pub fn check_proof_of_work(header: &Header) -> Result<(), ValidationError> {
@@ -52,54 +56,80 @@ where
     let height = prev.height + 1;
 
     match network {
-        Network::Regtest => {
-            if header.bits.to_consensus() != REGTEST_POWLIMIT_BITS {
-                return Err(ValidationError::BadDifficulty);
-            }
-            Ok(())
-        }
-        Network::Testnet => {
-            let expected =
-                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, false)?;
-            if header.bits.to_consensus() != expected {
-                return Err(ValidationError::BadDifficulty);
-            }
-            Ok(())
-        }
-        Network::Signet => {
-            // Signet consensus is enforced by block signing, not PoW difficulty.
-            // Accept whatever bits are set (PoW check still validates hash <= target).
-            Ok(())
-        }
-        Network::Testnet4 => {
-            // Testnet4 uses testnet3's 20-minute min-difficulty rule, plus
-            // two BIP 94 changes: (1) the timewarp guard — the first block
-            // of each retarget period must not be timestamped more than
-            // MAX_TIMEWARP before its parent; (2) the retarget is seeded
-            // from the first block of the period (see
-            // calculate_next_bits_bip94), so an end-of-period min-difficulty
-            // block can't reset the real difficulty.
+        // Signet consensus is enforced by block signing, not PoW difficulty.
+        // Accept whatever bits are set (PoW check still validates hash <= target).
+        Network::Signet => return Ok(()),
+        // Testnet4 adds the BIP 94 timewarp guard: the first block of each
+        // retarget period must not be timestamped more than MAX_TIMEWARP
+        // before its parent. The seeding change lives in `next_bits`.
+        Network::Testnet4
             if height.is_multiple_of(RETARGET_INTERVAL)
-                && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP)
-            {
-                return Err(ValidationError::TimewarpAttack);
-            }
-            let expected =
-                calculate_next_bits_testnet(height, header, prev, &get_ancestor, &get_by_hash, true)?;
-            if header.bits.to_consensus() != expected {
-                return Err(ValidationError::BadDifficulty);
-            }
-            Ok(())
+                && header.time < prev.header.time.saturating_sub(MAX_TIMEWARP) =>
+        {
+            return Err(ValidationError::TimewarpAttack);
         }
-        _ => {
-            // Mainnet
-            let expected = calculate_next_bits(height, prev, &get_ancestor)?;
-            if header.bits.to_consensus() != expected {
-                return Err(ValidationError::BadDifficulty);
-            }
-            Ok(())
-        }
+        _ => {}
     }
+
+    let expected = next_bits(network, prev, header.time, get_ancestor, get_by_hash)?;
+    if header.bits != expected {
+        return Err(ValidationError::BadDifficulty);
+    }
+    Ok(())
+}
+
+/// The `nBits` a block building on `prev` with timestamp `header_time` must
+/// carry — Core's `GetNextWorkRequired`.
+///
+/// [`check_difficulty`] compares a received header against this; block
+/// template assembly calls it directly so a template is valid at a retarget
+/// boundary. The timestamp matters only on testnet3 and testnet4, where a
+/// block more than 20 minutes after its parent may use the minimum
+/// difficulty. `get_ancestor` looks up an entry by height (the retarget
+/// seed); `get_by_hash` follows parent pointers (the testnet walk-back).
+///
+/// Signet validation does not check `nBits`, but a template still needs the
+/// right value: signet retargets with the mainnet rules against its own
+/// proof-of-work limit.
+pub fn next_bits<F, G>(
+    network: Network,
+    prev: &BlockIndexEntry,
+    header_time: u32,
+    get_ancestor: F,
+    get_by_hash: G,
+) -> Result<CompactTarget, ValidationError>
+where
+    F: Fn(u32) -> Option<BlockIndexEntry>,
+    G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
+{
+    let height = prev.height + 1;
+    let bits = match network {
+        Network::Regtest => REGTEST_POWLIMIT_BITS,
+        Network::Testnet => calculate_next_bits_testnet(
+            height,
+            header_time,
+            prev,
+            &get_ancestor,
+            &get_by_hash,
+            false,
+        )?,
+        // Testnet4 uses testnet3's 20-minute min-difficulty rule, with the
+        // retarget seeded from the first block of the period (see
+        // calculate_next_bits_bip94), so an end-of-period min-difficulty
+        // block can't reset the real difficulty.
+        Network::Testnet4 => calculate_next_bits_testnet(
+            height,
+            header_time,
+            prev,
+            &get_ancestor,
+            &get_by_hash,
+            true,
+        )?,
+        Network::Signet => calculate_next_bits(height, prev, &get_ancestor, SIGNET_POWLIMIT_BITS)?,
+        // Mainnet
+        _ => calculate_next_bits(height, prev, &get_ancestor, MAINNET_POWLIMIT_BITS)?,
+    };
+    Ok(CompactTarget::from_consensus(bits))
 }
 
 /// Calculate expected difficulty bits for mainnet.
@@ -112,6 +142,7 @@ fn calculate_next_bits<F>(
     height: u32,
     prev: &BlockIndexEntry,
     get_ancestor: &F,
+    powlimit_bits: u32,
 ) -> Result<u32, ValidationError>
 where
     F: Fn(u32) -> Option<BlockIndexEntry>,
@@ -130,7 +161,7 @@ where
     // Clamp to [TARGET_TIMESPAN/4, TARGET_TIMESPAN*4]
     let actual_timespan = actual_timespan.clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4);
 
-    Ok(retarget(prev.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS))
+    Ok(retarget(prev.header.bits, actual_timespan, powlimit_bits))
 }
 
 /// Retarget calculation under BIP 94 (testnet4). Identical to
@@ -172,7 +203,7 @@ where
 /// we hold, so the walk is gap-immune.
 fn calculate_next_bits_testnet<F, G>(
     height: u32,
-    header: &Header,
+    header_time: u32,
     prev: &BlockIndexEntry,
     get_ancestor: &F,
     get_by_hash: &G,
@@ -190,11 +221,11 @@ where
         if bip94 {
             return calculate_next_bits_bip94(height, prev, get_ancestor);
         }
-        return calculate_next_bits(height, prev, get_ancestor);
+        return calculate_next_bits(height, prev, get_ancestor, TESTNET_POWLIMIT_BITS);
     }
 
     // Testnet special rule: if >20 minutes since last block, allow min difficulty
-    if header.time > prev.header.time + TESTNET_ALLOW_MIN_DIFF_AFTER {
+    if header_time > prev.header.time + TESTNET_ALLOW_MIN_DIFF_AFTER {
         return Ok(TESTNET_POWLIMIT_BITS);
     }
 
@@ -570,6 +601,79 @@ mod tests {
             ),
             "prev-seeded (testnet3) difficulty must be rejected on testnet4"
         );
+    }
+
+    /// Block templates take their `nBits` from `next_bits`, and a received
+    /// block is judged by `check_difficulty`. Where the two disagree, a miner
+    /// hashing the template finds a block the node itself rejects. The case
+    /// that matters is a retarget boundary, where the answer is not the
+    /// parent's bits; the mid-period testnet case shows the timestamp is an
+    /// input.
+    #[test]
+    fn next_bits_agrees_with_check_difficulty_at_period_boundary() {
+        let t0 = 1_700_000_000u32;
+        let period_bits = 0x1c00ffffu32;
+
+        for network in [Network::Bitcoin, Network::Testnet4] {
+            let genesis = bitcoin::constants::genesis_block(network);
+            let mut first_header = genesis.header;
+            first_header.time = t0;
+            first_header.bits = CompactTarget::from_consensus(period_bits);
+            let first_entry = entry(first_header, 2016);
+
+            // The period ran twice as fast as intended, so the target halves.
+            let mut prev_header = genesis.header;
+            prev_header.time = t0 + TARGET_TIMESPAN / 2;
+            prev_header.bits = CompactTarget::from_consensus(period_bits);
+            let prev = entry(prev_header, 4031);
+            let get_ancestor =
+                |h: u32| if h == 2016 { Some(first_entry.clone()) } else { None };
+
+            let header_time = prev_header.time + 600;
+            let bits = next_bits(network, &prev, header_time, get_ancestor, |_| None)
+                .expect("the seed is present");
+            assert_ne!(
+                bits, prev_header.bits,
+                "{network}: premise — a boundary block does not inherit its parent's bits"
+            );
+
+            let mut header = genesis.header;
+            header.time = header_time;
+            header.bits = bits;
+            assert!(
+                check_difficulty(&header, &prev, network, get_ancestor, |_| None).is_ok(),
+                "{network}: the bits next_bits computes must pass check_difficulty"
+            );
+            header.bits = prev_header.bits;
+            assert!(
+                matches!(
+                    check_difficulty(&header, &prev, network, get_ancestor, |_| None),
+                    Err(ValidationError::BadDifficulty)
+                ),
+                "{network}: the parent's bits are wrong at the boundary"
+            );
+        }
+
+        // Mid-period on testnet4 the header's own timestamp decides: within 20
+        // minutes of the parent the period difficulty holds, past it the
+        // minimum difficulty applies.
+        let genesis = bitcoin::constants::genesis_block(Network::Testnet4);
+        let mut prev_header = genesis.header;
+        prev_header.time = t0;
+        prev_header.bits = CompactTarget::from_consensus(period_bits);
+        let prev = entry(prev_header, 100);
+        let soon = prev_header.time + TESTNET_ALLOW_MIN_DIFF_AFTER;
+        let late = soon + 1;
+        let at_soon = next_bits(Network::Testnet4, &prev, soon, |_| None, |_| None).unwrap();
+        let at_late = next_bits(Network::Testnet4, &prev, late, |_| None, |_| None).unwrap();
+        assert_eq!(at_soon.to_consensus(), period_bits);
+        assert_eq!(at_late.to_consensus(), TESTNET_POWLIMIT_BITS);
+        for (time, bits) in [(soon, at_soon), (late, at_late)] {
+            let mut header = genesis.header;
+            header.time = time;
+            header.bits = bits;
+            assert!(check_difficulty(&header, &prev, Network::Testnet4, |_| None, |_| None).is_ok());
+        }
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub struct BlockTemplate {
     pub height: u32,
     pub bits: CompactTarget,
     pub cur_time: u32,
+    /// The earliest timestamp a block on this template may carry: the
+    /// median time past of the tip, plus one (Core's `mintime`).
+    pub min_time: u32,
     pub transactions: Vec<TemplateTx>,
     pub coinbase_value: u64,
 }
@@ -168,12 +171,6 @@ fn assemble_template(
     let tip_entry = chain_state.get_block_index(&tip_hash).unwrap();
     let height = tip_entry.height + 1;
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, height);
-
-    // Determine bits (difficulty)
-    let bits = match chain_state.network {
-        bitcoin::Network::Regtest => CompactTarget::from_consensus(0x207fffff),
-        _ => tip_entry.header.bits, // Simplified; full retarget in pow.rs
-    };
 
     // Select transactions from mempool by effective fee rate (includes
     // fee_delta). Template assembly is scope-filtered: transactions
@@ -363,8 +360,44 @@ fn assemble_template(
     // Saturating keeps the value in range so the future-block check can do its
     // job on it.
     let now = u32::try_from(crate::time::now_secs()).unwrap_or(u32::MAX);
-    let mtp = chain_state.get_median_time_past(height);
-    let cur_time = std::cmp::max(now, mtp + 1);
+    let min_time = template_mtp + 1;
+    let mut cur_time = std::cmp::max(now, min_time);
+    // BIP 94 (testnet4): the first block of a retarget period may not be
+    // stamped more than 600 s before its parent. Core's `UpdateTime` lifts the
+    // timestamp to that floor; without it a node whose clock trails the tip
+    // builds a template that fails `check_difficulty` as a timewarp.
+    if chain_state.network == bitcoin::Network::Testnet4
+        && height.is_multiple_of(crate::validation::pow::RETARGET_INTERVAL)
+    {
+        cur_time = cur_time.max(tip_entry.header.time.saturating_sub(600));
+    }
+
+    // Difficulty for a block at `cur_time` on this tip — the same computation
+    // `check_difficulty` compares a received block against, so a template is
+    // valid at a retarget boundary. On testnet3/testnet4 the answer depends on
+    // the timestamp (the 20-minute minimum-difficulty rule), which is why it
+    // is computed after `cur_time` is fixed. The height index is the active
+    // chain, and the tip is on it, so its rows are this template's ancestors.
+    //
+    // A failure means an ancestor the node should hold is missing. Reusing
+    // the tip's bits keeps the template well-formed; the block it yields is
+    // judged by `accept_block`, which fails closed on the same missing entry.
+    let bits = crate::validation::pow::next_bits(
+        chain_state.network,
+        &tip_entry,
+        cur_time,
+        |h| chain_state.get_block_index(&chain_state.get_block_hash_by_height(h)?),
+        |hash| chain_state.get_block_index(hash),
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "mining::template",
+            height,
+            error = %e,
+            "cannot compute the difficulty for the next block; using the tip's bits"
+        );
+        tip_entry.header.bits
+    });
 
     // Core sets these at the end of `CreateNewBlock`; `getmininginfo`
 
@@ -388,6 +421,7 @@ fn assemble_template(
         height,
         bits,
         cur_time,
+        min_time,
         transactions,
         coinbase_value: subsidy + total_fees,
     }
@@ -445,6 +479,15 @@ fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
 /// and the coinbase slot is zeroed), and external mining software trusts the
 /// field rather than computing its own (#548).
 pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(&compute_witness_commitment(txs));
+    hex::encode(script)
+}
+
+/// The 32-byte witness commitment for a block holding a coinbase followed by
+/// `txs`, with an all-zero witness reserved value:
+/// `SHA256d(witness_merkle_root || [0; 32])`.
+pub fn compute_witness_commitment(txs: &[TemplateTx]) -> [u8; 32] {
     // Coinbase wtxid = 0x00...00, then wtxids of included transactions
     let mut hashes: Vec<[u8; 32]> = vec![[0u8; 32]];
     for ttx in txs {
@@ -457,11 +500,7 @@ pub fn compute_witness_commitment_hex(txs: &[TemplateTx]) -> String {
     let mut preimage = [0u8; 64];
     preimage[..32].copy_from_slice(&witness_root);
     preimage[32..].copy_from_slice(&witness_nonce);
-    let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage);
-
-    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    script.extend_from_slice(&commitment.to_byte_array());
-    hex::encode(script)
+    bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array()
 }
 
 /// Whether anything spending `txid` pays a fee — the CPFP half of Core's

@@ -19,6 +19,7 @@ pub mod stall_watchdog;
 pub mod startup_progress;
 pub mod time;
 pub mod storage;
+pub mod stratum;
 pub mod validation;
 pub mod warnings;
 

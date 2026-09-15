@@ -31,6 +31,7 @@ item below is (or will be) written up in full in the in-development
 - Rust SDK: warns when the node is one minor version behind, refuses two or more (`StreamError::NodeTooOld`, override `allow_old_node()`) and any schema mismatch (`StreamError::SchemaMismatch`); `StreamClient::node_version()`.
 - Go SDK: the same check (`ErrNodeTooOld`, `WithAllowOldNode`, `ErrSchemaMismatch`, `WithLogger`, `Client.NodeVersion`); `Watch` now waits for response headers; the module is versioned with the node (`satdevents.Version`), next tag `clients/go/v0.6.0`.
 - The Umbrel and StartOS packages open onto the status page, and the appliance turns it on; Umbrel publishes Esplora over TLS on 8431; the reference stack and the appliance serve metrics and the status page over native TLS on 9336 (#750).
+- **Stratum V1 solo-mining server** (`--stratum=1`): miners connect to the node directly; the username is the payout address. Loopback by default, TLS/mTLS listener, refused on signet (#746).
 
 ### Fixed
 
@@ -45,6 +46,7 @@ item below is (or will be) written up in full in the in-development
   release build with a diagnostic that showed the service running (#742).
 - The Umbrel package takes its own host ports (8430, 8433, 8436, 8439, 50012), so it installs beside Bitcoin Node, Fulcrum and Ride The Lightning, and its backups leave the chain out (#743).
 - The StartOS package's backups skip the AssumeUTXO background chainstate, and its sync check no longer reports `verificationprogress`, which read about 69% at genesis (#743).
+- `getblocktemplate` now carries the retargeted difficulty at a retarget boundary (and after a testnet 20-minute gap) instead of the tip's bits, and reports `mintime` as median time past + 1 instead of `curtime` (#746).
 
 ## Releases
 

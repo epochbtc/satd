@@ -3347,6 +3347,99 @@ async fn main() {
         });
     }
 
+    // Stratum solo-mining server. Same startup shape as Electrum: every
+    // listener binds here, so a port conflict or bad certificate is fatal,
+    // then the server runs on the API runtime.
+    if config.stratum {
+        let parse_bind = |flag: &str, raw: &str| -> SocketAddr {
+            raw.parse().unwrap_or_else(|e| {
+                eprintln!("Error: invalid --{flag} {raw:?}: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            })
+        };
+        let stratum_bind = parse_bind("stratumbind", &config.stratum_bind);
+        let stratum_tls_bind = config
+            .stratum_tls_bind
+            .as_deref()
+            .map(|raw| parse_bind("stratumtlsbind", raw));
+        // Validated against the network when the config loaded.
+        let fallback_address = config.stratum_address.as_deref().map(|a| {
+            a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                .expect("validated at config load")
+                .assume_checked()
+                .script_pubkey()
+        });
+        if let Some(cert) = config.stratum_tls_cert.as_ref()
+            && let Ok(pem) = std::fs::read_to_string(cert)
+            && let Some(size) = node::stratum::tls::oversized_miner_ca(&pem)
+        {
+            tracing::warn!(
+                cert = %cert.display(),
+                bytes = size,
+                limit = node::stratum::tls::MINER_CA_PEM_LIMIT,
+                "the last certificate in --stratumtlscert is larger than some miner firmware \
+                 can store as a custom CA; see the Stratum chapter of the manual"
+            );
+        }
+        let stratum_cfg = node::stratum::StratumConfig {
+            network: config.network,
+            bind: stratum_bind,
+            tls_bind: stratum_tls_bind,
+            tls_cert: config.stratum_tls_cert.clone(),
+            tls_key: config.stratum_tls_key.clone(),
+            mtls: config.stratum_mtls,
+            mtls_client_ca: config.stratum_mtls_client_ca.clone(),
+            mtls_client_allow: config.stratum_mtls_client_allow.clone(),
+            fallback_address,
+            initial_difficulty: config
+                .stratum_difficulty
+                .unwrap_or_else(|| node::stratum::default_initial_difficulty(config.network)),
+            max_conns: config.stratum_max_conns,
+            vardiff: Default::default(),
+        };
+        let server = match node::stratum::StratumServer::bind(
+            stratum_cfg,
+            chain_state.clone(),
+            mempool.clone(),
+            Some(peer_manager.clone()),
+            // `main` runs on the core runtime.
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: stratum server bind failed: {e}");
+                auth.cleanup();
+                std::process::exit(1);
+            }
+        };
+        let reported_bind = server
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| stratum_bind.to_string());
+        let reported_tls_bind = match (server.local_tls_addr(), stratum_tls_bind) {
+            (Some(Ok(a)), _) => Some(a.to_string()),
+            (Some(Err(_)), Some(cfg)) => Some(cfg.to_string()),
+            (None, _) | (Some(Err(_)), None) => None,
+        };
+        tracing::info!(
+            target: "node::stratum",
+            bind = %reported_bind,
+            tls_bind = ?reported_tls_bind,
+            "Stratum server listening"
+        );
+        listener_status.set_stratum(reported_bind);
+        if let Some(tls_bind) = reported_tls_bind {
+            listener_status.set_stratum_tls(tls_bind);
+        }
+        let stratum_shutdown = shutdown_rx.clone();
+        api_handle.spawn(async move {
+            server.run(stratum_shutdown).await;
+        });
+    }
+
     // Write PID file if requested
     if let Some(ref pid_path) = config.pid
         && let Err(e) = std::fs::write(pid_path, std::process::id().to_string())
