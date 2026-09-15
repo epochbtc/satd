@@ -194,6 +194,8 @@ startup error.
 | `seednode` | none | hot | core | One-shot seed peer connected at startup to bootstrap discovery. |
 | `maxconnections` | 125 | hot | core | Maximum total connections. `0` (or any value ≤ 0) soft-sets `listen=0`, as in Core — see `listen`. That half is a startup decision: changing `maxconnections` over SIGHUP applies the new cap but does not start or stop the listener. |
 | `maxinboundperip` | 3 | hot | satd | Max simultaneous inbound peers from one source IP (Core-style flood guard; no Core flag). |
+| `cmpctblockprefill` | false | restart | satd | Announce a new block as a `cmpctblock` with the transactions this node lacked when it arrived prefilled, so a peer that lacks them too rebuilds the block without a `getblocktxn` round trip. Bitcoin Core's proposed design (#35558, not yet merged in Core); off until measurement says otherwise. |
+| `cmpctblockprefillbytes` | 8192 | restart | satd | Transaction bytes a `cmpctblockprefill` announcement may carry beyond the coinbase. Transactions nobody relayed to this node go first, then replaced or policy-refused ones; one that does not fit is skipped. `0` prefills nothing. |
 | `blockreconstructionextratxn` | 100 | restart | core | Recently seen transactions that are not in the mempool — replaced, or refused by policy — kept so a compact block that includes one still reconstructs without a round trip. `0` keeps none. |
 | `maxuploadtarget` | 0 (unlimited) | hot | core | Soft cap (bytes/24h) on historical block upload. |
 | `dns` | true | restart | core | Allow DNS lookups for `-addnode`/`-seednode`/`-connect`. With `dns=0` those options accept only literal IP addresses and `.onion` targets; a hostname is refused. |
