@@ -516,9 +516,7 @@ note = "measured 2026-09-15: node2 is started with -prune=1, which satd refuses 
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
-status = "skip"
-reason = "core-log"
-note = "measured 2026-09-15: L44 assert_debug_log 'ThreadRPCServer method=getblocktemplate'. Behind it: the longpoll must block until the tip or mempool changes. Follow-up: a debuglog_map.toml rule over satd's RPC trace line"
+status = "run"
 
 [[test]]
 file = "mining_mainnet.py"
@@ -608,7 +606,7 @@ status = "run"
 file = "p2p_dns_seeds.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: L32 assert_debug_log 'DNS seeding disabled' is not in the node log. Behind it: addrman. Follow-up: addrman"
+note = "measured 2026-09-15: the DNS seeding disabled line landed; L36 then wants -connect with -dnsseed=1 to still query the seeds (Loading addresses from DNS seed), where satd skips DNS whenever -connect is set. Follow-up: Core's DNS seeding conditions (addrman track)"
 
 [[test]]
 file = "p2p_eviction.py"
@@ -645,9 +643,7 @@ file = "p2p_getdata.py"
 status = "run"
 [[test]]
 file = "p2p_handshake.py"
-status = "skip"
-reason = "core-log"
-note = "measured 2026-09-15: L79 assert_debug_log 'ignoring redundant verack message'; satd does not log the event. Behind it three more handshake lines. Follow-up: handshake log lines"
+status = "run"
 
 [[test]]
 file = "p2p_headers_sync_with_minchainwork.py"
@@ -689,7 +685,7 @@ note = "measured 2026-09-15: L94 getheaders goes to a second peer during initial
 file = "p2p_invalid_block.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: L89 assert_debug_log 'bad-txns-duplicate'; satd rejects the block but logs no reject reason. Behind it: mutated-twin re-acceptance. Follow-up: block reject log line"
+note = "measured 2026-09-15: the mutated-block gate now logs Core's Block mutated: <reason>; L89 still misses bad-txns-duplicate, so the duplicate-transaction block is not reaching that gate on the P2P path. Follow-up: run the mutation gate on every block-ingress path"
 
 [[test]]
 file = "p2p_invalid_locator.py"
@@ -705,7 +701,7 @@ note = "measured 2026-09-15: L96 getnettotals.totalbytesrecv not advanced by a p
 file = "p2p_invalid_tx.py"
 status = "skip"
 reason = "core-log"
-note = "measured 2026-09-15: L74 assert_debug_log 'bad-txns-vout-empty'; satd rejects the transaction but logs no reject reason. Behind it: getorphantxs and orphan log lines. Follow-up: tx reject log line"
+note = "measured 2026-09-15: the reject line is Core's (<txid> (wtxid=...) from peer=N was not accepted: <reason>); L74 still misses bad-txns-vout-empty because satd resolves inputs before the structural checks, so a malformed transaction is orphaned rather than rejected. Follow-up: Core's CheckTransaction ordering, then getorphantxs (W14)"
 
 [[test]]
 file = "p2p_leak.py"
@@ -811,9 +807,7 @@ note = "measured 2026-09-15: L79 no sendtxrcncl during the handshake; satd has n
 
 [[test]]
 file = "p2p_timeouts.py"
-status = "skip"
-reason = "core-log"
-note = "measured 2026-09-15: L52 assert_debug_log 'Added connection peer=0'; satd logs no inbound accept with the peer id. Behind it: the handshake-timeout lines. Follow-up: connection and timeout log lines"
+status = "run"
 
 [[test]]
 file = "p2p_tx_download.py"
@@ -1003,9 +997,7 @@ note = "measured 2026-09-15: L70 scantxoutset refuses pkh() with -5. satd implem
 
 [[test]]
 file = "rpc_setban.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L48 assert_debug_log 'Cleared nodestate for peer=2'; satd logs 'Peer disconnected id=2'. The --v2transport variant also wants 'retrying with v1 transport protocol for peer=2'. Follow-up: debuglog_map.toml rules"
+status = "run"
 
 [[test]]
 file = "rpc_signer.py"

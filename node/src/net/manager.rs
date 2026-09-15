@@ -97,6 +97,14 @@ const DEFAULT_MAX_INBOUND_PER_IP: usize = 3;
 /// Default handshake timeout in milliseconds, matching Bitcoin Core's
 /// `-timeout` default (5000ms).
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
+
+/// Core's `DEFAULT_PEER_CONNECT_TIMEOUT`: seconds a new connection has before
+/// the inactivity check may drop it (`-peertimeout`).
+pub const DEFAULT_PEER_CONNECT_TIMEOUT_SECS: i64 = 60;
+
+/// Core's `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS`: a pruned peer is a
+/// wanted outbound peer while our tip is within this many blocks of now.
+const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: u64 = 144;
 /// Default distinct-witness count before a local tx is considered
 /// propagated and rebroadcast stops. 1 = "any peer fetched/echoed it."
 const DEFAULT_BROADCAST_CONFIRM_PEERS: u64 = 1;
@@ -234,6 +242,14 @@ struct PeerHandle {
     /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
     /// [`NetTotals`].
     stats: Arc<PeerStats>,
+}
+
+/// A message's type as Core names it in a log line.
+fn handshake_msg_type(msg: &NetworkMessage) -> String {
+    match msg {
+        NetworkMessage::Unknown { command, .. } => command.to_string(),
+        m => m.cmd().to_string(),
+    }
 }
 
 /// Core's `ProcessMessage` line, written as the message comes off the wire
@@ -491,6 +507,8 @@ pub struct PeerManager {
     /// config after construction (see [`set_connect_timeout_ms`]) without
     /// widening the already-large `with_config` argument list.
     connect_timeout_ms: AtomicU64,
+    /// `-peertimeout`, seconds.
+    peer_connect_timeout_secs: AtomicU64,
     /// Rebroadcast cadence for unbroadcast local txs, in seconds. `0` means
     /// "auto" — the spawner randomizes each interval in
     /// `[REBROADCAST_AUTO_MIN_SECS, REBROADCAST_AUTO_MAX_SECS]` (Core's
@@ -712,6 +730,7 @@ impl PeerManager {
             pending_onion_dials: RwLock::new(HashSet::new()),
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
+            peer_connect_timeout_secs: AtomicU64::new(DEFAULT_PEER_CONNECT_TIMEOUT_SECS as u64),
             rebroadcast_interval_secs: AtomicU64::new(0),
             promotion_queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             broadcast_confirm_peers: AtomicU64::new(DEFAULT_BROADCAST_CONFIRM_PEERS),
@@ -770,6 +789,11 @@ impl PeerManager {
     /// Set the handshake timeout (Bitcoin Core's `-timeout`), in
     /// milliseconds. Call once at startup before peers connect. A value
     /// of 0 is clamped to 1ms so the handshake can never block forever.
+    /// Core's `-peertimeout`, seconds.
+    pub fn set_peer_connect_timeout_secs(&self, secs: u64) {
+        self.peer_connect_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+    }
+
     pub fn set_connect_timeout_ms(&self, ms: u64) {
         self.connect_timeout_ms.store(ms.max(1), Ordering::Relaxed);
     }
@@ -1727,7 +1751,7 @@ impl PeerManager {
         // Establish the transport before spawning so a failed v2 handshake
         // can re-dial for v1. Peers that already failed v2 this session are
         // connected straight as v1 to avoid a wasted round trip.
-        let conn = self
+        let (conn, id) = self
             .establish_outbound(id, stream, OutboundDial::Direct(addr), use_v2)
             .await?;
 
@@ -1804,7 +1828,7 @@ impl PeerManager {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
-        let conn = self
+        let (conn, id) = self
             .establish_outbound(id, stream, OutboundDial::Onion(host.to_string(), port), None)
             .await?;
 
@@ -1915,7 +1939,7 @@ impl PeerManager {
         // NoBan) && banned) { ... return; }`), with the same NoBan exemption
         // so `-whitelist`/`-whitebind` peers stay reachable.
         if !perms.noban && self.is_addr_banned(&addr) {
-            tracing::debug!(%addr, "banned peer: refusing inbound connection");
+            tracing::debug!("connection from {addr} dropped (banned)");
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1987,6 +2011,7 @@ impl PeerManager {
             msg_rx
         };
         tracing::info!(%addr, id, noban = perms.noban, "Accepted inbound peer");
+        tracing::debug!("Added connection peer={id}");
         self.spawn_peer_task(
             id,
             addr,
@@ -3158,6 +3183,7 @@ impl PeerManager {
         let mut peers = self.peers.write();
         if let Some(handle) = peers.remove(&id) {
             tracing::info!(id, addr = %handle.info.addr, "Peer disconnected");
+            tracing::debug!("Cleared nodestate for peer={id}");
         }
         drop(peers);
         // Notify IBD scheduler so in-flight blocks get reassigned
@@ -5783,7 +5809,11 @@ impl PeerManager {
                 }
             }
             Err(e) => {
-                tracing::debug!(%txid, "Tx rejected: {}", e);
+                tracing::debug!(
+                    "{txid} (wtxid={}) from peer={id} was not accepted: {}",
+                    tx.compute_wtxid(),
+                    e.state_string()
+                );
                 // Only consensus-invalid transactions are misbehavior; policy
                 // rejections (fee floor, dust, mempool limits, RBF, …) carry no
                 // ban score so we don't sever honest peers on low-fee networks.
@@ -6847,6 +6877,7 @@ impl PeerManager {
             }
             peers.insert(id, handle);
         }
+        tracing::debug!("Added connection peer={id}");
         self.spawn_peer_task(id, addr, transport, direction, msg_rx);
     }
 
@@ -7066,7 +7097,7 @@ impl PeerManager {
         mut stream: TcpStream,
         target: OutboundDial,
         use_v2: Option<bool>,
-    ) -> Result<Connection, String> {
+    ) -> Result<(Connection, PeerId), String> {
         let magic = self.chain_state.p2p_magic();
         let skip_v2 = match &target {
             OutboundDial::Direct(addr) => self.v2_downgraded.read().contains(addr),
@@ -7074,7 +7105,7 @@ impl PeerManager {
         };
         let v2_wanted = use_v2.unwrap_or_else(|| self.v2_transport_enabled());
         if !v2_wanted || skip_v2 {
-            return Ok(Connection::with_magic(stream, magic));
+            return Ok((Connection::with_magic(stream, magic), id));
         }
 
         let network = self.chain_state.network;
@@ -7085,8 +7116,9 @@ impl PeerManager {
         )
         .await;
         match v2 {
-            Ok(Ok((cipher, leftover))) => Ok(Connection::v2(
-                crate::net::v2transport::V2Connection::new(stream, cipher, leftover),
+            Ok(Ok((cipher, leftover))) => Ok((
+                Connection::v2(crate::net::v2transport::V2Connection::new(stream, cipher, leftover)),
+                id,
             )),
             _ => {
                 drop(stream);
@@ -7098,8 +7130,11 @@ impl PeerManager {
                     self.v2_downgraded.write().insert(*addr);
                 }
                 tracing::debug!("retrying with v1 transport protocol for peer={id}");
+                tracing::debug!("Cleared nodestate for peer={id}");
+                // Core retries on a new connection, and so a new peer id.
                 let stream = self.redial(&target).await?;
-                Ok(Connection::with_magic(stream, magic))
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                Ok((Connection::with_magic(stream, magic), id))
             }
         }
     }
@@ -7117,6 +7152,9 @@ impl PeerManager {
         // here, in the spawned task, so the accept loop is never blocked on
         // a peer's handshake: read the first bytes and run v2 detection
         // when enabled, else plaintext v1.
+        // Core's `m_connected`, on the node clock: the inactivity check
+        // measures `-peertimeout` from here.
+        let connected_at = crate::time::now_secs();
         let mut conn = match transport {
             IncomingTransport::Established(conn) => *conn,
             IncomingTransport::Raw(stream) => {
@@ -7146,7 +7184,7 @@ impl PeerManager {
         }
 
         // Perform handshake with timeout
-        let version = self.perform_handshake(id, &mut conn, direction).await?;
+        let version = self.perform_handshake(id, &mut conn, direction, connected_at).await?;
 
         // The handshake is done, so record it here rather than waiting for the
         // manager to drain the event below. The manager still gets the event
@@ -7294,6 +7332,10 @@ impl PeerManager {
                 {
                     Ok(Ok(msg)) => {
                         log_received(id, &msg);
+                        // Past the handshake, so any `verack` repeats one.
+                        if matches!(msg, NetworkMessage::Verack) {
+                            tracing::debug!("ignoring redundant verack message from peer={id}");
+                        }
                         // Core applies a peer's fee filter on the message
                         // thread. Through the manager's drain it could be up
                         // to a tick late, and a transaction announced in that
@@ -7562,20 +7604,83 @@ impl PeerManager {
         }
     }
 
-    /// Receive a message with timeout.
-    async fn recv_with_timeout(conn: &mut Connection, timeout: Duration) -> Result<NetworkMessage, String> {
-        tokio::time::timeout(timeout, conn.recv())
-            .await
-            .map_err(|_| "handshake timeout".to_string())?
-            .map_err(|e| format!("recv: {}", e))
+    /// Receive the next handshake message, dropping the peer when Core's
+    /// `InactivityCheck` would: `-peertimeout` seconds after it connected, on
+    /// the node clock, with the handshake still incomplete.
+    async fn recv_handshake(
+        &self,
+        id: PeerId,
+        conn: &mut Connection,
+        connected_at: u64,
+    ) -> Result<NetworkMessage, String> {
+        let recv = conn.recv();
+        tokio::pin!(recv);
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                r = &mut recv => return r.map_err(|e| format!("recv: {}", e)),
+                _ = tick.tick() => {
+                    if let Some(reason) = self.handshake_inactivity(id, connected_at) {
+                        tracing::debug!("{reason}");
+                        return Err("handshake timeout".to_string());
+                    }
+                }
+            }
+        }
     }
 
-    /// Perform the version/verack handshake with timeouts.
+    /// Core's `InactivityCheck` for a connection that has not finished its
+    /// handshake: `None` until `-peertimeout` has passed, then the reason
+    /// line Core logs.
+    fn handshake_inactivity(&self, id: PeerId, connected_at: u64) -> Option<String> {
+        let timeout = self.peer_connect_timeout_secs.load(Ordering::Relaxed);
+        if crate::time::now_secs() <= connected_at.saturating_add(timeout) {
+            return None;
+        }
+        let (received, sent) = self
+            .peers
+            .read()
+            .get(&id)
+            .map_or((true, true), |h| (h.stats.bytes_recv() > 0, h.stats.bytes_sent() > 0));
+        if received && sent {
+            return Some(format!("version handshake timeout, disconnecting peer={id}"));
+        }
+        let mut never = String::new();
+        if !received {
+            never.push_str(", never received from peer");
+        }
+        if !sent {
+            never.push_str(", never sent to peer");
+        }
+        Some(format!("socket no message in first {timeout} seconds{never}, disconnecting peer={id}"))
+    }
+
+    /// Core's `HasAllDesirableServiceFlags` for an outbound full-relay,
+    /// block-relay-only or addr-fetch peer: `NETWORK | WITNESS`, or
+    /// `NETWORK_LIMITED | WITNESS` from a pruned peer while our tip is within a
+    /// day of now. Returns the flags wanted when the peer lacks them.
+    fn missing_desirable_services(&self, services: ServiceFlags) -> Option<ServiceFlags> {
+        let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        if services.has(ServiceFlags::NETWORK_LIMITED) {
+            let tip_time = self
+                .chain_state
+                .get_block_index(&self.chain_state.tip_hash())
+                .map_or(0, |e| e.header.time as u64);
+            let depth = crate::time::now_secs().saturating_sub(tip_time) / 600;
+            if depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS {
+                wanted = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+            }
+        }
+        (!services.has(wanted)).then_some(wanted)
+    }
+
+    /// Perform the version/verack handshake, bounded by `-peertimeout`.
     async fn perform_handshake(
         &self,
         id: PeerId,
         conn: &mut Connection,
         direction: Direction,
+        connected_at: u64,
     ) -> Result<VersionMessage, String> {
         // The connection type is already recorded on the PeerHandle by
         // `spawn_peer` / `accept_inbound`, so the handshake can read it rather
@@ -7583,9 +7688,11 @@ impl PeerManager {
         let conn_type = self.conn_type_of(id);
         let our_version =
             self.build_version_message(conn.peer_addr().map_err(|e| e.to_string())?, conn_type);
-        // Bitcoin Core's `-timeout` (default 5000ms), set from config at
-        // startup; bounds each step of the version/verack exchange.
-        let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        if direction == Direction::Outbound
+            && let Some(h) = self.peers.write().get_mut(&id)
+        {
+            h.info.local_nonce = Some(our_version.nonce);
+        }
 
         // BIP 155: a peer sends `sendaddrv2` after its version and before its
         // verack to opt into addrv2. Those bytes arrive inside the recv loops
@@ -7594,27 +7701,56 @@ impl PeerManager {
         // onion) to a peer that supports it.
         let mut peer_wants_addrv2 = false;
 
-        let their_version = match direction {
+        if direction == Direction::Outbound {
+            conn.send(NetworkMessage::Version(our_version.clone()))
+                .await
+                .map_err(|e| format!("send version: {}", e))?;
+            // BIP 155: signal addrv2 support after Version, before Verack
+            conn.send(NetworkMessage::SendAddrV2)
+                .await
+                .map_err(|e| format!("send sendaddrv2: {}", e))?;
+        }
+
+        // Core's `ProcessMessage` before `version`: anything else is ignored
+        // with a line naming it.
+        let their_version = loop {
+            match self.recv_handshake(id, conn, connected_at).await? {
+                NetworkMessage::Version(v) => break v,
+                other => tracing::debug!(
+                    "non-version message before version handshake. Message \"{}\" from peer={id}",
+                    handshake_msg_type(&other)
+                ),
+            }
+        };
+
+        if direction == Direction::Inbound {
+            // Core's `CheckIncomingNonce`: our own outbound version coming back.
+            let to_self = self.peers.read().values().any(|h| {
+                h.info.direction == Direction::Outbound
+                    && h.info.state != PeerState::Connected
+                    && h.info.local_nonce == Some(their_version.nonce)
+            });
+            if to_self {
+                let addr = conn.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
+                tracing::info!("connected to self at {addr}, disconnecting");
+                return Err("connected to self".to_string());
+            }
+        }
+
+        if direction == Direction::Outbound
+            && matches!(conn_type, ConnType::OutboundFullRelay | ConnType::BlockRelay | ConnType::AddrFetch)
+            && let Some(wanted) = self.missing_desirable_services(their_version.services)
+        {
+            tracing::debug!(
+                "peer does not offer the expected services ({:08x} offered, {:08x} expected), disconnecting peer={id}",
+                their_version.services.to_u64(),
+                wanted.to_u64()
+            );
+            return Err("peer lacks the expected services".to_string());
+        }
+
+        match direction {
             Direction::Outbound => {
-                conn.send(NetworkMessage::Version(our_version))
-                    .await
-                    .map_err(|e| format!("send version: {}", e))?;
-
-                // BIP 155: signal addrv2 support after Version, before Verack
-                conn.send(NetworkMessage::SendAddrV2)
-                    .await
-                    .map_err(|e| format!("send sendaddrv2: {}", e))?;
-
-                let their_version = loop {
-                    let msg = Self::recv_with_timeout(conn, timeout).await?;
-                    if matches!(msg, NetworkMessage::SendAddrV2) {
-                        peer_wants_addrv2 = true;
-                    }
-                    if let NetworkMessage::Version(v) = msg {
-                        break v;
-                    }
-                };
-
                 // A feeler exists to answer one question -- is anything still
                 // listening there? -- and the peer's `version` answers it.
                 // Core closes the connection here without sending a verack
@@ -7622,6 +7758,7 @@ impl PeerManager {
                 // the handshake"), so the peer never enters the connected set
                 // and never reaches `getpeerinfo`.
                 if conn_type == ConnType::Feeler {
+                    tracing::debug!("feeler connection completed, disconnecting peer={id}");
                     // Drop the handle here rather than leaving it for the
                     // manager's next event drain. `is_addr_connected` counts
                     // anything not yet `Disconnected`, so a lingering feeler
@@ -7631,64 +7768,44 @@ impl PeerManager {
                     self.peers.write().remove(&id);
                     return Err("feeler connection: closing after version".to_string());
                 }
-
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
-
-                loop {
-                    let msg = Self::recv_with_timeout(conn, timeout).await?;
-                    if matches!(msg, NetworkMessage::SendAddrV2) {
-                        peer_wants_addrv2 = true;
-                    }
-                    if matches!(msg, NetworkMessage::Verack) {
-                        break;
-                    }
-                }
-
-                conn.send(NetworkMessage::SendHeaders)
-                    .await
-                    .map_err(|e| format!("send sendheaders: {}", e))?;
-
-                their_version
             }
             Direction::Inbound => {
-                let their_version = loop {
-                    let msg = Self::recv_with_timeout(conn, timeout).await?;
-                    if matches!(msg, NetworkMessage::SendAddrV2) {
-                        peer_wants_addrv2 = true;
-                    }
-                    if let NetworkMessage::Version(v) = msg {
-                        break v;
-                    }
-                };
-
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
-
                 // BIP 155: signal addrv2 support after Version, before Verack
                 conn.send(NetworkMessage::SendAddrV2)
                     .await
                     .map_err(|e| format!("send sendaddrv2: {}", e))?;
-
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
-
-                loop {
-                    let msg = Self::recv_with_timeout(conn, timeout).await?;
-                    if matches!(msg, NetworkMessage::SendAddrV2) {
-                        peer_wants_addrv2 = true;
-                    }
-                    if matches!(msg, NetworkMessage::Verack) {
-                        break;
-                    }
-                }
-
-                their_version
             }
-        };
+        }
+
+        // Between `version` and `verack` Core takes only the negotiation
+        // messages; anything else is ignored with a line naming it.
+        loop {
+            match self.recv_handshake(id, conn, connected_at).await? {
+                NetworkMessage::Verack => break,
+                NetworkMessage::SendAddrV2 => peer_wants_addrv2 = true,
+                NetworkMessage::WtxidRelay => {}
+                NetworkMessage::Unknown { command, .. } if command.as_ref() == "sendtxrcncl" => {}
+                other => tracing::debug!(
+                    "Unsupported message \"{}\" prior to verack from peer={id}",
+                    handshake_msg_type(&other)
+                ),
+            }
+        }
+
+        if direction == Direction::Outbound {
+            conn.send(NetworkMessage::SendHeaders)
+                .await
+                .map_err(|e| format!("send sendheaders: {}", e))?;
+        }
 
         if peer_wants_addrv2
             && let Some(handle) = self.peers.write().get_mut(&id)

@@ -666,6 +666,9 @@ pub struct Config {
     /// Core's `-maxtipage`, seconds: a tip older than this keeps the node in
     /// initial block download. Default 24 hours.
     pub maxtipage: i64,
+    /// Core's `-peertimeout`, seconds: how long a new connection has to
+    /// finish its handshake before the inactivity check drops it. Default 60.
+    pub peertimeout: i64,
     /// Bitcoin Core's `-persistmempool`: save the mempool to
     /// `<datadir>/<chain>/mempool.dat` on clean shutdown and re-admit
     /// it (re-validated) on startup. Default true, matching Core.
@@ -2914,6 +2917,17 @@ impl Config {
             },
         };
 
+        let peertimeout = match cli.peertimeout {
+            Some(v) => v,
+            None => match file_get("peertimeout") {
+                Some(v) => v.trim().parse::<i64>().unwrap_or(0),
+                None => node::net::manager::DEFAULT_PEER_CONNECT_TIMEOUT_SECS,
+            },
+        };
+        if peertimeout <= 0 {
+            return Err("peertimeout must be a positive integer.".to_string());
+        }
+
         let permitbaremultisig = cli
             .permitbaremultisig
             .or_else(|| file_get("permitbaremultisig").and_then(|v| parse_bool(&v)))
@@ -3913,6 +3927,7 @@ impl Config {
             limitclustercount,
             mempoolexpiry,
             maxtipage,
+            peertimeout,
             persistmempool: cli
                 .persistmempool
                 .or_else(|| file_get("persistmempool").and_then(|v| parse_bool(&v)))
@@ -5309,6 +5324,14 @@ pub struct CliArgs {
         help = "Maximum tip age in seconds to consider the node out of initial block download (default: 86400)"
     )]
     pub maxtipage: Option<i64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        allow_hyphen_values = true,
+        help = "Seconds a new peer has to complete the handshake before an inactive connection is dropped (default: 60)"
+    )]
+    pub peertimeout: Option<i64>,
 
     #[arg(
         long,
@@ -7245,6 +7268,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "rpcpassword",
         "rpcthreads",
         "rpcworkqueue",
+        "rpcservertimeout",
         "rpctlsbind",
         "rpctlscert",
         "rpctlskey",
@@ -7293,6 +7317,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "limitclustercount",
         "mempoolexpiry",
         "maxtipage",
+        "peertimeout",
         "cjdnsreachable",
         "persistmempool",
         "permitbaremultisig",
@@ -7960,6 +7985,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "rpcpassword",
     "rpcthreads",
     "rpcworkqueue",
+    "rpcservertimeout",
     "apithreads",
     "rpcreadonlybind",
     "rpcreadonlyport",
@@ -8052,6 +8078,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "limitclustercount",
     "mempoolexpiry",
     "maxtipage",
+    "peertimeout",
     "cjdnsreachable",
     "persistmempool",
     "permitbaremultisig",
@@ -10221,6 +10248,46 @@ testactivationheight=bip34@2
         assert!(err.contains("rpcreadonlyallowip"), "got: {err}");
     }
 
+    /// `-rpcservertimeout` and `-peertimeout` from the file, not just the
+    /// command line: an unknown key is dropped with a warning, which left
+    /// every RPC connection on the 30-second default however the operator
+    /// (or the Core functional framework, which writes 99000) set it.
+    #[test]
+    fn server_and_peer_timeouts_come_from_the_config_file() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "regtest=1\n[regtest]\nrpcservertimeout=99000\npeertimeout=7\n").unwrap();
+        let argv = [
+            "satd",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--conf",
+            conf.to_str().unwrap(),
+        ];
+        let cfg = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap();
+        assert_eq!(cfg.rpc_server_timeout, Some(std::time::Duration::from_secs(99_000)));
+        assert_eq!(cfg.peertimeout, 7);
+        assert!(is_known_config_key("rpcservertimeout"));
+        assert!(is_known_config_key("peertimeout"));
+    }
+
+    /// Core: `peertimeout must be a positive integer.`
+    #[test]
+    fn a_non_positive_peertimeout_is_refused() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv = [
+            "satd",
+            "--regtest",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--peertimeout=0",
+        ];
+        let err = Config::from_cli(CliArgs::try_parse_from(argv).unwrap()).unwrap_err();
+        assert_eq!(err, "peertimeout must be a positive integer.");
+    }
+
     #[test]
     fn rpc_readonly_keys_recognized_in_config_file() {
         // A Core-shaped config carrying the read-only keys must load, not
@@ -10399,6 +10466,7 @@ testactivationheight=bip34@2
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
             maxtipage: None,
+            peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,
@@ -10707,6 +10775,7 @@ testactivationheight=bip34@2
             signetseednode: Vec::new(),
             signetchallenge: Vec::new(),
             maxtipage: None,
+            peertimeout: None,
             cjdnsreachable: None,
             datadir: Some(PathBuf::from("/tmp/satd-test")),
             conf: None,

@@ -610,6 +610,7 @@ fn field_specs() -> Vec<FieldSpec> {
         // it requires a restart.
         restart!("rpcthreads", rpc_threads),
         restart!("rpcworkqueue", rpc_workqueue),
+        restart!("rpcservertimeout", rpc_server_timeout),
         // The token store binds to a fixed path when it is loaded at startup
         // and is shared (as an `Arc`) with the surfaces. Changing WHERE the
         // file lives therefore requires a restart; changing its CONTENTS (token
@@ -775,6 +776,7 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("signetseednode", signet_seed_nodes),
         restart!("signetchallenge", signet_challenge),
         restart!("maxtipage", maxtipage),
+        restart!("peertimeout", peertimeout),
         // ---- Proxy / Tor ----
         restart!("proxy", proxy),
         restart!("proxyrandomize", proxyrandomize),
