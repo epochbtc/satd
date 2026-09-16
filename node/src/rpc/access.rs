@@ -192,6 +192,7 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         | "getprioritisedtransactions"
         // operational flush of the mempool to disk
         | "savemempool"
+        | "pruneblockchain"
         // moves the node clock on a mockable chain (regtest); additionally
         // gated on the `test:clock` capability, which `rpc:write` does not imply
         | "setmocktime"

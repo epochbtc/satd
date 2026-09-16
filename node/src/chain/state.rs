@@ -8071,6 +8071,16 @@ impl ChainState {
     /// `keep_blocks` is the number of recent blocks to keep data for.
     /// Returns the number of files deleted.
     pub fn prune_blocks(&self, keep_blocks: u32) -> u32 {
+        let tip_height = self.tip.read().height;
+        if tip_height <= keep_blocks {
+            return 0;
+        }
+        self.prune_up_to(tip_height - keep_blocks)
+    }
+
+    /// Delete the block files holding only blocks at or below `prune_below`,
+    /// the target `pruneblockchain` names. Returns how many files went.
+    pub fn prune_up_to(&self, prune_below: u32) -> u32 {
         // One consistent snapshot of the tip the plan below is computed
         // against. The mutation section revalidates this exact (hash,
         // height) pair under `accept_lock` before acting on the plan.
@@ -8078,10 +8088,9 @@ impl ChainState {
             let tip = self.tip.read();
             (tip.hash, tip.height)
         };
-        if tip_height <= keep_blocks {
+        if prune_below >= tip_height {
             return 0;
         }
-        let prune_below = tip_height - keep_blocks;
 
         // Collect file_numbers used by pruneable blocks (height <= prune_below)
         let mut pruneable_files: std::collections::HashMap<u32, Vec<(BlockHash, u32)>> =

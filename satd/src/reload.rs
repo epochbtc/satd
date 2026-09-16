@@ -940,7 +940,22 @@ fn field_specs() -> Vec<FieldSpec> {
         restart!("stratumv2maxchannels", stratum_v2_max_channels),
         restart!("stratumv2jd", stratum_v2_jd),
         // ---- Storage / pruning / reindex ----
-        restart!("prune", prune),
+        // Not `restart!("prune", prune)`: `-prune=1` is manual mode, which
+        // leaves the budget at 0, so comparing the budget alone would read a
+        // switch between `-prune=0` and `-prune=1` as no change at all.
+        FieldSpec {
+            key: "prune",
+            diff: |old, new| {
+                let spelled = |c: &Config| {
+                    if c.prune_manual { "1".to_string() } else { c.prune.to_string() }
+                };
+                let (o, n) = (spelled(old), spelled(new));
+                if o != n { Some((o, n)) } else { None }
+            },
+            apply: None,
+            sensitive: false,
+        },
+        restart!("fastprune", fastprune),
         restart!("reindex", reindex),
         restart!("reindexchainstate", reindex_chainstate),
         restart!("checkblockindex", check_block_index),

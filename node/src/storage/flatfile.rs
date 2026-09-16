@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 
 const MAX_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
 
+/// Core's `-fastprune` file size (`blockstorage.cpp`: `0x10000` when
+/// `fast_prune` is set). Pruning deletes whole files, so a test chain of
+/// small blocks never crosses the 128 MiB boundary and nothing is ever
+/// deleted; the option exists so a prune can be exercised in a test.
+pub const FAST_PRUNE_FILE_SIZE: u64 = 0x10000;
+
 /// The all-zero XOR key: on-disk bytes are stored as-is (plaintext).
 const ZERO_XOR_KEY: [u8; 8] = [0u8; 8];
 
@@ -156,6 +162,13 @@ pub struct FlatFileManager {
     /// and `rev*.dat`; satd keeps undo data in RocksDB, so there is no
     /// `rev*` term (recorded in `CORE_DIFFERENCES.md`).
     total_bytes: u64,
+    /// The size at which an append rolls into the next `blk*.dat`. Normally
+    /// [`MAX_FILE_SIZE`]; `-fastprune` lowers it to
+    /// [`FAST_PRUNE_FILE_SIZE`]. Only the *write* side reads this — the
+    /// read path's bound stays the constant, because that check is a
+    /// corruption guard against a datadir written under another setting,
+    /// not a policy.
+    max_file_size: u64,
 }
 
 /// Sum the sizes of every `blk*.dat` in `dir`.
@@ -186,6 +199,13 @@ impl FlatFileManager {
     /// initialize fresh dirs to plaintext.
     pub fn new(blocks_dir: &Path) -> std::io::Result<Self> {
         Self::with_xor_mode(blocks_dir, XorMode::Auto)
+    }
+
+    /// Core's `-fastprune`: roll into a new `blk*.dat` every
+    /// [`FAST_PRUNE_FILE_SIZE`] bytes instead of every 128 MiB, so a prune
+    /// on a short test chain has whole files it can delete.
+    pub fn set_fast_prune(&mut self, fast: bool) {
+        self.max_file_size = if fast { FAST_PRUNE_FILE_SIZE } else { MAX_FILE_SIZE };
     }
 
     pub fn with_xor_mode(blocks_dir: &Path, mode: XorMode) -> std::io::Result<Self> {
@@ -228,6 +248,7 @@ impl FlatFileManager {
             read_cache: std::collections::HashMap::new(),
             xor_key,
             total_bytes,
+            max_file_size: MAX_FILE_SIZE,
         })
     }
 
@@ -265,7 +286,7 @@ impl FlatFileManager {
         // outgoing file first: it will never be written again, and syncing
         // it here keeps the "only the current file can be dirty" invariant
         // that lets `sync_all` ignore closed files.
-        if self.current_pos > 0 && self.current_pos + record_size > MAX_FILE_SIZE {
+        if self.current_pos > 0 && self.current_pos + record_size > self.max_file_size {
             // Fsync the outgoing file first: it will never be written again,
             // and syncing it here keeps the "only the current file can be
             // dirty" invariant that lets `sync_all` ignore closed files.

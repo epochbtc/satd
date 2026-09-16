@@ -608,15 +608,6 @@ silently returning an empty or wrong answer.
   inputs are added, and a wrong number on the one field a signer checks before
   committing funds is worse than an absent one.
 
-- **`-prune=1`** — Core's spelling for *manual* pruning
-  (`PRUNE_TARGET_MANUAL`), where the node prunes only on a `pruneblockchain`
-  call. satd has no `pruneblockchain` RPC, so it refuses `-prune=1` at startup
-  rather than reading it as a 1 MiB budget — which would put the node on its
-  288-block floor and delete block data automatically, the opposite of what the
-  operator asked for. Every other `-prune=<n>` is automatic pruning, in MiB as
-  Core's is, so `getblockchaininfo.automatic_pruning` is always true on a
-  pruning satd node.
-
 - **`savemempool`** — Core refuses with `-1 The mempool was not loaded yet`
   when `CTxMemPool::GetLoadTried()` is false. satd attempts the load
   unconditionally at startup and has no such flag, so the precondition has

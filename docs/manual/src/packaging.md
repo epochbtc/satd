@@ -426,7 +426,15 @@ no stop-and-reindex step. The backfill cursors are in
 ## Pruning
 
 `--prune=<MiB>` has the same shape as in Bitcoin Core. The minimum is
-550 MiB.
+550 MiB, and the node prunes to that budget on its own.
+
+`--prune=1` is Core's spelling for *manual* pruning: prune mode is on, but
+nothing is deleted until `pruneblockchain <height>` asks for it. The RPC
+deletes block data at or below that height and returns the height of the
+last block pruned; the height may be given as a Unix timestamp instead, and a
+request that reaches into the most recent 288 blocks is clamped to them. A
+manual pruner reports `automatic_pruning: false` and no `prune_target_size`
+in `getblockchaininfo`.
 
 Indexes that scan historical blocks (`--txindex`, `--addressindex`,
 `--blockfilterindex`) require unpruned blocks. satd refuses to start

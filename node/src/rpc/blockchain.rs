@@ -103,10 +103,39 @@ pub(crate) fn target_hex(bits: bitcoin::CompactTarget) -> String {
     hex::encode(bitcoin::Target::from_compact(bits).to_be_bytes())
 }
 
+/// Whether the node prunes block data, and on whose schedule.
+///
+/// Core keeps the two apart: `-prune=<MiB>` is a budget the node enforces by
+/// itself, while `-prune=1` maps to `PRUNE_TARGET_MANUAL` and deletes nothing
+/// until `pruneblockchain` names a height. `getblockchaininfo` reports both as
+/// `pruned`, but only the first carries a `prune_target_size`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PruneMode {
+    /// `-prune=0`: every block is kept.
+    Off,
+    /// `-prune=1`: `pruneblockchain` is the only thing that deletes.
+    Manual,
+    /// `-prune=<MiB>`: the node prunes to a budget on its own.
+    Automatic(u64),
+}
+
+impl PruneMode {
+    /// Core's `fPruneMode`: true for either pruning mode.
+    pub fn is_on(self) -> bool {
+        !matches!(self, PruneMode::Off)
+    }
+
+    /// The automatic budget in MiB, `None` in the other two modes.
+    pub fn target_mb(self) -> Option<u64> {
+        match self {
+            PruneMode::Automatic(mb) => Some(mb),
+            _ => None,
+        }
+    }
+}
+
 /// Build the `getblockchaininfo` response from real chain state.
-/// `prune`: `None` when the node is not pruning, else the configured
-/// `-prune` target in MiB.
-pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64>) -> Value {
+pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value {
     let chain = match chain_state.network {
         Network::Regtest => "regtest",
         Network::Testnet => "test",
@@ -161,7 +190,7 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
         // implements `-prune` in full, so the old value told the operator of
         // a pruned node that it held the whole chain -- and a client reading
         // it would ask for a block that had been deleted.
-        "pruned": prune_target_mb.is_some(),
+        "pruned": prune.is_on(),
         // Core ≥ v27 warnings is an array of strings. Preserves older
         // behavior: if no active warnings, emit the empty-string form
         // Core used historically; otherwise emit the Core-v27 array.
@@ -180,21 +209,20 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     // something has actually been deleted — `GetPruneHeight` is `nullopt`
     // then and the RPC writes 0 (`rpc/blockchain.cpp`). `0` is accurate on
     // such a node: everything from genesis *is* here.
-    if prune_target_mb.is_some() {
+    if prune.is_on() {
         out["pruneheight"] = json!(chain_state.prune_height().unwrap_or(0));
+        // Core: `automatic_pruning` is false exactly when the target is
+        // `PRUNE_TARGET_MANUAL`, and `prune_target_size` is emitted only
+        // alongside a true one.
+        out["automatic_pruning"] = json!(prune.target_mb().is_some());
     }
-    if let Some(mib) = prune_target_mb {
+    if let Some(mib) = prune.target_mb() {
         // MiB, as Core's `-prune` is: `blockmanager_args.cpp` computes
         // `uint64_t(nPruneArg) * 1024 * 1024` and `getblockchaininfo` reports
         // that number verbatim. satd reported `mb * 1_000_000`, so `-prune=550`
         // came back as 550,000,000 against Core's 576,716,800 — a 4.9%
         // divergence on a byte budget an operator sizes a disk against.
         out["prune_target_size"] = json!(mib.saturating_mul(1024 * 1024));
-        // satd has no manual-pruning mode (no `pruneblockchain` RPC), so every
-        // pruning node prunes automatically. Core's `-prune=1` — its spelling
-        // for manual pruning — is refused at startup rather than silently
-        // taken as a 1 MiB budget, so it cannot reach here.
-        out["automatic_pruning"] = json!(true);
     }
     out
 }
@@ -1406,6 +1434,124 @@ fn map_invalidate_err(e: crate::chain::state::ChainError) -> (i32, String) {
     }
 }
 
+/// Core's `MIN_BLOCKS_TO_KEEP` (`validation.h`): the tail no prune touches,
+/// so a peer that just fell behind can still be served the recent chain.
+pub const MIN_BLOCKS_TO_KEEP: u32 = 288;
+
+/// Core's `TIMESTAMP_WINDOW` (`chain.h`): the two-hour buffer
+/// `pruneblockchain` subtracts from a timestamp argument, so blocks that
+/// carried an old timestamp are still included.
+const TIMESTAMP_WINDOW: i64 = 2 * 60 * 60;
+
+/// Core's `PruneAfterHeight` (`kernel/chainparams.cpp`): the chain must be at
+/// least this tall before `pruneblockchain` will do anything.
+fn prune_after_height(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => 100_000,
+        _ => 1_000,
+    }
+}
+
+/// Core's `CChain::FindEarliestAtLeast`: the lowest active-chain block whose
+/// `nTimeMax` is at least `time`.
+///
+/// `nTimeMax` is a running maximum over the chain, so the block it finds is
+/// exactly the lowest one whose *own* header time reaches `time`. satd does
+/// not store that running maximum, so this binary-searches the header times
+/// — near enough to monotone to land within a block or two — and then walks
+/// back to catch an inversion. A block's time must beat the median of the
+/// previous eleven, so an inversion spans a handful of blocks at most; the
+/// walk covers two retarget periods, which is far past that.
+fn find_earliest_at_least(chain_state: &ChainState, time: i64) -> Option<u32> {
+    let tip_height = chain_state.tip_height();
+    let time_at = |h: u32| -> Option<i64> {
+        let hash = chain_state.get_block_hash_by_height(h)?;
+        Some(chain_state.get_block_index(&hash)?.header.time as i64)
+    };
+    // Binary search for the first height whose header time reaches `time`.
+    let (mut lo, mut hi) = (0u32, tip_height);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match time_at(mid) {
+            Some(t) if t < time => lo = mid + 1,
+            Some(_) => hi = mid,
+            // A hole in the height index: treat it as "not yet there" so the
+            // search keeps climbing rather than settling on a gap.
+            None => lo = mid + 1,
+        }
+    }
+    time_at(lo).filter(|t| *t >= time)?;
+    // Walk back over the inversion window, keeping the lowest block that
+    // still reaches `time`.
+    let floor = lo.saturating_sub(2 * 2016);
+    let mut best = lo;
+    for h in (floor..lo).rev() {
+        if time_at(h).is_some_and(|t| t >= time) {
+            best = h;
+        }
+    }
+    Some(best)
+}
+
+/// `pruneblockchain` — delete block data up to a height, or up to the first
+/// block at least two hours older than a timestamp.
+///
+/// Returns Core's value: the height of the last block pruned, `-1` when the
+/// active chain still starts at genesis. The height is clamped to
+/// `tip - MIN_BLOCKS_TO_KEEP` rather than refused, which is what Core does —
+/// an operator asking to prune into the tail gets the deepest prune that is
+/// allowed, not an error.
+pub fn prune_blockchain(
+    chain_state: &ChainState,
+    prune: PruneMode,
+    height_param: i64,
+) -> Result<i64, (i32, String)> {
+    if !prune.is_on() {
+        return Err((
+            -1,
+            "Cannot prune blocks because node is not in prune mode.".to_string(),
+        ));
+    }
+    if height_param < 0 {
+        return Err((-8, "Negative block height.".to_string()));
+    }
+
+    // Core: a value over a billion is too large to be a height and too small
+    // to be a block time after Sep 2001, so it is read as a timestamp.
+    let mut height = if height_param > 1_000_000_000 {
+        find_earliest_at_least(chain_state, height_param - TIMESTAMP_WINDOW).ok_or((
+            -8,
+            "Could not find block with at least the specified timestamp.".to_string(),
+        ))?
+    } else {
+        height_param as u32
+    };
+
+    let chain_height = chain_state.tip_height();
+    if chain_height < prune_after_height(chain_state.network) {
+        return Err((-1, "Blockchain is too short for pruning.".to_string()));
+    } else if height > chain_height {
+        return Err((
+            -8,
+            "Blockchain is shorter than the attempted prune height.".to_string(),
+        ));
+    } else if height > chain_height - MIN_BLOCKS_TO_KEEP {
+        tracing::debug!(
+            "Attempt to prune blocks close to the tip.  Retaining the minimum number of blocks."
+        );
+        height = chain_height - MIN_BLOCKS_TO_KEEP;
+    }
+
+    // Core prunes files holding only blocks *below* the named height
+    // (`nManualPruneHeight` bounds `PruneOneBlockFile` at `height`), and
+    // `prune_up_to` takes the same "at or below" bound.
+    chain_state.prune_up_to(height);
+
+    // `prune_height()` is the first height still stored; Core reports the
+    // last one pruned, and `-1` when nothing on the active chain is gone.
+    Ok(chain_state.prune_height().unwrap_or(0) as i64 - 1)
+}
+
 /// `invalidateblock` — mark a block invalid and re-activate the best valid
 /// chain. Returns `null` on success (Core parity).
 pub fn invalidate_block(
@@ -1832,13 +1978,80 @@ mod tests {
     #[test]
     fn test_getblockchaininfo_genesis() {
         let (cs, dir) = make_cs();
-        let info = get_blockchain_info(&cs, None);
+        let info = get_blockchain_info(&cs, PruneMode::Off);
 
         assert_eq!(info["chain"], "regtest");
         assert_eq!(info["blocks"], 0);
 
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         assert_eq!(info["bestblockhash"], genesis.block_hash().to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core reports both prune modes as `pruned`, and tells them apart with
+    /// `automatic_pruning`. A manual pruner has no budget, so it carries no
+    /// `prune_target_size` — an operator reading one there would size a disk
+    /// against a number the node never enforces.
+    #[test]
+    fn the_two_prune_modes_report_cores_two_shapes() {
+        let (cs, dir) = make_cs();
+
+        let off = get_blockchain_info(&cs, PruneMode::Off);
+        assert_eq!(off["pruned"], false);
+        assert!(off.get("pruneheight").is_none(), "{off}");
+        assert!(off.get("automatic_pruning").is_none(), "{off}");
+
+        let manual = get_blockchain_info(&cs, PruneMode::Manual);
+        assert_eq!(manual["pruned"], true);
+        assert_eq!(manual["pruneheight"], 0);
+        assert_eq!(manual["automatic_pruning"], false);
+        assert!(
+            manual.get("prune_target_size").is_none(),
+            "a manual pruner prunes to no budget: {manual}"
+        );
+
+        let auto = get_blockchain_info(&cs, PruneMode::Automatic(550));
+        assert_eq!(auto["pruned"], true);
+        assert_eq!(auto["automatic_pruning"], true);
+        // MiB, as Core's `-prune` is.
+        assert_eq!(auto["prune_target_size"], 550u64 * 1024 * 1024);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `pruneblockchain`'s refusals, in Core's order and Core's words. The
+    /// order matters: a too-short chain is answered as such even when the
+    /// height asked for is also past the tip.
+    #[test]
+    fn pruneblockchain_refuses_what_core_refuses() {
+        let (cs, dir) = make_cs();
+
+        let e = prune_blockchain(&cs, PruneMode::Off, 100).unwrap_err();
+        assert_eq!(e.0, -1);
+        assert_eq!(e.1, "Cannot prune blocks because node is not in prune mode.");
+
+        let e = prune_blockchain(&cs, PruneMode::Manual, -1).unwrap_err();
+        assert_eq!(e.0, -8);
+        assert_eq!(e.1, "Negative block height.");
+
+        // Regtest's `PruneAfterHeight` is 1000 and this chain is genesis
+        // only, so every height is answered "too short" rather than
+        // "shorter than the attempted prune height".
+        for h in [0, 100, 10_000] {
+            let e = prune_blockchain(&cs, PruneMode::Manual, h).unwrap_err();
+            assert_eq!(e.0, -1, "height {h}");
+            assert_eq!(e.1, "Blockchain is too short for pruning.", "height {h}");
+        }
+
+        // A timestamp argument on a chain with no block that old: Core's
+        // separate message, not a silent prune of nothing.
+        let e = prune_blockchain(&cs, PruneMode::Manual, 2_000_000_000).unwrap_err();
+        assert_eq!(e.0, -8);
+        assert_eq!(
+            e.1,
+            "Could not find block with at least the specified timestamp."
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

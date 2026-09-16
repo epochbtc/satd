@@ -7,7 +7,7 @@ use parking_lot::{Condvar, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -656,6 +656,9 @@ pub struct PeerManager {
     connect_timeout_ms: AtomicU64,
     /// `-peertimeout`, seconds.
     peer_connect_timeout_secs: AtomicU64,
+    /// Core's `-prune=1`: prune mode is on, but only `pruneblockchain`
+    /// deletes. Separate from `prune_target_mb`, which is 0 in that mode.
+    prune_manual: AtomicBool,
     /// Rebroadcast cadence for unbroadcast local txs, in seconds. `0` means
     /// "auto" — the spawner randomizes each interval in
     /// `[REBROADCAST_AUTO_MIN_SECS, REBROADCAST_AUTO_MAX_SECS]` (Core's
@@ -888,6 +891,7 @@ impl PeerManager {
             ban_duration_secs: AtomicU64::new(ban_duration_secs),
             connect_timeout_ms: AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_MS),
             peer_connect_timeout_secs: AtomicU64::new(DEFAULT_PEER_CONNECT_TIMEOUT_SECS as u64),
+            prune_manual: AtomicBool::new(false),
             rebroadcast_interval_secs: AtomicU64::new(0),
             promotion_queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             broadcast_confirm_peers: AtomicU64::new(DEFAULT_BROADCAST_CONFIRM_PEERS),
@@ -969,14 +973,24 @@ impl PeerManager {
         mgr
     }
 
-    /// Set the handshake timeout (Bitcoin Core's `-timeout`), in
-    /// milliseconds. Call once at startup before peers connect. A value
-    /// of 0 is clamped to 1ms so the handshake can never block forever.
-    /// Core's `-peertimeout`, seconds.
+    /// How long a connected peer may go without a useful message before it is
+    /// dropped (Core's `-peertimeout`, seconds). Call once at startup. A value
+    /// of 0 is clamped to 1s so a peer can never be held forever.
     pub fn set_peer_connect_timeout_secs(&self, secs: u64) {
         self.peer_connect_timeout_secs.store(secs.max(1), Ordering::Relaxed);
     }
 
+    /// Whether `-prune=1` manual pruning is on. The node deletes nothing on
+    /// its own in that mode, but it is still a pruned node to the network:
+    /// it cannot promise `NODE_NETWORK` and must not be asked for a block
+    /// below its floor.
+    pub fn set_prune_manual(&self, manual: bool) {
+        self.prune_manual.store(manual, Ordering::Relaxed);
+    }
+
+    /// Set the handshake timeout (Bitcoin Core's `-timeout`), in
+    /// milliseconds. Call once at startup before peers connect. A value
+    /// of 0 is clamped to 1ms so the handshake can never block forever.
     pub fn set_connect_timeout_ms(&self, ms: u64) {
         self.connect_timeout_ms.store(ms.max(1), Ordering::Relaxed);
     }
@@ -1207,9 +1221,11 @@ impl PeerManager {
         self.onion_proxy.clone().or_else(|| self.proxy.clone())
     }
 
-    /// Whether this node is in prune mode (`-prune` > 0).
+    /// Whether this node is in prune mode — Core's `fPruneMode`, true for
+    /// both `-prune=<MiB>` and `-prune=1`. A manual pruner has deleted
+    /// nothing yet but is still a node that will, so it answers the same.
     pub fn is_pruning(&self) -> bool {
-        self.prune_target_mb > 0
+        self.prune_target_mb > 0 || self.prune_manual.load(Ordering::Relaxed)
     }
 
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
