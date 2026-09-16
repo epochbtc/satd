@@ -6286,6 +6286,117 @@ mod raw_p2p {
         stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
         while recv_msg(&mut stream).is_ok() {}
     }
+
+    /// A peer that reads its own replies, for the one thing the drained
+    /// client above cannot do: watch for a specific `pong`.
+    pub struct OrderedP2pClient {
+        stream: TcpStream,
+    }
+
+    impl OrderedP2pClient {
+        pub fn connect(p2p_port: u16) -> Self {
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{p2p_port}").parse().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("p2p connect to {addr} failed: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut client = OrderedP2pClient { stream };
+            client.handshake();
+            client
+        }
+
+        fn handshake(&mut self) {
+            self.send(NetworkMessage::Version(build_version()));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (mut saw_version, mut saw_verack) = (false, false);
+            while !(saw_version && saw_verack) {
+                assert!(Instant::now() < deadline, "handshake timeout");
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Version(_)) => saw_version = true,
+                    Ok(NetworkMessage::Verack) => saw_verack = true,
+                    Ok(_) => continue,
+                    Err(e) => panic!("handshake recv failed: {e}"),
+                }
+            }
+            self.send(NetworkMessage::Verack);
+        }
+
+        pub fn send(&mut self, msg: NetworkMessage) {
+            let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
+            self.stream.write_all(&serialize(&raw)).expect("p2p write");
+            self.stream.flush().ok();
+        }
+
+        /// Read until the pong for `nonce` arrives, answering the node's own
+        /// pings meanwhile so it does not drop us while we wait.
+        pub fn await_pong(&mut self, nonce: u64, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                assert!(Instant::now() < deadline, "no pong for nonce {nonce:x}");
+                match recv_msg(&mut self.stream) {
+                    Ok(NetworkMessage::Pong(n)) if n == nonce => return,
+                    Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
+                    Ok(_) => continue,
+                    Err(e) => panic!("recv while waiting for pong: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Bitcoin Core processes one connection's messages one at a time, in
+/// arrival order, so a `pong` answers for everything the peer sent ahead of
+/// the `ping`. `send_and_ping(block)` therefore means "the block is
+/// connected" — Core's own functional tests lean on it constantly, and so do
+/// real peers.
+///
+/// satd spread that work across tasks: `block` travelled the event queue to
+/// the manager's 500ms drain and on to the block processor, while `ping` was
+/// answered straight off the socket task. The pong guaranteed nothing, and a
+/// peer that asked the node for its height the instant the pong landed got
+/// the height from before the block.
+#[test]
+fn a_pong_answers_for_the_block_that_arrived_before_the_ping() {
+    use bitcoin::consensus::deserialize;
+    use bitcoin::p2p::message::NetworkMessage;
+    use raw_p2p::OrderedP2pClient;
+    use serde_json::json;
+
+    // One node mines the block; the node under test has never seen it.
+    let source = TestNode::start(&[]);
+    let addr = DeterministicWallet::from_secret([0x7e; 32]).address.to_string();
+    let hashes = source.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
+    let hash = hashes[0].as_str().unwrap().to_string();
+    let raw = source.rpc_ok("getblock", vec![json!(hash), json!(0)]);
+    let block: bitcoin::Block =
+        deserialize(&hex::decode(raw.as_str().unwrap()).unwrap()).expect("block decodes");
+
+
+    let node = TestNode::start(&[]);
+    assert_eq!(get_rpc_u64(&node, "getblockcount").unwrap(), 0);
+
+    let mut peer = OrderedP2pClient::connect(node.p2p_port.expect("p2p port"));
+    let nonce = 0x5a7d_0000_0000_0001;
+    peer.send(NetworkMessage::Block(block));
+    peer.send(NetworkMessage::Ping(nonce));
+    peer.await_pong(nonce, Duration::from_secs(60));
+
+    // No sleeping, no polling: the pong is the node's word that it is done
+    // with the block, and this is the assertion that word has to survive.
+    assert_eq!(
+        get_rpc_u64(&node, "getblockcount").unwrap(),
+        1,
+        "the pong came back before the block was connected"
+    );
 }
 
 // ---------------------------------------------------------------------------

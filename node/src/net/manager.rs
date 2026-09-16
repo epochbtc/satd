@@ -238,7 +238,8 @@ pub enum NetEvent {
 
 /// A block handed to the block processor: the peer it came from, that peer's
 /// counters, and the block.
-type IncomingBlock = (PeerId, Option<Arc<PeerStats>>, bitcoin::Block);
+type IncomingBlock =
+    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight);
 
 /// BIP 152: at most this many peers are asked to announce blocks to us as
 /// `cmpctblock`s (high-bandwidth mode).
@@ -281,6 +282,12 @@ struct PeerHandle {
     /// I/O tasks. Read by `getpeerinfo`; rolls up into the global
     /// [`NetTotals`].
     stats: Arc<PeerStats>,
+    /// How many of this peer's messages the node has taken in and not yet
+    /// finished with. Core processes a connection's messages one at a time,
+    /// so a pong answers for everything ahead of it; satd spreads the work
+    /// across tasks, and this is what lets the pong wait for it. See
+    /// [`crate::net::flow`].
+    flow: Arc<crate::net::flow::PeerFlow>,
 }
 
 /// A message's type as Core names it in a log line.
@@ -559,6 +566,15 @@ pub struct PeerManager {
     /// bucketed by network group. Fed by addr gossip and successful
     /// connects; persisted across restarts.
     addrman: RwLock<crate::net::addrman::AddrMan>,
+    /// Wakes the manager loop's event drain before its next 500 ms tick.
+    ///
+    /// The drain cadence is deliberate everywhere else, but a peer whose
+    /// pong is parked behind queued work would otherwise pay up to a full
+    /// tick of it — and that lands in the round-trip time the *peer*
+    /// measures. Notifying here collapses the wait to the actual processing
+    /// time without speeding up the loop's periodic maintenance, which is
+    /// still driven by the interval alone.
+    drain_now: Arc<tokio::sync::Notify>,
     /// Channel to send received blocks to the processing thread.
     block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
@@ -866,6 +882,7 @@ impl PeerManager {
             advertised_onion: RwLock::new(None),
             whitelist: RwLock::new(Vec::new()),
             addrman: RwLock::new(crate::net::addrman::AddrMan::new()),
+            drain_now: Arc::new(tokio::sync::Notify::new()),
             block_tx,
             pending_compact: RwLock::new(HashMap::new()),
             extra_txns: Arc::new(parking_lot::Mutex::new(compact::ExtraTxnCache::new(
@@ -2201,6 +2218,7 @@ impl PeerManager {
                     info,
                     msg_tx,
                     disconnect: Arc::new(tokio::sync::Notify::new()),
+                    flow: Arc::new(crate::net::flow::PeerFlow::new()),
                     last_getheaders_sent: None,
                     last_mempool_served: None,
                     fee_filter_sent: None,
@@ -2950,6 +2968,12 @@ impl PeerManager {
         let mut last_tip: u32 = 0;
         let mut ticks: u64 = 0;
         let shutdown = self.shutdown.clone();
+        // True when the last wake came from `drain_now` rather than the
+        // interval: a peer's pong is parked behind the queue, and draining
+        // it is the whole of what was asked for. The periodic maintenance
+        // below stays on the interval — running it at the rate pings arrive
+        // would change every cadence in this loop.
+        let mut drain_only = false;
 
         loop {
             // Manager-loop heartbeat: bumped on every iteration so the
@@ -2981,12 +3005,24 @@ impl PeerManager {
                         self.handle_peer_disconnected(id);
                     }
                     Ok(NetEvent::MessageReceived { id, msg }) => {
-                        self.handle_message(id, msg);
+                        // The socket task counted this message in as it was
+                        // handed over; the guard counts it out once the work
+                        // is done, which is what a parked pong waits for.
+                        let guard = crate::net::flow::InFlight::adopt(self.peer_flow(id));
+                        self.handle_message(id, msg, guard);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                 }
                 processed += 1;
+            }
+
+            if drain_only {
+                drain_only = tokio::select! {
+                    _ = sync_interval.tick() => false,
+                    _ = self.drain_now.notified() => true,
+                };
+                continue;
             }
 
             // Check sync progress and request more blocks
@@ -3336,8 +3372,12 @@ impl PeerManager {
                 self.expire_compact_state();
             }
 
-            // Yield to tokio runtime
-            sync_interval.tick().await;
+            // Yield to tokio runtime, waking early when a peer is waiting
+            // on the drain above to answer a ping.
+            drain_only = tokio::select! {
+                _ = sync_interval.tick() => false,
+                _ = self.drain_now.notified() => true,
+            };
         }
     }
 
@@ -3407,7 +3447,17 @@ impl PeerManager {
         self.in_flight_blocks.write().remove(&id);
     }
 
-    fn handle_message(&self, id: PeerId, msg: NetworkMessage) {
+    /// `in_flight` is this message's place in the peer's queue: the socket
+    /// task counted it in, and dropping the guard counts it out. Arms that
+    /// finish their work here let it drop at the end of the call; the block
+    /// path hands it down the pipeline so the count stays up until the block
+    /// is connected, rejected, or dropped. See [`crate::net::flow`].
+    fn handle_message(
+        &self,
+        id: PeerId,
+        msg: NetworkMessage,
+        in_flight: crate::net::flow::InFlight,
+    ) {
         match msg {
             // Neither `Ping` nor `Pong` reaches here: the peer's write loop
             // answers the one and matches the other against that peer's
@@ -3425,7 +3475,7 @@ impl PeerManager {
             NetworkMessage::Block(block) => {
                 // `last_block` is stamped where the block is *accepted*, not
                 // here — see `block_processor` and `handle_block_ibd`.
-                self.handle_block(id, block);
+                self.handle_block(id, block, in_flight);
             }
             NetworkMessage::Tx(tx) => {
                 // `last_transaction` likewise: only a mempool accept counts.
@@ -4342,7 +4392,18 @@ impl PeerManager {
         self.peers.read().get(&id).map(|h| h.stats.clone())
     }
 
-    fn handle_block(&self, id: PeerId, block: bitcoin::Block) {
+    /// This peer's work-in-flight count, or `None` once it is gone — a
+    /// departed peer has no pong to park.
+    fn peer_flow(&self, id: PeerId) -> Option<Arc<crate::net::flow::PeerFlow>> {
+        self.peers.read().get(&id).map(|h| h.flow.clone())
+    }
+
+    fn handle_block(
+        &self,
+        id: PeerId,
+        block: bitcoin::Block,
+        in_flight: crate::net::flow::InFlight,
+    ) {
         if self.reject_if_mutated(id, &block) {
             return;
         }
@@ -4395,7 +4456,7 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send((id, self.peer_stats(id), block));
+        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -4982,7 +5043,15 @@ impl PeerManager {
         // Normal mode: process blocks from the channel.
         // Periodically check if the IBD scheduler was activated (header download completed
         // while we were in normal mode), and switch to the IBD connect loop if so.
-        let mut block_buffer: HashMap<bitcoin::BlockHash, bitcoin::Block> = HashMap::new();
+        // The in-flight guard rides along with the buffered block: a block
+        // waiting on a parent it has not seen is still work this peer sent
+        // that the node has not finished with, and a pong behind it must
+        // wait. Dropping the entry — connected, or evicted when the buffer
+        // fills — is what finally counts it out.
+        let mut block_buffer: HashMap<
+            bitcoin::BlockHash,
+            (bitcoin::Block, crate::net::flow::InFlight),
+        > = HashMap::new();
         loop {
             // Check if IBD scheduler was activated
             if ibd.read().is_some() {
@@ -5020,7 +5089,7 @@ impl PeerManager {
             drop(ready);
 
             // Drain all available blocks from the channel
-            while let Ok((sender, sender_stats, block)) = rx.try_recv() {
+            while let Ok((sender, sender_stats, block, in_flight)) = rx.try_recv() {
                 let hash = block.block_hash();
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
@@ -5077,7 +5146,7 @@ impl PeerManager {
                         loop {
                             let tip = chain_state.tip_hash();
                             match block_buffer.remove(&tip) {
-                                Some(b) => {
+                                Some((b, _in_flight)) => {
                                     let b_fees = Self::compute_block_fee_rates(&b, &chain_state);
                                     match chain_state.accept_block(&b) {
                                         Ok(acc) => {
@@ -5126,7 +5195,7 @@ impl PeerManager {
                     Err(crate::chain::state::ChainError::PrevBlockNotFound)
                     | Err(crate::chain::state::ChainError::BadPrevBlock) => {
                         if block_buffer.len() < 8192 {
-                            block_buffer.insert(block.header.prev_blockhash, block);
+                            block_buffer.insert(block.header.prev_blockhash, (block, in_flight));
                         }
                     }
                     Err(e) => {
@@ -7436,7 +7505,12 @@ impl PeerManager {
                     return;
                 }
                 self.log_reconstructed(id, &block_hash, entry.height, &stats, false, started);
-                let _ = self.block_tx.send((id, self.peer_stats(id), block));
+                let _ = self.block_tx.send((
+                    id,
+                    self.peer_stats(id),
+                    block,
+                    crate::net::flow::InFlight::new(self.peer_flow(id)),
+                ));
             }
             compact::Reconstruction::Partial { txs, missing_indices, stats } => {
                 // 11. Ask the peer for what the mempool could not supply.
@@ -7568,7 +7642,12 @@ impl PeerManager {
         match compact::complete_pending(pending, &txns, segwit_active) {
             Ok((block, stats)) => {
                 self.log_reconstructed(id, &block_hash, height, &stats, true, since);
-                let _ = self.block_tx.send((id, self.peer_stats(id), block));
+                let _ = self.block_tx.send((
+                    id,
+                    self.peer_stats(id),
+                    block,
+                    crate::net::flow::InFlight::new(self.peer_flow(id)),
+                ));
             }
             Err(compact::CompleteError::Invalid) => {
                 tracing::debug!(id, %block_hash, "blocktxn does not match the compact block");
@@ -7843,6 +7922,7 @@ impl PeerManager {
             info,
             msg_tx,
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
                     fee_filter_sent: None,
@@ -8210,11 +8290,13 @@ impl PeerManager {
         // the connection is torn down anyway.
         // Also the ping accounting the write loop needs below, so the map is
         // read once rather than again just before the loop starts.
-        let (ping_stats, disconnect_signal) = {
+        let (ping_stats, peer_flow, disconnect_signal) = {
             let peers = self.peers.read();
             match peers.get(&id) {
-                Some(h) => (Some(h.stats.clone()), Some(h.disconnect.clone())),
-                None => (None, None),
+                Some(h) => {
+                    (Some(h.stats.clone()), Some(h.flow.clone()), Some(h.disconnect.clone()))
+                }
+                None => (None, None, None),
             }
         };
         if let Some(stats) = &ping_stats {
@@ -8359,12 +8441,49 @@ impl PeerManager {
             &mut msg_rx,
             &mut read_rx,
             ping_stats,
+            peer_flow,
+            Some(self.drain_now.clone()),
             disconnect_signal,
         )
         .await;
 
         read_task.abort();
         result
+    }
+
+    /// Wait for everything this peer sent ahead of a `ping` to be finished
+    /// with, so the pong answers for it the way Core's does.
+    ///
+    /// Wakes the manager's drain first. Without that the wait is paced by
+    /// the loop's 500 ms tick, which is precisely the cadence this node
+    /// answers `ping` off the socket task to keep *out* of the round-trip
+    /// time the peer measures.
+    ///
+    /// Bounded, and deliberately so. Core can wait forever because its
+    /// message loop is the thing doing the work; satd's pong waits on other
+    /// tasks, and a message that never completes — a bug anywhere along the
+    /// block pipeline — would hold the pong until the peer dropped us for
+    /// not answering. The bound is well inside a peer's ping timeout
+    /// (Core's is 20 minutes), so the connection survives the bug.
+    ///
+    /// Returns whether the wait timed out.
+    async fn await_peer_idle(
+        id: PeerId,
+        flow: &crate::net::flow::PeerFlow,
+        drain_now: &Option<Arc<tokio::sync::Notify>>,
+    ) -> bool {
+        const MAX_PONG_WAIT: Duration = Duration::from_secs(60);
+        let in_flight = flow.in_flight();
+        let start = std::time::Instant::now();
+        if let Some(wake) = drain_now {
+            wake.notify_one();
+        }
+        let timed_out = tokio::time::timeout(MAX_PONG_WAIT, flow.wait_idle()).await.is_err();
+        tracing::trace!(
+            "pong peer={id}: waited {:?} for {in_flight} message(s) ahead of it",
+            start.elapsed()
+        );
+        timed_out
     }
 
     /// Write loop for a peer: forwards received messages to the manager
@@ -8379,6 +8498,7 @@ impl PeerManager {
     ///     terminate instead of leaving an untracked peer feeding events.
     ///     The earlier `Some(msg) = msg_rx.recv()` pattern silently
     ///     disabled the branch on close — review F2 (PRs #180-#184).
+    #[allow(clippy::too_many_arguments)]
     async fn peer_write_loop(
         id: PeerId,
         event_tx: &mpsc::Sender<NetEvent>,
@@ -8386,6 +8506,8 @@ impl PeerManager {
         msg_rx: &mut mpsc::Receiver<NetworkMessage>,
         read_rx: &mut mpsc::Receiver<NetworkMessage>,
         stats: Option<Arc<crate::net::stats::PeerStats>>,
+        flow: Option<Arc<crate::net::flow::PeerFlow>>,
+        drain_now: Option<Arc<tokio::sync::Notify>>,
         disconnect_signal: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), String> {
         // Bitcoin Core's keepalive cadence (`PING_INTERVAL`, net_processing.h).
@@ -8537,13 +8659,46 @@ impl PeerManager {
                         // put the manager's 500ms drain cadence into the
                         // round-trip time our *peer* measures. Core answers
                         // from its message-processing loop, promptly.
+                        //
+                        // But Core answers it *in order*, having finished
+                        // every message that arrived ahead of it on this
+                        // connection — which is what makes `send_and_ping`
+                        // mean "the block is connected" to a peer and to
+                        // Core's own functional tests. satd spreads that
+                        // work across tasks, so when the peer has something
+                        // outstanding the pong waits for it. An idle peer's
+                        // keepalive, which is nearly all of them, still gets
+                        // the immediate answer.
                         Some(NetworkMessage::Ping(nonce)) => {
+                            if let Some(flow) = &flow
+                                && !flow.is_idle()
+                            {
+                                let waited = Self::await_peer_idle(id, flow, &drain_now).await;
+                                if waited {
+                                    // A message that never completes is a
+                                    // bug in the pipeline, and holding the
+                                    // pong past the peer's ping timeout
+                                    // would cost us the connection over it.
+                                    tracing::debug!(
+                                        "pong peer={id}: still {} message(s) in flight after \
+                                         waiting, answering anyway",
+                                        flow.in_flight()
+                                    );
+                                }
+                            }
                             writer
                                 .send(NetworkMessage::Pong(nonce))
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
                         Some(msg) => {
+                            // Counted in here and out wherever the work ends
+                            // — the manager's drain for a message handled
+                            // inline, the block processor for a block. A
+                            // pong behind this message waits for that.
+                            if let Some(flow) = &flow {
+                                flow.queued();
+                            }
                             event_tx
                                 .send(NetEvent::MessageReceived { id, msg })
                                 .await
@@ -9228,6 +9383,7 @@ mod tests {
             info,
             msg_tx: tx,
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            flow: Arc::new(crate::net::flow::PeerFlow::new()),
             last_getheaders_sent: None,
             last_mempool_served: None,
                     fee_filter_sent: None,
@@ -9429,6 +9585,7 @@ mod tests {
                 info,
                 msg_tx: tx,
                 disconnect: Arc::new(tokio::sync::Notify::new()),
+                flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
                     fee_filter_sent: None,
@@ -9561,7 +9718,7 @@ mod tests {
         block.header.prev_blockhash =
             bitcoin::BlockHash::from_byte_array([0x42u8; 32]);
 
-        pm.handle_block(1, block);
+        pm.handle_block(1, block, crate::net::flow::InFlight::new(pm.peer_flow(1)));
 
         let peers = pm.peers.read();
         let handle = peers.get(&1).expect("peer session must stay up");
@@ -10700,6 +10857,7 @@ mod tests {
                 info,
                 msg_tx: tx,
                 disconnect: Arc::new(tokio::sync::Notify::new()),
+                flow: Arc::new(crate::net::flow::PeerFlow::new()),
                 last_getheaders_sent: None,
                 last_mempool_served: None,
                     fee_filter_sent: None,
@@ -11119,7 +11277,7 @@ mod tests {
             .insert(3, stale_pending(other.block_hash(), other.header, false));
         pm.note_blocks_requested(1, &[hash]);
 
-        pm.handle_block(3, block);
+        pm.handle_block(3, block, crate::net::flow::InFlight::new(pm.peer_flow(3)));
 
         let pending = pm.pending_compact.read();
         assert!(!pending.contains_key(&1) && !pending.contains_key(&2));
@@ -11141,13 +11299,13 @@ mod tests {
             (h.compact_blocks, h.hb_from)
         };
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 1 }));
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 1 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
         assert_eq!(info(&pm), (false, false), "version 1 is ignored");
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
         assert_eq!(info(&pm), (true, false), "low-bandwidth v2");
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
         assert_eq!(info(&pm), (true, true), "high-bandwidth v2");
     }
 

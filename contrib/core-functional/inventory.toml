@@ -71,7 +71,7 @@ status = "run"
 file = "feature_block.py"
 status = "skip"
 reason = "rpc-missing"
-note = "measured 2026-09-15: L157 generateblock expects -25 'TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction <txid>'; satd words it differently. Behind it ~50 more reject strings and the disconnect on an invalid block. Follow-up: block reject-reason parity (#671)"
+note = "measured 2026-09-16 with message ordering behind ping in place: still L157, where generateblock must report 'TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction <txid>'; satd omits the suffix. Behind it ~50 more reject strings and the disconnect on an invalid block. Follow-up: block reject-reason parity (#671)"
 
 [[test]]
 file = "feature_blocksdir.py"
@@ -89,13 +89,13 @@ note = "measured 2026-09-15: L38 compares blk*.dat and rev*.dat file counts (1 !
 file = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L75 send_blocks_and_test predicate times out: a block pushed with send_and_ping is not yet connected when the pong arrives (satd answers ping on the socket task, blocks go through the block processor). Behind it: Core's nSequenceId tie-break between equal-work tips. Follow-up: message ordering behind ping, then nSequenceId"
+note = "measured 2026-09-16 with message ordering behind ping in place: past the pong barrier and now failing at L75 on the in-memory chain split. Follow-up: Core's nSequenceId tie-break between equal-work tips"
 
 [[test]]
 file = "feature_cltv.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L95 bip65 still inactive at height 111: the block pushed with send_and_ping is not connected when the pong arrives. Behind it: the CLTV reject strings. Follow-up: message ordering behind ping"
+note = "measured 2026-09-16 with message ordering behind ping in place: the send_and_ping blocks now connect, and it fails at L169 on the same reject-details shape as feature_dersig — the failing input is not named. Follow-up: the script-failure input detail"
 
 [[test]]
 file = "feature_coinstatsindex.py"
@@ -118,7 +118,7 @@ note = "measured 2026-09-15: -nolisten=0 is accepted and warns in Core's words (
 file = "feature_csv_activation.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L181 send_blocks_and_test predicate times out: a block pushed with send_and_ping is not connected when the pong arrives. An earlier measurement hit -26 'scriptpubkey' on bare CSV scripts behind it. Follow-up: message ordering behind ping, then standardness"
+note = "measured 2026-09-16 with message ordering behind ping in place: past the pong barrier and now failing at L324, sending the success blocks. Follow-up: standardness for bare CSV scripts"
 
 [[test]]
 file = "feature_dbcrash.py"
@@ -129,7 +129,7 @@ reason = "core-internal"
 file = "feature_dersig.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L93 getblockcount 100 != 101: the block pushed with send_and_ping is not connected when the pong arrives. Behind it: the DERSIG reject strings. Follow-up: message ordering behind ping"
+note = "measured 2026-09-16 with message ordering behind ping in place: the send_and_ping blocks now connect, and it fails at L119 on testmempoolaccept's reject-details, which must name the failing input — 'mempool-script-verify-flag-failed (Non-canonical DER signature), input 0 of <txid> (wtxid <wtxid>), spending <prevout>'. satd's script verifier does not report which input failed. Follow-up: the script-failure input detail"
 
 [[test]]
 file = "feature_dirsymlinks.py"
@@ -337,7 +337,7 @@ note = "measured 2026-09-15: L65 KeyError 'muhash': gettxoutsetinfo ignores hash
 file = "feature_versionbits_warning.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L97 getmininginfo.warnings lacks Core's unknown-new-rules-activated warning; satd has no unknown-versionbits detection. Follow-up: unknown versionbits warning"
+note = "measured 2026-09-16: unchanged by message ordering — L97 getmininginfo.warnings still lacks Core's unknown-new-rules-activated warning. Follow-up: unknown versionbits warning"
 
 [[test]]
 file = "interface_bitcoin_cli.py"
@@ -761,7 +761,7 @@ note = "measured 2026-09-15: L52 no getheaders probe to a stale outbound peer. F
 file = "p2p_permissions.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L117 a tx pushed by a forcerelay peer is not in the mempool when send_txs_and_test checks. Behind it: forcerelay re-relay and its log line. Follow-up: message ordering behind ping"
+note = "measured 2026-09-16 with message ordering behind ping in place: past L117 and now failing at L123, where a forcerelay peer's transaction must reach the mempool. Follow-up: forcerelay re-relay and its log line"
 
 [[test]]
 file = "p2p_ping.py"
@@ -789,7 +789,7 @@ note = "measured 2026-09-15: L33 assert_debug_log 'Empty addrman, adding seednod
 file = "p2p_segwit.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L321 a tx pushed with send_and_ping is not in the mempool when the pong arrives. Behind it: witness-aware getdata and wtxid relay. Follow-up: message ordering behind ping, then #714"
+note = "measured 2026-09-16 with message ordering behind ping in place: past L321 and now failing at L508 test_v0_outputs_arent_spendable, where a block spending a v0 witness output without its witness must be rejected. Follow-up: witness-aware getdata and stripped blocks, then #714"
 
 [[test]]
 file = "p2p_sendheaders.py"
