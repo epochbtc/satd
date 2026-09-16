@@ -534,7 +534,7 @@ status = "run"
 file = "p2p_1p1c_network.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L105 node2 block sync times out, its IBD scheduler stuck at '32/130 stored, 0 in-flight, 10 pending'. Behind it: getorphantxs and 1P1C relay. Follow-up: IBD scheduler wedge"
+note = "measured 2026-09-16: the L105 scheduler stall is gone; the test reaches L126 getorphantxs, which satd does not implement. Follow-up: getorphantxs and 1P1C relay"
 
 [[test]]
 file = "p2p_add_connections.py"
@@ -570,7 +570,7 @@ status = "run"
 file = "p2p_blockfilters.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L60 node1 block sync times out in a 999-block IBD with 'Connector stuck waiting for block data'. Behind it: hash-keyed block filters. Follow-up: IBD scheduler wedge"
+note = "measured 2026-09-16: the L60 999-block sync now completes; the test runs to the filter checks and fails 'filter not found for non-active block'. IBD throughput is one fsync per block (#539), which left the sync a few seconds inside the 60s wait. Follow-up: hash-keyed block filters, then #539"
 
 [[test]]
 file = "p2p_blocksonly.py"
