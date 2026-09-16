@@ -1881,6 +1881,7 @@ async fn main() {
     // Bitcoin Core's `-timeout` bounds the version/verack handshake.
     // `config.timeout` is already normalised to milliseconds.
     peer_manager.set_connect_timeout_ms(config.timeout);
+    peer_manager.set_peer_connect_timeout_secs(config.peertimeout as u64);
     // Per-connection SOCKS credential randomization (Tor stream isolation).
     peer_manager.set_proxy_randomize(config.proxyrandomize);
     peer_manager.set_dns_enabled(config.dns);
@@ -3675,6 +3676,11 @@ async fn main() {
         && config.dns
         && config.dnsseed
         && (config.forcednsseed || peer_manager.addrman_is_empty());
+    // Core's `ThreadDNSAddressSeed` line when seeding is off (`-dnsseed=0`,
+    // or `-connect`, which defaults it off).
+    if !config.dnsseed || !config.automatic_outbound {
+        tracing::info!("DNS seeding disabled");
+    }
     if dns_seeding {
         let seed_addrs = node::net::dns::resolve_seeds_with(
             config.network,

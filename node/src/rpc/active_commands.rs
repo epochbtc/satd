@@ -55,6 +55,8 @@ impl Drop for ActiveGuard {
 }
 
 fn enter(method: &str) -> ActiveGuard {
+    // Core's `JSONRPCRequest::parse` line, one per command as it starts.
+    tracing::debug!("ThreadRPCServer method={method}");
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     ACTIVE.lock().push((
         token,

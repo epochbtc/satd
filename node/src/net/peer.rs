@@ -221,6 +221,9 @@ pub struct PeerInfo {
     /// indexed: Core's `pindexBestKnownBlock`, the bound on what the peer
     /// can be asked to serve.
     pub best_known_height: Option<u32>,
+    /// The nonce of the `version` we sent on this outbound connection, so an
+    /// inbound `version` carrying it can be recognised as ourselves.
+    pub local_nonce: Option<u64>,
     pub user_agent: String,
     pub ban_score: u32,
     /// The peer announced BIP 152 version 2 (witness) compact block support
@@ -302,6 +305,7 @@ impl PeerInfo {
             services: ServiceFlags::NONE,
             best_height: -1,
             best_known_height: None,
+            local_nonce: None,
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
