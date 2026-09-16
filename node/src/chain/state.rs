@@ -2589,7 +2589,25 @@ impl ChainState {
     ///
     /// The scan is O(index), as Core's is. It runs only on the two operator
     /// RPCs that can change a branch's validity, never on a P2P path.
+    ///
+    /// **Caller must hold `accept_lock`**, which is Core's `AssertLockHeld(
+    /// cs_main)` on `RecalculateBestHeader`. Both halves of the header tip
+    /// are published here as a plain overwrite, because lowering them is the
+    /// whole point — a chainwork-guarded write or a `fetch_max` would leave
+    /// the tip on the branch just invalidated. That makes the scan and the
+    /// publish a read-modify-write that must not interleave with
+    /// `commit_accepted_headers`, the only other writer of either half:
+    /// a batch landing in the window would be clobbered back to the stale
+    /// scan result. `accept_lock` is what excludes it, so the pair is atomic
+    /// against an incoming `headers` batch.
     pub(crate) fn recalculate_best_header(&self) {
+        // Stands in for `AssertLockHeld`: `try_lock` failing proves the lock
+        // is held. Cannot fire spuriously — it only fires when nothing holds
+        // the lock at all.
+        debug_assert!(
+            self.accept_lock.try_lock().is_none(),
+            "recalculate_best_header must run under accept_lock"
+        );
         let mut best: Option<(BlockHash, [u8; 32], u32)> = None;
         let store_ref = &*self.store;
         let stats = match store_ref.for_each_block_index(&mut |h, entry| {
@@ -2625,10 +2643,10 @@ impl ChainState {
             tracing::warn!("recalculate_best_header: no valid block index entry found");
             return;
         };
+        // Both an unguarded overwrite: this is the one path allowed to move
+        // the header tip *down*, and `accept_lock` (held by the caller) keeps
+        // a `headers` batch from landing between the scan and here.
         *self.best_header.write() = (best.0, best.1);
-        // A header batch racing in here can only raise this again (it holds no
-        // lock this path can take), and raising it is what a genuinely
-        // higher-work header should do.
         self.headers_tip_height.store(best.2, Ordering::Relaxed);
         tracing::debug!(
             "recalculate_best_header: header tip is now {} at height {}",
