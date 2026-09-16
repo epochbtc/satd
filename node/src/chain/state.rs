@@ -7779,6 +7779,26 @@ impl ChainState {
                 stack.extend(cs.iter().copied());
             }
         }
+        // Core's `ResetBlockFailureFlags` clears the ancestors too, and has to:
+        // the marks an `invalidateblock` leaves run from the block it named
+        // down to the leaves, so clearing only `root`'s subtree leaves the path
+        // between the active chain and `root` still invalid. The branch then
+        // cannot reconnect no matter how much work it carries — which is not
+        // what an operator asking to reconsider it means, and leaves the node
+        // reporting a header tip it cannot reach.
+        let mut up = self.store.get_block_index(&root).map(|e| e.header.prev_blockhash);
+        while let Some(h) = up {
+            let Some(mut e) = self.store.get_block_index(&h) else { break };
+            up = (e.height > 0).then_some(e.header.prev_blockhash);
+            if e.status == BlockStatus::Invalid {
+                e.status = if e.num_tx == 0 {
+                    BlockStatus::HeaderOnly
+                } else {
+                    BlockStatus::DataStored
+                };
+                batch.block_index_puts.push((h, e));
+            }
+        }
         if !batch.block_index_puts.is_empty() {
             self.write_chain_batch(batch)?;
         }
@@ -10755,6 +10775,34 @@ pub(crate) mod tests {
     /// on the branch that had just been refused, and `getblockchaininfo`
     /// reported a `headers` figure the node would never reach. It then grew
     /// with every further header on that branch.
+    /// Core's `ResetBlockFailureFlags` clears the failure marks on the
+    /// reconsidered block's *ancestors* as well as its descendants. satd
+    /// cleared only the subtree, so reconsidering the tip of a branch left the
+    /// path back to the fork still invalid: the branch could never reconnect,
+    /// however much work it carried, and the node sat with a header tip it had
+    /// no way to reach. This is `rpc_invalidateblock.py` L62.
+    #[test]
+    fn reconsidering_a_branch_tip_clears_the_marks_below_it_too() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 6);
+
+        // Invalidate low on the chain: 2..6 are all marked.
+        cs.invalidate_block(blocks[1].block_hash()).expect("invalidated");
+        assert_eq!(cs.tip_height(), 1);
+
+        // Reconsider the *tip*, as the Core test does. Clearing only its own
+        // subtree would leave heights 2..5 invalid and the tip unreachable.
+        cs.reconsider_block(blocks[5].block_hash()).expect("reconsidered");
+        assert_eq!(
+            cs.tip_height(),
+            6,
+            "the branch could not reconnect: the marks below the reconsidered block were left in place"
+        );
+        assert_eq!(cs.headers_tip_height(), 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn invalidateblock_takes_the_header_tip_off_the_invalidated_branch() {
         let (cs, dir) = make_chain_state();
