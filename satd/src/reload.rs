@@ -747,6 +747,10 @@ fn field_specs() -> Vec<FieldSpec> {
         // Sizes a ring the peer manager allocates once; a resize would have to
         // decide which of the kept transactions to drop.
         restart!("blockreconstructionextratxn", blockreconstructionextratxn),
+        // Read when a block is first announced; flipping it mid-flight would
+        // announce one block both ways.
+        restart!("cmpctblockprefill", cmpctblockprefill),
+        restart!("cmpctblockprefillbytes", cmpctblockprefillbytes),
         live!("maxuploadtarget", max_upload_target, |c, h| {
             h.peer_manager.set_max_upload_target(c.max_upload_target)
         }),

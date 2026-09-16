@@ -505,6 +505,11 @@ pub struct PeerManager {
     /// uses the same nonce, and `getblocktxn` for it needs no disk read.
     /// Core's `m_most_recent_block` / `m_most_recent_compact_block`.
     most_recent_block: RwLock<Option<RecentBlock>>,
+    /// `-cmpctblockprefill`: announce new blocks with the transactions this
+    /// node lacked prefilled (Core #35558). Set once at startup.
+    compact_prefill: std::sync::atomic::AtomicBool,
+    /// `-cmpctblockprefillbytes`: the prefill's transaction-byte budget.
+    compact_prefill_bytes: std::sync::atomic::AtomicUsize,
     /// The highest block announced before connecting it. Core's
     /// `m_highest_fast_announce`: a block at or below it is not announced
     /// early again.
@@ -789,6 +794,8 @@ impl PeerManager {
             compact_stats: CompactBlockStats::default(),
             hb_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             most_recent_block: RwLock::new(None),
+            compact_prefill: std::sync::atomic::AtomicBool::new(false),
+            compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES),
             highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
@@ -5832,7 +5839,7 @@ impl PeerManager {
             self.cached_compact(&hash).or_else(|| {
                 self.chain_state
                     .get_block(&hash)
-                    .and_then(|block| self.compact_for(&block, entry.height))
+                    .and_then(|block| self.compact_for(&block, entry.height, false))
             })
         } else {
             None
@@ -6559,7 +6566,7 @@ impl PeerManager {
                 let Some(block) = self.chain_state.get_block(hash) else {
                     return false;
                 };
-                match self.compact_for(&block, entry.height) {
+                match self.compact_for(&block, entry.height, false) {
                     Some(c) => c,
                     None => return false,
                 }
@@ -6725,7 +6732,7 @@ impl PeerManager {
             return;
         }
         let hash = block.block_hash();
-        let Some(compact) = self.compact_for(block, height) else {
+        let Some(compact) = self.compact_for(block, height, true) else {
             return;
         };
         let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
@@ -6748,7 +6755,13 @@ impl PeerManager {
         if announced.is_empty() {
             return;
         }
-        tracing::debug!(%hash, height, peers = announced.len(), "announcing block before connecting it");
+        tracing::debug!(
+            %hash,
+            height,
+            peers = announced.len(),
+            prefilled = compact.prefilled_txs.len(),
+            "announcing block before connecting it"
+        );
         self.compact_stats
             .sent_announce
             .fetch_add(announced.len() as u64, Ordering::Relaxed);
@@ -6764,10 +6777,17 @@ impl PeerManager {
     /// block at least as high as the cached one replaces it; an older block
     /// (a `MSG_CMPCT_BLOCK` getdata a few blocks back) is built without
     /// displacing the tip.
+    ///
+    /// With `-cmpctblockprefill`, the transactions this node lacked are
+    /// prefilled. Which those were can only be read off the mempool before
+    /// the block is connected (`before_connect`), since connecting removes
+    /// its transactions; a block first built afterwards is sent plain rather
+    /// than with a guess.
     fn compact_for(
         &self,
         block: &bitcoin::Block,
         height: u32,
+        before_connect: bool,
     ) -> Option<Arc<bitcoin::bip152::HeaderAndShortIds>> {
         let hash = block.block_hash();
         if let Some(recent) = self.most_recent_block.read().as_ref()
@@ -6775,7 +6795,22 @@ impl PeerManager {
         {
             return Some(recent.compact.clone());
         }
-        let compact = match compact::make_compact_block(block) {
+        let prefill = if before_connect && self.compact_prefill.load(Ordering::Relaxed) {
+            let candidates = {
+                let extra = self.extra_txns.lock();
+                compact::prefill_candidates(block, &self.mempool, &extra)
+            };
+            match candidates {
+                Some(c) => compact::prefill_indexes(block, &c, self.compact_prefill_bytes.load(Ordering::Relaxed)),
+                None => {
+                    tracing::debug!(%hash, "mempool busy; announcing without a prefill");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let compact = match compact::make_prefilled_compact_block(block, rand::random(), &prefill) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "could not build a compact block");
@@ -6875,6 +6910,13 @@ impl PeerManager {
     /// Compact block relay counters, for the metrics endpoint.
     pub fn compact_block_stats(&self) -> &CompactBlockStats {
         &self.compact_stats
+    }
+
+    /// `-cmpctblockprefill` and `-cmpctblockprefillbytes`. Call once at
+    /// startup, before blocks are announced.
+    pub fn set_compact_block_prefill(&self, enabled: bool, budget_bytes: usize) {
+        self.compact_prefill.store(enabled, Ordering::Relaxed);
+        self.compact_prefill_bytes.store(budget_bytes, Ordering::Relaxed);
     }
 
     /// Size the extra-transaction ring (`-blockreconstructionextratxn`).

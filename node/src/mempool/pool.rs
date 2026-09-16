@@ -2100,6 +2100,12 @@ impl Mempool {
         f(&self.inner.read().entries)
     }
 
+    /// [`Self::with_entries`] without waiting: `None` when a writer holds the
+    /// pool, for a caller that would rather skip the work than stall.
+    pub fn try_with_entries<R>(&self, f: impl FnOnce(&FxHashMap<Txid, MempoolEntry>) -> R) -> Option<R> {
+        self.inner.try_read().map(|inner| f(&inner.entries))
+    }
+
     /// Every txid currently in the mempool, regardless of quarantine
     /// scope. Template assembly uses this to distinguish "input is a
     /// confirmed coin" from "input depends on another mempool
