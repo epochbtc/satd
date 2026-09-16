@@ -1757,13 +1757,70 @@ mod version_check_tests {
         minors_behind(2).unwrap_or_else(|| format!("{}.9.0", sdk().major - 1))
     }
 
-    /// Captures `tracing` output for the duration of a test.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<Mutex<Vec<u8>>>);
+    thread_local! {
+        /// Where the test subscriber writes this thread's events.
+        static THREAD_LOGS: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl std::io::Write for Logs {
+    struct ThreadLogs;
+
+    thread_local! {
+        /// Set by a test that wants every event checked against its client's
+        /// compat lock. Per-thread, so it describes only the test that armed
+        /// it even while other tests are logging on their own threads.
+        static PROBE_COMPAT: std::cell::RefCell<Option<Arc<Mutex<CompatState>>>> =
+            const { std::cell::RefCell::new(None) };
+        /// One entry per event seen while the probe is armed: was the compat
+        /// lock free when it was logged?
+        static PROBE_FREE: std::cell::RefCell<Vec<bool>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records, for each event on an arming thread, whether the client's
+    /// compat lock was free. Part of the one global subscriber rather than a
+    /// scoped one for the reason given on [`Logs`].
+    struct ProbeLock;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLock {
+        fn on_event(
+            &self,
+            _: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            PROBE_COMPAT.with(|p| {
+                if let Some(compat) = p.borrow().as_ref() {
+                    let free = compat.try_lock().is_ok();
+                    PROBE_FREE.with(|f| f.borrow_mut().push(free));
+                }
+            });
+        }
+    }
+
+    /// Arms [`ProbeLock`] for this thread and disarms it on drop.
+    struct Probe;
+
+    impl Probe {
+        fn arm(compat: Arc<Mutex<CompatState>>) -> Self {
+            PROBE_FREE.with(|f| f.borrow_mut().clear());
+            PROBE_COMPAT.with(|p| *p.borrow_mut() = Some(compat));
+            Probe
+        }
+
+        fn seen(&self) -> Vec<bool> {
+            PROBE_FREE.with(|f| f.borrow().clone())
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            PROBE_COMPAT.with(|p| *p.borrow_mut() = None);
+        }
+    }
+
+    impl std::io::Write for ThreadLogs {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            THREAD_LOGS.with(|l| l.borrow_mut().extend_from_slice(buf));
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1771,30 +1828,57 @@ mod version_check_tests {
         }
     }
 
+    /// Captures `tracing` output for the duration of a test.
+    ///
+    /// One process-wide subscriber, installed once, writing into a per-thread
+    /// buffer -- deliberately not a scoped `set_default` per test. Whether a
+    /// `warn!` is evaluated at all is decided by tracing's process-wide
+    /// callsite interest and max-level hint, both of which a scoped
+    /// subscriber on *any* thread moves. Two of these tests running at once
+    /// could therefore leave one with an empty capture, which is how
+    /// `allow_old_node_downgrades_the_refusal_to_a_warning` failed in CI
+    /// asserting one warning against none. libtest gives each test its own
+    /// thread, so a per-thread buffer keeps them apart without a lock.
+    struct Logs;
+
     impl Logs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-            let logs = Logs::default();
-            let writer = logs.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+        fn capture() -> Self {
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(|| {
+                use tracing_subscriber::layer::SubscriberExt as _;
+                use tracing_subscriber::util::SubscriberInitExt as _;
+                let _ = tracing_subscriber::registry()
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(|| ThreadLogs),
+                    )
+                    .with(ProbeLock)
+                    .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                    .try_init();
+            });
+            THREAD_LOGS.with(|l| l.borrow_mut().clear());
+            Logs
+        }
+
+        fn lines(&self) -> Vec<String> {
+            THREAD_LOGS.with(|l| {
+                String::from_utf8(l.borrow().clone())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            })
         }
 
         fn warnings(&self) -> Vec<String> {
-            String::from_utf8(self.0.lock().unwrap().clone())
-                .unwrap()
-                .lines()
-                .filter(|l| l.contains("WARN"))
-                .map(str::to_owned)
-                .collect()
+            self.lines().into_iter().filter(|l| l.contains("WARN")).collect()
         }
     }
 
     #[tokio::test]
     async fn same_version_node_opens_silently() {
-        let (logs, _guard) = Logs::capture();
+        let logs = Logs::capture();
         let fake = FakeNode::new(Some(SDK_VERSION));
         let mut client = client_for(&fake).await;
         client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
@@ -1804,7 +1888,7 @@ mod version_check_tests {
 
     #[tokio::test]
     async fn newer_node_opens_silently() {
-        let (logs, _guard) = Logs::capture();
+        let logs = Logs::capture();
         let sdk = sdk();
         let fake = FakeNode::new(Some(&format!("{}.{}.0", sdk.major, sdk.minor + 3)));
         let mut client = client_for(&fake).await;
@@ -1846,7 +1930,7 @@ mod version_check_tests {
 
     #[tokio::test]
     async fn allow_old_node_downgrades_the_refusal_to_a_warning() {
-        let (logs, _guard) = Logs::capture();
+        let logs = Logs::capture();
         let fake = FakeNode::new(Some(&too_old()));
         let mut client = StreamClient::builder(serve(fake.clone()).await)
             .allow_old_node()
@@ -1895,7 +1979,7 @@ mod version_check_tests {
 
     #[tokio::test]
     async fn one_behind_warns_once_per_node_version() {
-        let (logs, _guard) = Logs::capture();
+        let logs = Logs::capture();
         // At a `.0` minor there is no one-behind in the same major; the
         // downgraded refusal logs the same warning.
         let (behind, allow) = match minors_behind(1) {
@@ -1931,24 +2015,7 @@ mod version_check_tests {
     /// otherwise deadlock, and a slow one would stall every stream open.
     #[tokio::test]
     async fn warning_is_logged_without_holding_the_compat_lock() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        /// Records, for each event, whether the client's compat lock was free.
-        struct ProbeLock {
-            compat: Arc<Mutex<CompatState>>,
-            free: Arc<Mutex<Vec<bool>>>,
-        }
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLock {
-            fn on_event(
-                &self,
-                _: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let free = self.compat.try_lock().is_ok();
-                self.free.lock().unwrap().push(free);
-            }
-        }
-
+        let _logs = Logs::capture();
         let (behind, allow) = match minors_behind(1) {
             Some(v) => (v, false),
             None => (too_old(), true),
@@ -1960,13 +2027,9 @@ mod version_check_tests {
         }
         let mut client = builder.connect().await.unwrap();
 
-        let free = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry()
-            .with(ProbeLock { compat: client.compat.clone(), free: free.clone() });
-        let _guard = tracing::subscriber::set_default(subscriber);
-
+        let probe = Probe::arm(client.compat.clone());
         client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
-        let seen = free.lock().unwrap().clone();
+        let seen = probe.seen();
         assert!(!seen.is_empty(), "the warning was not logged");
         assert!(seen.iter().all(|f| *f), "an event was logged under the compat lock: {seen:?}");
     }
