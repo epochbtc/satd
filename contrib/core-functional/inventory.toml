@@ -39,7 +39,7 @@ note = "measured 2026-09-15: L41 assert_debug_log 'Using /16 prefix for IP bucke
 file = "feature_assumeutxo.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L80 node1 is started with -prune=1, which satd refuses (no manual pruning mode). Behind that: rollback snapshots and the background-validation states. Follow-up: -prune=1, then rollback snapshots"
+note = "measured 2026-09-16 with -prune=1 implemented: gets past startup and now fails at L221, where loadtxoutset on a snapshot with less work must raise -32603; satd raises -22 for an unrecognised anchor. Follow-up: rollback snapshots and the background-validation states"
 
 [[test]]
 file = "feature_assumevalid.py"
@@ -183,7 +183,7 @@ note = "measured 2026-09-15: L39 subversion does not end with 'main; relative)/'
 file = "feature_index_prune.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L42 node0 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: prune-locked indexes and coinstatsindex. Follow-up: -prune=1, then prune locks"
+note = "measured 2026-09-16 with -prune=1 and -fastprune implemented: gets past startup and now fails at L61, where getindexinfo must report each index's best_block_height as it syncs. Follow-up: prune-locked indexes and coinstatsindex"
 
 [[test]]
 file = "feature_init.py"
@@ -286,8 +286,8 @@ note = "measured: asserts blocks/blk00001.dat exists after mining, then makes it
 [[test]]
 file = "feature_remove_pruned_files_on_startup.py"
 status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: startup refuses -prune=1 (no manual pruning mode). Behind it the test counts Core's blk*.dat/rev*.dat files. Follow-up: -prune=1, then a core-internal reclassification"
+reason = "core-internal"
+note = "measured 2026-09-16 with -prune=1 and -fastprune implemented: gets past startup and now fails at L32 opening blocks/rev00001.dat. satd keeps undo data in RocksDB and writes no rev*.dat, so this row cannot pass (CORE_DIFFERENCES.md)"
 
 [[test]]
 file = "feature_segwit.py"
@@ -512,7 +512,7 @@ note = "measured 2026-09-15: startup refuses -limitclustersize (Core v31 cluster
 file = "mining_basic.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: node2 is started with -prune=1, which satd refuses (no manual pruning mode). Follow-up: -prune=1, then re-measure"
+note = "measured 2026-09-16 with -prune=1 implemented: gets past startup and now fails at L86, where getblocktemplate's version must signal the TESTDUMMY deployment bit (expected 805306368, satd returns 536870912). Follow-up: versionbits signalling in the template"
 
 [[test]]
 file = "mining_getblocktemplate_longpoll.py"
@@ -849,7 +849,7 @@ status = "run"
 file = "rpc_blockchain.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L118 restart with -prune=1, which satd refuses (no manual pruning mode). Follow-up: -prune=1, then re-measure the remaining sub-tests"
+note = "measured 2026-09-16 with -prune=1 implemented: _test_prune_disk_space passes, and it now fails at L125, where a datadir holding a block from the future must refuse to start with Core's message. Follow-up: the future-block startup check"
 
 [[test]]
 file = "rpc_createmultisig.py"
@@ -895,7 +895,7 @@ note = "measured 2026-09-15: L46 getblockfilter answers -5 'filter not found for
 file = "rpc_getblockfrompeer.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L35 node2 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: getchaintips fork tips and prune heights. Follow-up: -prune=1"
+note = "measured 2026-09-16 with -prune=1 implemented: gets past startup and now fails at L92, where a block fetched with getblockfrompeer must arrive within a second. Follow-up: getblockfrompeer delivery"
 
 [[test]]
 file = "rpc_getblockstats.py"
@@ -979,7 +979,7 @@ reason = "no-wallet"
 file = "rpc_rawtransaction.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L81 node2 is started with -prune=1, which satd refuses (no manual pruning mode). Behind it: txindex over a cached datadir. Follow-up: -prune=1"
+note = "measured 2026-09-16 with -prune=1 implemented: gets past startup and now fails at L255, where createrawtransaction with no arguments must raise -1 with the help text; satd raises -3. Follow-up: the no-argument help error"
 
 [[test]]
 file = "rpc_scanblocks.py"

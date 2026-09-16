@@ -908,8 +908,15 @@ pub struct Config {
     /// hard-fails on the conflict.
     pub peerblockfilters: bool,
     pub prune: u64,
+    /// Core's `-prune=1`: manual pruning. Nothing is deleted until
+    /// `pruneblockchain` asks for it, and `getblockchaininfo` reports the node
+    /// as pruned with `automatic_pruning` false.
+    pub prune_manual: bool,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    /// Core's `-fastprune`: a 64 KiB block-file size, so pruning a short
+    /// test chain actually deletes something.
+    pub fastprune: bool,
     pub check_block_index: bool,
     /// Bitcoin Core's `-blocksxor` (v28+): whether blocks-dir `*.dat`
     /// payloads are XOR-obfuscated with the 8-byte key in `blocks/xor.dat`.
@@ -3625,22 +3632,19 @@ impl Config {
             .or_else(|| file_get("prune").and_then(|v| v.parse().ok()))
             .or(profile_defaults.prune)
             .unwrap_or(0); // 0 = no pruning
-        // Core reserves `-prune=1` for *manual* pruning: `blockmanager_args.cpp`
-        // maps it to `PRUNE_TARGET_MANUAL` rather than a 1 MiB budget, and the
-        // node then prunes only when `pruneblockchain` is called.
-        //
-        // satd has no `pruneblockchain` RPC, so it cannot honour that. Taken as
-        // a budget instead, `-prune=1` lands on the 288-block floor and deletes
-        // block data automatically -- the opposite of what the operator asked
-        // for, silently. Refuse it by name.
-        if prune == 1 {
-            return Err(
-                "-prune=1 is Bitcoin Core's spelling for manual pruning, which satd does not \
-                 implement (there is no pruneblockchain RPC). Use -prune=<target in MiB> for \
-                 automatic pruning, or -prune=0 to keep every block."
-                    .to_string(),
-            );
-        }
+        // Core reserves `-prune=1` for *manual* pruning (`blockmanager_args.cpp`
+        // maps it to `PRUNE_TARGET_MANUAL`, not a 1 MiB budget): nothing is
+        // deleted until `pruneblockchain` asks. Taken as a budget it would land
+        // on the 288-block floor and delete block data automatically, the
+        // opposite of what was asked, so it sets the manual mode instead.
+        let prune_manual = prune == 1;
+        let prune = if prune_manual { 0 } else { prune };
+        // Core's `fPruneMode`: both spellings are prune mode, and every rule
+        // that turns on prune mode -- the txindex conflict, `loadtxoutset`,
+        // the surfaces that need txindex -- applies to both. The budget is 0
+        // in manual mode, so `prune > 0` is not that question; this is.
+        let pruning = prune > 0 || prune_manual;
+        let prune_display = if prune_manual { "1".to_string() } else { prune.to_string() };
 
         // AssumeUTXO --fast-start source resolution + validation.
         //   - Remote sources MUST be https:// (TLS, validated certs).
@@ -3670,6 +3674,10 @@ impl Config {
                     ));
                 }
             }
+            // `prune > 0`, not `pruning`: manual mode has deleted nothing
+            // until `pruneblockchain` is called, and Core loads a snapshot on
+            // a pruned node happily. Only the automatic pruner, which starts
+            // deleting behind the load, is refused.
             if prune > 0 {
                 return Err(format!(
                     "--fast-start is incompatible with --prune={prune} (loadtxoutset cannot run \
@@ -3727,11 +3735,11 @@ impl Config {
             }
         }
         let mut esplora_resolved = esplora;
-        if esplora_resolved && prune > 0 {
+        if esplora_resolved && pruning {
             pending_notes.push(ConfigNote {
                 level: NoteLevel::Warn,
                 message: format!(
-                    "esplora requires --txindex, which is incompatible with --prune={prune}; \
+                    "esplora requires --txindex, which is incompatible with --prune={prune_display}; \
                      disabling esplora. Set --esplora=0 explicitly to silence this warning."
                 ),
             });
@@ -3756,11 +3764,11 @@ impl Config {
         // get_merkle endpoints need txindex; scripthash.* needs
         // addressindex.
         let mut electrum_resolved = electrum;
-        if electrum_resolved && prune > 0 {
+        if electrum_resolved && pruning {
             pending_notes.push(ConfigNote {
                 level: NoteLevel::Warn,
                 message: format!(
-                    "electrum requires --txindex, which is incompatible with --prune={prune}; \
+                    "electrum requires --txindex, which is incompatible with --prune={prune_display}; \
                      disabling electrum. Set --electrum=0 explicitly to silence this warning."
                 ),
             });
@@ -3823,7 +3831,7 @@ impl Config {
         // Validate prune + txindex conflict (now redundant with the
         // esplora reconciliation above for the esplora=1 path, but
         // still catches the operator who explicitly enables both).
-        if prune > 0 && txindex {
+        if pruning && txindex {
             return Err("prune mode is incompatible with -txindex".to_string());
         }
 
@@ -4009,6 +4017,7 @@ impl Config {
             txospenderindex,
             peerblockfilters,
             prune,
+            prune_manual,
             reindex: cli.reindex.unwrap_or(false),
             reindex_chainstate: cli.reindex_chainstate.unwrap_or(false),
             // Three-state on purpose: unset ≠ 0. Unset honors an existing
@@ -4018,6 +4027,10 @@ impl Config {
             blocksxor: cli
                 .blocksxor
                 .or_else(|| file_get("blocksxor").and_then(|v| parse_bool(&v))),
+            fastprune: cli
+                .fastprune
+                .or_else(|| file_get("fastprune").and_then(|v| parse_bool(&v)))
+                .unwrap_or(false),
             // Default on for regtest (matches Core's -checkblockindex), off
             // elsewhere — on a mainnet index the walk is ~1M point lookups.
             check_block_index: cli
@@ -4532,6 +4545,7 @@ impl Config {
             "network": self.network.to_string(),
             "datadir": self.datadir.display().to_string(),
             "prune": self.prune,
+            "prune_manual": self.prune_manual,
             "dbcache": self.dbcache,
             "blocksdir": self.blocksdir.as_ref().map(|p| p.display().to_string()),
             "signet_seed_nodes": self.signet_seed_nodes,
@@ -5797,6 +5811,16 @@ pub struct CliArgs {
                 blocksxor=0 refuses a dir with a nonzero stored key"
     )]
     pub blocksxor: Option<bool>,
+
+    #[arg(
+        long = "fastprune",
+        value_name = "BOOL",
+        value_parser = parse_bool_arg,
+        num_args = 0..=1,
+        default_missing_value = "1",
+        help = "Roll block files every 64 KiB instead of 128 MiB, so a prune on a short chain has whole files to delete (testing)"
+    )]
+    pub fastprune: Option<bool>,
 
     #[arg(
         long = "checkblockindex",
@@ -7331,6 +7355,7 @@ const NEGATABLE_BOOL_FLAGS: &[&str] = &[
     "reindex",
     "reindex-chainstate",
     "checkblockindex",
+    "fastprune",
     "mcp",
     "mcpmtls",
     "mcpauth",
@@ -7491,6 +7516,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "reindex",
         "reindex-chainstate",
         "checkblockindex",
+        "fastprune",
         "maxconnections",
         "maxinboundperip",
         "blockreconstructionextratxn",
@@ -8260,6 +8286,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "reindex",
     "reindexchainstate",
     "checkblockindex",
+    "fastprune",
     "blocksxor",
     "dbcache",
     "storageprofile",
@@ -10702,6 +10729,7 @@ testactivationheight=bip34@2
             reindex_chainstate: Some(false),
             blocksxor: None,
             checkblockindex: None,
+            fastprune: None,
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,
@@ -11013,6 +11041,7 @@ testactivationheight=bip34@2
             reindex_chainstate: Some(false),
             blocksxor: None,
             checkblockindex: None,
+            fastprune: None,
             maxconnections: None,
             maxinboundperip: None,
             blockreconstructionextratxn: None,
@@ -12918,21 +12947,24 @@ rpcport=39999
     /// maps it to `PRUNE_TARGET_MANUAL`, not a 1 MiB budget, and the node then
     /// prunes only when `pruneblockchain` is called.
     ///
-    /// satd has no `pruneblockchain` RPC. Read as a budget, `-prune=1` landed
-    /// on the 288-block floor and deleted block data automatically -- the
-    /// opposite of what the operator asked for, silently.
+    /// Read as a budget, `-prune=1` lands on the 288-block floor and deletes
+    /// block data automatically -- the opposite of what the operator asked
+    /// for, silently. It must set the manual mode and leave the budget at 0.
     #[test]
-    fn prune_one_is_refused_rather_than_misread() {
+    fn prune_one_is_manual_pruning_not_a_one_mib_budget() {
         let tmpdir = tempfile::tempdir().unwrap();
         let dd = tmpdir.path().to_str().unwrap();
-        let err = parse_negation(&["satd", "--regtest", "--datadir", dd, "--prune=1"])
-            .expect_err("-prune=1 must not start a node");
-        assert!(err.contains("manual pruning"), "{err}");
+        let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, "--prune=1"])
+            .expect("-prune=1 starts a node in manual prune mode");
+        assert!(cfg.prune_manual, "-prune=1 is manual pruning");
+        assert_eq!(cfg.prune, 0, "manual pruning has no budget to prune to");
 
-        // A real budget still starts, and 0 still means "keep everything".
-        for arg in ["--prune=550", "--prune=0"] {
-            parse_negation(&["satd", "--regtest", "--datadir", dd, arg])
+        // A real budget is automatic, and 0 keeps everything.
+        for (arg, want_mb) in [("--prune=550", 550), ("--prune=0", 0)] {
+            let cfg = parse_negation(&["satd", "--regtest", "--datadir", dd, arg])
                 .unwrap_or_else(|e| panic!("{arg} must start: {e}"));
+            assert!(!cfg.prune_manual, "{arg} is not manual");
+            assert_eq!(cfg.prune, want_mb, "{arg}");
         }
     }
 

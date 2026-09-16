@@ -6,12 +6,20 @@ use serde_json::json;
 pub fn get_node_status(ctx: &McpContext) -> String {
     // Same sources the JSON-RPC surface reads, so the MCP view cannot report
     // a different `pruned` or a different relay floor than `getnetworkinfo`.
-    let prune_target_mb = ctx
+    let prune = if ctx
         .effective_config
-        .get("prune")
-        .and_then(|v| v.as_u64())
-        .filter(|mb| *mb > 0);
-    let chain_info = blockchain::get_blockchain_info(&ctx.chain_state, prune_target_mb);
+        .get("prune_manual")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        blockchain::PruneMode::Manual
+    } else {
+        match ctx.effective_config.get("prune").and_then(|v| v.as_u64()) {
+            Some(mb) if mb > 0 => blockchain::PruneMode::Automatic(mb),
+            _ => blockchain::PruneMode::Off,
+        }
+    };
+    let chain_info = blockchain::get_blockchain_info(&ctx.chain_state, prune);
     let mempool_info = rawtx::get_mempool_info(&ctx.mempool);
     let pool_info = ctx.mempool.info();
     let net_info = network::get_network_info(

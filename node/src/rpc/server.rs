@@ -83,6 +83,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     ("listquarantine", "Blockchain"),
     ("loadtxoutset", "Blockchain"),
     ("preciousblock", "Blockchain"),
+    ("pruneblockchain", "Blockchain"),
     ("reconsiderblock", "Blockchain"),
     ("savemempool", "Blockchain"),
     ("scantxoutset", "Blockchain"),
@@ -556,13 +557,21 @@ fn net_datadir_from(ctx: &RpcContext) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The configured `-prune` target in MiB, or `None` when the node is not
-/// pruning. Read by `getblockchaininfo`.
-fn prune_target_mb_from(ctx: &RpcContext) -> Option<u64> {
-    ctx.effective_config
-        .get("prune")
-        .and_then(|v| v.as_u64())
-        .filter(|mb| *mb > 0)
+/// How the node prunes, from the effective config. Read by
+/// `getblockchaininfo` and `pruneblockchain`.
+fn prune_mode_from(ctx: &RpcContext) -> blockchain::PruneMode {
+    if ctx
+        .effective_config
+        .get("prune_manual")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return blockchain::PruneMode::Manual;
+    }
+    match ctx.effective_config.get("prune").and_then(|v| v.as_u64()) {
+        Some(mb) if mb > 0 => blockchain::PruneMode::Automatic(mb),
+        _ => blockchain::PruneMode::Off,
+    }
 }
 
 pub struct RpcContext {
@@ -864,7 +873,7 @@ pub async fn start(
     module.register_method("getblockchaininfo", |_params, ctx, _extensions| {
         Ok::<_, ErrorObjectOwned>(blockchain::get_blockchain_info(
             &ctx.chain_state,
-            prune_target_mb_from(ctx),
+            prune_mode_from(ctx),
         ))
     })?;
 
@@ -1152,6 +1161,18 @@ pub async fn start(
         let hash: String = args.required("blockhash")?;
         args.check()?;
         blockchain::precious_block(&hash).map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
+    })?;
+
+    module.register_method("pruneblockchain", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        // Core takes a signed height so it can name the two out-of-range
+        // cases apart: a negative height is "Negative block height", while a
+        // value past the tip is "Blockchain is shorter...". Reading it as
+        // unsigned would collapse both into a parse error.
+        let height: i64 = args.required("height")?;
+        args.check()?;
+        blockchain::prune_blockchain(&ctx.chain_state, prune_mode_from(ctx), height)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("invalidateblock", |params, ctx, _extensions| {

@@ -2231,6 +2231,108 @@ fn test_block_sync_between_nodes() {
     node_a.stop();
 }
 
+/// Core's `-prune=1` is *manual* pruning: prune mode is on, the node deletes
+/// nothing on its own, and `pruneblockchain` is the only thing that ever
+/// does. satd refused the flag at startup for want of that RPC, which turned
+/// away every operator who wanted to choose their own prune points -- and
+/// eight Core functional tests that set it.
+#[test]
+fn manual_pruning_deletes_only_what_pruneblockchain_asks_for() {
+    use serde_json::json;
+    let node = TestNode::start(&["--fastprune=1", "--prune=1"]);
+    let addr = DeterministicWallet::from_secret([0x6d; 32]).address.to_string();
+
+    // Prune mode is on, and it is the manual kind: no budget, so no
+    // `prune_target_size` for an operator to size a disk against.
+    let info = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(info["pruned"], true, "{info}");
+    assert_eq!(info["automatic_pruning"], false, "{info}");
+    assert!(info.get("prune_target_size").is_none(), "{info}");
+    assert_eq!(info["pruneheight"], 0, "nothing is deleted yet: {info}");
+
+    // Regtest's `PruneAfterHeight` is 1000, so a short chain is refused
+    // before any height argument is judged.
+    let short = node
+        .rpc_call_with_params("pruneblockchain", vec![json!(100)])
+        .unwrap();
+    assert_eq!(short["error"]["code"].as_i64(), Some(-1), "{short}");
+    assert_eq!(
+        short["error"]["message"], "Blockchain is too short for pruning.",
+        "{short}"
+    );
+
+    let negative = node
+        .rpc_call_with_params("pruneblockchain", vec![json!(-1)])
+        .unwrap();
+    assert_eq!(negative["error"]["code"].as_i64(), Some(-8), "{negative}");
+    assert_eq!(negative["error"]["message"], "Negative block height.", "{negative}");
+
+    // In batches: one `generatetoaddress` for a thousand blocks outruns the
+    // test client's request timeout.
+    for _ in 0..10 {
+        node.rpc_ok("generatetoaddress", vec![json!(100), json!(addr.clone())]);
+    }
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(addr)]);
+    assert_eq!(node.rpc_ok("getblockcount", vec![]), 1001);
+
+    // The whole point of manual mode: a thousand blocks in, with the file
+    // size down at 64 KiB so there is plenty to delete, the node has still
+    // deleted nothing.
+    let info = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(
+        info["pruneheight"], 0,
+        "manual pruning must not prune on its own: {info}"
+    );
+
+    // Past the tip is Core's other message, not the "too short" one.
+    let past = node
+        .rpc_call_with_params("pruneblockchain", vec![json!(2000)])
+        .unwrap();
+    assert_eq!(past["error"]["code"].as_i64(), Some(-8), "{past}");
+    assert_eq!(
+        past["error"]["message"], "Blockchain is shorter than the attempted prune height.",
+        "{past}"
+    );
+
+    // And now a prune that actually deletes.
+    let last_pruned = node.rpc_ok("pruneblockchain", vec![json!(500)]);
+    let last_pruned = last_pruned.as_i64().expect("a height");
+    assert!(last_pruned > 0, "the prune deleted nothing: {last_pruned}");
+    assert!(last_pruned <= 500, "it pruned past what was asked: {last_pruned}");
+    let info = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(
+        info["pruneheight"].as_i64(),
+        Some(last_pruned + 1),
+        "`pruneheight` is the first block still here, one above the last pruned: {info}"
+    );
+
+    // Core clamps a request into the 288-block tail rather than refusing it:
+    // the operator gets the deepest prune allowed.
+    let clamped = node.rpc_ok("pruneblockchain", vec![json!(1001)]);
+    assert!(
+        clamped.as_i64().unwrap() <= 1001 - 288,
+        "a prune into the tail must be clamped to it: {clamped}"
+    );
+}
+
+/// Without `-prune`, `pruneblockchain` is not a thing the node can do, and
+/// says so in Core's words rather than silently succeeding.
+#[test]
+fn pruneblockchain_refuses_a_node_that_is_not_pruning() {
+    use serde_json::json;
+    let node = TestNode::start(&[]);
+    let resp = node
+        .rpc_call_with_params("pruneblockchain", vec![json!(100)])
+        .unwrap();
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-1), "{resp}");
+    assert_eq!(
+        resp["error"]["message"], "Cannot prune blocks because node is not in prune mode.",
+        "{resp}"
+    );
+    let info = node.rpc_ok("getblockchaininfo", vec![]);
+    assert_eq!(info["pruned"], false, "{info}");
+}
+
 #[test]
 fn test_rpc_submitted_tx_relays_to_peer() {
     // Regression: a transaction submitted via `sendrawtransaction` must be

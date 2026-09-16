@@ -665,7 +665,7 @@ async fn main() {
         Some(true) => node::storage::flatfile::XorMode::Enabled,
         Some(false) => node::storage::flatfile::XorMode::Disabled,
     };
-    let flat_files = match FlatFileManager::with_xor_mode(&blocks_dir, xor_mode) {
+    let mut flat_files = match FlatFileManager::with_xor_mode(&blocks_dir, xor_mode) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error initializing block storage: {}", e);
@@ -673,6 +673,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    flat_files.set_fast_prune(config.fastprune);
 
     // -reindex used to eagerly slurp every block into a `Vec` here so the
     // FlatFileManager could be moved into ChainState; on a fully-synced
@@ -1882,6 +1883,7 @@ async fn main() {
     // `config.timeout` is already normalised to milliseconds.
     peer_manager.set_connect_timeout_ms(config.timeout);
     peer_manager.set_peer_connect_timeout_secs(config.peertimeout as u64);
+    peer_manager.set_prune_manual(config.prune_manual);
     // Per-connection SOCKS credential randomization (Tor stream isolation).
     peer_manager.set_proxy_randomize(config.proxyrandomize);
     peer_manager.set_dns_enabled(config.dns);
@@ -2059,8 +2061,14 @@ async fn main() {
         });
     }
 
-    if config.prune > 0 {
-        tracing::info!(target_mb = config.prune, "Block pruning enabled");
+    if config.prune > 0 || config.prune_manual {
+        if config.prune_manual {
+            // Core's `-prune=1`: prune mode is on and nothing is deleted
+            // until `pruneblockchain` asks.
+            tracing::info!("Block pruning enabled (manual)");
+        } else {
+            tracing::info!(target_mb = config.prune, "Block pruning enabled");
+        }
         // A datadir pruned before satd kept a floor has no `pruneheight`
         // record; establish one from the block index so the RPC does not
         // answer `0` for a node that has deleted blocks.
