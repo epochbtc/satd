@@ -2656,10 +2656,15 @@ impl PeerManager {
             return None;
         }
         let min_relay = self.mempool.min_fee_rate();
+        // Core's `currentFilter = m_mempool.GetMinFee()`: a full pool that has
+        // evicted its way to a higher floor tells its peers so, instead of
+        // inviting transactions it is about to reject. The static relay floor
+        // is applied below, after rounding, exactly as Core clamps
+        // `filterToSend`.
         let current = if self.chain_state.is_initial_block_download() {
             MAX_MONEY_SATS
         } else {
-            min_relay
+            self.mempool.min_fee()
         };
         let rounded = fee_filter_round(
             current,
@@ -2689,7 +2694,7 @@ impl PeerManager {
             } else if sent == max_filter {
                 true
             } else {
-                let current = self.mempool.min_fee_rate();
+                let current = self.mempool.min_fee().max(self.mempool.min_fee_rate());
                 current * 4 < sent * 3 || current * 3 > sent * 4
             };
             if !stale {
@@ -10611,6 +10616,43 @@ mod tests {
     }
 
     /// A BIP35 mempool response honors the requesting peer's fee filter.
+    /// Core's `MaybeSendFeefilter` advertises `m_mempool.GetMinFee()`, not the
+    /// static relay floor. A pool that has evicted its way to a higher minimum
+    /// has to say so, or peers keep offering transactions it is about to
+    /// refuse — and the periodic send is also the call that keeps the rolling
+    /// minimum's decay clock moving on a node nobody submits to.
+    #[test]
+    fn the_fee_filter_advertises_the_rolling_minimum() {
+        let (pm, _dir) = mk_test_pm();
+        let addr: SocketAddr = "10.0.0.9:8333".parse().unwrap();
+        let (h, _rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
+        pm.peers.write().insert(1, h);
+
+        // Leave IBD: the tip has to be recent, or every filter is the maximum
+        // and the mempool's minimum never reaches this code.
+        let tip = pm.chain_state.tip_hash();
+        let block = crate::chain::state::tests::build_test_block(
+            tip,
+            1,
+            crate::time::now_secs() as u32,
+        );
+        pm.chain_state.accept_block(&block).expect("block connects");
+        assert!(
+            !pm.chain_state.is_initial_block_download(),
+            "in IBD every filter is the maximum and this proves nothing"
+        );
+
+        let idle = pm.fee_filter_for(1).expect("a tx-relay peer is sent a filter");
+
+        // An eviction raises the rolling minimum well past the static floor.
+        pm.mempool.raise_rolling_min_for_test(200_000);
+        let raised = pm.fee_filter_for(1).expect("a tx-relay peer is sent a filter");
+        assert!(
+            raised > idle,
+            "the filter ignored the rolling minimum ({idle} -> {raised})"
+        );
+    }
+
     #[test]
     fn bip35_mempool_respects_fee_filter() {
         use bitcoin::hashes::Hash;
