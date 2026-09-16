@@ -518,7 +518,7 @@ async fn refresh_loop(
             _ = shutdown.changed() => return,
             event = next_event(&mut events) => {
                 if event.is_none() {
-                    // The sender is gone; fall back to polling the tip.
+                    // The sender is gone; the tip poll below carries on alone.
                     events = None;
                     continue;
                 }
@@ -527,10 +527,15 @@ async fn refresh_loop(
                 if let Some(rx) = events.as_mut() {
                     while rx.try_recv().is_ok() {}
                 }
+                polled_tip = shared.chain.tip_snapshot();
                 refresh.reset();
             }
             _ = refresh.tick() => {}
-            _ = poll.tick(), if events.is_none() => {
+            // Polled even while events flow: the download scheduler connects
+            // blocks without emitting chain events, so a node that catches up
+            // that way would otherwise hand out work on an old tip until the
+            // next refresh.
+            _ = poll.tick() => {
                 let tip = shared.chain.tip_snapshot();
                 if tip == polled_tip {
                     continue;

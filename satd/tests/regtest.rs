@@ -17659,6 +17659,35 @@ fn stratum_v1_mined_share_connects_block() {
     assert_eq!(mempool, json!([]), "the mined transaction left the mempool");
 }
 
+/// Work follows a tip the download scheduler reached. That path connects
+/// blocks without chain events, so a node that caught up through it kept
+/// handing out work on its old tip until the 30-second refresh, and a Job
+/// Declaration client that asked in between was refused.
+#[test]
+fn stratum_work_follows_a_tip_reached_by_block_download() {
+    use serde_json::json;
+    let source = TestNode::start(&[]);
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    source.rpc_ok("generatetoaddress", vec![json!(101), json!(addr)]);
+
+    let port = find_available_port();
+    let node = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        &format!("--connect=127.0.0.1:{}", source.p2p_port.unwrap()),
+    ]);
+    poll_until(
+        || node.rpc_ok("getblockcount", vec![]).as_u64() == Some(101),
+        test_timeout(60),
+        "the node must sync the source's chain",
+    );
+    poll_until(
+        || node.rpc_ok("getstratuminfo", vec![])["current_job"]["height"].as_u64() == Some(102),
+        Duration::from_secs(5),
+        "stratum work must move to the synced tip without waiting for the periodic refresh",
+    );
+}
+
 #[test]
 fn stratum_v1_new_block_pushes_clean_job() {
     use serde_json::json;

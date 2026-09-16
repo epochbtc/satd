@@ -215,7 +215,16 @@ pub struct PeerInfo {
     pub best_height: i32,
     pub user_agent: String,
     pub ban_score: u32,
+    /// The peer announced BIP 152 version 2 (witness) compact block support
+    /// with a `sendcmpct` message.
     pub compact_blocks: bool,
+    /// We sent this peer `sendcmpct(hb=1)`, so it may push us `cmpctblock`s
+    /// we did not ask for (BIP 152 high-bandwidth mode). Core's
+    /// `CNode::m_bip152_highbandwidth_to`.
+    pub hb_to: bool,
+    /// This peer sent us `sendcmpct(hb=1)`: it wants our new blocks as
+    /// `cmpctblock`s. Core's `CNode::m_bip152_highbandwidth_from`.
+    pub hb_from: bool,
     /// Peer requested BIP 130 header announcements via `sendheaders`.
     /// When true, new-tip blocks are announced to this peer with a
     /// `headers` message rather than a legacy `inv`.
@@ -283,6 +292,8 @@ impl PeerInfo {
             user_agent: String::new(),
             ban_score: 0,
             compact_blocks: false,
+            hb_to: false,
+            hb_from: false,
             prefers_headers: false,
             wants_addrv2: false,
             addr_relay_enabled: false,
@@ -462,8 +473,8 @@ impl PeerInfo {
             // does relay addresses, and reporting it as `false` misdescribes
             // every inbound link on the node.
             "addr_relay_enabled": self.addr_relay_enabled,
-            "bip152_hb_from": false,
-            "bip152_hb_to": false,
+            "bip152_hb_from": self.hb_from,
+            "bip152_hb_to": self.hb_to,
             "inv_to_send": 0,
             "last_inv_sequence": 0,
             // Bitcoin Core always emits these two; canonical Core client
