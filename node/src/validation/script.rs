@@ -2,8 +2,49 @@ use bitcoin::{Network, Transaction, TxOut};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptError {
-    #[error("script-verify-failed: {0}")]
-    VerifyFailed(String),
+    /// Verification failed on one input.
+    ///
+    /// The index is carried apart from the reason because Bitcoin Core
+    /// reports the two separately: `reason` is the script error on its own
+    /// ("Non-canonical DER signature"), which goes inside the reject reason,
+    /// while the input it failed on names the transaction's place in Core's
+    /// debug string (`input %i of %s (wtxid %s), spending %s:%i`). Folding
+    /// the index into the reason string, as this used to, put satd's wording
+    /// where Core puts the bare script error.
+    #[error("script-verify-failed: input {input}: {reason}")]
+    VerifyFailed { input: usize, reason: String },
+}
+
+impl ScriptError {
+    /// The script error alone, as Core's `ScriptErrorString` renders it.
+    pub fn reason(&self) -> &str {
+        match self {
+            ScriptError::VerifyFailed { reason, .. } => reason,
+        }
+    }
+
+    /// Which input failed.
+    pub fn input(&self) -> usize {
+        match self {
+            ScriptError::VerifyFailed { input, .. } => *input,
+        }
+    }
+
+    /// Core's `CScriptCheck::operator()` debug string for a failed input:
+    /// `input %i of %s (wtxid %s), spending %s:%i` (`validation.cpp`). It is
+    /// the detail half of the validation state, and what `testmempoolaccept`
+    /// reports in `reject-details`.
+    pub fn core_debug_string(&self, tx: &Transaction) -> Option<String> {
+        let input = self.input();
+        let txin = tx.input.get(input)?;
+        Some(format!(
+            "input {input} of {} (wtxid {}), spending {}:{}",
+            tx.compute_txid(),
+            tx.compute_wtxid(),
+            txin.previous_output.txid,
+            txin.previous_output.vout,
+        ))
+    }
 }
 
 /// Identifies which concrete verifier backs the authoritative (primary)
@@ -254,6 +295,44 @@ impl ConsensusVerifier {
     }
 }
 
+/// Name the script error behind a libbitcoinconsensus rejection.
+///
+/// The C API cannot tell us: `bitcoinconsensus_verify_script` reports a
+/// coarse `ERR_SCRIPT` and the `ScriptError_t` that VerifyScript actually
+/// produced never crosses the FFI boundary. Bitcoin Core, calling
+/// VerifyScript directly, puts that specific name in the rejection —
+/// `mempool-script-verify-flag-failed (Non-canonical DER signature)` — and
+/// every client and test that reads a rejection reads the name.
+///
+/// So the native engine, which computes the same thing and carries Core's
+/// `ScriptErrorString` table, is asked for the name. The *verdict* is not
+/// revisited: libconsensus has already rejected this input and that stands.
+/// This runs only on the failure path, and only to write the message.
+///
+/// If the two engines disagree about this input — the native one finding it
+/// valid — there is no name to borrow, and the coarse error is reported as
+/// it was. That disagreement is a parity bug worth knowing about, so it is
+/// logged rather than papered over.
+fn name_script_failure(
+    tx: &Transaction,
+    prev_outputs: &[TxOut],
+    flags: u32,
+    input: usize,
+    coarse: bitcoinconsensus::Error,
+) -> String {
+    match consensus::verify_transaction(tx, prev_outputs, flags) {
+        Err((idx, consensus::Error::ErrScript(e))) if idx == input => e.as_str().to_string(),
+        _ => {
+            tracing::debug!(
+                input,
+                "the native engine does not agree that this input fails; \
+                 reporting the coarse error"
+            );
+            format!("{coarse:?}")
+        }
+    }
+}
+
 impl ScriptVerifier for ConsensusVerifier {
     fn verify_transaction(
         &self,
@@ -293,7 +372,10 @@ impl ScriptVerifier for ConsensusVerifier {
                 input_index,
                 flags,
             )
-            .map_err(|e| ScriptError::VerifyFailed(format!("input {}: {:?}", input_index, e)))?;
+            .map_err(|e| ScriptError::VerifyFailed {
+                input: input_index,
+                reason: name_script_failure(tx, prev_outputs, flags, input_index, e),
+            })?;
         }
 
         Ok(())
@@ -341,9 +423,8 @@ impl ScriptVerifier for RustVerifier {
         // Batch API: passes &Transaction so we don't re-deserialize per
         // input, and shares a single SighashCache across inputs (BIP143
         // hashPrevouts / hashSequence / hashOutputs are tx-wide).
-        consensus::verify_transaction(tx, prev_outputs, flags).map_err(|(idx, e)| {
-            ScriptError::VerifyFailed(format!("rust input {idx}: {e}"))
-        })
+        consensus::verify_transaction(tx, prev_outputs, flags)
+            .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
     }
 
     fn primary_engine(&self) -> PrimaryEngine {

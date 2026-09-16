@@ -93,9 +93,8 @@ note = "measured 2026-09-16 with message ordering behind ping in place: past the
 
 [[test]]
 file = "feature_cltv.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-16 with message ordering behind ping in place: the send_and_ping blocks now connect, and it fails at L169 on the same reject-details shape as feature_dersig — the failing input is not named. Follow-up: the script-failure input detail"
+status = "run"
+note = "flipped 2026-09-16: message ordering behind ping, Core's ContextualCheckBlockHeader line, the script error named the way Core names it, and Core's 'Block validation error' line"
 
 [[test]]
 file = "feature_coinstatsindex.py"
@@ -127,9 +126,8 @@ reason = "core-internal"
 
 [[test]]
 file = "feature_dersig.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-16 with message ordering behind ping in place: the send_and_ping blocks now connect, and it fails at L119 on testmempoolaccept's reject-details, which must name the failing input — 'mempool-script-verify-flag-failed (Non-canonical DER signature), input 0 of <txid> (wtxid <wtxid>), spending <prevout>'. satd's script verifier does not report which input failed. Follow-up: the script-failure input detail"
+status = "run"
+note = "flipped 2026-09-16: message ordering behind ping, Core's ContextualCheckBlockHeader line, the script error named the way Core names it, and Core's 'Block validation error' line"
 
 [[test]]
 file = "feature_dirsymlinks.py"

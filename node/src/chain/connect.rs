@@ -375,7 +375,22 @@ pub struct ConnectParams<'a> {
     pub replay_plan: Option<&'a crate::chain::replay_plan::ReplayPlan>,
 }
 
+/// Connect a block, logging Core's line if it fails.
+///
+/// Bitcoin Core writes `Block validation error: <state>` from `ConnectTip`
+/// whenever a block fails to connect (`validation.cpp`), and its functional
+/// tests read the node's log for it — it is how a test tells *which* rule a
+/// block broke apart from the fact that it was refused. Wrapping the whole
+/// of connect rather than each rejection site means every caller — the p2p
+/// path, `submitblock`, the background validator, repair — gets the line,
+/// and gets it once per failed block.
 pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
+    connect_block_inner(params).inspect_err(|e| {
+        tracing::debug!("Block validation error: {e}");
+    })
+}
+
+fn connect_block_inner(params: &ConnectParams) -> Result<StoreBatch, ConnectError> {
     #[cfg(feature = "block-filter-index")]
     let ConnectParams {
         store, block, height, parent_chainwork, flat_pos,
@@ -839,7 +854,11 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
             for (tx, prev_outputs) in &verify_queue {
                 script_verifier
                     .verify_transaction(tx, prev_outputs, height)
-                    .map_err(|e| ConnectError::ScriptFailed(e.to_string()))?;
+                    // `reason()`, not the whole error: Core's
+                    // `block-script-verify-flag-failed (...)` carries the
+                    // bare script error, and the input it failed on is
+                    // reported separately.
+                    .map_err(|e| ConnectError::ScriptFailed(e.reason().to_string()))?;
             }
         } else {
             let queue_ref = &verify_queue;
@@ -856,7 +875,9 @@ pub fn connect_block(params: &ConnectParams) -> Result<StoreBatch, ConnectError>
                                 if let Err(e) = script_verifier
                                     .verify_transaction(tx, prev_outputs, height)
                                 {
-                                    errs.push(ConnectError::ScriptFailed(e.to_string()));
+                                    errs.push(ConnectError::ScriptFailed(
+                                        e.reason().to_string(),
+                                    ));
                                 }
                             }
                             errs

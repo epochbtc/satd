@@ -6003,7 +6003,7 @@ impl PeerManager {
     fn tx_rejection_ban_score(e: &MempoolError) -> u32 {
         match e {
             // Consensus-invalid: bad script/signature, or outputs > inputs.
-            MempoolError::Script(_) | MempoolError::BadAmounts => INVALID_TX_BAN_SCORE,
+            MempoolError::Script(..) | MempoolError::BadAmounts => INVALID_TX_BAN_SCORE,
             // Everything else is local policy / standardness / resource limits /
             // RBF / duplicates — not misbehavior.
             MempoolError::AlreadyExists
@@ -9274,7 +9274,7 @@ mod tests {
     fn tx_rejection_ban_score_only_scores_consensus_invalid() {
         // Consensus-invalid → scored.
         assert_eq!(
-            PeerManager::tx_rejection_ban_score(&MempoolError::Script("x".into())),
+            PeerManager::tx_rejection_ban_score(&MempoolError::Script("x".into(), None)),
             INVALID_TX_BAN_SCORE
         );
         assert_eq!(

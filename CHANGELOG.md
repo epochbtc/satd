@@ -45,6 +45,8 @@ item below is (or will be) written up in full in the in-development
 
 - Compact block receive path hardened: a `cmpctblock`'s header is validated before the block is reconstructed, pending reconstructions and the record of which blocks were asked of a peer are bounded per peer and expire, a block being reconstructed is not also downloaded in full, and a merkle mismatch after reconstruction falls back to fetching the full block instead of penalising the peer (Core parity; #763).
 - Stratum work follows a tip the node reached through block download. Those blocks connect without a chain event, so work stayed on the old tip for up to 30 seconds after a node caught up — long enough for a Job Declaration client to be refused (#763).
+- A rejected script now says *which* script rule it broke, as Bitcoin Core does: `mempool-script-verify-flag-failed (Non-canonical DER signature)` rather than a generic `ERR_SCRIPT`, and `testmempoolaccept`'s `reject-details` names the input it failed on. A block that fails to connect logs Core's `Block validation error: <reason>` line.
+
 - A `pong` now answers for everything the peer sent ahead of the `ping`, as Bitcoin Core's does. satd answered `ping` on the peer's socket task while `block` and `tx` travelled a queue to the manager and on to the block processor, so a peer that used `send_and_ping(block)` — the standard way to wait for a block, and what Core's own test framework does — got the pong before the block was connected.
 
 - `-maxtipage` is honoured: a tip older than it keeps the node in initial block download. It was parsed and ignored.

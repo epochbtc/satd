@@ -42,10 +42,18 @@ pub struct Utxo {
     pub value: i64,
 }
 
-/// Coarse error type matching `bitcoinconsensus::Error`.
+/// Error type mirroring `bitcoinconsensus::Error`, except that a script
+/// failure carries *which* script error it was.
+///
+/// The C API cannot: `bitcoinconsensus_verify_script` returns a coarse
+/// `ERR_SCRIPT` and the specific `ScriptError_t` never crosses the FFI
+/// boundary. This engine is not the C API and already computes the specific
+/// error, so it reports it — Bitcoin Core names the script error in
+/// `mempool-script-verify-flag-failed (...)` and every test that reads a
+/// rejection reads that name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    ErrScript,
+    ErrScript(error::ScriptError),
     ErrTxIndex,
     ErrTxSizeMismatch,
     ErrTxDeserialize,
@@ -58,7 +66,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ErrScript => write!(f, "script verification failed"),
+            // Core's `ScriptErrorString`, which is what a rejection reason
+            // quotes.
+            Self::ErrScript(e) => write!(f, "{}", e.as_str()),
             Self::ErrTxIndex => write!(f, "invalid input index"),
             Self::ErrTxSizeMismatch => write!(f, "tx size mismatch"),
             Self::ErrTxDeserialize => write!(f, "tx deserialization failed"),
@@ -183,7 +193,7 @@ pub fn verify_with_flags(
         flag_set,
         &tx_checker,
     )
-    .map_err(|_| Error::ErrScript)
+    .map_err(Error::ErrScript)
 }
 
 /// Verify every input of a transaction in one batch.
@@ -250,7 +260,7 @@ pub fn verify_transaction(
             flag_set,
             &tx_checker,
         )
-        .map_err(|_| (i, Error::ErrScript))?;
+        .map_err(|e| (i, Error::ErrScript(e)))?;
     }
 
     Ok(())
