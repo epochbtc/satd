@@ -100,6 +100,36 @@ labels) and does not consume an RPC worker on every scrape.
 > variant for, undecodable frames, and v2 decoy packets are all counted under
 > `*other*`, matching Core.
 
+### Compact block relay
+
+Each block that arrives as a BIP 152 compact block logs one line at `info`
+when it is reconstructed:
+
+```
+compact block reconstructed hash=… height=… peer=… prefilled=1 prefilled_bytes=… mempool=2841 mempool_bytes=… extra=0 extra_bytes=0 requested=3 fetched_bytes=… redundant_prefilled=0 round_trip=true elapsed_ms=…
+```
+
+`prefilled`, `mempool`, `extra` and `requested` count where the block's
+transactions came from: sent with the block, found in the mempool, found among
+recently replaced or policy-refused transactions (`blockreconstructionextratxn`),
+or requested with `getblocktxn`. `round_trip=false` means the block was built
+without asking the peer for anything. A reconstruction that is given up logs
+`compact block abandoned` with `reason=merkle` (the filled block failed its
+merkle check, so the full block was requested), `reason=timeout` or
+`reason=invalid`.
+
+The same numbers are counters:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `satd_net_compact_block_reconstructions_total` | `outcome` = `direct`, `round_trip`, `fallback`, `invalid` | Compact blocks received, by how they ended. |
+| `satd_net_compact_block_fetched_bytes_total` | — | Transaction bytes received in `blocktxn` messages. |
+| `satd_net_compact_block_txs_total` | `source` = `prefilled`, `mempool`, `extra`, `requested` | Transactions of reconstructed blocks, by where they came from. |
+| `satd_net_compact_block_sent_total` | `kind` = `announce`, `getdata` | `cmpctblock` messages sent. |
+
+The share of blocks reconstructed without a round trip is
+`direct / (direct + round_trip + fallback)`.
+
 ## Status page
 
 `--statuspage=1` adds a browser page to the metrics listener, a simplified,

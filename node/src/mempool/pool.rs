@@ -836,6 +836,9 @@ impl Default for MempoolConfig {
     }
 }
 
+/// See [`Mempool::set_replaced_tx_sink`].
+pub type ReplacedTxSink = Box<dyn Fn(Vec<Transaction>) + Send + Sync>;
+
 /// In-memory transaction pool.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
@@ -894,6 +897,11 @@ pub struct Mempool {
     /// `set_event_sender`; remains `None` in tests that don't need
     /// event emission.
     event_tx: Mutex<Option<broadcast::Sender<MempoolEvent>>>,
+    /// Receives the transactions an RBF replacement evicts, after the pool's
+    /// lock is released. The P2P layer keeps them for compact block
+    /// reconstruction (Core's `m_replaced_transactions` →
+    /// `AddToCompactExtraTransactions`).
+    replaced_tx_sink: Mutex<Option<ReplacedTxSink>>,
     /// Bounded ring of recent events for MCP snapshot consumption.
     /// Always maintained (cheap) so MCP tools work whether or not
     /// the broadcast sender is wired.
@@ -1090,6 +1098,7 @@ impl Mempool {
             policy_demoted_total: std::sync::atomic::AtomicU64::new(0),
             policy_reload_failures: std::sync::atomic::AtomicU64::new(0),
             event_tx: Mutex::new(None),
+            replaced_tx_sink: Mutex::new(None),
             event_ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             quarantine_event_tx: Mutex::new(None),
             sp_gate: arc_swap::ArcSwap::from_pointee(std::sync::atomic::AtomicUsize::new(0)),
@@ -1153,6 +1162,12 @@ impl Mempool {
     /// emission on this, not on the mere presence of `prev_scripts`.
     pub fn streams_prevout_scripts(&self) -> bool {
         self.config.read().prevout_meta.retains_script()
+    }
+
+    /// Wire the receiver for RBF-replaced transactions (see
+    /// `replaced_tx_sink`). Replaces any earlier one.
+    pub fn set_replaced_tx_sink(&self, sink: ReplacedTxSink) {
+        *self.replaced_tx_sink.lock() = Some(sink);
     }
 
     /// Wire a broadcast sender for mempool events. Must be called
@@ -2612,6 +2627,7 @@ impl Mempool {
         let (all_evicted, _) = Self::rbf_conflict_set(&inner, &conflicts, usize::MAX)
             .expect("an unbounded walk cannot exceed usize::MAX");
         let mut replaced: Vec<Txid> = Vec::new();
+        let mut replaced_txs: Vec<Transaction> = Vec::new();
         for evict_txid in &all_evicted {
             if let Some(evict_entry) = inner.entries.remove(evict_txid) {
                 let was_acting = evict_entry.scope.is_acting();
@@ -2625,6 +2641,7 @@ impl Mempool {
                     replaced.push(*evict_txid);
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
+                replaced_txs.push(evict_entry.tx);
             }
         }
         self.sync_unbroadcast_len(&inner);
@@ -2740,6 +2757,11 @@ impl Mempool {
                 txid: *conflict_txid,
                 replacing_txid: txid,
             });
+        }
+        if !replaced_txs.is_empty()
+            && let Some(sink) = self.replaced_tx_sink.lock().as_ref()
+        {
+            sink(replaced_txs);
         }
         // §10: the default mempool stream reflects the *acting* class only — a
         // quarantined admission emits no `Enter` there. Held placements emit
