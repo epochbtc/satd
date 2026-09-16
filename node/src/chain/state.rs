@@ -698,7 +698,17 @@ impl ChainState {
                 // must fail startup loudly, not silently degrade the
                 // competing-chain pull path to the active tip.
                 let scan_stats = store.for_each_block_index(&mut |h, e| {
-                    if compare_u256(&e.chainwork, &best_header.1) > 0 {
+                    // Skip invalidated branches, as Core's
+                    // `RecalculateBestHeader` does: an `invalidateblock` before
+                    // the restart marked them, and seeding the header tip from
+                    // one would put it straight back on a branch this node has
+                    // already refused — the same defect through the restart
+                    // door. The leaf set below still takes them: a tip whose
+                    // marks an operator may yet clear with `reconsiderblock`
+                    // stays known.
+                    if e.status != BlockStatus::Invalid
+                        && compare_u256(&e.chainwork, &best_header.1) > 0
+                    {
                         best_header = (h, e.chainwork);
                     }
                     all.insert(h);
@@ -2552,6 +2562,79 @@ impl ChainState {
         if compare_u256(&chainwork, &best.1) > 0 {
             *best = (hash, chainwork);
         }
+    }
+
+    /// Core's `ChainstateManager::RecalculateBestHeader`: rescan the block
+    /// index for the highest-work entry that is not on a failed branch and
+    /// move the header tip to it.
+    ///
+    /// Both halves of that tip only ever move *up* in normal operation —
+    /// `best_header` takes the higher chainwork, `headers_tip_height` is a
+    /// `fetch_max` high-water mark — which is right while headers only ever
+    /// arrive. Invalidating a branch is the one event that can move it down,
+    /// and it has to: `getblockchaininfo.headers`, the initial-block-download
+    /// heuristic, the scheduler's target height and the stall detector all
+    /// read the distance between this and the active tip, and leaving it on
+    /// the dead branch aims every one of them at a chain the node has just
+    /// decided it will never connect — a gap that then grows with every block
+    /// the rest of the network mines on it.
+    ///
+    /// Seeded from nothing rather than from the active tip: this is called
+    /// from `invalidateblock`, where the tip may itself still be the block
+    /// being invalidated, and seeding with an invalid entry's chainwork would
+    /// make the scan unable to find anything "better". The scan always finds
+    /// at least genesis, and `getblockchaininfo` floors the figure at the
+    /// active tip anyway, so an undershoot can never report `headers` below
+    /// `blocks`.
+    ///
+    /// The scan is O(index), as Core's is. It runs only on the two operator
+    /// RPCs that can change a branch's validity, never on a P2P path.
+    pub(crate) fn recalculate_best_header(&self) {
+        let mut best: Option<(BlockHash, [u8; 32], u32)> = None;
+        let store_ref = &*self.store;
+        let stats = match store_ref.for_each_block_index(&mut |h, entry| {
+            if entry.status == BlockStatus::Invalid {
+                return;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|b| compare_u256(&entry.chainwork, &b.1) > 0)
+            {
+                best = Some((h, entry.chainwork, entry.height));
+            }
+        }) {
+            Ok(stats) => stats,
+            Err(e) => {
+                // A scan that cannot complete leaves the header tip where it
+                // is rather than lowering it on partial evidence.
+                tracing::warn!("recalculate_best_header: block index scan failed: {e}");
+                return;
+            }
+        };
+        // Undecodable rows mean the scan may have missed the heaviest valid
+        // branch. Say so rather than silently lowering the header tip past it,
+        // the same way the startup seed does.
+        if stats.skipped_bad_key > 0 || stats.skipped_bad_value > 0 {
+            tracing::warn!(
+                skipped_bad_key = stats.skipped_bad_key,
+                skipped_bad_value = stats.skipped_bad_value,
+                "recalculate_best_header: block_index scan skipped undecodable rows;                  the header tip may be low until the next header arrives"
+            );
+        }
+        let Some(best) = best else {
+            tracing::warn!("recalculate_best_header: no valid block index entry found");
+            return;
+        };
+        *self.best_header.write() = (best.0, best.1);
+        // A header batch racing in here can only raise this again (it holds no
+        // lock this path can take), and raising it is what a genuinely
+        // higher-work header should do.
+        self.headers_tip_height.store(best.2, Ordering::Relaxed);
+        tracing::debug!(
+            "recalculate_best_header: header tip is now {} at height {}",
+            best.0,
+            best.2
+        );
     }
 
     /// Record a newly indexed block in the leaf set: it is a tip until
@@ -7293,7 +7376,15 @@ impl ChainState {
                      reconsiderblock undoes the invalidation."
                 )),
             }
-        })
+        })?;
+
+        // Core's `InvalidateBlock` ends with `RecalculateBestHeader()`. The
+        // marks written above are what make the old header tip unreachable, so
+        // without this the node keeps reporting — and steering by — a header
+        // tip on the branch it just refused. Runs after activation so the
+        // scan sees the tip it is about to be compared against.
+        self.recalculate_best_header();
+        Ok(())
     }
 
     /// Clear the `Invalid` mark on `hash` and its descendants, then
@@ -7336,7 +7427,13 @@ impl ChainState {
                      to retry activation."
                 )),
             }
-        })
+        })?;
+
+        // Core's `ResetBlockFailureFlags` is the mirror of the recalculation
+        // in `invalidate_block`: clearing the marks can put a heavier branch
+        // back in play, and the header tip has to be allowed back up to it.
+        self.recalculate_best_header();
+        Ok(())
     }
 
     /// Self-heal an active tip that is durably marked `Invalid` — the state a
@@ -10651,6 +10748,45 @@ pub(crate) mod tests {
     /// delete a block file the reorg is about to read back. Deleting the
     /// acquisition in `prune_blocks` makes this fail: the prune completes
     /// while the lock is held.
+    /// Core's `InvalidateBlock` ends with `RecalculateBestHeader()`, and
+    /// `ResetBlockFailureFlags` mirrors it. satd's header tip only ever moved
+    /// up — `best_header` takes the higher chainwork, `headers_tip_height` is
+    /// a `fetch_max` high-water mark — so after an `invalidateblock` it stayed
+    /// on the branch that had just been refused, and `getblockchaininfo`
+    /// reported a `headers` figure the node would never reach. It then grew
+    /// with every further header on that branch.
+    #[test]
+    fn invalidateblock_takes_the_header_tip_off_the_invalidated_branch() {
+        let (cs, dir) = make_chain_state();
+        let blocks = build_and_connect_chain(&cs, 10);
+        assert_eq!(cs.tip_height(), 10);
+        assert_eq!(cs.headers_tip_height(), 10);
+        assert_eq!(cs.best_header_hash(), blocks[9].block_hash());
+
+        // Invalidate height 5: the active chain truncates to 4, and the header
+        // tip has to come with it.
+        cs.invalidate_block(blocks[4].block_hash()).expect("invalidated");
+        assert_eq!(cs.tip_height(), 4);
+        assert_eq!(
+            cs.headers_tip_height(),
+            4,
+            "the header tip stayed on the invalidated branch"
+        );
+        assert_eq!(cs.best_header_hash(), blocks[3].block_hash());
+
+        // Reconsidering puts the branch — and the header tip — back.
+        cs.reconsider_block(blocks[4].block_hash()).expect("reconsidered");
+        assert_eq!(cs.tip_height(), 10);
+        assert_eq!(
+            cs.headers_tip_height(),
+            10,
+            "the header tip did not follow the branch back"
+        );
+        assert_eq!(cs.best_header_hash(), blocks[9].block_hash());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prune_blocks_mutation_waits_for_the_accept_lock() {
         use std::sync::atomic::{AtomicBool, Ordering};
