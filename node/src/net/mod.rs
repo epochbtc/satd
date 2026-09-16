@@ -5,6 +5,7 @@ pub mod bg_catchup;
 pub mod compact;
 pub mod connection;
 pub mod dns;
+pub mod flow;
 pub mod ibd;
 pub mod manager;
 pub mod peer;

@@ -322,7 +322,16 @@ fn test_api_verify_script_failure() {
     let c = credit_tx(&spk, 0);
     let tx_bytes = serialize_tx(&spend_tx(&c, &[], &[]));
     let result = consensus::verify_with_flags(&spk, 0, &tx_bytes, None, 0, 0);
-    assert_eq!(result, Err(Error::ErrScript));
+    // The specific script error, not a coarse "it failed": Core names it in
+    // the rejection reason and every test that reads one reads that name.
+    assert_eq!(
+        result,
+        Err(Error::ErrScript(consensus::error::ScriptError::EvalFalse))
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Script evaluated without error but finished with a false/empty top stack element"
+    );
 }
 
 // =========================================================================

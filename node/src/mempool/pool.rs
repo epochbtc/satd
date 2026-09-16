@@ -121,8 +121,15 @@ pub enum MempoolError {
     /// (`validation.cpp`), because the two carry different consequences: a
     /// mempool failure is `TX_NOT_STANDARD` and never bans, a block failure is
     /// `TX_CONSENSUS`. `mandatory-script-verify-flag-failed` is neither.
+    ///
+    /// The second field is Core's `CScriptCheck` debug string naming the
+    /// input that failed (`input 0 of <txid> (wtxid <wtxid>), spending
+    /// <outpoint>`). Core reports it as the *detail* half of the validation
+    /// state, which is what `testmempoolaccept` returns in `reject-details`;
+    /// satd reported the reason alone, so a caller could see that a script
+    /// failed but not on which input.
     #[error("mempool-script-verify-flag-failed ({0})")]
-    Script(String),
+    Script(String, Option<String>),
     #[error("bad-txns-in-belowout")]
     BadAmounts,
     #[error("bad-txns-premature-spend-of-coinbase")]
@@ -211,7 +218,7 @@ impl MempoolError {
             // Everything else is an "invalid or rejected" verdict, which
             // Core funnels through `MEMPOOL_REJECTED` -> `-26`.
             Self::BadAmounts
-            | Self::Script(_)
+            | Self::Script(..)
             | Self::DecodeFailed
             | Self::PrematureCoinbaseSpend
             | Self::Validation(_)
@@ -246,7 +253,7 @@ impl MempoolError {
             MempoolError::MempoolFull => "mempool full".to_string(),
             MempoolError::MempoolMinFeeNotMet(..) => "mempool min fee not met".to_string(),
             MempoolError::Validation(s) => s.clone(),
-            MempoolError::Script(s) => {
+            MempoolError::Script(s, _) => {
                 format!("mempool-script-verify-flag-failed ({s})")
             }
             MempoolError::BadAmounts => "bad-txns-in-belowout".to_string(),
@@ -300,7 +307,9 @@ impl MempoolError {
             // Core: `strprintf("%d < %d", package_fee, min_relay_fee)`.
             MempoolError::InsufficientFee(fee, required) => Some(format!("{fee} < {required}")),
             MempoolError::MempoolMinFeeNotMet(fee, required) => Some(format!("{fee} < {required}")),
-            MempoolError::Script(detail) => Some(detail.clone()),
+            // Core's detail for a script failure is the *input* it failed
+            // on, not the script error — that is already in the reason.
+            MempoolError::Script(_, input) => input.clone(),
             _ => None,
         }
     }
@@ -314,7 +323,9 @@ impl MempoolError {
         let reason = self.reject_reason();
         match self.reject_details() {
             None => reason,
-            Some(_) if matches!(self, MempoolError::Script(_)) => reason,
+            Some(detail) if matches!(self, MempoolError::Script(..)) => {
+                format!("{reason}, {detail}")
+            }
             Some(detail) if detail.starts_with(&reason) => detail,
             Some(detail) => format!("{reason}, {detail}"),
         }
@@ -2776,7 +2787,9 @@ impl Mempool {
         // Use tip_height + 1 since the tx will be mined in the next block
         script_verifier
             .verify_transaction(&tx, &prev_outputs, tip_height + 1)
-            .map_err(|e| MempoolError::Script(e.to_string()))?;
+            .map_err(|e| {
+                MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx))
+            })?;
 
         // RBF: remove conflicted transactions before inserting replacement.
         // Collect replaced txids so we can emit LeaveReplaced events after the
@@ -4509,7 +4522,9 @@ impl Mempool {
         let tip_height = chain_state.tip_height();
         script_verifier
             .verify_transaction(tx, &prev_outputs, tip_height + 1)
-            .map_err(|e| MempoolError::Script(e.to_string()))?;
+            .map_err(|e| {
+                MempoolError::Script(e.reason().to_string(), e.core_debug_string(tx))
+            })?;
 
         // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
         // `sendrawtransaction` accept this?", so it must apply the same policy
@@ -5654,7 +5669,9 @@ impl Mempool {
         // Script verification
         script_verifier
             .verify_transaction(&tx, &prev_outputs, tip_height + 1)
-            .map_err(|e| MempoolError::Script(e.to_string()))?;
+            .map_err(|e| {
+                MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx))
+            })?;
 
         let fee_rate = policy::fee_rate_sat_per_kvb(fee, weight as u64);
 
@@ -6779,7 +6796,7 @@ mod tests {
         // does. `mandatory-script-verify-flag-failed`, which satd reported for
         // both, is neither, and told a client the wrong thing about whether
         // its transaction had broken a consensus rule.
-        let script_err = MempoolError::Script("SIG_DER".to_string());
+        let script_err = MempoolError::Script("SIG_DER".to_string(), None);
         assert_eq!(
             script_err.reject_reason(),
             "mempool-script-verify-flag-failed (SIG_DER)"

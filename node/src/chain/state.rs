@@ -6240,7 +6240,17 @@ impl ChainState {
         validation::pow::check_future_timestamp(&block.header, unix_now_secs())?;
 
         // Mandatory block-version gate (Core: bad-version) — BIP34/66/65.
-        connect::check_block_version(&block.header, new_height, self.network)?;
+        if let Err(e) = connect::check_block_version(&block.header, new_height, self.network) {
+            // Core rejects a stale block version in
+            // `ContextualCheckBlockHeader` and logs the header and the
+            // reason together. `feature_dersig` and `feature_cltv` read the
+            // node's log for exactly this line — it is how they tell a block
+            // refused for its version from one refused for its content.
+            tracing::debug!(
+                "AcceptBlockHeader: Consensus::ContextualCheckBlockHeader: {block_hash}, {e}"
+            );
+            return Err(e.into());
+        }
 
         // Signet block-solution check (BIP 325), custom signet only.
         self.check_signet_solution(block)?;
