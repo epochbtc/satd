@@ -428,7 +428,7 @@ async fn main() {
     // cookie" signal). Operators who want both can always set
     // rpcauth=... explicitly instead — that keeps the cookie file
     // for sat-cli's no-flag default while still allowing user/pass.
-    if !(config.rpcuser.is_some() && config.rpcpassword.is_some()) {
+    if !(config.rpc_cookie_disabled || config.rpcuser.is_some() && config.rpcpassword.is_some()) {
         let cookie_path = config
             .rpc_cookie_file
             .clone()
@@ -442,7 +442,10 @@ async fn main() {
             }
             Ok(_) => unreachable!("generate_cookie_with always returns Verify"),
             Err(e) => {
-                eprintln!("Error generating cookie file: {}", e);
+                // Core's startup error for a cookie it cannot write, with the
+                // reason in the log.
+                println!("Unable to open cookie authentication file for writing: {e}");
+                eprintln!("Error: Unable to start HTTP server. See debug log for details.");
                 std::process::exit(1);
             }
         }
@@ -507,7 +510,23 @@ async fn main() {
     // bind in the list; non-loopback binds are accepted too so a
     // remote operator can also see "Loading database..." instead of
     // "Connection refused" during long startups.
-    let rpc_binds: Vec<SocketAddr> = config.rpcbind.clone();
+    let mut rpc_binds: Vec<SocketAddr> = config.rpcbind.clone();
+    if config.rpcbind_is_default {
+        // Core binds both loopbacks by default and carries on when one of
+        // them fails; on a host without IPv6, ::1 cannot be bound.
+        rpc_binds.retain(|addr| {
+            if addr.is_ipv4() {
+                return true;
+            }
+            match std::net::TcpListener::bind(addr) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(%addr, error = %e, "cannot bind the default RPC address; skipping it");
+                    false
+                }
+            }
+        });
+    }
     let startup_progress = node::startup_progress::StartupProgress::new();
     let startup_handle = {
         // Like the full JSON-RPC server, the IBD-phase RPC stays on the
@@ -784,6 +803,7 @@ async fn main() {
             // Custom signet (BIP 325): enables block-solution validation
             // and custom P2P magic. Set before sharing the ChainState.
             cs.set_signet_challenge(config.signet_challenge.clone());
+            node::chain::state::ChainState::set_max_tip_age(config.maxtipage);
             if cs.network == bitcoin::Network::Signet {
                 tracing::info!(
                     "Signet derived magic (message start): {}",
@@ -2564,6 +2584,8 @@ async fn main() {
         binds = ?bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         "RPC server listening"
     );
+    // Core's end-of-init line, which tooling waits for.
+    tracing::info!("init message: Done loading");
 
     // Node-health detectors (A3). Always on: the conditions they watch are the
     // ones an operator gets paged about, the poll is a handful of atomic reads

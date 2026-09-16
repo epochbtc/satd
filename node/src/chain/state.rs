@@ -561,6 +561,15 @@ impl BlockAcceptance {
     }
 }
 
+/// Core's `DEFAULT_MAX_TIP_AGE`: a tip older than this keeps the node in
+/// initial block download.
+pub const DEFAULT_MAX_TIP_AGE_SECS: i64 = 24 * 60 * 60;
+
+/// `-maxtipage`. Process-wide like the node clock it is compared against
+/// (`crate::time`), so the associated IBD predicates need no `ChainState`.
+static MAX_TIP_AGE_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(DEFAULT_MAX_TIP_AGE_SECS);
+
 impl ChainState {
     /// The height a just-connected block occupies, or `None` if it did not
     /// connect.
@@ -1712,9 +1721,19 @@ impl ChainState {
         Self::time_is_ibd_at(tip_time, crate::time::now_secs())
     }
 
-    /// [`Self::tip_time_is_ibd`] against a given clock reading.
+    /// [`Self::tip_time_is_ibd`] against a given clock reading: Core's
+    /// `tip->Time() < Now() - max_tip_age`, with `-maxtipage` (default 24h).
+    /// Signed arithmetic, because Core accepts any `int64` age and an age
+    /// larger than the clock reading means no tip is ever too old.
     pub(crate) fn time_is_ibd_at(tip_time: u32, now: u64) -> bool {
-        (tip_time as u64) + 86_400 < now
+        let max_age = MAX_TIP_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        i128::from(tip_time) < i128::from(now) - i128::from(max_age)
+    }
+
+    /// Set Core's `-maxtipage`, in seconds, for the IBD predicate. Called
+    /// once at startup; the default is [`DEFAULT_MAX_TIP_AGE_SECS`].
+    pub fn set_max_tip_age(secs: i64) {
+        MAX_TIP_AGE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the node is in initial block download, judged by the active
@@ -13445,6 +13464,18 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's `IsInitialBlockDownload` tip-age test: a tip exactly
+    /// `max_tip_age` old is current, one second older is not. Reads the
+    /// default age; `-maxtipage` itself is process-global and exercised by
+    /// Core's `feature_maxtipage.py`.
+    #[test]
+    fn tip_age_boundary_matches_core() {
+        let now = 1_700_000_000u64;
+        let age = DEFAULT_MAX_TIP_AGE_SECS as u64;
+        assert!(!ChainState::time_is_ibd_at((now - age) as u32, now));
+        assert!(ChainState::time_is_ibd_at((now - age - 1) as u32, now));
     }
 
     #[test]

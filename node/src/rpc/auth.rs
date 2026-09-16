@@ -74,7 +74,14 @@ impl RpcAuth {
         {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
-            let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+            // Core's temporary name (`GetAuthCookieFile(/*temp=*/true)`): the
+            // cookie path plus `.tmp`. A stale one is removed below; one that
+            // cannot be (a directory in its way) fails startup, as in Core.
+            let tmp = {
+                let mut name = path.clone().into_os_string();
+                name.push(".tmp");
+                PathBuf::from(name)
+            };
             // create_new + mode: born with restrictive perms, fails if a stale
             // temp exists rather than reusing a foreign file.
             let mut f = match std::fs::OpenOptions::new()
