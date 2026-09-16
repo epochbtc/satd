@@ -57,7 +57,7 @@ fn block_confirmations(chain_state: &ChainState, hash: &bitcoin::BlockHash, heig
 /// Walked through parent pointers rather than the height index, so a block off
 /// the active chain gets its OWN ancestry instead of the active chain's — and
 /// so the answer does not depend on an index that describes a different branch.
-fn block_median_time(chain_state: &ChainState, entry: &BlockIndexEntry) -> u32 {
+pub(crate) fn block_median_time(chain_state: &ChainState, entry: &BlockIndexEntry) -> u32 {
     let mut times = Vec::with_capacity(11);
     times.push(entry.header.time);
     let mut height = entry.height;
@@ -92,6 +92,17 @@ fn next_block_hash(
         .map(|h| h.to_string())
 }
 
+/// `nBits` as Core's RPCs print it: eight lowercase hex digits.
+pub(crate) fn bits_hex(bits: bitcoin::CompactTarget) -> String {
+    format!("{:08x}", bits.to_consensus())
+}
+
+/// The target `nBits` encodes, as the 64-digit big-endian hex Core's
+/// `GetTarget(...).GetHex()` prints beside `bits` (v29+).
+pub(crate) fn target_hex(bits: bitcoin::CompactTarget) -> String {
+    hex::encode(bitcoin::Target::from_compact(bits).to_be_bytes())
+}
+
 /// Build the `getblockchaininfo` response from real chain state.
 /// `prune`: `None` when the node is not pruning, else the configured
 /// `-prune` target in MiB.
@@ -109,17 +120,18 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
     // alongside the hash of a different block.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
 
-    let (difficulty, time, mediantime, chainwork) =
+    let (bits, difficulty, time, mediantime, chainwork) =
         if let Some(entry) = chain_state.get_block_index(&tip_hash) {
             let cw_hex = hex::encode(entry.chainwork);
             (
+                entry.header.bits,
                 target_to_difficulty(entry.header.bits),
                 entry.header.time as u64,
                 block_median_time(chain_state, &entry) as u64,
                 cw_hex,
             )
         } else {
-            (0.0, 0u64, 0u64, "0".to_string())
+            (bitcoin::CompactTarget::from_consensus(0), 0.0, 0u64, 0u64, "0".to_string())
         };
 
     // IBD heuristic: if tip is more than 24 hours behind wall clock, we're
@@ -132,6 +144,8 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
         "blocks": tip_height,
         "headers": chain_state.headers_tip_height().max(tip_height),
         "bestblockhash": tip_hash.to_string(),
+        "bits": bits_hex(bits),
+        "target": target_hex(bits),
         "difficulty": difficulty,
         "time": time,
         "mediantime": mediantime,
@@ -156,6 +170,9 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune_target_mb: Option<u64
             v => Value::Array(v.into_iter().map(Value::String).collect()),
         },
     });
+    if let Some(challenge) = chain_state.signet_challenge() {
+        out["signet_challenge"] = json!(hex::encode(challenge));
+    }
     // Core emits these only on a pruned node, so they follow the flag rather
     // than always appearing.
     //
@@ -478,6 +495,18 @@ pub fn get_chain_states(chain_state: &ChainState) -> Value {
         }
     }
 
+    // Core prints each chainstate tip's `bits` and `target` (v29+).
+    for cs in &mut chainstates {
+        let entry = cs["bestblockhash"]
+            .as_str()
+            .and_then(|h| h.parse::<bitcoin::BlockHash>().ok())
+            .and_then(|h| chain_state.get_block_index(&h));
+        if let Some(entry) = entry {
+            cs["bits"] = json!(bits_hex(entry.header.bits));
+            cs["target"] = json!(target_hex(entry.header.bits));
+        }
+    }
+
     json!({
         "headers": chain_state.headers_tip_height().max(tip_height),
         "chainstates": chainstates,
@@ -606,7 +635,8 @@ pub fn get_block(
         "time": entry.header.time,
         "mediantime": block_median_time(chain_state, &entry),
         "nonce": entry.header.nonce,
-        "bits": format!("{:08x}", entry.header.bits.to_consensus()),
+        "bits": bits_hex(entry.header.bits),
+        "target": target_hex(entry.header.bits),
         "difficulty": difficulty,
         "chainwork": format!("{:0>64}", chainwork_hex),
         "nTx": entry.num_tx,
@@ -668,7 +698,8 @@ pub fn get_block_header(
         "time": entry.header.time,
         "mediantime": block_median_time(chain_state, &entry),
         "nonce": entry.header.nonce,
-        "bits": format!("{:08x}", entry.header.bits.to_consensus()),
+        "bits": bits_hex(entry.header.bits),
+        "target": target_hex(entry.header.bits),
         "difficulty": difficulty,
         "chainwork": format!("{:0>64}", chainwork_hex),
         "nTx": entry.num_tx,

@@ -1515,12 +1515,6 @@ pub async fn start(
         // asked for a block back without touching the chain and got a new tip.
         args.check()?;
 
-        if ctx.chain_state.network != bitcoin::Network::Regtest {
-            return Err(ErrorObjectOwned::owned(
-                -1, "generateblock is only available in regtest mode", None::<()>,
-            ));
-        }
-
         // Core's `getScriptFromDescriptor`: `output` is either an address or a
         // full output descriptor. A string containing `(` is a descriptor, and
         // its own error must reach the caller — `rpc_generate.py` asserts on
@@ -2958,14 +2952,15 @@ pub async fn start(
     module.register_method("getprioritisedtransactions", |_params, ctx, _extensions| {
         let prioritised = ctx.mempool.get_prioritised_transactions();
         let mut result = serde_json::Map::new();
-        for (txid, (fee_delta, in_mempool)) in &prioritised {
-            result.insert(
-                txid.to_string(),
-                serde_json::json!({
-                    "fee_delta": fee_delta,
-                    "in_mempool": in_mempool,
-                }),
-            );
+        for (txid, (fee_delta, in_mempool, modified_fee)) in &prioritised {
+            let mut row = serde_json::json!({
+                "fee_delta": fee_delta,
+                "in_mempool": in_mempool,
+            });
+            if let Some(modified_fee) = modified_fee {
+                row["modified_fee"] = serde_json::json!(modified_fee);
+            }
+            result.insert(txid.to_string(), row);
         }
         Ok::<_, ErrorObjectOwned>(serde_json::json!(result))
     })?;
