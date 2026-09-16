@@ -1156,11 +1156,12 @@ pub async fn start(
             .map_err(|e| ErrorObjectOwned::owned(-8, e, None::<()>))
     })?;
 
-    module.register_method("preciousblock", |params, _ctx, _extensions| {
+    module.register_method("preciousblock", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let hash: String = args.required("blockhash")?;
         args.check()?;
-        blockchain::precious_block(&hash).map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))
+        blockchain::precious_block(&ctx.chain_state, &hash)
+            .map_err(|(code, msg)| ErrorObjectOwned::owned(code, msg, None::<()>))
     })?;
 
     module.register_method("pruneblockchain", |params, ctx, _extensions| {
