@@ -472,7 +472,7 @@ reason = "no-wallet"
 file = "mempool_reorg.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L54 node1 block sync times out after invalidateblock: its headers tip stays on the invalidated branch. Behind it: Core's Poisson tx-announcement trickle. Follow-up: invalidateblock resets the best header"
+note = "measured 2026-09-16: the L54 sync timeout is gone (#778); L94 test_reorg_relay asserts no tx announcement inside the trickle window, and satd announces at once. Follow-up: Core's Poisson tx-announcement trickle"
 
 [[test]]
 file = "mempool_resurrect.py"
@@ -930,9 +930,7 @@ status = "run"
 
 [[test]]
 file = "rpc_invalidateblock.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L58 headers 7 != blocks 4 after invalidateblock: the headers tip stays on the invalidated branch. Behind it: branch selection at L54. Follow-up: invalidateblock resets the best header"
+status = "run"
 
 [[test]]
 file = "rpc_misc.py"
