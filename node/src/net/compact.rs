@@ -457,11 +457,16 @@ pub fn make_get_block_txn(block_hash: BlockHash, missing_indices: &[u64]) -> Blo
     }
 }
 
-/// Create a HeaderAndShortIds from a full block for sending as a compact block.
-pub fn make_compact_block(block: &Block) -> Option<HeaderAndShortIds> {
+/// Bitcoin Core's `MAX_CMPCTBLOCK_DEPTH`: a `MSG_CMPCT_BLOCK` getdata for a
+/// block deeper than this below the tip is answered with the full block.
+pub const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
+
+/// Build the `cmpctblock` form of `block` — version 2 (witness), a fresh
+/// random nonce, the coinbase prefilled — for sending. BIP 152: "Nodes SHOULD
+/// NOT use the same nonce across multiple different blocks."
+pub fn make_compact_block(block: &Block) -> Result<HeaderAndShortIds, bitcoin::bip152::Error> {
     let nonce: u64 = rand::random();
-    // Version 2 = with witness data
-    HeaderAndShortIds::from_block(block, nonce, 2, &[]).ok()
+    HeaderAndShortIds::from_block(block, nonce, 2, &[])
 }
 
 #[cfg(test)]
@@ -515,7 +520,7 @@ mod tests {
     fn test_make_compact_block() {
         let block = regtest_genesis();
         let compact = make_compact_block(&block);
-        assert!(compact.is_some());
+        assert!(compact.is_ok());
         let compact = compact.unwrap();
         // The compact block's header should match the original
         assert_eq!(compact.header, block.header);

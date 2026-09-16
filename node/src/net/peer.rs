@@ -225,6 +225,10 @@ pub struct PeerInfo {
     /// This peer sent us `sendcmpct(hb=1)`: it wants our new blocks as
     /// `cmpctblock`s. Core's `CNode::m_bip152_highbandwidth_from`.
     pub hb_from: bool,
+    /// The newest block this peer is known to have: one it sent or announced
+    /// to us, or one we announced to it. Keeps a block from being announced
+    /// twice (once before connecting it, once after) or back to its source.
+    pub known_block: Option<bitcoin::BlockHash>,
     /// Peer requested BIP 130 header announcements via `sendheaders`.
     /// When true, new-tip blocks are announced to this peer with a
     /// `headers` message rather than a legacy `inv`.
@@ -294,6 +298,7 @@ impl PeerInfo {
             compact_blocks: false,
             hb_to: false,
             hb_from: false,
+            known_block: None,
             prefers_headers: false,
             wants_addrv2: false,
             addr_relay_enabled: false,

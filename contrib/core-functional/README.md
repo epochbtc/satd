@@ -148,6 +148,12 @@ target; the rest need Core-only binaries or internals.
 
 ## Fixed
 
+- **BIP 152 high-bandwidth compact block relay.** satd asked every peer for
+  high-bandwidth announcements and never selected any itself, so
+  `getpeerinfo.bip152_hb_to` stayed false where Core's selection rule
+  (`MaybeSetPeerAsAnnouncingHeaderAndIDs`) promotes the peer that delivered
+  the tip. Selection, `cmpctblock` announcements and `MSG_CMPCT_BLOCK`
+  serving now follow Core. This put `p2p_compactblocks_hb.py` in the run-set.
 - **`-connect=0` was dialled as an address.** Core spells "open no outbound
   connections" that way and every functional-test node is started with it, so
   satd dialled `0.0.0.0:8333` at startup and kept re-dialling it from the

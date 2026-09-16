@@ -228,6 +228,22 @@ pub enum NetEvent {
     },
 }
 
+/// A block handed to the block processor: the peer it came from, that peer's
+/// counters, and the block.
+type IncomingBlock = (PeerId, Option<Arc<PeerStats>>, bitcoin::Block);
+
+/// BIP 152: at most this many peers are asked to announce blocks to us as
+/// `cmpctblock`s (high-bandwidth mode).
+const MAX_HB_PEERS: usize = 3;
+
+/// See `PeerManager::most_recent_block`.
+struct RecentBlock {
+    hash: bitcoin::BlockHash,
+    height: u32,
+    block: Arc<bitcoin::Block>,
+    compact: Arc<bitcoin::bip152::HeaderAndShortIds>,
+}
+
 /// Handle for sending messages to a specific peer.
 struct PeerHandle {
     info: PeerInfo,
@@ -469,7 +485,7 @@ pub struct PeerManager {
     /// connects; persisted across restarts.
     addrman: RwLock<crate::net::addrman::AddrMan>,
     /// Channel to send received blocks to the processing thread.
-    block_tx: mpsc::UnboundedSender<(Option<Arc<PeerStats>>, bitcoin::Block)>,
+    block_tx: mpsc::UnboundedSender<IncomingBlock>,
     /// Compact block reconstructions awaiting a `blocktxn`, at most one per
     /// peer. Bounded by the peer count, expired after
     /// [`compact::COMPACT_PENDING_TIMEOUT`], dropped when the peer disconnects
@@ -481,6 +497,18 @@ pub struct PeerManager {
     extra_txns: Arc<parking_lot::Mutex<compact::ExtraTxnCache>>,
     /// Compact block relay counters, rendered by the metrics endpoint.
     compact_stats: CompactBlockStats,
+    /// The peers we asked to announce blocks as `cmpctblock`s, least
+    /// recently useful at the front. Core's `lNodesAnnouncingHeaderAndIDs`.
+    hb_peers: parking_lot::Mutex<std::collections::VecDeque<PeerId>>,
+    /// The newest block that extended our tip, with its `cmpctblock` form
+    /// built once: every announcement and `MSG_CMPCT_BLOCK` answer for it
+    /// uses the same nonce, and `getblocktxn` for it needs no disk read.
+    /// Core's `m_most_recent_block` / `m_most_recent_compact_block`.
+    most_recent_block: RwLock<Option<RecentBlock>>,
+    /// The highest block announced before connecting it. Core's
+    /// `m_highest_fast_announce`: a block at or below it is not announced
+    /// early again.
+    highest_fast_announce: std::sync::atomic::AtomicU32,
     /// Per-address reconnect backoff state.
     reconnect_backoff: RwLock<HashMap<SocketAddr, ReconnectState>>,
     /// Exponential backoff for `.onion` reconnect candidates, keyed by host
@@ -759,6 +787,9 @@ impl PeerManager {
                 compact::DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN,
             ))),
             compact_stats: CompactBlockStats::default(),
+            hb_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            most_recent_block: RwLock::new(None),
+            highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
             onion_reconnect_backoff: RwLock::new(HashMap::new()),
@@ -817,6 +848,18 @@ impl PeerManager {
             }));
         }
 
+        // Announce a block to high-bandwidth peers as soon as it has passed
+        // everything short of connection, from whichever path it arrives on:
+        // P2P, `submitblock`, or a miner on the Stratum server.
+        {
+            let pm = Arc::downgrade(&mgr);
+            mgr.chain_state.set_pow_valid_block_hook(Box::new(move |block, height| {
+                if let Some(pm) = pm.upgrade() {
+                    pm.fast_announce(block, height);
+                }
+            }));
+        }
+
         // Spawn block processing thread
         let cs = chain_state;
         let mp = mempool;
@@ -825,8 +868,9 @@ impl PeerManager {
         let eta_secs = mgr.ibd_eta_secs.clone();
         let orph = mgr.orphanage.clone();
         let cs_for_block = cs.clone();
+        let pm_for_block = Arc::downgrade(&mgr);
         std::thread::spawn(move || {
-            Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph);
+            Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph, pm_for_block);
         });
 
         // Background AssumeUTXO catch-up connect loop. Long-lived: idles
@@ -3104,6 +3148,7 @@ impl PeerManager {
         // A departed peer's partial compact block can never be completed,
         // and its requests will never be answered.
         self.pending_compact.write().remove(&id);
+        self.hb_peers.lock().retain(|p| *p != id);
         self.in_flight_blocks.write().remove(&id);
     }
 
@@ -3626,6 +3671,10 @@ impl PeerManager {
             }
         }
 
+        if let Some(last) = headers.last() {
+            self.note_peer_has_block(id, last.block_hash());
+        }
+
         if accepted > 0 {
             // Update headers tip tracking from actual chain state
             let htip = self.chain_state.headers_tip_height() as u64;
@@ -3997,6 +4046,7 @@ impl PeerManager {
             return;
         }
         self.note_block_arrived(&block.block_hash());
+        self.note_peer_has_block(id, block.block_hash());
 
         // Operator-requested single-block re-fetch. Must come before every
         // other route: the normal paths reject a block we already have an
@@ -4044,7 +4094,7 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send((self.peer_stats(id), block));
+        let _ = self.block_tx.send((id, self.peer_stats(id), block));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -4583,7 +4633,7 @@ impl PeerManager {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn block_processor(
-        mut rx: mpsc::UnboundedReceiver<(Option<Arc<PeerStats>>, bitcoin::Block)>,
+        mut rx: mpsc::UnboundedReceiver<IncomingBlock>,
         chain_state: Arc<ChainState>,
         mempool: Arc<Mempool>,
         fee_estimator: Arc<FeeEstimator>,
@@ -4596,6 +4646,7 @@ impl PeerManager {
         network: Network,
         ibd_eta_secs: Arc<AtomicU64>,
         orphanage: Arc<TxOrphanage>,
+        peer_manager: std::sync::Weak<PeerManager>,
     ) {
         let mut last_log_height: u32 = 0;
         let mut last_prune_height: u32 = 0;
@@ -4668,7 +4719,7 @@ impl PeerManager {
             drop(ready);
 
             // Drain all available blocks from the channel
-            while let Ok((sender_stats, block)) = rx.try_recv() {
+            while let Ok((sender, sender_stats, block)) = rx.try_recv() {
                 let hash = block.block_hash();
                 // Compute fees BEFORE accept_block — connect_block removes spent coins.
                 let fees = Self::compute_block_fee_rates(&block, &chain_state);
@@ -4715,6 +4766,11 @@ impl PeerManager {
                             fee_estimator.record_block(&fees);
                             mempool.remove_for_block(&block, height);
                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
+                            if chain_state.tip_hash() == hash
+                                && let Some(pm) = peer_manager.upgrade()
+                            {
+                                pm.block_became_tip(sender, &block, height);
+                            }
                         }
                         // Drain buffer
                         loop {
@@ -5755,17 +5811,65 @@ impl PeerManager {
         };
         let headers_msg = NetworkMessage::Headers(vec![entry.header]);
         let inv_msg = NetworkMessage::Inv(vec![Inventory::Block(hash)]);
-        let peers = self.peers.read();
-        for handle in peers.values() {
-            if handle.info.state != PeerState::Connected {
-                continue;
+
+        // A peer that asked for high-bandwidth relay gets the block itself as
+        // a `cmpctblock` — but only the tip, one block at a time, as Core's
+        // `SendMessages` does (a reorg's intermediate blocks go out as
+        // headers). A peer that already has the block, because it sent it
+        // to us or the pre-connect announcement already reached it, is
+        // skipped.
+        let is_tip = self.chain_state.tip_hash() == hash;
+        let wants_compact = is_tip && {
+            let peers = self.peers.read();
+            peers.values().any(|h| {
+                h.info.state == PeerState::Connected
+                    && h.info.hb_from
+                    && h.info.compact_blocks
+                    && h.info.known_block != Some(hash)
+            })
+        };
+        let compact = if wants_compact {
+            self.cached_compact(&hash).or_else(|| {
+                self.chain_state
+                    .get_block(&hash)
+                    .and_then(|block| self.compact_for(&block, entry.height))
+            })
+        } else {
+            None
+        };
+
+        let mut announced = Vec::new();
+        {
+            let peers = self.peers.read();
+            for (id, handle) in peers.iter() {
+                if handle.info.state != PeerState::Connected || handle.info.known_block == Some(hash) {
+                    continue;
+                }
+                let msg = match &compact {
+                    Some(c) if handle.info.hb_from && handle.info.compact_blocks => {
+                        NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
+                            compact_block: (**c).clone(),
+                        })
+                    }
+                    _ if handle.info.prefers_headers => headers_msg.clone(),
+                    _ => inv_msg.clone(),
+                };
+                let is_compact = matches!(msg, NetworkMessage::CmpctBlock(_));
+                if handle.msg_tx.try_send(msg).is_ok() {
+                    if is_compact {
+                        self.compact_stats.sent_announce.fetch_add(1, Ordering::Relaxed);
+                    }
+                    announced.push(*id);
+                }
             }
-            let msg = if handle.info.prefers_headers {
-                headers_msg.clone()
-            } else {
-                inv_msg.clone()
-            };
-            let _ = handle.msg_tx.try_send(msg);
+        }
+        if !announced.is_empty() {
+            let mut peers = self.peers.write();
+            for id in announced {
+                if let Some(h) = peers.get_mut(&id) {
+                    h.info.known_block = Some(hash);
+                }
+            }
         }
     }
 
@@ -6434,27 +6538,61 @@ impl PeerManager {
         }
     }
 
+    /// Answer a `MSG_CMPCT_BLOCK` getdata with a `cmpctblock`, if the block
+    /// is within [`compact::MAX_CMPCTBLOCK_DEPTH`] of the tip and we are not
+    /// syncing (Core: `can_direct_fetch && pindex->nHeight >= tip->nHeight -
+    /// MAX_CMPCTBLOCK_DEPTH`). Returns false when the full block should be
+    /// sent instead.
+    fn serve_compact_block(&self, id: PeerId, hash: &bitcoin::BlockHash) -> bool {
+        if self.ibd.read().is_some() || self.is_ibd() {
+            return false;
+        }
+        let Some(entry) = self.chain_state.get_block_index(hash) else {
+            return false;
+        };
+        if entry.height.saturating_add(compact::MAX_CMPCTBLOCK_DEPTH) < self.chain_state.tip_height() {
+            return false;
+        }
+        let compact = match self.cached_compact(hash) {
+            Some(c) => c,
+            None => {
+                let Some(block) = self.chain_state.get_block(hash) else {
+                    return false;
+                };
+                match self.compact_for(&block, entry.height) {
+                    Some(c) => c,
+                    None => return false,
+                }
+            }
+        };
+        let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
+            compact_block: (*compact).clone(),
+        });
+        if self.send_to_peer(id, msg) {
+            self.compact_stats.sent_getdata.fetch_add(1, Ordering::Relaxed);
+            self.note_peer_has_block(id, *hash);
+        }
+        true
+    }
+
     fn handle_getdata(&self, id: PeerId, inventory: Vec<Inventory>) {
         let mut not_found = Vec::new();
         for inv in inventory {
             match inv {
-                // `MSG_CMPCT_BLOCK` (BIP 152). A peer requests the tip block
-                // as a compact block when it has a high-bandwidth compact-
-                // relay relationship with us — Bitcoin Core does this for
-                // the block immediately after its tip. We don't yet build
-                // `cmpctblock` responses, but BIP 152 explicitly permits
-                // answering a `MSG_CMPCT_BLOCK` getdata with a full `block`
-                // message (it is what Core itself sends for any block more
-                // than a few back from the tip), and Core accepts the full
-                // block against its in-flight compact request. Serving it
-                // as a full block is therefore correct; the alternative —
-                // letting it fall through to `_ => {}` — silently drops the
-                // request, so a Core peer stalls forever on the next block
-                // (it never re-requests). Treat it exactly like a block
-                // request.
+                // `MSG_CMPCT_BLOCK` (BIP 152). A block within
+                // `MAX_CMPCTBLOCK_DEPTH` of the tip is answered with a
+                // `cmpctblock` (`serve_compact_block`). Anything deeper, or
+                // anything while we are still syncing, gets the full `block`,
+                // which BIP 152 permits and Core itself sends; Core accepts
+                // it against its in-flight compact request. Letting the
+                // request fall through to `_ => {}` instead would silently
+                // drop it, and a Core peer never re-requests.
                 Inventory::Block(hash)
                 | Inventory::WitnessBlock(hash)
                 | Inventory::CompactBlock(hash) => {
+                    if matches!(inv, Inventory::CompactBlock(_)) && self.serve_compact_block(id, &hash) {
+                        continue;
+                    }
                     if let Some(block) = self.chain_state.get_block(&hash) {
                         // -maxuploadtarget: decline historical blocks once
                         // the rolling budget is spent (download/noban peers
@@ -6551,6 +6689,189 @@ impl PeerManager {
         })
     }
 
+    /// A block delivered by `from` has just become our tip. Core promotes the
+    /// peer that delivered the best block to high-bandwidth compact relay
+    /// (`BlockChecked` → `MaybeSetPeerAsAnnouncingHeaderAndIDs`).
+    fn block_became_tip(&self, from: PeerId, block: &bitcoin::Block, height: u32) {
+        let _ = (block, height);
+        if self.ibd.read().is_some() || self.is_ibd() {
+            return;
+        }
+        self.maybe_set_peer_as_hb(from);
+    }
+
+    /// Bitcoin Core's `NewPoWValidBlock`: announce a block that extends our
+    /// tip to high-bandwidth peers before connecting it. It has passed proof
+    /// of work, header context and `check_block`; script validation and the
+    /// UTXO update come after. BIP 152 allows relaying a block this early,
+    /// and a connect failure does not take the announcement back: every
+    /// receiver validates the block itself, and whoever produced an invalid
+    /// block paid for its proof of work.
+    ///
+    /// Called under the chain's accept lock, so it only reads chain state.
+    pub fn fast_announce(&self, block: &bitcoin::Block, height: u32) {
+        if self.ibd.read().is_some() || self.is_ibd() {
+            return;
+        }
+        // One early announcement per height, and never for a lower one.
+        if self
+            .highest_fast_announce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| (height > h).then_some(height))
+            .is_err()
+        {
+            return;
+        }
+        if !crate::validation::block::segwit_active_at(self.chain_state.network, height) {
+            return;
+        }
+        let hash = block.block_hash();
+        let Some(compact) = self.compact_for(block, height) else {
+            return;
+        };
+        let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
+            compact_block: (*compact).clone(),
+        });
+        let mut announced = Vec::new();
+        {
+            let peers = self.peers.read();
+            for (id, handle) in peers.iter() {
+                if handle.info.state == PeerState::Connected
+                    && handle.info.hb_from
+                    && handle.info.compact_blocks
+                    && handle.info.known_block != Some(hash)
+                    && handle.msg_tx.try_send(msg.clone()).is_ok()
+                {
+                    announced.push(*id);
+                }
+            }
+        }
+        if announced.is_empty() {
+            return;
+        }
+        tracing::debug!(%hash, height, peers = announced.len(), "announcing block before connecting it");
+        self.compact_stats
+            .sent_announce
+            .fetch_add(announced.len() as u64, Ordering::Relaxed);
+        let mut peers = self.peers.write();
+        for id in announced {
+            if let Some(h) = peers.get_mut(&id) {
+                h.info.known_block = Some(hash);
+            }
+        }
+    }
+
+    /// The `cmpctblock` form of `block`, from the tip cache or built now. A
+    /// block at least as high as the cached one replaces it; an older block
+    /// (a `MSG_CMPCT_BLOCK` getdata a few blocks back) is built without
+    /// displacing the tip.
+    fn compact_for(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Option<Arc<bitcoin::bip152::HeaderAndShortIds>> {
+        let hash = block.block_hash();
+        if let Some(recent) = self.most_recent_block.read().as_ref()
+            && recent.hash == hash
+        {
+            return Some(recent.compact.clone());
+        }
+        let compact = match compact::make_compact_block(block) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(%hash, error = %e, "could not build a compact block");
+                return None;
+            }
+        };
+        let mut recent = self.most_recent_block.write();
+        match recent.as_ref() {
+            // Built concurrently by another path: keep one nonce per block.
+            Some(r) if r.hash == hash => return Some(r.compact.clone()),
+            Some(r) if r.height > height => return Some(compact),
+            _ => {}
+        }
+        *recent = Some(RecentBlock {
+            hash,
+            height,
+            block: Arc::new(block.clone()),
+            compact: compact.clone(),
+        });
+        Some(compact)
+    }
+
+    /// The cached `cmpctblock` for `hash`, if it is the tip cache's block.
+    fn cached_compact(&self, hash: &bitcoin::BlockHash) -> Option<Arc<bitcoin::bip152::HeaderAndShortIds>> {
+        self.most_recent_block
+            .read()
+            .as_ref()
+            .filter(|r| r.hash == *hash)
+            .map(|r| r.compact.clone())
+    }
+
+    /// Record that `id` has `hash` (it sent or announced it, or we announced
+    /// it to the peer).
+    fn note_peer_has_block(&self, id: PeerId, hash: bitcoin::BlockHash) {
+        if let Some(h) = self.peers.write().get_mut(&id) {
+            h.info.known_block = Some(hash);
+        }
+    }
+
+    /// Bitcoin Core's `MaybeSetPeerAsAnnouncingHeaderAndIDs`
+    /// (`net_processing.cpp`): ask `id` to announce new blocks to us as
+    /// `cmpctblock`s, keeping at most [`MAX_HB_PEERS`] such peers. The least
+    /// recently useful is demoted to make room, but an inbound promotion never
+    /// demotes our only outbound high-bandwidth peer.
+    fn maybe_set_peer_as_hb(&self, id: PeerId) {
+        use bitcoin::p2p::message_compact_blocks::SendCmpct;
+        // Under -blocksonly our mempool cannot reconstruct compact blocks.
+        if self.blocksonly() {
+            return;
+        }
+        let (demoted, promoted) = {
+            let mut hb = self.hb_peers.lock();
+            let peers = self.peers.read();
+            let Some(handle) = peers.get(&id) else {
+                return;
+            };
+            if !handle.info.compact_blocks {
+                return;
+            }
+            if let Some(pos) = hb.iter().position(|p| *p == id) {
+                let _ = hb.remove(pos);
+                hb.push_back(id);
+                return;
+            }
+            let is_outbound =
+                |p: &PeerId| peers.get(p).is_some_and(|h| h.info.direction == Direction::Outbound);
+            if handle.info.direction == Direction::Inbound
+                && hb.len() >= MAX_HB_PEERS
+                && hb.iter().filter(|p| is_outbound(p)).count() == 1
+                && hb.front().is_some_and(is_outbound)
+            {
+                // Put the outbound peer in the second slot, out of reach of
+                // the pop below.
+                hb.swap(0, 1);
+            }
+            let demoted = if hb.len() >= MAX_HB_PEERS { hb.pop_front() } else { None };
+            hb.push_back(id);
+            (demoted, id)
+        };
+        {
+            let mut peers = self.peers.write();
+            if let Some(d) = demoted.and_then(|d| peers.get_mut(&d)) {
+                d.info.hb_to = false;
+            }
+            if let Some(p) = peers.get_mut(&promoted) {
+                p.info.hb_to = true;
+            }
+        }
+        if let Some(d) = demoted {
+            tracing::debug!(peer = d, "demoting peer from high-bandwidth compact relay");
+            self.send_to_peer(d, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        }
+        tracing::debug!(peer = promoted, "selecting peer for high-bandwidth compact relay");
+        self.send_to_peer(promoted, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+    }
+
     /// Compact block relay counters, for the metrics endpoint.
     pub fn compact_block_stats(&self) -> &CompactBlockStats {
         &self.compact_stats
@@ -6628,6 +6949,7 @@ impl PeerManager {
         let Some(entry) = self.accept_compact_header(id, &compact.header) else {
             return;
         };
+        self.note_peer_has_block(id, block_hash);
 
         // 4. Already have the block.
         if entry.status != BlockStatus::HeaderOnly {
@@ -6765,7 +7087,7 @@ impl PeerManager {
                     return;
                 }
                 self.log_reconstructed(id, &block_hash, entry.height, &stats, false, started);
-                let _ = self.block_tx.send((self.peer_stats(id), block));
+                let _ = self.block_tx.send((id, self.peer_stats(id), block));
             }
             compact::Reconstruction::Partial { txs, missing_indices, stats } => {
                 // 11. Ask the peer for what the mempool could not supply.
@@ -6811,6 +7133,19 @@ impl PeerManager {
         id: PeerId,
         request: bitcoin::bip152::BlockTransactionsRequest,
     ) {
+        // The tip cache first, as Core does: the block a peer is most likely
+        // reconstructing is the one we just announced, and it needs no disk
+        // read.
+        let cached = self
+            .most_recent_block
+            .read()
+            .as_ref()
+            .filter(|r| r.hash == request.block_hash)
+            .map(|r| r.block.clone());
+        if let Some(block) = cached {
+            self.send_block_txn(id, &request, &block);
+            return;
+        }
         let Some(entry) = self.chain_state.get_block_index(&request.block_hash) else {
             tracing::debug!(id, hash = %request.block_hash, "getblocktxn for a block we don't have");
             return;
@@ -6828,7 +7163,18 @@ impl PeerManager {
             tracing::debug!(id, hash = %request.block_hash, "getblocktxn for a block we don't have");
             return;
         };
-        match bitcoin::bip152::BlockTransactions::from_request(&request, &block) {
+        self.send_block_txn(id, &request, &block);
+    }
+
+    /// Answer a `getblocktxn` from `block`; an out-of-range index is
+    /// misbehaviour (Core: "getblocktxn with out-of-bounds tx indices").
+    fn send_block_txn(
+        &self,
+        id: PeerId,
+        request: &bitcoin::bip152::BlockTransactionsRequest,
+        block: &bitcoin::Block,
+    ) {
+        match bitcoin::bip152::BlockTransactions::from_request(request, block) {
             Ok(txns) => {
                 self.send_to_peer(
                     id,
@@ -6873,7 +7219,7 @@ impl PeerManager {
         match compact::complete_pending(pending, &txns, segwit_active) {
             Ok((block, stats)) => {
                 self.log_reconstructed(id, &block_hash, height, &stats, true, since);
-                let _ = self.block_tx.send((self.peer_stats(id), block));
+                let _ = self.block_tx.send((id, self.peer_stats(id), block));
             }
             Err(compact::CompleteError::Invalid) => {
                 tracing::debug!(id, %block_hash, "blocktxn does not match the compact block");
@@ -7472,16 +7818,13 @@ impl PeerManager {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Negotiate compact block support (BIP 152, version 2 = with witness).
-        // This is `hb=1`, so the peer may push us `cmpctblock`s from here on.
-        // The flag is set before the message goes out: the peer's first
-        // `cmpctblock` can be processed before this task resumes.
-        if let Some(handle) = self.peers.write().get_mut(&id) {
-            handle.info.hb_to = true;
-        }
+        // Negotiate compact block support (BIP 152, version 2 = with witness)
+        // in low-bandwidth mode, as Core does. A peer is asked for
+        // high-bandwidth announcements only once it has delivered a block
+        // that became our tip (`maybe_set_peer_as_hb`).
         writer.send(NetworkMessage::SendCmpct(
             bitcoin::p2p::message_compact_blocks::SendCmpct {
-                send_compact: true,
+                send_compact: false,
                 version: 2,
             },
         ))
@@ -10196,5 +10539,98 @@ mod tests {
 
         pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
         assert_eq!(info(&pm), (true, true), "high-bandwidth v2");
+    }
+
+    // ---- BIP 152 high-bandwidth peer selection ----
+
+    fn hb_peer(
+        pm: &PeerManager,
+        id: PeerId,
+        dir: Direction,
+    ) -> mpsc::Receiver<NetworkMessage> {
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+        let (mut h, rx) = mk_handle_rx(id, addr, PeerState::Connected, 0);
+        h.info.direction = dir;
+        h.info.compact_blocks = true;
+        pm.peers.write().insert(id, h);
+        rx
+    }
+
+    fn sendcmpct_flags(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<bool> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let NetworkMessage::SendCmpct(s) = m {
+                out.push(s.send_compact);
+            }
+        }
+        out
+    }
+
+    /// Core's `MaybeSetPeerAsAnnouncingHeaderAndIDs`, case by case: a known
+    /// peer moves to the back; a fourth peer demotes the front; an inbound
+    /// promotion never demotes the only outbound high-bandwidth peer; a peer
+    /// without version-2 compact block support is never selected.
+    #[test]
+    fn maybe_set_peer_as_hb_follows_cores_selection() {
+        let pm = empty_peer_manager();
+        let mut rx: HashMap<PeerId, mpsc::Receiver<NetworkMessage>> = HashMap::new();
+        rx.insert(1, hb_peer(&pm, 1, Direction::Outbound));
+        for id in 2..=5 {
+            rx.insert(id, hb_peer(&pm, id, Direction::Inbound));
+        }
+        let deque = |pm: &PeerManager| pm.hb_peers.lock().iter().copied().collect::<Vec<_>>();
+        let hb_to = |pm: &PeerManager, id: PeerId| pm.peers.read()[&id].info.hb_to;
+
+        for id in 1..=3 {
+            pm.maybe_set_peer_as_hb(id);
+        }
+        assert_eq!(deque(&pm), vec![1, 2, 3]);
+        assert_eq!(sendcmpct_flags(rx.get_mut(&1).unwrap()), vec![true]);
+        assert!(hb_to(&pm, 1) && hb_to(&pm, 2) && hb_to(&pm, 3));
+
+        // Already selected: moves to the back, nothing is sent.
+        pm.maybe_set_peer_as_hb(1);
+        assert_eq!(deque(&pm), vec![2, 3, 1]);
+        assert!(sendcmpct_flags(rx.get_mut(&1).unwrap()).is_empty());
+
+        // A fourth, inbound: the front (inbound 2) is demoted.
+        pm.maybe_set_peer_as_hb(4);
+        assert_eq!(deque(&pm), vec![3, 1, 4]);
+        assert_eq!(sendcmpct_flags(rx.get_mut(&2).unwrap()), vec![true, false]);
+        assert!(!hb_to(&pm, 2));
+
+        // Make the outbound peer the front: 3 out, then 1 and 4 remain with
+        // the outbound first.
+        pm.hb_peers.lock().clear();
+        pm.hb_peers.lock().extend([1, 3, 4]);
+        // An inbound promotion with the only outbound peer at the front swaps
+        // it into the second slot, so inbound 3 is demoted instead.
+        pm.maybe_set_peer_as_hb(5);
+        assert_eq!(deque(&pm), vec![1, 4, 5]);
+        assert_eq!(sendcmpct_flags(rx.get_mut(&3).unwrap()).last(), Some(&false));
+        assert!(!sendcmpct_flags(rx.get_mut(&1).unwrap()).contains(&false));
+
+        // No v2 compact block support: never selected.
+        let _rx6 = hb_peer(&pm, 6, Direction::Inbound);
+        pm.peers.write().get_mut(&6).unwrap().info.compact_blocks = false;
+        pm.maybe_set_peer_as_hb(6);
+        assert!(!deque(&pm).contains(&6));
+
+        // -blocksonly: never selected.
+        pm.set_blocksonly(true);
+        pm.hb_peers.lock().clear();
+        pm.maybe_set_peer_as_hb(2);
+        assert!(deque(&pm).is_empty());
+    }
+
+    /// A disconnected peer leaves the high-bandwidth set.
+    #[test]
+    fn disconnect_removes_a_high_bandwidth_peer() {
+        let pm = empty_peer_manager();
+        let _rx = hb_peer(&pm, 1, Direction::Inbound);
+        pm.maybe_set_peer_as_hb(1);
+        assert_eq!(pm.hb_peers.lock().len(), 1);
+        pm.handle_peer_disconnected(1);
+        assert!(pm.hb_peers.lock().is_empty());
     }
 }

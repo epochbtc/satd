@@ -17688,6 +17688,80 @@ fn stratum_work_follows_a_tip_reached_by_block_download() {
     );
 }
 
+/// A block a miner finds through the Stratum server reaches a high-bandwidth
+/// P2P peer as a `cmpctblock`. Stratum submissions go through the same
+/// `accept_block` as every other block, so they get the pre-connect
+/// announcement too — which is what shortens propagation for a block this
+/// node found.
+#[test]
+fn stratum_found_block_reaches_a_high_bandwidth_peer_as_cmpctblock() {
+    use addconn_listener::{Inbound, recv, send};
+    use bitcoin::p2p::message::NetworkMessage;
+    use serde_json::json;
+    let port = find_available_port();
+    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let funder = DeterministicWallet::from_secret([0x5b; 32]);
+    node.rpc_ok("generatetoaddress", vec![json!(101), json!(funder.address.to_string())]);
+    let miner = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+
+    // A P2P peer the node dialled, asking for high-bandwidth relay.
+    let peer = Inbound::bind();
+    let out = node
+        .rpc_call_with_params(
+            "addconnection",
+            vec![json!(peer.addr.to_string()), json!("outbound-full-relay"), json!(false)],
+        )
+        .unwrap();
+    assert!(out["error"].is_null(), "addconnection: {out}");
+    let (mut stream, _) = peer.accept_version(test_timeout(20));
+    peer.complete_handshake(&mut stream);
+    send(
+        &mut stream,
+        NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+            send_compact: true,
+            version: 2,
+        }),
+    );
+    poll_until(
+        || {
+            node.rpc_ok("getpeerinfo", vec![])
+                .as_array()
+                .is_some_and(|ps| ps.iter().any(|p| p["bip152_hb_from"] == json!(true)))
+        },
+        test_timeout(20),
+        "the node must record the high-bandwidth request",
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut client = plain_stratum_client(port);
+        let (extranonce1, params) = client.handshake(&format!("{miner}.rig1")).await;
+        let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
+        let submit = json!([
+            format!("{miner}.rig1"),
+            params[0],
+            hex::encode(extranonce2),
+            format!("{ntime:08x}"),
+            format!("{nonce:08x}"),
+        ]);
+        let reply = client.call("mining.submit", submit).await;
+        assert_eq!(reply["result"], true, "{reply}");
+    });
+
+    let tip: bitcoin::BlockHash = get_rpc_str(&node, "getbestblockhash").unwrap().parse().unwrap();
+    let deadline = Instant::now() + test_timeout(20);
+    loop {
+        assert!(Instant::now() < deadline, "no cmpctblock for the Stratum-found block");
+        if let NetworkMessage::CmpctBlock(c) = recv(&mut stream)
+            && c.compact_block.header.block_hash() == tip
+        {
+            break;
+        }
+    }
+    let block = node.rpc_ok("getblock", vec![json!(tip.to_string())]);
+    assert_eq!(block["height"], json!(102));
+}
+
 #[test]
 fn stratum_v1_new_block_pushes_clean_job() {
     use serde_json::json;
