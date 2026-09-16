@@ -109,6 +109,10 @@ pub enum MempoolError {
     InsufficientFee(u64, u64),
     #[error("mempool full")]
     MempoolFull,
+    /// Below the rolling minimum a full pool has raised: the fee, and the fee
+    /// that minimum demands for the transaction's size, in satoshis.
+    #[error("mempool min fee not met")]
+    MempoolMinFeeNotMet(u64, u64),
     #[error("{0}")]
     Validation(String),
     /// A script failure on the *mempool* path. Core reports
@@ -215,6 +219,7 @@ impl MempoolError {
             | Self::ConflictingSpend
             | Self::InsufficientFee(..)
             | Self::MempoolFull
+            | Self::MempoolMinFeeNotMet(..)
             | Self::NonFinal
             | Self::NonBip68Final
             | Self::Dust
@@ -239,6 +244,7 @@ impl MempoolError {
             MempoolError::MissingInputs => "bad-txns-inputs-missingorspent".to_string(),
             MempoolError::InsufficientFee(..) => "min relay fee not met".to_string(),
             MempoolError::MempoolFull => "mempool full".to_string(),
+            MempoolError::MempoolMinFeeNotMet(..) => "mempool min fee not met".to_string(),
             MempoolError::Validation(s) => s.clone(),
             MempoolError::Script(s) => {
                 format!("mempool-script-verify-flag-failed ({s})")
@@ -293,20 +299,30 @@ impl MempoolError {
             MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
             // Core: `strprintf("%d < %d", package_fee, min_relay_fee)`.
             MempoolError::InsufficientFee(fee, required) => Some(format!("{fee} < {required}")),
+            MempoolError::MempoolMinFeeNotMet(fee, required) => Some(format!("{fee} < {required}")),
             MempoolError::Script(detail) => Some(detail.clone()),
             _ => None,
         }
     }
 
-    /// The full string for `sendrawtransaction` error messages. Produces
-    /// `"reject-reason, details"` when details exist, otherwise just the
-    /// reject-reason.
-    pub fn sendrawtransaction_msg(&self) -> String {
-        if let Some(detail) = self.reject_details() {
-            detail
-        } else {
-            self.reject_reason()
+    /// Core's `TxValidationState::ToString()`: the reject reason, then
+    /// `, ` and the detail when there is one. It is `sendrawtransaction`'s
+    /// error message and `testmempoolaccept`'s `reject-details`. Some details
+    /// already open with their reason, and a script failure's reason already
+    /// carries its detail in parentheses.
+    pub fn state_string(&self) -> String {
+        let reason = self.reject_reason();
+        match self.reject_details() {
+            None => reason,
+            Some(_) if matches!(self, MempoolError::Script(_)) => reason,
+            Some(detail) if detail.starts_with(&reason) => detail,
+            Some(detail) => format!("{reason}, {detail}"),
         }
+    }
+
+    /// The `sendrawtransaction` error message: [`Self::state_string`].
+    pub fn sendrawtransaction_msg(&self) -> String {
+        self.state_string()
     }
 }
 
@@ -470,6 +486,9 @@ pub struct MempoolInfo {
     pub bytes: usize,
     pub max_size: usize,
     pub min_fee_rate: u64,
+    /// Core's `mempoolminfee`: the larger of the rolling minimum and the
+    /// relay floor, sat/kvB.
+    pub mempool_min_fee: u64,
     pub incremental_relay_fee: u64,
     pub full_rbf: bool,
     /// Count of locally-originated txs not yet confirmed propagated.
@@ -682,6 +701,67 @@ struct MempoolInner {
     /// When a tx enters the pool any pre-existing delta here is applied to its
     /// `MempoolEntry::fee_delta`; the entry remains so subsequent calls stack.
     fee_deltas: FxHashMap<Txid, i64>,
+    /// Core's `m_sequence_number`: starts at 1 and goes up by one for every
+    /// transaction added or removed, for any reason. `getrawmempool` reports
+    /// it so a client can line a snapshot up with a notification stream.
+    sequence: u64,
+    /// Core's rolling minimum feerate, raised by eviction and decayed after
+    /// blocks. Behind a `Mutex` because reading it *is* a write: see
+    /// `RollingMinFee::at`.
+    rolling: Mutex<RollingMinFee>,
+}
+
+/// Core's `rollingMinimumFeeRate` and its bookkeeping (`txmempool.cpp`).
+#[derive(Debug, Clone, Copy, Default)]
+struct RollingMinFee {
+    /// sat/kvB, fractional between decays as in Core.
+    rate: f64,
+    last_update: i64,
+    block_since_bump: bool,
+}
+
+/// Core's `ROLLING_FEE_HALFLIFE`: twelve hours.
+const ROLLING_FEE_HALFLIFE: f64 = 60.0 * 60.0 * 12.0;
+
+impl RollingMinFee {
+    /// Core's `GetMinFee`, at `now`, for a pool using `usage` of `limit`
+    /// bytes. Returns the minimum in sat/kvB.
+    ///
+    /// Core declares `rollingMinimumFeeRate` and `lastRollingFeeUpdate`
+    /// `mutable` and writes them from the const `GetMinFee`, so *every* caller
+    /// — a fee check, `getmempoolinfo`, the periodic `feefilter` — banks the
+    /// decay it just computed. Taking `&mut self` here keeps that: a caller
+    /// that computed decay and dropped it would lose it for good, because
+    /// `removeForBlock` moves `last_update` up to the block without applying
+    /// anything, so the elapsed time would never be charged against the rate.
+    fn at(&mut self, now: i64, usage: usize, limit: usize, incremental: u64) -> u64 {
+        if !self.block_since_bump || self.rate == 0.0 {
+            return self.rate.round() as u64;
+        }
+        if now > self.last_update + 10 {
+            let mut halflife = ROLLING_FEE_HALFLIFE;
+            if usage < limit / 4 {
+                halflife /= 4.0;
+            } else if usage < limit / 2 {
+                halflife /= 2.0;
+            }
+            self.rate /= 2f64.powf((now - self.last_update) as f64 / halflife);
+            self.last_update = now;
+            if self.rate < incremental as f64 / 2.0 {
+                self.rate = 0.0;
+                return 0;
+            }
+        }
+        (self.rate.round() as u64).max(incremental)
+    }
+
+    /// Core's `trackPackageRemoved`.
+    fn package_removed(&mut self, rate: u64) {
+        if rate as f64 > self.rate {
+            self.rate = rate as f64;
+            self.block_since_bump = false;
+        }
+    }
 }
 
 impl MempoolInner {
@@ -696,6 +776,7 @@ impl MempoolInner {
     /// Account a newly-inserted entry of `tx_size` bytes into the per-class
     /// counters. Call right after `entries.insert`.
     fn account_insert(&mut self, scope: QuarantineScope, tx_size: usize) {
+        self.sequence += 1;
         self.total_bytes += tx_size;
         if scope.is_quarantined() {
             self.quarantine_bytes += tx_size;
@@ -706,6 +787,7 @@ impl MempoolInner {
     /// Call right after `entries.remove`, passing the removed entry's scope and
     /// serialized size.
     fn account_remove(&mut self, scope: QuarantineScope, tx_size: usize) {
+        self.sequence += 1;
         self.total_bytes = self.total_bytes.saturating_sub(tx_size);
         if scope.is_quarantined() {
             self.quarantine_bytes = self.quarantine_bytes.saturating_sub(tx_size);
@@ -1086,6 +1168,8 @@ impl Mempool {
                 quarantine_bytes: 0,
                 unbroadcast: HashMap::new(),
                 fee_deltas: FxHashMap::default(),
+                sequence: 1,
+                rolling: Mutex::new(RollingMinFee::default()),
             }),
             unbroadcast_len: std::sync::atomic::AtomicUsize::new(0),
             config: RwLock::new(config),
@@ -1248,6 +1332,37 @@ impl Mempool {
     /// (e.g. per-peer `feefilter`) avoid cloning the whole policy struct.
     pub fn min_fee_rate(&self) -> u64 {
         self.config.read().min_fee_rate
+    }
+
+    /// Test-only: raise the rolling minimum as an eviction would, without
+    /// having to fill and trim a pool first.
+    #[cfg(test)]
+    pub(crate) fn raise_rolling_min_for_test(&self, rate: u64) {
+        self.inner.read().rolling.lock().package_removed(rate);
+    }
+
+    /// Core's `GetMinFee`: the rolling minimum a full pool raised, decayed to
+    /// now. Zero once it has decayed away — the static relay floor is a
+    /// separate clamp each caller applies, as Core's `filterToSend` does.
+    ///
+    /// Reading this *writes*: it banks the decay it computed. That is Core's
+    /// behaviour, and the periodic `feefilter` send is the caller Core relies
+    /// on to keep the clock moving on a node nobody is submitting to.
+    pub fn min_fee(&self) -> u64 {
+        // Policy first, released before `inner` — the leaf-lock order `info`
+        // and `remove_expired` keep.
+        let (max_size_bytes, incremental_relay_fee) = {
+            let cfg = self.config.read();
+            (cfg.max_size_bytes, cfg.incremental_relay_fee)
+        };
+        let inner = self.inner.read();
+        let acting_bytes = inner.acting_bytes();
+        inner.rolling.lock().at(
+            crate::time::now_secs() as i64,
+            acting_bytes,
+            max_size_bytes,
+            incremental_relay_fee,
+        )
     }
 
     /// Current maximum mempool size in bytes.
@@ -1861,8 +1976,10 @@ impl Mempool {
 
                 // Apply: per-class byte accounting, then stamp the new scope+rule.
                 let size = bitcoin::consensus::serialize(&tx).len();
+                // A class change moves no transaction in or out of the pool.
                 inner.account_remove(old_scope, size);
                 inner.account_insert(new_scope, size);
+                inner.sequence -= 2;
                 if let Some(e) = inner.entries.get_mut(&txid) {
                     e.scope = new_scope;
                     e.quarantine_rule = stamped_rule.clone();
@@ -1890,11 +2007,11 @@ impl Mempool {
             // that overflowed, only the overflow amount.
             if inner.acting_bytes() > cfg.max_size_bytes {
                 let over = inner.acting_bytes() - cfg.max_size_bytes;
-                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, false));
+                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, false, cfg.incremental_relay_fee));
             }
             if inner.quarantine_bytes > cfg.quarantine_max_bytes {
                 let over = inner.quarantine_bytes - cfg.quarantine_max_bytes;
-                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, true));
+                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, true, cfg.incremental_relay_fee));
             }
 
             // Net visibility diff for the standard (acting-only) surfaces,
@@ -1928,6 +2045,19 @@ impl Mempool {
                     ));
                 }
             }
+
+            // Core's `m_sequence_number` counts entries and exits of the set
+            // `getrawmempool(mempool_sequence=true)` reports, which for satd is
+            // the acting class. A reload that quarantines a resident
+            // transaction (or promotes one back) changes that set without
+            // adding or removing anything physically, and the cancelled
+            // accounting bumps above leave the counter still. A client would
+            // then see two different txid sets carrying the same sequence and
+            // nothing to tell it a change had been missed. The diff above is
+            // computed over the whole set, so descendants dragged across the
+            // boundary are counted with the ancestor that dragged them.
+
+            inner.sequence += (std_enter.len() + std_leave.len()) as u64;
 
             self.sync_unbroadcast_len(&inner);
         }
@@ -2428,6 +2558,19 @@ impl Mempool {
         // prioritised transaction — one of #660's bullets.
         let effective_fee = modified_fee(fee, fee_delta);
         let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight as u64);
+        // Core's `CheckFeeRate`: the rolling minimum a full pool raised comes
+        // first, then the static relay floor.
+        let acting_bytes = inner.acting_bytes();
+        let min_fee = inner.rolling.lock().at(
+            crate::time::now_secs() as i64,
+            acting_bytes,
+            cfg.max_size_bytes,
+            cfg.incremental_relay_fee,
+        );
+        let required = policy::fee_for_rate(min_fee, weight as u64);
+        if required > 0 && effective_fee < required {
+            return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
+        }
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(
                 effective_fee,
@@ -2616,7 +2759,7 @@ impl Mempool {
                 return Err(MempoolError::MempoolFull);
             }
             // Evict enough lowest-fee-rate entries *of this class* to make room.
-            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size, quarantined);
+            evicted_full_pool = Self::evict_lowest_fee_entries(&mut inner, tx_size, quarantined, cfg.incremental_relay_fee);
             self.sync_unbroadcast_len(&inner);
             // If still not enough room after eviction, reject.
             let class_bytes_after = if quarantined {
@@ -2821,6 +2964,12 @@ impl Mempool {
         let mut evicted_conflicts: Vec<Txid> = Vec::new();
         {
             let mut inner = self.inner.write();
+            // Core's `removeForBlock`: the rolling minimum starts decaying.
+            {
+                let mut rolling = inner.rolling.lock();
+                rolling.last_update = crate::time::now_secs() as i64;
+                rolling.block_since_bump = true;
+            }
             for tx in &block.txdata {
                 let txid = tx.compute_txid();
                 if let Some(entry) = inner.entries.remove(&txid) {
@@ -3184,6 +3333,20 @@ impl Mempool {
     /// dedicated extension surfaces (`getquarantineinfo`/`listquarantine`/
     /// `getquarantineentry`, PR 7b). Until a policy is loaded every scope is
     /// empty, so this equals the union and behavior is byte-identical.
+    /// The acting txids and the mempool sequence number, read under one
+    /// lock so the number describes exactly that set (Core's
+    /// `MempoolToJSON` with `mempool_sequence`).
+    pub fn acting_txids_with_sequence(&self) -> (Vec<Txid>, u64) {
+        let inner = self.inner.read();
+        let txids = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.scope.is_acting())
+            .map(|(k, _)| *k)
+            .collect();
+        (txids, inner.sequence)
+    }
+
     pub fn get_acting_entries(&self) -> Vec<(Txid, MempoolEntry)> {
         self.inner
             .read()
@@ -4310,6 +4473,17 @@ impl Mempool {
 
         let effective_fee = modified_fee(fee, priority_delta);
         let fee_rate = policy::fee_rate_sat_per_kvb(effective_fee, weight_u64);
+        let acting_bytes = inner.acting_bytes();
+        let min_fee = inner.rolling.lock().at(
+            crate::time::now_secs() as i64,
+            acting_bytes,
+            cfg.max_size_bytes,
+            cfg.incremental_relay_fee,
+        );
+        let required = policy::fee_for_rate(min_fee, weight_u64);
+        if required > 0 && effective_fee < required {
+            return Err(MempoolError::MempoolMinFeeNotMet(effective_fee, required));
+        }
         if fee_rate < cfg.min_fee_rate {
             return Err(MempoolError::InsufficientFee(
                 effective_fee,
@@ -4721,9 +4895,19 @@ impl Mempool {
                         ));
                     }
                 }
-                Err(MempoolError::InsufficientFee(..))
-                | Err(MempoolError::Dust)
-                | Err(MempoolError::EphemeralDustFee) => {
+                // `MempoolMinFeeNotMet` belongs here with the static floor's
+                // `InsufficientFee`: a zero-fee ephemeral dust parent fails the
+                // relay floor by construction, and which of the two floors
+                // refused it is an accident of whether the pool has evicted
+                // anything yet. Leaving it out sent every dust parent to the
+                // catch-all arm the moment the rolling minimum rose above zero,
+                // failing a package form that works on an idle node.
+                Err(
+                    orig_err @ (MempoolError::InsufficientFee(..)
+                    | MempoolError::MempoolMinFeeNotMet(..)
+                    | MempoolError::Dust
+                    | MempoolError::EphemeralDustFee),
+                ) => {
                     // Candidate for ephemeral dust parent: check the conditions.
                     let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     let sum_out: u64 = ptx.tx.output.iter().map(|o| o.value.to_sat()).sum();
@@ -4783,6 +4967,12 @@ impl Mempool {
                     } else if dust_count == 1 && base_fee == 0 {
                         // Valid ephemeral dust candidate — defer acceptance.
                         ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
+                    } else if matches!(orig_err, MempoolError::MempoolMinFeeNotMet(..)) {
+                        // The rolling minimum refused it and it is not a dust
+                        // parent: report what refused it, with Core's
+                        // `TxValidationState::ToString()` shape, rather than
+                        // re-deriving a static-floor reason that did not fire.
+                        failed.insert(ptx.wtxid, orig_err.state_string());
                     } else {
                         // Not ephemeral dust — propagate original error.
                         // Re-compute the reason.
@@ -5514,6 +5704,7 @@ impl Mempool {
         inner: &mut MempoolInner,
         bytes_needed: usize,
         want_quarantined: bool,
+        incremental_relay_fee: u64,
     ) -> Vec<Txid> {
         // Sort *this class's* entries by fee rate ascending; the other class is
         // never an eviction candidate (its own budget governs it).
@@ -5550,6 +5741,7 @@ impl Mempool {
             if to_remove.contains(txid) {
                 continue;
             }
+            let package_start = to_remove.len();
             to_remove.push(*txid);
             if let Some(entry) = inner.entries.get(txid) {
                 freed += bitcoin::consensus::serialize(&entry.tx).len();
@@ -5587,6 +5779,19 @@ impl Mempool {
                     to_remove.push(child);
                     desc_queue.push(child);
                 }
+            }
+            // Core's `TrimToSize`: the rolling minimum rises to the evicted
+            // package's feerate plus the incremental relay fee, so nothing
+            // paying what was just evicted gets back in before a block.
+            if !want_quarantined {
+                let (fees, weight) = to_remove[package_start..]
+                    .iter()
+                    .filter_map(|t| inner.entries.get(t))
+                    .fold((0u64, 0u64), |(f, w), e| {
+                        (f + modified_fee(e.fee, e.fee_delta), w + e.weight as u64)
+                    });
+                let removed = policy::fee_rate_sat_per_kvb(fees, weight) + incremental_relay_fee;
+                inner.rolling.lock().package_removed(removed);
             }
         }
 
@@ -5765,11 +5970,19 @@ impl Mempool {
                     .is_some_and(|e| e.scope.is_acting())
             })
             .count();
+        let acting_bytes = inner.acting_bytes();
+        let rolling_min = inner.rolling.lock().at(
+            crate::time::now_secs() as i64,
+            acting_bytes,
+            max_size,
+            incremental_relay_fee,
+        );
         MempoolInfo {
             size,
             bytes: inner.acting_bytes(),
             max_size,
             min_fee_rate,
+            mempool_min_fee: rolling_min.max(min_fee_rate),
             incremental_relay_fee,
             full_rbf,
             unbroadcast,
@@ -6169,7 +6382,7 @@ mod tests {
         let original_bytes = inner.total_bytes;
 
         // Evict to free space
-        Mempool::evict_lowest_fee_entries(&mut inner, original_bytes, false);
+        Mempool::evict_lowest_fee_entries(&mut inner, original_bytes, false, 0);
 
         // The low-fee tx should be gone
         assert_eq!(inner.entries.len(), 0);
@@ -7010,6 +7223,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Core's `GetMinFee`: eviction raises the minimum, it holds until a
+    /// block, then halves every twelve hours (sooner in an emptier pool) and
+    /// drops to zero below half the incremental relay fee.
+    #[test]
+    fn the_rolling_minimum_holds_until_a_block_then_decays() {
+        let limit = 1_000_000;
+        let mut r = RollingMinFee::default();
+        assert_eq!(r.at(0, limit, limit, 1_000), 0);
+
+        r.package_removed(8_000);
+        assert_eq!(r.at(1_000_000, limit, limit, 1_000), 8_000, "no decay before a block");
+
+        r.last_update = 100;
+        r.block_since_bump = true;
+        let half_day = ROLLING_FEE_HALFLIFE as i64;
+        let min = r.at(100 + half_day, limit, limit, 1_000);
+        assert_eq!(min, 4_000, "one halflife with the pool full");
+        let min = r.at(100 + half_day + half_day / 4, limit / 5, limit, 1_000);
+        assert_eq!(min, 2_000, "a quarter-full pool decays four times as fast");
+        let min = r.at(100 + 4 * half_day, limit, limit, 1_000);
+        assert_eq!((min, r.rate), (0, 0.0), "below half the incremental fee it is gone");
+    }
+
+    /// Core's `GetMinFee` writes the decay it computed through `mutable`
+    /// members, so a read banks it. It has to: `removeForBlock` moves
+    /// `lastRollingFeeUpdate` up to the block without charging the elapsed
+    /// time against the rate, so decay a reader computed and dropped is gone
+    /// for good. Reading and dropping leaves the floor pinned at the evicted
+    /// rate through any number of blocks — an empty pool still demanding
+    /// 8,000 sat/kvB half a day later.
+    #[test]
+    fn a_read_banks_the_decay_a_block_would_otherwise_erase() {
+        let limit = 1_000_000;
+        // The reviewer's shape: eviction raises the floor, then twelve hours
+        // pass with reads (`getmempoolinfo`, the periodic `feefilter`) and a
+        // block every ten minutes, and nothing submitted.
+        let mut full = RollingMinFee::default();
+        full.package_removed(8_000);
+        full.last_update = 0;
+        full.block_since_bump = true;
+        let mut empty = full;
+
+        let mut now = 0;
+        for _ in 0..72 {
+            now += 600;
+            let _ = full.at(now, limit, limit, 1_000);
+            let _ = empty.at(now, 0, limit, 1_000);
+            // Core's `removeForBlock`, once per block.
+            full.last_update = now;
+            full.block_since_bump = true;
+            empty.last_update = now;
+            empty.block_since_bump = true;
+        }
+
+        assert_eq!(now, ROLLING_FEE_HALFLIFE as i64, "twelve hours of blocks");
+        assert_eq!(
+            full.at(now, limit, limit, 1_000),
+            4_000,
+            "a full pool decays one halflife in twelve hours"
+        );
+        assert_eq!(
+            empty.at(now, 0, limit, 1_000),
+            1_000,
+            "an empty pool decays four times as fast and lands back on the incremental fee"
+        );
+    }
+
+    /// Eviction sets the rolling minimum to the evicted package's feerate plus
+    /// the incremental relay fee, and a transaction below it is refused with
+    /// Core's reason.
+    #[test]
+    fn eviction_raises_the_mempool_minimum_fee() {
+        let cheap_op = outpoint(0xE1);
+        let rich_op = outpoint(0xE2);
+        let low_op = outpoint(0xE3);
+        let (cs, mp, dir) = make_funded_env(&[
+            (cheap_op, coin(100_000)),
+            (rich_op, coin(100_000)),
+            (low_op, coin(100_000)),
+        ]);
+        let cheap = tx_from(&[cheap_op], &[(99_000, 0xD1)]);
+        let cheap_fee_rate = {
+            let txid = mp
+                .accept_transaction(cheap, &cs, &NoopVerifier, TxSource::Rpc, false)
+                .expect("cheap");
+            let inner = mp.inner.read();
+            let e = &inner.entries[&txid];
+            policy::fee_rate_sat_per_kvb(e.fee, e.weight as u64)
+        };
+        mp.accept_transaction(tx_from(&[rich_op], &[(50_000, 0xD2)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("rich");
+        let min_relay = mp.info().min_fee_rate;
+        assert_eq!(mp.info().mempool_min_fee, min_relay);
+
+        let mut inner = mp.inner.write();
+        let one = inner.total_bytes / 2;
+        Mempool::evict_lowest_fee_entries(&mut inner, one, false, 1_000);
+        drop(inner);
+        assert_eq!(mp.info().mempool_min_fee, cheap_fee_rate + 1_000);
+
+        let low = tx_from(&[low_op], &[(99_000, 0xD3)]);
+        let err = mp
+            .accept_transaction(low, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect_err("below the raised minimum");
+        assert!(matches!(err, MempoolError::MempoolMinFeeNotMet(..)), "{err:?}");
+        assert!(err.state_string().starts_with("mempool min fee not met, 1000 < "), "{}", err.state_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's mempool sequence starts at 1 and counts every transaction in
+    /// and out, whatever took it out.
+    #[test]
+    fn the_mempool_sequence_counts_every_add_and_removal() {
+        let op = outpoint(0xEE);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+        assert_eq!(mp.acting_txids_with_sequence(), (vec![], 1));
+
+        let parent = tx_from(&[op], &[(90_000, 0xC4)]);
+        let parent_txid = mp
+            .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("parent admitted");
+        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(80_000, 0xC5)]);
+        mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("child admitted");
+        let (txids, sequence) = mp.acting_txids_with_sequence();
+        assert_eq!((txids.len(), sequence), (2, 3));
+
+        mp.inner.write().entries.get_mut(&parent_txid).unwrap().time = 0;
+        assert_eq!(mp.remove_expired(), 2);
+        assert_eq!(mp.acting_txids_with_sequence(), (vec![], 5));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `prioritisetransaction` has to move the transaction's place in the
     /// eviction order too. The stored `fee_rate` is the rate as of admission
     /// and the delta never rewrote it, so an operator could lift a
@@ -7036,7 +7384,7 @@ mod tests {
         // Squeeze the pool until exactly one entry can stay.
         let mut inner = mp.inner.write();
         let half = inner.total_bytes / 2;
-        let evicted = Mempool::evict_lowest_fee_entries(&mut inner, half, false);
+        let evicted = Mempool::evict_lowest_fee_entries(&mut inner, half, false, 0);
         drop(inner);
 
         assert!(
@@ -7926,7 +8274,7 @@ mod tests {
         let evicted = {
             let mut inner = mp.inner.write();
             // Free a large amount from the ACTING class.
-            Mempool::evict_lowest_fee_entries(&mut inner, 10_000_000, false)
+            Mempool::evict_lowest_fee_entries(&mut inner, 10_000_000, false, 0)
         };
         assert!(
             evicted.contains(&a_lo),
@@ -7954,7 +8302,7 @@ mod tests {
         .len();
         let evicted = {
             let mut inner = mp.inner.write();
-            Mempool::evict_lowest_fee_entries(&mut inner, one_entry, true)
+            Mempool::evict_lowest_fee_entries(&mut inner, one_entry, true, 0)
         };
         assert!(evicted.contains(&q_lo), "cheapest held entry evicted first");
         assert!(!evicted.contains(&q_hi), "higher-fee held entry retained");
@@ -8037,7 +8385,7 @@ mod tests {
         // the acting goal does eviction continue on to `a_other`.
         let evicted = {
             let mut inner = mp.inner.write();
-            Mempool::evict_lowest_fee_entries(&mut inner, p_size + 1, false)
+            Mempool::evict_lowest_fee_entries(&mut inner, p_size + 1, false, 0)
         };
 
         assert!(evicted.contains(&p), "acting parent evicted");
@@ -8926,6 +9274,56 @@ mod tests {
         assert!(t.demoted.is_empty());
         assert!(scope_of(&mp, &txid).is_acting());
         assert_eq!(mp.quarantine_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `getrawmempool(mempool_sequence=true)` returns the acting set and the
+    /// counter that describes it, so the counter has to move whenever that set
+    /// does. A policy reload moves transactions across the acting boundary
+    /// without adding or removing anything physically, and the class change
+    /// cancels its own accounting bumps — leaving two different txid sets
+    /// sharing one sequence number, which a client reads as "nothing changed".
+    #[test]
+    fn a_reload_that_changes_the_acting_set_advances_the_sequence() {
+        let op = outpoint(0xdb);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
+
+        let tx = spend(op, 99_000, 0x22);
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("admitted");
+        let (acting, seq) = mp.acting_txids_with_sequence();
+        assert_eq!(acting, vec![txid]);
+
+        // Quarantine it: it leaves the acting set, so the sequence must move.
+        set_ruleset(&mp, "version 1\nquarantine catch when tx.version == 2");
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.demoted, vec![txid]);
+        let (acting_after, seq_after) = mp.acting_txids_with_sequence();
+        assert!(acting_after.is_empty(), "the tx is still visible: {acting_after:?}");
+        assert!(
+            seq_after > seq,
+            "the acting set emptied at the same sequence ({seq} -> {seq_after})"
+        );
+
+        // Promote it back: it re-enters, so the sequence must move again.
+        mp.clear_policy();
+        let t = mp.reapply_policy(&cs);
+        assert_eq!(t.promoted, vec![txid]);
+        let (acting_back, seq_back) = mp.acting_txids_with_sequence();
+        assert_eq!(acting_back, vec![txid]);
+        assert!(
+            seq_back > seq_after,
+            "the tx reappeared at the same sequence ({seq_after} -> {seq_back})"
+        );
+
+        // A reload that moves nothing must not move the counter.
+        let _ = mp.reapply_policy(&cs);
+        assert_eq!(
+            mp.acting_txids_with_sequence().1,
+            seq_back,
+            "a no-op reload advanced the sequence"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10540,6 +10938,44 @@ mod tests {
         );
         // Nothing at all is left, so unwinding the parent cannot orphan anyone.
         assert_eq!(mp.inner.read().entries.len(), 0, "{results:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rolling minimum must not break the ephemeral-dust package form.
+    /// A zero-fee dust parent fails *some* fee floor by construction — which
+    /// one is an accident of whether the pool has evicted anything yet — and
+    /// the deferral that lets its sweeping child pay for it keyed on the
+    /// static floor's rejection alone. Once an eviction raised the rolling
+    /// minimum, the parent took a different exit and was failed outright,
+    /// stranding a funded child with no input.
+    #[test]
+    fn an_ephemeral_dust_package_still_lands_after_eviction_raised_the_floor() {
+        let op = outpoint(0xC9);
+        let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
+        let dust = p2wpkh_dust_threshold() - 1;
+
+        // An eviction has raised the rolling minimum well above the parent's
+        // (zero) feerate, as `TrimToSize` does on a full pool.
+        mp.inner.write().rolling.lock().package_removed(20_000);
+        assert!(mp.min_fee() >= 20_000, "the fixture needs a raised floor");
+
+        let parent = tx_from(
+            &[op],
+            &[(dust, 0x75), (25_000, 0x76), (50_000 - dust - 25_000, 0x77)],
+        );
+        let parent_txid = parent.compute_txid();
+        let sweeper = tx_from(
+            &[
+                OutPoint { txid: parent_txid, vout: 0 },
+                OutPoint { txid: parent_txid, vout: 1 },
+            ],
+            &[(20_000, 0x78)],
+        );
+        let sweeper_txid = sweeper.compute_txid();
+        let (msg, results) = mp.accept_package(vec![parent, sweeper], &cs, &NoopVerifier);
+        assert_eq!(msg, "success", "{results:?}");
+        assert!(in_pool(&mp, &parent_txid), "the dust parent was refused: {results:?}");
+        assert!(in_pool(&mp, &sweeper_txid), "the sweeping child was stranded: {results:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1834,7 +1834,20 @@ pub async fn start(
     module.register_method("getrawmempool", |params, ctx, _extensions| {
         let mut args = Args::new(&params);
         let verbose: bool = args.optional_or("verbose", false)?;
+        let mempool_sequence: bool = args.optional_or("mempool_sequence", false)?;
         args.check()?;
+        if mempool_sequence {
+            if verbose {
+                return Err(ErrorObjectOwned::owned(
+                    -8,
+                    "Verbose results cannot contain mempool sequence values.",
+                    None::<()>,
+                ));
+            }
+            let (txids, sequence) = ctx.mempool.acting_txids_with_sequence();
+            let txids: Vec<String> = txids.iter().map(|t| t.to_string()).collect();
+            return Ok(serde_json::json!({ "txids": txids, "mempool_sequence": sequence }));
+        }
         Ok::<_, ErrorObjectOwned>(rawtx::get_raw_mempool(&ctx.mempool, verbose))
     })?;
 
@@ -2177,9 +2190,8 @@ pub async fn start(
                         "allowed": false,
                         "reject-reason": e.reject_reason(),
                     });
-                    if let Some(details) = e.reject_details() {
-                        entry["reject-details"] = serde_json::Value::String(details);
-                    }
+                    // Core pushes `state.ToString()` for every rejection.
+                    entry["reject-details"] = serde_json::Value::String(e.state_string());
                     results.push(entry);
                 }
             }
