@@ -580,7 +580,7 @@ note = "measured 2026-09-15: L60 node1 block sync times out in a 999-block IBD w
 file = "p2p_blocksonly.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L120 under -blocksonly a tx from a peer without relay permission does not disconnect it. Follow-up: Core's -blocksonly violation disconnects"
+note = "measured 2026-09-15: the -blocksonly violation disconnects landed; L46 then waits for a getdata by wtxid, and satd announces the RPC transaction by txid. Follow-up: BIP 339 wtxid relay (#714)"
 
 [[test]]
 file = "p2p_compactblocks.py"
@@ -618,7 +618,7 @@ note = "measured 2026-09-15: L119 no inbound peer is evicted (0 != 1); satd has 
 file = "p2p_feefilter.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L24 a feefilter is sent to a forcerelay-permissioned peer, which Core never does. Follow-up: Core's feefilter send rules"
+note = "measured 2026-09-15: the feefilter send rules landed; L87 then waits for inventory announced by wtxid, and satd announces by txid. Follow-up: BIP 339 wtxid relay (#714)"
 
 [[test]]
 file = "p2p_filter.py"
@@ -675,7 +675,7 @@ note = "measured 2026-09-15: L86 sum(inflight) never equals the stalled block co
 file = "p2p_ibd_txrelay.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L49 peers' minfeefilter is not MAX_FEE_FILTER while the node is in IBD. Follow-up: Core's IBD feefilter"
+note = "measured 2026-09-15: the IBD feefilter and the received-message log line landed; L96 then waits for a getdata answering a MSG_WTX inv, which satd ignores. Follow-up: BIP 339 wtxid relay (#714)"
 
 [[test]]
 file = "p2p_initial_headers_sync.py"
@@ -731,15 +731,11 @@ note = "measured 2026-09-15: L78 getpeerinfo.inflight is [] where [101] is expec
 
 [[test]]
 file = "p2p_net_deadlock.py"
-status = "skip"
-reason = "rpc-missing"
-note = "measured 2026-09-15: sendmsgtopeer is Method not found. Follow-up: sendmsgtopeer"
+status = "run"
 
 [[test]]
 file = "p2p_nobloomfilter_messages.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L30 mempool/filterload/filteradd/filterclear with -peerbloomfilters=0 do not disconnect the peer. Follow-up: Core's no-bloom-filter disconnects"
+status = "run"
 
 [[test]]
 file = "p2p_node_network_limited.py"
@@ -773,9 +769,7 @@ note = "measured 2026-09-15: L117 a tx pushed by a forcerelay peer is not in the
 
 [[test]]
 file = "p2p_ping.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L43 pingwait 0.099 != 3: ping timing reads the wall clock, not the mock clock. Behind it: Core's pong log lines. Follow-up: ping timing on the node clock"
+status = "run"
 
 [[test]]
 file = "p2p_private_broadcast.py"
@@ -841,7 +835,7 @@ note = "measured 2026-09-15: L100 assert_debug_log 'AcceptBlockHeader: not addin
 file = "p2p_v2_encrypted.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-15: L85 KeyError 'version' in bytessent_per_msg under v2 transport: v2 connections do not account bytes per message type. Behind it: the advertised-v2/actually-v1 downgrade re-dial. Follow-up: per-message byte accounting on v2"
+note = "measured 2026-09-15: passes run alone (6 of 6), fails under the parallel run-set: L107 waits for the announcing peer to be asked for the last block, and satd also downloads from an earlier P2PDataStore connection that answered its periodic getheaders with the same headers. Core sends getheaders to a peer once at connection. Follow-up: headers-sync peer selection (W17)"
 
 [[test]]
 file = "p2p_v2_misbehaving.py"
@@ -851,9 +845,7 @@ note = "measured 2026-09-15: L152 the peer is absent from getpeerinfo during v2 
 
 [[test]]
 file = "p2p_v2_transport.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L39 localservices lacks NODE_P2P_V2 (2048) with -v2transport=1. Behind it: the v2 detection/error log lines. Follow-up: NODE_P2P_V2 in localservices"
+status = "run"
 
 [[test]]
 file = "rpc_bind.py"

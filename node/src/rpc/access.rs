@@ -176,6 +176,8 @@ pub fn classify(method: &str) -> Option<RpcAccess> {
         // Core's hidden test RPC: makes the node dial out. Regtest-gated in
         // the handler, and Control here so it is off the read-only listener.
         | "addconnection"
+        // Core's hidden test RPC: pushes an arbitrary message to a peer.
+        | "sendmsgtopeer"
         | "disconnectnode"
         | "setban"
         | "clearbanned"

@@ -213,6 +213,12 @@ impl IbdScheduler {
     /// Respects per-peer limits and the max-ahead window.
     /// Always prioritizes blocks near the connect cursor to avoid deadlocks.
     pub fn assign_blocks(&mut self, peer_id: PeerId) -> Vec<BlockHash> {
+        self.assign_blocks_up_to(peer_id, u32::MAX)
+    }
+
+    /// [`Self::assign_blocks`], never past `max_height`: the highest block
+    /// the peer can serve. Heights above it stay in the pool for others.
+    pub fn assign_blocks_up_to(&mut self, peer_id: PeerId, max_height: u32) -> Vec<BlockHash> {
         let slots = self
             .peer_slots
             .entry(peer_id)
@@ -242,7 +248,7 @@ impl IbdScheduler {
         // This prevents stalls where random blocks are downloaded far ahead but the
         // connect thread is blocked waiting for the next sequential block.
         // 256 blocks ensures the near-cursor region is well-covered across multiple peers.
-        let priority_end = (self.connect_cursor + 256).min(self.target_height);
+        let priority_end = (self.connect_cursor + 256).min(self.target_height).min(max_height);
         for h in (self.connect_cursor + 1)..=priority_end {
             if hashes.len() >= budget {
                 break;
@@ -292,7 +298,7 @@ impl IbdScheduler {
             if self.in_flight.contains_key(&height) {
                 continue;
             }
-            if self.is_peer_on_cooldown(height, peer_id, now) {
+            if height > max_height || self.is_peer_on_cooldown(height, peer_id, now) {
                 // Hold this height aside; a different peer's next call can
                 // claim it. Pushed back to the pool after this peer's pass.
                 deferred.push(height);
@@ -884,6 +890,28 @@ mod tests {
         let unique: HashSet<BlockHash> = all.iter().copied().collect();
         assert_eq!(all.len(), unique.len(), "No overlapping block assignments");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer is never asked for a block above the highest it can serve,
+    /// from the priority zone or the pool, and what it cannot take stays
+    /// available to the next peer.
+    #[test]
+    fn assign_blocks_up_to_stops_at_the_peers_height() {
+        let (cs, dir) = make_chain_state_with_headers(100);
+        let mut sched = IbdScheduler::new(100, 0, &cs, 50_000);
+
+        let short = sched.assign_blocks_up_to(1, 5);
+        assert_eq!(short.len(), 5, "heights 1..=5 and nothing above");
+        for hash in &short {
+            let h = cs.get_block_index(hash).unwrap().height;
+            assert!(h <= 5, "height {h} is above the peer's 5");
+        }
+        assert!(sched.assign_blocks_up_to(1, 5).is_empty());
+
+        let full = sched.assign_blocks(2);
+        assert!(!full.is_empty());
+        assert!(full.iter().all(|hash| cs.get_block_index(hash).unwrap().height > 5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

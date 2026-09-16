@@ -173,6 +173,7 @@ const HELP_METHODS: &[(&str, &str)] = &[
     // include this one, so a row here is excluded by construction rather
     // than by a filter someone has to remember.
     ("addconnection", "hidden"),
+    ("sendmsgtopeer", "hidden"),
     ("generate", "hidden"),
     ("unsubscribemempool", "hidden"),
 ];
@@ -2744,7 +2745,15 @@ pub async fn start(
             )
         })?;
         let command: String = args.optional_or("command", "onetry".to_string())?;
+        let v2transport: Option<bool> = args.optional("v2transport")?;
         args.check()?;
+        if v2transport == Some(true) && !ctx.peer_manager.v2_transport_enabled() {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Error: v2transport requested but not enabled (see -v2transport)",
+                None::<()>,
+            ));
+        }
 
         // Parse via PeerAddr so `.onion:port` targets are accepted, not just
         // `SocketAddr`s — Bitcoin Core's addnode takes onion addresses, and a
@@ -2771,7 +2780,7 @@ pub async fn start(
                 }
                 let pm = ctx.peer_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = pm.connect_peer_addr(&addr).await {
+                    if let Err(e) = pm.connect_peer_addr_with(&addr, v2transport).await {
                         tracing::debug!(%addr, "addnode add: initial dial failed: {e}");
                     }
                 });
@@ -2784,7 +2793,7 @@ pub async fn start(
                     .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
                 ctx.peer_manager
-                    .connect_peer_addr(&addr)
+                    .connect_peer_addr_with(&addr, v2transport)
                     .await
                     .map_err(|e| ErrorObjectOwned::owned(-1, e, None::<()>))?;
             }
@@ -3038,6 +3047,35 @@ pub async fn start(
             "address": address,
             "connection_type": conn_type_in,
         }))
+    })?;
+
+    // Core's hidden `sendmsgtopeer`: push an arbitrary message to a peer. The
+    // functional tests use it to send types the node does not know.
+    module.register_method("sendmsgtopeer", |params, ctx, _extensions| {
+        let mut args = Args::new(&params);
+        let peer_id: u64 = args.required("peer_id")?;
+        let msg_type: String = args.required("msg_type")?;
+        let msg: String = args.required("msg")?;
+        args.check()?;
+        // CMessageHeader::MESSAGE_TYPE_SIZE.
+        if msg_type.len() > 12 {
+            return Err(ErrorObjectOwned::owned(
+                -8,
+                "Error: msg_type too long, max length is 12",
+                None::<()>,
+            ));
+        }
+        let payload = hex::decode(&msg).map_err(|_| {
+            ErrorObjectOwned::owned(-8, "Error parsing input for msg", None::<()>)
+        })?;
+        if !ctx.peer_manager.send_raw_message(peer_id, &msg_type, payload) {
+            return Err(ErrorObjectOwned::owned(
+                -1,
+                "Error: Could not send message to peer",
+                None::<()>,
+            ));
+        }
+        Ok::<_, ErrorObjectOwned>(serde_json::json!({}))
     })?;
 
     module.register_method("disconnectnode", |params, ctx, _extensions| {
@@ -4772,16 +4810,16 @@ mod help_listing_tests {
         }
     }
 
-    /// Core hides these three, and satd's regtest suite asserts
-    /// `addconnection` stays out of the listing. Naming them keeps a later
-    /// re-categorisation from quietly advertising a test-only dial RPC.
+    /// Core hides these, and satd's regtest suite asserts `addconnection`
+    /// stays out of the listing. Naming them keeps a later re-categorisation
+    /// from quietly advertising a test-only dial or raw-send RPC.
     #[test]
-    fn the_hidden_commands_are_the_expected_three() {
+    fn the_hidden_commands_are_the_expected_four() {
         let hidden: Vec<&str> = HELP_METHODS
             .iter()
             .filter(|(_, c)| *c == "hidden")
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(hidden, ["addconnection", "generate", "unsubscribemempool"]);
+        assert_eq!(hidden, ["addconnection", "sendmsgtopeer", "generate", "unsubscribemempool"]);
     }
 }

@@ -51,6 +51,7 @@ impl Connection {
             magic,
             buf: Vec::with_capacity(4096),
             leading: None,
+            counters: None,
         })
     }
 
@@ -64,6 +65,7 @@ impl Connection {
             magic,
             buf: Vec::with_capacity(4096),
             leading: Some(leading),
+            counters: None,
         })
     }
 
@@ -87,6 +89,16 @@ impl Connection {
                 let (r, w) = c.split();
                 (ConnectionReader::V2(r), ConnectionWriter::V2(w))
             }
+        }
+    }
+
+    /// Attach the per-peer counters before the version handshake, so its
+    /// messages show in `bytessent_per_msg` / `bytesrecv_per_msg` as Core's
+    /// do. The halves `split` returns keep them.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        match self {
+            Connection::V1(c) => c.counters = Some(counters),
+            Connection::V2(c) => c.set_counters(counters),
         }
     }
 
@@ -193,6 +205,7 @@ pub struct V1Connection {
     /// (transport detection), replayed ahead of the socket on the first
     /// `recv`. Consumed during the version handshake, before `split`.
     leading: Option<Vec<u8>>,
+    counters: Option<Arc<PeerStats>>,
 }
 
 /// Read half of a split [`V1Connection`].
@@ -226,31 +239,39 @@ impl V1Connection {
                 stream: read_half,
                 magic: self.magic,
                 buf: self.buf,
-                counters: None,
+                counters: self.counters.clone(),
             },
             V1Writer {
                 stream: write_half,
                 magic: self.magic,
-                counters: None,
+                counters: self.counters,
             },
         )
     }
 
-    /// Send a network message. Pre-split (handshake) path — uncounted.
+    /// Send a network message. Pre-split (handshake) path, counted once
+    /// counters are attached.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let raw = RawNetworkMessage::new(self.magic, msg);
         let bytes = serialize(&raw);
-        self.stream.write_all(&bytes).await
+        self.stream.write_all(&bytes).await?;
+        if let Some(c) = &self.counters {
+            c.record_sent(bytes.len());
+            c.attribute_sent(raw.cmd(), bytes.len());
+        }
+        Ok(())
     }
 
     /// Receive the next network message. Skips messages that fail to
-    /// deserialize. Pre-split (handshake) path — uncounted.
+    /// deserialize. Pre-split (handshake) path, counted once counters are
+    /// attached; bytes replayed from transport detection count here.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
         if let Some(lead) = self.leading.take() {
             let mut reader = LeadingReader::new(lead, &mut self.stream);
-            return recv_message(&mut reader, self.magic, &mut self.buf, None).await;
+            return recv_message(&mut reader, self.magic, &mut self.buf, self.counters.as_ref())
+                .await;
         }
-        recv_message(&mut self.stream, self.magic, &mut self.buf, None).await
+        recv_message(&mut self.stream, self.magic, &mut self.buf, self.counters.as_ref()).await
     }
 
     /// Get the peer's remote address.
@@ -395,6 +416,19 @@ async fn recv_message<R: AsyncReadExt + Unpin>(
                     c.attribute_recv(raw.cmd(), wire_len);
                 }
                 return Ok(raw.payload().clone());
+            }
+            Err(_) if &header[4..16] == b"pong\0\0\0\0\0\0\0\0" && payload_len < 8 => {
+                // Too short to hold a nonce. Core still acts on it -- it
+                // cancels the outstanding ping -- so it reaches the peer loop
+                // rather than being skipped.
+                if let Some(c) = counters {
+                    c.attribute_recv("pong", wire_len);
+                }
+                return Ok(NetworkMessage::Unknown {
+                    command: bitcoin::p2p::message::CommandString::try_from_static("pong")
+                        .expect("static command"),
+                    payload,
+                });
             }
             Err(_) => {
                 if let Some(c) = counters {

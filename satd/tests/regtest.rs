@@ -16271,7 +16271,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         .unwrap();
     assert_eq!(unknown["result"].as_str(), Some("help: unknown command: nosuchrpc"));
 
-    // Everything registered is listed except the deliberately hidden pair:
+    // Everything registered is listed except the deliberately hidden ones:
     // a method an operator cannot find in `help` may as well not exist.
     // `dump_all_command_conversions` is `help`'s own escape hatch for
     // rpc_help.py, not a method.
@@ -16282,7 +16282,7 @@ fn help_answers_for_a_registered_command_that_the_listing_omits() {
         .iter()
         .filter_map(|row| row.get(0)?.as_str().map(str::to_string))
         .collect();
-    let hidden = ["addconnection", "generate", "unsubscribemempool"];
+    let hidden = ["addconnection", "generate", "sendmsgtopeer", "unsubscribemempool"];
     let mut missing: Vec<&str> = registered
         .iter()
         .map(String::as_str)

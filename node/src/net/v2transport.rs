@@ -24,8 +24,10 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::Network;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::net::stats::PeerStats;
@@ -43,9 +45,11 @@ const GARBAGE_TERMINATOR_LEN: usize = 16;
 const LENGTH_FIELD_LEN: usize = 3;
 /// Minimum decryptable packet: 1 header byte + 16-byte Poly1305 tag.
 const MIN_PACKET_LEN: usize = 1 + 16;
-/// Upper bound on a v2 packet we will allocate for, matching Bitcoin
-/// Core's `MAX_PROTOCOL_MESSAGE_LENGTH` (4 MB) plus BIP 324 framing.
-const MAX_V2_PACKET_LEN: usize = 4_000_014;
+/// Upper bound on a v2 packet we will allocate for. Core's
+/// `MAX_CONTENTS_LEN` is a long-encoding byte, a 12-byte message type and a
+/// `MAX_PROTOCOL_MESSAGE_LENGTH` (4 MB) payload; `decrypt_packet_len` also
+/// counts the header byte and the 16-byte tag.
+const MAX_V2_PACKET_LEN: usize = 1 + 12 + 4_000_000 + 1 + 16;
 
 /// Errors from the v2 message codec.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +89,57 @@ pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
         return Err(V2CodecError::Truncated);
     }
     bip324::serde::deserialize(contents).map_err(|e| V2CodecError::Deserialize(e.to_string()))
+}
+
+/// Counts raw handshake bytes into the peer's totals as they cross the
+/// socket. Core's `bytesrecv` moves with every byte of the key, the garbage
+/// and the version packet, so a peer stalled mid-handshake shows its
+/// progress in `getpeerinfo`.
+struct CountingStream<'a, S> {
+    inner: &'a mut S,
+    counters: Option<&'a Arc<PeerStats>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        let n = buf.filled().len() - before;
+        if n > 0
+            && let Some(c) = self.counters
+        {
+            c.record_recv(n);
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut *self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = &res
+            && let Some(c) = self.counters
+        {
+            c.record_sent(*n);
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
 }
 
 fn handshake_io_err(e: bip324::Error) -> io::Error {
@@ -203,6 +258,7 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     network: Network,
     role: Role,
     prefetch: &[u8],
+    peer: u64,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
     let handshake = Handshake::new(network, role).map_err(handshake_io_err)?;
 
@@ -211,6 +267,7 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let handshake = handshake
         .send_key(None, &mut key_buf)
         .map_err(handshake_io_err)?;
+    tracing::debug!("start sending v2 handshake to peer={peer}");
     stream.write_all(&key_buf).await?;
     stream.flush().await?;
 
@@ -235,10 +292,11 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream.read_exact(&mut garbage_buf).await?;
     let mut sent_version = handshake;
     let (mut received_garbage, consumed) = loop {
-        match sent_version
-            .receive_garbage(&garbage_buf)
-            .map_err(handshake_io_err)?
-        {
+        let received = sent_version.receive_garbage(&garbage_buf);
+        if let Err(bip324::Error::NoGarbageTerminator) = &received {
+            tracing::debug!("V2 transport error: missing garbage terminator, peer={peer}");
+        }
+        match received.map_err(handshake_io_err)? {
             GarbageResult::FoundGarbage {
                 handshake,
                 consumed_bytes,
@@ -284,21 +342,44 @@ async fn drive_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Run the responder (inbound) side of a v2 handshake. `prefetch` is the
-/// bytes already read off the socket during v1/v2 detection.
+/// bytes already read off the socket during v1/v2 detection; the caller
+/// has counted them. Handshake bytes are counted into `counters`.
 pub async fn responder_handshake(
     stream: &mut TcpStream,
     network: Network,
     prefetch: &[u8],
+    peer: u64,
+    counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
-    drive_handshake(stream, network, Role::Responder, prefetch).await
+    counted_handshake(stream, network, Role::Responder, prefetch, peer, counters).await
 }
 
 /// Run the initiator (outbound) side of a v2 handshake.
 pub async fn initiator_handshake(
     stream: &mut TcpStream,
     network: Network,
+    peer: u64,
+    counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
-    drive_handshake(stream, network, Role::Initiator, &[]).await
+    counted_handshake(stream, network, Role::Initiator, &[], peer, counters).await
+}
+
+async fn counted_handshake(
+    stream: &mut TcpStream,
+    network: Network,
+    role: Role,
+    prefetch: &[u8],
+    peer: u64,
+    counters: Option<&Arc<PeerStats>>,
+) -> io::Result<(CipherSession, Vec<u8>)> {
+    let mut counted = CountingStream { inner: stream, counters };
+    let (cipher, leftover) = drive_handshake(&mut counted, network, role, prefetch, peer).await?;
+    // Bytes read past the version packet belong to the next packet, which
+    // the steady-state reader counts whole when it frames it.
+    if let Some(c) = counters {
+        c.discount_recv(leftover.len());
+    }
+    Ok((cipher, leftover))
 }
 
 /// Encrypted v2 P2P connection (pre-split).
@@ -306,6 +387,7 @@ pub struct V2Connection {
     stream: TcpStream,
     cipher: CipherSession,
     leftover: Vec<u8>,
+    counters: Option<Arc<PeerStats>>,
 }
 
 /// Read half of a split [`V2Connection`].
@@ -342,7 +424,14 @@ impl V2Connection {
             stream,
             cipher,
             leftover,
+            counters: None,
         }
+    }
+
+    /// Attach the per-peer counters, so the version handshake's messages
+    /// are counted and attributed as the steady-state ones are.
+    pub fn set_counters(&mut self, counters: Arc<PeerStats>) {
+        self.counters = Some(counters);
     }
 
     /// Split into separate read and write halves.
@@ -354,27 +443,38 @@ impl V2Connection {
                 stream: read_half,
                 cipher: inbound,
                 leftover: self.leftover,
-                counters: None,
+                counters: self.counters.clone(),
             },
             V2Writer {
                 stream: write_half,
                 cipher: outbound,
-                counters: None,
+                counters: self.counters,
             },
         )
     }
 
     /// Send a network message over the encrypted channel. Pre-split
-    /// (handshake) path — uncounted.
+    /// (handshake) path, counted once counters are attached.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
-        send_v2(&mut self.stream, self.cipher.outbound(), msg).await?;
+        let cmd = msg.cmd();
+        let n = send_v2(&mut self.stream, self.cipher.outbound(), msg).await?;
+        if let Some(c) = &self.counters {
+            c.record_sent(n);
+            c.attribute_sent(cmd, n);
+        }
         Ok(())
     }
 
     /// Receive the next network message from the encrypted channel. Pre-split
-    /// (handshake) path — uncounted.
+    /// (handshake) path, counted once counters are attached.
     pub async fn recv(&mut self) -> io::Result<NetworkMessage> {
-        recv_v2(&mut self.stream, self.cipher.inbound(), &mut self.leftover, None).await
+        recv_v2(
+            &mut self.stream,
+            self.cipher.inbound(),
+            &mut self.leftover,
+            self.counters.as_ref(),
+        )
+        .await
     }
 
     /// Get the peer's remote address.
@@ -497,7 +597,7 @@ mod tests {
             // (which are the start of the initiator's ellswift key here).
             let mut first = [0u8; 4];
             sock.read_exact(&mut first).await.unwrap();
-            let (cipher, leftover) = drive_handshake(&mut sock, net, Role::Responder, &first)
+            let (cipher, leftover) = drive_handshake(&mut sock, net, Role::Responder, &first, 0)
                 .await
                 .unwrap();
             let mut conn = V2Connection::new(sock, cipher, leftover);
@@ -511,7 +611,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (cipher, leftover) = initiator_handshake(&mut client, net).await.unwrap();
+        let (cipher, leftover) = initiator_handshake(&mut client, net, 0, None).await.unwrap();
         let mut conn = V2Connection::new(client, cipher, leftover);
 
         conn.send(NetworkMessage::Ping(7)).await.unwrap();
@@ -520,6 +620,53 @@ mod tests {
         conn.send(NetworkMessage::GetAddr).await.unwrap();
 
         server.await.unwrap();
+    }
+
+    /// A handshake pair over loopback, each side counting into its own stats.
+    async fn counted_pair(
+        net: Network,
+    ) -> (V2Connection, V2Connection, Arc<PeerStats>, Arc<PeerStats>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_stats = PeerStats::new(crate::net::stats::NetTotals::new());
+        let client_stats = PeerStats::new(crate::net::stats::NetTotals::new());
+        let ss = server_stats.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (cipher, leftover) =
+                responder_handshake(&mut sock, net, &[], 1, Some(&ss)).await.unwrap();
+            V2Connection::new(sock, cipher, leftover)
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (cipher, leftover) =
+            initiator_handshake(&mut client, net, 2, Some(&client_stats)).await.unwrap();
+        let client = V2Connection::new(client, cipher, leftover);
+        (server.await.unwrap(), client, server_stats, client_stats)
+    }
+
+    /// Every byte one side of the handshake writes, the other counts as read.
+    #[tokio::test]
+    async fn handshake_bytes_are_counted_on_both_sides() {
+        let (_server, _client, server_stats, client_stats) = counted_pair(Network::Regtest).await;
+        assert!(client_stats.bytes_sent() > 64, "at least the key went out");
+        assert_eq!(server_stats.bytes_recv(), client_stats.bytes_sent());
+        assert_eq!(client_stats.bytes_recv(), server_stats.bytes_sent());
+    }
+
+    /// Core's `MAX_CONTENTS_LEN` admits a 4 MB payload under a 12-byte
+    /// message type; the packet framing around it must not be refused.
+    #[tokio::test]
+    async fn a_four_megabyte_message_fits_a_v2_packet() {
+        let (mut server, mut client, _, _) = counted_pair(Network::Regtest).await;
+        let msg = NetworkMessage::Unknown {
+            command: bitcoin::p2p::message::CommandString::try_from_static("unknown").unwrap(),
+            payload: vec![0xab; 4_000_000],
+        };
+        let sent = msg.clone();
+        let send = tokio::spawn(async move { client.send(sent).await.map(|_| client) });
+        let got = server.recv().await.expect("a 4 MB message is accepted");
+        assert_eq!(got, msg);
+        send.await.unwrap().unwrap();
     }
 
     /// A v2 initiator against a v1-only peer must fail the handshake — this
@@ -545,7 +692,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let result = initiator_handshake(&mut client, Network::Bitcoin).await;
+        let result = initiator_handshake(&mut client, Network::Bitcoin, 0, None).await;
         assert!(
             result.is_err(),
             "v2 initiator handshake must fail against a v1 peer"

@@ -20,7 +20,11 @@
 //! and headers are stamped from this clock, so leaving it on the system clock
 //! would put the two sides of the comparison on different clocks.
 //!
-//! Peer timeouts, reconnect backoff, ban expiry, fee-estimator decay, and the
+//! The keepalive ping is the exception on the peer side: Core schedules it,
+//! times its round trip and judges its timeout on this clock (`MaybeSendPing`),
+//! and so does satd ([`now_micros`]).
+//!
+//! Other peer timeouts, reconnect backoff, ban expiry, fee-estimator decay, and the
 //! orphanage all read `Instant::now()` and are deliberately **not** mockable:
 //! a monotonic clock that can jump backwards underflows or waits forever.
 //! Core's tests that need those mock its scheduler instead, which satd does
@@ -64,6 +68,19 @@ pub fn now_secs() -> u64 {
     }
 }
 
+/// The node's current time in microseconds since the epoch: the mock (whole
+/// seconds) if one is installed, otherwise the system clock. Core times its
+/// ping round trips and schedules its keepalive on this clock.
+pub fn now_micros() -> u64 {
+    match MOCK_TIME.load(Ordering::Relaxed) {
+        0 => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0),
+        mocked => mocked.saturating_mul(1_000_000),
+    }
+}
+
 /// Whether `setmocktime` may move the clock on `network`.
 ///
 /// Core gates on `Params().IsMockableChain()`, and only regtest sets
@@ -95,6 +112,11 @@ pub fn mock_time() -> Option<u64> {
     }
 }
 
+/// Held by a unit test that installs the mock clock, and by the ones that
+/// measure elapsed node time, so the two never overlap on parallel threads.
+#[cfg(test)]
+pub static CLOCK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +133,7 @@ mod tests {
     /// forward here.
     #[test]
     fn mock_replaces_the_system_clock_and_can_be_cleared() {
+        let _clock = CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(mock_time().is_none(), "no mock installed by default");
         let real = now_secs();
         assert!(real > 1_600_000_000, "system clock looks wrong: {real}");

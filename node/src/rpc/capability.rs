@@ -58,6 +58,9 @@ fn required_capability(method: &str) -> Capability {
         // principal (cookie / rpcauth) holds every capability and is
         // unaffected; the RPC is regtest-only regardless.
         "addconnection" => Capability::TestNet,
+        // Writes arbitrary bytes onto a peer connection: the same class of
+        // test-only peer control as `addconnection`.
+        "sendmsgtopeer" => Capability::TestNet,
         _ => match classify(method) {
             Some(RpcAccess::Read) => Capability::RpcRead,
             _ => Capability::RpcWrite,
