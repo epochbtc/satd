@@ -89,7 +89,7 @@ note = "measured 2026-09-15: L38 compares blk*.dat and rev*.dat file counts (1 !
 file = "feature_chain_tiebreaks.py"
 status = "skip"
 reason = "feature-missing"
-note = "measured 2026-09-16 with message ordering behind ping in place: past the pong barrier and now failing at L75 on the in-memory chain split. Follow-up: Core's nSequenceId tie-break between equal-work tips"
+note = "measured 2026-09-16 with the nSequenceId tie-break in place: still L75, and the tie-break is not the blocker. The node requests blocks only along its best-header chain, so with two equal-work header branches (B1 announced first, B2 the one the peer will serve) it asks for B1 forever and never fetches B2; no block message ever arrives. Follow-up: Core's HeadersDirectFetchBlocks — fetch along the chain a peer just announced, not only along best_header"
 
 [[test]]
 file = "feature_cltv.py"
@@ -962,9 +962,7 @@ note = "measured 2026-09-15: L546 waits for four wtxid announcements; satd annou
 
 [[test]]
 file = "rpc_preciousblock.py"
-status = "skip"
-reason = "feature-missing"
-note = "measured 2026-09-15: L67 the tip after preciousblock is the wrong branch: preciousblock is a no-op and equal-work tips are not ordered by Core's nSequenceId. Follow-up: preciousblock"
+status = "run"
 
 [[test]]
 file = "rpc_psbt.py"

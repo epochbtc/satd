@@ -263,6 +263,64 @@ pub struct UtxoSetInfo {
 
 /// See `ChainState::set_pow_valid_block_hook`.
 pub type PowValidBlockHook = Box<dyn Fn(&Block, u32) + Send + Sync>;
+/// Bitcoin Core's `nSequenceId` (`chain.h`): "(memory only) Sequential id
+/// assigned to distinguish order in which blocks are received." It is the
+/// second key of Core's `CBlockIndexWorkComparator` — equal-work tips are
+/// ordered by *when each became connectable*, earliest first — and
+/// `preciousblock` works by handing a block an id below every natural one.
+///
+/// Memory only in satd too, exactly as in Core: nothing here is persisted, so
+/// the block index keeps its on-disk shape. What a restart loses is the
+/// arrival order, and Core replaces it with a rule that keeps the chain
+/// stable across a reboot — the blocks of the chain it loaded score
+/// [`SEQ_ID_BEST_CHAIN_FROM_DISK`], everything else
+/// [`SEQ_ID_INIT_FROM_DISK`] — so the tip it shut down on still wins a tie.
+#[derive(Debug)]
+struct SequenceIds {
+    /// Ids assigned during this run. Absent means "came from disk"; see
+    /// [`ChainState::sequence_id`] for what that scores.
+    ids: std::collections::HashMap<BlockHash, i32>,
+    /// Core's `nBlockSequenceId`: the next natural id. Counts up, so a block
+    /// that became connectable earlier sorts before one that did so later.
+    next: i32,
+    /// Core's `nBlockReverseSequenceId`: the next `preciousblock` id. Counts
+    /// *down* from -1, below every natural id, so the most recent
+    /// `preciousblock` outranks both the natural order and every earlier
+    /// `preciousblock`.
+    reverse: i32,
+    /// Core's `nLastPreciousChainwork`: the active tip's work as of the last
+    /// `preciousblock`. When the chain has since been extended, the reverse
+    /// counter restarts — otherwise a long-ago `preciousblock` would keep
+    /// outranking a fresh one forever.
+    last_precious_chainwork: [u8; 32],
+    /// Core's `m_blocks_unlinked`: `parent -> children whose data is stored
+    /// but which are not connectable yet`. A block that arrives before its
+    /// parent gets no id at the time; it is queued here and picked up by the
+    /// descendant walk when the parent becomes connectable, so ids still run
+    /// in connectable order rather than in arrival order.
+    unlinked: std::collections::HashMap<BlockHash, Vec<BlockHash>>,
+}
+
+/// Core's `SEQ_ID_BEST_CHAIN_FROM_DISK` (`chain.h`): what the blocks of the
+/// chain loaded at startup score, so that tip beats an equal-work competitor.
+const SEQ_ID_BEST_CHAIN_FROM_DISK: i32 = 0;
+/// Core's `SEQ_ID_INIT_FROM_DISK` (`chain.h`): what every other block loaded
+/// from disk scores.
+const SEQ_ID_INIT_FROM_DISK: i32 = 1;
+
+impl Default for SequenceIds {
+    fn default() -> Self {
+        Self {
+            ids: std::collections::HashMap::new(),
+            // Core: `nBlockSequenceId = SEQ_ID_INIT_FROM_DISK + 1`, so every
+            // id handed out this run outranks a block loaded from disk.
+            next: SEQ_ID_INIT_FROM_DISK + 1,
+            reverse: -1,
+            last_precious_chainwork: [0u8; 32],
+            unlinked: std::collections::HashMap::new(),
+        }
+    }
+}
 
 /// Central chain state manager.
 pub struct ChainState {
@@ -310,6 +368,11 @@ pub struct ChainState {
     /// branch is active, not which blocks have children. Only a *new* entry
     /// can add a leaf or take one away.
     tips: RwLock<std::collections::HashSet<BlockHash>>,
+    /// Core's `nSequenceId` and the two counters that feed it
+    /// (`nBlockSequenceId`, `nBlockReverseSequenceId`) plus
+    /// `nLastPreciousChainwork` — the equal-work tie-break. See
+    /// [`SequenceIds`].
+    sequence_ids: Mutex<SequenceIds>,
     /// Cached block timestamps for MTP computation (avoids 22 DB reads per block).
     /// Stores (height, timestamp) pairs for the last ~12 blocks.
     mtp_cache: Mutex<Vec<(u32, u32)>>,
@@ -752,6 +815,7 @@ impl ChainState {
                     best_header: RwLock::new(best_header),
                     header_row_changes: Mutex::new(Vec::new()),
                     tips: RwLock::new(tips),
+                    sequence_ids: Mutex::new(SequenceIds::default()),
                     mtp_cache: Mutex::new(Vec::with_capacity(12)),
                     connector_scan_last: Mutex::new(None),
                     num_threads,
@@ -865,6 +929,7 @@ impl ChainState {
             best_header: RwLock::new((genesis_hash, work_for_bits(genesis.header.bits))),
             header_row_changes: Mutex::new(Vec::new()),
             tips: RwLock::new(std::collections::HashSet::from([genesis_hash])),
+            sequence_ids: Mutex::new(SequenceIds::default()),
             mtp_cache: Mutex::new(Vec::with_capacity(12)),
             connector_scan_last: Mutex::new(None),
             num_threads,
@@ -4353,7 +4418,7 @@ impl ChainState {
         };
 
         let mut batch = crate::storage::StoreBatch::default();
-        batch.block_index_puts.push((block_hash, entry));
+        batch.block_index_puts.push((block_hash, entry.clone()));
         // Write height_hash so the forward connect loop can find this block even
         // if accept_headers was never called (e.g. crash-resume or out-of-order
         // sync). Same active-chain rule as header acceptance: only ABOVE the
@@ -4394,6 +4459,10 @@ impl ChainState {
                 batch.height_hash_puts.push((new_height, block_hash));
             }
             self.write_chain_batch(batch)?;
+            // Core's `ReceivedBlockTransactions`, called under the same lock
+            // that made the data durable: this block's arrival order is now
+            // fixed, and so is that of any descendant it just unblocked.
+            self.note_block_data_arrived(block_hash, &entry);
         }
 
         Ok((block_hash, new_height))
@@ -6400,6 +6469,9 @@ impl ChainState {
             let mut batch = crate::storage::StoreBatch::default();
             batch.block_index_puts.push((block_hash, entry.clone()));
             self.write_chain_batch(batch)?;
+            // Core's `ReceivedBlockTransactions`: fix this block's place in
+            // the arrival order before anything can consult the tie-break.
+            self.note_block_data_arrived(block_hash, &entry);
 
             // Check if this side chain now has more work than the current tip
             let tip_entry = self.store.get_block_index(&current_tip)
@@ -6843,6 +6915,13 @@ impl ChainState {
         {
             self.set_tip(block_hash, new_height);
         }
+
+        // Core's `ReceivedBlockTransactions` for the connected block: it is on
+        // the active chain, so connectability needs no test, and the walk
+        // picks up any block that was waiting on it. Also covers the reorg
+        // path, whose triggering block reaches here after its branch is
+        // reconnected.
+        self.assign_sequence_ids(block_hash);
 
         // Reorg fully committed: the cache now holds a consistent
         // full-reorg delta. Release the flush-exclusion lock so the
@@ -7405,6 +7484,61 @@ impl ChainState {
         Ok(())
     }
 
+    /// Bitcoin Core's `Chainstate::PreciousBlock` — `preciousblock`.
+    ///
+    /// Treat `hash` as preferable to every equal-work tip the node knows,
+    /// then re-activate. It cannot override work: a block with *less* work
+    /// than the active tip is left alone, because the tie-break is only ever
+    /// consulted between candidates of equal work. What it does is hand the
+    /// block a sequence id below every naturally-assigned one, so it wins the
+    /// tie it would otherwise lose on arrival order.
+    ///
+    /// The reverse counter keeps descending, so calling this on a second tip
+    /// overrides the first. It restarts at -1 whenever the chain has been
+    /// extended since the last call (`last_precious_chainwork`) — without
+    /// that, a `preciousblock` from a thousand blocks ago would keep
+    /// outranking one made now.
+    pub fn precious_block(&self, hash: BlockHash) -> Result<(), ChainError> {
+        let _accept_guard = self.accept_lock.lock();
+        self.check_no_snapshot_load()?;
+
+        let entry = self
+            .store
+            .get_block_index(&hash)
+            .ok_or(ChainError::BlockNotFound)?;
+
+        let tip_entry = self
+            .store
+            .get_block_index(&self.tip_hash())
+            .ok_or(ChainError::BadPrevBlock)?;
+
+        // Core: "Nothing to do, this block is not at the tip." Less work than
+        // the active tip can never be reached by a tie-break, so Core returns
+        // success without touching the counters — `preciousblock` on a buried
+        // block is a no-op, not an error.
+        if compare_u256(&entry.chainwork, &tip_entry.chainwork) < 0 {
+            return Ok(());
+        }
+
+        {
+            let mut seq = self.sequence_ids.lock();
+            if compare_u256(&tip_entry.chainwork, &seq.last_precious_chainwork) > 0 {
+                // The chain has been extended since the last call, so the
+                // earlier preference is stale: restart the counter.
+                seq.reverse = -1;
+            }
+            seq.last_precious_chainwork = tip_entry.chainwork;
+            let id = seq.reverse;
+            // Core stops at `i32::MIN` rather than wrapping — "we can't keep
+            // reducing the counter if somebody really wants to call
+            // preciousblock 2**31-1 times on the same set of tips".
+            seq.reverse = seq.reverse.saturating_sub(1);
+            seq.ids.insert(hash, id);
+        }
+
+        self.activate_best_chain()
+    }
+
     /// Clear the `Invalid` mark on `hash` and its descendants, then
     /// re-activate the best valid chain — Bitcoin Core's `reconsiderblock`.
     /// If the reconsidered chain now carries the most work it becomes the
@@ -7827,6 +7961,94 @@ impl ChainState {
     /// is present and non-invalid — i.e. it could be connected right now. Used
     /// by [`Self::find_best_valid_tip`] to skip candidates whose path has a
     /// gap (a `HeaderOnly`/`Invalid`/missing ancestor).
+    /// This block's [`SequenceIds`] score — Core's `pindex->nSequenceId`.
+    ///
+    /// An id assigned this run wins outright. Without one the block came from
+    /// disk, and Core's rule is that the chain it loaded scores
+    /// [`SEQ_ID_BEST_CHAIN_FROM_DISK`] and everything else
+    /// [`SEQ_ID_INIT_FROM_DISK`], so the tip a node shut down on holds its
+    /// ground against an equal-work competitor instead of the choice
+    /// wobbling from one boot to the next.
+    ///
+    /// Core freezes that set once, walking back from the tip at load. satd
+    /// asks the height index whether the block is on the active chain *now*,
+    /// which is O(1) instead of a walk over every block in the chain at every
+    /// startup. The two agree except for a block that was on the loaded chain
+    /// and has since been reorged away — which by then has a real id from
+    /// [`Self::assign_sequence_ids`] in the overwhelming majority of cases,
+    /// and where the answer this gives ("no longer preferred") is the one the
+    /// incumbent rule wants anyway.
+    fn sequence_id(&self, hash: &BlockHash, height: u32) -> i32 {
+        if let Some(id) = self.sequence_ids.lock().ids.get(hash) {
+            return *id;
+        }
+        if self.active_chain_hash_at_height(height) == Some(*hash) {
+            SEQ_ID_BEST_CHAIN_FROM_DISK
+        } else {
+            SEQ_ID_INIT_FROM_DISK
+        }
+    }
+
+    /// Core's `ReceivedBlockTransactions`: `hash`'s data has arrived and the
+    /// block is connectable, so give it the next sequence id and then walk the
+    /// descendants this unblocks, giving each one an id in turn.
+    ///
+    /// The walk is what makes the id mean "became connectable" rather than
+    /// "arrived". A block whose data landed while its parent was still
+    /// missing was parked in `unlinked` with no id; when the parent finally
+    /// connects, parent and child are numbered in that order — the order they
+    /// became connectable — not in the order the bytes showed up.
+    ///
+    /// A no-op for a block that already has an id: a re-store of the same
+    /// block must not renumber it, or a competing tip could jump the queue by
+    /// being sent twice.
+    fn assign_sequence_ids(&self, hash: BlockHash) {
+        let mut seq = self.sequence_ids.lock();
+        let mut queue = std::collections::VecDeque::from([hash]);
+        while let Some(h) = queue.pop_front() {
+            if seq.ids.contains_key(&h) {
+                continue;
+            }
+            let id = seq.next;
+            // Saturate rather than wrap: an id that wrapped negative would
+            // outrank every natural id and silently act as a `preciousblock`.
+            seq.next = seq.next.saturating_add(1);
+            seq.ids.insert(h, id);
+            if let Some(children) = seq.unlinked.remove(&h) {
+                queue.extend(children);
+            }
+        }
+    }
+
+    /// Park `child` until `parent` becomes connectable — Core's
+    /// `m_blocks_unlinked.insert`. The descendant walk in
+    /// [`Self::assign_sequence_ids`] drains it.
+    fn park_unlinked(&self, parent: BlockHash, child: BlockHash) {
+        let mut seq = self.sequence_ids.lock();
+        if seq.ids.contains_key(&child) {
+            return;
+        }
+        let siblings = seq.unlinked.entry(parent).or_default();
+        if !siblings.contains(&child) {
+            siblings.push(child);
+        }
+    }
+
+    /// Record that `hash`'s data is now stored: assign its sequence id if it
+    /// is connectable, otherwise park it behind its parent.
+    fn note_block_data_arrived(&self, hash: BlockHash, entry: &BlockIndexEntry) {
+        match self.is_connectable(entry) {
+            Ok(true) => self.assign_sequence_ids(hash),
+            Ok(false) => self.park_unlinked(entry.header.prev_blockhash, hash),
+            Err(e) => {
+                // The tie-break is an ordering preference, not a safety
+                // property: a block left without an id scores as if loaded
+                // from disk, which is the conservative end.
+                tracing::debug!(%hash, error = %e, "sequence id: connectability check failed");
+            }
+        }
+    }
+
     fn is_connectable(&self, entry: &BlockIndexEntry) -> Result<bool, ChainError> {
         let mut h = entry.header.block_hash();
         let mut height = entry.height;
@@ -7857,6 +8079,30 @@ impl ChainState {
     /// equal-work side chains never displace the active tip). When the active
     /// tip is itself invalid (just invalidated), the best connectable
     /// alternative is returned unconditionally.
+    /// Bitcoin Core's `CBlockIndexWorkComparator`
+    /// (`node/blockstorage.cpp`), as an ordering where `Less` means "better
+    /// chain": most chainwork first, then the earliest sequence id — the
+    /// block that became connectable first, or that `preciousblock` has
+    /// pushed below every natural id.
+    ///
+    /// The hash is the last resort, where Core uses the `CBlockIndex*`
+    /// address. Neither is meaningful; both exist so the order is total. Core
+    /// notes its pointer case "should only happen with blocks loaded from
+    /// disk, as those share the same id", which is exactly when satd reaches
+    /// the hash.
+    fn compare_candidates(&self, a: &BlockIndexEntry, b: &BlockIndexEntry) -> std::cmp::Ordering {
+        match compare_u256(&a.chainwork, &b.chainwork) {
+            1 => std::cmp::Ordering::Less,
+            -1 => std::cmp::Ordering::Greater,
+            _ => {
+                let (ha, hb) = (a.header.block_hash(), b.header.block_hash());
+                self.sequence_id(&ha, a.height)
+                    .cmp(&self.sequence_id(&hb, b.height))
+                    .then_with(|| ha.cmp(&hb))
+            }
+        }
+    }
+
     fn find_best_valid_tip(&self) -> Result<BlockIndexEntry, ChainError> {
         let current_tip = self.tip_hash();
         let tip_entry = self
@@ -7874,13 +8120,14 @@ impl ChainState {
                 candidates.push(e);
             }
         })?;
-        // Most chainwork first; ties broken by hash for determinism (the
-        // iteration order of `for_each_block_index` is unspecified).
-        candidates.sort_by(|a, b| match compare_u256(&a.chainwork, &b.chainwork) {
-            1 => std::cmp::Ordering::Less,
-            -1 => std::cmp::Ordering::Greater,
-            _ => a.header.block_hash().cmp(&b.header.block_hash()),
-        });
+        // Core's `CBlockIndexWorkComparator` (`node/blockstorage.cpp`): most
+        // chainwork first, then the earliest sequence id — the block that
+        // became connectable first, or that `preciousblock` has pushed below
+        // every natural id. The hash is the last resort where Core uses the
+        // `CBlockIndex*` address, which is to say only for determinism: the
+        // iteration order of `for_each_block_index` is unspecified, and Core's
+        // pointer order is no more meaningful.
+        candidates.sort_by(|a, b| self.compare_candidates(a, b));
 
         for cand in &candidates {
             let ch = cand.header.block_hash();
@@ -7889,9 +8136,13 @@ impl ChainState {
                 // highest-work of a tie we won't switch away from): stay.
                 return Ok(cand.clone());
             }
-            if tip_valid && compare_u256(&cand.chainwork, &tip_entry.chainwork) <= 0 {
-                // No remaining candidate has strictly more work than the
-                // still-valid tip — keep it.
+            if tip_valid && self.compare_candidates(cand, &tip_entry).is_ge() {
+                // Nothing left outranks the still-valid tip. Candidates are
+                // sorted, so no later one can either. This is where the
+                // incumbent wins an equal-work tie — not by a special case,
+                // but because it became connectable first and so carries the
+                // lower sequence id. `preciousblock` is exactly the operator
+                // saying otherwise, and it gets through here for that reason.
                 return Ok(tip_entry);
             }
             if self.is_connectable(cand)? {
@@ -10013,6 +10264,164 @@ pub(crate) mod tests {
                 BlockStatus::Valid
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's `CBlockIndexWorkComparator` breaks an equal-work tie on
+    /// `nSequenceId` — the order the blocks became connectable — not on the
+    /// hash. Build the tie so the two orderings disagree: whichever of the two
+    /// competing tips has the *higher* hash is stored first, so a hash
+    /// tie-break would pick the other one.
+    #[test]
+    fn an_equal_work_tie_breaks_on_arrival_order_not_hash() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let fork_point = main[1].block_hash(); // height 2
+        let main3 = main[2].block_hash();
+
+        // Two equal-work competitors at height 3 off the same parent.
+        let a = build_test_block(fork_point, 3, 1_400_000_777);
+        let b = build_test_block(fork_point, 3, 1_400_000_888);
+        // Store the higher-hashed one first so arrival order and hash order
+        // disagree; a hash tie-break would pick `low`.
+        let (first, second) = if a.block_hash() > b.block_hash() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        assert!(first.block_hash() > second.block_hash());
+
+        for blk in [&first, &second] {
+            cs.accept_header(&blk.header).unwrap();
+            cs.store_block(blk).unwrap();
+        }
+
+        // Invalidating the incumbent leaves the two competitors as the only
+        // equal-work candidates, so the tie-break alone decides.
+        cs.invalidate_block(main3).unwrap();
+        assert_eq!(
+            cs.tip_hash(),
+            first.block_hash(),
+            "the tip must be the block that became connectable first, not the lower hash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `preciousblock` hands a block an id below every naturally-assigned one,
+    /// so it takes a tie it would otherwise lose on arrival order.
+    #[test]
+    fn preciousblock_overrides_the_arrival_order_tie_break() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let fork_point = main[1].block_hash();
+        let main3 = main[2].block_hash();
+
+        let first = build_test_block(fork_point, 3, 1_400_000_777);
+        let second = build_test_block(fork_point, 3, 1_400_000_888);
+        for blk in [&first, &second] {
+            cs.accept_header(&blk.header).unwrap();
+            cs.store_block(blk).unwrap();
+        }
+        cs.invalidate_block(main3).unwrap();
+        assert_eq!(cs.tip_hash(), first.block_hash(), "arrival order picks first");
+
+        cs.precious_block(second.block_hash()).unwrap();
+        assert_eq!(
+            cs.tip_hash(),
+            second.block_hash(),
+            "preciousblock must override the arrival-order tie-break"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reverse counter keeps descending, so a second `preciousblock`
+    /// outranks the first.
+    #[test]
+    fn a_second_preciousblock_overrides_the_first() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let fork_point = main[1].block_hash();
+        let main3 = main[2].block_hash();
+
+        let first = build_test_block(fork_point, 3, 1_400_000_777);
+        let second = build_test_block(fork_point, 3, 1_400_000_888);
+        for blk in [&first, &second] {
+            cs.accept_header(&blk.header).unwrap();
+            cs.store_block(blk).unwrap();
+        }
+        cs.invalidate_block(main3).unwrap();
+
+        cs.precious_block(second.block_hash()).unwrap();
+        assert_eq!(cs.tip_hash(), second.block_hash());
+        cs.precious_block(first.block_hash()).unwrap();
+        assert_eq!(
+            cs.tip_hash(),
+            first.block_hash(),
+            "the later preciousblock must outrank the earlier one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core returns success without touching anything when the block carries
+    /// less work than the active tip: the tie-break is never consulted across
+    /// a work difference, so there is nothing for `preciousblock` to do.
+    #[test]
+    fn preciousblock_on_a_lower_work_block_is_a_no_op_success() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 4);
+        let tip_before = cs.tip_hash();
+
+        cs.precious_block(main[1].block_hash()).unwrap();
+        assert_eq!(
+            cs.tip_hash(),
+            tip_before,
+            "preciousblock on a buried block must not move the tip"
+        );
+        assert!(matches!(
+            cs.precious_block(BlockHash::from_byte_array([0x42; 32])),
+            Err(ChainError::BlockNotFound)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core numbers blocks by when they became *connectable*, which is why
+    /// `ReceivedBlockTransactions` walks descendants. A block whose data
+    /// arrives while its parent is missing is parked; when the parent lands,
+    /// parent and child are numbered in that order. Here the child of one
+    /// branch arrives before its parent, and still loses the tie at its own
+    /// height to a competitor that was connectable the whole time.
+    #[test]
+    fn a_block_stored_before_its_parent_is_numbered_when_the_parent_arrives() {
+        let (cs, dir) = make_chain_state();
+        let main = build_and_connect_chain(&cs, 3);
+        let fork_point = main[1].block_hash();
+        let main3 = main[2].block_hash();
+
+        // Branch A: height 3 and 4, but 4's data arrives first (its parent
+        // A3 is not stored yet, so A4 is not connectable).
+        let a3 = build_test_block(fork_point, 3, 1_400_000_301);
+        let a4 = build_test_block(a3.block_hash(), 4, 1_400_000_401);
+        // Branch B: height 3 and 4 in order, stored entirely after A4.
+        let b3 = build_test_block(fork_point, 3, 1_400_000_302);
+        let b4 = build_test_block(b3.block_hash(), 4, 1_400_000_402);
+
+        for blk in [&a3, &a4, &b3, &b4] {
+            cs.accept_header(&blk.header).unwrap();
+        }
+        // A4 first — parked, unnumbered. Then B3, B4 — both connectable.
+        // Then A3, which unblocks A4 via the descendant walk.
+        for blk in [&a4, &b3, &b4, &a3] {
+            cs.store_block(blk).unwrap();
+        }
+
+        cs.invalidate_block(main3).unwrap();
+        // B4 became connectable before A4 did (A4 was waiting on A3, which
+        // arrived last), so B4 takes the height-4 tie.
+        assert_eq!(
+            cs.tip_hash(),
+            b4.block_hash(),
+            "the tie must follow connectable order, not the order data arrived"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

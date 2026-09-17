@@ -1414,9 +1414,19 @@ pub fn get_mempool_entries_bulk(mempool: &Mempool, txid_strs: &[String]) -> Valu
     Value::Object(out)
 }
 
-/// `preciousblock` — mark a block as precious (prefer during reorg tie-breaking).
-pub fn precious_block(_hash_str: &str) -> Result<Value, String> {
-    // Stub: acknowledge but don't implement tie-breaking preference
+/// `preciousblock` — treat a block as preferable to every equal-work tip.
+///
+/// Core returns `null` on success and reports a bad hash as `-5 Block not
+/// found`; a block with less work than the active tip is a no-op success, not
+/// an error. See [`crate::chain::state::ChainState::precious_block`].
+pub fn precious_block(
+    chain_state: &crate::chain::state::ChainState,
+    hash_str: &str,
+) -> Result<Value, (i32, String)> {
+    let hash: bitcoin::BlockHash = hash_str
+        .parse()
+        .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
+    chain_state.precious_block(hash).map_err(map_invalidate_err)?;
     Ok(Value::Null)
 }
 
