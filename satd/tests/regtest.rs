@@ -18901,6 +18901,65 @@ fn stratum_v1_new_block_pushes_clean_job() {
     });
 }
 
+/// A node that catches up over P2P moves its tip through the IBD connect
+/// loop, and that loop emits no chain event. The stratum server rebuilt its
+/// work on chain events alone, polling the tip only as a fallback for a
+/// missing event channel -- so a node that caught up went on serving work
+/// built on the tip it had *before*, for up to the 30-second periodic
+/// rebuild. On a node that synced from genesis that is work on genesis, a
+/// hundred blocks down. Every job a miner got in that window was stale, and
+/// every job a Job Declaration client declared against it was refused for
+/// committing to the wrong height.
+#[test]
+fn stratum_work_follows_a_tip_that_caught_up_over_p2p() {
+    use serde_json::json;
+    let mut node_a = TestNode::start(&[]);
+    let p2p_port_a = node_a.p2p_port.expect("node A p2p port");
+    let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
+    // Far enough ahead that the catch-up goes through the IBD connect loop
+    // rather than block-by-block acceptance.
+    node_a.rpc_ok("generatetoaddress", vec![json!(120), json!(addr.clone())]);
+
+    let port = find_available_port();
+    let mut node_b = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        &format!("--connect=127.0.0.1:{p2p_port_a}"),
+    ]);
+    poll_until(
+        || get_rpc_u64(&node_b, "getblockcount").unwrap_or(0) >= 120,
+        Duration::from_secs(60),
+        "node B did not sync node A's chain",
+    );
+    let tip = get_rpc_str(&node_b, "getbestblockhash").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Well inside the 30s periodic rebuild that used to be the only
+        // thing that recovered from this.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let mut client = plain_stratum_client(port);
+            let (_, job) = client.handshake(&addr).await;
+            if notify_prevhash(&job) == tip {
+                assert_eq!(notify_height(&job), 121, "{job}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stratum is still serving work for a tip the node left behind: \
+                 job prevhash {} vs chain tip {tip}",
+                notify_prevhash(&job),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    node_b.stop();
+    node_a.stop();
+}
+
+
 /// A miner that never stops submitting still gets the job for a new tip. On
 /// regtest every share a CPU miner finds is a block, so it submits without
 /// pause; a session that served the miner's lines ahead of new work never
