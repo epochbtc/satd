@@ -133,6 +133,12 @@ pub enum PsbtError {
     #[error("converting to a version 0 PSBT produced bytes the v0 parser rejected: {0}")]
     V0Roundtrip(String),
 
+    #[error(
+        "this PSBT asks for more than {limit} silent payment checks; \
+         no transaction that can be relayed needs that many"
+    )]
+    TooMuchWork { limit: usize },
+
     #[error("{0}")]
     Structure(String),
 }

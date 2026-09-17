@@ -270,10 +270,16 @@ fn psbt_fee(psbt: &Psbt) -> Option<Amount> {
 }
 
 /// `analyzepsbt` — analyze PSBT completeness.
-pub fn analyze_psbt(psbt_b64: &str) -> Result<Value, (i32, String)> {
+/// `chain_state` is what lets the silent payment checks cross-check each
+/// previous output against the UTXO set. The version 0 path ignores it
+/// entirely and behaves identically with or without it.
+pub fn analyze_psbt(
+    psbt_b64: &str,
+    chain_state: Option<&ChainState>,
+) -> Result<Value, (i32, String)> {
     match parse_any(psbt_b64)? {
         Parsed::V0(psbt) => analyze_psbt_v0(&psbt),
-        Parsed::V2(raw) => psbt_v2::analyze(&raw),
+        Parsed::V2(raw) => psbt_v2::analyze(&raw, chain_state),
     }
 }
 
@@ -417,20 +423,23 @@ fn as_v2(parsed: &Parsed) -> RawPsbt {
 }
 
 /// `finalizepsbt` — finalize a fully-signed PSBT into a network transaction.
-pub fn finalize_psbt(psbt_b64: &str, extract: bool) -> Result<Value, (i32, String)> {
+pub fn finalize_psbt(
+    psbt_b64: &str,
+    extract: bool,
+    chain_state: Option<&ChainState>,
+) -> Result<Value, (i32, String)> {
     match parse_any(psbt_b64)? {
         Parsed::V0(psbt) => finalize_psbt_v0(psbt, extract),
         Parsed::V2(raw) => {
             // BIP 375 gives the Transaction Extractor the duty of recomputing
             // every silent payment output script and checking it before a
-            // transaction leaves the PSBT. satd cannot do that yet, so it
-            // refuses rather than extract a transaction whose outputs it has
-            // not verified. Lifted in the change that adds the verifier.
+            // transaction leaves the PSBT. There is no override: a silent
+            // payment paid to the wrong script is not recoverable, and
+            // `extract=false` is gated too because a finalised PSBT is one
+            // `sendrawtransaction` away from the chain.
             if psbt_v2::has_silent_payments(&raw) {
-                return Err((
-                    -22,
-                    "silent payment outputs cannot be finalized by this version".to_string(),
-                ));
+                let view = satd_psbt::V2View::new(&raw).map_err(|e| (-22, e.to_string()))?;
+                psbt_v2::extractor_gate(&view, chain_state)?;
             }
             let (finalized, complete) = psbt_v2::finalize(&raw)?;
             if extract && complete {
@@ -699,7 +708,7 @@ mod tests {
             }],
         };
         let analyze = |psbt: &Psbt| {
-            analyze_psbt(&psbt_to_base64(psbt)).expect("analyzes")
+            analyze_psbt(&psbt_to_base64(psbt), None).expect("analyzes")
         };
 
         // The honest PSBT: a matching non_witness_utxo, fee 0.01 BTC.

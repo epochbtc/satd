@@ -80,14 +80,14 @@ fn take_snapshot() -> Value {
 
     for (name, b64) in fixtures() {
         record(&format!("decodepsbt/{name}"), psbt::decode_psbt(&b64));
-        record(&format!("analyzepsbt/{name}"), psbt::analyze_psbt(&b64));
+        record(&format!("analyzepsbt/{name}"), psbt::analyze_psbt(&b64, None));
         record(
             &format!("finalizepsbt-extract/{name}"),
-            psbt::finalize_psbt(&b64, true),
+            psbt::finalize_psbt(&b64, true, None),
         );
         record(
             &format!("finalizepsbt-keep/{name}"),
-            psbt::finalize_psbt(&b64, false),
+            psbt::finalize_psbt(&b64, false, None),
         );
         record(
             &format!("combinepsbt-self/{name}"),
