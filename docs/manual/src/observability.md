@@ -130,6 +130,25 @@ The same numbers are counters:
 The share of blocks reconstructed without a round trip is
 `direct / (direct + round_trip + fallback)`.
 
+### Stratum server
+
+While the [Stratum server](stratum.md) runs, its counters are exported. A node
+with `--stratum=0` exports none of these families.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `satd_stratum_connections` | gauge | — | Open Stratum connections, V1 and V2. |
+| `satd_stratum_miners` | gauge | — | Authorized Stratum V1 connections plus open Stratum V2 channels. |
+| `satd_stratum_shares_total` | counter | `result` = `accepted`, `rejected`, `stale` | Shares submitted, by result. |
+| `satd_stratum_blocks_found_total` | counter | — | Blocks found by miners that joined the active chain. |
+| `satd_stratum_hashrate_hashes_per_second` | gauge | — | Estimated hashrate of the connected miners, from the shares accepted over the last ten minutes. |
+
+There are no per-miner series. A worker name is whatever the miner sends, so a
+label on it would let a miner create series without limit; `getstratuminfo`
+lists each miner instead. A miner that stops hashing shows as
+`satd_stratum_miners` holding steady while the accepted-share rate falls to
+zero.
+
 ## Status page
 
 `--statuspage=1` adds a browser page to the metrics listener, a simplified,

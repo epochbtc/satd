@@ -218,13 +218,18 @@ asking for work selection with `unsupported-feature-flags`.
 ## Monitoring
 
 `getstratuminfo` reports the listeners, the authority key, open connections
-and channels, share counters, blocks found and the current job. See
-[JSON-RPC Extensions](json-rpc-extensions.md#stratum).
+and channels, share counters, blocks found, the current job, and every
+connected miner with its device, difficulty, share counts, best share and
+estimated hashrate. See [JSON-RPC Extensions](json-rpc-extensions.md#stratum).
+The same counters are Prometheus metrics; see
+[Observability](observability.md#stratum-server).
 
 ## Verifying a miner
 
-The log shows whether a device is working from the node's side. Every miner
-gets these lines with no extra flags:
+For a quick check, `sat-cli getstratuminfo` lists each connected miner with
+its share counts, the time of its last accepted share and its estimated
+hashrate. The log has the history. Every miner gets these lines with no extra
+flags:
 
 | Line | Level | Says |
 |---|---|---|

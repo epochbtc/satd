@@ -141,7 +141,24 @@ unconditionally.
   },
   "shares": { "accepted": 412, "rejected": 3, "stale": 1 },
   "blocks_found": 0,
-  "last_block": null
+  "last_block": null,
+  "hashrate": 1210000000000.0,
+  "miners": [
+    {
+      "protocol": "v1",
+      "peer": "192.0.2.10:51234",
+      "channel_id": null,
+      "address": "bc1q…",
+      "worker": "rig1",
+      "device": "<user agent the firmware sent>",
+      "difficulty": 10000,
+      "connected_time": 1760000000,
+      "shares": { "accepted": 208, "rejected": 1, "stale": 0 },
+      "best_share_difficulty": 4812337.6,
+      "last_share_time": 1760006280,
+      "hashrate": 1210000000000.0
+    }
+  ]
 }
 ```
 
@@ -157,6 +174,24 @@ unconditionally.
 *   `blocks_found` counts blocks found through the server that joined the
     active chain; `last_block` is `{ "height", "hash", "time" }` for the most
     recent, or null.
+*   `miners` lists every miner connected now, oldest first: an authorized
+    Stratum V1 connection, or a Stratum V2 channel (`channel_id` set). A miner
+    leaves the list when it disconnects.
+    *   `address` is the payout address, or null when `--stratumaddress` pays;
+        `worker` is the part of the username after the first `.`.
+    *   `device` is the Stratum V1 user agent, or the Stratum V2 vendor,
+        hardware version and firmware, reduced to printable ASCII; null if the
+        miner sent none.
+    *   `difficulty` is the share difficulty the miner is set to now.
+        `connected_time` and `last_share_time` (null before the first accepted
+        share) are Unix times.
+    *   `shares` count this miner's shares, as the node-wide `shares` do.
+        `best_share_difficulty` is the highest difficulty an accepted share's
+        header achieved.
+    *   `hashrate` is an estimate in hashes per second, from the difficulty of
+        the shares accepted over the last ten minutes (see
+        [Verifying a miner](stratum.md#verifying-a-miner)).
+*   The top-level `hashrate` is the sum over `miners`.
 
 ## Client-side PSBT signing (no signing RPC)
 
