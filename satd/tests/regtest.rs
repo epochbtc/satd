@@ -18820,6 +18820,7 @@ fn stratum_v2_extended_share_connects_block() {
     assert!(opened.contains("kind=\"extended\"") && opened.contains("device=test-miner"), "{opened}");
     let closed = find("Stratum V2 channel closed");
     assert!(closed.contains("accepted=1") && closed.contains("rejected=0"), "{closed}");
+    assert!(closed.contains("reason=\"end of stream\""), "a miner hanging up is not a read failure: {closed}");
     assert!(!closed.contains("best_share=0.000"), "the block is the best share: {closed}");
 }
 

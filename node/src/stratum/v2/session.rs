@@ -218,8 +218,13 @@ pub(crate) async fn run(
                     session.handle(msg_type, &payload, &mut work_rx).await
                 }
                 Some(Err(e)) => {
-                    tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 read failed");
-                    reason = "read failed";
+                    reason = match &e {
+                        TransportError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => "end of stream",
+                        _ => {
+                            tracing::debug!(target: "node::stratum", %peer, error = %e, "Stratum V2 read failed");
+                            "read failed"
+                        }
+                    };
                     break;
                 }
                 None => {
