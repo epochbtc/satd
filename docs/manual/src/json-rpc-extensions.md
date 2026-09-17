@@ -178,7 +178,8 @@ unconditionally.
     Stratum V1 connection, or a Stratum V2 channel (`channel_id` set). A miner
     leaves the list when it disconnects.
     *   `address` is the payout address, or null when `--stratumaddress` pays;
-        `worker` is the part of the username after the first `.`.
+        `worker` is the part of the username after the first `.`, reduced to
+        printable ASCII and at most 64 characters.
     *   `device` is the Stratum V1 user agent, or the Stratum V2 vendor,
         hardware version and firmware, reduced to printable ASCII; null if the
         miner sent none.
