@@ -18679,6 +18679,16 @@ fn stratum_v2_handshake_and_standard_channel() {
         let mut payload = miner.expect(0x1c, Duration::from_secs(10)).await;
         let ok: SubmitSharesSuccess = binary_sv2::from_bytes(&mut payload).unwrap();
         assert_eq!((ok.channel_id, ok.last_sequence_number), (channel_id, 1));
+        // The channel is listed as a miner, with the device it set up as.
+        let info = tokio::task::block_in_place(|| node.rpc_ok("getstratuminfo", vec![]));
+        let miners = info["miners"].as_array().expect("miners");
+        assert_eq!(miners.len(), 1, "{info}");
+        let m = &miners[0];
+        assert_eq!(m["protocol"], "v2", "{m}");
+        assert_eq!(m["channel_id"], channel_id, "{m}");
+        assert_eq!(m["worker"], "rig", "{m}");
+        assert_eq!(m["device"], "test-miner", "{m}");
+        assert_eq!(m["shares"]["accepted"], 1, "{m}");
     });
     poll_until(
         || get_rpc_u64(&node, "getblockcount") == Some(6),
@@ -19255,26 +19265,47 @@ fn stratum_v2_jd_refuses_a_transaction_not_in_the_mempool() {
 fn getstratuminfo_reports_live_counters() {
     use serde_json::json;
     let port = find_available_port();
-    let node = TestNode::start(&["--stratum=1", &format!("--stratumbind=127.0.0.1:{port}")]);
+    let metrics_port = find_available_port();
+    let node = TestNode::start(&[
+        "--stratum=1",
+        &format!("--stratumbind=127.0.0.1:{port}"),
+        &format!("--metricsport={metrics_port}"),
+    ]);
+    let metrics = |port: u16| -> String {
+        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get(format!("http://127.0.0.1:{port}/metrics")).send() {
+                Ok(r) => return r.text().unwrap(),
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => panic!("metrics on {port}: {e}"),
+            }
+        }
+    };
     let addr = DeterministicWallet::from_secret(STRATUM_MINER_SECRET).address.to_string();
     let before = node.rpc_ok("getstratuminfo", vec![]);
     assert_eq!(before["enabled"], true, "{before}");
     assert_eq!(before["listeners"]["v1"], format!("127.0.0.1:{port}"));
     assert_eq!(before["shares"]["accepted"], 0);
+    assert_eq!(before["miners"], json!([]), "{before}");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut client = plain_stratum_client(port);
-        let (extranonce1, params) = client.handshake(&addr).await;
+        // A subscribed connection that has not authorized is not a miner yet.
+        let info = tokio::task::block_in_place(|| node.rpc_ok("getstratuminfo", vec![]));
+        assert_eq!(info["miners"], json!([]), "{info}");
+        let worker = format!("{addr}.rig1");
+        let (extranonce1, params) = client.handshake(&worker).await;
         let (extranonce2, ntime, nonce) = grind_stratum_block(&extranonce1, &params);
         let reply = client
             .call(
                 "mining.submit",
-                json!([addr, params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
+                json!([worker, params[0], hex::encode(extranonce2), format!("{ntime:08x}"), format!("{nonce:08x}")]),
             )
             .await;
         assert_eq!(reply["result"], true, "{reply}");
-        let stale = client.call("mining.submit", json!([addr, "ffff", "00000000", "00000000", "00000000"])).await;
+        let stale = client.call("mining.submit", json!([worker, "ffff", "00000000", "00000000", "00000000"])).await;
         assert_eq!(stale["error"][0], 21);
 
         let info = tokio::task::block_in_place(|| node.rpc_ok("getstratuminfo", vec![]));
@@ -19285,10 +19316,44 @@ fn getstratuminfo_reports_live_counters() {
         assert_eq!(info["connections"], 1, "{info}");
         assert_eq!(info["channels"], 1, "{info}");
         assert!(info["current_job"]["height"].is_u64(), "{info}");
-    });
 
-    let off = TestNode::start(&[]);
+        // The same share, attributed to the miner that sent it.
+        let miners = info["miners"].as_array().expect("miners");
+        assert_eq!(miners.len(), 1, "{info}");
+        let m = &miners[0];
+        assert_eq!(m["protocol"], "v1", "{m}");
+        assert_eq!(m["address"], addr, "{m}");
+        assert_eq!(m["worker"], "rig1", "{m}");
+        assert_eq!(m["device"], "test-miner/1.0", "{m}");
+        assert!(m["channel_id"].is_null(), "{m}");
+        assert_eq!(m["difficulty"], 1, "{m}");
+        assert_eq!(m["shares"], json!({"accepted": 1, "rejected": 0, "stale": 1}), "{m}");
+        assert!(m["best_share_difficulty"].as_f64().unwrap() > 0.0, "{m}");
+        assert!(m["last_share_time"].as_u64().unwrap() >= m["connected_time"].as_u64().unwrap(), "{m}");
+        assert!(m["peer"].as_str().unwrap().starts_with("127.0.0.1:"), "{m}");
+        assert!(m["hashrate"].as_f64().is_some(), "{m}");
+        assert_eq!(info["hashrate"], m["hashrate"], "{info}");
+
+        let body = tokio::task::block_in_place(|| metrics(metrics_port));
+        assert!(body.contains("satd_stratum_miners 1"), "{body}");
+        assert!(body.contains("satd_stratum_shares_total{result=\"accepted\"} 1"), "{body}");
+        assert!(body.contains("satd_stratum_blocks_found_total 1"), "{body}");
+        assert!(body.contains("satd_stratum_hashrate_hashes_per_second "), "{body}");
+    });
+    // The runtime, and the client with it, are gone: the miner leaves the list.
+    drop(rt);
+    poll_until(
+        || node.rpc_ok("getstratuminfo", vec![])["miners"] == json!([]),
+        test_timeout(10),
+        "a disconnected miner leaves getstratuminfo",
+    );
+    assert!(metrics(metrics_port).contains("satd_stratum_miners 0"));
+
+    let off_metrics = find_available_port();
+    let off = TestNode::start(&[&format!("--metricsport={off_metrics}")]);
     let info = off.rpc_ok("getstratuminfo", vec![]);
     assert_eq!(info["enabled"], false, "{info}");
     assert!(info["listeners"]["v1"].is_null());
+    assert_eq!(info["miners"], json!([]), "{info}");
+    assert!(!metrics(off_metrics).contains("satd_stratum_"), "no Stratum families without the server");
 }

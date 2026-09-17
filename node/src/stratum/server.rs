@@ -60,6 +60,8 @@ pub struct StratumStats {
     pub shares_stale: AtomicU64,
     /// Blocks found by miners that joined the active chain.
     pub blocks_found: AtomicU64,
+    /// The miners connected now.
+    pub miners: Arc<super::miner::MinerRegistry>,
     last_block: parking_lot::Mutex<Option<LastBlock>>,
 }
 
@@ -145,6 +147,11 @@ pub struct StratumHandle {
 }
 
 impl StratumHandle {
+    /// The server's counters and connected miners.
+    pub fn stats(&self) -> &StratumStats {
+        &self.shared.stats
+    }
+
     /// The `getstratuminfo` result.
     pub fn info(&self) -> serde_json::Value {
         let shared = &self.shared;
@@ -183,6 +190,8 @@ impl StratumHandle {
             },
             "blocks_found": load(&stats.blocks_found),
             "last_block": last_block,
+            "hashrate": stats.miners.hashrate(),
+            "miners": stats.miners.info(),
         })
     }
 
@@ -199,6 +208,8 @@ impl StratumHandle {
             "shares": { "accepted": 0, "rejected": 0, "stale": 0 },
             "blocks_found": 0,
             "last_block": null,
+            "hashrate": 0.0,
+            "miners": [],
         })
     }
 }

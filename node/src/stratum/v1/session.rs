@@ -24,7 +24,7 @@ use super::{
 };
 use crate::stratum::config::{Payout, resolve_payout};
 use crate::stratum::job::{Job, JobManager};
-use crate::stratum::miner::{self, MinerTally, format_difficulty, format_hashrate};
+use crate::stratum::miner::{self, MinerRecord, MinerSlot, format_difficulty, format_hashrate};
 use crate::stratum::server::{CountGuard, ShareOutcome, Shared, submit_found_block};
 use crate::stratum::share::{
     ShareResult, effective_share_target, hash_difficulty, network_difficulty, validate_share,
@@ -64,7 +64,8 @@ struct Session<S> {
     channel: Option<CountGuard>,
     /// What the miner called itself in `mining.subscribe`, made safe to log.
     user_agent: Option<String>,
-    tally: MinerTally,
+    /// This miner's `getstratuminfo` entry, from its first authorize.
+    miner: Option<MinerSlot>,
 }
 
 /// A share that was not accepted, with what the log line needs.
@@ -119,7 +120,7 @@ pub(crate) async fn run<S>(
         seen: HashSet::new(),
         channel: None,
         user_agent: None,
-        tally: MinerTally::new(std::time::Instant::now()),
+        miner: None,
     };
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -339,6 +340,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             "Stratum miner authorized"
         );
         let first = self.payout.is_none();
+        let miner = self.miner.get_or_insert_with(|| {
+            self.shared.stats.miners.register(MinerRecord::new("v1", self.peer, None, self.vardiff.difficulty()))
+        });
+        {
+            let mut record = miner.lock();
+            record.address = payout.address.clone();
+            record.worker = payout.worker.clone();
+            record.device = self.user_agent.clone();
+        }
         self.payout = Some(payout);
         if first {
             self.channel = Some(CountGuard::new(self.shared.stats.clone(), |s| &s.channels));
@@ -385,6 +395,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 
     /// Tell the miner its new difficulty and give it a job at that difficulty.
     async fn difficulty_changed(&mut self, difficulty: u64) -> Result<(), Close> {
+        if let Some(miner) = &self.miner {
+            miner.lock().difficulty = difficulty;
+        }
         self.write(notification("mining.set_difficulty", json!([difficulty]))).await?;
         let work = self.jobs.latest().map(|j| j.template.work.clone());
         match work {
@@ -452,7 +465,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         let line = match reply {
             Ok(()) => response(&req.id, json!(true)),
             Err(refusal) => {
-                self.tally.refuse(outcome);
+                if let Some(miner) = &self.miner {
+                    miner.lock().tally.refuse(outcome);
+                }
                 self.log_refusal(&refusal);
                 error_response(&req.id, refusal.error, None)
             }
@@ -572,7 +587,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         }
         self.seen.insert(key);
         self.vardiff.record_share();
-        self.tally.accept(std::time::Instant::now(), difficulty, hash_difficulty);
+        if let Some(miner) = &self.miner {
+            miner.lock().tally.accept(std::time::Instant::now(), difficulty, hash_difficulty);
+        }
     }
 
     fn worker(&self) -> &str {
@@ -582,7 +599,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     /// The periodic `-debug=stratum` reading: is this miner still hashing,
     /// and at what rate.
     fn log_status(&mut self) {
-        let Some(report) = self.tally.status_due(std::time::Instant::now()) else { return };
+        let Some(miner) = &self.miner else { return };
+        let Some(report) = miner.lock().tally.status_due(std::time::Instant::now()) else { return };
         tracing::debug!(
             target: "node::stratum",
             peer = %self.peer,
@@ -600,25 +618,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     /// One line when the connection ends. A miner that authorized gets it at
     /// info, beside its "authorized" line, so a device that keeps dropping is
     /// visible without `-debug=stratum`.
-    fn log_close(&mut self, reason: &str) {
+    fn log_close(&self, reason: &str) {
         let now = std::time::Instant::now();
-        let Some(payout) = self.payout.as_ref() else {
+        let (Some(payout), Some(miner)) = (self.payout.as_ref(), self.miner.as_ref()) else {
             tracing::debug!(target: "node::stratum", peer = %self.peer, reason, "Stratum connection closed");
             return;
         };
-        let hashrate = format_hashrate(self.tally.hashrate(now));
-        let total = self.tally.total();
+        let (hashrate, total, connected_secs, best_share) = {
+            let mut record = miner.lock();
+            let tally = &mut record.tally;
+            (format_hashrate(tally.hashrate(now)), tally.total(), tally.connected_secs(now), tally.best_share())
+        };
         tracing::info!(
             target: "node::stratum",
             peer = %self.peer,
             address = payout.address.as_deref().unwrap_or("<--stratumaddress>"),
             worker = payout.worker.as_deref().unwrap_or(""),
             reason,
-            connected_secs = self.tally.connected_secs(now),
+            connected_secs,
             accepted = total.accepted,
             rejected = total.rejected,
             stale = total.stale,
-            best_share = %format_difficulty(self.tally.best_share()),
+            best_share = %format_difficulty(best_share),
             %hashrate,
             "Stratum miner disconnected"
         );

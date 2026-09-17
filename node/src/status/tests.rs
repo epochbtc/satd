@@ -121,6 +121,7 @@ fn fixture(n: u32) -> Fixture {
         health: None,
         webhooks: None,
         status: None,
+        listeners: None,
     };
     let sources = StatusSources::new(
         crate::rpc::server::ServerListenerStatus::new(),

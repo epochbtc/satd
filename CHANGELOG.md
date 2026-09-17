@@ -40,6 +40,7 @@ item below is (or will be) written up in full in the in-development
 - Opt-in `cmpctblock` prefill (`-cmpctblockprefill`, `-cmpctblockprefillbytes`, default off / 8192 bytes): new blocks are announced with the transactions this node lacked prefilled, following Core's proposal #35558 (#772).
 - `getmininginfo` reports `bits`, `target`, `blockmintxfee` and the next block's `height`/`bits`/`difficulty`/`target`; `getblock`, `getblockheader`, `getblockchaininfo` and `getchainstates` report `target`; on signet `getblockchaininfo` and `getmininginfo` report `signet_challenge`; `getprioritisedtransactions` reports `modified_fee`; `getmempoolentry` reports `wtxid`.
 - **Stratum V2 Job Declaration** (`--stratumv2jd=1`), solo semantics: a miner declares its own transaction set from this node's mempool. New `getstratuminfo` RPC (#751).
+- `getstratuminfo` lists each connected miner (device, difficulty, share counts, best share, last share, estimated hashrate) and a node-wide hashrate; the metrics endpoint exports `satd_stratum_*` connections, miners, shares by result, blocks found and hashrate.
 - `-debug=stratum`: the Stratum server's per-miner debug lines (device, version-rolling mask, every share with the difficulty it achieved, a five-minute status line with estimated hashrate). Always logged: a disconnect summary per miner, and every refused share with its reason.
 
 ### Fixed

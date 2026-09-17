@@ -74,6 +74,10 @@ pub struct MetricsContext {
     /// Inputs for the status snapshot beyond the ones above. `None` wherever
     /// no status page is served.
     pub status: Option<Arc<crate::status::StatusSources>>,
+    /// Where the Stratum server registers once it is bound. The `stratum`
+    /// families are rendered only while a server is running, so a node with
+    /// `--stratum=0` exports none of them rather than zeros.
+    pub listeners: Option<Arc<crate::rpc::server::ServerListenerStatus>>,
 }
 
 impl MetricsContext {
@@ -291,6 +295,9 @@ impl MetricsContext {
                     v.load(Relaxed),
                 );
             }
+        }
+        if let Some(stratum) = self.listeners.as_ref().and_then(|l| l.stratum_handle()) {
+            render_stratum(&mut out, stratum.stats());
         }
         metric(
             &mut out,
@@ -679,6 +686,58 @@ pub fn readiness(
     } else {
         Ok(())
     }
+}
+
+/// The Stratum server's counters. Per-miner figures are aggregated: a worker
+/// name is chosen by the miner, so a label carrying it would let any miner
+/// grow the series count without bound. `getstratuminfo` has the per-miner
+/// breakdown.
+fn render_stratum(out: &mut String, stats: &crate::stratum::StratumStats) {
+    use std::sync::atomic::Ordering::Relaxed;
+    metric(
+        out,
+        "satd_stratum_connections",
+        "Open Stratum connections, V1 and V2.",
+        "gauge",
+        &[],
+        stats.connections.load(Relaxed),
+    );
+    metric(
+        out,
+        "satd_stratum_miners",
+        "Miners connected: authorized Stratum V1 connections plus open Stratum V2 channels.",
+        "gauge",
+        &[],
+        stats.miners.len() as u64,
+    );
+    metric_header(
+        out,
+        "satd_stratum_shares_total",
+        "Shares submitted to the Stratum server, by result: accepted, rejected, or stale (for a job that is no longer current).",
+        "counter",
+    );
+    for (result, v) in [
+        ("accepted", &stats.shares_accepted),
+        ("rejected", &stats.shares_rejected),
+        ("stale", &stats.shares_stale),
+    ] {
+        metric_sample(out, "satd_stratum_shares_total", &[("result", result)], v.load(Relaxed));
+    }
+    metric(
+        out,
+        "satd_stratum_blocks_found_total",
+        "Blocks found by Stratum miners that joined the active chain.",
+        "counter",
+        &[],
+        stats.blocks_found.load(Relaxed),
+    );
+    metric_header(
+        out,
+        "satd_stratum_hashrate_hashes_per_second",
+        "Estimated hashrate of the connected miners, from the difficulty of the shares each had accepted over the last ten minutes.",
+        "gauge",
+    );
+    let _ = writeln!(out, "satd_stratum_hashrate_hashes_per_second {}", stats.miners.hashrate());
 }
 
 fn metric(
@@ -1653,6 +1712,27 @@ mod tests {
                 "missing series for {id}:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn stratum_metrics_are_valid_exposition_format() {
+        use std::sync::atomic::Ordering;
+        let stats = crate::stratum::StratumStats::default();
+        stats.shares_accepted.store(7, Ordering::Relaxed);
+        stats.shares_stale.store(1, Ordering::Relaxed);
+        let peer = "127.0.0.1:4000".parse().unwrap();
+        let miner = stats.miners.register(crate::stratum::miner::MinerRecord::new("v1", peer, None, 1_000));
+        let mut out = String::new();
+        render_stratum(&mut out, &stats);
+        assert_one_header_per_family(&out);
+        assert!(out.contains("satd_stratum_shares_total{result=\"accepted\"} 7"), "{out}");
+        assert!(out.contains("satd_stratum_shares_total{result=\"stale\"} 1"), "{out}");
+        assert!(out.contains("satd_stratum_miners 1"), "{out}");
+        assert!(out.contains("satd_stratum_hashrate_hashes_per_second 0"), "{out}");
+        drop(miner);
+        let mut out = String::new();
+        render_stratum(&mut out, &stats);
+        assert!(out.contains("satd_stratum_miners 0"), "a disconnected miner leaves the gauge: {out}");
     }
 
     #[test]
